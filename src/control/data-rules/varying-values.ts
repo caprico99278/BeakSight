@@ -11,8 +11,17 @@
 //   欄（合成の番号つきのメール・電話・番号・文字）の名前。一覧の画面には前の登録が並ぶので、一覧の画面の答え合わせの期待は、この欄に限る（人の名前・固定の一覧・
 //   辞書の値は、2 つ以上の値を作りえても、回をまたいで同じになりうる）。`readVerificationVaryingRejectionOf` は、照合の READ の定義の画面の path が `{id}` の型で
 //   ない（一覧の画面）とき、この欄で判定する。下書き（自動の下書きの選び方）、許可の発行、開始の画面、書き込みの指定の組み立てが同じ判定を使う。
+// - LU-7 fix round 2（一覧の行の更新の設計書 5.5 の 7、K3）: 一覧の画面の照合と一覧の行の更新の「毎回違う欄」の判定は `readVerificationUniqueRejectionOf` の
+//   1 か所（許可の発行は `readVerificationVaryingRejectionOf` を通して、書き込みの開始 `writeStartSpecOf` は直接呼ぶ）。一覧の行の更新（`listRow`）は、行を選ぶ欄で
+//   前の登録の行と区別するので、行を選ぶ欄が台帳の登録の毎回違う欄にあることを求める（変える欄が毎回違う欄であることは求めない）。
 import type { ExecutionGrantRejectionReason } from '../approval/execution-grant.js';
-import { API_SCENARIO_TRANSPORT, scenarioTransportOf, type ScenarioRevision } from '../approval/scenario-contracts.js';
+import {
+  API_SCENARIO_TRANSPORT,
+  scenarioTransportOf,
+  type ScenarioListRow,
+  type ScenarioRevision,
+  type VerificationExpectation,
+} from '../approval/scenario-contracts.js';
 import type { DiscoveryCandidate } from '../../discovery/candidate-contracts.js';
 import { hasGeneratedValueExpectation, isReadCheckPageTemplatePath } from '../../discovery/read-check-contracts.js';
 import {
@@ -75,8 +84,38 @@ export const isListPageReadTarget = (readTargetPagePath: string | null | undefin
 export const varyingFieldNamesOf = (planned: RuleSetPlan): readonly string[] =>
   Object.freeze([...planned.plans].filter(([, plan]) => planVaries(plan, planned)).map(([name]) => name));
 
+/**
+ * LU-7 fix round 2: 一覧の画面の照合と一覧の行の更新の「毎回違う欄」の判定（許可の発行と書き込みの開始が使う唯一の判定。外れれば理由、通れば null）。
+ * - 一覧の行の更新（`listRow` あり）: 行を選ぶ欄が、台帳の登録の今の入力の規則で実行のたびに違う値になる欄（`ledgerUniqueEachRunFieldNames`。分からなければ
+ *   拒む）にあること。照合の READ の画面によらない（LU-8 の開始の確かめ直しも、これ 1 つ）。変える欄（照合の期待の欄）が毎回違う欄であることは求めない。
+ * - 一覧の行のない一覧の画面の照合（`listPage`）: 期待の欄が、そのシナリオの毎回違う欄（`uniqueEachRunFieldNames`）であること（OP-REV6 の I-1 のまま）。
+ * - ほか（`{id}` の型の画面・候補の READ）は対象の外（null。`{id}` の型は `readVerificationVaryingRejectionOf` が変わる欄で判定する）。
+ */
+export const readVerificationUniqueRejectionOf = (input: {
+  readonly expectations: readonly VerificationExpectation[];
+  /** 照合の READ の定義が一覧の画面（`isListPageReadTarget`）か。 */
+  readonly listPage: boolean;
+  /** そのシナリオの、実行のたびに違う値になる欄（`uniqueEachRunFieldNamesOf`）。 */
+  readonly uniqueEachRunFieldNames: readonly string[];
+  /** 一覧の行の更新の行の選び方（承認した API の指定の `ledger.listRow`。なければ null）。 */
+  readonly listRow: Pick<ScenarioListRow, 'rowKeyField'> | null;
+  /** 台帳の登録の、今の入力の規則で実行のたびに違う値になる欄（分からなければ null）。一覧の行の更新だけが見る。 */
+  readonly ledgerUniqueEachRunFieldNames: readonly string[] | null | undefined;
+}): typeof READ_VERIFICATION_NOT_VARYING | null => {
+  if (input.listRow !== null) {
+    return (input.ledgerUniqueEachRunFieldNames ?? []).includes(input.listRow.rowKeyField) ? null : READ_VERIFICATION_NOT_VARYING;
+  }
+  if (!input.listPage) {
+    return null;
+  }
+  const unique = new Set(input.uniqueEachRunFieldNames);
+  return hasGeneratedValueExpectation(input.expectations, (expectation) => 'fieldName' in expectation && unique.has(expectation.fieldName))
+    ? null
+    : READ_VERIFICATION_NOT_VARYING;
+};
+
 /** 照合の READ の判定が見るシナリオの項目。 */
-type VaryingScenario = EvaluationScenario & Pick<ScenarioRevision, 'verification'>;
+type VaryingScenario = EvaluationScenario & Pick<ScenarioRevision, 'verification'> & { readonly api?: Pick<NonNullable<ScenarioRevision['api']>, 'ledger'> };
 
 /**
  * API のシナリオの送る値を持たない照合の READ が、実行のたびに変わる値と比べる期待を持つか（持たなければ理由、持てば null。対象の外も null）。
@@ -88,6 +127,11 @@ export const readVerificationVaryingRejectionOf = (
   candidate: DiscoveryCandidate,
   /** OP-REV6 の I-1: 照合の READ の定義の画面の path（画面の path の定義でなければ null）。一覧の画面なら、実行のたびに違う値になる欄で判定する。 */
   readTargetPagePath: string | null = null,
+  /**
+   * LU-7 fix round 2: 一覧の行の更新の、台帳の登録の今の入力の規則で実行のたびに違う値になる欄（省けば null。一覧の画面の照合の一覧の行の更新は拒む。
+   * fail-closed）。
+   */
+  ledgerUniqueEachRunFieldNames: readonly string[] | null = null,
 ): typeof READ_VERIFICATION_NOT_VARYING | null => {
   const read = scenario.verification.readVerification;
   if (scenarioTransportOf(scenario) !== API_SCENARIO_TRANSPORT || read === null || read.bindings.length > 0) {
@@ -97,7 +141,14 @@ export const readVerificationVaryingRejectionOf = (
   if (!planned.evaluation.executable) {
     return null;
   }
-  const varying = new Set(isListPageReadTarget(readTargetPagePath) ? uniqueEachRunFieldNamesOf(planned) : varyingFieldNamesOf(planned));
+  // LU-7 fix round 2: 一覧の画面は、唯一の判定 `readVerificationUniqueRejectionOf`（一覧の行の更新は、行を選ぶ欄で判定する）。
+  if (isListPageReadTarget(readTargetPagePath)) {
+    return readVerificationUniqueRejectionOf({
+      expectations: read.expectations, listPage: true, uniqueEachRunFieldNames: uniqueEachRunFieldNamesOf(planned),
+      listRow: scenario.api?.ledger?.listRow ?? null, ledgerUniqueEachRunFieldNames,
+    });
+  }
+  const varying = new Set(varyingFieldNamesOf(planned));
   return hasGeneratedValueExpectation(read.expectations, (expectation) => 'fieldName' in expectation && varying.has(expectation.fieldName))
     ? null
     : READ_VERIFICATION_NOT_VARYING;

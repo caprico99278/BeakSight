@@ -3,8 +3,84 @@
  * 共用する。Node の側の値だけ。ページの中で動く関数は外の値を参照できないので、ページの中の読み方はそれぞれの部品が持つ）。
  */
 
-/** フォームを読む・値を入れる・送る、それぞれの時間の上限（ms）。 */
+import type { Page } from 'playwright';
+import { PROGRESS_WATCH_QUIET_LIMIT_MS, watchProgress } from '../core/progress-watch.js';
+import { observationWindowsOrProduction, type ObservationWindows } from '../core/observation-windows.js';
+import { openEndedStageDeadline } from '../orchestration/stage-deadline.js';
+import { attachPageProgressSignals } from './page-progress-signals.js';
+import { waitForPageSettled, type DataActivity } from './page-settling.js';
+
+/**
+ * ログインのフォームを読む・値を入れる・送る、それぞれの時間の上限（ms）。L12b（設計書 `2026-11-09-beaksight-remove-limits-design.md` 6.2 の判断 7）: ログインの
+ * 群（自動ログインの間隔と回数）のまま、ログインの側だけが使う（書き込みの側は `WRITE_STEP_TIMEOUT_MS`）。
+ */
 export const FORM_STEP_TIMEOUT_MS = 10_000;
+
+/**
+ * L12b（設計書 6.2。T23）: 書き込みの入力の部品（form と API）の、1 手（読む・入れる・押す）を待つ長さ（ms）。期限ではなく、L0 の進みの見張りの反応なしの長さ
+ * （`PROGRESS_WATCH_QUIET_LIMIT_MS`）と同じにする（1 回のブラウザの呼び出しが、この長さの間、全く返らないときだけ見放す。前の 10 秒の上限は撤廃した）。
+ */
+export const WRITE_STEP_TIMEOUT_MS = PROGRESS_WATCH_QUIET_LIMIT_MS;
+
+/**
+ * L12b（L12a の限界 3・4。T24）: 押した後のページの送信と画面の変化が静まるまで待つ（書き込みの段の唯一の部品。form と API の入力の部品と書き込みの流れが使う）。
+ * 期限を置かない（全く反応がないとき・静まらないときは、L0 の進みの見張り `watchProgress` が終える）。`until` が真になったら、静まりを待たずに終える。静まりの判定は、
+ * 落ち着きの待ちの唯一の部品 `waitForPageSettled`（作りの印・高さ・読み込みの段・データの途中の数）に任せる。静まりの窓は、開いたままのデータの要求を届いたと
+ * みなす長さ（`OPEN_DATA_REQUEST_QUIET_MS`）にする（押した後に少し遅れて出るページの送信を待つため。これより遅れて出る送信は見落としうる。限界）。
+ * TEST-TIME-B・RB-2: 窓の長さ（`afterPress.pressQuietWindowMs`）と確かめの間隔（`pageSettle.pollIntervalMs`）は、呼ぶ側が渡す観察の窓の一式
+ * （`observationWindows`）でだけ替わる（テストだけ。利用者が触れる口からは渡せない）。省略すると本番の値。
+ */
+export async function waitForPageQuietAfterPress(
+  page: Page,
+  options: {
+    readonly dataActivity?: (() => DataActivity) | undefined;
+    readonly until?: (() => boolean) | undefined;
+    readonly observationWindows?: ObservationWindows | undefined;
+  } = {},
+): Promise<void> {
+  const windows = observationWindowsOrProduction(options.observationWindows);
+  const quietWindowMs = windows.afterPress.pressQuietWindowMs;
+  const { pollIntervalMs } = windows.pageSettle;
+  if (page.isClosed()) {
+    return;
+  }
+  await watchProgress(async (signals) => {
+    const detach = attachPageProgressSignals(page, signals);
+    const stop = new AbortController();
+    const until = options.until;
+    // `until` が真になったら、静まりの待ちをやめる（見張りの終わりと同じ口で止める）。
+    const watchUntil = until === undefined ? undefined : (async (): Promise<void> => {
+      while (!stop.signal.aborted && !signals.signal.aborted) {
+        if (until()) {
+          stop.abort();
+          return;
+        }
+        await new Promise((resolve) => setTimeout(resolve, pollIntervalMs));
+      }
+    })();
+    const progress = {
+      mark: signals.mark,
+      get signal(): AbortSignal {
+        return stop.signal.aborted ? stop.signal : signals.signal;
+      },
+    };
+    try {
+      await waitForPageSettled(page, {
+        // 期限の数を必ず受け取る部品なので、切らない値（L1 の共通の部品 `openEndedStageDeadline`）を渡す。
+        deadlineAtMs: openEndedStageDeadline(Date.now()),
+        pollIntervalMs,
+        stableWindowMs: quietWindowMs,
+        openDataRequestQuietMs: quietWindowMs,
+        progress,
+        ...(options.dataActivity === undefined ? {} : { dataActivity: options.dataActivity }),
+      });
+    } finally {
+      stop.abort();
+      await watchUntil;
+      detach();
+    }
+  });
+}
 
 /** 受ける method（ブラウザの `method`・`formMethod` のプロパティは小文字）。 */
 export const FORM_POST_METHOD = 'post';

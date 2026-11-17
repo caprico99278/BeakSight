@@ -56,9 +56,8 @@ const READ_METHOD_EXCEPTIONS: Readonly<Record<string, string>> = Object.freeze({
   'tests/integration/guard-api-write-stage.test.ts': 'Guard のテスト（組 7 の範囲の外。両方の Chromium で確かめる安全の組が寄せる）。寄せたら消す',
   'tests/integration/guard-audit-stage.test.ts': 'Guard のテスト（組 7 の範囲の外。両方の Chromium で確かめる安全の組が寄せる）。寄せたら消す',
   'tests/integration/guard-login-stage.test.ts': 'Guard のテスト（組 7 の範囲の外。両方の Chromium で確かめる安全の組が寄せる）。寄せたら消す',
-  'tests/integration/guard-update-payload.test.ts': 'Guard のテスト（組 7 の範囲の外。両方の Chromium で確かめる安全の組が寄せる）。寄せたら消す',
   'tests/integration/guard-write-stage.test.ts': 'Guard のテスト（組 7 の範囲の外。両方の Chromium で確かめる安全の組が寄せる）。寄せたら消す',
-  'tests/integration/passive-request-guard.test.ts': 'Guard のテスト（組 7 の範囲の外。両方の Chromium で確かめる安全の組が寄せる）。寄せたら消す',
+  'tests/integration/passive-request-guard-browser.test.ts': 'Guard のテスト（組 7 の範囲の外。両方の Chromium で確かめる安全の組が寄せる）。寄せたら消す',
   'tests/helpers/authenticated-site-fixture.ts': 'fixture のサーバの側の読み取りの判定（組 8 の範囲の fixture）。寄せたら消す',
   'tests/helpers/discovery-site-fixture.ts': 'fixture のサーバの側の読み取りの判定（組 8 の範囲の fixture）。寄せたら消す',
   'tests/helpers/large-checkpoint-fixture.ts': 'fixture のサーバの側の読み取りの判定（組 8 の範囲の fixture）。寄せたら消す',
@@ -85,7 +84,7 @@ const FAKE_NAVIGATION_PORT = /(?<![.\w$])isNavigationRequest\s*(?::\s*(?:async\s
 const FAKE_REQUEST_EXCEPTIONS: Readonly<Record<string, string>> = Object.freeze({
   'tests/component/network-collector.test.ts':
     '転送の前後（`redirectedFrom`・`redirectedTo`）、時間（`timing`）、大きさ（`sizes`）、ヘッダを持つ別の形の偽の要求（`fakePlaywrightRequest` の項目にない口を書き換える）',
-  'tests/integration/passive-request-guard.test.ts': 'Guard のテスト（組 7 の範囲の外。調べの口が投げる偽の要求）。`overrides` で書き直したら消す',
+  'tests/unit/passive-request-guard.test.ts': 'Guard のテスト（組 7 の範囲の外。調べの口が投げる偽の要求）。`overrides` で書き直したら消す',
 });
 
 /** `fakePlaywrightRequest(…)` の引数の範囲（その中の口は `overrides` なので数えない）。 */

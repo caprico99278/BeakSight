@@ -128,6 +128,47 @@ describe('COLOR_CONTRAST_VIOLATION', () => {
     expect(drafts[1]?.severity).toBe('WARN');
   });
 
+  it('AUD-8: 支援技術に無効と伝わる要素（対象外の印）は数えず、見た目だけ無効の要素は残して事実を文言に付ける', () => {
+    const readFacts = {
+      status: 'READ' as const,
+      matchesDisabled: false,
+      disabledAttribute: null,
+      ariaDisabled: null,
+      inert: null,
+      axDisabled: null,
+      pointerEvents: 'auto',
+      cursor: 'not-allowed',
+      tabIndexNegative: false,
+      disabledForAssistiveTech: false,
+      disabledStateNotExposed: true,
+    };
+    const record = accessibilityRecord([
+      axeRule('color-contrast', 'serious', [
+        { ...node(['#visual-only'], 'serious'), disabledFacts: readFacts, countExclusion: null },
+        {
+          ...node(['#aria-disabled'], 'serious'),
+          disabledFacts: { ...readFacts, ariaDisabled: 'ANCESTOR', cursor: 'auto', disabledForAssistiveTech: true, disabledStateNotExposed: false },
+          countExclusion: 'DISABLED_FOR_ASSISTIVE_TECH',
+        },
+      ]),
+    ]);
+    const drafts = contrastRule().evaluate(input([record]));
+    expect(drafts).toHaveLength(1);
+    expect(identity(drafts[0], 'target')).toBe('["#visual-only"]');
+    expect(drafts[0]?.message).toContain('無効の状態を支援技術に伝えていません');
+  });
+
+  it('EV-1: 色から計算した丸める前の比と基準を文に出し、境目に近い値も基準に届いたと丸めない', () => {
+    const contrastCheck = {
+      id: 'color-contrast', group: 'any' as const, result: 'FAILED' as const, messageKey: null,
+      data: { fgColor: '#777777', bgColor: '#ffffff', contrastRatio: 4.48, expectedContrastRatio: '4.5:1' },
+    };
+    const record = accessibilityRecord([
+      axeRule('color-contrast', 'serious', [{ ...node(['#near'], 'serious'), checks: [contrastCheck], computedContrastRatio: 4.4999 }]),
+    ]);
+    expect(contrastRule().evaluate(input([record]))[0]?.message).toContain('4.49（基準 4.5）');
+  });
+
   it('color-contrast 以外の violation と、incomplete は、COLOR_CONTRAST_VIOLATION にしない', () => {
     const record = accessibilityRecord([axeRule('image-alt', 'critical', [node(['img'])])], {
       incomplete: [axeRule('color-contrast', 'serious', [node(['#unknown-background'])])],
@@ -171,6 +212,33 @@ describe('A11Y_ の Rule', () => {
     expect(drafts[0]?.ruleId).toBe('A11Y_DUPLICATE_ID');
     expect(drafts[0]?.identityFields).toEqual([]);
     expect(drafts[0]?.message).toContain('3 件');
+    // COV-6: 古い記録（件数の上限があった版）を読むときだけ、起きた事実として出す。
+    expect(drafts[0]?.message).toContain('以前の版');
+  });
+
+  it('COV-6: 新しい記録（記録しなかった件数 0）では、要素がなくても上限の文言を出さない', () => {
+    const record = accessibilityRecord([axeRule('duplicate-id', 'minor', [])]);
+    const drafts = axeViolationRule().evaluate(input([record]));
+    expect(drafts).toHaveLength(1);
+    expect(drafts[0]?.message).not.toContain('上限');
+  });
+
+  it('COV-6: 上限を超える件数の要素も、全部が Rule に渡り、要素ごとの Finding になる', () => {
+    const count = 150;
+    const record = accessibilityRecord([
+      axeRule('image-alt', 'critical', Array.from({ length: count }, (_value, index) => node([`#image-${index}`]))),
+    ]);
+    const drafts = axeViolationRule().evaluate(input([record]));
+    expect(drafts).toHaveLength(count);
+    expect(identity(drafts.at(-1), 'target')).toBe(JSON.stringify([`#image-${count - 1}`]));
+    expect(drafts.every((draft) => !draft.message.includes('上限'))).toBe(true);
+  });
+
+  it('COV-6: 古い記録で、要素のある violation に記録しなかった件数があれば、以前の版の事実として出す', () => {
+    const record = accessibilityRecord([axeRule('image-alt', 'critical', [node(['#first'])], 5)]);
+    const drafts = axeViolationRule().evaluate(input([record]));
+    expect(drafts[0]?.message).toContain('5 件');
+    expect(drafts[0]?.message).toContain('以前の版');
   });
 
   it('incomplete と、PARTIAL の収集で観測されなかったものからは、Finding を作らない', () => {
@@ -216,5 +284,19 @@ describe('ACCESSIBILITY_RULES と Rule Engine', () => {
       'A11Y_REGION',
       'COLOR_CONTRAST_VIOLATION',
     ]);
+  });
+});
+
+describe('AUD-9a: axe の Finding の groupingKeys', () => {
+  it('要素ごとの Finding に、axe の target を同じ値で残す', () => {
+    const record = accessibilityRecord([axeRule('image-alt', 'critical', [node(['#hero > img']), node([['iframe', '#inner']])])]);
+    const result = new RuleEngine({ targetId: 'a11y-grouping', firstFindingSequence: 1, catalog: [axeViolationRule()] })
+      .evaluate(input([record]));
+    expect(result.failures).toEqual([]);
+    expect(result.findings.map((finding) => JSON.stringify(finding.groupingKeys)).sort()).toEqual([
+      JSON.stringify([{ name: 'target', value: JSON.stringify(['#hero > img']) }]),
+      JSON.stringify([{ name: 'target', value: JSON.stringify([['iframe', '#inner']]) }]),
+    ].sort());
+    expect(result.findings.every((finding) => finding.schemaVersion === 'finding-schema/1.1')).toBe(true);
   });
 });

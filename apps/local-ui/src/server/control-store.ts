@@ -1,6 +1,6 @@
 /**
  * 画面のサーバの管理データの接続（Task 23 設計書 4.3、4.6。T23f）。サーバだけで使う。
- * - リポジトリの root を自分の場所から決め（`repositoryRootOf`）、`openControlDatabase(resolveControlDatabasePath(root))` を 1 回だけ行って
+ * - データの根（本番はリポジトリの root。`local-ui-runtime` が決める）の `openControlDatabase(resolveControlDatabasePath(root))` を 1 回だけ行って
  *   使い回す（`npm run setup:local` と同じ準備の部品）。データの場所を変える引数や環境変数はない。
  * - 本番の起動の部品は、待ち受けの前に `launcher-bridge` を通して `prepareLocalUiStore` を呼ぶ。失敗したら、`npm run setup:local` と同じ
  *   説明の文（`src/presentation/messages.ts`）を出して止まる。開発のサーバも、待ち受けを始めたときに準備する。
@@ -22,7 +22,7 @@ import {
   SETUP_LOCAL_TEXT,
   cliFieldText,
 } from '../../../../src/presentation/messages.js';
-import { repositoryRootOf } from './repository-root';
+import { localUiRuntimeOptions } from './local-ui-runtime';
 
 /** 準備の失敗（理由と英語の詳細。振り分けは `controlStoreFailureOf`）。 */
 export type LocalUiStoreFailure = ControlStoreFailure;
@@ -43,8 +43,8 @@ let state: StoreState = { kind: 'unprepared' };
 /** 環境の理由（Node の版を添えて出す）。 */
 const ENVIRONMENT_REASONS: ReadonlySet<ControlStoreFailureReason> = new Set(['NODE_VERSION_UNSUPPORTED', 'NODE_SQLITE_UNAVAILABLE']);
 
-/** このサーバのリポジトリの root（区切りは `/`）。 */
-export const localUiRepositoryRoot = (): string => repositoryRootOf(import.meta.url);
+/** このサーバのデータの根（本番はリポジトリの root。区切りは `/`。RB-7: `local-ui-runtime` の 1 か所から読む）。 */
+export const localUiRepositoryRoot = (): string => localUiRuntimeOptions().dataRoot;
 
 /** 管理データのファイルの場所（絶対パス）。 */
 const databasePath = (): string => resolveControlDatabasePath(localUiRepositoryRoot());

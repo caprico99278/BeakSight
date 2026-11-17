@@ -1,7 +1,7 @@
 /**
  * シナリオの種類と、書き込みのジョブの種類の対応（T31h-2。Task 31 の設計書 3 章。登録（CREATE）は `WRITE_CREATE`、更新（UPDATE）は
- * `WRITE_UPDATE`）。開始の画面（`write-job-functions.ts`）とシナリオの詳細（`scenario-functions.ts`）が、プロファイルで始められるか
- * （`execution-policy.ts` の行）を確かめるのに共用する。ジョブの詳細（`audit-job-functions.ts`）は、書き込みのジョブかを決めるのに使う。
+ * `WRITE_UPDATE`）。ジョブの詳細（`audit-job-functions.ts`）と書き込みの結果（`write-results.ts`）が、書き込みのジョブかを決めるのに使う。
+ * SPEC-4: 開始の画面を外したので、シナリオの種類からジョブの種類を引く口（`writeJobKindOf`）は捨てた。
  */
 import type { ScenarioKind } from '../../../../src/control/approval-view.js';
 import type { AuditJobKind } from '../../../../src/control/job/job-records.js';
@@ -16,9 +16,6 @@ const WRITE_JOB_KIND_OF_SCENARIO_KIND = Object.freeze({
   CREATE: WORKER_WRITE_CREATE_JOB_KIND,
   UPDATE: WORKER_WRITE_UPDATE_JOB_KIND,
 } as const satisfies Record<ScenarioKind, WriteJobKind>);
-
-/** シナリオの種類の、書き込みのジョブの種類。 */
-export const writeJobKindOf = (kind: ScenarioKind): WriteJobKind => WRITE_JOB_KIND_OF_SCENARIO_KIND[kind];
 
 /** 書き込みのジョブの種類か（T31h-2。ジョブの詳細が、書き込みの結果を読むかを決める）。 */
 export const isWriteJobKind = (jobKind: AuditJobKind): jobKind is WriteJobKind =>

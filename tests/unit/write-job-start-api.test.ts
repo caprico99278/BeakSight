@@ -15,7 +15,7 @@ import type { SeedRecord } from '../../src/control/data-rules/scenario-data.js';
 import type { ReadCheckView } from '../../src/control/job/read-check-store.js';
 import {
   WRITE_READ_VERIFICATION_PAGE_TARGET,
-  apiCreateReadListPagePathOf,
+  readListPagePathForWriteOf,
   readVerificationTargetRejectionOf,
   writeStartSpecOf,
 } from '../../src/control/job/write-job-start.js';
@@ -270,14 +270,14 @@ describe('T40a: the write specification of an API CREATE scenario', () => {
     expect(readVerificationTargetRejectionOf(CANDIDATE_READ, 'API')).toBeNull();
     expect(readVerificationTargetRejectionOf(TEMPLATE_READ, 'FORM')).toBe(WRITE_READ_VERIFICATION_PAGE_TARGET);
     expect(readVerificationTargetRejectionOf(FIXED_PAGE_READ, 'API')).toBe(WRITE_READ_VERIFICATION_PAGE_TARGET);
-    expect(readVerificationTargetRejectionOf(FIXED_PAGE_READ, 'API', apiCreateReadListPagePathOf(TEMPLATE_SCENARIO, CANDIDATE))).toBe(WRITE_READ_VERIFICATION_PAGE_TARGET);
+    expect(readVerificationTargetRejectionOf(FIXED_PAGE_READ, 'API', readListPagePathForWriteOf(TEMPLATE_SCENARIO, CANDIDATE))).toBe(WRITE_READ_VERIFICATION_PAGE_TARGET);
   });
 
   // OP-R（設計書 `2026-10-27-beaksight-one-pass-flow-design.md` 4.1.9 の R1。T37d の判断 5 を改めた）: API の登録に限って、登録の画面の 1 つ上の一覧の画面の定義を
   // 照合の READ に使う（送る値なし。期待は生成した値。GET 1 回は、ワーカーが行う）。FORM と API の更新と、ほかの画面の path は、今のまま使わない。
   it('lets the list page READ one above the create page through the start check for an API create only (OP-R R1)', () => {
     const rejectionOf = (scenario: ScenarioRevision, evidence: DiscoveryCandidate) =>
-      readVerificationTargetRejectionOf(LIST_READ, scenarioTransportOf(scenario), apiCreateReadListPagePathOf(scenario, evidence));
+      readVerificationTargetRejectionOf(LIST_READ, scenarioTransportOf(scenario), readListPagePathForWriteOf(scenario, evidence));
     expect(rejectionOf(LIST_SCENARIO, CANDIDATE)).toBeNull();
     expect(rejectionOf({ ...LIST_SCENARIO, transport: 'FORM' }, CANDIDATE)).toBe(WRITE_READ_VERIFICATION_PAGE_TARGET);
     expect(rejectionOf({ ...LIST_SCENARIO, kind: 'UPDATE' }, CANDIDATE)).toBe(WRITE_READ_VERIFICATION_PAGE_TARGET);

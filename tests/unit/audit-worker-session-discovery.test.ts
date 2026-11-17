@@ -1,5 +1,5 @@
 // T27d（Task 27 の設計書 4.6 と、変更履歴の「T27b・T27c の報告と T27d の前の判断」の (3)）: ワーカーの流れの、発見のジョブ（`DISCOVERY`）の扱いを、
-// 偽の IPC の口と偽のログインの段と偽の発見の流れで確かめる（本物の子 process と Chromium は `discovery-job-fork.test.ts`）。
+// 偽の IPC の口と偽のログインの段と偽の発見の流れで確かめる（本物の Chromium は `discovery-run.test.ts`、子 process の端から端は画面の `full-flow.test.ts`）。
 // - ログインの段（手動）の後に、監査の中核を呼ばずに、発見の流れを、ジョブの ID・設定・ログインの状態つきの認証の指定・止める印で呼ぶ。
 // - 発見の流れの観測を IPC に写す: Run を作った → `RUN_STARTED`（新しい Run、出力先からの相対パス）、セッションの切れ → `AUTH_STATE`
 //   （`SESSION_LOST`、URL）。終わり → `FINISHED`（Run を実行した結果だけ件数の要約。候補を載せない）と、結果の終了コード。
@@ -208,12 +208,31 @@ describe('audit worker session (T27d): the discovery job', () => {
     expect(run.sent.every((message) => validateWorkerToParentMessage(message).ok)).toBe(true);
   });
 
+  // DEF-195: 発見の流れの進み具合を、監査と同じ `PROGRESS` で親へ送る（新しい形を作らない）。
+  it('relays the progress of the discovery flow as PROGRESS, the same as the audit', async () => {
+    const report = {
+      pagesFinished: 2, pagesDiscovered: 6, maxPages: 20, elapsedMs: 20_000, navigationCount: 2, pacingWaitMs: 0,
+      requests: { allowedOrigins: { count: 4, peakPerMinute: 4 }, otherOrigins: { count: 0, peakPerMinute: 0 }, servedFromCache: 0, withheldOtherOrigins: 0 },
+      recentPerMinute: { allowedOrigins: 4, otherOrigins: 0 },
+    };
+    const run = await runWorker({
+      executeDiscovery: async (_request, observer) => {
+        observer.onRunStarted({ runId: RUN_ID, runDirectory: resolve(OUTPUT_DIRECTORY, RUN_ID) });
+        observer.onProgress?.(report);
+        return ranOutcome;
+      },
+    });
+    expect(meaningful(run).map(({ type }) => type)).toEqual(['AUTH_STATE', 'RUN_STARTED', 'PROGRESS', 'FINISHED']);
+    expect(run.sent.find(({ type }) => type === 'PROGRESS')).toEqual({ protocol: WORKER_PROTOCOL_VERSION, type: 'PROGRESS', report });
+    expect(run.sent.every((message) => validateWorkerToParentMessage(message).ok)).toBe(true);
+  });
+
   it('sends FINISHED without the counts when the discovery did not start a Run (RUN_ACTIVE)', async () => {
-    const run = await runWorker({ executeDiscovery: async () => ({ kind: 'RUN_ACTIVE', activeRunId: RUN_ID, exitCode: EXIT_CODES.RUN_UNAVAILABLE }) });
+    const run = await runWorker({ executeDiscovery: async () => ({ kind: 'RUN_ACTIVE', exitCode: EXIT_CODES.RUN_UNAVAILABLE }) });
     expect(meaningful(run).at(-1)).toEqual({
       protocol: WORKER_PROTOCOL_VERSION,
       type: 'FINISHED',
-      outcome: { kind: 'RUN_ACTIVE', exitCode: EXIT_CODES.RUN_UNAVAILABLE, runId: RUN_ID, runDirectory: null, runStatus: null },
+      outcome: { kind: 'RUN_ACTIVE', exitCode: EXIT_CODES.RUN_UNAVAILABLE, runId: null, runDirectory: null, runStatus: null },
     });
     expect(run.exitCode).toBe(EXIT_CODES.RUN_UNAVAILABLE);
   });

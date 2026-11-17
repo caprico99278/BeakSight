@@ -1,0 +1,32 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8">
+    <title>Resource delivery after click with a send fixture</title>
+  </head>
+  <body>
+    <main>
+      <h1>Resource delivery after click with a send fixture</h1>
+      <!--
+        resource-delivery-after-click.html と同じボタン 1 つ（L10 の後の安全の側の設計の変更の確かめ）。クリックすると、画像（/resource-delivery.svg）を
+        読み（凍結の読み取りとして通る）、同じ押下で POST（/__mutation）も送ろうとする（書き込みは、今どおり凍結で止まり、サーバに届かない）。
+      -->
+      <button type="button" aria-expanded="false" aria-controls="toggle-panel">Toggle details</button>
+      <div id="toggle-panel" hidden>Expanded fixture content</div>
+    </main>
+    <script>
+      const toggle = document.querySelector('button');
+      const panel = document.querySelector('#toggle-panel');
+      toggle.addEventListener('click', () => {
+        const expanded = toggle.getAttribute('aria-expanded') !== 'true';
+        toggle.setAttribute('aria-expanded', String(expanded));
+        panel.hidden = !expanded;
+        const image = new Image();
+        image.alt = 'An image requested after the click';
+        image.src = '/resource-delivery.svg';
+        panel.append(image);
+        fetch('/__mutation', { method: 'POST', body: 'after-click' }).catch(() => undefined);
+      });
+    </script>
+  </body>
+</html>

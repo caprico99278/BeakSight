@@ -216,18 +216,18 @@ describe('performance evidence in a guarded Chromium lifecycle', () => {
     network.detach();
   });
 
-  it('reports a full Resource Timing buffer as PARTIAL instead of COMPLETE', async () => {
+  // L2（設計書 `2026-11-09-beaksight-remove-limits-design.md` 4、INV-LIMITS の表 A の N10）: ページのバッファが満杯になっても、observer で受けた
+  // 全部の項目を、期限なし（進みの見張り）で最後まで記録する。
+  it('L2: records every resource entry to the end even after the page Resource Timing buffer is full, without a deadline', async () => {
     const overflowCount = MAX_RESOURCE_TIMING_ENTRIES + 20;
     const { collector, network, fixturePage } = await openInstrumentedPage(`/many-stylesheets.html#${overflowCount}`);
 
-    const evidence = await collector.collect(fixturePage, await network.snapshot(), {
-      deadlineAtMs: Date.now() + 5_000,
-    });
+    const evidence = await collector.collect(fixturePage, await network.snapshot());
 
-    expect(evidence).toMatchObject({ status: 'PARTIAL', reason: 'RESOURCE_LIMIT_REACHED' });
-    expect(evidence.resourceCoverage?.bufferFull).toBe(true);
-    expect(evidence.resources.length).toBeLessThanOrEqual(MAX_RESOURCE_TIMING_ENTRIES);
-    expect(evidence.resourceSummaries).not.toBeNull();
+    expect(evidence.status, JSON.stringify(evidence.resourceCoverage)).toBe('COMPLETE');
+    expect(evidence.resourceCoverage).toMatchObject({ bufferFull: true, omittedEntryCount: 0 });
+    expect(evidence.resources.filter((resource) => resource.url.includes('/resource-item.css'))).toHaveLength(overflowCount);
+    expect(evidence.resourceSummaries?.stylesheet.count).toBe(overflowCount);
     network.detach();
   });
 

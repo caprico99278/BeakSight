@@ -26,7 +26,7 @@ const next = (extra: Record<string, unknown>): Record<string, unknown> => ({
 
 describe('OP-2: the write stages of the chained run in the IPC contract', () => {
   it('raises the protocol version to 4 for the new shape', () => {
-    expect(WORKER_PROTOCOL_VERSION).toBe('beaksight-worker-message/7'); // DEF-180: 前の読み込みの時刻で版 5。OP-H: チェックした画面の数で版 6。OP-L: 保存できなかった理由で版 7
+    expect(WORKER_PROTOCOL_VERSION).toBe('beaksight-worker-message/9'); // WSO: チェックした画面だけの段の並びと読む画面で版 9。DEF-200: ログインし直す段の指定（`RELOGIN_STAGE`）と、自動ログインの段の通した一覧（DEF-194）で版 8。 DEF-180: 前の読み込みの時刻で版 5。OP-H: チェックした画面の数で版 6。OP-L: 保存できなかった理由で版 7
   });
 
   it('lets NEXT_STAGE start a create or an update write stage with the write specification', () => {

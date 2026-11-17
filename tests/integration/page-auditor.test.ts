@@ -8,12 +8,12 @@ import type { Browser, BrowserContext, Page } from 'playwright';
 import { afterAll, afterEach, beforeAll, describe, expect, it } from 'vitest';
 import { wait } from '../../src/core/deadline.js';
 import { RuleEngine } from '../../src/audit/rule-engine.js';
-import type { AuditRule } from '../../src/audit/rule.js';
 import {
   BrowserContextFactory,
   ContextConstructionError,
   type InteractionGuardedSession,
 } from '../../src/browser/context-factory.js';
+import { OLD_HIDDEN_CRAWL_DEFAULTS } from '../../src/config/load-config.js';
 import type { AuditConfig, Viewport } from '../../src/config/types.js';
 import type {
   EvidenceRecord,
@@ -21,35 +21,31 @@ import type {
   EvidenceType,
   PageAuditOutcome,
   ViewportProfile,
+  PageLoadPhaseRecord,
+  ViewportRecheckRecord,
 } from '../../src/core/contracts.js';
 import type { NormalizedHttpUrlEvidence } from '../../src/core/evidence-types.js';
 import {
-  COLLECTOR_DEADLINE_MARGIN_MS,
   CONTEXT_CLOSE_TIMEOUT_MS,
-  MAX_ERROR_MESSAGE_LENGTH,
-  PAGE_SETTLING_PACING,
   SESSION_OPEN_TIMEOUT_MS,
-  STRESS_LAYOUT_MEASURE_RESERVE_MS,
 } from '../../src/core/limits.js';
 import { validateArtifact } from '../../src/core/schema-validator.js';
 import type { NavigationPacer } from '../../src/crawl/navigation-pacer.js';
 import { normalizeUrl } from '../../src/crawl/normalize-url.js';
 import { collectAccessibilityEvidence } from '../../src/evidence/accessibility-collector.js';
-import { collectLayoutEvidence, collectStressLayout } from '../../src/evidence/layout-collector.js';
+import { collectStressLayout } from '../../src/evidence/layout-collector.js';
+import { isOutsideRunAuditScope } from '../../src/orchestration/authenticated-run.js';
 import { IdAllocator } from '../../src/orchestration/id-allocator.js';
 import { PageAuditor, type PageAuditAttempt, type PageAuditorDependencies } from '../../src/orchestration/page-auditor.js';
-import {
-  PASSIVE_CONTEXT_CLOSE_DEADLINE_MESSAGE,
-  PassiveContextCloseDeadlineError,
-} from '../../src/orchestration/passive-session-close.js';
+import { PASSIVE_CONTEXT_CLOSE_DEADLINE_MESSAGE } from '../../src/orchestration/passive-session-close.js';
 import { chromiumNetErrorCode } from '../../src/orchestration/page-navigation.js';
-import { PassiveSessionOpenDeadlineError } from '../../src/orchestration/passive-session-open.js';
 import { isNetworkLayerFailure } from '../../src/safety/network-layer-failure.js';
 import { SafetyLedger } from '../../src/safety/safety-ledger.js';
 import { startFixtureServer, type FixtureServer, type FixtureServerOptions } from '../../fixtures/server.js';
 import { browserOpeningPageAfterNewContext } from '../helpers/browser-opening-page.js';
-import { BROWSER_DEFAULT_FAVICON_PATH, isCliChromiumSelected, testContextsOf, useHeadlessChromium } from '../helpers/chromium.js';
+import { testContextsOf, useHeadlessChromium } from '../helpers/chromium.js';
 import { createDeferred } from '../helpers/deferred.js';
+import { TEST_SHORT_AUDIT_OBSERVATION_WINDOWS } from '../helpers/test-waits.js';
 import { createTestNavigationPacer } from '../helpers/navigation-pacer.js';
 import { createTestConfig, TEST_FACTORY_OPTIONS, type TestConfigOverrides } from '../helpers/test-config.js';
 
@@ -72,10 +68,6 @@ const NO_STRESS_SWEEP: TestConfigOverrides = { viewports: { stressWidths: [] } }
 const BUSY_LOOP_PAGE = '/page-auditor-busy-loop.html';
 /** 利用者の操作なしに、GET・HEAD 以外のリクエストを送るページ（R14 の m4）。 */
 const NON_READ_REQUESTS_PAGE = '/page-auditor-non-read-requests.html';
-/** `/js-error.html` の文書でない要求の数（壊れた画像 1 つ。DEF-130-fix）。 */
-const BROKEN_IMAGE_SUBRESOURCE_REQUESTS = 1;
-/** DEF-150: 1 つのビューポートの読み込みあたり、ブラウザ自身が取りに行く favicon の要求の数の上限（CLI の Chromium だけが取りに行く）。 */
-const BROWSER_FAVICON_REQUESTS_PER_LOAD = 1;
 
 let browser: Browser;
 const servers: FixtureServer[] = [];
@@ -137,7 +129,16 @@ interface AuditFixtureOptions {
    * 必須の依存なので、省略した場合は、違反では止めないことを明示する `NEVER_STOP_FOR_SAFETY` を渡す。
    */
   readonly safetyViolationRecorded?: PageAuditorDependencies['safetyViolationRecorded'];
+  /** L0: Run の時間の上限の時刻（省略すると渡さない）。 */
+  readonly runDeadlineAtMs?: number;
+  /** L1: 進みの見張りの反応なしの長さ（省略すると `TEST_PROGRESS_QUIET_LIMIT_MS`）。 */
+  readonly progressWatchQuietLimitMs?: number;
 }
+
+/** L1: テストの進みの見張りの反応なしの長さ（ms。fixture の各段は、これより十分に短く終わる）。 */
+const TEST_PROGRESS_QUIET_LIMIT_MS = 5_000;
+/** RB-10: 応答のない読み込みの場面の、見張りの反応なしの長さ（ms）。 */
+const NO_RESPONSE_QUIET_LIMIT_MS = 1_500;
 
 /** 違反では止めないことを明示する、違反の確かめ（Page Auditor だけを確かめるテスト用。C18f）。 */
 const NEVER_STOP_FOR_SAFETY: PageAuditorDependencies['safetyViolationRecorded'] = () => false;
@@ -169,6 +170,13 @@ async function auditFixture(server: FixtureServer, pathname: string, options: Au
     ...(options.collectors === undefined ? {} : { collectors: options.collectors }),
     ...(options.deadlines === undefined ? {} : { deadlines: options.deadlines }),
     safetyViolationRecorded: options.safetyViolationRecorded ?? NEVER_STOP_FOR_SAFETY,
+    // SD-2: 製品の Run と同じく、点検の範囲（許可 Origin の外）へ移った画面は点検しない。
+    isOutsideAuditScope: (target: string) => isOutsideRunAuditScope(target, new Set(config.site.allowedOrigins), null),
+    ...(options.runDeadlineAtMs === undefined ? {} : { runDeadlineAtMs: options.runDeadlineAtMs }),
+    // L1: 進みの見張りの反応なしの長さ（テストでは短くする。製品は 3 分）。
+    progressWatchQuietLimitMs: options.progressWatchQuietLimitMs ?? TEST_PROGRESS_QUIET_LIMIT_MS,
+    // RB-10: 落ち着き・スクロール・知らせの枠の待ちを短くする（1 場面 5 秒以内）。
+    observationWindows: TEST_SHORT_AUDIT_OBSERVATION_WINDOWS,
   });
   const pageId = allocator.allocatePageId();
   const outcome = await auditor.audit(normalized(`${server.origin}${pathname}`, config), pageId);
@@ -186,6 +194,11 @@ function evidenceOf<TType extends EvidenceType>(
   return outcome.result.evidence.filter(
     (record): record is EvidenceRecordFor<TType> & EvidenceRecord => record.type === type && record.viewport === viewport,
   );
+}
+
+/** AUD-2e: 1 回目の layout の Evidence（確かめ直しの段 `recheck` で集め直した主の layout を除く。幅の走査の結果は 1 回目の Evidence だけが持つ）。 */
+function firstPassLayoutOf(outcome: PageAuditOutcome, viewport: ViewportProfile): EvidenceRecordFor<'layout'> | undefined {
+  return evidenceOf(outcome, 'layout', viewport).find((record) => record.capture?.phase !== 'recheck');
 }
 
 function evidenceTypesOf(outcome: PageAuditOutcome, viewport: ViewportProfile): EvidenceType[] {
@@ -218,16 +231,9 @@ describe('PageAuditor on a page with a broken image and console errors (Task 14 
     expect(result.status).toBe('AUDITED');
     expect(result.pageUrl).toBe(pageUrl);
     expect(result.incompleteReasons).toEqual([]);
-    // DEF-150: CLI の Chromium は、アイコンの指定のないページで、ブラウザ自身の `/favicon.ico`（`BROWSER_DEFAULT_FAVICON_PATH`）を取りに行き、Guard は
-    // それも文書でない要求に数える（製品の振る舞いは変えない。サーバには届かないことがある）。その分を、ブラウザの別に、1 つの読み込みあたりの上限まで
-    // 除いて数える。テストの既定の headless shell は取りに行かないので、今どおり 1 ちょうど。
-    const browserFaviconAllowance = isCliChromiumSelected() ? BROWSER_FAVICON_REQUESTS_PER_LOAD : 0;
+    // SPEC-1: 要求の数（DEF-129・T37R2-fix・DEF-130-fix）は成果物に書かない。
     for (const viewport of ['desktop', 'mobile'] as const) {
       const viewportResult = result.viewports[viewport];
-      const browserFaviconCounted = (viewportResult?.subresourceRequests ?? 0) - BROKEN_IMAGE_SUBRESOURCE_REQUESTS;
-      expect(browserFaviconCounted, `${viewport}: the ${BROWSER_DEFAULT_FAVICON_PATH} requests of the browser itself`).toBeGreaterThanOrEqual(0);
-      expect(browserFaviconCounted, `${viewport}: the ${BROWSER_DEFAULT_FAVICON_PATH} requests of the browser itself`)
-        .toBeLessThanOrEqual(browserFaviconAllowance);
       expect(viewportResult).toEqual({
         requestedUrl: pageUrl,
         finalUrl: pageUrl,
@@ -235,12 +241,24 @@ describe('PageAuditor on a page with a broken image and console errors (Task 14 
         status: 'AUDITED',
         incompleteReasons: [],
         navigationOutcome: 'OK',
-        // DEF-129: Guard が通した main frame の文書の要求の数（BeakSight 自身の読み込み 1 回だけ）。
-        documentRequests: 1,
-        // T37R2-fix: 子の frame の文書の要求の数（この画面に子の frame はない）。
-        childFrameDocumentRequests: 0,
-        // DEF-130-fix: 文書でない要求の数（この画面の壊れた画像 1 つ。DEF-150: ブラウザ自身の favicon の分は上で除いた）。
-        subresourceRequests: BROKEN_IMAGE_SUBRESOURCE_REQUESTS + browserFaviconCounted,
+        // AUD-2a: 状態 ID と、安定の判定の結果・通知の枠の扱い（この画面に通知の枠はない）。経過と観測の数は揺れるので、形だけを確かめる。
+        stateId: `${result.pageId}:${viewport}:1`,
+        settling: {
+          status: 'SETTLED',
+          reason: 'DOM_AND_HEIGHT_STABLE',
+          elapsedMs: expect.any(Number) as unknown as number,
+          observationCount: expect.any(Number) as unknown as number,
+          lastScrollHeight: expect.any(Number) as unknown as number,
+          watchEnd: null,
+          // AUD-2b: 読み込みの段の移り変わり（最初は DOM の準備、最後は落ち着いた）。
+          loadPhases: expect.arrayContaining([
+            expect.objectContaining({ phase: 'AFTER_DOM_CONTENT_LOADED' }),
+            expect.objectContaining({ phase: 'SETTLED' }),
+          ]) as unknown as readonly PageLoadPhaseRecord[],
+        },
+        notificationHandling: { dismissedCount: 0, hiddenCount: 0, digests: [] },
+        // AUD-2d: 落ち着いた後の確かめ直しの表（中身は `page-auditor-recheck.test.ts` で確かめる。ここでは確かめ直したことだけ）。
+        recheck: expect.objectContaining({ status: 'RECHECKED', stateId: `${result.pageId}:${viewport}:1` }) as unknown as ViewportRecheckRecord,
       });
     }
     // Desktop の Evidence が先に採番され、その後に Mobile の Evidence が採番される。
@@ -248,16 +266,22 @@ describe('PageAuditor on a page with a broken image and console errors (Task 14 
     expect(viewportsInOrder.indexOf('mobile')).toBeGreaterThan(viewportsInOrder.lastIndexOf('desktop'));
   });
 
-  it('collects every Passive Evidence type before the rules, and Links only on Desktop', () => {
+  it('collects every Passive Evidence type before the rules, and Links on every viewport', () => {
     const { outcome } = run;
+    // AUD-4d: フォーカスの確かめ（`focus`）も、どのビューポートにもある（ほかの証拠を集め終えた後に読む）。
+    // N5: リンクは、どのビューポートでも集める（Mobile にだけあるリンクも辿る）。
     const passiveTypes: EvidenceType[] = [
-      'accessibility', 'color', 'console', 'dom', 'layout', 'network', 'performance', 'safety', 'screenshot', 'scroll',
+      'accessibility', 'console', 'dom','focus', 'layout', 'link', 'network', 'performance', 'safety', 'screenshot', 'scroll',
     ];
-    expect(evidenceTypesOf(outcome, 'desktop')).toEqual([...passiveTypes, 'link'].sort());
-    expect(evidenceTypesOf(outcome, 'mobile')).toEqual(passiveTypes.sort());
+    expect(evidenceTypesOf(outcome, 'desktop')).toEqual([...passiveTypes].sort());
+    expect(evidenceTypesOf(outcome, 'mobile')).toEqual([...passiveTypes].sort());
     expect(outcome.result.evidence.every((record) => record.pageId === outcome.result.pageId)).toBe(true);
     for (const viewport of ['desktop', 'mobile'] as const) {
-      expect(evidenceOf(outcome, 'screenshot', viewport).map((record) => record.payload.captureType)).toEqual([
+      // AUD-3d: 幅の走査の幅の画像（`stressWidth` を持つ）と、確かめ直しの段の画像（段 `recheck`）は除き、主の画像を見る（下の 'writes the screenshot files' で
+      // 数える）。
+      expect(evidenceOf(outcome, 'screenshot', viewport)
+        .filter((record) => record.payload.stressWidth === undefined && record.capture?.phase !== 'recheck')
+        .map((record) => record.payload.captureType)).toEqual([
         'VIEWPORT',
         'FULL_PAGE',
       ]);
@@ -299,7 +323,15 @@ describe('PageAuditor on a page with a broken image and console errors (Task 14 
 
   it('writes the screenshot files that the screenshot Evidence points to', async () => {
     const screenshots = run.outcome.result.evidence.filter((record) => record.type === 'screenshot');
-    expect(screenshots).toHaveLength(4);
+    // 主の画像 4 枚（2 つのビューポート × viewport・全体）と、AUD-3d: 幅の走査の幅ごとの viewport の画像（Desktop だけ。走査した幅の数）と、確かめ直しの段の
+    // viewport の画像（ビューポートごとに 1 枚）。
+    const layout = evidenceOf(run.outcome, 'layout', 'desktop').find((record) => record.capture?.phase !== 'recheck');
+    const sweptWidths = (layout?.payload.stressSweep ?? []).filter((result) => result.layout !== null).map((result) => result.width);
+    expect(sweptWidths.length).toBeGreaterThan(0);
+    expect(screenshots).toHaveLength(4 + sweptWidths.length + 2);
+    expect(screenshots.filter((record) => record.capture?.phase === 'recheck').map((record) => record.viewport)).toEqual(['desktop', 'mobile']);
+    expect(screenshots.flatMap((record) => (record.type === 'screenshot' && record.payload.stressWidth !== undefined ? [record.payload.stressWidth] : [])))
+      .toEqual(sweptWidths);
     for (const record of screenshots) {
       if (record.type !== 'screenshot') continue;
       await expect(access(join(run.screenshotRootDirectory, ...record.payload.relativePath.split('/')))).resolves
@@ -309,8 +341,8 @@ describe('PageAuditor on a page with a broken image and console errors (Task 14 
 
   it('sweeps the stress widths once on Desktop, without the two primary viewport widths (4.5.6)', () => {
     const { outcome, config } = run;
-    const [desktopLayout] = evidenceOf(outcome, 'layout', 'desktop');
-    const [mobileLayout] = evidenceOf(outcome, 'layout', 'mobile');
+    const desktopLayout = firstPassLayoutOf(outcome, 'desktop');
+    const mobileLayout = firstPassLayoutOf(outcome, 'mobile');
     const primaryWidths = [config.viewports.primaryDesktop.width, config.viewports.primaryMobile.width];
     const expectedWidths = config.viewports.stressWidths.filter((width) => !primaryWidths.includes(width));
 
@@ -323,14 +355,15 @@ describe('PageAuditor on a page with a broken image and console errors (Task 14 
 
   it('records one PASSIVE safety Evidence per Ledger (the Passive Context and each stress sweep session)', () => {
     const { outcome } = run;
-    const sweptWidthCount = evidenceOf(outcome, 'layout', 'desktop')[0]?.payload.stressSweep?.length ?? 0;
+    const sweptWidthCount = firstPassLayoutOf(outcome, 'desktop')?.payload.stressSweep?.length ?? 0;
     const desktopSafety = evidenceOf(outcome, 'safety', 'desktop');
     const mobileSafety = evidenceOf(outcome, 'safety', 'mobile');
 
     expect(desktopSafety).toHaveLength(1 + sweptWidthCount);
     expect(mobileSafety).toHaveLength(1);
     expect([...desktopSafety, ...mobileSafety].every((record) => record.payload.scope === 'PASSIVE')).toBe(true);
-    expect(outcome.safety).toEqual({ invariantViolationCount: 0, invariantViolations: [], recordTruncated: false });
+    // 違反がなく、違反にしない止めた記録（SAFE-2 の 4）もない（確かめたい欄だけを見る）。
+    expect(outcome.safety).toMatchObject({ invariantViolationCount: 0, invariantViolations: [], frameClassificationFailureCount: 0, readNavigationFailureCount: 0 });
   });
 
   it('returns a deeply frozen outcome that matches the page schema', async () => {
@@ -369,6 +402,25 @@ describe('PageAuditor Desktop and Mobile independence (Task 14 Step 3)', () => {
   }, AUDIT_TEST_TIMEOUT_MS);
 });
 
+describe('PageAuditor on a page whose main container scrolls by itself (DEF-207)', () => {
+  it('traverses the inner container, keeps the page AUDITED, and collects the content drawn late at its bottom', async () => {
+    const server = await startServer();
+    const { outcome } = await auditFixture(server, '/inner-scroll-late-heading.html', { overrides: NO_STRESS_SWEEP });
+    const { result } = outcome;
+
+    expect(result.incompleteReasons).toEqual([]);
+    expect(result.status).toBe('AUDITED');
+    for (const viewport of ['desktop', 'mobile'] as const) {
+      expect(result.viewports[viewport].status).toBe('AUDITED');
+      const [scroll] = evidenceOf(outcome, 'scroll', viewport);
+      expect(scroll?.payload).toMatchObject({ status: 'COMPLETE', restoration: { status: 'RESTORED' } });
+      const [dom] = evidenceOf(outcome, 'dom', viewport);
+      expect(dom?.payload.headings.map((heading) => heading.text)).toContain('Late inner heading');
+    }
+    await expect(validateArtifact('page', JSON.parse(JSON.stringify(result)) as unknown)).resolves.toEqual({ ok: true });
+  }, AUDIT_TEST_TIMEOUT_MS);
+});
+
 describe('PageAuditor navigation failures (4.3.0, 4.5.4)', () => {
   // SU2a（サイトが応答しないときに Run を止める設計書 3.1）: `/__slow` は、遅らせる間、ヘッダを返さない。応答のない時間切れはサイトの
   // 不調なので、Desktop は理由 `SITE_UNAVAILABLE` を加えた FAILED にし、Mobile は始めない（SKIPPED）。両方のビューポートが FAILED に
@@ -378,6 +430,8 @@ describe('PageAuditor navigation failures (4.3.0, 4.5.4)', () => {
     const server = await startServer({ slowResponseDelayMs: SLOW_RESPONSE_DELAY_MS });
     const { outcome, remainingContextCount } = await auditFixture(server, '/__slow', {
       overrides: { ...NO_STRESS_SWEEP, crawl: { navigationTimeoutMs: SHORT_NAVIGATION_TIMEOUT_MS } },
+      // RB-10: 応答のない読み込みを見放すまでの反応なしの長さを短くする（1 場面 5 秒以内）。
+      progressWatchQuietLimitMs: NO_RESPONSE_QUIET_LIMIT_MS,
     });
     const { result } = outcome;
 
@@ -386,7 +440,10 @@ describe('PageAuditor navigation failures (4.3.0, 4.5.4)', () => {
       status: 'FAILED',
       navigationOutcome: 'TIMEOUT',
       httpStatus: null,
+      // L1: 期待を直した。読み込みの期限（`navigationTimeoutMs`）は撤廃し、進みの見張りが応答のない読み込みを見放す（理由 `STAGE_UNRESPONSIVE` を先に残す）。
+      // 見放した読み込みは、前と同じ時間切れの観測で、サイトの不調を判定する。
       incompleteReasons: [
+        { code: 'STAGE_UNRESPONSIVE', detail: 'navigation' },
         { code: 'NAVIGATION_FAILED', detail: 'TIMEOUT' },
         { code: 'SITE_UNAVAILABLE', detail: 'passive:TIMEOUT' },
       ],
@@ -396,7 +453,7 @@ describe('PageAuditor navigation failures (4.3.0, 4.5.4)', () => {
     expect(evidenceOf(outcome, 'console', 'desktop')).toHaveLength(1);
     expect(evidenceOf(outcome, 'safety', 'desktop')).toHaveLength(1);
     // ナビゲーションが失敗したので、以降の収集はしない。
-    for (const type of ['scroll', 'dom', 'layout', 'color', 'accessibility', 'performance', 'screenshot', 'link'] as const) {
+    for (const type of ['scroll', 'dom', 'layout', 'accessibility', 'performance', 'screenshot', 'link'] as const) {
       expect(evidenceOf(outcome, type, 'desktop'), `desktop ${type}`).toHaveLength(0);
     }
     // Mobile は始めない（理由 `SITE_UNAVAILABLE`、`detail` は `null` の SKIPPED。Evidence はない）。
@@ -410,7 +467,7 @@ describe('PageAuditor navigation failures (4.3.0, 4.5.4)', () => {
     await expect(validateArtifact('page', JSON.parse(JSON.stringify(result)) as unknown)).resolves.toEqual({ ok: true });
   }, AUDIT_TEST_TIMEOUT_MS);
 
-  it('marks both viewports FAILED on a blocked external redirect and records the network and safety Evidence', async () => {
+  it('marks both viewports FAILED on an external redirect (not audited) and records the network Evidence', async () => {
     const external = await startServer();
     const primary = await startServer({ externalRedirectUrl: `${external.origin}/index.html` });
     const { outcome, remainingContextCount } = await auditFixture(primary, '/__external-redirect', {
@@ -418,8 +475,8 @@ describe('PageAuditor navigation failures (4.3.0, 4.5.4)', () => {
     });
     const { result } = outcome;
 
+    // SD-2: Guard は main frame の移動を止めない（外へ届く）。移った画面は点検しない（`BLOCKED_EXTERNAL_REDIRECT`）。
     expect(result.status).toBe('FAILED');
-    expect(external.getCounters().get).toBe(0);
     for (const viewport of ['desktop', 'mobile'] as const) {
       expect(result.viewports[viewport]).toMatchObject({
         status: 'FAILED',
@@ -428,10 +485,7 @@ describe('PageAuditor navigation failures (4.3.0, 4.5.4)', () => {
       });
       const [network] = evidenceOf(outcome, 'network', viewport);
       expect(network?.payload.requests.some((request) => request.url === `${primary.origin}/__external-redirect`)).toBe(true);
-      const [safety] = evidenceOf(outcome, 'safety', viewport);
-      expect(safety?.payload.blockedNavigations).toMatchObject([{ url: `${external.origin}/index.html` }]);
-      expect(result.findings.some((finding) =>
-        finding.ruleId === 'SAFETY_EXTERNAL_NAVIGATION_BLOCKED' && finding.viewport === viewport)).toBe(true);
+      expect(evidenceOf(outcome, 'dom', viewport)).toHaveLength(0);
     }
     expect(outcome.safety.invariantViolationCount).toBe(0);
     expect(remainingContextCount).toBe(0);
@@ -487,87 +541,38 @@ describe('PageAuditor navigation failures (4.3.0, 4.5.4)', () => {
   }, AUDIT_TEST_TIMEOUT_MS);
 });
 
+// RB-10: collector の例外・PARTIAL・設定で外した段は、偽の口の単体（`tests/unit/page-auditor-steps.test.ts`）へ移した。
 describe('PageAuditor collector failures (4.5.5)', () => {
-  it('records COLLECTOR_INCOMPLETE with <stage>:<reason> when a collector throws, and closes the Context', async () => {
-    const server = await startServer();
-    let calls = 0;
-    const { outcome, remainingContextCount } = await auditFixture(server, '/index.html', {
-      overrides: NO_STRESS_SWEEP,
-      collectors: {
-        collectDomEvidence: async () => {
-          calls += 1;
-          throw new Error('injected DOM collector failure');
-        },
-      },
-    });
-    const { result } = outcome;
-
-    expect(calls).toBe(2);
-    expect(result.status).toBe('PARTIAL');
-    for (const viewport of ['desktop', 'mobile'] as const) {
-      expect(result.viewports[viewport]).toMatchObject({
-        status: 'PARTIAL',
-        navigationOutcome: 'OK',
-        incompleteReasons: [{ code: 'COLLECTOR_INCOMPLETE', detail: 'dom:EVALUATION_FAILED' }],
-      });
-      // 例外を投げた段階の Evidence はなく、ほかの段階の Evidence は記録される。
-      expect(evidenceOf(outcome, 'dom', viewport)).toHaveLength(0);
-      expect(evidenceOf(outcome, 'layout', viewport)).toHaveLength(1);
-      expect(evidenceOf(outcome, 'network', viewport)).toHaveLength(1);
-    }
-    expect(result.incompleteReasons).toEqual([{ code: 'COLLECTOR_INCOMPLETE', detail: 'dom:EVALUATION_FAILED' }]);
-    expect(remainingContextCount).toBe(0);
-    await expect(validateArtifact('page', JSON.parse(JSON.stringify(result)) as unknown)).resolves.toEqual({ ok: true });
-  }, AUDIT_TEST_TIMEOUT_MS);
-
-  it('records COLLECTOR_INCOMPLETE and keeps the Evidence when a collector returns PARTIAL', async () => {
-    const server = await startServer();
-    const { outcome } = await auditFixture(server, '/index.html', {
-      overrides: NO_STRESS_SWEEP,
-      collectors: {
-        collectLayoutEvidence: async (...args: Parameters<typeof collectLayoutEvidence>) => {
-          const collected = await collectLayoutEvidence(...args);
-          return Object.freeze({ status: 'PARTIAL', reason: 'LAYOUT_COMPARISON_LIMIT_REACHED', layout: collected.layout });
-        },
-      },
-    });
-
-    for (const viewport of ['desktop', 'mobile'] as const) {
-      expect(outcome.result.viewports[viewport]).toMatchObject({
-        status: 'PARTIAL',
-        incompleteReasons: [{ code: 'COLLECTOR_INCOMPLETE', detail: 'layout:LAYOUT_COMPARISON_LIMIT_REACHED' }],
-      });
-      expect(evidenceOf(outcome, 'layout', viewport)[0]?.payload.primary).toMatchObject({
-        status: 'PARTIAL',
-        reason: 'LAYOUT_COMPARISON_LIMIT_REACHED',
-      });
-    }
-  }, AUDIT_TEST_TIMEOUT_MS);
-
   it('removes the partially written screenshot file when the screenshot stage fails', async () => {
     const server = await startServer();
     const writtenPaths: string[] = [];
     const { outcome, screenshotRootDirectory } = await auditFixture(server, '/index.html', {
       overrides: NO_STRESS_SWEEP,
       collectors: {
-        captureScreenshots: async (page, paths) => {
-          await page.screenshot({ path: paths.viewportCapture.outputPath, type: 'png' });
-          writtenPaths.push(paths.viewportCapture.outputPath);
-          throw new Error('injected full-page screenshot failure');
+        // AUD-2c: 撮る画像（`parts`）の書き先に、途中まで書いてから失敗する。
+        captureScreenshots: async (page, paths, options) => {
+          const outputPath = options?.parts === 'FULL_PAGE' ? paths.fullPageCapture.outputPath : paths.viewportCapture.outputPath;
+          await page.screenshot({ path: outputPath, type: 'png' });
+          writtenPaths.push(outputPath);
+          throw new Error('injected screenshot failure');
         },
       },
     });
 
-    expect(writtenPaths).toHaveLength(2);
+    // AUD-2c: viewport の画像と全体の画像を別の回に撮るので、失敗させる collector は、ビューポートごとに 2 回呼ばれる（どちらの回の書きかけも消す）。
+    expect(writtenPaths).toHaveLength(4);
     for (const path of writtenPaths) {
       expect(path.startsWith(screenshotRootDirectory)).toBe(true);
       await expect(access(path)).rejects.toThrow();
     }
     for (const viewport of ['desktop', 'mobile'] as const) {
+      // AUD-2c: viewport の画像の回と全体の画像の回が、それぞれ失敗を記録する。
       expect(outcome.result.viewports[viewport].incompleteReasons).toEqual([
         { code: 'COLLECTOR_INCOMPLETE', detail: 'screenshot:EVALUATION_FAILED' },
+        { code: 'COLLECTOR_INCOMPLETE', detail: 'screenshot:EVALUATION_FAILED' },
       ]);
-      expect(evidenceOf(outcome, 'screenshot', viewport)).toHaveLength(0);
+      // 失敗させた段の画像は残らない（AUD-3d の続き: 確かめ直しの段の画像は、別の部品で撮るので残る）。
+      expect(evidenceOf(outcome, 'screenshot', viewport).filter((record) => record.capture?.phase !== 'recheck')).toHaveLength(0);
     }
   }, AUDIT_TEST_TIMEOUT_MS);
 
@@ -575,12 +580,16 @@ describe('PageAuditor collector failures (4.5.5)', () => {
     const server = await startServer();
     let crashRequests = 0;
     const startedAtMs = Date.now();
+    // RB-10: crash の事象の代表として、Desktop だけを落とす（Mobile は本物の collector で集め、crash が次のビューポートに及ばないことを見る）。
     const { outcome, remainingContextCount } = await auditFixture(server, '/index.html', {
-      overrides: NO_STRESS_SWEEP,
+      overrides: { ...NO_STRESS_SWEEP, audit: { interactions: false, performance: false } },
       collectors: {
         // 描画プロセスを落とし、そのまま終わらない collector（crash した page への操作が終わらない場合を再現する）。
-        collectColorEvidence: async (page) => {
+        collectAccessibilityEvidence: async (page, options) => {
           crashRequests += 1;
+          if (crashRequests > 1) {
+            return collectAccessibilityEvidence(page, options);
+          }
           const session = await page.context().newCDPSession(page);
           void session.send('Page.crash').catch(() => undefined);
           return new Promise<never>(() => undefined);
@@ -588,101 +597,31 @@ describe('PageAuditor collector failures (4.5.5)', () => {
       },
     });
 
-    expect(crashRequests).toBe(2);
+    // Desktop の crash の 1 回と、Mobile の 1 回目の axe と落ち着いた後の確かめ直しの axe。
+    expect(crashRequests).toBe(3);
     expect(outcome.result.status).toBe('FAILED');
-    for (const viewport of ['desktop', 'mobile'] as const) {
+    expect(outcome.result.viewports.mobile.status).not.toBe('FAILED');
+    for (const viewport of ['desktop'] as const) {
       expect(outcome.result.viewports[viewport]).toMatchObject({ status: 'FAILED', navigationOutcome: 'OK' });
       // crash した段階を1回だけ、`<段階>:PAGE_CRASHED` として記録し（設計書 4.5.4）、それより後の段階（accessibility など）は実行しない。
       expect(outcome.result.viewports[viewport].incompleteReasons.filter((reason) => reason.code === 'COLLECTOR_INCOMPLETE'))
-        .toEqual([{ code: 'COLLECTOR_INCOMPLETE', detail: 'color:PAGE_CRASHED' }]);
-      for (const type of ['color', 'accessibility', 'performance', 'screenshot', 'link'] as const) {
+        .toEqual([{ code: 'COLLECTOR_INCOMPLETE', detail: 'accessibility:PAGE_CRASHED' }]);
+      for (const type of ['accessibility', 'performance', 'link'] as const) {
         expect(evidenceOf(outcome, type, viewport), `${viewport} ${type}`).toHaveLength(0);
       }
+      // AUD-2c: viewport の画像は、axe の段（crash させた段）の前に撮るので残る。全体の画像は、crash の後なので撮らない。
+      expect(evidenceOf(outcome, 'screenshot', viewport).map((shot) => shot.payload.captureType)).toEqual(['VIEWPORT']);
       expect(evidenceOf(outcome, 'network', viewport)).toHaveLength(1);
       expect(evidenceOf(outcome, 'console', viewport)).toHaveLength(1);
     }
     // ページの期限（overallPageTimeoutMs）まで待たずに終わる。
-    expect(Date.now() - startedAtMs).toBeLessThan(createTestConfig(server.origin).crawl.overallPageTimeoutMs);
+    // L14: ページの期限の既定は外した（前の既定の値と比べる）。
+    expect(Date.now() - startedAtMs).toBeLessThan(OLD_HIDDEN_CRAWL_DEFAULTS.overallPageTimeoutMs);
     expect(remainingContextCount).toBe(0);
     await expect(validateArtifact('page', JSON.parse(JSON.stringify(outcome.result)) as unknown))
       .resolves.toEqual({ ok: true });
   }, AUDIT_TEST_TIMEOUT_MS);
 
-  it('does not run the stages that the settings disable, and does not give them reasons', async () => {
-    const server = await startServer();
-    const { outcome } = await auditFixture(server, '/index.html', {
-      overrides: {
-        ...NO_STRESS_SWEEP,
-        audit: { performance: false, accessibility: false, screenshots: false, interactions: false },
-      },
-    });
-
-    expect(outcome.result.status).toBe('AUDITED');
-    for (const viewport of ['desktop', 'mobile'] as const) {
-      expect(outcome.result.viewports[viewport]).toMatchObject({ status: 'AUDITED', incompleteReasons: [] });
-      for (const type of ['performance', 'accessibility', 'screenshot'] as const) {
-        expect(evidenceOf(outcome, type, viewport), `${viewport} ${type}`).toHaveLength(0);
-      }
-      expect(evidenceOf(outcome, 'dom', viewport)).toHaveLength(1);
-    }
-  }, AUDIT_TEST_TIMEOUT_MS);
-});
-
-describe('PageAuditor rule evaluation and cleanup failures', () => {
-  it('marks the viewport PARTIAL with RULE_EVALUATION_FAILED when a page rule fails', async () => {
-    const server = await startServer();
-    const failingRule: AuditRule = {
-      ruleId: 'TEST_FAILING_RULE',
-      version: 1,
-      category: 'DOM',
-      severity: 'WARN',
-      plainMessage: 'テストの指摘です。',
-      evaluate: () => {
-        throw new Error('injected rule failure');
-      },
-    };
-    const sequences: number[] = [];
-    const { outcome, allocator } = await auditFixture(server, '/index.html', {
-      overrides: NO_STRESS_SWEEP,
-      createRuleEngine: (firstFindingSequence) => {
-        sequences.push(firstFindingSequence);
-        return new RuleEngine({ targetId: 'test-target', firstFindingSequence, catalog: [failingRule] });
-      },
-    });
-
-    // 評価のたびに、採番器の連番から新しい RuleEngine を作る。
-    expect(sequences).toEqual([1, 1]);
-    expect(allocator.nextFindingSequence).toBe(1);
-    for (const viewport of ['desktop', 'mobile'] as const) {
-      expect(outcome.result.viewports[viewport]).toMatchObject({
-        status: 'PARTIAL',
-        incompleteReasons: [{ code: 'RULE_EVALUATION_FAILED', detail: 'TEST_FAILING_RULE:injected rule failure' }],
-      });
-    }
-    expect(outcome.result.status).toBe('PARTIAL');
-  }, AUDIT_TEST_TIMEOUT_MS);
-
-  it('does not hide a failure to close the Passive Context', async () => {
-    const server = await startServer();
-    class FailingCloseFactory extends BrowserContextFactory {
-      override async closePassiveContext(context: BrowserContext): Promise<void> {
-        await super.closePassiveContext(context);
-        throw new Error('injected Context close failure');
-      }
-    }
-    const { outcome, remainingContextCount } = await auditFixture(server, '/index.html', {
-      overrides: NO_STRESS_SWEEP,
-      createFactory: (config) => new FailingCloseFactory(browser, config, () => new SafetyLedger()),
-    });
-
-    expect(remainingContextCount).toBe(0);
-    for (const viewport of ['desktop', 'mobile'] as const) {
-      expect(outcome.result.viewports[viewport].status).toBe('PARTIAL');
-      expect(outcome.result.viewports[viewport].incompleteReasons).toEqual([
-        { code: 'UNHANDLED_FAILURE', detail: 'passive-context-close:injected Context close failure' },
-      ]);
-    }
-  }, AUDIT_TEST_TIMEOUT_MS);
 });
 
 // DEF-007: 再試行を区別する情報の形が不正なら、監査を始めずに TypeError を投げる。
@@ -818,67 +757,8 @@ describe('PageAuditor session open and close deadlines (DEF-008)', () => {
     }
   }
 
-  it('marks both viewports FAILED with DEADLINE_EXCEEDED when the Passive Context is not created before the deadline', async () => {
-    const server = await startServer();
-    let contextCalls = 0;
-    const startedAt = performance.now();
-    const { outcome, remainingContextCount } = await auditFixture(server, '/index.html', {
-      overrides: NO_STRESS_SWEEP,
-      createFactory: (config) => new (class extends BrowserContextFactory {
-        override async createPassiveContext(): Promise<BrowserContext> {
-          contextCalls += 1;
-          return new Promise<never>(() => undefined);
-        }
-      })(browser, config, () => new SafetyLedger(), TEST_FACTORY_OPTIONS),
-      deadlines: { sessionOpenTimeoutMs: SHORT_OPEN_DEADLINE_MS },
-    });
-    const elapsedMs = performance.now() - startedAt;
-
-    expect(contextCalls).toBe(2);
-    expect(elapsedMs).toBeLessThan(SESSION_OPEN_TIMEOUT_MS);
-    expect(outcome.result.status).toBe('FAILED');
-    for (const viewport of ['desktop', 'mobile'] as const) {
-      expect(outcome.result.viewports[viewport]).toMatchObject({
-        status: 'FAILED',
-        navigationOutcome: null,
-        incompleteReasons: [{ code: 'DEADLINE_EXCEEDED', detail: 'passive-context' }],
-      });
-      // Context がないので、Ledger も Evidence もない。
-      expect(outcome.result.evidence.filter((record) => record.viewport === viewport)).toEqual([]);
-    }
-    expect(outcome.safety.invariantViolationCount).toBe(0);
-    expect(server.getRequestObservations()).toEqual([]);
-    expect(remainingContextCount).toBe(0);
-    await expect(validateArtifact('page', JSON.parse(JSON.stringify(outcome.result)) as unknown))
-      .resolves.toEqual({ ok: true });
-  }, DEADLINE_AUDIT_TEST_TIMEOUT_MS);
-
-  it('closes a Passive Context that arrives after the open deadline', async () => {
-    const server = await startServer();
-    const gate = createDeferred<undefined>();
-    let lateContexts = 0;
-    const { outcome } = await auditFixture(server, '/index.html', {
-      overrides: NO_STRESS_SWEEP,
-      createFactory: (config) => new (class extends BrowserContextFactory {
-        override async createPassiveContext(viewport: Viewport): Promise<BrowserContext> {
-          await gate.promise;
-          const context = await super.createPassiveContext(viewport);
-          lateContexts += 1;
-          return context;
-        }
-      })(browser, config, () => new SafetyLedger(), TEST_FACTORY_OPTIONS),
-      deadlines: { sessionOpenTimeoutMs: SHORT_OPEN_DEADLINE_MS },
-    });
-    expect(outcome.result.viewports.desktop.incompleteReasons)
-      .toEqual([{ code: 'DEADLINE_EXCEEDED', detail: 'passive-context' }]);
-
-    // audit() が戻った後に Context が届く。部品が、待たずに閉じる。
-    gate.resolve(undefined);
-    await expect.poll(() => lateContexts, { timeout: LATE_RELEASE_TIMEOUT_MS }).toBe(2);
-    await expect.poll(() => testContextsOf(browser).length, { timeout: LATE_RELEASE_TIMEOUT_MS }).toBe(0);
-    expect(server.getRequestObservations()).toEqual([]);
-  }, DEADLINE_AUDIT_TEST_TIMEOUT_MS);
-
+  // RB-10: 作成の期限切れの代表は下の 1 本（Context はでき page ができない。口が Ledger を渡すことも確かめる）。Context ができない期限切れと、遅れて届いた
+  // Context を閉じることは、`tests/unit/passive-session-open.test.ts` と偽の口の単体（`page-auditor-steps.test.ts`）が受け持つ。
   it('marks both viewports FAILED and closes the Context when the Passive page is not created before the deadline', async () => {
     const server = await startServer();
     let pageCalls = 0;
@@ -962,186 +842,8 @@ describe('PageAuditor session open and close deadlines (DEF-008)', () => {
     }
   }, DEADLINE_AUDIT_TEST_TIMEOUT_MS);
 
-  it('bounds the stress sweep session open by the page deadline (notAfterMs)', async () => {
-    const server = await startServer();
-    /** ページの期限。Passive の段階が早く終わるページで、幅の走査の段階に余裕をもって届く長さにする。 */
-    const pageTimeoutMs = 4_000;
-    let contextCalls = 0;
-    const sweep: { deadlineAtMs?: number | undefined; rejectedAt?: number; error?: unknown } = {};
-    const { outcome } = await auditFixture(server, '/index.html', {
-      overrides: {
-        viewports: { stressWidths: [320] },
-        crawl: { overallPageTimeoutMs: pageTimeoutMs },
-        audit: { interactions: false, screenshots: false, performance: false, accessibility: false },
-      },
-      // 2回目の Context（Desktop の幅の走査のセッション）だけ、作成が戻らない。
-      createFactory: (config) => new (class extends BrowserContextFactory {
-        override async createPassiveContext(viewport: Viewport): Promise<BrowserContext> {
-          contextCalls += 1;
-          if (contextCalls === 2) {
-            return new Promise<never>(() => undefined);
-          }
-          return super.createPassiveContext(viewport);
-        }
-      })(browser, config, () => new SafetyLedger(), TEST_FACTORY_OPTIONS),
-      // 作成の期限そのものは長くして、ページの期限で見切ることを確かめる。
-      deadlines: { sessionOpenTimeoutMs: AUDIT_TEST_TIMEOUT_MS },
-      collectors: {
-        collectStressLayout: async (createSession, _url, widths, options) => {
-          sweep.deadlineAtMs = options?.deadlineAtMs;
-          try {
-            await createSession({ width: widths[0] ?? 320, height: 800 });
-          } catch (error) {
-            sweep.rejectedAt = Date.now();
-            sweep.error = error;
-            throw error;
-          }
-          throw new Error('the stress sweep session must not open');
-        },
-      },
-    });
-
-    expect(sweep.error).toBeInstanceOf(PassiveSessionOpenDeadlineError);
-    expect(sweep.deadlineAtMs).toBeDefined();
-    // 幅の走査の期限（ページの期限の範囲の中）で見切る。
-    expect(sweep.rejectedAt ?? Number.NaN).toBeGreaterThanOrEqual((sweep.deadlineAtMs ?? Number.NaN) - TIMER_TOLERANCE_MS);
-    expect(sweep.rejectedAt ?? Number.NaN).toBeLessThan((sweep.deadlineAtMs ?? Number.NaN) + COLLECTOR_DEADLINE_MARGIN_MS);
-    expect(outcome.result.viewports.desktop.incompleteReasons)
-      .toContainEqual({ code: 'COLLECTOR_INCOMPLETE', detail: 'stress-layout:EVALUATION_FAILED' });
-  }, DEADLINE_AUDIT_TEST_TIMEOUT_MS);
-
-  // RP18r の Minor-2: 幅の走査のセッションを閉じる処理の期限切れを、段階の理由の detail から読み取れるようにする
-  // （コードは `COLLECTOR_INCOMPLETE` のまま。detail は `stress-layout:CLOSE_DEADLINE_EXCEEDED`）。
-  it('records stress-layout:CLOSE_DEADLINE_EXCEEDED when closing a stress sweep session Context does not finish', async () => {
-    const server = await startServer();
-    let contextCalls = 0;
-    let stressContext: BrowserContext | undefined;
-    const { outcome, remainingContextCount } = await auditFixture(server, '/index.html', {
-      overrides: {
-        viewports: { stressWidths: [320] },
-        audit: { interactions: false, screenshots: false, performance: false, accessibility: false },
-      },
-      // 2回目の Context（Desktop の幅の走査のセッション）だけ、閉じる処理が戻らない（Context は閉じる）。
-      createFactory: (config) => new (class extends BrowserContextFactory {
-        override async createPassiveContext(viewport: Viewport): Promise<BrowserContext> {
-          contextCalls += 1;
-          const context = await super.createPassiveContext(viewport);
-          if (contextCalls === 2) {
-            stressContext = context;
-          }
-          return context;
-        }
-
-        override async closePassiveContext(context: BrowserContext): Promise<void> {
-          await super.closePassiveContext(context);
-          if (context === stressContext) {
-            await new Promise<never>(() => undefined);
-          }
-        }
-      })(browser, config, () => new SafetyLedger(), TEST_FACTORY_OPTIONS),
-      deadlines: { contextCloseTimeoutMs: SHORT_CLOSE_DEADLINE_MS },
-    });
-
-    expect(stressContext).toBeDefined();
-    expect(remainingContextCount).toBe(0);
-    const reasons = outcome.result.viewports.desktop.incompleteReasons;
-    expect(reasons).toContainEqual({ code: 'COLLECTOR_INCOMPLETE', detail: 'stress-layout:CLOSE_DEADLINE_EXCEEDED' });
-    expect(reasons).not.toContainEqual({ code: 'COLLECTOR_INCOMPLETE', detail: 'stress-layout:EVALUATION_FAILED' });
-    expect(outcome.result.viewports.desktop.status).toBe('PARTIAL');
-    expect(outcome.safety.invariantViolationCount).toBe(0);
-    await expect(validateArtifact('page', JSON.parse(JSON.stringify(outcome.result)) as unknown))
-      .resolves.toEqual({ ok: true });
-  }, DEADLINE_AUDIT_TEST_TIMEOUT_MS);
-
-  it('records stress-layout:CLOSE_DEADLINE_EXCEEDED for a close deadline inside an AggregateError, and keeps other failures', async () => {
-    const server = await startServer();
-    const overrides: TestConfigOverrides = {
-      viewports: { stressWidths: [320] },
-      audit: { interactions: false, screenshots: false, performance: false, accessibility: false },
-    };
-    const throwingSweep = (error: unknown): PageAuditorDependencies['collectors'] => ({
-      collectStressLayout: async () => {
-        throw error;
-      },
-    });
-
-    const cases: readonly (readonly [unknown, string])[] = [
-      [new PassiveContextCloseDeadlineError(), 'stress-layout:CLOSE_DEADLINE_EXCEEDED'],
-      [
-        new AggregateError(
-          [new Error('work failed'), new AggregateError([new Error('page close failed'), new PassiveContextCloseDeadlineError()])],
-          'both failed',
-        ),
-        'stress-layout:CLOSE_DEADLINE_EXCEEDED',
-      ],
-      [new AggregateError([new Error('work failed'), new Error('close failed')], 'both failed'), 'stress-layout:EVALUATION_FAILED'],
-      [new PassiveSessionOpenDeadlineError('context'), 'stress-layout:EVALUATION_FAILED'],
-    ];
-    for (const [error, detail] of cases) {
-      const { outcome } = await auditFixture(server, '/index.html', { overrides, collectors: throwingSweep(error) });
-      const stressReasons = outcome.result.viewports.desktop.incompleteReasons
-        .filter((reason) => reason.detail?.startsWith('stress-layout:') === true);
-      expect(stressReasons).toEqual([{ code: 'COLLECTOR_INCOMPLETE', detail }]);
-    }
-  }, DEADLINE_AUDIT_TEST_TIMEOUT_MS);
-
-  it('records NOT_VERIFIABLE (CHECK_NOT_COMPLETED) for candidates whose session is not opened, and closes late sessions', async () => {
-    const server = await startServer();
-    const gate = createDeferred<undefined>();
-    let sessionCalls = 0;
-    let lateSessions = 0;
-    const overrides: TestConfigOverrides = { ...NO_STRESS_SWEEP, audit: { screenshots: false } };
-    const config = createTestConfig(server.origin, '/', overrides);
-    const factory = new (class extends PreparedPassiveSessionFactory {
-      override async createInteractionSession(viewport: Viewport): Promise<InteractionGuardedSession> {
-        sessionCalls += 1;
-        await gate.promise;
-        const session = await super.createInteractionSession(viewport);
-        lateSessions += 1;
-        return session;
-      }
-    })(browser, config, () => new SafetyLedger(), TEST_FACTORY_OPTIONS);
-    // Passive の Context と page は、期限の外で作っておく（DEF-035。混雑で Interaction の段階まで進まないことを防ぐ）。
-    await factory.preparePassiveSessions([config.viewports.primaryDesktop, config.viewports.primaryMobile]);
-    const startedAt = performance.now();
-    const { outcome } = await auditFixture(server, '/accordion.html', {
-      overrides,
-      createFactory: (auditConfig) => {
-        expect(auditConfig).toEqual(config);
-        return factory;
-      },
-      deadlines: { sessionOpenTimeoutMs: SHORT_OPEN_DEADLINE_MS },
-    });
-    const elapsedMs = performance.now() - startedAt;
-
-    // 候補ごとに、注入した期限で見切る（実際の期限 `SESSION_OPEN_TIMEOUT_MS` を待たない）。
-    expect(elapsedMs).toBeLessThan(SESSION_OPEN_TIMEOUT_MS);
-    // Desktop の Passive の作成が期限を過ぎていない（過ぎると、Interaction の段階まで進まない。DEF-035）。
-    expect(outcome.result.viewports.desktop.incompleteReasons).not.toContainEqual(PASSIVE_OPEN_DEADLINE_REASON);
-    const interactions = evidenceOf(outcome, 'interaction', 'desktop');
-    expect(sessionCalls).toBeGreaterThan(0);
-    expect(interactions).toHaveLength(sessionCalls);
-    for (const interaction of interactions) {
-      expect(interaction.payload).toMatchObject({
-        status: 'NOT_VERIFIABLE',
-        notVerifiableKind: 'CHECK_NOT_COMPLETED',
-        reason: SESSION_OPEN_DEADLINE_REASON,
-        reasonDetail: null,
-        lifecycle: { status: 'CLOSED', reason: 'SESSION_NOT_OPENED', reasonDetail: null },
-      });
-    }
-    expect(evidenceOf(outcome, 'safety', 'desktop').filter((record) => record.payload.scope === 'INTERACTION'))
-      .toHaveLength(sessionCalls);
-    expect(outcome.safety.invariantViolationCount).toBe(0);
-    await expect(validateArtifact('page', JSON.parse(JSON.stringify(outcome.result)) as unknown))
-      .resolves.toEqual({ ok: true });
-
-    // audit() が戻った後に session が届く。待たずに閉じる。
-    gate.resolve(undefined);
-    await expect.poll(() => lateSessions, { timeout: LATE_RELEASE_TIMEOUT_MS }).toBe(sessionCalls);
-    await expect.poll(() => testContextsOf(browser).length, { timeout: LATE_RELEASE_TIMEOUT_MS }).toBe(0);
-  }, DEADLINE_AUDIT_TEST_TIMEOUT_MS);
-
+  // RB-10: 閉じる期限切れの代表は上の 1 本（Passive の Context）。幅の走査の閉じる期限切れと失敗の理由の訳は偽の口の単体、候補の session の作成の期限切れ
+  // （`SESSION_OPEN_DEADLINE`）は isolated-auditor と passive-session-open の単体が受け持つ。遅れて届く失敗の代表は下の 1 本。
   it('closes the Context of a ContextConstructionError that arrives after the Interaction session open deadline', async () => {
     const server = await startServer();
     const gate = createDeferred<undefined>();
@@ -1221,8 +923,13 @@ describe('PageAuditor page deadline (R14 I1)', () => {
    * 修正前は、止まったページの dom の段階が戻らず、この上限を超える（テストの時間の上限に達する）。
    */
   const BUSY_LOOP_AUDIT_LIMIT_MS = SHORT_PAGE_TIMEOUT_MS * 4;
+  /** RB-10: 止まった page の場面の、見張りの反応なしの長さ（ms）。 */
+  const BUSY_LOOP_QUIET_LIMIT_MS = 1_500;
 
-  it('returns within a few page deadlines on a page whose main thread stays blocked, with DEADLINE_EXCEEDED', async () => {
+  // L1（設計書 `2026-11-09-beaksight-remove-limits-design.md` 6 の L1）: ページの期限は撤廃し、進みの見張りで終える。期待を直した: 落ち着きの待ちの期限
+  // （`resourceSettlingTimeoutMs` 500ms）もなくなったので、止まったページで最初に止まるのは dom の段階ではなく落ち着きの待ち（settling）で、理由は
+  // `dom:DEADLINE_EXCEEDED` ではなく `STAGE_UNRESPONSIVE`（`detail` は settling）。反応なしの長さ（テストでは 5 秒）で戻る。
+  it('returns within a few quiet limits on a page whose main thread stays blocked, with STAGE_UNRESPONSIVE', async () => {
     const server = await startServer();
     const unhandledRejections: unknown[] = [];
     const onUnhandledRejection = (reason: unknown): void => {
@@ -1247,6 +954,8 @@ describe('PageAuditor page deadline (R14 I1)', () => {
           ruleEvaluations.push(firstFindingSequence);
           return new RuleEngine({ targetId: 'test-target', firstFindingSequence });
         },
+        // RB-10: 止まった page を見放すまでの反応なしの長さを短くする（ビューポート 2 つで 5 秒以内）。
+        progressWatchQuietLimitMs: BUSY_LOOP_QUIET_LIMIT_MS,
       });
       const elapsedMs = Date.now() - startedAtMs;
 
@@ -1255,10 +964,9 @@ describe('PageAuditor page deadline (R14 I1)', () => {
       for (const viewport of ['desktop', 'mobile'] as const) {
         const viewportResult = outcome.result.viewports[viewport];
         expect(viewportResult).toMatchObject({ status: 'PARTIAL', navigationOutcome: 'OK' });
-        // 期限を過ぎた段階を1回だけ記録し、残りの段階は実行も記録もしない。
-        expect(viewportResult.incompleteReasons.filter((reason) => reason.detail?.endsWith(':DEADLINE_EXCEEDED')))
-          .toEqual([{ code: 'COLLECTOR_INCOMPLETE', detail: 'dom:DEADLINE_EXCEEDED' }]);
-        for (const type of ['dom', 'layout', 'color', 'accessibility', 'performance', 'screenshot', 'link'] as const) {
+        // 応答しなかった段階を1回だけ記録し、残りの段階は実行も記録もしない。
+        expect(viewportResult.incompleteReasons).toEqual([{ code: 'STAGE_UNRESPONSIVE', detail: 'settling' }]);
+        for (const type of ['dom', 'layout', 'accessibility', 'performance', 'screenshot', 'link'] as const) {
           expect(evidenceOf(outcome, type, viewport), `${viewport} ${type}`).toHaveLength(0);
         }
         // それまでに集めた Evidence と、Safety の Evidence は記録する。
@@ -1278,89 +986,13 @@ describe('PageAuditor page deadline (R14 I1)', () => {
       process.off('unhandledRejection', onUnhandledRejection);
     }
   }, BUSY_LOOP_AUDIT_LIMIT_MS * 2);
+
+  // RB-10: 止まった main thread の代表は上の 1 本。Run の時間の上限で次のビューポートを始めないことは偽の口の単体、見張りが Run の時間の上限で段を終える
+  // ことは `tests/unit/progress-watch.test.ts` が受け持つ。
 });
 
-// P14e（R14 の I2、設計書 4.3）: 構築に失敗した Context の Ledger も、Safety の Evidence と違反の集計に含める。
-describe('PageAuditor Passive Context construction failure (R14 I2)', () => {
-  it('includes the Ledger of the Context of ContextConstructionError in the safety Evidence and the safety summary', async () => {
-    const server = await startServer();
-    /** 最初の Passive Context（Desktop）だけ、Ledger に違反を1件記録してから `ContextConstructionError` を投げる。 */
-    class ConstructionFailureFactory extends BrowserContextFactory {
-      #failed = false;
-
-      override async createPassiveContext(viewport: Viewport): Promise<BrowserContext> {
-        const context = await super.createPassiveContext(viewport);
-        if (this.#failed) {
-          return context;
-        }
-        this.#failed = true;
-        this.getSafetyLedger(context).recordInvariantViolation({
-          code: 'TEST_CONSTRUCTION_VIOLATION',
-          message: 'injected construction violation',
-        });
-        throw new ContextConstructionError(context, this.getSafetyLedger(context), new Error('injected guard installation failure'));
-      }
-    }
-    const { outcome } = await auditFixture(server, '/index.html', {
-      overrides: { ...NO_STRESS_SWEEP, audit: { interactions: false } },
-      createFactory: (config) => new ConstructionFailureFactory(browser, config, () => new SafetyLedger()),
-    });
-
-    expect(outcome.safety.invariantViolationCount).toBe(1);
-    expect(outcome.safety.invariantViolations).toEqual([
-      { code: 'TEST_CONSTRUCTION_VIOLATION', message: 'injected construction violation' },
-    ]);
-    expect(outcome.result.viewports.desktop.status).toBe('FAILED');
-    expect(outcome.result.viewports.desktop.incompleteReasons.map((reason) => reason.code)).toEqual(['UNHANDLED_FAILURE']);
-    // 構築に失敗した Context の Ledger から、PASSIVE の safety の Evidence を1つ作る（違反は Evidence に含めない）。
-    const desktopSafety = evidenceOf(outcome, 'safety', 'desktop');
-    expect(desktopSafety).toHaveLength(1);
-    expect(desktopSafety[0]?.payload.scope).toBe('PASSIVE');
-    expect(JSON.stringify(outcome.result)).not.toContain('TEST_CONSTRUCTION_VIOLATION');
-    expect(outcome.result.viewports.mobile.status).toBe('AUDITED');
-    await expect(validateArtifact('page', JSON.parse(JSON.stringify(outcome.result)) as unknown))
-      .resolves.toEqual({ ok: true });
-  }, AUDIT_TEST_TIMEOUT_MS);
-});
-
-// C14x（R14r2 の Minor-1）: Context の構築の失敗の理由（`passive-context:...`）には、`ContextConstructionError` の元の原因
-// （`cause`）のメッセージを、上限（`MAX_ERROR_MESSAGE_LENGTH`）付きで含める。
-describe('PageAuditor Passive Context construction failure detail (R14r2 Minor-1)', () => {
-  const OPEN_LABEL = 'passive-context:';
-  it.each([
-    ['a short cause message', 'injected guard installation failure'],
-    ['a cause message longer than the limit', `long-cause-${'x'.repeat(MAX_ERROR_MESSAGE_LENGTH * 2)}`],
-  ])('includes %s of ContextConstructionError in the detail within the limit', async (_label, causeMessage) => {
-    const server = await startServer();
-    /** 最初の Passive Context（Desktop）だけ、`causeMessage` を原因とする `ContextConstructionError` を投げる。 */
-    class ConstructionFailureFactory extends BrowserContextFactory {
-      #failed = false;
-
-      override async createPassiveContext(viewport: Viewport): Promise<BrowserContext> {
-        const context = await super.createPassiveContext(viewport);
-        if (this.#failed) {
-          return context;
-        }
-        this.#failed = true;
-        throw new ContextConstructionError(context, this.getSafetyLedger(context), new Error(causeMessage));
-      }
-    }
-    const { outcome } = await auditFixture(server, '/index.html', {
-      overrides: { ...NO_STRESS_SWEEP, audit: { interactions: false } },
-      createFactory: (config) => new ConstructionFailureFactory(browser, config, () => new SafetyLedger()),
-    });
-
-    const reasons = outcome.result.viewports.desktop.incompleteReasons;
-    expect(reasons.map((reason) => reason.code)).toEqual(['UNHANDLED_FAILURE']);
-    const detail = reasons[0]?.detail ?? '';
-    expect(detail.startsWith(OPEN_LABEL)).toBe(true);
-    expect(detail.length).toBeLessThanOrEqual(OPEN_LABEL.length + MAX_ERROR_MESSAGE_LENGTH);
-    // 元の原因のメッセージ（長い場合は、その先頭の部分）が、detail に含まれる。
-    expect(detail).toContain(causeMessage.slice(0, 64));
-    await expect(validateArtifact('page', JSON.parse(JSON.stringify(outcome.result)) as unknown))
-      .resolves.toEqual({ ok: true });
-  }, AUDIT_TEST_TIMEOUT_MS);
-});
+// RB-10: Passive の Context の構築の失敗（Ledger を含めること・原因の全文を理由に書くこと）は、偽の口の単体（`page-auditor-steps.test.ts`）へ移した。Guard が
+// Context を閉じる本物の代表は、下の GUARD_INSTALLATION_FAILED の 1 本。
 
 // P14f（R14r の Important-1、設計書 4.3）: Guard の取り付けに失敗し、Guard が Context を閉じた場合も、その Context の Ledger を、
 // Safety の Evidence と違反の集計に含める。Context は残らない（`auditFixture` が確かめる）。
@@ -1387,75 +1019,8 @@ describe('PageAuditor Guard installation failure that closes the Context (R14r I
       .resolves.toEqual({ ok: true });
   }, AUDIT_TEST_TIMEOUT_MS);
 
-  it('counts GUARD_INSTALLATION_FAILED and records the safety Evidence on the stress sweep path', async () => {
-    const server = await startServer();
-    const { outcome } = await auditFixture(server, '/index.html', {
-      overrides: { viewports: { stressWidths: [320] }, audit: { interactions: false } },
-      // 1回目は Desktop の Passive Context、2回目は幅の走査のセッションの Context である。
-      createFactory: (config) => new BrowserContextFactory(browserOpeningPageAfterNewContext(browser, { onlyOnCall: 2 }), config, () => new SafetyLedger(), TEST_FACTORY_OPTIONS),
-    });
-
-    expect(outcome.safety.invariantViolationCount).toBe(1);
-    expect(outcome.safety.invariantViolations.map((violation) => violation.code)).toEqual(['GUARD_INSTALLATION_FAILED']);
-    // Passive の Context と、幅の走査のセッションの Context の、2つの Ledger から、PASSIVE の safety の Evidence を作る。
-    const desktopSafety = evidenceOf(outcome, 'safety', 'desktop');
-    expect(desktopSafety).toHaveLength(2);
-    expect(desktopSafety.every((record) => record.payload.scope === 'PASSIVE')).toBe(true);
-    expect(outcome.result.viewports.desktop.status).toBe('PARTIAL');
-    await expect(validateArtifact('page', JSON.parse(JSON.stringify(outcome.result)) as unknown))
-      .resolves.toEqual({ ok: true });
-  }, AUDIT_TEST_TIMEOUT_MS);
-});
-
-// P14f（R14r の Minor-2、設計書 4.5.7）: 期限を受け取る collector には、ページの期限から `COLLECTOR_DEADLINE_MARGIN_MS` を引いた時刻を
-// 渡す。collector が期限で止まったときの PARTIAL の Evidence を、ページの期限で捨てずに記録する。
-describe('PageAuditor collector deadline margin (R14r Minor-2)', () => {
-  it('records the PARTIAL Evidence of a collector that stops at the deadline it received', async () => {
-    const server = await startServer();
-    const pageTimeoutMs = 6_000;
-    const receivedDeadlines: number[] = [];
-    /** 各ビューポートのページの期限の上限（実際のページの期限は、これ以前である）。 */
-    const latestPageDeadlines: number[] = [];
-    const { outcome } = await auditFixture(server, '/index.html', {
-      overrides: {
-        ...NO_STRESS_SWEEP,
-        crawl: { overallPageTimeoutMs: pageTimeoutMs },
-        audit: { interactions: false, performance: false, screenshots: false, accessibility: true },
-      },
-      collectors: {
-        // 受け取った期限まで待ってから、本番の collector を呼ぶ（期限を過ぎているので、PARTIAL の DEADLINE_EXCEEDED を返す）。
-        collectAccessibilityEvidence: async (page, options) => {
-          const deadlineAtMs = options?.deadlineAtMs ?? Number.NaN;
-          receivedDeadlines.push(deadlineAtMs);
-          await new Promise((resolve) => setTimeout(resolve, Math.max(0, deadlineAtMs - Date.now())));
-          return collectAccessibilityEvidence(page, { deadlineAtMs });
-        },
-      },
-      // ページの期限の上限を知るために、Passive Context を作る前の時刻を記録する（ページの期限は、これより前に決まる）。
-      createFactory: (config) => new (class extends BrowserContextFactory {
-        override async createPassiveContext(viewport: Viewport): Promise<BrowserContext> {
-          latestPageDeadlines.push(Date.now() + pageTimeoutMs);
-          return super.createPassiveContext(viewport);
-        }
-      })(browser, config, () => new SafetyLedger(), TEST_FACTORY_OPTIONS),
-    });
-
-    expect(receivedDeadlines).toHaveLength(2);
-    for (const viewport of ['desktop', 'mobile'] as const) {
-      const accessibility = evidenceOf(outcome, 'accessibility', viewport);
-      expect(accessibility, viewport).toHaveLength(1);
-      expect(accessibility[0]?.payload).toMatchObject({ status: 'PARTIAL', reason: 'DEADLINE_EXCEEDED' });
-      expect(outcome.result.viewports[viewport]).toMatchObject({ status: 'PARTIAL' });
-      expect(outcome.result.viewports[viewport].incompleteReasons).toContainEqual(
-        { code: 'COLLECTOR_INCOMPLETE', detail: 'accessibility:DEADLINE_EXCEEDED' },
-      );
-    }
-    // 渡した期限は、ページの期限から、少なくとも余裕の分だけ前である。
-    expect(latestPageDeadlines).toHaveLength(2);
-    receivedDeadlines.forEach((deadlineAtMs, index) => {
-      expect(deadlineAtMs).toBeLessThanOrEqual((latestPageDeadlines[index] ?? Number.NaN) - COLLECTOR_DEADLINE_MARGIN_MS);
-    });
-  }, AUDIT_TEST_TIMEOUT_MS);
+  // RB-10: 幅の走査の道の GUARD_INSTALLATION_FAILED は、同じ事象（Guard が Context を閉じる）なので上の 1 本に寄せた。collector に期限を渡さず見張りの口を渡す
+  // ことは、偽の口の単体へ移した。
 });
 
 // T44 P1-5（ユーザーの判断「待ってから測る」）と T44R2 の I-6・M-5: 幅の走査の各幅の読み込みの後に、最初の読み込みと同じ落ち着きの待ち（本物の
@@ -1481,17 +1046,18 @@ describe('PageAuditor: the stress sweep waits for the page to settle before meas
         }),
       },
     });
-    const sweep = evidenceOf(outcome, 'layout', 'desktop')[0]?.payload.stressSweep ?? [];
+    const sweep = firstPassLayoutOf(outcome, 'desktop')?.payload.stressSweep ?? [];
     expect(sweep.map(({ width, status }) => `${String(width)} ${status}`)).toEqual(['320 COMPLETE', '768 COMPLETE']);
     expect(settled.map(({ width }) => width)).toEqual([320, 768]);
-    // 本物の落ち着きの待ち: 高さが変わらない時間（`PAGE_SETTLING_PACING.stableWindowMs`）を待つ。
+    // 本物の落ち着きの待ち: 高さが変わらない時間（差し込んだ一式の `pageSettle.stableWindowMs`）を待つ。
     for (const { waitedMs } of settled) {
-      expect(waitedMs).toBeGreaterThanOrEqual(PAGE_SETTLING_PACING.stableWindowMs - TIMER_TOLERANCE_MS);
+      expect(waitedMs).toBeGreaterThanOrEqual(TEST_SHORT_AUDIT_OBSERVATION_WINDOWS.pageSettle.stableWindowMs - TIMER_TOLERANCE_MS);
     }
   }, AUDIT_TEST_TIMEOUT_MS);
 
-  it('stops waiting for a page that does not settle early enough to measure the layout of the width (T44R2 I-6)', async () => {
+  it('settles a width that only keeps growing with no new structure, without waiting for the run time limit (T44R2 I-6, changed by L1 and DEF-245 D)', async () => {
     const server = await startServer();
+    const runDeadlineAtMs = Date.now() + STRESS_SETTLE_PAGE_TIMEOUT_MS * 4;
     // 幅 320 だけ落ち着かない画面。落ち着きの待ちの上限（`resourceSettlingTimeoutMs`）を、走査の期限より長くする（残りの時間の少ない幅）。
     const waits: { readonly waitedMs: number; readonly remainingMs: number }[] = [];
     const { outcome } = await auditFixture(server, '/stress-narrow-never-settles.html', {
@@ -1510,16 +1076,15 @@ describe('PageAuditor: the stress sweep waits for the page to settle before meas
           },
         }),
       },
+      runDeadlineAtMs,
     });
-    // 待ちは、その幅の期限の前に、形を測る予備を残して止まる。
+    // DEF-245 の D（設計者の判断 2026-11-11）: 期待を直した。この画面は、新しい作りの印が出ないまま高さだけが伸び続ける（同じ要素の高さが伸びるだけ）ので、
+    // 静まったとみなし、Run の時間の上限を待たずに、その幅を測る（網羅は作りの印で決める）。
     expect(waits).toHaveLength(1);
-    expect(waits[0]?.remainingMs).toBeGreaterThanOrEqual(STRESS_LAYOUT_MEASURE_RESERVE_MS - TIMER_TOLERANCE_MS);
-    const [sweep] = evidenceOf(outcome, 'layout', 'desktop')[0]?.payload.stressSweep ?? [];
-    // 落ち着くのを待ち切らずに、予備を残して止め、形を測る（DEADLINE_EXCEEDED にしない）。
+    expect(waits[0]?.waitedMs).toBeLessThan(STRESS_SETTLE_PAGE_TIMEOUT_MS);
+    expect(outcome.result.viewports.desktop.incompleteReasons.filter(({ detail }) => detail?.startsWith('stress-layout:') === true)).toEqual([]);
+    const [sweep] = firstPassLayoutOf(outcome, 'desktop')?.payload.stressSweep ?? [];
     expect(sweep?.width).toBe(320);
-    expect(sweep?.status).toBe('COMPLETE');
-    expect(sweep?.layout).not.toBeNull();
-    expect(outcome.result.viewports.desktop.incompleteReasons).not.toContainEqual(expect.objectContaining({ detail: expect.stringContaining('stress-layout') }));
   }, AUDIT_TEST_TIMEOUT_MS);
 });
 
@@ -1575,87 +1140,12 @@ describe('PageAuditor: no new viewport or stress width after a safety invariant 
     };
   }
 
-  /** `violatingCall` 番目（1から数える）に作った Passive Context の Ledger に、違反を1件記録する factory。作った数を数える。 */
-  class ViolatingContextFactory extends BrowserContextFactory {
-    passiveContexts = 0;
-    readonly #violatingCall: number;
-
-    constructor(config: AuditConfig, createLedger: () => SafetyLedger, violatingCall: number) {
-      super(browser, config, createLedger, TEST_FACTORY_OPTIONS);
-      this.#violatingCall = violatingCall;
-    }
-
-    override async createPassiveContext(viewport: Viewport): Promise<BrowserContext> {
-      const context = await super.createPassiveContext(viewport);
-      this.passiveContexts += 1;
-      if (this.passiveContexts === this.#violatingCall) {
-        this.getSafetyLedger(context).recordInvariantViolation({ code: 'TEST_INJECTED_VIOLATION', message: 'injected violation' });
-      }
-      return context;
-    }
-  }
-
-  it('does not start the Mobile viewport after a violation in Desktop and records it as SKIPPED with SAFETY_VIOLATION_ABORT', async () => {
-    const server = await startServer();
-    const ledgers = trackLedgers();
-    let factory: ViolatingContextFactory | undefined;
-    const { outcome } = await auditFixture(server, '/index.html', {
-      overrides: { ...NO_STRESS_SWEEP, audit: { interactions: false } },
-      // 1回目の Context は、Desktop の Passive Context である。
-      createFactory: (config) => (factory = new ViolatingContextFactory(config, ledgers.create, 1)),
-      safetyViolationRecorded: ledgers.violationRecorded,
-    });
-
-    // Mobile の Context は作らない。
-    expect(factory?.passiveContexts).toBe(1);
-    expect(outcome.result.viewports.desktop.navigationOutcome).toBe('OK');
-    expect(outcome.result.viewports.mobile).toEqual({
-      requestedUrl: outcome.result.pageUrl,
-      finalUrl: null,
-      httpStatus: null,
-      status: 'SKIPPED',
-      incompleteReasons: [SAFETY_VIOLATION_ABORT],
-      navigationOutcome: null,
-    });
-    expect(evidenceTypesOf(outcome, 'mobile')).toEqual([]);
-    expect(outcome.result.findings.filter((finding) => finding.viewport === 'mobile')).toEqual([]);
-    // 一部のビューポートだけが SKIPPED なので、ページは PARTIAL（`derivePageAuditStatus`）。ページの理由にも残す。
-    expect(outcome.result.status).toBe('PARTIAL');
-    expect(outcome.result.incompleteReasons).toContainEqual(SAFETY_VIOLATION_ABORT);
-    expect(outcome.safety.invariantViolationCount).toBe(1);
-    await expect(validateArtifact('page', JSON.parse(JSON.stringify(outcome.result)) as unknown))
-      .resolves.toEqual({ ok: true });
-  }, AUDIT_TEST_TIMEOUT_MS);
-
-  it('does not start the next stress width after a violation in a stress session, and records stress-layout:SAFETY_VIOLATION_ABORT', async () => {
-    const server = await startServer();
-    const ledgers = trackLedgers();
-    let factory: ViolatingContextFactory | undefined;
-    const { outcome } = await auditFixture(server, '/index.html', {
-      overrides: { viewports: { stressWidths: [320, 768] }, audit: { interactions: false } },
-      // 1回目は Desktop の Passive Context、2回目は幅の走査の最初の幅（320）のセッションの Context である。
-      createFactory: (config) => (factory = new ViolatingContextFactory(config, ledgers.create, 2)),
-      safetyViolationRecorded: ledgers.violationRecorded,
-    });
-
-    // 2つ目の幅（768）と、Mobile の Context は作らない。
-    expect(factory?.passiveContexts).toBe(2);
-    expect(outcome.result.viewports.desktop.incompleteReasons).toContainEqual(
-      { code: 'COLLECTOR_INCOMPLETE', detail: 'stress-layout:SAFETY_VIOLATION_ABORT' },
-    );
-    // 始めた幅の走査のセッションの Ledger は、今までどおり、PASSIVE の safety の Evidence にする。
-    expect(evidenceOf(outcome, 'safety', 'desktop')).toHaveLength(2);
-    expect(outcome.result.viewports.mobile).toMatchObject({ status: 'SKIPPED', incompleteReasons: [SAFETY_VIOLATION_ABORT] });
-    expect(outcome.safety.invariantViolationCount).toBe(1);
-    await expect(validateArtifact('page', JSON.parse(JSON.stringify(outcome.result)) as unknown))
-      .resolves.toEqual({ ok: true });
-  }, AUDIT_TEST_TIMEOUT_MS);
-
+  // RB-10: Desktop・幅の走査の中の違反で次を始めない順と、違反がなければ全部を始めることは、偽の口の単体（`page-auditor-steps.test.ts`）へ移した。
   // C18i（RC18b の N2）: 幅の走査のセッションの中で違反が起き、Guard がそのセッションの Context を閉じた場合も、段階の理由を
   // `stress-layout:SAFETY_VIOLATION_ABORT` にする（違反で止まったことが分かる理由）。RC18b の再現では、セッションの後始末の失敗から
   // `stress-layout:EVALUATION_FAILED` になっていた。新しい理由のコードは加えない（既存のコードの detail で表す）。
   it('records stress-layout:SAFETY_VIOLATION_ABORT when the Guard closes a stress session Context after a violation inside it', async () => {
-    /** 2つ目の page（幅の走査の最初の幅のセッション）だけが、読み込みの初めに外部スキームへ移動するようにする factory。 */
+    /** 2つ目の page（幅の走査の最初の幅のセッション）だけが、読み込みの後にポップアップを開くようにする factory。 */
     class ExternalSchemeInStressSessionFactory extends BrowserContextFactory {
       passivePages = 0;
 
@@ -1663,9 +1153,9 @@ describe('PageAuditor: no new viewport or stress width after a safety invariant 
         const page = await super.createPassivePage(context);
         this.passivePages += 1;
         if (this.passivePages === 2) {
-          // 外部スキームへの移動は違反になり、Guard が Context を閉じる（headed と headless を問わない。中断した Run の再開の
-          // 設計書 4.10）。宛先は実在しないものである。
-          await page.addInitScript({ content: "window.location.href = 'mailto:nobody@example.invalid';" });
+          // SAFE-2 の 4 の後: 外部スキームへの移動は違反でなくなった（止めた記録だけ）。違反のきっかけは、CDP の付いていない page の要求
+          // （DEF-113。`window.open` のポップアップ）にする。Guard が止め、Context を閉じる。
+          await page.addInitScript({ content: "window.addEventListener('load', () => { setTimeout(() => { window.open('/popup-x.html'); }, 0); });" });
         }
         return page;
       }
@@ -1690,21 +1180,22 @@ describe('PageAuditor: no new viewport or stress width after a safety invariant 
       .resolves.toEqual({ ok: true });
   }, AUDIT_TEST_TIMEOUT_MS);
 
-  it('starts every viewport and stress width when the injected check answers no violation', async () => {
+  // DEF-247: 幅の走査の page が読み込みの初めに外部スキーム（mailto）へ移ろうとした幅は、その記録で幅を終える（DEF-245 の続きの C）。終えるときは、page だけを
+  // 閉じず、その幅の session の口で Context ごと閉じるので、Guard が印のない session の切れを違反にしない（違反 0 で、Mobile も続ける）。
+  it('ends a stress width whose page tries an external scheme without a violation (DEF-247)', async () => {
     const server = await startServer();
-    const ledgers = trackLedgers();
-    let factory: ViolatingContextFactory | undefined;
-    const { outcome } = await auditFixture(server, '/index.html', {
-      overrides: { viewports: { stressWidths: [320, 768] }, audit: { interactions: false } },
-      // 違反を記録しない（0番目の Context はない）。
-      createFactory: (config) => (factory = new ViolatingContextFactory(config, ledgers.create, 0)),
-      safetyViolationRecorded: ledgers.violationRecorded,
+    // 読み込みの後に、ページ自身が mailto へ移ろうとする画面（GATE-S03 と同じ画面。どの読み込みでも試みる）。
+    const { outcome } = await auditFixture(server, '/external-scheme-navigation.html?via=location-href&to=mailto', {
+      overrides: { crawl: { allowedQueryParameters: ['via', 'to'] }, viewports: { stressWidths: [320] }, audit: { interactions: false } },
     });
 
-    // Desktop、幅の走査の2つの幅、Mobile。
-    expect(factory?.passiveContexts).toBe(4);
+    expect(outcome.safety.invariantViolationCount).toBe(0);
     expect(outcome.result.viewports.mobile.status).not.toBe('SKIPPED');
-    expect(JSON.stringify(outcome.result)).not.toContain('SAFETY_VIOLATION_ABORT');
+    // DEF-250 の c: Desktop の page が mailto へ移ろうとした後は、残りの段を始めずにビューポートを終える（CLI の Chromium で誤りの画面に替わっても、見張りの
+    // 時間切れを待たない）。理由は、外部スキームの移動として残る。
+    const desktopCodes = outcome.result.viewports.desktop.incompleteReasons.map(({ code }) => code);
+    expect(desktopCodes).not.toContain('STAGE_UNRESPONSIVE');
+    expect(desktopCodes).toContain('DOCUMENT_LEFT_DURING_AUDIT');
   }, AUDIT_TEST_TIMEOUT_MS);
 });
 

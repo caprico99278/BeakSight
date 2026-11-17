@@ -25,11 +25,10 @@
       "additionalProperties": false,
       "required": ["startUrl", "allowedOrigins"],
       "properties": {
-        "startUrl": { "type": "string", "maxLength": 2048 },
+        "startUrl": { "type": "string" },
         "allowedOrigins": {
           "type": "array",
-          "maxItems": 16,
-          "items": { "type": "string", "maxLength": 2048 }
+          "items": { "type": "string" }
         }
       }
     }

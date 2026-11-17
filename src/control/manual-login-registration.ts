@@ -18,7 +18,6 @@ import { isOriginInAllowedOrigins } from '../crawl/normalize-url.js';
 import { procedureNameHasWriteWord } from '../discovery/classify.js';
 import {
   AUTH_SETUP_SCHEMA_VERSION_3,
-  MAX_LOGIN_SIDE_REQUESTS,
   MAX_LOGIN_SIDE_REQUESTS_PER_LOGIN_STAGE,
   SCRIPT_REQUEST_TRANSPORT,
   loginTransportOf,
@@ -163,8 +162,8 @@ export const manualLoginRegistrationOf = (input: ManualLoginRegistrationInput): 
       continue;
     }
     if (sameTarget(registration.origin, registration.path, token)
-      || sides.some((side) => sameTarget(registration.origin, registration.path, side) && side.method === registration.method)
-      || sides.length >= MAX_LOGIN_SIDE_REQUESTS) {
+      || sides.some((side) => sameTarget(registration.origin, registration.path, side) && side.method === registration.method)) {
+      // L11（設計書 `2026-11-09-beaksight-remove-limits-design.md` 4）: ログインに伴う送信の件数の上限は撤廃した（足せるだけ足す）。
       continue;
     }
     // ML-a-fix-2: 回数の上限は、手動の段で見えた回数でなく、閉じた上限（今の決まりの最大）。ログインの後の呼び出しが、自動ログインの段で上限で止まらない。
@@ -207,7 +206,6 @@ const isPlainProcedureCallPath = (path: string): boolean =>
  * - `ALREADY_REGISTERED`: 登録済みの送信の理由で止めた行か、今の設定にすでにある送信。
  * - `NO_TOKEN_TARGET`: ログインに伴う送信を足すのに、token の送信先がない（スクリプトで送るログインの設定でない）。
  * - `NO_STORAGE_KEY`: 成功の鍵がない（今の設定にも、ジョブのログインの観察にも、許可 Origin の案がない）。
- * - `SIDE_REQUEST_LIMIT`: ログインに伴う送信が上限の数まである。
  * - `NEW_TARGET_FROM_AUTOMATED_LOGIN`（MI-G。設計書 `2026-10-26-beaksight-minimal-input-ux-design.md` 4.7）: 自動ログインの文脈（`isAutomatedLoginSource`）の
  *   行から、token の送信先か、承認したサービスの Origin を足そうとした（まだ人が手動のログインで観察していない送信先へ、資格情報を送らないため）。
  */
@@ -217,7 +215,6 @@ export const LOGIN_STAGE_ROW_REGISTRATION_REJECTIONS = Object.freeze([
   'ALREADY_REGISTERED',
   'NO_TOKEN_TARGET',
   'NO_STORAGE_KEY',
-  'SIDE_REQUEST_LIMIT',
   'NEW_TARGET_FROM_AUTOMATED_LOGIN',
   // MI-F1（設計書 4.7.1 の 3）: 自動ログインのプロファイルで、資格情報の送信先（ログインに伴う送信の送信先、送り方など）が変わる（保存の部品の層と同じ判定
   // `authSetupCredentialDestinationChangesOf`。案の時点で拒む）。
@@ -333,9 +330,7 @@ export const loginStageRowRegistrationOf = (input: LoginStageRowRegistrationInpu
     if (sameTarget(token) || sides.some((side) => sameTarget(side) && side.method === registration.method)) {
       return rowRejected('ALREADY_REGISTERED');
     }
-    if (sides.length >= MAX_LOGIN_SIDE_REQUESTS) {
-      return rowRejected('SIDE_REQUEST_LIMIT');
-    }
+    // L11: 件数の上限で断ることは撤廃した。
     const side: LoginSideRequest = {
       origin: registration.origin, path: registration.path, method: registration.method, maxPerLoginStage: MAX_LOGIN_SIDE_REQUESTS_PER_LOGIN_STAGE,
     };

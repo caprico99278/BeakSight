@@ -122,7 +122,9 @@ const openGrantsOf = (tags: readonly string[]): number => tags
   .filter((grant) => grant !== null && grant.consumedAt === null && grant.invalidatedAt === null).length;
 
 describe('execution grants (T28d): races between two processes', () => {
-  it('never reserves more than the cumulative limit when two processes issue, consume and commit at the same time', async () => {
+  // L12b（設計書 `2026-11-09-beaksight-remove-limits-design.md` 6.2。S14・S15）: 累積の件数の上限を撤廃したので、前の「累積の上限を超えない」の代わりに、2 つの
+  // process が同時に発行・消費・締めをしても、予約の数・発行の数・消費の数・締めの数が一致し（取り違えて 2 重に数えない）、開いたままの許可が残らないことを確かめる。
+  it('keeps the reservations, the issues, the consumptions and the commits equal when two processes issue, consume and commit at the same time (L12b)', async () => {
     const latest = prepareGrantProfile(database);
     prepareScenario(database, latest, 'scenario-race', { limits: { maxCreatesPerRun: 1, maxCumulativeCreates: CUMULATIVE_LIMIT } });
     const results = await runInLockstep([
@@ -130,16 +132,14 @@ describe('execution grants (T28d): races between two processes', () => {
       startChild(GRANT_CHILD_PROTOCOL.writeLoopMode, 'scenario-race', 'b'),
     ], GRANT_CHILD_ROUNDS);
     const reservations = readWriteReservations(database, 'scenario-race');
-    // 安全の決まり（先に確かめる）: 予約の合計（`RELEASED` を除く）は、累積の上限を超えない（ちょうど上限まで使う）。
     const counted = reservations.filter(({ state }) => state !== 'RELEASED').reduce((sum, { count }) => sum + count, 0);
-    expect(counted).toBe(CUMULATIVE_LIMIT);
-    // 回をそろえたので、許可が期限切れで無効になって予約が返ることはない（返した予約 0。発行の数 = 予約の数）。
     expect(reservations.filter(({ state }) => state === 'RELEASED')).toEqual([]);
     const issued = results.reduce((sum, result) => sum + (result['ISSUED'] ?? 0), 0);
-    expect(issued).toBe(CUMULATIVE_LIMIT);
-    expect(results.reduce((sum, result) => sum + (result['COMMITTED'] ?? 0), 0)).toBe(CUMULATIVE_LIMIT);
-    expect(results.reduce((sum, result) => sum + (result['CONSUMED'] ?? 0), 0)).toBe(CUMULATIVE_LIMIT);
-    expect(results.reduce((sum, result) => sum + (result['GRANT_CUMULATIVE_LIMIT_REACHED'] ?? 0), 0)).toBeGreaterThan(0);
+    // 前の累積の上限（`CUMULATIVE_LIMIT`）を超えて書ける。
+    expect(issued).toBeGreaterThan(CUMULATIVE_LIMIT);
+    expect(counted).toBe(issued);
+    expect(results.reduce((sum, result) => sum + (result['COMMITTED'] ?? 0), 0)).toBe(issued);
+    expect(results.reduce((sum, result) => sum + (result['CONSUMED'] ?? 0), 0)).toBe(issued);
     expect(openGrantsOf(['a', 'b'])).toBe(0);
   }, PROCESS_TEST_TIMEOUT_MS);
 

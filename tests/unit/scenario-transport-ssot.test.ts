@@ -44,7 +44,6 @@ describe('T40R-fix-B: the transport values', () => {
     'src/control/approval/scenario-store.ts',
     'src/control/data-rules/field-evaluation.ts',
     'src/safety/passive-request-guard.ts',
-    'apps/local-ui/src/components/ScenarioForm.tsx',
   ])('compares no raw transport string in %s', (path) => {
     const code = sourceOf(path).split('\n').filter((line) => !/^\s*(?:\/\/|\*|\/\*\*)/u.test(line)).join('\n');
     expect(code).not.toMatch(/[!=]==\s*'(?:API|FORM)'/u);

@@ -9,7 +9,6 @@
 // 例の値は、匿名の値（`example.invalid`、`127.0.0.1`）だけを使う。
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import {
-  MAX_LOGIN_STATE_NAME_ROWS,
   authenticatedStateNameRecordOf,
   filterAuthenticatedState,
   type AuthenticatedState,
@@ -343,12 +342,13 @@ describe('DEF-139: authenticatedStateNameRecordOf records the names and whether 
     expect(record.indexedDB.rows.map(({ outcome }) => outcome)).toEqual(['CARRIED']);
   });
 
-  it('merges the same rows into a count, and keeps only the counts over the named limit', () => {
-    const many = Array.from({ length: MAX_LOGIN_STATE_NAME_ROWS + 3 }, (_, index) => cookie(`h${index}.other.invalid`, `n${index}`));
+  // LZ-3a: 置き場所ごとの行の数の上限（前は 16）は撤廃した。前の上限を超える行も残らず残す。
+  it('merges the same rows into a count, and keeps every row beyond the former limit', () => {
+    const many = Array.from({ length: 19 }, (_, index) => cookie(`h${index}.other.invalid`, `n${index}`));
     const record = authenticatedStateNameRecordOf(stateOf([cookie('app.example.invalid', 'a'), cookie('app.example.invalid', 'b'), ...many]), APPROVED);
     expect(record.cookies.rows[0]).toEqual({ domain: 'app.example.invalid', path: '/', hostOnly: true, shape: null, outcome: 'CARRIED', count: 2 });
-    expect(record.cookies.rows).toHaveLength(MAX_LOGIN_STATE_NAME_ROWS);
-    expect(record.cookies.unlisted).toBe(4);
+    expect(record.cookies.rows).toHaveLength(20);
+    expect(record.cookies.unlisted).toBe(0);
   });
 
   it('hides a value-like cookie path, and gives an empty record for a malformed state without throwing', () => {

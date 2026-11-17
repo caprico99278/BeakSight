@@ -1,6 +1,6 @@
 import { useState } from 'react';
 import { Link, createFileRoute, notFound, useRouter } from '@tanstack/react-router';
-import { formatCount, formatDateTime } from '../../../../../../src/presentation/format.js';
+import { formatCount } from '../../../../../../src/presentation/format.js';
 import { LOCAL_UI_DISCOVERY_TEXT, LOCAL_UI_SCENARIO_TEXT, LOCAL_UI_TEXT, LOCAL_UI_WRITE_STAGE_TEXT } from '../../../../../../src/presentation/messages.js';
 import { DiscoveryStartButton } from '../../../components/DiscoveryStartButton';
 import { Notice } from '../../../components/Notice';
@@ -13,7 +13,7 @@ import { inputRuleStateDisplay, scenarioKindDisplay, toneClass } from '../../../
 import { emptyScenarioListEntryOf } from '../../../display/next-steps';
 import type { AuditJobStartView } from '../../../server/audit-job-functions';
 import { scenarioAutoDraftPreviewFn } from '../../../server/scenario-autodraft-functions';
-import { scenarioListPageFn, type ScenarioSummaryView } from '../../../server/scenario-functions';
+import { scenarioListPageFn } from '../../../server/scenario-functions';
 
 export const Route = createFileRoute('/scenarios/$profileId/')({
   loader: async ({ params }) => {
@@ -33,15 +33,10 @@ export const Route = createFileRoute('/scenarios/$profileId/')({
 const text = LOCAL_UI_SCENARIO_TEXT;
 
 
-/** 承認の期限の表示（有効な承認の期限。ないときは最後の承認の期限。承認の記録がなければ「なし」）。 */
-const expiryText = (scenario: ScenarioSummaryView): string => {
-  const expiresAt = scenario.status?.expiresAt ?? scenario.lastApprovalExpiresAt;
-  return expiresAt === null ? text.noExpiry : formatDateTime(expiresAt);
-};
-
 /**
  * シナリオの一覧（Task 28 の設計書 4.6。T28e）。プロファイルの詳細から開く。シナリオごとの種類、画面と送信先、状態（下書き・承認済み・要再承認
- * （理由の一覧）・期限切れ・撤回済み）、承認の期限、上限と使った件数。書き込みを実行するボタンは置かない。
+ * （理由の一覧）・撤回済み）、1 回の件数と使った件数。書き込みを実行するボタンは置かない。LZ-3c: 承認の期限（承認は期限で切れない。L12b）と累積の上限は
+ * 出さない（判定に使わない名残の値を、上限に見せない）。
  */
 function ScenariosPage() {
   const page = Route.useLoaderData();
@@ -102,7 +97,6 @@ function ScenariosPage() {
                     <th scope="col" className="nowrap">{columns.kind}</th>
                     <th scope="col">{columns.page}</th>
                     <th scope="col">{columns.state}</th>
-                    <th scope="col">{columns.expiresAt}</th>
                     <th scope="col">{columns.limits}</th>
                     <th scope="col">{columns.inputRules}</th>
                     <th scope="col" className="nowrap">{columns.operations}</th>
@@ -119,9 +113,8 @@ function ScenariosPage() {
                         {/* PL-5（設計書 3 章の 2）: 送り先・サイトのアドレス・何回目の変更かは出さない（画面のアドレスの後ろだけ）。 */}
                         <td className="cell-break">{scenario.pagePath}</td>
                         <td><ScenarioStatus status={scenario.status} showDescriptions={false} /></td>
-                        <td>{expiryText(scenario)}</td>
                         <td data-testid="scenario-limits-used">
-                          {text.limitsValue(formatCount(scenario.limits.maxCreatesPerRun), formatCount(scenario.used), formatCount(scenario.limits.maxCumulativeCreates))}
+                          {text.limitsValue(formatCount(scenario.limits.maxCreatesPerRun), formatCount(scenario.used))}
                         </td>
                         <td data-testid="scenario-input-rule-state" data-state={scenario.inputRuleState}>
                           <span className={toneClass(inputRules.tone)}>{inputRules.label}</span>

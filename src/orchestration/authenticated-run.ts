@@ -3,9 +3,9 @@
 // - 指定の形と検査（`RunAuthentication`、`assertRunAuthentication`）。
 // - factory に渡す指定（`authenticatedContextOptions`。絞り込みの関数に、許可 Origin を包む）。
 // - 認証つきの Run の有効な設定（`authenticatedRunConfig`。Interaction を行わないことを `audit.interactions: false` で記録する。4.7）。
-// - 読み込みの事前の判定（`isRunNavigationBlocked`。CCX-10）: main frame のナビゲーションの GET として、要求の判定の owner の
-//   `classifyPassiveRequest` に、許可 Origin と `auditExclusions` の口を渡し、あわせてセッションの切れの path を見る。止める範囲は引数で選ぶ
-//   （`AUDIT_EXCLUSION`: 監査の段の除外の BLOCK だけ。巡回の候補の除外。`ANY_BLOCK`: どの BLOCK でも。READ の確かめの事前の判定
+// - 読み込みの事前の判定（`isRunNavigationBlocked`。CCX-10）: 点検の範囲の判定（`src/safety/request-policy.ts` の `isOutsideAuditScope`・`isAuditExcludedUrl`）に、
+//   許可 Origin と `auditExclusions` を渡し、あわせてセッションの切れの path を見る。止める範囲は引数で選ぶ
+//   （`AUDIT_EXCLUSION`: 監査の段の除外だけ。巡回の候補の除外。`ANY_BLOCK`: 許可 Origin の外も。READ の確かめの事前の判定
 //   `isReadUrlAllowed`）。巡回と READ の確かめの両方が、ここを使う（同じ意味の判定を書き写さない）。
 // - 巡回の候補から外す URL の判定（`isExcludedCrawlCandidate`。上の判定を `AUDIT_EXCLUSION` で呼ぶ。新しく書かない）。
 // - セッションの切れの判定（`isSessionLostUrl`。読み込みの後の判定 `sessionLostUrlOf` は Page Auditor とワーカーの流れが共用する。CCX-6）と、
@@ -28,11 +28,6 @@ import { ConfigError } from '../config/config-error.js';
 import type { AuditConfig } from '../config/types.js';
 import type { IncompleteReason, IncompleteReasonCode } from '../core/contracts.js';
 import {
-  BLOCKED_AUDIT_EXCLUSION_REASONS,
-  MAX_SESSION_LOSS_BLOCKED_REQUESTS,
-  MAX_SESSION_LOSS_KEY_SHAPES,
-  MAX_SESSION_LOSS_PATH_LENGTH,
-  MAX_SESSION_LOSS_REDIRECT_PATHS,
   SESSION_LOSS_KEY_CHANGES,
   SESSION_LOSS_ORIGIN_KINDS,
   SESSION_LOSS_STORAGE_KINDS,
@@ -51,10 +46,17 @@ import { createSha256Fingerprint } from '../core/ids.js';
 import { saturatingIncrement } from '../core/saturating-count.js';
 import { sortedKeysJsonOf } from '../core/sorted-keys-json.js';
 import { isOriginInAllowedOrigins } from '../crawl/normalize-url.js';
+import { crawlUrlHasDestructiveWord } from '../discovery/destructive-action.js';
 import { loginObservedQueryOf, newStorageKeyShapesOf } from '../discovery/login-observation.js';
 import { recordedRequestPathOf } from '../safety/login-stage-blocked-requests.js';
 import { isSecretUrlQueryParameterName } from '../safety/redact.js';
-import { classifyPassiveRequest, type AuditExclusionPolicy } from '../safety/request-policy.js';
+import {
+  NOTIFICATION_DISMISSAL_BLOCK_REASON,
+  isAuditExcludedUrl,
+  isOutsideAuditScope,
+  type AuditExclusionPolicy,
+  type RequestResourceType,
+} from '../safety/request-policy.js';
 import type { SafetyLedger } from '../safety/safety-ledger.js';
 import type { RunCheckpointAuthentication } from './run-checkpoint.js';
 
@@ -63,7 +65,9 @@ import type { RunCheckpointAuthentication } from './run-checkpoint.js';
  * - `initialState`: ログインの段で取り出した認証済みの状態（メモリだけ。ファイルに書かない）。
  * - `approvedTestOrigins`: 状態を渡してよい Origin（認証の設定の `approvedTestOrigins`）。設定の `site.allowedOrigins` に含まれなければならない。
  * - `auditExclusions`: 監査の段の除外（認証の設定の `excludedPaths`、`auditPathPrefixes`、既定の危険な語）。
- * - `sessionLostPathPrefix`: セッションの切れと判定する path の前方一致（認証の設定の `sessionLostCondition`。`/` で始まる）。
+ * - `sessionLostPathPrefix`: セッションの切れと判定する path の前方一致（認証の設定の `sessionLostCondition`。`/` で始まる）。NL-2（設計書
+ *   `2026-11-06-beaksight-no-login-test-site-design.md` 3.2 の 4）: ログインのないテスト用のサイトの Run は null（セッションの切れを判定しない。`"/"` を
+ *   代わりに渡すと、どの path も切れになるので使わない。`src/control/read-check-page-path.ts` の null の扱いと同じ）。
  * - `filterState`: 状態を絞る関数（認証の設定の owner の `filterAuthenticatedState`。2 つ目の引数に `approvedTestOrigins` を渡す。DEF-139: 3 つ目の
  *   引数に、監査の段の口の承認したサービスの Origin（口がなければ空）を渡す）。
  * - `auditStage`（T35a。Task 35 の設計書 3.2）: スクリプトで送るログインの監査の段の口（`AuditStageServiceRequests`）。スクリプトで送るログインの Run
@@ -74,7 +78,7 @@ export interface RunAuthentication {
   readonly initialState: AuthenticatedStorageState;
   readonly approvedTestOrigins: readonly string[];
   readonly auditExclusions: AuditExclusionPolicy;
-  readonly sessionLostPathPrefix: string;
+  readonly sessionLostPathPrefix: string | null;
   readonly filterState: (
     state: AuthenticatedStorageState,
     approvedTestOrigins: readonly string[],
@@ -86,6 +90,18 @@ export interface RunAuthentication {
    * factory の指定へ写し（`authenticatedContextOptions`）、factory が Context の状態を読み直したときに使う（鍵がなければセッションの切れ）。
    */
   readonly sessionKeyPresent?: ((state: AuthenticatedStorageState) => boolean) | undefined;
+  /**
+   * DEF-233（設計書 `2026-11-09-beaksight-discovery-token-refresh-design.md` 2.2）: ローカル ストレージの鍵（Origin と名前）が、ログインの成功の鍵の形に当たるか
+   * （`sessionKeyPresent` と同じく、ワーカーが認証の設定の成功の鍵の形で作る）。factory の指定へ写し、probe を行った Context の次の画面へ渡す状態に、
+   * 閉じる前のこの鍵の値だけを重ねる。
+   */
+  readonly sessionKeyName?: ((origin: string, name: string) => boolean) | undefined;
+  /**
+   * DEF-233 fix round 1（設計書 2.3 の 4）: セッションが切れたときに、自動でログインし直せる（自動ログインのプロファイル。DEF-200）。真のときだけ、承認したサービスの
+   * Origin の 401 で描けなかった画面をセッションの切れにする（`serviceUnauthorizedSessionLostDetailOf`）。省略は偽（手動のログインは、今のとおり
+   * `SERVICE_READ_REFUSED` を付けて続ける）。
+   */
+  readonly automatedRelogin?: boolean | undefined;
 }
 
 /**
@@ -163,8 +179,9 @@ export function assertRunAuthentication(value: unknown, config: AuditConfig): as
   ) {
     throw new TypeError('RunCoordinator authentication requires audit exclusions');
   }
-  if (typeof sessionLostPathPrefix !== 'string' || !sessionLostPathPrefix.startsWith(PATH_PREFIX_START)) {
-    throw new TypeError('RunCoordinator authentication session lost path prefix must start with "/"');
+  // NL-2: null（ログインのないテスト用のサイト。セッションの切れを判定しない）か、`/` で始まる path。
+  if (sessionLostPathPrefix !== null && (typeof sessionLostPathPrefix !== 'string' || !sessionLostPathPrefix.startsWith(PATH_PREFIX_START))) {
+    throw new TypeError('RunCoordinator authentication session lost path prefix must be null or start with "/"');
   }
   if (!isStringArray(approvedTestOrigins) || approvedTestOrigins.length === 0) {
     throw new TypeError('RunCoordinator authentication requires approved test origins');
@@ -178,6 +195,12 @@ export function assertRunAuthentication(value: unknown, config: AuditConfig): as
   }
   if (value.sessionKeyPresent !== undefined && typeof value.sessionKeyPresent !== 'function') {
     throw new TypeError('RunCoordinator authentication session key check must be a function');
+  }
+  if (value.automatedRelogin !== undefined && typeof value.automatedRelogin !== 'boolean') {
+    throw new TypeError('RunCoordinator authentication automated relogin must be a boolean');
+  }
+  if (value.sessionKeyName !== undefined && typeof value.sessionKeyName !== 'function') {
+    throw new TypeError('RunCoordinator authentication session key name check must be a function');
   }
   assertNoSecretAllowedQueryParameters(config);
 }
@@ -216,6 +239,10 @@ export function authenticatedContextOptions(authentication: RunAuthentication): 
     ...(auditStage === undefined ? {} : { auditStage }),
     // T35c: ログインの状態の鍵があるかの判定（あるときだけ）。
     ...(authentication.sessionKeyPresent === undefined ? {} : { sessionKeyPresent: authentication.sessionKeyPresent }),
+    // DEF-233: 成功の鍵の名前の判定（あるときだけ）。
+    ...(authentication.sessionKeyName === undefined ? {} : { sessionKeyName: authentication.sessionKeyName }),
+    // DEF-220: 承認したテストの Origin（送らずに観察する probe の口が、テスト用のサイト自身の API の区分に当てる。ログインのある形とない形の両方）。
+    approvedTestOrigins,
   });
 }
 
@@ -228,25 +255,20 @@ export function authenticatedRunConfig(config: AuditConfig): AuditConfig {
   return { ...config, audit: { ...config.audit, interactions: false } };
 }
 
-/** 監査の段の除外の BLOCK の理由（要求の判定の結果が、除外によるものかを見分ける。一覧の owner は core）。 */
-const AUDIT_EXCLUSION_REASONS: readonly string[] = BLOCKED_AUDIT_EXCLUSION_REASONS;
-
-/** 読み込みの事前の判定に使う、main frame のナビゲーションの GET の事実（要求の判定の入力の形）。 */
-const RUN_NAVIGATION_METHOD = 'GET';
-
 /**
- * 読み込みの事前の判定で止める、要求の判定の BLOCK の範囲（閉じた一覧。CCX-10）。
- * - `AUDIT_EXCLUSION`: 監査の段の除外の理由（`BLOCKED_AUDIT_EXCLUSION_REASONS`）の BLOCK だけ（巡回の候補の除外。ほかの BLOCK は、読み込みの
- *   ときに Guard が止めて記録する）。
- * - `ANY_BLOCK`: どの BLOCK でも（READ の確かめの事前の判定。読まずに `READ_BLOCKED_BY_POLICY` にする。fail-closed）。
+ * 読み込みの事前の判定で止める範囲（閉じた一覧。CCX-10）。
+ * - `AUDIT_EXCLUSION`: 監査の段の除外（読まないパス・読む範囲の外・危険な語。`isAuditExcludedUrl`）だけ（巡回の候補の除外。許可 Origin の外は、巡回の候補の
+ *   選び方が別に外す）。
+ * - `ANY_BLOCK`: 点検の範囲の外のどれでも（許可 Origin の外を含む。`isOutsideAuditScope`。READ の確かめの事前の判定。読まずに `READ_BLOCKED_BY_POLICY` にする。
+ *   fail-closed）。
  */
 export const RUN_NAVIGATION_BLOCK_SCOPES = Object.freeze(['AUDIT_EXCLUSION', 'ANY_BLOCK'] as const);
 export type RunNavigationBlockScope = (typeof RUN_NAVIGATION_BLOCK_SCOPES)[number];
 
 /**
- * 読み込みの事前の判定（CCX-10。巡回の候補の除外と、READ の確かめの事前の判定の共通の部品）。次のどちらかなら真（読み込まない）。
- * - 要求の判定の owner の `classifyPassiveRequest` に、main frame のナビゲーションの GET として、許可 Origin と `auditExclusions` の口を渡し、
- *   `scope` の範囲の BLOCK になる（Guard と同じ判定）。
+ * 読み込みの事前の判定（CCX-10。巡回の候補の除外と、READ の確かめの事前の判定の共通の部品。BeakSight 自身の移動の前の判定）。次のどちらかなら真（読み込まない）。
+ * - `scope` の範囲の点検の範囲の外に当たる。SD-2（設計書 `2026-11-16-beaksight-action-based-delete-guard-design.md` 2.4）: 要求の判定（Guard）は main frame の移動を
+ *   除外で止めなくなったので、要求の判定を通さず、範囲の判定（`isOutsideAuditScope`・`isAuditExcludedUrl`）を直に使う。
  * - セッションの切れの path に当たる（ログインの画面。読むと、セッションの切れと取り違えて Run を止めるため）。
  */
 export function isRunNavigationBlocked(
@@ -255,32 +277,50 @@ export function isRunNavigationBlocked(
   authentication: Pick<RunAuthentication, 'auditExclusions' | 'sessionLostPathPrefix'>,
   scope: RunNavigationBlockScope,
 ): boolean {
-  const decision = classifyPassiveRequest(
-    { kind: 'HTTP', method: RUN_NAVIGATION_METHOD, url, isNavigationRequest: true, isMainFrame: true },
-    allowedOrigins,
-    { auditExclusions: authentication.auditExclusions },
-  );
-  const blocked = decision.action === 'BLOCK' && (scope === 'ANY_BLOCK' || AUDIT_EXCLUSION_REASONS.includes(decision.reason));
+  const blocked = scope === 'ANY_BLOCK'
+    ? isOutsideAuditScope(url, allowedOrigins, authentication.auditExclusions)
+    : isAuditExcludedUrl(url, allowedOrigins, authentication.auditExclusions);
   return blocked || isSessionLostUrl(url, authentication.sessionLostPathPrefix);
+}
+
+/**
+ * SD-2（設計書 `2026-11-16-beaksight-action-based-delete-guard-design.md` 2.4 の「main frame の文書の移動」）: 読み込んだ画面の main frame の URL が点検の範囲の外か
+ * （許可 Origin の外、監査の段の除外、巡回の移る先の URL の語 `crawlUrlHasDestructiveWord`）。範囲の外へ移った画面は点検しない（`navigatePage` の口）。セッションの
+ * 切れの path は外にしない（読み込みの後のセッションの切れの判定に任せる）。`authentication` が null なら公開監査（除外の口なし）。
+ */
+export function isOutsideRunAuditScope(
+  url: string,
+  allowedOrigins: ReadonlySet<string>,
+  authentication: Pick<RunAuthentication, 'auditExclusions' | 'sessionLostPathPrefix'> | null,
+): boolean {
+  if (authentication !== null && isSessionLostUrl(url, authentication.sessionLostPathPrefix)) {
+    return false;
+  }
+  return isOutsideAuditScope(url, allowedOrigins, authentication?.auditExclusions) || crawlUrlHasDestructiveWord(url);
 }
 
 /**
  * 巡回の候補から外す URL か（Task 25 の設計書 4.2、4.7。T25c）。読み込みの事前の判定（`isRunNavigationBlocked`）を、監査の段の除外の範囲
  * （`AUDIT_EXCLUSION`）で呼ぶ。監査の段の除外に当たるか、セッションの切れの path に当たれば真。
+ * SD-1（設計書 `2026-11-16-beaksight-action-based-delete-guard-design.md` 2.3）: 巡回の移る先の URL の語（`crawlUrlHasDestructiveWord`）に当たる URL も真（移らない）。
  */
 export function isExcludedCrawlCandidate(
   url: string,
   allowedOrigins: ReadonlySet<string>,
   authentication: Pick<RunAuthentication, 'auditExclusions' | 'sessionLostPathPrefix'>,
 ): boolean {
-  return isRunNavigationBlocked(url, allowedOrigins, authentication, 'AUDIT_EXCLUSION');
+  return isRunNavigationBlocked(url, allowedOrigins, authentication, 'AUDIT_EXCLUSION') || crawlUrlHasDestructiveWord(url);
 }
 
 /**
  * URL の path が、セッションの切れの path の前方一致（`prefix`）に当たるか（Task 25 の設計書 4.3）。解析できない URL は偽（ページの中の
- * `about:blank` などは、セッションの切れの印にしない）。
+ * `about:blank` などは、セッションの切れの印にしない）。NL-2: `prefix` が null（ログインのないテスト用のサイト）なら、いつも偽（判定しない）。
+ * この判定を通る呼び出し（読み込みの事前の判定・読み込みの後の判定・証拠の組み立て）は、すべて同じく判定しない。
  */
-export function isSessionLostUrl(url: string, prefix: string): boolean {
+export function isSessionLostUrl(url: string, prefix: string | null): boolean {
+  if (prefix === null) {
+    return false;
+  }
   try {
     return new URL(url).pathname.startsWith(prefix);
   } catch {
@@ -293,11 +333,19 @@ export function isSessionLostUrl(url: string, prefix: string): boolean {
  * - main frame の最後の URL（`page.url()`）の path が、セッションの切れの path の前方一致（`prefix`）に当たれば、その URL。
  * - 当たらなければ、その Context の Guard が監査の段の除外で止めた main frame の移動の先（Safety Ledger の `blockedAuditExclusions` の、
  *   `mainFrameNavigation` が真の記録の URL）のうち、最初に当たるもの（ログインの画面が読む範囲の外で、Guard がリダイレクトを止めた場合）。
+ * - fix round 4・5（通知の枠の設計書 3.2.3 の 1、3.2.4 の 2）: 許可 Origin（`allowedOrigins`）を渡したときだけ、通知の枠の閉じる押下の期間に Guard が止めた
+ *   文書の移動の先のうち、許可 Origin への移動も見る。渡さない呼び出し（ワーカーの 1 画面の読み込みなど）は見ない（その画面は、止めた移動の理由で記録される）。
+ *   RB-14a（X11）: 見るだけの点検の押す期間の移動は止めないので、page が渡す移動の行き先（`pressNavigationTargets`）の許可 Origin への移動も見る。
  * - どれも当たらなければ `null`。
- * 当たった URL は伏せ字の前の値なので、記録や知らせに使う側が伏せる。
+ * 当たった URL は伏せ字の前の値なので、記録や知らせに使う側が伏せる。NL-2: `prefix` が null なら、いつも `null`（`isSessionLostUrl`）。
  */
-export function sessionLostUrlOf(page: Pick<Page, 'url'>, ledger: Pick<SafetyLedger, 'snapshot'>, prefix: string): string | null {
-  return sessionLostLandingOf(page, ledger, prefix)?.url ?? null;
+export function sessionLostUrlOf(
+  page: SessionLossPage,
+  ledger: Pick<SafetyLedger, 'snapshot'>,
+  prefix: string | null,
+  allowedOrigins?: readonly string[],
+): string | null {
+  return sessionLostLandingOf(page, ledger, prefix, allowedOrigins)?.url ?? null;
 }
 
 /**
@@ -332,11 +380,12 @@ export interface SessionLossCheck {
  */
 export function sessionLostUrlAt(
   point: SessionLossCheckPoint,
-  page: Pick<Page, 'url'>,
+  page: SessionLossPage,
   ledger: Pick<SafetyLedger, 'snapshot'>,
-  prefix: string,
+  prefix: string | null,
+  allowedOrigins?: readonly string[],
 ): SessionLossCheck | null {
-  const url = sessionLostUrlOf(page, ledger, prefix);
+  const url = sessionLostUrlOf(page, ledger, prefix, allowedOrigins);
   return url === null ? null : Object.freeze({ point, url });
 }
 
@@ -348,36 +397,78 @@ export function sessionLossStageDetailOf(stage: string, point: SessionLossCheckP
   return point === SESSION_LOSS_CHECK_POINTS.navigation ? stage : `${stage}:${point}`;
 }
 
+/**
+ * セッションの切れを確かめる page（`url()`）。RB-14a（X11）: 監査の読み込みの口は、見るだけの点検の押す期間に Guard が止めずに数えた移動の行き先
+ * （`pressNavigationTargets`）も渡す（止めた移動の記録の代わり。ワーカーの page は渡さない）。
+ */
+export type SessionLossPage = Pick<Page, 'url'> & { readonly pressNavigationTargets?: () => readonly string[] };
+
 /** 行き着いた先と、どこで見たか（`sessionLostUrlOf` の判定の順。当たらなければ `null`）。 */
 const sessionLostLandingOf = (
-  page: Pick<Page, 'url'>,
+  page: SessionLossPage,
   ledger: Pick<SafetyLedger, 'snapshot'>,
-  prefix: string,
+  prefix: string | null,
+  allowedOrigins?: readonly string[],
 ): { readonly url: string; readonly landedBy: SessionLossLandedBy } | null => {
-  if (isSessionLostUrl(page.url(), prefix)) {
+  // NL-2: セッションの切れの path がなければ判定しない（下の止めた移動の先も見ない）。
+  if (prefix === null) {
+    return null;
+  }
+  // SD-2（設計書 `2026-11-16-beaksight-action-based-delete-guard-design.md` 2.4）: Guard は許可 Origin の外への main frame の移動を止めないので、許可 Origin を渡した
+  // 呼び出しでは、今の URL も許可 Origin のものだけを見る（ほかの Origin のログインの画面へ移っても、セッションの切れにしない。fix round 5 と揃える）。
+  if (isSessionLostUrl(page.url(), prefix) && (allowedOrigins === undefined || isAllowedOriginUrl(page.url(), allowedOrigins))) {
     return { url: page.url(), landedBy: 'PAGE_URL' };
   }
-  const blocked = (ledger.snapshot().blockedAuditExclusions?.events ?? [])
+  const snapshot = ledger.snapshot();
+  const blocked = (snapshot.blockedAuditExclusions?.events ?? [])
     .find(({ mainFrameNavigation, url }) => mainFrameNavigation && isSessionLostUrl(url, prefix));
-  return blocked === undefined ? null : { url: blocked.url, landedBy: 'BLOCKED_REDIRECT' };
+  if (blocked !== undefined) {
+    return { url: blocked.url, landedBy: 'BLOCKED_REDIRECT' };
+  }
+  // fix round 4（通知の枠の設計書 3.2.3 の 1）: 通知の枠の閉じる押下の期間に Guard が止めた文書の移動の先も、止めた転送と同じく見る（移動は届けていない）。
+  // fix round 5（設計書 3.2.4 の 2）: 許可 Origin への移動だけを見る（前からの止めた転送の経路と揃える。Origin の照合は `isOriginInAllowedOrigins`）。
+  if (allowedOrigins === undefined) {
+    return null;
+  }
+  const pressBlocked = snapshot.blockedRequests
+    .find(({ reason, resourceType, url }) => reason === NOTIFICATION_DISMISSAL_BLOCK_REASON && resourceType === DOCUMENT_RESOURCE_TYPE
+      && isAllowedOriginUrl(url, allowedOrigins) && isSessionLostUrl(url, prefix));
+  if (pressBlocked !== undefined) {
+    return { url: pressBlocked.url, landedBy: 'BLOCKED_REDIRECT' };
+  }
+  // RB-14a（X11）: 見るだけの点検の押す期間の移動は止めないので、Guard が数えた行き先を見る（移った先として `PAGE_URL`）。
+  const pressMoved = (page.pressNavigationTargets?.() ?? []).find((url) => isAllowedOriginUrl(url, allowedOrigins) && isSessionLostUrl(url, prefix));
+  return pressMoved === undefined ? null : { url: pressMoved, landedBy: 'PAGE_URL' };
 };
+
+/** fix round 5: URL の Origin が許可 Origin か（読めない URL は偽）。 */
+const isAllowedOriginUrl = (url: string, allowedOrigins: readonly string[]): boolean => {
+  try {
+    return isOriginInAllowedOrigins(allowedOrigins, new URL(url).origin);
+  } catch {
+    return false;
+  }
+};
+
+/** fix round 4: 文書の要求の種類（止めた要求の記録の `resourceType`）。 */
+const DOCUMENT_RESOURCE_TYPE = 'document' satisfies RequestResourceType;
 
 // ---------------------------------------------------------------------------------------------------------------
 // セッションの切れの証拠（DEF-138。設計書 `2026-10-19-beaksight-session-loss-evidence-design.md` 2.1）
 // ---------------------------------------------------------------------------------------------------------------
 // 判定（`sessionLostUrlOf`）と同じ owner に置く唯一の部品。Page Auditor（監査）とワーカーの 1 画面の読み込み（発見・READ の確かめ）が共用する。
-// - 経路の記録（`observeSessionLossNavigation`）: 読み込みの前に page に付け、main frame の文書の要求の URL を上限（`MAX_SESSION_LOSS_REDIRECT_PATHS`）まで
-//   メモリに持つ（リダイレクトの各段と、クライアントの側の移動の文書の要求。要求を足さない）。
+// - 経路の記録（`observeSessionLossNavigation`）: 読み込みの前に page に付け、main frame の文書の要求の URL を残らず（LZ-3a: 数の上限は
+//   ない）メモリに持つ（リダイレクトの各段と、クライアントの側の移動の文書の要求。要求を足さない）。
 // - 証拠の組み立て（`sessionLossEvidenceOf`）: 値を持たない形にする。path は止めた一覧と同じ決まり（`recordedRequestPathOf`。値に見える区切りを伏せ、
 //   上限の長さで切る）、query はログインの段の観察と同じ名前の記録（`loginObservedQueryOf` の名前だけ。値に見える名前は伏せる）。止めた要求は
-//   Safety Ledger の記録の形ごとに数える（上限はログインの段の止めた一覧と同じ）。鍵の名前の違いは、factory が残した名前（`AuthenticatedContextStateNames`）
+//   Safety Ledger の記録の形ごとに数える（LZ-3a: 行の数の上限はない）。鍵の名前の違いは、factory が残した名前（`AuthenticatedContextStateNames`）
 //   から、ログインの段の観察と同じ接頭辞と接尾辞の案（`storageKeyShapeOf`。秘密に見える名前の端は出さない）と数にする。
 // - Origin の区別は、承認したサービスの Origin、許可 Origin（Origin の照合の owner `isOriginInAllowedOrigins`）、そのほかの順に決める。
 
 /** 経路の記録の写し（URL は伏せ字の前の値なので、証拠の組み立てだけに渡す）。 */
 export interface SessionLossNavigationRecord {
   readonly urls: readonly string[];
-  /** 上限を超えて記録しなかった数。 */
+  /** 記録しなかった数（LZ-3a: 数の上限はないので、いつも 0。証拠の `redirectPathsOmitted` の形のために残す）。 */
   readonly omitted: number;
 }
 
@@ -389,20 +480,14 @@ export interface SessionLossNavigationObserver {
 }
 
 /**
- * 読み込みの前に `page` に付け、main frame のナビゲーションの要求の URL を、上限まで記録する（DEF-138。値は読まない。要求を出さない）。例外を投げない。
+ * 読み込みの前に `page` に付け、main frame のナビゲーションの要求の URL を、残らず記録する（DEF-138。値は読まない。要求を出さない）。例外を投げない。
  */
 export function observeSessionLossNavigation(page: Page): SessionLossNavigationObserver {
   const urls: string[] = [];
-  let omitted = 0;
   let disposed = false;
   const onRequest = (request: Request): void => {
-    if (!isMainFrameNavigationRequest(page, request)) {
-      return;
-    }
-    if (urls.length < MAX_SESSION_LOSS_REDIRECT_PATHS) {
+    if (isMainFrameNavigationRequest(page, request)) {
       urls.push(request.url());
-    } else {
-      omitted = saturatingIncrement(omitted);
     }
   };
   try {
@@ -411,7 +496,7 @@ export function observeSessionLossNavigation(page: Page): SessionLossNavigationO
     disposed = true;
   }
   return Object.freeze({
-    snapshot: (): SessionLossNavigationRecord => Object.freeze({ urls: Object.freeze([...urls]), omitted }),
+    snapshot: (): SessionLossNavigationRecord => Object.freeze({ urls: Object.freeze([...urls]), omitted: 0 }),
     dispose: (): void => {
       if (disposed) {
         return;
@@ -432,11 +517,12 @@ export interface SessionLossEvidenceInput {
   readonly stage: string | null;
   /** 頼んだ URL。 */
   readonly requestedUrl: string;
-  /** 読み込んだ page（閉じた後でもよい。`url()` だけを読む）。 */
-  readonly page: Pick<Page, 'url'>;
+  /** 読み込んだ page（閉じた後でもよい。`url()` と、あれば押す期間の移動の行き先だけを読む）。 */
+  readonly page: SessionLossPage;
   /** その Context の Safety Ledger（閉じた後の記録を含めてよい）。 */
   readonly ledger: Pick<SafetyLedger, 'snapshot'>;
-  readonly sessionLostPathPrefix: string;
+  /** セッションの切れの path（NL-2: ログインのないテスト用のサイトは null。そのときは行き着いた先を見ない）。 */
+  readonly sessionLostPathPrefix: string | null;
   /** 経路の記録（記録しなかったなら `null`）。 */
   readonly navigation: SessionLossNavigationRecord | null;
   /** factory が残した、その Context の状態の名前（なければ `null`）。 */
@@ -492,13 +578,12 @@ const parsedUrlOf = (url: string): URL | null => {
   }
 };
 
-/** path の表記（path と query の名前だけ。値は持たない）。 */
+/** path の表記（path と query の名前だけ。値は持たない）。URL-LEN: 長さでは切らない（前は 2,048 で切った）。 */
 const pathNotationOf = (url: URL): string => {
   const names = loginObservedQueryOf(url.searchParams)?.names ?? [];
-  const notation = names.length === 0
+  return names.length === 0
     ? recordedRequestPathOf(url.pathname)
     : `${recordedRequestPathOf(url.pathname)}${PATH_QUERY_START}${names.join(PATH_QUERY_SEPARATOR)}`;
-  return notation.slice(0, MAX_SESSION_LOSS_PATH_LENGTH);
 };
 
 /** http(s) の URL の path の表記（読めない URL と、http(s) でない URL は `null`）。 */
@@ -514,14 +599,14 @@ const blockedRequestRowsOf = (
 ): { readonly rows: readonly SessionLossBlockedRequest[]; readonly unlisted: number } => {
   const snapshot = ledger.snapshot();
   const exclusions = snapshot.blockedAuditExclusions;
-  // main frame の移動を止めた記録と監査の段の除外を先に、ページが出した要求を後に並べる（行き着いた先に近い記録を、上限で落とさない）。
+  // main frame の移動を止めた記録と監査の段の除外を先に、ページが出した要求を後に並べる（行き着いた先に近い記録を先に読める）。
   const events: readonly { readonly method: string; readonly url: string; readonly reason: SessionLossBlockedRequestReason }[] = [
     ...snapshot.blockedNavigations,
     ...(exclusions?.events ?? []),
     ...snapshot.blockedRequests,
   ];
   const rows = new Map<string, { -readonly [K in keyof SessionLossBlockedRequest]: SessionLossBlockedRequest[K] }>();
-  // 監査の段の除外のうち、Ledger の記録の上限で記録しなかった回数も数える。
+  // 監査の段の除外のうち、Ledger の記録の上限で記録しなかった回数も数える（LZ-3a: Ledger の事象の数の上限は撤廃したので、今は 0）。
   let unlisted = exclusions === undefined ? 0 : Math.max(0, exclusions.count - exclusions.events.length);
   for (const { method, url, reason } of events) {
     const parsed = parsedUrlOf(url);
@@ -534,10 +619,8 @@ const blockedRequestRowsOf = (
     const existing = rows.get(key);
     if (existing !== undefined) {
       existing.count = saturatingIncrement(existing.count);
-    } else if (rows.size < MAX_SESSION_LOSS_BLOCKED_REQUESTS) {
-      rows.set(key, { ...row, count: 1 });
     } else {
-      unlisted = saturatingIncrement(unlisted);
+      rows.set(key, { ...row, count: 1 });
     }
   }
   return { rows: Object.freeze([...rows.values()].map((row) => Object.freeze({ ...row }))), unlisted };
@@ -582,7 +665,7 @@ const namesByGroupOf = (names: AuthenticatedStateNames, resolver: OriginKindReso
 const changedNamesOf = (from: ReadonlySet<string>, to: ReadonlySet<string>): { readonly count: number; readonly shapes: readonly SessionLossKeyShape[] } => {
   const count = [...from].filter((name) => !to.has(name)).length;
   const shapes = count === 0 ? [] : newStorageKeyShapesOf([...to], [...from])?.shapes ?? [];
-  return { count, shapes: Object.freeze(shapes.slice(0, MAX_SESSION_LOSS_KEY_SHAPES).map(({ prefix, suffix }) => Object.freeze({ prefix, suffix }))) };
+  return { count, shapes: Object.freeze(shapes.map(({ prefix, suffix }) => Object.freeze({ prefix, suffix }))) };
 };
 
 /** 鍵の名前の違いの行（置き場所・Origin の区別・向きの順。違いのない組は入れない）。 */
@@ -616,7 +699,7 @@ const storageKeyChangesOf = (names: AuthenticatedContextStateNames | null, resol
  */
 export function sessionLossEvidenceOf(input: SessionLossEvidenceInput): SessionLossEvidence {
   const resolver = originKindResolverOf(input.allowedOrigins, input.serviceOrigins);
-  const landing = sessionLostLandingOf(input.page, input.ledger, input.sessionLostPathPrefix)
+  const landing = sessionLostLandingOf(input.page, input.ledger, input.sessionLostPathPrefix, input.allowedOrigins)
     ?? { url: input.page.url(), landedBy: 'PAGE_URL' as const };
   // 経路は、page で見た main frame の文書の要求に、Guard が止めた main frame の移動の先（page の事象に出ない。Ledger の記録の順）を続ける（同じ URL は
   // 重ねない）。
@@ -636,8 +719,8 @@ export function sessionLossEvidenceOf(input: SessionLossEvidenceInput): SessionL
     requestedPath: httpPathNotationOf(input.requestedUrl),
     landedPath: httpPathNotationOf(landing.url),
     landedBy: landing.landedBy,
-    redirectPaths: Object.freeze(redirectPaths.slice(0, MAX_SESSION_LOSS_REDIRECT_PATHS)),
-    redirectPathsOmitted: (input.navigation?.omitted ?? 0) + Math.max(0, redirectPaths.length - MAX_SESSION_LOSS_REDIRECT_PATHS),
+    redirectPaths: Object.freeze(redirectPaths),
+    redirectPathsOmitted: input.navigation?.omitted ?? 0,
     blockedRequests: blocked.rows,
     blockedRequestsUnlisted: blocked.unlisted,
     storageKeyChange: storageKeyChangesOf(input.stateNames, resolver),

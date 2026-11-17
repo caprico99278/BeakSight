@@ -28,7 +28,6 @@ import { apiRequestShapeOf } from '../../src/core/api-request-shape.js';
 import type { DiscoveryCandidate } from '../../src/discovery/candidate-contracts.js';
 import type { ReadCheckDefinition } from '../../src/discovery/read-check-contracts.js';
 import { observedSubmissionProbeOf, type SubmissionProbeInputField } from '../../src/discovery/submission-probe-contracts.js';
-import { EXECUTION_GRANT_REJECTION_DESCRIPTIONS } from '../../src/presentation/messages.js';
 import { sampleApprovalFacts } from '../helpers/approval-facts-sample.js';
 import { ALL_CONFIRMED, PROFILE_ID, candidateOf, sampleScenario } from './approval-samples.js';
 import { NO_JS_BINDING, SAMPLE_ORIGIN, sampleButton } from './discovery-candidate-samples.js';
@@ -184,10 +183,9 @@ describe('T41b: the grant of an API UPDATE', () => {
   // LG-3b: 送り方の判定 `apiWriteRejectionOf` は捨てた。T41a の契約のない API の更新が保存・読み出しで止まる確かめは
   // `scenario-api-update-contract.test.ts` の `rejects an API UPDATE %s (saved before T41a)`、契約のある API の更新に許可を出す確かめは
   // `tests/integration/api-update-grant-start.test.ts`。
-  it('has the reason of the filter not bound to the ledger id at the end of the closed list, with its description', () => {
+  it('has the reason of the filter not bound to the ledger id at the end of the closed list', () => {
     // MI-F1（設計書 4.7.1 の 5）: その後ろに、副作用の確認の済んでいない版の理由を足した（`execution-grant-side-effects.test.ts`）。
     expect(EXECUTION_GRANT_REJECTION_REASONS.at(-2)).toBe('SCENARIO_API_FILTER_NOT_BOUND_TO_LEDGER_ID');
-    expect(EXECUTION_GRANT_REJECTION_DESCRIPTIONS.SCENARIO_API_FILTER_NOT_BOUND_TO_LEDGER_ID.description.length).toBeGreaterThan(0);
   });
 });
 
@@ -371,7 +369,7 @@ describe('T41b: the IPC rules of an API UPDATE START', () => {
     ['a key that is not in the request', [{ key: 'other', value: 'o' }], true],
     ['a duplicate key', [{ key: 'email', value: 'a@example.invalid' }, { key: 'email', value: 'b@example.invalid' }], true],
     ['too many items (by the schema)', Array.from({ length: 65 }, (_value, index) => ({ key: `key${index}`, value: 'v' })), false],
-    ['a value over the length limit (by the schema)', [{ key: 'email', value: 'x'.repeat(8_193) }], false],
+    // L12b（設計書 `2026-11-09-beaksight-remove-limits-design.md` 6.2。S18）: 値の長さの上限（前は 8,192）を撤廃したので、長い値は拒まない。
     ['a value that is not a string (by the schema)', [{ key: 'email', value: null }], false],
     ['another property (by the schema)', [{ key: 'email', value: 'e', field: 'x' }], false],
     ['no list (by the schema)', undefined, false],

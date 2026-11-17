@@ -10,7 +10,6 @@ import {
 } from './contracts.js';
 import { safeErrorMessage } from './errors.js';
 import { isNonNegativeSafeInteger } from './guards.js';
-import { MAX_ERROR_MESSAGE_LENGTH } from './limits.js';
 import type { ArtifactSchemaName } from './schema-validator.js';
 
 export interface RunStatusInput {
@@ -125,6 +124,9 @@ export const derivePageAuditStatus = (viewportStatuses: readonly ViewportAuditSt
   return 'AUDITED';
 };
 
+/** EV-5: 監査しなかった（まだ見ていない）ページ・ビューポートの状態か（表示用モデルの、まだ見ていない数）。 */
+export const isUncollectedAuditStatus = (status: ViewportAuditStatus): boolean => status === 'SKIPPED';
+
 /**
  * collector が PARTIAL を返したか、例外を投げた場合の未完了の理由（Task 14〜17 の設計書 4.5.5）。
  * コードは `COLLECTOR_INCOMPLETE`、`detail` は `<段階>:<理由>`。`<理由>` は、collector の PARTIAL の理由か、
@@ -143,8 +145,7 @@ export const collectorIncompleteReason = (stage: PageAuditStage, reason: string)
 
 /**
  * `UNHANDLED_FAILURE` の理由（Task 14〜17 の設計書 4.5.5、5.6.1。CC-021。組み立ては、ここだけで行う）。
- * `detail` は `<場面>:<メッセージ>`。メッセージは `safeErrorMessage(error, MAX_ERROR_MESSAGE_LENGTH)` で、上限
- * （`MAX_ERROR_MESSAGE_LENGTH`）付きの文字列にする。場面は切り詰めない。制御文字は、取り除かずにそのまま残す
+ * `detail` は `<場面>:<メッセージ>`。メッセージは `safeErrorMessage(error)` の文字列にする（LZ-2: 切り詰めない）。制御文字は、取り除かずにそのまま残す
  * （Page Auditor と Run Coordinator の2か所の実装が、どちらもこの扱いだった）。
  * 空の場面は `RangeError` を投げる。結果は凍結する。
  */
@@ -152,14 +153,14 @@ export const unhandledFailureReason = (scene: string, error: unknown): Incomplet
   if (typeof scene !== 'string' || scene.length === 0) {
     throw new RangeError('unhandled failure scene must be a non-empty string');
   }
-  return Object.freeze({ code: 'UNHANDLED_FAILURE', detail: `${scene}:${safeErrorMessage(error, MAX_ERROR_MESSAGE_LENGTH)}` });
+  return Object.freeze({ code: 'UNHANDLED_FAILURE', detail: `${scene}:${safeErrorMessage(error)}` });
 };
 
 /** Rule の評価の失敗（`src/audit/rule-engine.ts` の `RuleEvaluationFailure` と同じ形。core から audit に依存しないため、形で受け取る）。 */
 export interface RuleEvaluationFailureLike {
   readonly code: Extract<IncompleteReasonCode, 'RULE_EVALUATION_FAILED'>;
   readonly ruleId: string;
-  /** 失敗の内容。Rule Engine が上限（`MAX_ERROR_MESSAGE_LENGTH`）付きにしたもの。 */
+  /** 失敗の内容。 */
   readonly message: string;
 }
 
@@ -172,8 +173,8 @@ export const ruleEvaluationFailureReason = (failure: RuleEvaluationFailureLike):
 
 /**
  * スキーマに合わない artifact の理由（Task 14〜17 の設計書 6.1.1、R15d の判断6。CC-022。組み立ては、ここだけで行う）。
- * コードは `REQUIRED_ARTIFACT_INVALID`、`detail` は `<スキーマ>:<ID>:<最初の誤り>`（誤りがなければ `invalid`）。`detail` の全体を
- * `safeErrorMessage` で上限（`MAX_ERROR_MESSAGE_LENGTH`）付きにする。Run Coordinator と `ArtifactWriter` が同じ artifact に
+ * コードは `REQUIRED_ARTIFACT_INVALID`、`detail` は `<スキーマ>:<ID>:<最初の誤り>`（誤りがなければ `invalid`）。`detail` は
+ * 切り詰めない（LZ-2）。Run Coordinator と `ArtifactWriter` が同じ artifact に
  * 同じ理由を作るので、コードと `detail` で重複を除ける。結果は凍結する。
  */
 export const requiredArtifactInvalidReason = (
@@ -183,5 +184,5 @@ export const requiredArtifactInvalidReason = (
 ): IncompleteReason =>
   Object.freeze({
     code: 'REQUIRED_ARTIFACT_INVALID',
-    detail: safeErrorMessage(`${schema}:${id}:${errors[0] ?? 'invalid'}`, MAX_ERROR_MESSAGE_LENGTH),
+    detail: `${schema}:${id}:${errors[0] ?? 'invalid'}`,
   });

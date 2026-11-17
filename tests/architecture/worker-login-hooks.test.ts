@@ -34,10 +34,12 @@
  *   命令（`CAPTURE_ONLY_CDP_COMMANDS`）を書く。その部品を参照する（import・文字列）のは、手動のログインの段（`authenticated-login.ts`）だけ（自動ログインの段・
  *   ほかのジョブの流れは参照しない。OP-1 の修正の 1 回目で、保存の口の process の組み立てを足した）。受け取った値を取り出す口（`CAPTURED_VALUE_ACCESSORS`）は、
  *   部品の外では閉じた一覧（`CAPTURED_VALUE_USERS`。保存の口だけ）のファイルだけが書く。部品は (q) の入力の操作を行わない（(q) の例外の一覧に入れない）。
+ * - RB-2（TEST-TIME-B の条件 2。前の `testWaits` と SLIM-2 の `auditSendCloseSettleMs` を寄せた）: (p) に、観察の窓の一式の口（`observationWindows`）が、
+ *   process の組み立てと一式を通す部品の閉じた一覧にだけ現れ、本番の Run の依存にないことを足した。本番の入口は (n) で渡さない。
  * - ファイル全体を 1 秒以内に終える。
  */
 import { describe, expect, it } from 'vitest';
-import { countIdentifier, findCallSites, loadSourceFiles, scanSource, type ScannedSource } from './source-scan.js';
+import { countIdentifier, findCallSites, loadLocalUiSourceFiles, loadSourceFiles, scanSource, type ScannedSource } from './source-scan.js';
 
 const WORKER_DIRECTORY = 'src/worker/';
 const ENTRY_PATH = 'src/worker/audit-worker.ts';
@@ -48,7 +50,32 @@ const HOOK_OWNER_PATHS: ReadonlySet<string> = new Set([
   'src/worker/automated-login.ts',
 ]);
 // FM-2: ジョブのブラウザを表示しないテストだけの口（`hideJobBrowser`。process の組み立てだけが持つ）を足した。
-const TEST_ONLY_HOOK_NAMES: readonly string[] = ['onLoginPageReady', 'launchLoginBrowser', 'launchAutomatedLoginBrowser', 'openCredentialStore', 'hideJobBrowser'];
+const TEST_ONLY_HOOK_NAMES: readonly string[] = [
+  'onLoginPageReady', 'launchLoginBrowser', 'launchAutomatedLoginBrowser', 'openCredentialStore', 'hideJobBrowser',
+];
+const PROCESS_ASSEMBLY_PATH = 'src/worker/audit-worker-process.ts';
+/**
+ * RB-2: 観察の窓の一式の差し込みの口の名前（TEST-TIME-B の `testWaits` と SLIM-2 の `auditSendCloseSettleMs` を寄せた）と、それが現れてよいファイル（閉じた一覧。
+ * process の組み立てと、一式を受けて通す部品だけ）。CLI の引数・設定・IPC・画面のサーバには現れない（`src/cli/` は Run の中核の依存の型だけ）。
+ */
+const OBSERVATION_WINDOWS_HOOK_NAME = 'observationWindows';
+const OBSERVATION_WINDOWS_USERS: readonly string[] = [
+  PROCESS_ASSEMBLY_PATH,
+  'src/cli/audit-run.ts',
+  'src/orchestration/run-coordinator.ts',
+  'src/orchestration/page-auditor.ts',
+  'src/browser/context-factory.ts',
+  'src/worker/discovery-run.ts',
+  // RB-8 の残り（RB-12 で行った）: 1 画面の読み込みの受け口（`GuardedPageLoadOptions.observationWindows`。進行中の要求の数え方の本文の猶予）。
+  'src/worker/worker-run-session.ts',
+  'src/worker/write-create-run.ts',
+  // RB-11: 書き込みの入力の部品の受け口（API の入力の見張りの指定、form の押す操作の引数、押した後の静まりの待ちの指定）。
+  'src/browser/api-write-submitter.ts',
+  'src/browser/write-form-submitter.ts',
+  'src/browser/form-submission-common.ts',
+  // RB-9: 知らせの枠を閉じる輪の受け口（`NotificationDismissalOptions.observationWindows`）。
+  'src/interaction/notification-overlay.ts',
+];
 const ENTRY_CALL = /\brunAuditWorkerProcess\s*\(([^)]*)\)/gu;
 const ENVIRONMENT_READS = /\bprocess\s*\.\s*(?:env|argv)\b/gu;
 /**
@@ -79,7 +106,23 @@ const INPUT_OPERATION_OWNERS: ReadonlySet<string> = new Set([
  * Interaction の Guard が止める）。ここでも `click` のほかの入力の操作は許さない。
  */
 const CLICK_ONLY_EXCEPTION_PATH = 'src/interaction/isolated-auditor.ts';
+/**
+ * (q) `click` だけの例外（DEF-210。通知の枠の設計書 3.2）: 通知の枠の閉じるボタンを押す部品（値を入れない。押した後の送信は、その Context の Guard が監査の段の
+ * 判定で扱う）。ここでも `click` のほかの入力の操作は許さない。
+ */
+const NOTIFICATION_CLICK_EXCEPTION_PATH = 'src/interaction/notification-overlay.ts';
+const CLICK_ONLY_EXCEPTION_PATHS: ReadonlySet<string> = new Set([CLICK_ONLY_EXCEPTION_PATH, NOTIFICATION_CLICK_EXCEPTION_PATH]);
 const CLICK_OPERATION = /^\.\s*click\s*\($/u;
+/**
+ * (q) キーを押すことだけの例外（EV-4。設計書 `2026-11-16-beaksight-finding-evidence-design.md` 3.4）: 横にスクロールする領域の実操作（Tab で届くか・矢印の
+ * キーで動くか）。値を入れる要素は起点にせず、そこへフォーカスが来たら止める。押してよいキーは `KEY_PRESS_ALLOWED_KEYS` だけ（文字・Enter・Space は許さない）。
+ * 押す所は `.keyboard.press(key)` の 1 か所で、その引数は、ファイルの中のキーの一覧 `SCROLLABLE_REGION_KEYS` の型（一覧の外は押さずに投げる）。
+ */
+const KEY_PRESS_ONLY_EXCEPTION_PATH = 'src/evidence/reveal-and-capture.ts';
+const KEY_PRESS_OPERATION = /^(?:\.\s*press\s*\(|keyboard)$/u;
+const KEY_PRESS_ALLOWED_KEYS: readonly string[] = ['Tab', 'Shift+Tab', 'ArrowRight', 'ArrowLeft', 'ArrowDown', 'ArrowUp'];
+const KEY_PRESS_KEY_LIST = /\bSCROLLABLE_REGION_KEYS\s*=\s*Object\.freeze\(\[([^\]]*)\]/u;
+const KEY_PRESS_CALL = /\.\s*press\s*\(([^)]*)\)/gu;
 /** (x) 入力の部品を参照してよいファイル（自動ログインの段）。 */
 const AUTOMATED_LOGIN_PATH = 'src/worker/automated-login.ts';
 const MANUAL_LOGIN_PATH = 'src/worker/authenticated-login.ts';
@@ -177,6 +220,15 @@ describe('Worker login hooks (T25d) and the single form input owner (T26d-1)', (
       .filter(({ path }) => !HOOK_OWNER_PATHS.has(path))
       .flatMap(({ path, bare }) => TEST_ONLY_HOOK_NAMES.filter((name) => new RegExp(`\\b${name}\\b`, 'u').test(bare)).map((name) => `${path}: ${name}`));
     expect(leaks).toEqual([]);
+    // RB-2（TEST-TIME-B の条件 2）: 観察の窓の一式の口は、閉じた一覧のファイルにだけ現れる（画面のサーバも含めて）。本番の入口は (n) のとおり口を渡さず、本番の Run の
+    // 依存（`PRODUCTION_RUN_DEPENDENCIES`）にもないので、本番の値（省略時の既定）で動く。
+    const windowsUsers = [...SOURCE_FILES, ...loadLocalUiSourceFiles()]
+      .filter(({ bare }) => countIdentifier(bare, OBSERVATION_WINDOWS_HOOK_NAME) > 0).map(({ path }) => path).sort();
+    expect(windowsUsers).toEqual([...OBSERVATION_WINDOWS_USERS].sort());
+    const runCore = SOURCE_FILES.find(({ path }) => path === 'src/cli/audit-run.ts')?.bare ?? '';
+    const productionRunDependencies = /\bPRODUCTION_RUN_DEPENDENCIES\b[^=]*=[^;]*;/u.exec(runCore)?.[0] ?? '';
+    expect(productionRunDependencies).toContain('launchBrowser');
+    expect(countIdentifier(productionRunDependencies, OBSERVATION_WINDOWS_HOOK_NAME)).toBe(0);
   });
 
   it('(q) src/ never types into the page, except the four input owners (login, write, the submission probe and the API write)', () => {
@@ -187,12 +239,22 @@ describe('Worker login hooks (T25d) and the single form input owner (T26d-1)', (
     const operations = SOURCE_FILES
       .filter(({ path }) => !INPUT_OPERATION_OWNERS.has(path))
       .flatMap((file) => findInputOperations(file)
-        .filter((operation) => !(file.path === CLICK_ONLY_EXCEPTION_PATH && CLICK_OPERATION.test(operation)))
+        .filter((operation) => !(CLICK_ONLY_EXCEPTION_PATHS.has(file.path) && CLICK_OPERATION.test(operation)))
+        .filter((operation) => !(file.path === KEY_PRESS_ONLY_EXCEPTION_PATH && KEY_PRESS_OPERATION.test(operation)))
         .map((operation) => `${file.path}: ${operation}`));
     expect(operations).toEqual([]);
+    // EV-4: キーを押す例外のファイルは、一覧のキーだけを、`.keyboard.press(key)` の 1 か所で押す。
+    const keyOwner = SOURCE_FILES.find(({ path }) => path === KEY_PRESS_ONLY_EXCEPTION_PATH)?.code ?? '';
+    const listed = [...(KEY_PRESS_KEY_LIST.exec(keyOwner)?.[1] ?? '').matchAll(/'([^']*)'/gu)].map((match) => match[1]);
+    expect(listed).toEqual(KEY_PRESS_ALLOWED_KEYS);
+    expect([...keyOwner.matchAll(KEY_PRESS_CALL)].map((match) => (match[1] ?? '').trim())).toEqual(['key']);
+    expect(keyOwner).toMatch(/type ScrollableRegionKey = \(typeof SCROLLABLE_REGION_KEYS\)\[number\];/u);
+    expect(keyOwner).toMatch(/const pressRegionKey = \(page: KeyboardRevealPage, key: ScrollableRegionKey\)/u);
     // click の例外のファイルが、実際に click を使う（例外の一覧が古くなっていない）。
-    const clickOwner = SOURCE_FILES.find(({ path }) => path === CLICK_ONLY_EXCEPTION_PATH);
-    expect(findInputOperations(clickOwner ?? scanSource('')).some((operation) => CLICK_OPERATION.test(operation))).toBe(true);
+    for (const clickPath of CLICK_ONLY_EXCEPTION_PATHS) {
+      const clickOwner = SOURCE_FILES.find(({ path }) => path === clickPath);
+      expect(findInputOperations(clickOwner ?? scanSource('')).some((operation) => CLICK_OPERATION.test(operation)), clickPath).toBe(true);
+    }
     // 例外のファイルが、実際に値を入れる（例外の一覧が古くなっていない）。
     const owner = SOURCE_FILES.find(({ path }) => path === FORM_SUBMITTER_PATH);
     expect(findInputOperations(owner ?? scanSource(''))).toContain('.fill(');

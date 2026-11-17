@@ -1,7 +1,7 @@
 // DEF-138（設計書 `2026-10-19-beaksight-session-loss-evidence-design.md` 3 章の受け入れ条件 1・4・5）: 監査の Run がセッションの切れで止まったとき、
 // `run.json` の `authentication.sessionLoss` に、判定したページの証拠（頼んだ path、行き着いた先、経路、止めた要求、鍵の名前の違い）が残る。
 // - fixture（認証つきの SPA）の 2 ページ目が、クライアントの側でログインの画面へ移る（ローカル ストレージのログインの状態の鍵を消してから移る）場合と、
-//   サーバの側でリダイレクトする（ログインの画面は読む範囲の外で、Guard がリダイレクトを止める）場合。
+//   サーバの側でリダイレクトする（ログインの画面は読む範囲の外。FIN-1（SD-2）: Guard は止めず、リダイレクトは届く）場合。
 // - token・query の値（移る先の URL の目印）・資格情報が `run.json` に出ない。止める・飛ばす（`STOPPED_BY_AUTH_SESSION_LOST`、理由 `AUTH_SESSION_LOST`）
 //   は今のまま。
 // Chromium はテストの既定の headless。値は出力しない。
@@ -34,7 +34,6 @@ const TEST_TIMEOUT_MS = 180_000;
 const MAX_PAGES = 4;
 /** 移る先の path の表記（query は名前だけ。名前はログインの段の観察の記録と同じく並べる）。 */
 const LANDED_PATH = `${SPA_APP_PATHS.auth}?from&ticket`;
-const LIMITS = Object.freeze({ perMinute: 120, perRun: 600 });
 
 describe('DEF-138: the session loss evidence in run.json of an audit Run', () => {
   let site: SpaAuthSite | undefined;
@@ -57,9 +56,7 @@ describe('DEF-138: the session loss evidence in run.json of an audit Run', () =>
   const auditStageOf = (spa: SpaAuthSite): AuditStageServiceRequests => ({
     approvedServiceOrigins: [spa.backendOrigin],
     auditReadRequests: [],
-    scriptLogin: { origin: spa.tokenOrigin, path: SPA_BACKEND_PATHS.token, requiredQuery: [{ name: 'grant_type', value: SPA_GRANT_TYPES.password }] },
-    serviceRequestLimits: LIMITS,
-  });
+    scriptLogin: { origin: spa.tokenOrigin, path: SPA_BACKEND_PATHS.token, requiredQuery: [{ name: 'grant_type', value: SPA_GRANT_TYPES.password }] },  });
 
   const auditAdmin = async (
     page: SpaSessionLossPage,
@@ -121,7 +118,8 @@ describe('DEF-138: the session loss evidence in run.json of an audit Run', () =>
     expectNoValues(text, spa);
   }, TEST_TIMEOUT_MS);
 
-  it('keeps the evidence of a page that the server redirects to the login page outside the audit range (the Guard stops it), without values', async () => {
+  // FIN-1（SD-2 の 2.4）: サーバのリダイレクトは、読む範囲の外でも Guard が止めずに届く（移った画面は点検しない）。行き着いた先は、移った後の URL で判定する。
+  it('keeps the evidence of a page that the server redirects to the login page outside the audit range (it arrives), without values', async () => {
     const { run, text, spa } = await auditAdmin('server', { auditPathPrefixes: [SPA_APP_PATHS.admin], scriptLogin: true });
     expect(run.runStatus).toBe('PARTIAL');
     expect(run.executions.at(-1)?.endReason).toBe('STOPPED_BY_AUTH_SESSION_LOST');
@@ -131,10 +129,10 @@ describe('DEF-138: the session loss evidence in run.json of an audit Run', () =>
     expect(loss?.stage).toBe('desktop:passive');
     expect(loss?.requestedPath).toBe(SPA_SESSION_LOSS_PATH);
     expect(loss?.landedPath).toBe(LANDED_PATH);
-    expect(loss?.landedBy).toBe('BLOCKED_REDIRECT');
+    expect(loss?.landedBy).toBe('PAGE_URL');
     expect(loss?.redirectPaths[0]).toEqual({ originKind: 'ALLOWED', path: SPA_SESSION_LOSS_PATH });
     expect(loss?.redirectPaths).toContainEqual({ originKind: 'ALLOWED', path: LANDED_PATH });
-    expect(loss?.blockedRequests).toContainEqual({ method: 'GET', originKind: 'ALLOWED', path: SPA_APP_PATHS.auth, reason: 'AUDIT_EXCLUDED_URL', count: 1 });
+    expect(loss?.blockedRequests).toEqual([]);
     // 鍵は消えていない（読み込みの前と後で名前が同じ）。
     expect(loss?.storageKeyChange?.filter(({ storage, originKind }) => storage === 'LOCAL_STORAGE' && originKind === 'ALLOWED')).toEqual([]);
     expectNoValues(text, spa);

@@ -153,7 +153,8 @@ describe('C18i: the existing judgments still stop the OOPIF (navigation outside 
     expect(window.count(null, '/__mutation')).toBe(0);
   });
 
-  it('Passive: the OOPIF navigating the top frame outside the allowed Origin (by a real click) is blocked and never reaches the server', async () => {
+  // FIN-1（SD-2 の 2.4）: ページ（OOPIF）自身が main frame を許可 Origin の外へ移す移動は止めない（届き、止めた記録はない）。読み取りでない要求は届かない。
+  it('Passive: the OOPIF navigating the top frame outside the allowed Origin (by a real click) is not stopped, and no non-read request reaches the server', async () => {
     const window = openServerWindow(server);
     await withGuardedPassivePage(headlessFactory, viewport, async (page, _context, ledger) => {
       const url = `${server.origin}${crossSiteFramePath(selfNavigatingFramePath())}`;
@@ -162,20 +163,13 @@ describe('C18i: the existing judgments still stop the OOPIF (navigation outside 
       const [frame] = crossSiteFrames(page);
 
       await frame!.getByRole('button', { name: 'Navigate top' }).click();
-      // DEF-162: BN で足された遮断の記録の時点（`phase`）も期待に入れる。
-      await expect.poll(() => ledger.snapshot().blockedNavigations).toContainEqual({
-        method: 'GET',
-        url: `${crossSiteOrigin}${NAVIGATION_TARGET_PAGE}`,
-        reason: 'EXTERNAL_MAIN_FRAME_NAVIGATION',
-        phase: 'LOAD',
-      });
+      await expect.poll(() => page.url()).toBe(`${crossSiteOrigin}${NAVIGATION_TARGET_PAGE}`);
       await wait(QUIET_PERIOD_MS);
 
-      // 止めた main frame の移動の後は、Chromium のエラーのページになる（既存の扱い）。移動の先には、たどり着かない。
-      expect(page.url()).not.toBe(`${crossSiteOrigin}${NAVIGATION_TARGET_PAGE}`);
+      expect(ledger.snapshot().blockedNavigations).toEqual([]);
       expect(ledger.snapshot().invariantViolations).toEqual([]);
     });
-    expect(window.count('GET', NAVIGATION_TARGET_PAGE)).toBe(0);
+    expect(window.count('GET', NAVIGATION_TARGET_PAGE)).toBe(1);
     expect(window.nonReadCounters()).toEqual(NO_NON_READ_REQUESTS);
   });
 });
@@ -362,11 +356,13 @@ describe('C18i fail-closed (RC18c M3): injected OOPIF event failures record a vi
 });
 
 describe('C18i: the OOPIF sessions are bounded, and a closed OOPIF releases its session', () => {
-  it(`more than the limit of simultaneous OOPIFs (${OOPIF_OVER_LIMIT_COUNT}) is OOPIF_GUARD_ATTACH_FAILED and closes the Context`, async () => {
+  // L10（設計書 `2026-11-09-beaksight-remove-limits-design.md` 4。INV-LIMITS の N22）: 前は、同時の OOPIF の数を 64 までにし、超えた OOPIF を
+  // `OOPIF_GUARD_ATTACH_FAILED` にして Context を閉じた。上限は撤廃したので、前の上限を超える数の OOPIF にも横取りを付け、どれも読み込み、違反にせず、Context を閉じない。
+  it(`guards more simultaneous OOPIFs (${OOPIF_OVER_LIMIT_COUNT}) than the former limit, without a violation (L10)`, async () => {
     await withGuardedPassivePage(headlessFactory, viewport, async (page, context, ledger) => {
       await page.goto(`${server.origin}${NAVIGATION_TARGET_PAGE}`, { waitUntil: 'load' });
-      // 1件ずつ、読み込みを待ってから加える（同時に読み込むと、page の session のリダイレクトの対応付けの上限 64 に先に達するため）。
-      // 上限を超えた OOPIF は進めないので、その読み込みは終わらず、Guard が Context を閉じると、evaluate が失敗する。
+      // 1件ずつ、読み込みを待ってから加える。
+      let loadedCount = 0;
       for (let index = 0; index < OOPIF_OVER_LIMIT_COUNT; index += 1) {
         const loaded = await page.evaluate(({ origin, frameIndex }) => new Promise<void>((resolve) => {
           const frame = document.createElement('iframe');
@@ -377,13 +373,12 @@ describe('C18i: the OOPIF sessions are bounded, and a closed OOPIF releases its 
         if (!loaded) {
           break;
         }
+        loadedCount += 1;
       }
-      await expect.poll(() => isPassiveRequestGuardClosed(context), { timeout: 30_000 }).toBe(true);
 
-      expect(ledger.snapshot().invariantViolations).toContainEqual({
-        code: 'OOPIF_GUARD_ATTACH_FAILED',
-        message: 'OOPIF guard session limit reached',
-      });
+      expect(loadedCount).toBe(OOPIF_OVER_LIMIT_COUNT);
+      expect(isPassiveRequestGuardClosed(context)).toBe(false);
+      expect(ledger.snapshot().invariantViolations).toEqual([]);
     });
   }, MANY_OOPIF_TEST_TIMEOUT_MS);
 

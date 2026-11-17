@@ -12,26 +12,24 @@ import { candidateOfDiscoveryDocumentByShape } from '../../src/control/discovery
 import { discoveryIndexEntryOf, type DiscoveryIndexEntry } from '../../src/control/job/discovery-index-store.js';
 import {
   apiRequestShapeOf,
-  MAX_API_SHAPE_BODY_KEYS,
-  MAX_API_SHAPE_HEADER_NAMES,
-  MAX_API_SHAPE_MARKERS,
-  MAX_API_SHAPE_MEDIA_TYPE_LENGTH,
-  MAX_API_SHAPE_NAME_LENGTH,
-  MAX_API_SHAPE_PATH_LENGTH,
-  MAX_API_SHAPE_QUERY_NAMES,
   type ApiRequestShape,
 } from '../../src/core/api-request-shape.js';
 import { MAX_HTTP_METHOD_LENGTH } from '../../src/core/limits.js';
 import { validateArtifact } from '../../src/core/schema-validator.js';
 import { apiShapeDigestOf } from '../../src/discovery/api-shape-classification.js';
-import { MAX_CANDIDATE_FIELDS, MAX_FIELD_NAME_LENGTH, type DiscoveredCandidate, type DiscoveryCandidate } from '../../src/discovery/candidate-contracts.js';
+import type { DiscoveredCandidate, DiscoveryCandidate } from '../../src/discovery/candidate-contracts.js';
 import { classifyCandidate } from '../../src/discovery/classify.js';
 import { DISCOVERY_ARTIFACT_SCHEMA_VERSION, DUPLICATE_IDENTITY_CONFLICT_REASON, mergeDiscoveryCandidates, type DiscoveryDocument } from '../../src/discovery/discovery-result.js';
 import { computeCandidateDigests } from '../../src/discovery/fingerprint.js';
 import {
-  MAX_SUBMISSION_PROBE_FIELD_SELECTOR_LENGTH,
   notObservedSubmissionProbeOf,
   observedSubmissionProbeOf,
+  SHARED_LAYOUT_STATE_KEY_FORMAT,
+  sharedLayoutStateKeyOf,
+  sharedLayoutStructureKeyOf,
+  submissionProbeOpenerOf,
+  submissionProbeStrengthOf,
+  withSubmissionProbeStage,
   type SubmissionProbeRecord,
 } from '../../src/discovery/submission-probe-contracts.js';
 import { NO_JS_BINDING, SAMPLE_ALLOWED_ORIGINS, SAMPLE_ORIGIN, sampleButton } from './discovery-candidate-samples.js';
@@ -96,19 +94,17 @@ describe('T37c: the submissionProbe item of the candidate schema', () => {
   it('uses the named limits of the shape contract', () => {
     const shape = defs['apiRequestShape'];
     expect(prop(shape, 'method').maxLength).toBe(MAX_HTTP_METHOD_LENGTH);
-    expect(prop(shape, 'resourceType').maxLength).toBe(MAX_API_SHAPE_NAME_LENGTH);
-    expect(prop(shape, 'pathShape').maxLength).toBe(MAX_API_SHAPE_PATH_LENGTH);
-    expect(prop(shape, 'queryNames').maxItems).toBe(MAX_API_SHAPE_QUERY_NAMES);
-    expect(prop(shape, 'queryNames').items?.maxLength).toBe(MAX_API_SHAPE_NAME_LENGTH);
-    expect(prop(shape, 'filters').maxItems).toBe(MAX_API_SHAPE_QUERY_NAMES);
-    expect(prop(shape, 'headerNames').maxItems).toBe(MAX_API_SHAPE_HEADER_NAMES);
-    expect(prop(shape, 'headerNames').items?.maxLength).toBe(MAX_API_SHAPE_NAME_LENGTH);
-    expect(prop(shape, 'contentType').anyOf?.[0]?.maxLength).toBe(MAX_API_SHAPE_MEDIA_TYPE_LENGTH);
+    // URL-LEN: path の型の長さの上限（前は 1,024）はない。L13（N25）: 名前の長さ・数、媒体の型の長さ、鍵の数、目印の数の上限もない。
     const body = defs['apiRequestBody'];
-    expect(prop(body, 'keys').maxItems).toBe(MAX_API_SHAPE_BODY_KEYS);
-    expect(prop(body, 'markerKeys').maxItems).toBe(MAX_API_SHAPE_BODY_KEYS);
-    expect(prop(body, 'markerKeys').items?.properties?.['markers']?.maxItems).toBe(MAX_API_SHAPE_MARKERS);
-    expect(prop(body, 'markerKeys').items?.properties?.['markers']?.items?.maximum).toBe(MAX_API_SHAPE_MARKERS - 1);
+    for (const [name, node] of [
+      ['resourceType', prop(shape, 'resourceType')], ['pathShape', prop(shape, 'pathShape')], ['queryNames', prop(shape, 'queryNames')],
+      ['queryNames/items', prop(shape, 'queryNames').items], ['filters', prop(shape, 'filters')], ['headerNames', prop(shape, 'headerNames')],
+      ['headerNames/items', prop(shape, 'headerNames').items], ['contentType', prop(shape, 'contentType').anyOf?.[0]], ['keys', prop(body, 'keys')],
+      ['markerKeys', prop(body, 'markerKeys')], ['markers', prop(body, 'markerKeys').items?.properties?.['markers']],
+      ['markers/items', prop(body, 'markerKeys').items?.properties?.['markers']?.items],
+    ] as const) {
+      expect([node?.['maxLength'], node?.['maxItems'], node?.['maximum']], name).toEqual([undefined, undefined, undefined]);
+    }
     expect(candidateSchema.required).not.toContain('submissionProbe');
   });
 
@@ -119,7 +115,7 @@ describe('T37c: the submissionProbe item of the candidate schema', () => {
     expectValid(withProbe(SAVE, observed([])));
     expectValid(withProbe(SAVE, observed([CREATE_SHAPE, CREATE_SHAPE])));
     expectValid(withProbe(SAVE, observedSubmissionProbeOf({ shapes: [], nonReadRequestCount: 1, readRequestCount: 0, unrecordedShapeCount: 1 }, FIELDS)));
-    for (const reason of ['PAGE_CHANGED', 'PRESS_LIMIT_REACHED', 'TARGET_NOT_FOUND', 'PRESS_FAILED'] as const) {
+    for (const reason of ['PAGE_CHANGED', 'PRESS_LIMIT_REACHED', 'TARGET_NOT_FOUND', 'PRESS_FAILED', 'SAME_IDENTITY_PRESSED'] as const) {
       expectValid(withProbe(SAVE, notObservedSubmissionProbeOf(reason)));
     }
   });
@@ -224,28 +220,31 @@ describe('T38a: the fields of the probe in the candidate schema and the lookup b
 
   it('uses the named limits for the fields of the probe', () => {
     const items = prop(defs['submissionProbe'], 'inputFields').items;
-    expect(prop(defs['submissionProbe'], 'inputFields').maxItems).toBe(MAX_CANDIDATE_FIELDS);
-    expect(prop(items, 'name').anyOf?.[0]?.maxLength).toBe(MAX_FIELD_NAME_LENGTH);
-    expect(prop(items, 'selector').anyOf?.[0]?.maxLength).toBe(MAX_SUBMISSION_PROBE_FIELD_SELECTOR_LENGTH);
-    expect(prop(items, 'marker').anyOf?.[0]?.maximum).toBe(MAX_API_SHAPE_MARKERS - 1);
+    // L13（N25・N28・N30）: 欄の数、名前の長さ、目印の番号の上限（前は 200・256・31）はない。
+    expect(prop(defs['submissionProbe'], 'inputFields').maxItems).toBeUndefined();
+    expect(prop(items, 'name').anyOf?.[0]?.maxLength).toBeUndefined();
+    // LZ-2: 欄の CSS の長さの上限（前は 512）はない。
+    expect(prop(items, 'selector').anyOf?.[0]?.maxLength).toBeUndefined();
+    expect(prop(items, 'marker').anyOf?.[0]?.maximum).toBeUndefined();
     expect((defs['submissionProbe']?.['required'] as readonly string[] | undefined) ?? []).not.toContain('inputFields');
   });
 
   it('accepts the fields of the probe (and a probe written before T38a without them)', () => {
     expectValid(withProbe(SAVE, withFields([CREATE_SHAPE])));
     expectValid(withProbe(SAVE, notObservedSubmissionProbeOf('PAGE_CHANGED', FIELDS, INPUT_FIELDS)));
+    // LZ-2: 前の上限（512）より長い CSS も受ける。
+    expectValid({ ...SAVE, submissionProbe: { ...withFields([CREATE_SHAPE]), inputFields: [{ ...INPUT_FIELDS[0], selector: `#${'a'.repeat(512)}` }] } });
     const { inputFields: _omitted, ...before } = withFields([CREATE_SHAPE]);
     expectValid(withProbe(SAVE, before as SubmissionProbeRecord));
   });
 
-  it('rejects a value, a marker out of the range and an unknown type in the fields of the probe', () => {
+  it('rejects a value, a negative marker and an unknown type in the fields of the probe', () => {
     const probe = withFields([CREATE_SHAPE]);
     const cases: readonly (readonly [string, unknown])[] = [
       ['a value', [{ ...INPUT_FIELDS[0], value: 'x' }]],
       ['a marker value', [{ ...INPUT_FIELDS[0], markerValue: MARKERS[0] }]],
-      ['a marker out of the range', [{ ...INPUT_FIELDS[0], marker: MAX_API_SHAPE_MARKERS }]],
+      ['a negative marker', [{ ...INPUT_FIELDS[0], marker: -1 }]],
       ['an unknown type', [{ ...INPUT_FIELDS[0], type: 'button' }]],
-      ['a too long selector', [{ ...INPUT_FIELDS[0], selector: `#${'a'.repeat(MAX_SUBMISSION_PROBE_FIELD_SELECTOR_LENGTH)}` }]],
       ['a missing selector', [{ name: 'name', type: 'text', marker: 0 }]],
     ];
     for (const [name, inputFields] of cases) {
@@ -267,5 +266,97 @@ describe('T38a: the fields of the probe in the candidate schema and the lookup b
     const { inputFields: _omitted, ...before } = withFields([CREATE_SHAPE]);
     const old = withProbe(SAVE, before as SubmissionProbeRecord);
     expect(candidateOfDiscoveryDocumentByShape(documentOf([old]), SAVE.identityDigest, before.shapeDigest ?? '')).toBeNull();
+  });
+});
+
+// LU-4（設計書 `2026-11-02-beaksight-list-row-update-design.md` 5.1 の 2）: 窓の中の保存の記録の任意の項目 `opener`（開き手の識別の digest・名前があるか・
+// 開き手の語）。値と行の中身は持たない。`opener` のない記録（LU-4 の前の成果物）も通す。
+describe('LU-4: the opener item of the probe in the candidate schema', () => {
+  const opener = submissionProbeOpenerOf(SAVE.identityDigest, true, ['編集']);
+  const withOpener = (): SubmissionProbeRecord =>
+    observedSubmissionProbeOf({ shapes: [UPDATE_SHAPE], nonReadRequestCount: 1, readRequestCount: 0, unrecordedShapeCount: 0 }, FIELDS, [], ['保存'], opener);
+
+  it('accepts a probe with the opener and a probe without it, and keeps the opener optional', () => {
+    expectValid(withProbe(SAVE, withOpener()));
+    expectValid(withProbe(SAVE, notObservedSubmissionProbeOf('PAGE_CHANGED', FIELDS, [], opener)));
+    expectValid(withProbe(SAVE, observed([UPDATE_SHAPE])));
+    expect((defs['submissionProbe']?.['required'] as readonly string[] | undefined) ?? []).not.toContain('opener');
+  });
+
+  it('rejects a value, a row content, an unknown word and a broken digest in the opener', () => {
+    const probe = withOpener();
+    const cases: readonly (readonly [string, unknown])[] = [
+      ['a row value', { ...opener, value: 'item one' }],
+      ['a row id', { ...opener, rowId: 1 }],
+      ['an unknown word', { ...opener, openerWords: ['保存'] }],
+      ['a broken digest', { ...opener, identityDigest: 'sha256:x' }],
+      ['a missing name flag', { identityDigest: opener.identityDigest, openerWords: [] }],
+    ];
+    for (const [name, value] of cases) {
+      expectInvalid({ ...SAVE, submissionProbe: { ...probe, opener: value } }, name);
+    }
+  });
+});
+
+// COV-1（網羅の設計書 3.3、DEF-238 の設計書 3.1 の 2）: 段の記録（段の番号と、前の押下の並び。値は持たない）、段をまたいだ記録の強さ、状態の構造の鍵つきの
+// 共通の枠の押した印。
+describe('COV-1: the stage of a probe, the strength of a probe, and the shared layout key with the state', () => {
+  const DIGEST = `sha256:${'a'.repeat(64)}`;
+  const OTHER = `sha256:${'b'.repeat(64)}`;
+
+  it('adds the stage from the second stage only, and the schema accepts it and rejects a broken one', () => {
+    const probe = observed([CREATE_SHAPE]);
+    expect(withSubmissionProbeStage(probe, { number: 1, priorPresses: [] })).toBe(probe);
+    const staged = withSubmissionProbeStage(probe, { number: 3, priorPresses: [{ stage: 1, identityDigest: DIGEST, ordinal: 0 }, { stage: 2, identityDigest: OTHER, ordinal: 4 }] });
+    expect(staged.stage).toEqual({ number: 3, priorPresses: [{ stage: 1, identityDigest: DIGEST, ordinal: 0 }, { stage: 2, identityDigest: OTHER, ordinal: 4 }] });
+    expect(Object.isFrozen(staged.stage)).toBe(true);
+    expectValid(withProbe(SAVE, staged));
+    expectValid(withProbe(SAVE, withSubmissionProbeStage(notObservedSubmissionProbeOf('DISABLED_SUBMITTER'), { number: 2, priorPresses: [] })));
+    const cases: readonly (readonly [string, unknown])[] = [
+      ['the first stage', { number: 1, priorPresses: [] }],
+      ['a value in a press', { number: 2, priorPresses: [{ stage: 1, identityDigest: DIGEST, ordinal: 0, value: 'x' }] }],
+      ['not a digest', { number: 2, priorPresses: [{ stage: 1, identityDigest: 'x', ordinal: 0 }] }],
+      ['a negative order', { number: 2, priorPresses: [{ stage: 1, identityDigest: DIGEST, ordinal: -1 }] }],
+      ['an extra item', { number: 2, priorPresses: [], url: '/x' }],
+    ];
+    for (const [name, value] of cases) {
+      expectInvalid({ ...SAVE, submissionProbe: { ...probe, stage: value } }, name);
+    }
+  });
+
+  it('orders the strength: a write shape, then no request, then a press without observation, then not pressed', () => {
+    expect(submissionProbeStrengthOf(observed([CREATE_SHAPE]))).toBe(4);
+    expect(submissionProbeStrengthOf(observed([]))).toBe(3);
+    expect(submissionProbeStrengthOf(notObservedSubmissionProbeOf('PRESS_FAILED'))).toBe(2);
+    for (const reason of ['TARGET_NOT_FOUND', 'PAGE_CHANGED', 'DISABLED_SUBMITTER', 'SAME_IDENTITY_PRESSED', 'SAME_WORDS_NO_REQUEST', 'SHARED_LAYOUT_PRESSED',
+      'PRESS_LIMIT_REACHED', 'DISABLED_FILL_LIMIT_REACHED'] as const) {
+      expect(submissionProbeStrengthOf(notObservedSubmissionProbeOf(reason)), reason).toBe(1);
+    }
+  });
+
+  // SLK-1（網羅の設計書 6 章の 2026-11-16）: 印の鍵は、共通の枠の部分の構造（枠の中の候補・欄・開いた窓・見出し）と候補の識別の組。
+  it('SLK-1: makes the shared layout key from the structure of the layout part, so the key changes only when its candidates or fields change', () => {
+    const layout = {
+      candidateIdentityDigests: [DIGEST], fields: [], openedDialogOrRegion: false, headingLevels: [], linkPaths: ['/news/1'], hasExpandToggle: false,
+    };
+    const key = sharedLayoutStateKeyOf(sharedLayoutStructureKeyOf(layout), DIGEST);
+    expect(sharedLayoutStateKeyOf(sharedLayoutStructureKeyOf({ ...layout, candidateIdentityDigests: [DIGEST, DIGEST] }), DIGEST)).toBe(key);
+    expect(sharedLayoutStateKeyOf(sharedLayoutStructureKeyOf({ ...layout, candidateIdentityDigests: [DIGEST, OTHER] }), DIGEST)).not.toBe(key);
+    const field = { name: 'q', type: 'search', required: false, disabled: false, optionValues: null };
+    expect(sharedLayoutStateKeyOf(sharedLayoutStructureKeyOf({ ...layout, fields: [field] }), DIGEST)).not.toBe(key);
+    expect(sharedLayoutStateKeyOf(sharedLayoutStructureKeyOf(layout), OTHER)).not.toBe(key);
+    expect(key).toMatch(/^sha256:[0-9a-f]{64}$/u);
+  });
+
+  // REV-SD の M-4: 枠の中のリンクの並び（path の型の集合）と、開閉の印（`aria-expanded` の有無）も、枠の部分の構造に入れる（印の版 3）。
+  it('REV-SD M-4: the link path shapes and the expand toggle of the layout part change the key, the numbers in the paths do not', () => {
+    const layout = {
+      candidateIdentityDigests: [DIGEST], fields: [], openedDialogOrRegion: false, headingLevels: [], linkPaths: ['/news/1'], hasExpandToggle: false,
+    };
+    const key = sharedLayoutStructureKeyOf(layout);
+    expect(sharedLayoutStructureKeyOf({ ...layout, linkPaths: ['/news/2', '/news/3'] })).toBe(key);
+    expect(sharedLayoutStructureKeyOf({ ...layout, linkPaths: ['/news/1', '/settings'] })).not.toBe(key);
+    expect(sharedLayoutStructureKeyOf({ ...layout, hasExpandToggle: true })).not.toBe(key);
+    expect(SHARED_LAYOUT_STATE_KEY_FORMAT).toBe('beaksight-shared-layout-state/3');
   });
 });

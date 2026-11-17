@@ -9,7 +9,7 @@
 //   ハブのページ自身は、A01〜A06 の Finding が出てはならない、同じ Run の中の対照のページである。
 // - ACCORDION: `/accordion.html`（A07）。MUTATION: `/mutation-button.html`、POST_FORM: `/post-form.html`（A08）。
 //   Interaction の段階の結果と、Run の全体でサーバに届いたリクエストを確かめるので、ページごとに Run を分ける。
-// - PAGE_LIMIT: ハブから、`maxPages: 2` でたどる（A09。上限のない HUB の Run が対照）。
+// - A09・A10 は、ブラウザを使わない単体へ移した（RB-10。下の注記）。
 // 各 Run は、自分の fixture のサーバを使う。
 import { mkdtemp, rm } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
@@ -22,28 +22,21 @@ import {
   type FixtureServerCounters,
 } from '../../fixtures/server.js';
 import { EXIT_CODES } from '../../src/cli/exit-codes.js';
-import { finishAuditRun } from '../../src/cli/run-command.js';
-import { RUN_ARTIFACT_FILE_NAMES, runArtifactDirectory } from '../../src/core/artifact-layout.js';
 import type {
   AuditRunResult,
   EvidenceRecord,
   Finding,
   InteractionStatus,
   PageAuditResult,
-  RunSummary,
   ViewportProfile,
 } from '../../src/core/contracts.js';
-import { deriveRunStatus } from '../../src/core/status.js';
-import { auditRun } from '../helpers/audit-run-fixture.js';
 import {
-  captureCliOutput,
   cliTargetConfig,
   createRunLauncher,
   expectOnlyReadRequests,
   expectSchemaValid,
   fastRunConfig,
   findingsOf,
-  readJson,
   readRunAudit,
   runCliInProcess,
   runWithCoordinator,
@@ -215,21 +208,19 @@ const expectOnlyReadRequestsIn = (run: GateRun): void => expectOnlyReadRequests(
 // Run の実行
 // ---------------------------------------------------------------------------------------------------------------
 
-/** `beforeAll` で行う Run の数（HUB、ACCORDION、MUTATION、POST_FORM、PAGE_LIMIT。Run ごとに Chromium を1つ起動する）。 */
-const GATE_RUN_COUNT = 5;
+/** `beforeAll` で行う Run の数（HUB、ACCORDION、MUTATION、POST_FORM。Run ごとに Chromium を1つ起動する）。 */
+const GATE_RUN_COUNT = 4;
 
 let hub: CliGateRun;
 let accordion: GateRun;
 let mutation: GateRun;
 let postForm: GateRun;
-let pageLimit: GateRun;
 
 beforeAll(async () => {
   hub = await auditWithCli(PATHS.hub);
   accordion = await auditWithCoordinator(PATHS.accordion);
   mutation = await auditWithCoordinator(PATHS.mutationButton);
   postForm = await auditWithCoordinator(PATHS.postForm);
-  pageLimit = await auditWithCoordinator(PATHS.hub, { crawl: { maxPages: 2 } });
 }, RUNS_TIMEOUT_MS);
 
 /** 監査の対象のページが1つの Run の、そのページ。 */
@@ -384,62 +375,8 @@ describe('Auditor Gates (Task 18 design 4.3)', () => {
   // TS-f: GATE-A08 の対照（Guard のない Context で、同じボタンが POST を 1 件送り、ほかの変更系のメソッドは送らない）は、
   // `gate-fixtures.test.ts` の Task 18 の POST の fixture の対照に、1 か所にまとめた。
 
-  it('GATE-A09: the page limit makes the Run PARTIAL with MAX_PAGES_REACHED (the same site without the limit is COMPLETE)', async () => {
-    expect(pageLimit.result.run.runStatus).toBe('PARTIAL');
-    expect(pageLimit.result.run.incompleteReasons).toContainEqual({ code: 'MAX_PAGES_REACHED', detail: null });
-    expect(pageLimit.result.run.crawlLimits.maxPagesReached).toBe(true);
-    expect(pageLimit.result.pages.filter((page) => page.status !== 'SKIPPED')).toHaveLength(2);
-    expect(pageLimit.result.pages.filter((page) => page.status === 'SKIPPED').length).toBeGreaterThan(0);
-    expectOnlyReadRequestsIn(pageLimit);
-    await expectSchemaValid(pageLimit.result);
-    // 対照: 同じサイトを既定の上限でたどった Run（HUB）は、上限に達せず、MAX_PAGES_REACHED もない。
-    expect(hub.result.run.crawlLimits).toEqual({ maxPagesReached: false, maxDepthReached: false, maxRuntimeReached: false });
-    expect(hub.result.run.incompleteReasons.map(({ code }) => code)).not.toContain('MAX_PAGES_REACHED');
-    expect(hub.result.run.runStatus).toBe('COMPLETE');
-  });
-
-  describe('GATE-A10: a Run with an artifact that does not match its schema is not COMPLETE', () => {
-    let directory: string;
-
-    beforeAll(async () => {
-      directory = await workDirectory('schema');
-    });
-
-    it('GATE-A10: finishAuditRun derives PARTIAL with REQUIRED_ARTIFACT_INVALID and exits with 2', async () => {
-      const [firstPage] = auditRun().pages;
-      if (firstPage === undefined) {
-        throw new Error('the fixture has no page');
-      }
-      // page のスキーマにない項目を加えた Run。渡す時点の Run Status と、その入力は、COMPLETE のまま。
-      const invalid = auditRun({ pages: [{ ...firstPage, unexpectedField: true } as PageAuditResult] });
-      expect(invalid.run.runStatus).toBe('COMPLETE');
-      expect(deriveRunStatus(invalid.statusInput)).toBe('COMPLETE');
-      const outputDirectory = join(directory, 'invalid');
-
-      const exitCode = await finishAuditRun(invalid, outputDirectory, captureCliOutput().output);
-
-      expect(exitCode).toBe(EXIT_CODES.PARTIAL);
-      const run = (await readJson(join(runArtifactDirectory(outputDirectory, invalid.run.runId), RUN_ARTIFACT_FILE_NAMES.run))) as RunSummary;
-      expect(run.runStatus).toBe('PARTIAL');
-      expect(run.runStatus).not.toBe('COMPLETE');
-      expect(run.incompleteReasons).toContainEqual({
-        code: 'REQUIRED_ARTIFACT_INVALID',
-        detail: expect.stringMatching(/^page:PAGE-000001:/u),
-      });
-    });
-
-    it('GATE-A10 (control): the same Run without the extra field stays COMPLETE and exits with 0', async () => {
-      const valid = auditRun();
-      const outputDirectory = join(directory, 'valid');
-
-      const exitCode = await finishAuditRun(valid, outputDirectory, captureCliOutput().output);
-
-      expect(exitCode).toBe(EXIT_CODES.COMPLETE);
-      const run = (await readJson(join(runArtifactDirectory(outputDirectory, valid.run.runId), RUN_ARTIFACT_FILE_NAMES.run))) as RunSummary;
-      expect(run.runStatus).toBe('COMPLETE');
-      expect(run.incompleteReasons).toEqual([]);
-    });
-  });
+  // RB-10: GATE-A09（ページの上限で PARTIAL と MAX_PAGES_REACHED）は偽の Page Auditor の単体（`tests/unit/run-coordinator.test.ts` の「stops at the page
+  // limit…」）、GATE-A10（スキーマに合わない成果物で COMPLETE にしない）はブラウザを使わない単体（`tests/unit/run-command.test.ts`）が受け持つ。
 });
 
 describe('Auditor Gates: ERROR Findings do not decide the Run Status (completion meaning, Task 18 design 4.3)', () => {

@@ -1,6 +1,6 @@
 // OP-1（設計書 `doc/design/2026-10-27-beaksight-one-pass-flow-design.md` 4.1 の D4・D5、4.1.3 の 1・2）: まとめて実行の、ログインの直後の登録と自動ログインへの
-// 切り替えを、ジョブの管理の側で確かめる（偽のワーカー `tests/helpers/fake-audit-worker.ts` の `chain` を本物の `fork` で起動する。本物のワーカーと Chromium での
-// 端から端は `login-registration-fork.test.ts`）。
+// 切り替えを、ジョブの管理の側で確かめる（偽のワーカー `tests/helpers/fake-audit-worker.ts` の `chain` を本物の `fork` で起動する。本物の Chromium での
+// 受け取りは `login-credential-capture.test.ts`、画面からの端から端は `full-flow.test.ts`・`login-secret-markers.test.ts`）。
 // - `START` の `loginRegistration`: 手動のログインのプロファイルのまとめて実行だけ。受け取りの根は、希望が自動ログインで、資格情報のファイルがないときだけ。
 // - 書く順（4.1.3 の 1）: 親が登録と切り替えを組み立てて確かめる → 許し（`CREDENTIAL_SAVE_ALLOWED`）→ ワーカーが書いて知らせる → 親が 1 回の保存 → 新しい設定
 //   （`LOGIN_REGISTERED`）。3 つのセレクタがそろわないときは許しを送らず、登録だけ保存する（手動のまま）。

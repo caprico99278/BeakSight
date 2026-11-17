@@ -1,7 +1,7 @@
 // U16b（Task 14〜17 の設計書 6.1.1、6.1.2。ARCH05、ARCH08）: artifact の書き出しの唯一の owner（`ArtifactWriter.writeRun`）。
 // JSON をメモリの上で組み立てて検証し、スキーマに合わない場合は Run Status を `deriveRunStatus` で導き直してから、一時ファイルと
 // rename で書く。書き出すテキストは、UTF-8 と LF にする。
-import { link, lstat, mkdir, mkdtemp, open, readdir, readFile, rename, rm, symlink, unlink, writeFile } from 'node:fs/promises';
+import { lstat, mkdir, mkdtemp, open, readdir, readFile, rename, rm, symlink, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { basename, join, relative, resolve } from 'node:path';
 import { afterEach, describe, expect, it } from 'vitest';
@@ -12,14 +12,13 @@ import {
   checkpointPageArtifactRelativePath,
   pageArtifactRelativePath,
   runArtifactDirectory,
-  siteUnavailableDiagnosticRelativePath,
 } from '../../src/core/artifact-layout.js';
 import { findingsOfAuditArtifact } from '../../src/core/audit-artifact-findings.js';
+import { decodeCheckpointPageRecord, decodePageRecord, encodeCheckpointPageRecord, type PageRecord } from '../../src/core/page-record-codec.js';
 import type { AuditRunResult, Finding, PageAuditResult, PageId, RunSummary } from '../../src/core/contracts.js';
 import { createRunId } from '../../src/core/ids.js';
 import { validateArtifact } from '../../src/core/schema-validator.js';
 import { deriveRunStatus, type RunStatusInput } from '../../src/core/status.js';
-import { createRunLock, judgeRunLock, renewRunLock, type RunLockHost } from '../../src/core/process-lock.js';
 import {
   checkRunCheckpointConsistency,
   checkRunCheckpointPageConsistency,
@@ -29,10 +28,6 @@ import {
   type RunCheckpointPage,
 } from '../../src/orchestration/run-checkpoint.js';
 import {
-  SITE_UNAVAILABLE_DIAGNOSTIC_SCHEMA_VERSION,
-  type SiteUnavailableDiagnosticRecord,
-} from '../../src/orchestration/run-coordinator.js';
-import {
   ArtifactWriteError,
   ArtifactWriter,
   type CheckpointFileHandle,
@@ -41,7 +36,6 @@ import {
 import { RENAME_MAX_ATTEMPTS, RENAME_RETRY_DELAY_MS, RENAME_RETRY_ERROR_CODES } from '../../src/core/rename-retry.js';
 import { SafetyLedger } from '../../src/safety/safety-ledger.js';
 import {
-  FIXTURE_OBSERVED_AT,
   FIXTURE_ORIGIN,
   FIXTURE_RUN_ID as RUN_ID,
   PAGE_1,
@@ -195,29 +189,39 @@ describe('ArtifactWriter.writeRun: the layout (design 6.1.2)', () => {
     const root = await outputDirectory();
     const result = edgeCaseAuditRun();
     const written = await new ArtifactWriter().writeRun(result, { outputDirectory: root });
-    const audit = await readJson(join(written.runDirectory, 'audit.json')) as { readonly pages: readonly PageAuditResult[]; readonly findings: readonly Finding[] };
+    const audit = await readJson(join(written.runDirectory, 'audit.json')) as { readonly pages: readonly string[]; readonly findings: readonly Finding[] };
     const pageFindingIds = new Set(result.pages.flatMap((page) => page.findings.map(({ findingId }) => findingId)));
     expect(audit.findings).toEqual(result.findings.filter(({ findingId }) => !pageFindingIds.has(findingId)));
     expect(audit.findings.length).toBeGreaterThan(0);
-    expect(audit.pages).toEqual(result.pages);
-    expect([...findingsOfAuditArtifact(audit)].sort((left, right) => left.findingId.localeCompare(right.findingId)))
+    // REC-2: ページは、目録のパスの page.json から読む。
+    const pages = await Promise.all(audit.pages.map(async (path) => decodePageRecord(await readJson(join(written.runDirectory, path)) as PageRecord)));
+    expect(pages).toEqual(result.pages);
+    expect([...findingsOfAuditArtifact({ pages, findings: audit.findings })].sort((left, right) => left.findingId.localeCompare(right.findingId)))
       .toEqual([...result.findings].sort((left, right) => left.findingId.localeCompare(right.findingId)));
     await expect(validateArtifact('audit', audit)).resolves.toEqual({ ok: true });
   });
 
-  it('writes the run summary, the audit with its schema version and without statusInput, and each page as it is', async () => {
+  // REC-2: audit.json は目録（run.json のパス、ページの page.json のパスの一覧、Run だけの Finding）。run とページの写しは持たない。
+  it('writes the run summary, each page as it is, and audit.json as the catalog of their paths without a copy of the run', async () => {
     const root = await outputDirectory();
     const result = auditRun();
     const written = await new ArtifactWriter().writeRun(result, { outputDirectory: root });
     const runDirectory = written.runDirectory;
 
     expect(await readJson(join(runDirectory, 'run.json'))).toEqual(result.run);
+    // REC-3: page.json はディスクの形（`page-schema/2.0`）で、schema に合い、戻すとメモリの形のページになる。
+    const pageJson = await readJson(join(runDirectory, 'pages/PAGE-000001/page.json')) as PageRecord;
+    expect(pageJson.schemaVersion).toBe('page-schema/2.0');
+    await expect(validateArtifact('page', pageJson)).resolves.toEqual({ ok: true });
+    expect(decodePageRecord(pageJson)).toEqual(result.pages[0]);
     const audit = await readJson(join(runDirectory, 'audit.json'));
-    expect(Object.keys(audit as object)).toEqual(['schemaVersion', 'run', 'pages', 'findings']);
-    // T44f（Task 44 の設計書 P3-1 の B）: 最上位の findings は、ページの結果に入っていない Finding（Run の規則の Finding）だけ。この見本はページの Finding だけ。
-    expect(audit).toEqual({ schemaVersion: 'audit-schema/1.0', run: result.run, pages: result.pages, findings: [] });
-    expect(JSON.stringify(audit)).not.toContain('statusInput');
-    expect(await readJson(join(runDirectory, 'pages/PAGE-000001/page.json'))).toEqual(result.pages[0]);
+    // この見本の Finding はページの Finding だけ（Run だけの Finding はない）。
+    expect(audit).toEqual({
+      schemaVersion: 'audit-schema/2.0',
+      run: 'run.json',
+      pages: ['pages/PAGE-000001/page.json', 'pages/PAGE-000002/page.json'],
+      findings: [],
+    });
     await expect(validateArtifact('audit', audit)).resolves.toEqual({ ok: true });
   });
 
@@ -255,6 +259,7 @@ describe('ArtifactWriter.writeRun: the layout (design 6.1.2)', () => {
     await new ArtifactWriter().writeRun(auditRun(), { outputDirectory: root });
     expect((await listTree(root)).filter((path) => path.includes('.tmp'))).toEqual([]);
   });
+
 });
 
 describe('ArtifactWriter.writeRun: schema validation and the Run Status (design 6.1.1, A10, ARCH05)', () => {
@@ -278,28 +283,25 @@ describe('ArtifactWriter.writeRun: schema validation and the Run Status (design 
     const written = await new ArtifactWriter().writeRun(auditRun({ invalidSecondPage: true }), { outputDirectory: root });
 
     expect(written.schemaValid).toBe(false);
+    // REC-2: audit.json はページを写さないので、ページの誤りは page.json の誤りだけ。
     expect(written.invalidArtifacts.map(({ path, schema }) => [path, schema])).toEqual([
       ['pages/PAGE-000002/page.json', 'page'],
-      ['audit.json', 'audit'],
     ]);
     expect(written.result.run.runStatus).toBe('PARTIAL');
     expect(written.result.statusInput.requiredArtifactsValid).toBe(false);
     expect(deriveRunStatus(written.result.statusInput)).toBe('PARTIAL');
     const reasons = written.result.run.incompleteReasons;
-    expect(reasons.map(({ code }) => code)).toEqual(['REQUIRED_ARTIFACT_INVALID', 'REQUIRED_ARTIFACT_INVALID']);
+    expect(reasons.map(({ code }) => code)).toEqual(['REQUIRED_ARTIFACT_INVALID']);
     expect(reasons[0]?.detail).toMatch(/^page:PAGE-000002:\/ must NOT have additional properties/u);
-    expect(reasons[1]?.detail).toMatch(new RegExp(`^audit:${RUN_ID}:/pages/1 `, 'u'));
     expect(written.result.statusInput.incompleteReasons).toEqual(reasons);
 
-    // スキーマに合わない JSON も、隠さずに書く。run.json と audit.json は、導き直した Run Status で書く。
+    // スキーマに合わない JSON も、隠さずに書く。run.json は、導き直した Run Status で書く。
     expect(written.files).toContain('pages/PAGE-000002/page.json');
     const invalidPage = await readJson(join(written.runDirectory, 'pages/PAGE-000002/page.json'));
     expect(invalidPage).toMatchObject({ unexpectedField: true });
     const run = await readJson(join(written.runDirectory, 'run.json'));
     expect(run).toEqual(written.result.run);
     await expect(validateArtifact('run', run)).resolves.toEqual({ ok: true });
-    const audit = (await readJson(join(written.runDirectory, 'audit.json'))) as { readonly run: unknown };
-    expect(audit.run).toEqual(written.result.run);
   });
 
   it('does not add the same reason twice when the Run Coordinator already recorded it', async () => {
@@ -339,10 +341,29 @@ describe('ArtifactWriter.writeRun: schema validation and the Run Status (design 
     const root = await outputDirectory();
     const written = await new ArtifactWriter().writeRun(auditRun({ run: { toolVersion: '' } }), { outputDirectory: root });
     expect(written.schemaValid).toBe(false);
-    expect(written.invalidArtifacts.map(({ path }) => path)).toEqual(['run.json', 'audit.json']);
+    expect(written.invalidArtifacts.map(({ path }) => path)).toEqual(['run.json']);
     expect(written.result.run.runStatus).toBe('PARTIAL');
     expect(written.result.run.incompleteReasons[0]?.detail).toMatch(new RegExp(`^run:${RUN_ID}:/toolVersion `, 'u'));
     expect(await readJson(join(written.runDirectory, 'run.json'))).toMatchObject({ toolVersion: '', runStatus: 'PARTIAL' });
+  });
+
+  // MEM-1（DEF-266）: 分けて確かめても、誤りの文は、書いた audit.json・page.json・run.json をまるごと確かめた文と同じ。REC-2: audit.json の誤りは、
+  // Run だけの Finding の誤りだけ（run とページは写さない）。
+  it('reports the same errors as validating each written JSON as a whole (MEM-1)', async () => {
+    const base = auditRun({ invalidSecondPage: true, run: { toolVersion: '' } });
+    const runOnlyFinding = { ...finding(9, 'WARN', 'HTTP', null, []), unexpectedField: true } as Finding;
+    const written = await new ArtifactWriter().writeRun({ ...base, findings: [...base.findings, runOnlyFinding] }, { outputDirectory: await outputDirectory() });
+
+    const errorsOf = async (schema: 'audit' | 'run' | 'page', path: string): Promise<readonly string[]> => {
+      const validation = await validateArtifact(schema, await readJson(join(written.runDirectory, path)));
+      return validation.ok ? [] : validation.errors;
+    };
+    expect(written.invalidArtifacts).toEqual([
+      { path: 'pages/PAGE-000002/page.json', schema: 'page', errors: await errorsOf('page', 'pages/PAGE-000002/page.json') },
+      { path: 'run.json', schema: 'run', errors: await errorsOf('run', 'run.json') },
+      { path: 'audit.json', schema: 'audit', errors: await errorsOf('audit', 'audit.json') },
+    ]);
+    expect(written.invalidArtifacts[2]?.errors.every((error) => error.startsWith('/findings/0'))).toBe(true);
   });
 
   it('does not change the input Run', async () => {
@@ -857,7 +878,7 @@ async function savedRunDirectory(): Promise<{ readonly runDirectory: string; rea
   return { runDirectory, writer };
 }
 
-const checkpointFile = (runDirectory: string, file: 'state' | 'previousState' | 'lock'): string =>
+const checkpointFile = (runDirectory: string, file: 'state' | 'previousState'): string =>
   artifactFilePath(runDirectory, checkpointArtifactRelativePath(file));
 const checkpointPageFile = (runDirectory: string, pageId: PageId): string =>
   artifactFilePath(runDirectory, checkpointPageArtifactRelativePath(pageId));
@@ -914,14 +935,6 @@ function recordingFileOperations(runDirectory: string, calls: string[]): Checkpo
       calls.push(`rm ${name(path)}`);
       await rm(path, options);
     },
-    link: async (existingPath, newPath) => {
-      calls.push(`link ${name(existingPath)} -> ${name(newPath)}`);
-      await link(existingPath, newPath);
-    },
-    unlink: async (path) => {
-      calls.push(`unlink ${name(path)}`);
-      await unlink(path);
-    },
   };
 }
 
@@ -933,8 +946,8 @@ describe('ArtifactWriter: writing the checkpoint (resumable run design 4.1〜4.3
     const written = await new ArtifactWriter().writeCheckpointPage(runDirectory, value);
 
     expect(written).toBe('checkpoint/pages/PAGE-000002.json');
-    // T44f: artifact の JSON の書式は字下げなし（`serializeArtifactJson`）。
-    expect(await readFile(checkpointPageFile(runDirectory, PAGE_2), 'utf8')).toBe(`${JSON.stringify(value)}\n`);
+    // T44f: artifact の JSON の書式は字下げなし（`serializeArtifactJson`）。REC-3: 中身はディスクの形。
+    expect(await readFile(checkpointPageFile(runDirectory, PAGE_2), 'utf8')).toBe(`${JSON.stringify(encodeCheckpointPageRecord(value))}\n`);
     expect(await listTree(runDirectory)).toEqual(['checkpoint/', 'checkpoint/pages/', 'checkpoint/pages/PAGE-000002.json']);
   });
 
@@ -1067,162 +1080,103 @@ describe('ArtifactWriter: writing the checkpoint (resumable run design 4.1〜4.3
   });
 });
 
-// ---------------------------------------------------------------------------------------------------------------
-// D2（サイトの不調で止めたときの診断の記録の設計書 2.3）: 診断の記録の書き出し（`diagnostics/site-unavailable-<pageId>-<実行の番号>.json`）。
-// スキーマで検証してから、一時ファイルと名前の変更で書く。検証に失敗したら、何も書かずに例外を投げる。
-// ---------------------------------------------------------------------------------------------------------------
+/** 保存を読む2つの関数（ページの保存まで読む `readCheckpoint` と、状態の保存だけを読む `readCheckpointState`）。 */
+type Reader = 'readCheckpoint' | 'readCheckpointState';
+const READERS: readonly Reader[] = ['readCheckpoint', 'readCheckpointState'];
+const readWith = async (reader: Reader, writer: ArtifactWriter, runDirectory: string, checkState = checkRunCheckpointConsistency) =>
+  reader === 'readCheckpoint'
+    ? await writer.readCheckpoint(runDirectory, { checkState, checkPage: checkRunCheckpointPageConsistency })
+    : await writer.readCheckpointState(runDirectory, checkState);
 
-/**
- * 見本の診断の記録（そのページの最終の試行の結果と、Desktop の観察の結果。Desktop の文書の要求は、ヘッダを送り、応答がない）。
- * Mobile は、Passive の読み込みを始めなかった（`null`）。
- */
-function sampleDiagnostic(pageId: typeof PAGE_1 | typeof PAGE_2, executionNumber: number): SiteUnavailableDiagnosticRecord {
-  const result = page(pageId, pageId === PAGE_1 ? '/' : '/second.html', 'FAILED', [dom(6, pageId, 'desktop', '止まったページ')]);
-  const observedAtMs = Date.parse(FIXTURE_OBSERVED_AT);
-  return {
-    schemaVersion: SITE_UNAVAILABLE_DIAGNOSTIC_SCHEMA_VERSION,
-    runId: RUN_ID,
-    executionNumber,
-    writtenAt: FIXTURE_OBSERVED_AT,
-    pageId,
-    url: result.pageUrl,
-    siteUnavailableDetail: 'desktop:passive:TIMEOUT',
-    page: result,
-    navigationDiagnostics: {
-      // D3 の形: Passive の観察に加えて、幅の走査の幅ごとと Interaction の候補ごとの観察（この見本では、どちらもない）。
-      desktop: {
-        passive: {
-          status: 'OBSERVED',
-          observationStartedAtMs: observedAtMs,
-          observationEndedAtMs: observedAtMs + 3_000,
-          documentRequests: [{
-            hops: [{
-              url: result.pageUrl,
-              method: 'GET',
-              truncated: false,
-              issuedAtMs: observedAtMs + 1,
-              requestHeadersSentAtMs: observedAtMs + 2,
-              responseHeadersReceivedAtMs: null,
-              httpStatus: null,
-              remoteIpAddress: null,
-              remotePort: null,
-            }],
-            loadingFinishedAtMs: null,
-            loadingFailure: null,
-          }],
-          omittedDocumentRequestCount: 0,
-          omittedEventCount: 0,
-        },
-        stressWidths: [],
-        interactionCandidates: [],
-      },
-      mobile: null,
+/** `state.json` を使えなくする壊し方と、その理由（R5a: 確かめの順と結果の形は、2つの読み方で同じ）。 */
+const BROKEN_STATES = [
+  [
+    'state.json is cut off in the middle',
+    async (runDirectory: string) => {
+      const statePath = checkpointFile(runDirectory, 'state');
+      await writeFile(statePath, (await readFile(statePath, 'utf8')).slice(0, 120), 'utf8');
     },
-  };
-}
-
-/** 1 回目の試行（SU5。確かめ直す前の、捨てた試行）。 */
-const FIRST_ATTEMPT = 1;
-/** 確かめ直しの試行（SU5）。 */
-const RECHECK_ATTEMPT = 2;
-
-const diagnosticFile = (runDirectory: string, pageId: PageId, executionNumber: number, attemptNumber: number): string =>
-  artifactFilePath(runDirectory, siteUnavailableDiagnosticRelativePath(pageId, executionNumber, attemptNumber));
-
-// SU5（サイトが応答しないときに Run を止める設計書 3.5.2）: 同じ実行で同じページを 1 回確かめ直すので、ファイルの名前に試行の番号を加える
-// （`diagnostics/site-unavailable-<pageId>-<実行の番号>-<試行の番号>.json`）。試行の番号は、記録の中ではなく、引数で受ける（記録の形は変えない）。
-describe('ArtifactWriter: writing the site-unavailable diagnostic (site-unavailable diagnostics design 2.3)', () => {
-  it('writes the diagnostic to diagnostics/site-unavailable-<pageId>-<execution>-<attempt>.json in the artifact JSON format, and returns its path', async () => {
-    const { runDirectory } = await runDirectoryInWork();
-    const value = sampleDiagnostic(PAGE_2, 2);
-
-    const written = await new ArtifactWriter().writeSiteUnavailableDiagnostic(runDirectory, value, RECHECK_ATTEMPT);
-
-    expect(written).toBe('diagnostics/site-unavailable-PAGE-000002-2-2.json');
-    expect(written).toBe(siteUnavailableDiagnosticRelativePath(PAGE_2, 2, RECHECK_ATTEMPT));
-    expect(await readFile(diagnosticFile(runDirectory, PAGE_2, 2, RECHECK_ATTEMPT), 'utf8')).toBe(`${JSON.stringify(value)}\n`);
-    await expect(validateArtifact('site-unavailable-diagnostic', await readJson(diagnosticFile(runDirectory, PAGE_2, 2, RECHECK_ATTEMPT))))
-      .resolves.toEqual({ ok: true });
-    // `diagnostics/`（と Run のディレクトリ）がなければ作る。一時ファイルは残らない。試行の番号は、記録の中に書かない。
-    expect(await listTree(runDirectory)).toEqual(['diagnostics/', 'diagnostics/site-unavailable-PAGE-000002-2-2.json']);
-    expect(await readJson(diagnosticFile(runDirectory, PAGE_2, 2, RECHECK_ATTEMPT))).toEqual(value);
-  });
-
-  it('keeps the diagnostics of other pages, executions and attempts, and the other outputs of the run directory', async () => {
-    const { root, runDirectory } = await runDirectoryInWork();
-    const writer = new ArtifactWriter();
-    await writer.writeRun(auditRun(), { outputDirectory: root });
-    const outputs = await listTree(runDirectory);
-
-    for (const [pageId, executionNumber, attemptNumber] of [
-      [PAGE_2, 1, FIRST_ATTEMPT],
-      [PAGE_2, 1, RECHECK_ATTEMPT],
-      [PAGE_2, 2, FIRST_ATTEMPT],
-      [PAGE_1, 2, FIRST_ATTEMPT],
-    ] as const) {
-      await writer.writeSiteUnavailableDiagnostic(runDirectory, sampleDiagnostic(pageId, executionNumber), attemptNumber);
-    }
-
-    expect(await listTree(runDirectory)).toEqual([
-      ...outputs,
-      'diagnostics/',
-      'diagnostics/site-unavailable-PAGE-000001-2-1.json',
-      'diagnostics/site-unavailable-PAGE-000002-1-1.json',
-      'diagnostics/site-unavailable-PAGE-000002-1-2.json',
-      'diagnostics/site-unavailable-PAGE-000002-2-1.json',
-    ].sort());
-    expect(await readJson(diagnosticFile(runDirectory, PAGE_2, 1, FIRST_ATTEMPT))).toEqual(sampleDiagnostic(PAGE_2, 1));
-    expect(await readJson(diagnosticFile(runDirectory, PAGE_2, 1, RECHECK_ATTEMPT))).toEqual(sampleDiagnostic(PAGE_2, 1));
-    expect(await readJson(diagnosticFile(runDirectory, PAGE_2, 2, FIRST_ATTEMPT))).toEqual(sampleDiagnostic(PAGE_2, 2));
-  });
-
-  it('does not write a diagnostic that does not match its schema (for example with request headers), and throws an ArtifactWriteError', async () => {
-    const { runDirectory } = await runDirectoryInWork();
-    const sample = sampleDiagnostic(PAGE_1, 1);
-    const withHeaders = { ...sample, requestHeaders: { cookie: 'session=1' } } as unknown as SiteUnavailableDiagnosticRecord;
-    const withInvalidPage = { ...sample, page: { ...sample.page, unexpectedField: true } } as unknown as SiteUnavailableDiagnosticRecord;
-
-    for (const invalid of [withHeaders, withInvalidPage]) {
-      const failure = await new ArtifactWriter().writeSiteUnavailableDiagnostic(runDirectory, invalid, FIRST_ATTEMPT).catch((error: unknown) => error);
-
-      expect(failure).toBeInstanceOf(ArtifactWriteError);
-      expect((failure as ArtifactWriteError).message).toContain('site-unavailable-diagnostic');
-      expect((failure as ArtifactWriteError).path).toBe(diagnosticFile(runDirectory, PAGE_1, 1, FIRST_ATTEMPT));
-    }
-    await expect(readdir(runDirectory)).rejects.toMatchObject({ code: 'ENOENT' });
-  });
-
-  it('refuses a page ID, an execution number or an attempt number that cannot be in the file name, and an empty run directory, before writing anything', async () => {
-    const { runDirectory } = await runDirectoryInWork();
-    const writer = new ArtifactWriter();
-    for (const pageId of ['../escape', 'PAGE-1', 'notes']) {
-      const unsafe = { ...sampleDiagnostic(PAGE_1, 1), pageId: pageId as PageId };
-      await expect(writer.writeSiteUnavailableDiagnostic(runDirectory, unsafe, FIRST_ATTEMPT), pageId).rejects.toBeInstanceOf(RangeError);
-    }
-    for (const number of [0, -1, 1.5]) {
-      await expect(writer.writeSiteUnavailableDiagnostic(runDirectory, sampleDiagnostic(PAGE_1, number), FIRST_ATTEMPT), `execution ${String(number)}`)
-        .rejects.toBeInstanceOf(RangeError);
-      await expect(writer.writeSiteUnavailableDiagnostic(runDirectory, sampleDiagnostic(PAGE_1, 1), number), `attempt ${String(number)}`)
-        .rejects.toBeInstanceOf(RangeError);
-    }
-    await expect(writer.writeSiteUnavailableDiagnostic('', sampleDiagnostic(PAGE_1, 1), FIRST_ATTEMPT)).rejects.toBeInstanceOf(TypeError);
-    await expect(readdir(runDirectory)).rejects.toMatchObject({ code: 'ENOENT' });
-  });
-
-  it('throws an ArtifactWriteError and removes the temporary file when the diagnostic cannot be renamed into place', async () => {
-    const { runDirectory } = await runDirectoryInWork();
-    await mkdir(join(diagnosticFile(runDirectory, PAGE_1, 1, FIRST_ATTEMPT), 'blocker'), { recursive: true });
-
-    const failure = await new ArtifactWriter().writeSiteUnavailableDiagnostic(runDirectory, sampleDiagnostic(PAGE_1, 1), FIRST_ATTEMPT)
-      .catch((error: unknown) => error);
-
-    expect(failure).toBeInstanceOf(ArtifactWriteError);
-    expect((failure as ArtifactWriteError).path).toBe(diagnosticFile(runDirectory, PAGE_1, 1, FIRST_ATTEMPT));
-    expect((await listTree(runDirectory)).filter((path) => path.includes('.tmp'))).toEqual([]);
-  });
-});
+    'is not valid JSON',
+  ],
+  [
+    'state.json does not match checkpoint.schema.json',
+    async (runDirectory: string) =>
+      writeFile(checkpointFile(runDirectory, 'state'), JSON.stringify({ ...sampleCheckpoint(2), unexpected: true }), 'utf8'),
+    /^does not match the schema checkpoint: \/ must NOT have additional properties/u,
+  ],
+  [
+    // PAGE-000002 は FAILED だが、終わったページの一覧にない（スキーマには合う）。
+    'state.json does not pass the consistency check',
+    async (runDirectory: string) =>
+      writeFile(checkpointFile(runDirectory, 'state'), JSON.stringify({ ...sampleCheckpoint(2), completedPageIds: [PAGE_1] }), 'utf8'),
+    /^is not consistent: .*is not listed in \/completedPageIds/u,
+  ],
+] as const;
 
 describe('ArtifactWriter: reading the checkpoint (resumable run design 4.2, 4.3)', () => {
+  it.each(READERS.flatMap((reader) => BROKEN_STATES.map(([name, breakState, reason]) => [reader, name, breakState, reason] as const)))(
+    '%s: uses state.prev.json when %s',
+    async (reader, _name, breakState, reason) => {
+      const { runDirectory, writer } = await savedRunDirectory();
+      await breakState(runDirectory);
+
+      const read = await readWith(reader, writer, runDirectory);
+
+      expect(read).toMatchObject({ ok: true, source: 'prev', state: sampleCheckpoint(1) });
+      expect(read.failures).toEqual([
+        { source: 'state', path: 'checkpoint/state.json', reason: typeof reason === 'string' ? reason : expect.stringMatching(reason) },
+      ]);
+    },
+  );
+
+  it.each(READERS)('%s: returns the reasons of both files, without throwing and without a URL, when neither can be used', async (reader) => {
+    const { runDirectory, writer } = await savedRunDirectory();
+    await writeFile(checkpointFile(runDirectory, 'state'), '{', 'utf8');
+    await writeFile(checkpointFile(runDirectory, 'previousState'), JSON.stringify({ schemaVersion: 'checkpoint-schema/1.0' }), 'utf8');
+
+    const read = await readWith(reader, writer, runDirectory);
+
+    expect(read).toEqual({
+      ok: false,
+      failures: [
+        { source: 'state', path: 'checkpoint/state.json', reason: 'is not valid JSON' },
+        { source: 'prev', path: 'checkpoint/state.prev.json', reason: expect.stringMatching(/^does not match the schema checkpoint: \/ must include state/u) },
+      ],
+    });
+    expect(JSON.stringify(read)).not.toContain(FIXTURE_ORIGIN);
+  });
+
+  it.each(READERS)('%s: returns "does not exist" for both files when there is no checkpoint', async (reader) => {
+    const { runDirectory } = await runDirectoryInWork();
+    await mkdir(runDirectory, { recursive: true });
+
+    await expect(readWith(reader, new ArtifactWriter(), runDirectory)).resolves.toEqual({
+      ok: false,
+      failures: [
+        { source: 'state', path: 'checkpoint/state.json', reason: 'does not exist' },
+        { source: 'prev', path: 'checkpoint/state.prev.json', reason: 'does not exist' },
+      ],
+    });
+  });
+
+  // MEM-3c（DEF-266）: ページの保存を 1 つずつ集める口（全部を配列で持たない）。state.json のページが使えなければ、集めたものを捨てて state.prev.json から集め直す。
+  it('gives the page checkpoints one at a time to a collector, and collects again from state.prev.json when a page of state.json is missing (MEM-3c)', async () => {
+    const { runDirectory, writer } = await savedRunDirectory();
+    await rm(checkpointPageFile(runDirectory, PAGE_2));
+    const begun: string[][] = [];
+
+    const read = await writer.readCheckpointCollected(runDirectory, CHECKS, {
+      begin: () => {
+        const seen: string[] = [];
+        begun.push(seen);
+        return { add: async (value: RunCheckpointPage) => { seen.push(value.pageId); }, finish: () => [...seen] };
+      },
+    });
+
+    expect(read).toMatchObject({ ok: true, source: 'prev', state: sampleCheckpoint(1), pages: [PAGE_1] });
+    expect(begun).toEqual([[PAGE_1], [PAGE_1]]);
+  });
+
   it('reads state.json and the page checkpoints of its completed pages, checked by the schema and the consistency checks', async () => {
     const { runDirectory, writer } = await savedRunDirectory();
 
@@ -1242,42 +1196,6 @@ describe('ArtifactWriter: reading the checkpoint (resumable run design 4.2, 4.3)
       const pages: readonly RunCheckpointPage[] = read.pages;
       expect(state.completedPageIds).toEqual(pages.map(({ pageId }) => pageId));
     }
-  });
-
-  it('uses state.prev.json when state.json is cut off in the middle', async () => {
-    const { runDirectory, writer } = await savedRunDirectory();
-    const statePath = checkpointFile(runDirectory, 'state');
-    await writeFile(statePath, (await readFile(statePath, 'utf8')).slice(0, 120), 'utf8');
-
-    const read = await writer.readCheckpoint(runDirectory, CHECKS);
-
-    expect(read).toMatchObject({ ok: true, source: 'prev', state: sampleCheckpoint(1), pages: [samplePage(PAGE_1)] });
-    expect(read.failures).toEqual([{ source: 'state', path: 'checkpoint/state.json', reason: 'is not valid JSON' }]);
-  });
-
-  it('uses state.prev.json when state.json does not match checkpoint.schema.json', async () => {
-    const { runDirectory, writer } = await savedRunDirectory();
-    await writeFile(checkpointFile(runDirectory, 'state'), JSON.stringify({ ...sampleCheckpoint(2), unexpected: true }), 'utf8');
-
-    const read = await writer.readCheckpoint(runDirectory, CHECKS);
-
-    expect(read).toMatchObject({ ok: true, source: 'prev', state: sampleCheckpoint(1) });
-    expect(read.failures).toEqual([
-      { source: 'state', path: 'checkpoint/state.json', reason: expect.stringMatching(/^does not match the schema checkpoint: \/ must NOT have additional properties/u) },
-    ]);
-  });
-
-  it('uses state.prev.json when state.json does not pass the consistency check', async () => {
-    const { runDirectory, writer } = await savedRunDirectory();
-    // PAGE-000002 は FAILED だが、終わったページの一覧にない（スキーマには合う）。
-    await writeFile(checkpointFile(runDirectory, 'state'), JSON.stringify({ ...sampleCheckpoint(2), completedPageIds: [PAGE_1] }), 'utf8');
-
-    const read = await writer.readCheckpoint(runDirectory, CHECKS);
-
-    expect(read).toMatchObject({ ok: true, source: 'prev', state: sampleCheckpoint(1) });
-    expect(read.failures).toEqual([
-      { source: 'state', path: 'checkpoint/state.json', reason: expect.stringMatching(/^is not consistent: .*is not listed in \/completedPageIds/u) },
-    ]);
   });
 
   it('uses state.prev.json when a page checkpoint listed in state.json does not exist', async () => {
@@ -1330,37 +1248,6 @@ describe('ArtifactWriter: reading the checkpoint (resumable run design 4.2, 4.3)
 
     expect(read).toMatchObject({ ok: true, source: 'prev', state: sampleCheckpoint(1), pages: [samplePage(PAGE_1)] });
     expect(read.failures).toEqual([{ source: 'state', path: 'checkpoint/state.json', reason: 'does not exist' }]);
-  });
-
-  it('returns the reasons of both files, without throwing, when neither can be used', async () => {
-    const { runDirectory, writer } = await savedRunDirectory();
-    await writeFile(checkpointFile(runDirectory, 'state'), '{', 'utf8');
-    await writeFile(checkpointFile(runDirectory, 'previousState'), JSON.stringify({ schemaVersion: 'checkpoint-schema/1.0' }), 'utf8');
-
-    const read = await writer.readCheckpoint(runDirectory, CHECKS);
-
-    expect(read).toEqual({
-      ok: false,
-      failures: [
-        { source: 'state', path: 'checkpoint/state.json', reason: 'is not valid JSON' },
-        { source: 'prev', path: 'checkpoint/state.prev.json', reason: expect.stringMatching(/^does not match the schema checkpoint: \/ must include state/u) },
-      ],
-    });
-    // 理由に URL を入れない。
-    expect(JSON.stringify(read)).not.toContain(FIXTURE_ORIGIN);
-  });
-
-  it('returns "does not exist" for both files when there is no checkpoint', async () => {
-    const { runDirectory } = await runDirectoryInWork();
-    await mkdir(runDirectory, { recursive: true });
-
-    await expect(new ArtifactWriter().readCheckpoint(runDirectory, CHECKS)).resolves.toEqual({
-      ok: false,
-      failures: [
-        { source: 'state', path: 'checkpoint/state.json', reason: 'does not exist' },
-        { source: 'prev', path: 'checkpoint/state.prev.json', reason: 'does not exist' },
-      ],
-    });
   });
 
   it('does not put a URL in the reasons, even when the consistency check fails on a URL', async () => {
@@ -1419,40 +1306,9 @@ describe('ArtifactWriter: reading only the state of the checkpoint (resumable ru
     await expect(writer.readCheckpoint(runDirectory, CHECKS)).resolves.toMatchObject({ ok: false });
   });
 
-  it('uses state.prev.json when state.json is cut off in the middle', async () => {
-    const { runDirectory, writer } = await savedRunDirectory();
-    const statePath = checkpointFile(runDirectory, 'state');
-    await writeFile(statePath, (await readFile(statePath, 'utf8')).slice(0, 120), 'utf8');
-
-    await expect(writer.readCheckpointState(runDirectory, checkRunCheckpointConsistency)).resolves.toEqual({
-      ok: true,
-      source: 'prev',
-      state: sampleCheckpoint(1),
-      failures: [{ source: 'state', path: 'checkpoint/state.json', reason: 'is not valid JSON' }],
-    });
-  });
-
-  it('uses state.prev.json when state.json does not match checkpoint.schema.json', async () => {
-    const { runDirectory, writer } = await savedRunDirectory();
-    await writeFile(checkpointFile(runDirectory, 'state'), JSON.stringify({ ...sampleCheckpoint(2), unexpected: true }), 'utf8');
-
-    const read = await writer.readCheckpointState(runDirectory, checkRunCheckpointConsistency);
-
-    expect(read).toMatchObject({ ok: true, source: 'prev', state: sampleCheckpoint(1) });
-    expect(read.failures).toEqual([
-      { source: 'state', path: 'checkpoint/state.json', reason: expect.stringMatching(/^does not match the schema checkpoint: \/ must NOT have additional properties/u) },
-    ]);
-  });
-
-  it('uses state.prev.json when state.json does not pass the consistency check, and when the check throws', async () => {
+  it('uses state.prev.json when the consistency check throws on state.json', async () => {
     const { runDirectory, writer } = await savedRunDirectory();
     await writeFile(checkpointFile(runDirectory, 'state'), JSON.stringify({ ...sampleCheckpoint(2), completedPageIds: [PAGE_1] }), 'utf8');
-
-    const inconsistent = await writer.readCheckpointState(runDirectory, checkRunCheckpointConsistency);
-    expect(inconsistent).toMatchObject({ ok: true, source: 'prev', state: sampleCheckpoint(1) });
-    expect(inconsistent.failures).toEqual([
-      { source: 'state', path: 'checkpoint/state.json', reason: expect.stringMatching(/^is not consistent: .*is not listed in \/completedPageIds/u) },
-    ]);
 
     const throwing = await writer.readCheckpointState(runDirectory, (state: RunCheckpoint) => {
       if (state.completedPageIds.length === 1 && state.frontier.entries.some(({ state: urlState }) => urlState === 'FAILED')) {
@@ -1466,35 +1322,11 @@ describe('ArtifactWriter: reading only the state of the checkpoint (resumable ru
     ]);
   });
 
-  it('returns the reasons of both files, without throwing, when neither can be used', async () => {
-    const { runDirectory, writer } = await savedRunDirectory();
-    await writeFile(checkpointFile(runDirectory, 'state'), '{', 'utf8');
-    await writeFile(checkpointFile(runDirectory, 'previousState'), JSON.stringify({ schemaVersion: 'checkpoint-schema/1.0' }), 'utf8');
-
-    const read = await writer.readCheckpointState(runDirectory, checkRunCheckpointConsistency);
-
-    expect(read).toEqual({
-      ok: false,
-      failures: [
-        { source: 'state', path: 'checkpoint/state.json', reason: 'is not valid JSON' },
-        { source: 'prev', path: 'checkpoint/state.prev.json', reason: expect.stringMatching(/^does not match the schema checkpoint: \/ must include state/u) },
-      ],
-    });
-    expect(JSON.stringify(read)).not.toContain(FIXTURE_ORIGIN);
-  });
-
-  it('returns "does not exist" for both files when there is no checkpoint, and refuses invalid arguments', async () => {
+  it('refuses invalid arguments', async () => {
     const { runDirectory } = await runDirectoryInWork();
     await mkdir(runDirectory, { recursive: true });
     const writer = new ArtifactWriter();
 
-    await expect(writer.readCheckpointState(runDirectory, checkRunCheckpointConsistency)).resolves.toEqual({
-      ok: false,
-      failures: [
-        { source: 'state', path: 'checkpoint/state.json', reason: 'does not exist' },
-        { source: 'prev', path: 'checkpoint/state.prev.json', reason: 'does not exist' },
-      ],
-    });
     await expect(writer.readCheckpointState('', checkRunCheckpointConsistency)).rejects.toBeInstanceOf(TypeError);
     await expect(writer.readCheckpointState(runDirectory, undefined as never)).rejects.toBeInstanceOf(TypeError);
   });
@@ -1516,14 +1348,6 @@ describe('ArtifactWriter: the run ID of the checkpoint must be the name of the r
     const path = checkpointFile(runDirectory, file);
     await writeFile(path, JSON.stringify({ ...(await readJson(path) as RunCheckpoint), runId: OTHER_RUN_ID }), 'utf8');
   };
-
-  /** 保存を読む2つの関数（ページの保存まで読む `readCheckpoint` と、状態の保存だけを読む `readCheckpointState`）。 */
-  type Reader = 'readCheckpoint' | 'readCheckpointState';
-  const READERS: readonly Reader[] = ['readCheckpoint', 'readCheckpointState'];
-  const readWith = async (reader: Reader, writer: ArtifactWriter, runDirectory: string, checkState = checkRunCheckpointConsistency) =>
-    reader === 'readCheckpoint'
-      ? await writer.readCheckpoint(runDirectory, { checkState, checkPage: checkRunCheckpointPageConsistency })
-      : await writer.readCheckpointState(runDirectory, checkState);
 
   it.each(READERS)('%s: uses state.prev.json when the run ID of state.json differs from the name of the run directory', async (reader) => {
     const { runDirectory, writer } = await savedRunDirectory();
@@ -1696,158 +1520,6 @@ describe('ArtifactWriter: removing the checkpoint files a finished Run does not 
 
   it('refuses an empty run directory', async () => {
     await expect(new ArtifactWriter().removeFinishedCheckpointFiles('')).rejects.toBeInstanceOf(TypeError);
-  });
-});
-
-/** ロックの見本の、プロセスと OS の値（ロックのテストと、名前の変更のやり直しのテストで使う）。 */
-const HOST: RunLockHost = Object.freeze({ processId: 4_321, nowMs: 1_000_000, bootedAtMs: 400_000 });
-
-describe('ArtifactWriter: the run lock (resumable run design 4.4)', () => {
-
-  it('creates checkpoint/run.lock exclusively with the given lock, and fsyncs it', async () => {
-    const { runDirectory } = await runDirectoryInWork();
-    const calls: string[] = [];
-    const writer = new ArtifactWriter({ fileOperations: recordingFileOperations(runDirectory, calls), platform: 'linux' });
-    const lock = createRunLock(HOST);
-
-    await expect(writer.acquireRunLock(runDirectory, lock)).resolves.toEqual({ acquired: true });
-
-    expect(await readJson(checkpointFile(runDirectory, 'lock'))).toEqual(lock);
-    // SR-1-F（DEF-168）: 中身を書き終えた一時ファイルから `link` で作る（中身のないロックのファイルが外から見えない）。
-    const temporary = `checkpoint/.run.lock.new-${String(process.pid)}-<time>.<uuid>.tmp`;
-    expect(calls.map((call) => call.replace(/\.new-(\d+)-\d+\./gu, '.new-$1-<time>.'))).toEqual([
-      'mkdir checkpoint',
-      `open ${temporary} wx`,
-      `write ${temporary}`,
-      `sync ${temporary}`,
-      `close ${temporary}`,
-      `link ${temporary} -> checkpoint/run.lock`,
-      `unlink ${temporary}`,
-      'open checkpoint r',
-      'sync checkpoint',
-      'close checkpoint',
-    ]);
-    expect(await readdir(join(runDirectory, 'checkpoint'))).toEqual(['run.lock']);
-  });
-
-  it('does not take a lock that already exists, and returns its current content for judgeRunLock', async () => {
-    const { runDirectory } = await runDirectoryInWork();
-    const writer = new ArtifactWriter();
-    const lock = createRunLock(HOST);
-    await writer.acquireRunLock(runDirectory, lock);
-
-    const second = await writer.acquireRunLock(runDirectory, createRunLock({ ...HOST, processId: 9_999 }));
-
-    expect(second).toEqual({ acquired: false, existing: lock });
-    expect(await readJson(checkpointFile(runDirectory, 'lock'))).toEqual(lock);
-    if (!second.acquired) {
-      const current = { nowMs: HOST.nowMs + 1_000, bootedAtMs: HOST.bootedAtMs, isProcessRunning: () => true };
-      expect(judgeRunLock(second.existing, current)).toBe('ACTIVE');
-      expect(judgeRunLock(second.existing, { ...current, isProcessRunning: () => false })).toBe('STALE');
-    }
-  });
-
-  it('returns null as the current content when the existing lock cannot be read as JSON', async () => {
-    const { runDirectory } = await runDirectoryInWork();
-    await mkdir(join(runDirectory, 'checkpoint'), { recursive: true });
-    await writeFile(checkpointFile(runDirectory, 'lock'), '{"processId":', 'utf8');
-
-    const second = await new ArtifactWriter().acquireRunLock(runDirectory, createRunLock(HOST));
-
-    expect(second).toEqual({ acquired: false, existing: null });
-    expect(await readFile(checkpointFile(runDirectory, 'lock'), 'utf8')).toBe('{"processId":');
-  });
-
-  it('replaces a stale lock and renews the heartbeat by rewriting the whole file, leaving no temporary file', async () => {
-    const { runDirectory } = await runDirectoryInWork();
-    const writer = new ArtifactWriter();
-    await writer.acquireRunLock(runDirectory, createRunLock(HOST));
-
-    const replacement = createRunLock({ processId: 5_555, nowMs: 2_000_000, bootedAtMs: 1_900_000 });
-    await writer.rewriteRunLock(runDirectory, replacement);
-    expect(await readJson(checkpointFile(runDirectory, 'lock'))).toEqual(replacement);
-
-    const renewed = renewRunLock(replacement, 2_060_000);
-    await writer.rewriteRunLock(runDirectory, renewed);
-    expect(await readJson(checkpointFile(runDirectory, 'lock'))).toEqual({ ...replacement, heartbeatAtMs: 2_060_000 });
-    expect(await listTree(runDirectory)).toEqual(['checkpoint/', 'checkpoint/run.lock']);
-  });
-
-  it('fsyncs the temporary file before renaming it into place when it rewrites the lock', async () => {
-    const { runDirectory } = await runDirectoryInWork();
-    const calls: string[] = [];
-    const writer = new ArtifactWriter({ fileOperations: recordingFileOperations(runDirectory, calls), platform: 'win32' });
-
-    await writer.rewriteRunLock(runDirectory, createRunLock(HOST));
-
-    expect(calls).toEqual([
-      'mkdir checkpoint',
-      'open checkpoint/.run.lock.<uuid>.tmp wx',
-      'write checkpoint/.run.lock.<uuid>.tmp',
-      'sync checkpoint/.run.lock.<uuid>.tmp',
-      'close checkpoint/.run.lock.<uuid>.tmp',
-      'rename checkpoint/.run.lock.<uuid>.tmp -> checkpoint/run.lock',
-    ]);
-  });
-
-  it('removes the lock, and does nothing when there is no lock', async () => {
-    const { runDirectory } = await runDirectoryInWork();
-    const writer = new ArtifactWriter();
-    await writer.acquireRunLock(runDirectory, createRunLock(HOST));
-
-    await writer.releaseRunLock(runDirectory);
-    expect(await listTree(runDirectory)).toEqual(['checkpoint/']);
-    await expect(writer.releaseRunLock(runDirectory)).resolves.toBeUndefined();
-  });
-
-  it('refuses a lock that cannot be written as JSON, before writing anything', async () => {
-    const { runDirectory } = await runDirectoryInWork();
-    const unwritable = { processId: 1n };
-
-    await expect(new ArtifactWriter().acquireRunLock(runDirectory, unwritable)).rejects.toBeInstanceOf(TypeError);
-    await expect(new ArtifactWriter().rewriteRunLock(runDirectory, unwritable)).rejects.toBeInstanceOf(TypeError);
-    await expect(readdir(runDirectory)).rejects.toMatchObject({ code: 'ENOENT' });
-  });
-
-  // R4a2a: 古いロックを作り直した後に、自分のものかを読み直すための、ロックの中身の読み取り（設計書 4.4）。
-  it('reads the current content of the lock, deeply frozen, without writing anything', async () => {
-    const { runDirectory } = await runDirectoryInWork();
-    const writer = new ArtifactWriter();
-    const lock = createRunLock(HOST);
-    await writer.acquireRunLock(runDirectory, lock);
-    const calls: string[] = [];
-    const reader = new ArtifactWriter({ fileOperations: recordingFileOperations(runDirectory, calls), platform: 'linux' });
-
-    const read = await reader.readRunLock(runDirectory);
-    expect(read).toEqual(lock);
-    expect(Object.isFrozen(read)).toBe(true);
-
-    const replacement = createRunLock({ ...HOST, processId: 5_555, nowMs: HOST.nowMs + 1 });
-    await writer.rewriteRunLock(runDirectory, replacement);
-    await expect(reader.readRunLock(runDirectory)).resolves.toEqual(replacement);
-
-    // 読むだけで、ファイルの操作（作成、書き込み、名前の変更、削除）をしない。
-    expect(calls).toEqual([]);
-    expect(await listTree(runDirectory)).toEqual(['checkpoint/', 'checkpoint/run.lock']);
-  });
-
-  it('returns null without creating anything when there is no lock, and when the lock cannot be read as JSON', async () => {
-    const { runDirectory } = await runDirectoryInWork();
-    const writer = new ArtifactWriter();
-
-    await expect(writer.readRunLock(runDirectory)).resolves.toBeNull();
-    await expect(readdir(runDirectory)).rejects.toMatchObject({ code: 'ENOENT' });
-
-    await mkdir(join(runDirectory, 'checkpoint'), { recursive: true });
-    await expect(writer.readRunLock(runDirectory)).resolves.toBeNull();
-
-    await writeFile(checkpointFile(runDirectory, 'lock'), '{"processId":', 'utf8');
-    await expect(writer.readRunLock(runDirectory)).resolves.toBeNull();
-    expect(await readFile(checkpointFile(runDirectory, 'lock'), 'utf8')).toBe('{"processId":');
-  });
-
-  it('refuses an empty run directory when it reads the lock', async () => {
-    await expect(new ArtifactWriter().readRunLock('')).rejects.toBeInstanceOf(TypeError);
   });
 });
 
@@ -2040,7 +1712,6 @@ interface RetriedWrite {
   readonly expectWritten: (runDirectory: string) => Promise<void>;
 }
 
-const RUN_LOCK_SAMPLE = createRunLock(HOST);
 /** `state.json` から `state.prev.json` への移し替えの書き出しの名前（`ENOENT` を、移すものがないとして扱う。今のとおり）。 */
 const MOVE_TO_PREVIOUS_STATE = 'state.json to state.prev.json of the state checkpoint';
 
@@ -2063,7 +1734,7 @@ const RETRIED_WRITES: Readonly<Record<string, RetriedWrite>> = {
     target: basename(checkpointPageArtifactRelativePath(PAGE_1)),
     write: async (writer, _root, runDirectory) => writer.writeCheckpointPage(runDirectory, samplePage(PAGE_1)),
     expectWritten: async (runDirectory) => {
-      expect(await readJson(checkpointPageFile(runDirectory, PAGE_1))).toEqual(samplePage(PAGE_1));
+      expect(decodeCheckpointPageRecord(await readJson(checkpointPageFile(runDirectory, PAGE_1)))).toEqual(samplePage(PAGE_1));
     },
   },
   'state.json of the state checkpoint': {
@@ -2082,21 +1753,6 @@ const RETRIED_WRITES: Readonly<Record<string, RetriedWrite>> = {
     expectWritten: async (runDirectory) => {
       expect(await readJson(checkpointFile(runDirectory, 'state'))).toEqual(sampleCheckpoint(2));
       expect(await readJson(checkpointFile(runDirectory, 'previousState'))).toEqual(sampleCheckpoint(1));
-    },
-  },
-  // D2（サイトの不調で止めたときの診断の記録の設計書 2.3）: 診断の記録も、今のファイルの書き方（`renameWithRetry`）で書く。
-  'the site-unavailable diagnostic': {
-    target: basename(siteUnavailableDiagnosticRelativePath(PAGE_2, 1, FIRST_ATTEMPT)),
-    write: async (writer, _root, runDirectory) => writer.writeSiteUnavailableDiagnostic(runDirectory, sampleDiagnostic(PAGE_2, 1), FIRST_ATTEMPT),
-    expectWritten: async (runDirectory) => {
-      expect(await readJson(diagnosticFile(runDirectory, PAGE_2, 1, FIRST_ATTEMPT))).toEqual(sampleDiagnostic(PAGE_2, 1));
-    },
-  },
-  'the run lock': {
-    target: basename(checkpointArtifactRelativePath('lock')),
-    write: async (writer, _root, runDirectory) => writer.rewriteRunLock(runDirectory, RUN_LOCK_SAMPLE),
-    expectWritten: async (runDirectory) => {
-      expect(await readJson(checkpointFile(runDirectory, 'lock'))).toEqual(RUN_LOCK_SAMPLE);
     },
   },
 };

@@ -20,7 +20,6 @@ import type {
   AutoDraftUpdateResultStatus,
   DraftValueGround,
   DraftValueOrigin,
-  ExecutionGrantRejectionReason,
   FormAutoDraftGap,
   UpdateVerificationCopyUnavailableReason,
   RecordIdSource,
@@ -41,16 +40,11 @@ import type {
   SUBMISSION_STATE_CATALOG,
   WRITE_REPORT_CHECK_CATALOG,
 } from '../../../../src/presentation/catalog.js';
-import type { EXECUTION_GRANT_REJECTION_DESCRIPTIONS, WRITE_START_LOCAL_REJECTION_DESCRIPTIONS } from '../../../../src/presentation/messages.js';
-import type { WriteChainStartRejectionReason, WriteStartLocalRejectionReason } from '../server/write-job-functions';
-import type { WriteChainOfferReason, WriteChainState, WriteChainStopReason } from '../server/write-chain-policy';
-import type { WRITE_CHAIN_STATE_CATALOG, WRITE_CHAIN_STOP_REASON_CATALOG } from '../../../../src/presentation/catalog.js';
 import type {
   STAGE_CHAIN_STAGE_STATE_CATALOG,
   STAGE_CHAIN_STATE_CATALOG,
   STAGE_CHAIN_STOP_REASON_CATALOG,
 } from '../../../../src/presentation/catalog.js';
-import type { LOCAL_UI_WRITE_TEXT } from '../../../../src/presentation/messages.js';
 import type { LOCAL_UI_FRAME_TEXT } from '../../../../src/presentation/messages.js';
 import type { LOCAL_UI_JOB_SUMMARY_TEXT } from '../../../../src/presentation/messages.js';
 import type { AuditPrimaryStartKind, JobSummaryActiveResult, JobSummaryFinishedResult } from '../server/audit-job-functions';
@@ -187,25 +181,14 @@ import type {
   SEMANTIC_KIND_CATALOG,
 } from '../../../../src/presentation/catalog.js';
 import type {
-  DATA_RULE_REQUEST_REJECTION_DESCRIPTIONS,
-  LOCAL_UI_DATA_RULE_TEXT,
-  RULE_PROBLEM_DETAIL_DESCRIPTIONS,
-} from '../../../../src/presentation/messages.js';
-import type {
-  ExternalDeliveryBlockedDetail,
   ExternalDeliveryKind,
   FieldRelationKind,
   FieldRuleStatus,
   GenerationMethod,
-  NeedsRuleInputDetail,
-  RuleConflictDetail,
   RuleOrigin,
-  RuleSetStoreRejectionReason,
   RuleSource,
   SemanticKind,
 } from '../../../../src/control/data-rules-view.js';
-import type { FIELD_RELATION_ROLES } from '../../../../src/control/data-rules-view.js';
-import type { DataRuleRequestLocalRejectionReason } from '../server/data-rule-functions';
 import type { AuthSetupSaveRejectionReason } from '../server/auth-setup-functions';
 import type { ProfileSaveGuardRejection } from '../../../../src/control/auth/credential-destination.js';
 import type {
@@ -215,7 +198,8 @@ import type {
   TargetCrawlLimitsChangeFailure,
   TargetSiteProblem,
 } from '../../../../src/config/target-config-draft.js';
-import type { IncompleteReasonCode, RunExecutionEndReason, RunStatus } from '../../../../src/core/contracts.js';
+import type { IncompleteReasonCode, RunExecutionEndReason, RunStatus, SessionLostDetail } from '../../../../src/core/contracts.js';
+import type { JOB_END_REASON_DETAIL_DESCRIPTIONS } from '../../../../src/presentation/catalog.js';
 import type { PrecheckFailureDetail } from '../../../../src/control/actions/action-contracts.js';
 import type {
   AUDIT_JOB_STOP_REQUESTED_TEXTS,
@@ -234,12 +218,13 @@ import type { AuditJobLoginConfirmRejectionReason } from '../../../../src/contro
 import type { AuditJobAutomatedLoginUnavailableReason, AuditJobLoginAutoRegistrationSkipReason } from '../../../../src/control/job/job-store.js';
 import type { ChainStageState, ChainState, ChainStopReason } from '../../../../src/control/job/stage-chain-policy.js';
 import type {
+  LOCAL_UI_DISPLAY_NAME_TEXT,
   LOCAL_UI_DISPLAY_SETTINGS_TEXT,
   LOCAL_UI_LOGIN_STAGE_REGISTER_TEXT,
   LOCAL_UI_MANUAL_LOGIN_TEXT,
   LOCAL_UI_STAGE_CHAIN_TEXT,
 } from '../../../../src/presentation/messages.js';
-import type { ProfileDisplaySettingsRejectionReason } from '../../../../src/control/store/profile-store.js';
+import type { ProfileDisplayNameRejectionReason, ProfileDisplaySettingsRejectionReason } from '../../../../src/control/store/profile-store.js';
 import type { LoginStageRowRejectionReason } from '../server/login-stage-registration-functions';
 // FM2e: 1 回の操作で自動ログインの設定を終える画面の理由と戻しの一覧（型だけ）。
 import type { AutomatedLoginSetupRejectionReason, AutomatedLoginSetupRollback } from '../server/credential-service';
@@ -391,6 +376,8 @@ export type CandidateKindCatalogCoversEveryKind = AssertTrue<SameKeys<CandidateK
 export type CandidateReasonDescriptionsCoverEveryCode = AssertTrue<SameKeys<CandidateReasonCode, keyof typeof CANDIDATE_REASON_DESCRIPTIONS>>;
 export type DiscoveryDriftCatalogCoversEveryDrift = AssertTrue<SameKeys<DiscoveryIndexDrift, keyof typeof DISCOVERY_DRIFT_CATALOG>>;
 export type DiscoveryEndReasonCatalogCoversEveryReason = AssertTrue<SameKeys<DiscoveryEndReason, keyof typeof DISCOVERY_END_REASON_CATALOG>>;
+// DEF-233: ジョブの終わり方の詳しい理由（セッションの切れの詳しい理由）のすべてに、説明がある（今の止まり方の文）。
+export type JobEndReasonDetailDescriptionsCoverEveryDetail = AssertTrue<SameKeys<SessionLostDetail, keyof typeof JOB_END_REASON_DETAIL_DESCRIPTIONS>>;
 // T37c（Task 37 の設計書 3.6）: 送らずに観察する probe の結果と理由のすべてに、表示がある。
 export type SubmissionProbeResultCatalogCoversEveryResult = AssertTrue<SameKeys<SubmissionProbeResult, keyof typeof SUBMISSION_PROBE_RESULT_CATALOG>>;
 export type SubmissionProbeReasonCatalogCoversEveryReason = AssertTrue<SameKeys<SubmissionProbeReason, keyof typeof SUBMISSION_PROBE_REASON_CATALOG>>;
@@ -434,9 +421,9 @@ export type ScenarioRequestRejectionDescriptionsCoverEveryReason = AssertTrue<
   SameKeys<ScenarioStoreRejectionReason | ScenarioRequestLocalRejectionReason, keyof typeof SCENARIO_REQUEST_REJECTION_DESCRIPTIONS>
 >;
 
-// T29e（Task 29 の設計書 3 章の「補完の画面」、4.1、4.4）: 入力の規則の意味の種類（23）・作り方・欄どうしの関係・出どころ・欄ごとの状態・入力の規則の
-// 状態・外部到達の種類、判定の細分のすべて、保存を拒む理由（保存の部品の理由と画面のサーバの理由）、関係の役割の名前のすべてに、表示と説明がある
-// （値の一覧は `src/control/data-rules-view.ts` から公開し直したものと、`data-rules.ts`・`data-rule-functions.ts` の一覧）。
+// T29e（Task 29 の設計書 4.1）: 入力の規則の意味の種類・作り方・欄どうしの関係・出どころ・欄ごとの状態・入力の規則の状態・外部到達の種類に、表示がある
+// （値の一覧は `src/control/data-rules-view.ts` から公開し直したものと、`data-rules.ts` の一覧）。SPEC-4: 規則の画面を外したので、判定の細分・保存を拒む
+// 理由・関係の役割の名前の文言は捨てた。
 export type SemanticKindCatalogCoversEveryKind = AssertTrue<SameKeys<SemanticKind, keyof typeof SEMANTIC_KIND_CATALOG>>;
 export type GenerationMethodCatalogCoversEveryMethod = AssertTrue<SameKeys<GenerationMethod, keyof typeof GENERATION_METHOD_CATALOG>>;
 export type FieldRelationKindCatalogCoversEveryKind = AssertTrue<SameKeys<FieldRelationKind, keyof typeof FIELD_RELATION_KIND_CATALOG>>;
@@ -446,18 +433,9 @@ export type RuleOriginCatalogCoversEveryOrigin = AssertTrue<SameKeys<RuleOrigin,
 export type FieldRuleStatusCatalogCoversEveryStatus = AssertTrue<SameKeys<FieldRuleStatus, keyof typeof FIELD_RULE_STATUS_CATALOG>>;
 export type InputRuleStateCatalogCoversEveryState = AssertTrue<SameKeys<InputRuleState, keyof typeof INPUT_RULE_STATE_CATALOG>>;
 export type ExternalDeliveryKindCatalogCoversEveryKind = AssertTrue<SameKeys<ExternalDeliveryKind, keyof typeof EXTERNAL_DELIVERY_KIND_CATALOG>>;
-export type RuleProblemDetailDescriptionsCoverEveryDetail = AssertTrue<
-  SameKeys<NeedsRuleInputDetail | RuleConflictDetail | ExternalDeliveryBlockedDetail, keyof typeof RULE_PROBLEM_DETAIL_DESCRIPTIONS>
->;
-export type DataRuleRequestRejectionDescriptionsCoverEveryReason = AssertTrue<
-  SameKeys<RuleSetStoreRejectionReason | DataRuleRequestLocalRejectionReason, keyof typeof DATA_RULE_REQUEST_REJECTION_DESCRIPTIONS>
->;
-export type DataRuleRelationRoleLabelsCoverEveryRole = AssertTrue<
-  SameKeys<(typeof FIELD_RELATION_ROLES)[FieldRelationKind][number], keyof typeof LOCAL_UI_DATA_RULE_TEXT.relationRoles>
->;
 
 // T30g（Task 30 の設計書 3 章）: 書き込みの結果・送信の状態・止めた理由・応答の判定・結果の理由・予約の締め・検証の指定の項目・登録の ID の取り方の
-// すべてに表示があり、実行の許可の発行を拒む理由と、書き込みの開始を画面のサーバが拒む理由のすべてに説明と手順がある。
+// すべてに表示がある。
 export type ActionResultCatalogCoversEveryResult = AssertTrue<SameKeys<ActionResult, keyof typeof ACTION_RESULT_CATALOG>>;
 export type SubmissionStateCatalogCoversEveryState = AssertTrue<SameKeys<SubmissionState, keyof typeof SUBMISSION_STATE_CATALOG>>;
 export type ActionBlockReasonCatalogCoversEveryReason = AssertTrue<SameKeys<ActionBlockReason, keyof typeof ACTION_BLOCK_REASON_CATALOG>>;
@@ -470,21 +448,8 @@ export type ScenarioVerificationItemCatalogCoversEveryItem = AssertTrue<
   SameKeys<ScenarioVerificationItem, keyof typeof SCENARIO_VERIFICATION_ITEM_CATALOG>
 >;
 export type RecordIdSourceCatalogCoversEverySource = AssertTrue<SameKeys<RecordIdSource, keyof typeof RECORD_ID_SOURCE_CATALOG>>;
-export type ExecutionGrantRejectionDescriptionsCoverEveryReason = AssertTrue<
-  SameKeys<ExecutionGrantRejectionReason, keyof typeof EXECUTION_GRANT_REJECTION_DESCRIPTIONS>
->;
-export type WriteStartLocalRejectionDescriptionsCoverEveryReason = AssertTrue<
-  SameKeys<WriteStartLocalRejectionReason, keyof typeof WRITE_START_LOCAL_REJECTION_DESCRIPTIONS>
->;
-
-// T41g（Task 41 の設計書 3.5.1）: 「登録してから更新する」の状態と、更新を始めなかった理由のすべてに表示があり、出す理由と何も始めずに拒む理由の
-// すべてに文言がある。
-export type WriteChainStateCatalogCoversEveryState = AssertTrue<SameKeys<WriteChainState, keyof typeof WRITE_CHAIN_STATE_CATALOG>>;
-export type WriteChainStopReasonCatalogCoversEveryReason = AssertTrue<SameKeys<WriteChainStopReason, keyof typeof WRITE_CHAIN_STOP_REASON_CATALOG>>;
-export type WriteChainOfferTextCoversEveryReason = AssertTrue<SameKeys<WriteChainOfferReason, keyof typeof LOCAL_UI_WRITE_TEXT.chain.offerReasons>>;
-export type WriteChainStartRejectionTextCoversEveryReason = AssertTrue<
-  SameKeys<WriteChainStartRejectionReason, keyof typeof LOCAL_UI_WRITE_TEXT.chain.startRejections>
->;
+// SPEC-4: 書き込みの開始の画面を外したので、実行の許可の発行を拒む理由と、開始を画面のサーバが拒む理由の文言は捨てた。「登録してから更新する」の
+// 状態・理由の表示と文言も、続けて始める口ごと捨てた。
 
 // T40d（Task 40 の設計書 3.5）: 書き込みの送り方のすべてに表示がある。
 export type ScenarioTransportCatalogCoversEveryTransport = AssertTrue<SameKeys<ScenarioTransport, keyof typeof SCENARIO_TRANSPORT_CATALOG>>;
@@ -518,6 +483,10 @@ export type ManualLoginConfirmRejectionTextCoversEveryReason = AssertTrue<
 // FM-1（手動の操作を減らす設計書 2.2）: 表示の設定の保存が拒む理由のすべてに文言がある。
 export type DisplaySettingsTextCoversEveryReason = AssertTrue<
   SameKeys<ProfileDisplaySettingsRejectionReason, keyof typeof LOCAL_UI_DISPLAY_SETTINGS_TEXT.reasons>
+>;
+// DN-1（プロファイルの表示名の設計書 2 章）: 画面に出す名前の保存が拒む理由のすべてに文言がある。
+export type DisplayNameTextCoversEveryReason = AssertTrue<
+  SameKeys<ProfileDisplayNameRejectionReason, keyof typeof LOCAL_UI_DISPLAY_NAME_TEXT.reasons>
 >;
 // FM-1（手動の操作を減らす設計書 2.1）: 表の 1 行の「登録する」の理由のすべてに文言がある。
 export type LoginStageRowRegisterTextCoversEveryReason = AssertTrue<

@@ -20,6 +20,7 @@ import {
   CREATE_SCENARIO_KIND,
   DRAFT_SCENARIO_STATE,
   UPDATE_SCENARIO_KIND,
+  humanRulesAttachedOf,
   listScenarios,
   missingVerificationItemsOf,
   readScenario,
@@ -31,7 +32,7 @@ import {
   type ScenarioView,
 } from '../../../../src/control/approval-view.js';
 import { readWriteResults } from '../../../../src/control/actions/write-result-facts.js';
-import { NOT_SENT_SUBMISSION_STATE } from '../../../../src/control/actions/action-contracts.js';
+import { NOT_SENT_SUBMISSION_STATE, PRECHECK_FAILED_BLOCK_REASON } from '../../../../src/control/actions/action-contracts.js';
 import { getProfile } from '../../../../src/control/store/profile-store.js';
 import { ACTIVE_PROFILE_STATUS } from '../../../../src/control/store/profile-records.js';
 import {
@@ -42,6 +43,7 @@ import {
   type WriteScreenNotCheckableKind,
   type WriteScreenUpdateState,
 } from '../display/write-screen-values';
+import { localUiAuditJobs } from './audit-jobs';
 import { localUiStore } from './control-store';
 import { requestOf } from './request-validation';
 import { LOCAL_UI_JOB_CONSOLE_TEXT } from '../../../../src/presentation/messages.js';
@@ -50,6 +52,7 @@ import { approvalExternalFactsOf } from './scenario-facts';
 import { loadTargetContext } from './target-config';
 import { nowCompactTimestamp } from './timestamps';
 import { localUiWriteModeSwitchDependencies, switchToWriteMode } from './write-mode-switch';
+import { writePrecheckDetailOfJob } from './write-results';
 
 /** 行のチェックの状態（閉じた一覧。文言はカタログ `LOCAL_UI_WRITE_SCREENS_TEXT.states`）。 */
 export const WRITE_SCREEN_ROW_STATES = Object.freeze(['CHECKED', 'CHECKABLE', 'RECHECK_NEEDED', 'NOT_CHECKABLE'] as const);
@@ -85,6 +88,11 @@ export interface WriteScreenRowView {
   readonly notCheckableKind: WriteScreenNotCheckableKind | null;
   /** OP-2 の修正の 2 回目（R1）: 更新の 1 行（更新の書き込みの手順があるか、作れるときは null）。 */
   readonly updateState: WriteScreenUpdateState | null;
+  /**
+   * LU-13 fix round 1（D3）: 同じ表の更新の画面が、名前のない開き手（アイコンだけ）から開くものだけか（`AutoDraftScreenView.updateOpenerUnnamedOnly`）。
+   * 真なら、更新の 1 行（`NOT_DECIDABLE`）の文を「この画面の更新は自動で扱えません。」にする。
+   */
+  readonly updateOpenerUnnamedOnly: boolean;
   readonly lastResult: WriteScreenLastResultView | null;
 }
 
@@ -112,9 +120,10 @@ interface ProfileKeyRequest {
 
 /**
  * シナリオの前の点検の結果（書き込みの記録がなければ null）。OP-F（設計者の判断の 4）: 送らずに締めた回（`NOT_SENT`。準備が通らなかった・止めた）は、前に試した回の
- * 結果を隠さない。最後に試した回の結果と、最後の回が送らずに締めた回ならその理由を返す。
+ * 結果を隠さない。最後に試した回の結果と、最後の回が送らずに締めた回ならその理由を返す。LU-13 fix round 1: 送る前の確かめで止めた回は、その回のジョブの記録の
+ * 具体的な理由（`writePrecheckDetailOfJob`。読めなければ null）も返す。
  */
-const lastResultOf = (scenarioId: string | null): WriteScreenKindResultView | null => {
+const lastResultOf = async (scenarioId: string | null): Promise<WriteScreenKindResultView | null> => {
   if (scenarioId === null) {
     return null;
   }
@@ -124,7 +133,9 @@ const lastResultOf = (scenarioId: string | null): WriteScreenKindResultView | nu
     return null;
   }
   const tried = [...results].reverse().find(({ submission }) => submission !== NOT_SENT_SUBMISSION_STATE);
-  return { tried: tried?.result ?? null, notSentReason: last.submission === NOT_SENT_SUBMISSION_STATE ? last.blockReason : null };
+  const notSentReason = last.submission === NOT_SENT_SUBMISSION_STATE ? last.blockReason : null;
+  const job = notSentReason === PRECHECK_FAILED_BLOCK_REASON ? localUiAuditJobs().getAuditJob(last.jobId) : null;
+  return { tried: tried?.result ?? null, notSentReason, notSentDetail: job === null ? null : await writePrecheckDetailOfJob(job) };
 };
 
 /**
@@ -155,13 +166,16 @@ const VERIFICATION_SPEC_MISSING_ROW_REASON = 'VERIFICATION_SPEC_MISSING';
 /** OP-G（E2）: 登録の手順の確かめの指定（番号の取り方・答え合わせ）がそろわないか（判定は許可の発行と同じ `missingVerificationItemsOf`）。 */
 const verificationMissingOf = (scenario: ScenarioView): boolean => missingVerificationItemsOf(scenario.current.verification, scenario.current).length > 0;
 
-/** 承認が今も有効か（承認していない・読めないなら偽）。 */
+/**
+ * 承認が今も有効か（承認していない・読めないなら偽）。SPEC-4: 外した規則の画面で人が保存した規則を付けた手順も偽（その規則は使わない。行は「もう一度チェックが
+ * 要る」になり、まとめて実行の始めに承認を取り消す。チェックし直すと、推した規則に替えて承認する `approveForCheck`）。
+ */
 const approvalValidOf = (scenarioId: string, external: Awaited<ReturnType<typeof approvalExternalFactsOf>>): boolean => {
   if (external === null) {
     return false;
   }
   const status = readScenarioApprovalStatus(localUiStore(), scenarioId, external, new Date());
-  return status !== null && status.scenario.state === 'APPROVED' && status.validity.approved;
+  return status !== null && status.scenario.state === 'APPROVED' && status.validity.approved && !humanRulesAttachedOf(localUiStore(), status.scenario);
 };
 
 /** 一覧の行と、その行の登録と更新の手順（OP-T fix round 1・2: 行に結び付く手順を、まとめて実行の始めが知るため。画面には返さない）。 */
@@ -190,16 +204,17 @@ const writeScreenListingOf = async (profileId: string): Promise<WriteScreenListi
   }
   const scenarios = listScenarios(localUiStore(), profileId);
   const external = await approvalExternalFactsOf(stored);
-  const rowOf = (screen: (typeof screens)[number]): WriteScreenRowView => {
+  const rowOf = async (screen: (typeof screens)[number]): Promise<WriteScreenRowView> => {
     const create = screen.scenarioId === null ? null : scenarios.find(({ scenarioId }) => scenarioId === screen.scenarioId) ?? null;
     const update = create === null ? null : rowUpdateOf(scenarios, create.scenarioId, screen.existingUpdateScenarioIds);
     const base = {
       rowKey: screen.rowKey, screenWord: writeScreenWordOf(screen.pagePath), screenName: screen.screenName, mayNotify: screen.mayNotify,
+      updateOpenerUnnamedOnly: screen.updateOpenerUnnamedOnly,
       updateState: (update !== null
         ? create !== null && updateAwaitsNotifyCheckOf(create, update) ? 'MAY_NOTIFY' : null
         : screen.updatePossible ? null : screen.updateFound ? 'NOT_DECIDABLE' : 'NEXT_INSPECTION') as WriteScreenUpdateState | null,
     };
-    const lastResult = create === null ? null : { create: lastResultOf(create.scenarioId), update: lastResultOf(update?.scenarioId ?? null) };
+    const lastResult = create === null ? null : { create: await lastResultOf(create.scenarioId), update: await lastResultOf(update?.scenarioId ?? null) };
     // OP-G（設計書 4.1.4 の E2）: 作ったデータの番号の取り方か答え合わせのしかたを決められなかった画面は、送らない（許可が出ない）ので、チェックできない行にして理由の
     // 1 行を出す（守り `VERIFICATION_SPEC_MISSING` は変えない）。
     if (create !== null && verificationMissingOf(create)) {
@@ -223,11 +238,11 @@ const writeScreenListingOf = async (profileId: string): Promise<WriteScreenListi
     // R3: 承認が無効になった行は、自動で承認し直さない（チェックを外した形で、もう一度チェックを求める）。
     return { ...base, state: valid ? 'CHECKED' : 'RECHECK_NEEDED', notCheckableReason: null, notCheckableKind: null, lastResult };
   };
-  const entries = screens.map((screen) => ({
-    row: rowOf(screen),
+  const entries = await Promise.all(screens.map(async (screen) => ({
+    row: await rowOf(screen),
     createScenarioId: screen.scenarioId,
     updateScenarioId: screen.scenarioId === null ? null : rowUpdateOf(scenarios, screen.scenarioId, screen.existingUpdateScenarioIds)?.scenarioId ?? null,
-  }));
+  })));
   return { entries, external };
 };
 
@@ -296,6 +311,14 @@ const CHECKED_SCREEN_REAPPROVAL_FAILED_CODE = 'CHECKED_SCREEN_REAPPROVAL_FAILED'
 /** 理由のコードだけをログに残す（値・URL は残さない）。 */
 const logReasonCode = (code: string): void => {
   console.error(LOCAL_UI_JOB_CONSOLE_TEXT.backgroundError, code);
+};
+
+/**
+ * DEF-199: 意図した取り消し（一覧でチェックしていない画面の承認）を、誤りでない知らせとして残す（誤りの文と標準エラーは使わない）。理由のコードだけを添える
+ * （値・URL は残さない）。
+ */
+const logUncheckedApprovalRevoked = (): void => {
+  console.info(LOCAL_UI_JOB_CONSOLE_TEXT.uncheckedApprovalRevoked, UNLISTED_APPROVAL_REVOKED_CODE);
 };
 
 /** OP-T fix round 2（Minor 6）: 承認し直せなかった画面の、登録と台帳に結ぶ更新の承認を取り消す（理由のコードを残す）。 */
@@ -370,7 +393,7 @@ const revokeUnlistedApprovals = (profileId: string, entries: readonly WriteScree
       allRevoked = false;
       continue;
     }
-    logReasonCode(UNLISTED_APPROVAL_REVOKED_CODE);
+    logUncheckedApprovalRevoked();
   }
   return allRevoked;
 };

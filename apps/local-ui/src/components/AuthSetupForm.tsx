@@ -37,14 +37,7 @@ import {
   AUTH_SETUP_SCHEMA_VERSION_3,
   AUDIT_READ_REQUEST_METHODS,
   AUTOMATED_LOGIN_FAILURE_CONDITION_KINDS,
-  MAX_AUDIT_READ_REQUESTS,
-  MAX_AUDIT_READ_REQUESTS_PER_PAGE_LOAD,
-  MAX_SERVICE_REQUESTS_PER_MINUTE,
-  MAX_SERVICE_REQUESTS_PER_RUN,
   MIN_AUDIT_READ_REQUESTS_PER_PAGE_LOAD,
-  MIN_SERVICE_REQUESTS_PER_MINUTE,
-  MIN_SERVICE_REQUESTS_PER_RUN,
-  SERVICE_REQUESTS_PER_PAGE_ALLOWANCE,
   type AuditReadRequest,
   type ServiceRequestLimits,
   AUTOMATED_LOGIN_MAX_LOGIN_ATTEMPTS,
@@ -60,7 +53,7 @@ import {
   type LoginResultCondition,
   type LoginTransport,
 } from '../../../../src/control/auth/auth-setup-contracts.js';
-import { formatCount, formatInteger, formatTimes } from '../../../../src/presentation/format.js';
+import { formatInteger, formatTimes } from '../../../../src/presentation/format.js';
 import {
   AUTH_SETUP_STORE_REJECTION_DESCRIPTIONS,
   AUTH_SETUP_VALIDATION_ERROR_DESCRIPTIONS,
@@ -125,7 +118,7 @@ export interface AuthSetupFormValues {
   readonly storageSuffix: string;
   /** T35d: 監査の段の読み取りの手続きの呼び出しの一覧（スクリプトの送信のときだけ送る。空なら項目を送らない）。 */
   readonly auditReads: readonly AuditReadFormValues[];
-  /** T35d: サービスの Origin への要求の上限（数の文字のまま。空なら上限の値。両方が空なら項目を送らない）。 */
+  /** T35d: サービスの Origin への要求の上限（数の文字のまま。両方が空なら項目を送らない。LZ-3c: 欄はなく、前に保存した値を書き戻すだけ）。 */
   readonly servicePerMinute: string;
   readonly servicePerRun: string;
 }
@@ -159,11 +152,7 @@ type TextValueKey = Exclude<
 /** ログインに伴う送信の method（`POST` だけ）。 */
 const [SIDE_REQUEST_METHOD] = LOGIN_SIDE_REQUEST_METHODS;
 
-/** T35d: 監査の段の読み取りの手続きの呼び出しの、1 回の読み込みの回数の選択肢と、新しい行の初めの値と、method（`POST` だけ）。 */
-const AUDIT_READ_COUNT_OPTIONS: readonly number[] = Array.from(
-  { length: MAX_AUDIT_READ_REQUESTS_PER_PAGE_LOAD - MIN_AUDIT_READ_REQUESTS_PER_PAGE_LOAD + 1 },
-  (_unused, index) => MIN_AUDIT_READ_REQUESTS_PER_PAGE_LOAD + index,
-);
+/** T35d: 監査の段の読み取りの手続きの呼び出しの、新しい行の初めの値と、method（`POST` だけ）。L11: 回数の選択肢はなくした（回数は数えない）。 */
 const EMPTY_AUDIT_READ: AuditReadFormValues = Object.freeze({ origin: '', path: '', maxPerPageLoad: MIN_AUDIT_READ_REQUESTS_PER_PAGE_LOAD });
 const [AUDIT_READ_METHOD] = AUDIT_READ_REQUEST_METHODS;
 
@@ -290,14 +279,12 @@ const auditReadsOf = (rows: readonly AuditReadFormValues[]): readonly AuditReadR
   rows.filter(({ origin, path }) => origin.length > 0 || path.trim().length > 0)
     .map(({ origin, path, maxPerPageLoad }) => ({ origin, path: path.trim(), method: AUDIT_READ_METHOD, maxPerPageLoad }));
 
-/** T35d: 上限の欄の値（空なら上限の値。数でない文字は、そのまま数にしてサーバの検証に任せる）。 */
-const limitOf = (text: string, maximum: number): number => (text.trim().length === 0 ? maximum : Number(text.trim()));
-
-/** T35d: サービスの Origin への要求の上限（両方の欄が空なら null。項目を送らない）。 */
+/**
+ * T35d: サービスの Origin への要求の上限（両方が空なら null。項目を送らない）。LZ-3c: 画面に欄はなく、前に保存した設定の値を、そのまま書き戻すだけ
+ * （使わない項目。書き戻すので、保存し直しても認証の設定の digest を変えない）。既定の値（前は上限の値）は補わない。
+ */
 const serviceRequestLimitsOf = (perMinute: string, perRun: string): ServiceRequestLimits | null =>
-  (perMinute.trim().length === 0 && perRun.trim().length === 0
-    ? null
-    : { perMinute: limitOf(perMinute, MAX_SERVICE_REQUESTS_PER_MINUTE), perRun: limitOf(perRun, MAX_SERVICE_REQUESTS_PER_RUN) });
+  (perMinute.trim().length === 0 && perRun.trim().length === 0 ? null : { perMinute: Number(perMinute.trim()), perRun: Number(perRun.trim()) });
 
 /** 必須の query の組の欄のうち、名前も値もない行を除いた組。 */
 const queriesOf = (rows: readonly QueryFormValues[]) =>
@@ -716,7 +703,7 @@ export function AuthSetupForm({
           {/* T35d（Task 35 の設計書 3.1、3.4）: 監査の段の読み取りの手続きの呼び出しと、サービスの Origin への要求の上限。 */}
           <GroupFrame
             label={FIELD_LABELS.auditReadRequests}
-            hint={auditText.auditReadsHint(formatCount(MAX_AUDIT_READ_REQUESTS), formatTimes(MAX_AUDIT_READ_REQUESTS_PER_PAGE_LOAD))}
+            hint={auditText.auditReadsUnlimitedHint}
             errors={errorsOf('auditReadRequests')}
             testId="auth-setup-audit-reads"
           >
@@ -741,20 +728,7 @@ export function AuthSetupForm({
                 </FieldFrame>
                 {plainInput('auditReadRequests', `auditReadPath${String(index)}`, row.path, '', (value) => changeAuditRead(index, 'path', value),
                   lineLabel(index, auditText.readPath))}
-                <FieldFrame label={lineLabel(index, auditText.readMaxPerPageLoad)} errors={[]}>
-                  {({ id, describedBy }) => (
-                    <select
-                      id={id}
-                      className="input"
-                      name={`auditReadMax${String(index)}`}
-                      value={String(row.maxPerPageLoad)}
-                      aria-describedby={describedBy}
-                      onChange={(event) => changeAuditRead(index, 'maxPerPageLoad', Number(event.target.value))}
-                    >
-                      {AUDIT_READ_COUNT_OPTIONS.map((count) => <option key={count} value={String(count)}>{formatTimes(count)}</option>)}
-                    </select>
-                  )}
-                </FieldFrame>
+                {/* L11: 1 回の読み込みの回数は数えないので、回数の欄は出さない（保存の値は今のまま持つ）。 */}
                 <span className="field-hint">{`${scriptText.methodFixed}: ${scriptText.methodFixedValue}`}</span>
                 <button type="button" className="button" onClick={() => change('auditReads', values.auditReads.filter((_row, rowIndex) => rowIndex !== index))}>
                   {lineLabel(index, auditText.removeRead)}
@@ -765,21 +739,14 @@ export function AuthSetupForm({
               <button
                 type="button"
                 className="button"
-                disabled={values.auditReads.length >= MAX_AUDIT_READ_REQUESTS}
                 onClick={() => change('auditReads', [...values.auditReads, EMPTY_AUDIT_READ])}
               >
                 {auditText.addRead}
               </button>
             </div>
           </GroupFrame>
-          <p className="field-group-subheading">{auditText.limitsHeading}</p>
-          <p className="field-hint">
-            {auditText.limitsBody(formatCount(MAX_SERVICE_REQUESTS_PER_MINUTE), formatCount(MAX_SERVICE_REQUESTS_PER_RUN), formatCount(SERVICE_REQUESTS_PER_PAGE_ALLOWANCE))}
-          </p>
-          {textInput('servicePerMinute', 'servicePerMinute',
-            auditText.perMinuteHint(formatCount(MIN_SERVICE_REQUESTS_PER_MINUTE), formatCount(MAX_SERVICE_REQUESTS_PER_MINUTE)))}
-          {textInput('servicePerRun', 'servicePerRun',
-            auditText.perRunHint(formatCount(MIN_SERVICE_REQUESTS_PER_RUN), formatCount(MAX_SERVICE_REQUESTS_PER_RUN), formatCount(SERVICE_REQUESTS_PER_PAGE_ALLOWANCE)))}
+          {/* L11（設計書 `2026-11-09-beaksight-remove-limits-design.md` 4）: 承認したサービスへの要求の上限は撤廃したので、上限の欄は出さない。保存してある値は
+              そのまま持つが、使わない（文書と digest を変えない）。 */}
         </fieldset>
       ) : null}
 

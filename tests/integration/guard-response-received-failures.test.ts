@@ -32,8 +32,6 @@ import { fastRunConfig, runWithCoordinator } from '../helpers/run-harness.js';
 
 /** 本文のない 4xx・5xx の応答を、Chromium が描かずに読み込みを失敗にしたときの理由。 */
 const HTTP_RESPONSE_CODE_FAILURE = 'net::ERR_HTTP_RESPONSE_CODE_FAILURE';
-/** DEF-145: `HTTP_MAIN_FRAME_DELIVERY_FAILED` の違反は、失敗した main frame の要求の method と path（と Origin）を持つ。 */
-const FAILED_MAIN_FRAME_REQUEST = expect.objectContaining({ method: expect.any(String), path: expect.any(String) });
 /** 401（Basic）に答える認証の情報がないので、Chromium が読み込みを失敗にしたときの理由。 */
 const INVALID_AUTH_CREDENTIALS = 'net::ERR_INVALID_AUTH_CREDENTIALS';
 /** 本文の途中の切断の理由（DEF-029 で、ネットワークの層の失敗の一覧に加えたもの）。 */
@@ -310,9 +308,12 @@ describe('DEF-029: a main-frame load that fails after the response was received 
   });
 });
 
-describe('DEF-029 controls: the same failures stay violations when the Guard cannot rely on them', () => {
+// SAFE-2 の 4（違反の区分の (3)。設計者の判断）: 前は、Guard が確かめられない読み取りの main frame の移動の失敗を違反（`HTTP_MAIN_FRAME_DELIVERY_FAILED`）にし、
+// Context を閉じた（fail-closed）。今は、読み取り（GET）なので、届いても届かなくても安全の決まりに反しない。違反にせず、読み取りの失敗の記録
+// （`readNavigationFailures`。method・Origin と path・失敗の理由・時点）に残し、Context は閉じない。読み取りでない要求の失敗は、今どおり違反。
+describe('DEF-029 controls after SAFE-2: the same failures are recorded as read failures, not violations, when the Guard cannot rely on them', () => {
   // 凍結の段階での同じ失敗（DEF-004b の確かめ方に合わせる。凍結の前に要求をサーバに届け、凍結の後に本文が空の 503 を返す）。
-  it('an empty 503 of a main-frame load during the interaction freeze stays a violation and invalidates the Context', async () => {
+  it('an empty 503 of a main-frame load during the interaction freeze is recorded as a read failure after the freeze, and keeps the Context', async () => {
     const server = await startResponseFailureServer();
     await withGuardedPage(server, async (page, context, ledger) => {
       expect((await page.goto(`${server.origin}${START_PATH}`))?.status()).toBe(STATUS.ok);
@@ -324,12 +325,11 @@ describe('DEF-029 controls: the same failures stay violations when the Guard can
       server.releaseHeld();
 
       expect((await observed).errorText).toBe(HTTP_RESPONSE_CODE_FAILURE);
-      await expect.poll(() => ledger.snapshot().invariantViolations).toEqual([{
-        code: 'HTTP_MAIN_FRAME_DELIVERY_FAILED', request: FAILED_MAIN_FRAME_REQUEST,
-        message: HTTP_RESPONSE_CODE_FAILURE,
+      await expect.poll(() => ledger.snapshot().readNavigationFailures?.events).toEqual([{
+        method: 'GET', url: `${server.origin}${PATHS.heldEmpty503}`, errorText: HTTP_RESPONSE_CODE_FAILURE, phase: 'INTERACTION',
       }]);
-      await expect.poll(() => isPassiveRequestGuardClosed(context)).toBe(true);
-      expect(() => assertPassiveRequestGuardActive(context)).toThrow(/invalidated/iu);
+      expect(ledger.snapshot().invariantViolations).toEqual([]);
+      expect(isPassiveRequestGuardClosed(context)).toBe(false);
     });
   });
 
@@ -352,7 +352,7 @@ describe('DEF-029 controls: the same failures stay violations when the Guard can
       name: 'a status just above the error range',
       response: async (): Promise<Response | null> => ({ status: () => ERROR_HTTP_STATUS_RANGE.max + 1 }) as unknown as Response,
     },
-  ])('$name: an empty 503 of a main-frame load stays a violation and invalidates the Context', async ({ response }) => {
+  ])('$name: an empty 503 of a main-frame load is recorded as a read failure and keeps the Context', async ({ response }) => {
     const server = await startResponseFailureServer();
     await withGuardedPage(server, async (page, context, ledger) => {
       const url = `${server.origin}${PATHS.empty503}`;
@@ -364,11 +364,11 @@ describe('DEF-029 controls: the same failures stay violations when the Guard can
       await expect(page.goto(url)).rejects.toThrow();
 
       expect((await observed).errorText).toBe(HTTP_RESPONSE_CODE_FAILURE);
-      await expect.poll(() => ledger.snapshot().invariantViolations).toEqual([{
-        code: 'HTTP_MAIN_FRAME_DELIVERY_FAILED', request: FAILED_MAIN_FRAME_REQUEST,
-        message: HTTP_RESPONSE_CODE_FAILURE,
+      await expect.poll(() => ledger.snapshot().readNavigationFailures?.events).toEqual([{
+        method: 'GET', url: url, errorText: HTTP_RESPONSE_CODE_FAILURE, phase: 'PASSIVE',
       }]);
-      await expect.poll(() => isPassiveRequestGuardClosed(context)).toBe(true);
+      expect(ledger.snapshot().invariantViolations).toEqual([]);
+      expect(isPassiveRequestGuardClosed(context)).toBe(false);
       expect(getCount(server, PATHS.empty503)).toBe(1);
     });
   });

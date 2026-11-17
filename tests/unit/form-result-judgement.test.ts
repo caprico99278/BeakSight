@@ -22,7 +22,6 @@ import {
   preSubmitReadStopOf,
   recordIdOfResultUrl,
 } from '../../src/control/actions/action-outcome.js';
-import { MAX_FORM_RECORD_ID_PATTERNS } from '../../src/control/approval/scenario-contracts.js';
 import type { ReadCheckResult } from '../../src/discovery/read-check-contracts.js';
 
 const ORIGIN = 'http://127.0.0.1:4173';
@@ -337,10 +336,6 @@ describe('PL-6a: the record id from the URL after sending', () => {
     expect(recordIdOfResultUrl(['/items/{id}'], 'not a url', url('/items/12'))).toBeNull();
     expect(recordIdOfResultUrl(['/items/{id}'], url('/items/new'), 'not a url')).toBeNull();
     expect(recordIdOfResultUrl(['/orders/{id}'], url('/items/new'), url('/items/12'))).toBeNull();
-  });
-
-  it('allows two patterns at most in the contract', () => {
-    expect(MAX_FORM_RECORD_ID_PATTERNS).toBe(2);
   });
 });
 

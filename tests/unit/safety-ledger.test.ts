@@ -34,7 +34,9 @@ import {
   type SafetyLedgerSnapshot,
   type SafetyLedgerUncountedBlockedRequestCategory,
 } from '../../src/safety/safety-ledger.js';
-import { runStatusInput } from '../helpers/audit-run-fixture.js';
+import { validateArtifact } from '../../src/core/schema-validator.js';
+import { summarizeRunSafety } from '../../src/orchestration/run-aggregation.js';
+import { runStatusInput, runSummary } from '../helpers/audit-run-fixture.js';
 
 /** 実行はすべて完了し、安全の事実だけを Ledger から渡したときの Run Status。 */
 const runStatusFromLedger = (snapshot: SafetyLedgerSnapshot) => deriveRunStatus(runStatusInput({
@@ -122,147 +124,74 @@ describe('SafetyLedger', () => {
     expect(Object.getPrototypeOf(ledger.snapshot().blockedRequestsByMethod)).toBeNull();
   });
 
-  it('bounds and deeply freezes interaction safety events', () => {
-    const ledger = new SafetyLedger();
-    for (let index = 0; index < 300; index += 1) {
-      ledger.recordBlockedInteractionRequest({
-        method: 'get',
-        url: `https://example.test/${index}`,
-        reason: 'INTERACTION_FROZEN',
-      });
-    }
-
-    const snapshot = ledger.snapshot();
-    expect(snapshot.blockedInteractionRequests).toHaveLength(256);
-    expect(snapshot.invariantViolations).toEqual([]);
-    expect(snapshot.invariantViolationCount).toBe(0);
-    expect(snapshot.recordLimits).toMatchObject({
-      truncated: true,
-      droppedEventCount: 44,
-      reachedCategories: ['blockedInteractionRequests'],
-    });
-    expect(Object.isFrozen(snapshot.blockedInteractionRequests)).toBe(true);
-    expect(Object.isFrozen(snapshot.blockedInteractionRequests[0])).toBe(true);
-    expect(() => {
-      (snapshot.blockedInteractionRequests as unknown as { method: string }[])[0]!.method = 'POST';
-    }).toThrow();
-  });
-
-  it('bounds every Task 5 event category and every retained string', () => {
+  // LZ-2: 文の長さの上限（前は method 32・文 2,048）は撤廃した。LZ-3a: 事象の数の上限（前は 256）も撤廃した。前の上限を超える事象を残らず残す。
+  it('keeps every event of every category beyond the former limit, whole and deeply frozen (LZ-3a)', () => {
     const ledger = new SafetyLedger();
     const longText = 'x'.repeat(3_000);
     for (let index = 0; index < 300; index += 1) {
       ledger.recordBlockedRequest({ method: longText, url: longText, reason: 'NON_READ_METHOD', resourceType: 'fetch', phase: 'LOAD' });
       ledger.recordBlockedNavigation({ method: longText, url: longText, reason: 'EXTERNAL_MAIN_FRAME_NAVIGATION', phase: 'LOAD' });
       ledger.recordBlockedWebSocket({ url: longText, reason: 'PASSIVE_WEBSOCKET', phase: 'LOAD' });
-      ledger.recordInvariantViolation({ code: longText, message: longText });
+      ledger.recordBlockedInteractionRequest({ method: 'get', url: `https://example.test/${index}`, reason: 'INTERACTION_FROZEN' });
+      ledger.recordExcludedInteractionCandidate({ candidateId: `c${index}`, reason: 'FORM_ASSOCIATED' });
+      ledger.recordExternalSchemeNavigation({ url: `tel:+1000000${index}`, scheme: 'tel', frame: 'MAIN', phase: 'INTERACTION', reason: 'EXTERNAL_SCHEME_NAVIGATION' });
+      ledger.recordInvariantViolation({ code: longText, message: `violation ${index}` });
     }
 
     const snapshot = ledger.snapshot();
-    expect(snapshot.blockedRequests).toHaveLength(256);
-    expect(snapshot.blockedNavigations).toHaveLength(256);
-    expect(snapshot.blockedWebSockets).toHaveLength(256);
-    expect(snapshot.invariantViolations).toHaveLength(256);
+    for (const events of [snapshot.blockedRequests, snapshot.blockedNavigations, snapshot.blockedWebSockets, snapshot.blockedInteractionRequests,
+      snapshot.excludedInteractionCandidates, snapshot.externalSchemeNavigations, snapshot.invariantViolations]) {
+      expect(events).toHaveLength(300);
+    }
     expect(snapshot.invariantViolationCount).toBe(300);
-    expect(snapshot.blockedRequests[0]?.method).toHaveLength(32);
-    expect(snapshot.blockedRequests[0]?.url).toHaveLength(2_048);
-    expect(snapshot.blockedNavigations[0]?.method).toHaveLength(32);
-    expect(snapshot.blockedNavigations[0]?.url).toHaveLength(2_048);
-    expect(snapshot.blockedWebSockets[0]?.url).toHaveLength(2_048);
-    expect(snapshot.invariantViolations.every((event) => (
-      event.code.length <= 2_048 && event.message.length <= 2_048
-    ))).toBe(true);
-    expect(snapshot.invariantViolations.every((event) => event.code === 'x'.repeat(2_048))).toBe(true);
-    expect(snapshot.recordLimits.truncated).toBe(true);
-    expect(snapshot.recordLimits.droppedEventCount).toBe(4 * 44);
-    expect(snapshot.recordLimits.reachedCategories).toEqual(expect.arrayContaining([
-      'blockedRequests',
-      'blockedNavigations',
-      'blockedWebSockets',
-      'invariantViolations',
-    ]));
-    expect(snapshot.recordLimits.truncatedTextCount).toBeGreaterThan(0);
+    expect(snapshot.invariantViolations.map((event) => event.message)).toEqual(Array.from({ length: 300 }, (_unused, index) => `violation ${index}`));
+    expect(snapshot.blockedRequests[0]).toMatchObject({ method: longText.toUpperCase(), url: longText });
+    expect(snapshot.blockedNavigations[0]).toMatchObject({ method: longText.toUpperCase(), url: longText });
+    expect(snapshot.blockedWebSockets[0]?.url).toBe(longText);
+    expect(snapshot.recordLimits).toEqual({
+      truncated: false, droppedEventCount: 0, uncountedBlockedRequestCount: 0, truncatedTextCount: 0, reachedCategories: [],
+    });
+    expect(Object.isFrozen(snapshot.blockedInteractionRequests)).toBe(true);
+    expect(Object.isFrozen(snapshot.blockedInteractionRequests[0])).toBe(true);
     expect(Object.isFrozen(snapshot.recordLimits)).toBe(true);
     expect(Object.isFrozen(snapshot.recordLimits.reachedCategories)).toBe(true);
     expect(Object.isFrozen(snapshot.blockedNavigations)).toBe(true);
     expect(Object.isFrozen(snapshot.blockedWebSockets[0])).toBe(true);
   });
 
-  it('caps distinct bounded method keys and records the overflow once', () => {
+  // LZ-3c: method の種類の数（前は 64）と method ごとの数（前は 65,535）の上限は撤廃した。どの method も、どの数も数え、記録は完全。
+  it('counts every method kind and every request of a method (LZ-3c)', () => {
     const ledger = new SafetyLedger();
     for (let index = 0; index < 80; index += 1) {
       ledger.recordBlockedRequest({
-        method: `custom-method-${index}`,
-        url: `https://example.test/${index}`,
-        reason: 'NON_READ_METHOD',
-        resourceType: 'fetch',
-        phase: 'LOAD',
+        method: `custom-method-${index}`, url: `https://example.test/${index}`, reason: 'NON_READ_METHOD', resourceType: 'fetch', phase: 'LOAD',
       });
     }
-
-    const snapshot = ledger.snapshot();
-    expect(Object.keys(snapshot.blockedRequestsByMethod)).toHaveLength(64);
-    expect(Object.keys(snapshot.blockedRequestsByMethod).every((method) => method.length <= 32)).toBe(true);
-    expect(snapshot.invariantViolations).toEqual([]);
-    expect(snapshot.recordLimits.truncated).toBe(true);
-    expect(snapshot.recordLimits.uncountedBlockedRequestCount).toBe(16);
-    expect(snapshot.recordLimits.reachedCategories.filter(
-      (category) => category === 'blockedRequestsByMethod',
-    )).toHaveLength(1);
-  });
-
-  it('saturates a method counter and records the saturation once', () => {
-    const ledger = new SafetyLedger();
     for (let index = 0; index < 65_540; index += 1) {
       ledger.recordBlockedRequest({ method: 'POST', url: 'https://example.test/', reason: 'NON_READ_METHOD', resourceType: 'fetch', phase: 'LOAD' });
     }
 
     const snapshot = ledger.snapshot();
-    expect(snapshot.blockedRequestsByMethod.POST).toBe(65_535);
+    expect(Object.keys(snapshot.blockedRequestsByMethod)).toHaveLength(81);
+    expect(snapshot.blockedRequestsByMethod.POST).toBe(65_540);
     expect(snapshot.invariantViolations).toEqual([]);
-    expect(snapshot.recordLimits.truncated).toBe(true);
-    expect(snapshot.recordLimits.uncountedBlockedRequestCount).toBe(5);
-    expect(snapshot.recordLimits.reachedCategories.filter(
-      (category) => category === 'blockedRequestsByMethod.POST.counter',
-    )).toHaveLength(1);
+    expect(snapshot.recordLimits).toMatchObject({ truncated: false, uncountedBlockedRequestCount: 0, reachedCategories: [] });
   });
 
   describe('R3: the record limit is an incomplete record, not an invariant violation', () => {
-    it('keeps 257 blocked POST requests out of invariantViolations and derives PARTIAL', () => {
+    // LZ-3a: 事象の数の上限（前は 256。超えると PARTIAL）は撤廃した。257 件の止めた要求も残らず残し、記録は完全。
+    it('keeps 257 blocked POST requests out of invariantViolations and keeps the record complete (LZ-3a)', () => {
       const ledger = new SafetyLedger();
       for (let index = 0; index < 257; index += 1) {
         ledger.recordBlockedRequest({ method: 'POST', url: `https://example.test/${index}`, reason: 'NON_READ_METHOD', resourceType: 'fetch', phase: 'LOAD' });
       }
 
       const snapshot = ledger.snapshot();
-      expect(snapshot.blockedRequests).toHaveLength(256);
+      expect(snapshot.blockedRequests).toHaveLength(257);
       expect(snapshot.blockedRequestsByMethod.POST).toBe(257);
       expect(snapshot.invariantViolations).toEqual([]);
-      expect(snapshot.invariantViolationCount).toBe(0);
-      expect(snapshot.recordLimits).toEqual({
-        truncated: true,
-        droppedEventCount: 1,
-        uncountedBlockedRequestCount: 0,
-        truncatedTextCount: 0,
-        reachedCategories: ['blockedRequests'],
-      });
-      expect(runStatusFromLedger(snapshot)).toBe('PARTIAL');
-    });
-
-    it('reports a complete record at exactly the event limit', () => {
-      const ledger = new SafetyLedger();
-      for (let index = 0; index < 256; index += 1) {
-        ledger.recordBlockedRequest({ method: 'POST', url: `https://example.test/${index}`, reason: 'NON_READ_METHOD', resourceType: 'fetch', phase: 'LOAD' });
-      }
-
-      expect(ledger.snapshot().recordLimits).toEqual({
-        truncated: false,
-        droppedEventCount: 0,
-        uncountedBlockedRequestCount: 0,
-        truncatedTextCount: 0,
-        reachedCategories: [],
-      });
-      expect(runStatusFromLedger(ledger.snapshot())).toBe('COMPLETE');
+      expect(snapshot.recordLimits.truncated).toBe(false);
+      expect(runStatusFromLedger(snapshot)).toBe('COMPLETE');
     });
 
     it('never overwrites a real invariant violation when other records are full', () => {
@@ -280,31 +209,12 @@ describe('SafetyLedger', () => {
       const snapshot = ledger.snapshot();
       expect(snapshot.invariantViolations).toEqual([{ code: 'HTTP_ABORT_FAILED', message: 'abort failed' }]);
       expect(snapshot.invariantViolationCount).toBe(1);
-      expect(snapshot.recordLimits.truncated).toBe(true);
+      // LZ-3c: method の種類の上限（前は 64）がないので、300 種類も数え、記録は完全。
+      expect(snapshot.recordLimits.truncated).toBe(false);
       expect(runStatusFromLedger(snapshot)).toBe('ABORTED_BY_SAFETY');
     });
 
-    it('keeps the earliest violations under their own limit and keeps counting beyond it', () => {
-      const ledger = new SafetyLedger();
-      for (let index = 0; index < 300; index += 1) {
-        ledger.recordInvariantViolation({ code: 'GUARD_FAILURE', message: `violation ${index}` });
-        ledger.recordBlockedRequest({ method: 'POST', url: 'https://example.test/', reason: 'NON_READ_METHOD', resourceType: 'fetch', phase: 'LOAD' });
-      }
-
-      const snapshot = ledger.snapshot();
-      expect(snapshot.invariantViolations).toHaveLength(256);
-      expect(snapshot.invariantViolations.map((event) => event.message)).toEqual(
-        Array.from({ length: 256 }, (_unused, index) => `violation ${index}`),
-      );
-      expect(snapshot.invariantViolationCount).toBe(300);
-      expect(snapshot.recordLimits.truncated).toBe(true);
-      expect(snapshot.recordLimits.reachedCategories).toEqual(
-        expect.arrayContaining(['invariantViolations', 'blockedRequests']),
-      );
-      expect(runStatusFromLedger(snapshot)).toBe('ABORTED_BY_SAFETY');
-    });
-
-    it('truncates an over-long HTTP method instead of recording an invariant violation', () => {
+    it('keeps a long HTTP method whole without recording an invariant violation (LZ-2)', () => {
       const ledger = new SafetyLedger();
       const method = 'X'.repeat(33);
 
@@ -315,11 +225,11 @@ describe('SafetyLedger', () => {
       const snapshot = ledger.snapshot();
       expect(snapshot.invariantViolations).toEqual([]);
       expect(snapshot.invariantViolationCount).toBe(0);
-      expect(snapshot.blockedRequests[0]?.method).toBe('X'.repeat(32));
-      expect(snapshot.blockedRequestsByMethod['X'.repeat(32)]).toBe(1);
-      expect(snapshot.blockedNavigations[0]?.method).toBe('X'.repeat(32));
-      expect(snapshot.blockedInteractionRequests[0]?.method).toBe('X'.repeat(32));
-      expect(snapshot.recordLimits).toMatchObject({ truncated: false, truncatedTextCount: 3 });
+      expect(snapshot.blockedRequests[0]?.method).toBe(method);
+      expect(snapshot.blockedRequestsByMethod[method]).toBe(1);
+      expect(snapshot.blockedNavigations[0]?.method).toBe(method);
+      expect(snapshot.blockedInteractionRequests[0]?.method).toBe(method);
+      expect(snapshot.recordLimits).toMatchObject({ truncated: false, truncatedTextCount: 0 });
       expect(runStatusFromLedger(snapshot)).toBe('COMPLETE');
     });
   });
@@ -344,24 +254,11 @@ describe('SafetyLedger', () => {
       expect(runStatusFromLedger(snapshot)).toBe('COMPLETE');
     });
 
-    it('bounds the candidate ID and marks the record incomplete at the event limit', () => {
+    it('keeps the whole candidate ID', () => {
       const ledger = new SafetyLedger();
       ledger.recordExcludedInteractionCandidate({ candidateId: 'x'.repeat(3_000), reason: 'RESET_CONTROL' });
-      for (let index = 0; index < 256; index += 1) {
-        ledger.recordExcludedInteractionCandidate({ candidateId, reason: 'FORM_ASSOCIATED' });
-      }
 
-      const snapshot = ledger.snapshot();
-      expect(snapshot.excludedInteractionCandidates).toHaveLength(256);
-      expect(snapshot.excludedInteractionCandidates[0]?.candidateId).toHaveLength(2_048);
-      expect(snapshot.recordLimits).toEqual({
-        truncated: true,
-        droppedEventCount: 1,
-        uncountedBlockedRequestCount: 0,
-        truncatedTextCount: 1,
-        reachedCategories: ['excludedInteractionCandidates'],
-      });
-      expect(runStatusFromLedger(snapshot)).toBe('PARTIAL');
+      expect(ledger.snapshot().excludedInteractionCandidates[0]?.candidateId).toHaveLength(3_000);
     });
   });
 
@@ -438,7 +335,7 @@ describe('SafetyLedger', () => {
       expect(event?.url).not.toContain('secret');
     });
 
-    it('bounds the URL and the scheme and marks the record incomplete at the event limit', () => {
+    it('keeps the whole URL and scheme', () => {
       const ledger = new SafetyLedger();
       ledger.recordExternalSchemeNavigation({
         url: `beaksight-test-app:${'x'.repeat(3_000)}`,
@@ -447,29 +344,11 @@ describe('SafetyLedger', () => {
         phase: 'PASSIVE',
         reason: 'EXTERNAL_SCHEME_NAVIGATION',
       });
-      for (let index = 0; index < 256; index += 1) {
-        ledger.recordExternalSchemeNavigation({
-          url: `tel:+1000000${index}`,
-          scheme: 'tel',
-          frame: 'MAIN',
-          phase: 'INTERACTION',
-          reason: 'EXTERNAL_SCHEME_NAVIGATION',
-        });
-      }
 
       const snapshot = ledger.snapshot();
-      expect(snapshot.externalSchemeNavigations).toHaveLength(256);
-      expect(snapshot.externalSchemeNavigations[0]?.url).toHaveLength(2_048);
-      expect(snapshot.externalSchemeNavigations[0]?.scheme).toHaveLength(2_048);
-      expect(snapshot.recordLimits).toEqual({
-        truncated: true,
-        droppedEventCount: 1,
-        uncountedBlockedRequestCount: 0,
-        truncatedTextCount: 2,
-        reachedCategories: ['externalSchemeNavigations'],
-      });
+      expect(snapshot.externalSchemeNavigations[0]?.url).toHaveLength('beaksight-test-app:'.length + 3_000);
+      expect(snapshot.externalSchemeNavigations[0]?.scheme).toHaveLength(3_000);
       expect(snapshot.invariantViolations).toEqual([]);
-      expect(runStatusFromLedger(snapshot)).toBe('PARTIAL');
     });
   });
 });
@@ -531,8 +410,9 @@ describe('T12d0: safety Evidence from a Safety Ledger snapshot', () => {
     expect(evidence).not.toHaveProperty('invariantViolations');
     expect(evidence).not.toHaveProperty('invariantViolationCount');
     expect(evidence.blockedRequestsByMethod).toEqual({ POST: 1 });
-    expect(evidence.blockedPopups).toHaveLength(256);
-    expect(evidence.recordLimits).toMatchObject({ truncated: true, droppedEventCount: 2, reachedCategories: ['blockedPopups'] });
+    // LZ-3a: 前の事象の数の上限（256）を超える 258 件も残す。
+    expect(evidence.blockedPopups).toHaveLength(258);
+    expect(evidence.recordLimits).toMatchObject({ truncated: false, droppedEventCount: 0, reachedCategories: [] });
     // 元の snapshot は変えない（違反は Run Status の入力として残る）。
     expect(snapshot.invariantViolations).toEqual([{ code: 'GUARD_FAILURE', message: 'guard failed' }]);
     expect(snapshot.invariantViolationCount).toBe(1);
@@ -600,13 +480,14 @@ describe('T12d0: safety Evidence from a Safety Ledger snapshot', () => {
 describe('P14a: page safety summary from the Ledger snapshots of a page', () => {
   const violation = (code: string) => ({ code, message: `${code} message` });
 
-  it('sums the invariant violation counts, keeps the recorded violations in order, and reports truncation', () => {
+  // LZ-3a・LZ-3c: 事象の数でも method の種類と数でも、記録は不完全にならない（65 種類の method も数える）。
+  it('sums the invariant violation counts and keeps the recorded violations in order', () => {
     const passive = new SafetyLedger();
     passive.recordInvariantViolation(violation('PASSIVE_A'));
     passive.recordInvariantViolation(violation('PASSIVE_B'));
     const interaction = new SafetyLedger();
-    for (let index = 0; index < 257; index += 1) {
-      interaction.recordBlockedPopup({ url: `https://example.test/popup/${index}`, reason: 'INTERACTION_FROZEN' });
+    for (let index = 0; index < 65; index += 1) {
+      interaction.recordBlockedRequest({ method: `M${index}`, url: 'https://example.test/', reason: 'NON_READ_METHOD', resourceType: 'fetch', phase: 'LOAD' });
     }
     const stress = new SafetyLedger();
     stress.recordInvariantViolation(violation('STRESS_A'));
@@ -616,14 +497,18 @@ describe('P14a: page safety summary from the Ledger snapshots of a page', () => 
     expect(summary).toEqual({
       invariantViolationCount: 3,
       invariantViolations: [violation('PASSIVE_A'), violation('PASSIVE_B'), violation('STRESS_A')],
-      recordTruncated: true,
+      recordTruncated: false,
+      // SAFE-2 の 4: 違反でない記録の数（この場面では 0）。
+      frameClassificationFailureCount: 0,
+      readNavigationFailureCount: 0,
     } satisfies PageSafetySummary);
     expect(Object.isFrozen(summary)).toBe(true);
     expect(Object.isFrozen(summary.invariantViolations)).toBe(true);
     expect(summary.invariantViolations.every((event) => Object.isFrozen(event))).toBe(true);
   });
 
-  it('counts the violations that the Ledger could not record', () => {
+  // LZ-3a: 違反の数の上限（前は 256）は撤廃した。前の上限を超える違反も、残らず要約に入る。
+  it('keeps every violation beyond the former limit in the summary', () => {
     const ledger = new SafetyLedger();
     for (let index = 0; index < 300; index += 1) {
       ledger.recordInvariantViolation(violation('GUARD_FAILURE'));
@@ -632,17 +517,21 @@ describe('P14a: page safety summary from the Ledger snapshots of a page', () => 
     const summary = summarizePageSafety([ledger.snapshot()]);
 
     expect(summary.invariantViolationCount).toBe(300);
-    expect(summary.invariantViolations).toHaveLength(256);
-    expect(summary.recordTruncated).toBe(true);
+    expect(summary.invariantViolations).toHaveLength(300);
+    expect(summary.recordTruncated).toBe(false);
   });
 
   it('reports no violation and a complete record for clean Ledgers and for no Ledger', () => {
-    expect(summarizePageSafety([new SafetyLedger().snapshot(), new SafetyLedger().snapshot()])).toEqual({
+    // SAFE-2 の 4: 違反でない記録の数も 0。
+    const clean = {
       invariantViolationCount: 0,
       invariantViolations: [],
       recordTruncated: false,
-    });
-    expect(summarizePageSafety([])).toEqual({ invariantViolationCount: 0, invariantViolations: [], recordTruncated: false });
+      frameClassificationFailureCount: 0,
+      readNavigationFailureCount: 0,
+    };
+    expect(summarizePageSafety([new SafetyLedger().snapshot(), new SafetyLedger().snapshot()])).toEqual(clean);
+    expect(summarizePageSafety([])).toEqual(clean);
   });
 
   it('stops the violation count at the largest safe integer', () => {
@@ -662,6 +551,20 @@ describe('P14a: page safety summary from the Ledger snapshots of a page', () => 
     }))).toBe('ABORTED_BY_SAFETY');
     expectTypeOf(summarizePageSafety).parameters.toEqualTypeOf<[readonly SafetyLedgerSnapshot[]]>();
     expectTypeOf(summarizePageSafety).returns.toEqualTypeOf<PageSafetySummary>();
+  });
+
+  // SAFE-2 の 4: 違反にしない止めた記録（frame の判定の失敗・読み取りの移動の失敗）と、外部スキームへの移動の試みの数を、run.json の safety に出す。
+  it('puts the numbers of the stopped records, which are not violations, in the Safety summary of run.json', async () => {
+    const ledger = new SafetyLedger();
+    ledger.recordFrameClassificationFailure({ url: 'mailto:a@example.test', phase: 'INTERACTION' });
+    ledger.recordFrameClassificationFailure({ url: 'https://example.test/frame', phase: 'PASSIVE' });
+    ledger.recordReadNavigationFailure({ method: 'GET', url: 'https://example.test/next', errorText: 'net::ERR_ABORTED', phase: 'PASSIVE' });
+    ledger.recordExternalSchemeNavigation({ url: 'tel:0000', scheme: 'tel', frame: 'MAIN', phase: 'PASSIVE', reason: 'EXTERNAL_SCHEME_NAVIGATION' });
+
+    const safety = summarizeRunSafety({ guardEnabled: true, snapshots: [ledger.snapshot()], auditSendPolicy: 'READ_ONLY' });
+
+    expect(safety).toMatchObject({ invariantViolationCount: 0, frameClassificationFailureCount: 2, readNavigationFailureCount: 1, externalSchemeNavigationCount: 1 });
+    expect((await validateArtifact('run', { ...runSummary(), safety })).ok).toBe(true);
   });
 });
 
@@ -755,8 +658,10 @@ describe('P18b: Safety Ledger types (CC-015, CC-028)', () => {
   // 含めない）も、記録の上限の分類の名前に加える。
   it('narrows the names of the Ledger record categories to the Safety event kinds and the invariant violations (CC-028)', () => {
     // BN-a: 閉じる途中に止めた要求の記録（`blockedClosingRequests`。省略できる項目で、事象の種類の一覧には含めない）も加える。
+    // SAFE-2 の 4: frame の判定の失敗と、読み取りの移動の失敗の記録（省略できる項目で、事象の種類の一覧には含めない）も加える。
     expectTypeOf<SafetyLedgerRecordCategory>()
-      .toEqualTypeOf<SafetyEventKind | 'blockedAuditExclusions' | 'blockedClosingRequests' | 'invariantViolations'>();
+      .toEqualTypeOf<SafetyEventKind | 'blockedAuditExclusions' | 'blockedClosingRequests' | 'frameClassificationFailures' | 'readNavigationFailures'
+        | 'invariantViolations'>();
 
     // @ts-expect-error 書き間違えた分類の名前は、型のエラーになる。
     const misspelled: SafetyLedgerRecordCategory = 'blockedRequest';

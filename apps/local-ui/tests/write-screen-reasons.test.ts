@@ -2,18 +2,28 @@
  * OP-2 の修正の 2 回目（判断 2・判断 1 の行の 1 行）: サイトの画面の一覧の、試せない行の理由と、更新の 1 行。
  * - 試せない理由のコード（`ScenarioDraftRejectionReason`）は、どれも、やさしい 1 行の種類（`writeScreenNotCheckableKindOf`）に振り分けられ、種類ごとに文がある。
  * - 文に技術の語（英字の識別子・Origin・path・API など）は入らない。
- * - 更新の 1 行: 更新の画面がまだ見つからないときは「更新は、次の点検で試します。」、見つかったが更新する欄を決められないときは「登録だけを試します」。
+ * - 更新の 1 行: 更新の画面がまだ見つからないときは「更新は、サイトの全部の画面を点検したときに試します。」（WSO）、見つかったが更新する欄を決められないときは
+ *   「登録だけを試します」。
  * 画面のサーバとブラウザは起動しない。
  */
 import { describe, expect, it } from 'vitest';
 import { SCENARIO_DRAFT_REJECTION_REASONS } from '../../../src/core/scenario-draft-rejection-reasons.js';
+import {
+  PRECHECK_FAILED_BLOCK_REASON,
+  PRECHECK_FAILURE_DETAILS,
+  actionRunPrecheckDetailOf,
+  type PrecheckFailureDetail,
+} from '../../../src/control/actions/action-contracts.js';
+import { SUBMISSION_PROBE_REASON_CATALOG } from '../../../src/presentation/catalog.js';
 import { LOCAL_UI_WRITE_SCREENS_TEXT } from '../../../src/presentation/messages.js';
 import {
+  apiKeyPathDisplayText,
   INSPECTION_WRITE_OUTCOMES,
   inspectionWriteOutcomeOf,
   WRITE_SCREEN_NOT_CHECKABLE_KINDS,
   WRITE_SCREEN_UPDATE_STATES,
   writeScreenLastResultLinesOf,
+  writeScreenListRowUpdateNotSentTextOf,
   writeScreenNotCheckableKindOf,
   writeScreenRowResultLinesOf,
 } from '../src/display/write-screen-values';
@@ -50,7 +60,7 @@ describe('OP-2 fix round 2: the plain line of a row that cannot be tried', () =>
 
   it('has the lines of the update', () => {
     expect([...WRITE_SCREEN_UPDATE_STATES].sort()).toEqual(['MAY_NOTIFY', 'NEXT_INSPECTION', 'NOT_DECIDABLE']);
-    expect(text.update.NEXT_INSPECTION).toBe('更新は、次の点検で試します。');
+    expect(text.update.NEXT_INSPECTION).toBe('更新は、サイトの全部の画面を点検したときに試します。');
     expect(text.update.NOT_DECIDABLE).toBe('更新する欄を決められないため、登録だけを試します。');
     // OP-F（M-3）: 点検の中で見つかった更新の画面が知らせを送ることがあり、チェックがそれを確かめていない。
     expect(text.update.MAY_NOTIFY).toBe('更新の画面は、メールや電話への知らせを送ることがあります。もう一度チェックすると、更新も試します。');
@@ -90,6 +100,95 @@ describe('OP-F: the lines of the last result of a row', () => {
   });
 });
 
+// LU-13（設計書 `2026-11-02-beaksight-list-row-update-design.md` 5.6）: 一覧の行から開く更新が送らずに止まったときは、更新の 1 行を短い 1 文にする（番号や
+// 技術の語は出さない）。ほかの理由は、今の「前回は更新を試せませんでした」の 1 行のまま。
+describe('LU-13: the short line of a list row update that was not sent', () => {
+  const notSent = (notSentDetail: PrecheckFailureDetail | null) =>
+    ({ create: { tried: 'VERIFIED' as const, notSentReason: null }, update: { tried: null, notSentReason: 'PRECHECK_FAILED' as const, notSentDetail } });
+  const rowNotFound = '更新できませんでした（作った行が一覧の最初のページに見つかりませんでした）。';
+  const openerNotFound = '更新できませんでした（一覧の行の『編集』が見つかりませんでした）。';
+  const expected: Readonly<Partial<Record<PrecheckFailureDetail, string>>> = {
+    ROW_NOT_UNIQUE: rowNotFound,
+    OPENER_NOT_FOUND: openerNotFound,
+    OPENER_UNNAMED: openerNotFound,
+    OPENER_DELETE_LIKE: openerNotFound,
+    PRIOR_VALUES_NOT_ACCEPTED: '更新できませんでした。',
+    TARGET_RECORD_UNUSABLE: '更新できませんでした。',
+  };
+
+  it('says the short line for each reason of a list row update, in place of the usual line', () => {
+    // カタログの鍵は、一覧の行の更新の 6 つの理由（どれも送らずに止めた理由の閉じた一覧の中）。
+    expect(Object.keys(text.lastResult.listRowUpdateNotSent).sort()).toEqual(Object.keys(expected).sort());
+    for (const detail of Object.keys(expected) as PrecheckFailureDetail[]) {
+      expect(PRECHECK_FAILURE_DETAILS, detail).toContain(detail);
+      expect(writeScreenLastResultLinesOf(notSent(detail), false).notTried, detail).toBe(expected[detail]);
+      expect(writeScreenRowResultLinesOf({ state: 'CHECKED', lastResult: notSent(detail), updateState: null })[0], detail)
+        .toEqual({ kind: 'LAST_NOT_TRIED', text: expected[detail] });
+    }
+  });
+
+  it('keeps the usual line for the other reasons and when the reason is not known', () => {
+    const usual = text.lastResult.updateNotTriedLast(text.lastResult.notSentReasons.PRECHECK_FAILED);
+    for (const detail of [null, ...PRECHECK_FAILURE_DETAILS.filter((item) => expected[item] === undefined)]) {
+      expect(writeScreenLastResultLinesOf(notSent(detail), false).notTried, String(detail)).toBe(usual);
+    }
+    expect(writeScreenLastResultLinesOf({ create: { tried: 'VERIFIED', notSentReason: null }, update: { tried: null, notSentReason: 'PRECHECK_FAILED' } }, false).notTried)
+      .toBe(usual);
+    // 登録の回が送らずに締めた回なら、登録の 1 行が先（今のまま）。
+    expect(writeScreenLastResultLinesOf({ create: { tried: null, notSentReason: 'PRECHECK_FAILED' }, update: notSent('ROW_NOT_UNIQUE').update }, false).notTried)
+      .toBe(text.lastResult.notTried(text.lastResult.notSentReasons.PRECHECK_FAILED));
+    expect(writeScreenListRowUpdateNotSentTextOf(null)).toBeNull();
+  });
+
+  it('uses no technical words or numbers in the lines', () => {
+    for (const line of Object.values(text.lastResult.listRowUpdateNotSent)) {
+      expect(line, line).not.toMatch(/[A-Za-z0-9０-９]|\//u);
+      expect(line, line).toMatch(/^更新できませんでした/u);
+      expect(line, line).toMatch(/。$/u);
+    }
+  });
+});
+
+// LU-13 fix round 1（案 A）: 書き込みのジョブの記録（`action-run.json`）から、送らずに止めた具体的な理由を読む 1 か所（ジョブの画面と一覧の行が使う）。
+describe('LU-13 fix round 1: the detail of a write stopped before sending, read from the action run', () => {
+  it('reads the detail only when the write stopped at the precheck, and null otherwise', () => {
+    expect(PRECHECK_FAILED_BLOCK_REASON).toBe('PRECHECK_FAILED');
+    expect(actionRunPrecheckDetailOf({ blockReason: 'PRECHECK_FAILED', precheckDetail: 'ROW_NOT_UNIQUE' })).toBe('ROW_NOT_UNIQUE');
+    expect(actionRunPrecheckDetailOf({ blockReason: 'PRECHECK_FAILED' })).toBeNull();
+    expect(actionRunPrecheckDetailOf({ blockReason: 'PAYLOAD_MISMATCH', precheckDetail: 'ROW_NOT_UNIQUE' })).toBeNull();
+    expect(actionRunPrecheckDetailOf({ blockReason: null })).toBeNull();
+    expect(actionRunPrecheckDetailOf(null)).toBeNull();
+  });
+});
+
+// LU-13 fix round 1（案 (a)(b)(c)。D3）: 名前のないアイコンだけの開き手で更新を扱えない画面は、今の `NOT_DECIDABLE` の 1 行のまま、文だけを
+// 「この画面の更新は自動で扱えません。」にする（ほかの状態と、名前のある開き手の画面は今のまま）。
+describe('LU-13 fix round 1: the line of a screen whose update opens only from an icon without a name', () => {
+  it('says that the update of the screen cannot be handled automatically, only for NOT_DECIDABLE', () => {
+    expect(text.updateOpenerUnnamed).toBe('この画面の更新は自動で扱えません。');
+    expect(text.updateOpenerUnnamed).not.toMatch(/[A-Za-z0-9]|\//u);
+    expect(writeScreenRowResultLinesOf({ state: 'CHECKABLE', lastResult: null, updateState: 'NOT_DECIDABLE', updateOpenerUnnamedOnly: true }))
+      .toEqual([{ kind: 'UPDATE_STATE', text: text.updateOpenerUnnamed, updateState: 'NOT_DECIDABLE' }]);
+    expect(writeScreenRowResultLinesOf({ state: 'CHECKABLE', lastResult: null, updateState: 'NOT_DECIDABLE', updateOpenerUnnamedOnly: false }))
+      .toEqual([{ kind: 'UPDATE_STATE', text: text.update.NOT_DECIDABLE, updateState: 'NOT_DECIDABLE' }]);
+    expect(writeScreenRowResultLinesOf({ state: 'CHECKABLE', lastResult: null, updateState: 'NEXT_INSPECTION', updateOpenerUnnamedOnly: true }))
+      .toEqual([{ kind: 'UPDATE_STATE', text: text.update.NEXT_INSPECTION, updateState: 'NEXT_INSPECTION' }]);
+    expect(writeScreenRowResultLinesOf({ state: 'NOT_CHECKABLE', lastResult: null, updateState: 'NOT_DECIDABLE', updateOpenerUnnamedOnly: true })).toEqual([]);
+  });
+});
+
+// LU-13（指示書の 3）: 操作さがしの新しい理由の文は、利用者向けの短い日本語（技術の語を出さない）。
+describe('LU-13: the plain lines of the new reasons of the operation search', () => {
+  it('says the new reasons in short plain words', () => {
+    expect(SUBMISSION_PROBE_REASON_CATALOG.OPENER_SIDE_REQUEST.label).toBe('開いたときにサイトが自動で送ったので、登録として扱わない');
+    expect(SUBMISSION_PROBE_REASON_CATALOG.SAME_IDENTITY_PRESSED.label).toBe('同じボタンは 1 つだけ押すので、ここは押さなかった');
+    expect(SUBMISSION_PROBE_REASON_CATALOG.CREATE_PATH_HAS_ID.label).toBe('もうあるデータに向けた送信なので、登録として扱わない');
+    for (const reason of ['OPENER_SIDE_REQUEST', 'SAME_IDENTITY_PRESSED', 'CREATE_PATH_HAS_ID'] as const) {
+      expect(SUBMISSION_PROBE_REASON_CATALOG[reason].label, reason).not.toMatch(/[A-Za-z]|\//u);
+    }
+  });
+});
+
 // OP-G（指示書の 3。完了の正直さ）: 点検の要点の書き込みの 1 行は、実際に送った段と結果から決める（前は、書き込みの段があれば結果によらず「登録・更新も行いました」）。
 describe('OP-G: the line of the inspection summary tells what was really written', () => {
   it('says what was done, what could not be confirmed and what could not be tried, and says nothing without a checked screen', () => {
@@ -119,7 +218,7 @@ describe('OP-H: the result lines of a row, in order and each ending with a full 
     expect(writeScreenRowResultLinesOf({ state: 'CHECKED', lastResult: { create: tried('VERIFIED'), update: tried('VERIFIED') }, updateState: null }))
       .toEqual([{ kind: 'LAST_RESULT', text: '登録しました。更新しました。' }]);
     expect(writeScreenRowResultLinesOf({ state: 'CHECKED', lastResult: { create: tried('VERIFIED'), update: null }, updateState: 'NEXT_INSPECTION' }))
-      .toEqual([{ kind: 'LAST_RESULT', text: '登録しました。' }, { kind: 'UPDATE_STATE', text: '更新は、次の点検で試します。', updateState: 'NEXT_INSPECTION' }]);
+      .toEqual([{ kind: 'LAST_RESULT', text: '登録しました。' }, { kind: 'UPDATE_STATE', text: '更新は、サイトの全部の画面を点検したときに試します。', updateState: 'NEXT_INSPECTION' }]);
     expect(writeScreenRowResultLinesOf({ state: 'CHECKED', lastResult: { create: tried('VERIFIED'), update: tried('VERIFIED') }, updateState: 'MAY_NOTIFY' })
       .map(({ kind }) => kind)).toEqual(['LAST_RESULT', 'UPDATE_STATE']);
     // 前の点検の結果がない行は、更新の 1 行だけ。チェックできない行は、更新の 1 行を出さない。
@@ -142,5 +241,26 @@ describe('OP-H: the result lines of a row, in order and each ending with a full 
         }
       }
     }
+  });
+});
+
+// ARR-5（DEF-234）: 並びの行の欄の鍵（道 `key[i]`・`key[i].name`）の、利用者に分かる言い方（部品は `apiKeyPathDisplayText` の 1 か所）。
+describe('ARR-5: the text of a key of a row of a list', () => {
+  it('says the row from 1 with the headings of the screen first', () => {
+    expect(apiKeyPathDisplayText('quals[0]', { list: '資格' })).toBe('資格（1 行目）');
+    expect(apiKeyPathDisplayText('careers[1].name', { list: '職歴', inner: '名前' })).toBe('職歴（2 行目）の 名前');
+  });
+
+  it('does not show the names of the keys or the brackets without the headings', () => {
+    for (const key of ['quals[0]', 'careers[1].name', 'skills[19]']) {
+      const shown = apiKeyPathDisplayText(key) ?? '';
+      expect(shown).not.toMatch(/[A-Za-z[\].]/u);
+    }
+    expect(apiKeyPathDisplayText('careers[1].name')).toBe('並びの項目（2 行目）の 中の項目');
+  });
+
+  it('leaves a key that is not a path to the current text', () => {
+    expect(apiKeyPathDisplayText('quals')).toBeNull();
+    expect(apiKeyPathDisplayText('title')).toBeNull();
   });
 });

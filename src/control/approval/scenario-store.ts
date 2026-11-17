@@ -22,14 +22,13 @@ import { isSha256Fingerprint } from '../../core/ids.js';
 import { deepFreeze } from '../../core/immutable.js';
 import { jsonCopyOf } from '../../core/json-copy.js';
 import { isNonNegativeSafeInteger, isRecord } from '../../core/guards.js';
-import { MAX_FIELD_NAME_LENGTH } from '../../discovery/candidate-contracts.js';
 import { READ_CHECK_RESULTS, type ReadCheckResult } from '../../discovery/read-check-contracts.js';
 import {
   ACTION_BLOCK_REASONS,
   MAX_HTTP_STATUS,
-  MAX_SUBMITTED_VALUE_LENGTH,
   MIN_HTTP_STATUS,
   NOT_SENT_SUBMISSION_STATE,
+  PRECHECK_FAILED_BLOCK_REASON as PRECHECK_FAILED_REASON,
   RESPONSE_JUDGEMENTS,
   SUBMISSION_STATES,
   type ActionBlockReason,
@@ -85,14 +84,12 @@ import {
   environmentEvidenceRejectionOf,
   executionGrantExpiresAtOf,
   expiredOpenGrantIdsOf,
-  isExecutionGrantExpired,
   usedCumulativeWrites,
   isWriteConcurrencyAvailable,
   isWriteReservationTransitionAllowed,
   selectUpdateTargetRecordId,
   targetSelectionRejectionOf,
   writeLimitRejectionOf,
-  writeRateRejectionOf,
   type ExecutionGrantRejectionReason,
   type ExpiringGrant,
   type WriteReservationRejectionReason,
@@ -132,7 +129,6 @@ import {
 import {
   APPROVAL_RECEIPT_SCHEMA_VERSION,
   APPROVER_LOCAL_OPERATOR,
-  MAX_SCENARIO_FIELD_NAMES,
   MIN_SCENARIO_REVISION,
   SCENARIO_ID_PATTERN,
   SCENARIO_SCHEMA_VERSION,
@@ -392,13 +388,15 @@ const discoveryJobProfileRevisionIn = (connection: SqliteConnection, profileId: 
  */
 const draftContextIn = (
   connection: SqliteConnection,
-  profile: Pick<SiteProfile, 'profileId' | 'revision' | 'approvedServiceOrigins'>,
+  profile: Pick<SiteProfile, 'profileId' | 'revision' | 'approvedServiceOrigins' | 'approvedTestOrigins'>,
   scenarioId: string | null,
   discoveryJobId: string,
 ): ScenarioDraftContext => ({
   scenarioId,
   scenarios: scenarioKindFactsIn(connection, profile.profileId),
   approvedServiceOrigins: profile.approvedServiceOrigins ?? [],
+  // DEF-220: テスト用のサイト自身の API の型の Origin は、プロファイルの承認したテストの Origin。
+  approvedTestOrigins: profile.approvedTestOrigins,
   // PL-U の修正の 1 回目（設計書 14.1 の U5）: 値は判定の 1 か所の読み出し（切り替えだけで進んだかを、保存した改訂の記録で確かめる）。
   profileRevisions: discoveryProfileRevisionsIn(connection, profile.profileId, discoveryJobProfileRevisionIn(connection, profile.profileId, discoveryJobId), profile.revision),
 });
@@ -658,8 +656,8 @@ export const readScenarioRevisions = (database: ControlDatabase, scenarioId: str
 // - 承認（`approveScenario`）: 画面から来た版と承認の digest が、サーバで今の事実から求め直した値と一致し、副作用の確認がすべて済み、再承認の判定
 //   （`evaluateApprovalValidity`）の理由が承認がないこと（`NOT_APPROVED`）だけのときだけ、承認者 `LOCAL_OPERATOR` の承認の記録を追記し、状態を
 //   `APPROVED` にする。期限は `approvalExpiresAtOf`。有効な承認の上の承認し直し（期限が延びる）は許す（T28c の判断）。
-//   MI-6（設計書 `2026-10-26-beaksight-minimal-input-ux-design.md` 4.6、ユーザーの判断 2）: 承認のダイアログで副作用の確認を確かめた承認
-//   （`confirmSideEffects`）は、確認のない版なら、画面が出した版と digest を照らした後、同じトランザクションで 4 項目を確かめた次の版を足して、その版を
+//   MI-6（設計書 `2026-10-26-beaksight-minimal-input-ux-design.md` 4.6、ユーザーの判断 2）: 副作用の確認を確かめた承認（SPEC-4: 一覧
+//   「登録・更新を試せる画面」のチェックが確認を兼ねる。`confirmSideEffects`）は、確認のない版なら、画面が出した版と digest を照らした後、同じトランザクションで 4 項目を確かめた次の版を足して、その版を
 //   承認する（版の写しの形・digest の項目・承認が縛るものは変えない。確かめに外れたら、版も記録も書かない）。
 // - 撤回（`revokeScenarioApproval`）: `APPROVED` のシナリオの最後の承認に対する撤回の記録を追記し、状態を `REVOKED` にする。同じトランザクションで、
 //   そのシナリオの消費していない許可を無効にし、その `RESERVED` の予約を `RELEASED` にする（T28d。節 3 の `releaseOpenGrantsIn`）。消費済みの許可の
@@ -679,7 +677,7 @@ export interface ScenarioApproval {
   readonly external: ApprovalExternalFacts;
   readonly at: string;
   /**
-   * MI-6（設計書 `2026-10-26-beaksight-minimal-input-ux-design.md` 4.6、ユーザーの判断 2）: 承認のダイアログで、副作用の確認の 4 項目を示して確かめたか
+   * MI-6（設計書 `2026-10-26-beaksight-minimal-input-ux-design.md` 4.6、ユーザーの判断 2）: 副作用の確認の 4 項目を確かめたか（SPEC-4: 一覧のチェックが兼ねる）
    * （省けば偽）。真で、今の版に確かめていない項目があれば、同じトランザクションで、4 項目をすべて確かめた次の版（ほかは今の版のまま）を足し、その版を
    * 承認する（承認が縛る digest は、その版のもの）。偽なら、確かめていない項目がある版は `SCENARIO_SIDE_EFFECTS_UNCONFIRMED` で拒む（今どおり）。
    */
@@ -695,7 +693,7 @@ export interface ScenarioRevocation {
   readonly at: string;
 }
 
-/** 承認の状態（画面の表示と承認のダイアログ）。凍結。 */
+/** 承認の状態（画面の表示と一覧のチェックの保存）。凍結。 */
 export interface ScenarioApprovalStatus {
   readonly scenario: ScenarioView;
   /** 今の版と今の事実から求めた承認の digest（承認の操作は、この値を送り返す）。 */
@@ -768,7 +766,7 @@ const approveIn = (database: ControlDatabase, connection: SqliteConnection, inpu
   if (unconfirmed && input.confirmSideEffects !== true) {
     return rejected('SCENARIO_SIDE_EFFECTS_UNCONFIRMED');
   }
-  // MI-6: 承認のダイアログで確かめた版（確認のない版なら、4 項目を確かめた次の版。ほかは今の版のまま。根拠の写しと発見のジョブも今の版のまま）。
+  // MI-6: 一覧のチェックで確かめた版（確認のない版なら、4 項目を確かめた次の版。ほかは今の版のまま。根拠の写しと発見のジョブも今の版のまま）。
   const scenario = unconfirmed
     ? assertStorableScenarioRevision({ ...shown.scenario, revision: row.revision + 1, sideEffectConfirmations: CONFIRMED_SIDE_EFFECTS, updatedAt: input.at })
     : shown.scenario;
@@ -845,7 +843,7 @@ export const approveScenario = (database: ControlDatabase, input: ScenarioApprov
     receiptId: requireId(input.receiptId, 'receipt id'),
     external: requireExternal(input.external),
     at: requireTimestamp(input.at),
-    // MI-6: 承認のダイアログで副作用の確認を確かめたか（真のときだけ真。ほかの値は偽として扱う）。
+    // MI-6: 一覧のチェックで副作用の確認を確かめたか（真のときだけ真。ほかの値は偽として扱う）。
     confirmSideEffects: input.confirmSideEffects === true,
   };
   if (!isSha256Fingerprint(values.expectedApprovalDigest)) {
@@ -909,11 +907,10 @@ export const readScenarioApprovalStatus = (
 // 節 3: 許可と予約（T28d。決まりは `execution-grant.ts`）
 // - 発行（`issueExecutionGrant`）: 1 つのトランザクションの中で、この順に確かめる: シナリオと版、発見の確かめ直し、承認の判定（`approvalStateIn`。
 //   時刻は書く時刻）、入力の規則の参照（T29d: 規則の集まりの最新の版で `evaluateRuleSet` をかけ、送る欄すべてが `DECIDED` でなければ `NEEDS_RULE_INPUT`。
-//   欄ごとの問題を `ruleProblems` に添える）、このシナリオの消費していない有効な許可、件数（1 回の Run の上限と累積の上限の残り）、書き込みの同時実行の枠
+//   欄ごとの問題を `ruleProblems` に添える）、このシナリオの消費していない有効な許可、件数（1 回の Run の上限）、書き込みの同時実行の枠
 //   （全体の、消費していない有効な許可と、消費済みで予約が `RESERVED` のままの許可の数）。外れたら何も書かずに理由で拒む。
 //   T30d: 入力の規則の後に、検証の指定がそろっていること（`missingVerificationItemsOf`。`VERIFICATION_SPEC_MISSING`）と、プロファイルの環境の証跡の
-//   参照（`environmentEvidenceRejectionOf`）を、件数の上限の後に連続の上限（`writeRateRejectionOf`。最後の書き込みから 5 分、24 時間に 5 件。
-//   判定の時刻は書く時刻）を確かめる。受けたら、古い許可
+//   参照（`environmentEvidenceRejectionOf`）を確かめる（累積の上限と連続の上限は L12b で撤廃した）。受けたら、古い許可
 //   （期限切れ、またはこのシナリオの承認の記録か版が今と違う、消費していない許可）を無効にして予約を返し、許可（ジョブの id に結び付け、期限は
 //   `executionGrantExpiresAtOf`）と予約（`RESERVED`）を書く。古い許可とその予約は、件数と同時実行の枠に数えない。
 // - 消費（`consumeExecutionGrant`）: 許可の id・シナリオ・版・ジョブ・プロファイル・未消費・未無効を確かめ、期限切れなら無効にして予約を返してから
@@ -1200,12 +1197,16 @@ const releaseOpenGrantsIn = (connection: SqliteConnection, scenarioId: string, a
   }
 };
 
-/** 期限切れの判定に要る許可の項目。 */
-const expiringGrantOf = (grant: GrantRow): ExpiringGrant => ({
+/** L12b: 許可のジョブの行があるか（同じデータベースのジョブの表）。 */
+const SELECT_JOB_EXISTS_SQL = 'SELECT count(*) AS n FROM jobs WHERE job_id = ?';
+
+/** 期限切れの判定に要る許可の項目（L12b: ジョブの行があるかを添える。ジョブが動いている許可は、期限で古い許可にしない）。 */
+const expiringGrantIn = (connection: SqliteConnection, grant: GrantRow): ExpiringGrant => ({
   grantId: grant.grant_id,
   expiresAt: grant.expires_at,
   consumedAt: grant.consumed_at,
   invalidatedAt: grant.invalidated_at,
+  jobExists: (connection.prepare(SELECT_JOB_EXISTS_SQL).get(grant.job_id) as { readonly n: number }).n > 0,
 });
 
 /**
@@ -1279,7 +1280,10 @@ const issueIn = (database: ControlDatabase, connection: SqliteConnection, input:
   // OP-REV6 の I-1: 一覧の画面の照合の READ は、実行のたびに違う値になる欄と比べる期待が要る（判定は同じ部品。定義の画面の path を渡す）。
   const readCheckId = scenario.verification.readVerification?.readCheckId;
   const readTargetPagePath = readCheckFactsIn(connection, row.profile_id).find((fact) => fact.readCheckId === readCheckId)?.pagePath ?? null;
-  const varyingRejection = readVerificationVaryingRejectionOf(latestRules.ruleSet, scenario, state.scenario.evidence, readTargetPagePath);
+  // LU-7 fix round 2: 一覧の行の更新は、行を選ぶ欄が台帳の登録の今の入力の規則で毎回違う欄かで判定する（書き込みの開始と同じ唯一の判定）。
+  const listRowLedgerId = scenario.api?.ledger?.listRow === undefined ? null : scenario.api.ledger.targetCreateScenarioId;
+  const ledgerUnique = listRowLedgerId === null ? null : ledgerFactIn(connection, row.profile_id, listRowLedgerId)?.uniqueEachRunFieldNames ?? null;
+  const varyingRejection = readVerificationVaryingRejectionOf(latestRules.ruleSet, scenario, state.scenario.evidence, readTargetPagePath, ledgerUnique);
   if (varyingRejection !== null) {
     return grantRejected(varyingRejection);
   }
@@ -1290,7 +1294,7 @@ const issueIn = (database: ControlDatabase, connection: SqliteConnection, input:
   }
   const openGrants = connection.prepare(SELECT_OPEN_GRANTS_SQL).all() as unknown as GrantRow[];
   // 古い許可: 期限切れ（`expiredOpenGrantIdsOf`。画面の使った件数と同じ判定）と、このシナリオの承認の記録か版が今と違う許可。
-  const expiredIds = expiredOpenGrantIdsOf(openGrants.map(expiringGrantOf), now);
+  const expiredIds = expiredOpenGrantIdsOf(openGrants.map((grant) => expiringGrantIn(connection, grant)), now);
   const stale = openGrants.filter((grant) => expiredIds.has(grant.grant_id)
     || (grant.scenario_id === row.scenario_id && !grantMatchesApproval(grant, row, state)));
   const staleIds: ReadonlySet<string> = new Set(stale.map((grant) => grant.grant_id));
@@ -1298,16 +1302,10 @@ const issueIn = (database: ControlDatabase, connection: SqliteConnection, input:
   if (live.some((grant) => grant.scenario_id === row.scenario_id)) {
     return grantRejected('GRANT_ALREADY_OPEN');
   }
-  const reservations = (connection.prepare(SELECT_SCENARIO_RESERVATIONS_SQL).all(row.scenario_id) as unknown as ReservationRow[])
-    .map(reservationViewOf);
-  const limitRejection = writeLimitRejectionOf(input.count, scenario.limits, reservations, staleIds);
+  // L12b（設計書 `2026-11-09-beaksight-remove-limits-design.md` 6.2。S14・S15）: 累積の上限と連続の上限は当てない（LZ-3c で部品も捨てた）。
+  const limitRejection = writeLimitRejectionOf(input.count, scenario.limits);
   if (limitRejection !== null) {
     return grantRejected(limitRejection);
-  }
-  // T30d: 連続の上限（同じシナリオの最後の書き込みから 5 分、24 時間に 5 件。`UNKNOWN` を数え、`RELEASED` を数えない）。
-  const rateRejection = writeRateRejectionOf(reservations, now);
-  if (rateRejection !== null) {
-    return grantRejected(rateRejection);
   }
   const inFlight = (connection.prepare(SELECT_IN_FLIGHT_COUNT_SQL).get(RESERVED_STATE) as { readonly n: number }).n;
   if (!isWriteConcurrencyAvailable(live.length + inFlight)) {
@@ -1380,10 +1378,7 @@ const consumeIn = (database: ControlDatabase, connection: SqliteConnection, inpu
     return grantRejected('GRANT_CLOCK_BEFORE_ISSUE');
   }
   const now = dateOfCompactUtcTimestamp(input.at);
-  if (isExecutionGrantExpired(grant.expires_at, now)) {
-    invalidateGrantIn(connection, grant.grant_id, input.at);
-    return grantRejected('GRANT_EXPIRED');
-  }
+  // L12b（設計書 6.2。S16）: 許可はジョブの中の予約として残し、期限（前は発行から 5 分。`GRANT_EXPIRED`）は当てない。
   if (!discoveryUnchangedIn(connection, grant.profile_id, input.snapshot)) {
     return grantRejected('GRANT_FACTS_CHANGED');
   }
@@ -1558,7 +1553,7 @@ export const readUsedCumulativeWrites = (database: ControlDatabase, scenarioId: 
   withReadTransaction(database, (connection) => {
     const openGrants = connection.prepare(SELECT_SCENARIO_OPEN_GRANTS_SQL).all(scenarioId) as unknown as GrantRow[];
     const reservations = (connection.prepare(SELECT_SCENARIO_RESERVATIONS_SQL).all(scenarioId) as unknown as ReservationRow[]).map(reservationViewOf);
-    return usedCumulativeWrites(reservations, expiredOpenGrantIdsOf(openGrants.map(expiringGrantOf), now));
+    return usedCumulativeWrites(reservations, expiredOpenGrantIdsOf(openGrants.map((grant) => expiringGrantIn(connection, grant)), now));
   });
 
 /**
@@ -1757,9 +1752,10 @@ const requireSubmittedValues = (values: Readonly<Record<string, string>>): Reado
     throw new RangeError('the submitted values must be an object');
   }
   const entries = Object.entries(values);
-  if (entries.length > MAX_SCENARIO_FIELD_NAMES || entries.some(([name, value]) => name.length === 0 || name.length > MAX_FIELD_NAME_LENGTH
-    || typeof value !== 'string' || value.length > MAX_SUBMITTED_VALUE_LENGTH)) {
-    throw new RangeError('the submitted values must be at most the field names of a scenario, with names and string values of the limits');
+  // L12b（設計書 `2026-11-09-beaksight-remove-limits-design.md` 6.2。S18）: 値の長さの上限（前は `MAX_SUBMITTED_VALUE_LENGTH`）は置かない。
+  // L13（N28・N30）: 値の数と名前の長さの上限（前は `MAX_SCENARIO_FIELD_NAMES`・`MAX_FIELD_NAME_LENGTH`）も置かない。
+  if (entries.some(([name, value]) => name.length === 0 || typeof value !== 'string')) {
+    throw new RangeError('the submitted values must have non-empty names and string values');
   }
   return Object.freeze(Object.fromEntries(entries));
 };
@@ -2050,8 +2046,6 @@ export type WriteClosureWithoutSendingResult =
 
 const UNCHANGED_CLOSURE: WriteClosureWithoutSendingResult = Object.freeze({ kind: 'UNCHANGED' });
 const GRANT_RELEASED_CLOSURE: WriteClosureWithoutSendingResult = Object.freeze({ kind: 'GRANT_RELEASED' });
-/** 送らずに止めた理由（送る前の確かめで止めた）。 */
-const PRECHECK_FAILED_REASON = 'PRECHECK_FAILED' satisfies ActionBlockReason;
 
 const closeWithoutSendingIn = (connection: SqliteConnection, input: WriteClosureWithoutSending): WriteClosureWithoutSendingResult => {
   const grant = grantRowOf(connection, input.grantId);

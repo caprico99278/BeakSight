@@ -25,19 +25,18 @@
     "schemaVersion": { "const": "beaksight-auth-setup/3" },
     "profileId": { "$ref": "urn:beaksight:schema:control:profile:1#/properties/profileId" },
     "profileRevision": { "type": "integer", "minimum": 1 },
-    "loginStartUrl": { "type": "string", "minLength": 1, "maxLength": 2048 },
+    "loginStartUrl": { "type": "string", "minLength": 1 },
     "loginPostEndpoints": {
       "type": "array",
       "minItems": 0,
-      "maxItems": 5,
       "uniqueItems": true,
       "items": {
         "type": "object",
         "additionalProperties": false,
         "required": ["origin", "path"],
         "properties": {
-          "origin": { "type": "string", "minLength": 1, "maxLength": 2048 },
-          "path": { "type": "string", "maxLength": 2048 }
+          "origin": { "type": "string", "minLength": 1 },
+          "path": { "type": "string" }
         }
       }
     },
@@ -46,8 +45,8 @@
       "additionalProperties": false,
       "required": ["pathPrefix", "selector"],
       "properties": {
-        "pathPrefix": { "type": "string", "maxLength": 2048 },
-        "selector": { "type": ["string", "null"], "maxLength": 256 }
+        "pathPrefix": { "type": "string" },
+        "selector": { "type": ["string", "null"] }
       }
     },
     "sessionLostCondition": {
@@ -55,36 +54,33 @@
       "additionalProperties": false,
       "required": ["pathPrefix"],
       "properties": {
-        "pathPrefix": { "type": ["string", "null"], "maxLength": 2048 }
+        "pathPrefix": { "type": ["string", "null"] }
       }
     },
     "excludedPaths": {
       "type": "array",
-      "maxItems": 50,
       "uniqueItems": true,
-      "items": { "type": "string", "maxLength": 2048 }
+      "items": { "type": "string" }
     },
     "auditPathPrefixes": {
       "type": "array",
-      "maxItems": 50,
       "uniqueItems": true,
-      "items": { "type": "string", "maxLength": 2048 }
+      "items": { "type": "string" }
     },
     "maxLoginAttempts": { "type": "integer", "minimum": 1, "maximum": 3 },
     "allowedIdpOrigins": {
       "type": "array",
-      "maxItems": 5,
       "uniqueItems": true,
-      "items": { "type": "string", "maxLength": 2048 }
+      "items": { "type": "string" }
     },
     "automatedLogin": {
       "type": ["object", "null"],
       "additionalProperties": false,
       "required": ["usernameSelector", "passwordSelector", "submitSelector", "failureConditions"],
       "properties": {
-        "usernameSelector": { "type": "string", "maxLength": 256 },
-        "passwordSelector": { "type": "string", "maxLength": 256 },
-        "submitSelector": { "type": "string", "maxLength": 256 },
+        "usernameSelector": { "type": "string" },
+        "passwordSelector": { "type": "string" },
+        "submitSelector": { "type": "string" },
         "failureConditions": {
           "type": "object",
           "additionalProperties": false,
@@ -106,18 +102,17 @@
           "additionalProperties": false,
           "required": ["origin", "path", "requiredQuery"],
           "properties": {
-            "origin": { "type": "string", "minLength": 1, "maxLength": 2048 },
-            "path": { "type": "string", "maxLength": 2048 },
+            "origin": { "type": "string", "minLength": 1 },
+            "path": { "type": "string" },
             "requiredQuery": {
               "type": "array",
-              "maxItems": 4,
               "items": {
                 "type": "object",
                 "additionalProperties": false,
                 "required": ["name", "value"],
                 "properties": {
-                  "name": { "type": "string", "maxLength": 256 },
-                  "value": { "type": "string", "maxLength": 256 }
+                  "name": { "type": "string" },
+                  "value": { "type": "string" }
                 }
               }
             }
@@ -128,16 +123,15 @@
     },
     "loginSideRequests": {
       "type": "array",
-      "maxItems": 8,
       "items": {
         "type": "object",
         "additionalProperties": false,
         "required": ["origin", "path", "method", "maxPerLoginStage"],
         "properties": {
-          "origin": { "type": "string", "minLength": 1, "maxLength": 2048 },
-          "path": { "type": "string", "maxLength": 2048 },
+          "origin": { "type": "string", "minLength": 1 },
+          "path": { "type": "string" },
           "method": { "enum": ["POST"] },
-          "maxPerLoginStage": { "type": "integer", "minimum": 1, "maximum": 3 }
+          "maxPerLoginStage": { "type": "integer", "minimum": 1, "maximum": 9007199254740991 }
         }
       }
     },
@@ -148,38 +142,37 @@
           "additionalProperties": false,
           "required": ["origin", "prefix", "suffix"],
           "properties": {
-            "origin": { "type": "string", "minLength": 1, "maxLength": 2048 },
-            "prefix": { "type": "string", "maxLength": 256 },
-            "suffix": { "type": "string", "maxLength": 256 }
+            "origin": { "type": "string", "minLength": 1 },
+            "prefix": { "type": "string" },
+            "suffix": { "type": "string" }
           }
         },
         { "type": "null" }
       ]
     },
     "auditReadRequests": {
-      "description": "Optional (T35a; Task 35 design 3.1): the POST requests for reading that a user registered to pass during the audit stage, with a limit per page load. SCRIPT_REQUEST only (the rule is in the policy).",
+      "description": "Optional (T35a; Task 35 design 3.1): the POST requests for reading that a user registered to pass during the audit stage. SCRIPT_REQUEST only (the rule is in the policy). L11: no limit of the number of items; the count per page load is not used (the registered requests pass every time).",
       "type": "array",
-      "maxItems": 8,
       "items": {
         "type": "object",
         "additionalProperties": false,
         "required": ["origin", "path", "method", "maxPerPageLoad"],
         "properties": {
-          "origin": { "type": "string", "minLength": 1, "maxLength": 2048 },
-          "path": { "type": "string", "maxLength": 2048 },
+          "origin": { "type": "string", "minLength": 1 },
+          "path": { "type": "string" },
           "method": { "enum": ["POST"] },
-          "maxPerPageLoad": { "type": "integer", "minimum": 1, "maximum": 10 }
+          "maxPerPageLoad": { "type": "integer", "minimum": 1, "maximum": 9007199254740991 }
         }
       }
     },
     "serviceRequestLimits": {
-      "description": "Optional (T35a; Task 35 design 3.1, 3.4): the limits of the requests to the approved service origins per minute and per Run. Absent means the maximum. SCRIPT_REQUEST only (the rule is in the policy). DEF-141: the maximums were raised from 120 and 600; the per minute limit makes the audit wait before the next load instead of refusing requests.",
+      "description": "Optional (T35a; Task 35 design 3.1, 3.4): the limits of the requests to the approved service origins per minute and per Run. Absent means the maximum. SCRIPT_REQUEST only (the rule is in the policy). DEF-141: the maximums were raised from 120 and 600. L11: the limits are not used (the audit neither waits nor stops by them); kept for the stored documents.",
       "type": "object",
       "additionalProperties": false,
       "required": ["perMinute", "perRun"],
       "properties": {
-        "perMinute": { "type": "integer", "minimum": 1, "maximum": 600 },
-        "perRun": { "type": "integer", "minimum": 1, "maximum": 10000 }
+        "perMinute": { "type": "integer", "minimum": 1, "maximum": 9007199254740991 },
+        "perRun": { "type": "integer", "minimum": 1, "maximum": 9007199254740991 }
       }
     }
   },
@@ -189,8 +182,8 @@
       "additionalProperties": false,
       "required": ["pathPrefix", "selector"],
       "properties": {
-        "pathPrefix": { "type": "string", "maxLength": 2048 },
-        "selector": { "type": ["string", "null"], "maxLength": 256 }
+        "pathPrefix": { "type": "string" },
+        "selector": { "type": ["string", "null"] }
       }
     }
   }

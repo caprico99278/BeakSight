@@ -5,7 +5,7 @@
  * - PL-U の修正の 1 回目（設計書 14.1 の判断、U3）: 押すとすぐに作る（確認のダイアログはなくした。下書きは何も送らず、書き込みの OK の前に中身を見られる
  *   ので、安全のための確認ではない）。作った結果（作った書き込みの手順の数の 1 行、書き込みの手順へのリンク、決められなかった理由の 1 行）を出す。
  * - 送り方・アドレスの形・推した値・照合の READ の型・入れる値の決まりの中身は出さない（3 章の 2。作った書き込みの手順の画面と成果物に残る）。
- * - 更新は作らず、作成の画面へのリンク（候補・型・前もって選ぶ台帳と画面の型。ID と型だけ）を出す（作ったデータの一覧の「書き換えを試す」と同じ行き先）。
+ * - 更新は作らない（行の状態だけ。SPEC-4 で作成の画面へのリンクを外した）。
  */
 import { useState } from 'react';
 import { Link, useRouter } from '@tanstack/react-router';
@@ -24,8 +24,6 @@ import {
   type AutoDraftResultView,
   type AutoDraftUpdateResultView,
 } from '../server/scenario-autodraft-functions';
-// 自動の下書きの案内から開いた作成の画面の印（URL の引数。承認に結ばない。値の 1 か所は `auto-draft-search.ts`）。
-import { AUTO_DRAFT_SEARCH_MARK } from '../display/auto-draft-search';
 import { Notice } from './Notice';
 
 const text = LOCAL_UI_AUTO_DRAFT_TEXT;
@@ -66,32 +64,12 @@ function CreateResult({ profileId, item }: Readonly<{ profileId: string; item: A
   );
 }
 
-/** 作った結果の、更新の行 1 つ（作成の画面へのリンク。変える欄は人が選ぶ）。 */
-function UpdateResult({ profileId, item }: Readonly<{ profileId: string; item: AutoDraftUpdateResultView }>) {
-  const { link } = item;
+/** 作った結果の、更新の行 1 つ（SPEC-4: 作成の画面へのリンクは外した。更新は一覧のチェックが作る）。 */
+function UpdateResult({ item }: Readonly<{ item: AutoDraftUpdateResultView }>) {
   return (
     <li data-testid="auto-draft-result-update" data-status={item.status} data-shape-digest={item.shapeDigest}>
       <p>{item.pagePath}: <strong>{text.updateStatuses[item.status]}</strong></p>
       {item.reason === null ? null : <p className="field-hint">{SCENARIO_DRAFT_REJECTION_DESCRIPTIONS[item.reason].description}</p>}
-      {link === null ? null : (
-        <p>
-          <Link
-            to="/scenarios/$profileId/new"
-            params={{ profileId }}
-            search={{
-              candidate: link.candidate,
-              ...(link.shape === '' ? {} : { shape: link.shape }),
-              ...(link.ledger === null ? {} : { ledger: link.ledger }),
-              ...(link.template === null ? {} : { template: link.template }),
-              autoDraft: AUTO_DRAFT_SEARCH_MARK,
-            }}
-            data-testid="auto-draft-open-create-form"
-            data-preset-ledger={item.presetLedger?.value ?? ''}
-          >
-            {text.openCreateForm}
-          </Link>
-        </p>
-      )}
     </li>
   );
 }
@@ -142,7 +120,7 @@ export function ScenarioAutoDraftPanel({ profileId, preview, label, showButton }
             <ul>{result.creates.map((item) => <CreateResult key={`${item.identityDigest} ${item.shapeDigest}`} profileId={profileId} item={item} />)}</ul>
           )}
           {result.updates.length === 0 ? null : (
-            <ul>{result.updates.map((item) => <UpdateResult key={`${item.identityDigest} ${item.shapeDigest}`} profileId={profileId} item={item} />)}</ul>
+            <ul>{result.updates.map((item) => <UpdateResult key={`${item.identityDigest} ${item.shapeDigest}`} item={item} />)}</ul>
           )}
         </div>
       ) : (

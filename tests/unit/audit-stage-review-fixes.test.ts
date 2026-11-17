@@ -61,7 +61,6 @@ const decide = (request: HttpRequestFacts, withheld: boolean | undefined): Passi
   classifyPassiveRequest(request, ALLOWED_ORIGINS, { auditExclusions: EXCLUSIONS, auditStage: stagePolicy(withheld) });
 
 const revisitBlocked: PassiveRequestDecision = { action: 'BLOCK', category: 'REQUEST', reason: 'SERVICE_ORIGIN_REVISIT' };
-const excluded: PassiveRequestDecision = { action: 'BLOCK', category: 'AUDIT_EXCLUSION', reason: 'AUDIT_EXCLUDED_URL' };
 const serviceRead: PassiveRequestDecision = { action: 'ALLOW', delivery: 'DIRECT', auditStageAdmission: { kind: 'SERVICE_ORIGIN_READ' } };
 
 describe('T35R-fix C-1: no request to the approved service origins on the width scan and Interaction contexts', () => {
@@ -85,20 +84,18 @@ describe('T35R-fix C-1: no request to the approved service origins on the width 
   it('keeps the current reasons of the non-read requests and the main frame navigation, and the allowed origin reads', () => {
     expect(decide(facts('POST', `${SERVICE_ORIGIN}${LIST_RPC_PATH}`, 'fetch'), true))
       .toEqual({ action: 'BLOCK', category: 'REQUEST', reason: 'NON_READ_METHOD', auditStageBlock: 'READ_REQUEST_OVER_LIMIT' });
-    expect(decide(facts('GET', `${SERVICE_ORIGIN}/`, 'document', true, true), true))
-      .toEqual({ action: 'BLOCK', category: 'NAVIGATION', reason: 'EXTERNAL_MAIN_FRAME_NAVIGATION' });
+    // SD-2: main frame の移動は止めない（範囲の外へ移った画面は、読み込みの側が点検しない）。
+    expect(decide(facts('GET', `${SERVICE_ORIGIN}/`, 'document', true, true), true)).toEqual({ action: 'ALLOW', delivery: 'INSPECT_REDIRECTS' });
     expect(decide(facts('GET', `${APP_ORIGIN}/admin`, 'fetch'), true)).toEqual({ action: 'ALLOW', delivery: 'DIRECT' });
   });
 });
 
-describe('T35R-fix M-1: the excluded paths and the dangerous terms on the registered read requests', () => {
-  it('blocks a registered call whose path has a dangerous term or starts with an excluded path', () => {
-    expect(decide(facts('POST', `${SERVICE_ORIGIN}${DANGEROUS_RPC_PATH}`, 'fetch'), false)).toEqual(excluded);
-    expect(decide(facts('POST', `${APP_ORIGIN}${EXCLUDED_RPC_PATH}`, 'fetch'), false)).toEqual(excluded);
-  });
-
-  it('blocks a registered call whose query has a dangerous term', () => {
-    expect(decide(facts('POST', `${SERVICE_ORIGIN}${LIST_RPC_PATH}?action=logout`, 'fetch'), false)).toEqual(excluded);
+// SD-2（設計書 `2026-11-16-beaksight-action-based-delete-guard-design.md` 2.4）: 登録した呼び出しを、読まないパスと危険な語で止めない（前の T35R-fix の M-1）。
+describe('T35R-fix M-1 and SD-2: the registered read requests are not stopped by the excluded paths and the dangerous terms', () => {
+  it('admits a registered call whose path or query has a dangerous term or whose path starts with an excluded path', () => {
+    for (const url of [`${SERVICE_ORIGIN}${DANGEROUS_RPC_PATH}`, `${APP_ORIGIN}${EXCLUDED_RPC_PATH}`, `${SERVICE_ORIGIN}${LIST_RPC_PATH}?action=logout`]) {
+      expect(decide(facts('POST', url, 'fetch'), false)).toMatchObject({ action: 'ALLOW', auditStageAdmission: { kind: 'AUDIT_READ_REQUEST' } });
+    }
   });
 
   it('admits a registered call outside the read range (the range is for the screen paths)', () => {
@@ -108,26 +105,19 @@ describe('T35R-fix M-1: the excluded paths and the dangerous terms on the regist
 });
 
 describe('T35R-fix I-3: the service request budget of the whole Run', () => {
+  // L11 で直した: 1 回の Run の上限は撤廃した（断らず、上限に届いたと言わない。LZ-3c: 上限の値も受けない）。前の実行までの数から数えることだけを確かめる。
   it('counts from the requests admitted by the previous executions, with a new per minute window', () => {
-    const budget = createServiceRequestBudget({ perMinute: 2, perRun: 3, now: () => 0, initialAdmitted: 2 });
-    expect([budget.tryConsume(), budget.tryConsume()]).toEqual([true, false]);
-    expect(budget.snapshot()).toEqual({ admitted: 3, refused: 1, limitReached: true });
-    expect(createServiceRequestBudget({ perMinute: 2, perRun: 3, now: () => 0, initialAdmitted: 3 }).isLimitReached()).toBe(true);
-    expect(createServiceRequestBudget({ perMinute: 2, perRun: 3, now: () => 0, initialAdmitted: 0 }).isLimitReached()).toBe(false);
+    const budget = createServiceRequestBudget({ now: () => 0, initialAdmitted: 2 });
+    expect([budget.tryConsume(), budget.tryConsume()]).toEqual([true, true]);
+    expect(budget.snapshot()).toEqual({ admitted: 4, refused: 0, limitReached: false });
   });
 
   it.each([-1, 1.5, Number.NaN])('rejects the initial count %s', (initialAdmitted) => {
-    expect(() => createServiceRequestBudget({ perMinute: 1, perRun: 1, now: () => 0, initialAdmitted })).toThrow(RangeError);
+    expect(() => createServiceRequestBudget({ now: () => 0, initialAdmitted })).toThrow(RangeError);
   });
 });
 
 describe('T35R-fix I-2・I-3: the counts of the audit stage carried by the checkpoint', () => {
-  const auditStage: AuditStageServiceRequests = {
-    approvedServiceOrigins: [SERVICE_ORIGIN],
-    auditReadRequests: [],
-    scriptLogin: { origin: SERVICE_ORIGIN, path: '/auth/v1/token', requiredQuery: [{ name: 'grant_type', value: 'password' }] },
-    serviceRequestLimits: { perMinute: 5, perRun: 3 },
-  };
   const previous = {
     registeredReadRequestsAllowed: 0,
     tokenRefreshBlocked: 0,
@@ -140,15 +130,16 @@ describe('T35R-fix I-2・I-3: the counts of the audit stage carried by the check
     serviceRequestPacingWaitMs: 0,
   };
 
+  // L11 で直した: 上限で断らない（前の実行の断った数は、記録として足したまま残る）。
   it('starts the budget from the saved admitted count, and saves the totals', () => {
-    const state = createAuditStageRunState(auditStage, () => 0, previous);
-    expect([state.budget.tryConsume(), state.budget.tryConsume()]).toEqual([true, false]);
-    expect(auditStageCountsOf(state)).toMatchObject({ serviceRequestsAdmitted: 3, serviceRequestLimitRefused: 2 });
+    const state = createAuditStageRunState(() => 0, previous);
+    expect([state.budget.tryConsume(), state.budget.tryConsume()]).toEqual([true, true]);
+    expect(auditStageCountsOf(state)).toMatchObject({ serviceRequestsAdmitted: 4, serviceRequestLimitRefused: 1 });
   });
 
   it('reports the limit reached in run.json when a previous execution refused a request, keeping the shape of run.json', () => {
-    const state = createAuditStageRunState({ ...auditStage, serviceRequestLimits: { perMinute: 5, perRun: 10 } }, () => 0, previous);
-    expect(state.budget.isLimitReached()).toBe(false);
+    const state = createAuditStageRunState(() => 0, previous);
+    expect(state.budget.snapshot().limitReached).toBe(false);
     const summary = runAuthenticationSummaryOf(state);
     expect(summary.serviceRequestLimitReached).toBe(true);
     // T37R-fix-B2（Task 37 の設計書 8 章の最後の行）: 許可 Origin への `fetch`・`xhr` を止めた数を足した（記録だけ。前の実行の数は 0）。
@@ -162,7 +153,7 @@ describe('T35R-fix I-2・I-3: the counts of the audit stage carried by the check
   });
 
   it('does not report the limit without a refusal under the limit', () => {
-    const state = createAuditStageRunState({ ...auditStage, serviceRequestLimits: { perMinute: 5, perRun: 10 } }, () => 0, undefined);
+    const state = createAuditStageRunState(() => 0, undefined);
     expect(state.budget.tryConsume()).toBe(true);
     expect(runAuthenticationSummaryOf(state).serviceRequestLimitReached).toBe(false);
     expect(auditStageCountsOf(state)).toMatchObject({ serviceRequestsAdmitted: 1, serviceRequestLimitRefused: 0 });
@@ -205,7 +196,6 @@ describe('T35R2-fix C-1: the factory options of the jobs without the Run Coordin
     approvedServiceOrigins: [SERVICE_ORIGIN],
     auditReadRequests: [{ origin: SERVICE_ORIGIN, path: LIST_RPC_PATH, method: 'POST', maxPerPageLoad: ONE }],
     scriptLogin: { origin: SERVICE_ORIGIN, path: '/auth/v1/token', requiredQuery: [{ name: 'grant_type', value: 'password' }] },
-    serviceRequestLimits: { perMinute: 2, perRun: 2 },
   };
   const authentication = (stage: AuditStageServiceRequests | undefined): RunAuthentication => ({
     initialState: { cookies: [], origins: [] },
@@ -221,8 +211,9 @@ describe('T35R2-fix C-1: the factory options of the jobs without the Run Coordin
   it('passes the audit stage without the registered read requests, with a budget of the whole job', () => {
     const options = jobContextFactoryOptions(authentication(auditStage), () => 0, 'NONE').factoryOptions;
     expect(options.authentication.auditStage).toEqual({ ...auditStage, auditReadRequests: [] });
+    // L11 で直した: 上限（ここでは 2）を超えても断らない（数えるだけ）。
     expect([options.serviceRequestBudget?.tryConsume(), options.serviceRequestBudget?.tryConsume(), options.serviceRequestBudget?.tryConsume()])
-      .toEqual([true, true, false]);
+      .toEqual([true, true, true]);
     expect(options.auditStageMonitor).toBeDefined();
   });
 

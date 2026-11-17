@@ -13,9 +13,8 @@ import {
   type HandleInteractionProbeInput,
   type PageInteractionProbeInput,
 } from '../../src/interaction/discover-candidates.js';
-import { INTERACTION_CANDIDATE_LIMITS } from '../../src/safety/interaction-policy.js';
 
-const limits = { ...INTERACTION_CANDIDATE_LIMITS };
+const limits = {};
 
 describe('interaction probe input types', () => {
   it('accepts only DISCOVER and RESOLVE for the page probe, and only INSPECT for the handle probe', () => {

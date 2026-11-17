@@ -38,7 +38,7 @@ const OTHER_RECORD: ApprovalTemplatedCandidateFact = Object.freeze({
   templatedIdentityDigests: [UPDATE_TEMPLATED_IDENTITY_DIGEST, `sha256:${'4'.repeat(64)}`],
   ruleDigest: UPDATE_CANDIDATE.ruleDigest,
   classification: 'UPDATE',
-  drift: 'NEW',
+  drift: 'SEEN',
 });
 
 const FACTS: ApprovalCurrentFacts = Object.freeze<ApprovalCurrentFacts>({
@@ -52,7 +52,7 @@ const FACTS: ApprovalCurrentFacts = Object.freeze<ApprovalCurrentFacts>({
   candidateShapeDigests: null,
   // T38R-fix: API のシナリオだけが使う事実。
   candidateKeyFieldDigests: null,
-  apiShapeOriginIndex: null,
+  apiShapeOrigin: null,
   latestDiscoveryProfileRevision: null,
   inputRuleReference: INPUT_RULES,
   readChecks: READ_CHECK_FACTS,
@@ -138,7 +138,7 @@ describe('approval validity of an UPDATE scenario (T31b)', () => {
     const create = sampleScenario();
     const createFacts: ApprovalCurrentFacts = {
       ...FACTS,
-      candidate: { identityDigest: CREATE_CANDIDATE.identityDigest, ruleDigest: CREATE_CANDIDATE.ruleDigest, classification: 'CREATE', drift: 'UNCHANGED' },
+      candidate: { identityDigest: CREATE_CANDIDATE.identityDigest, ruleDigest: CREATE_CANDIDATE.ruleDigest, classification: 'CREATE', drift: 'SEEN' },
     };
     for (const templatedCandidates of [null, []] as const) {
       const facts = { ...createFacts, templatedCandidates };

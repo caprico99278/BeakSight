@@ -14,12 +14,7 @@ import type { AuditConfig } from '../../src/config/types.js';
 import {
   AUTH_SETUP_SCHEMA_VERSION_3,
   AUTH_SETUP_VALIDATION_ERROR_CODES,
-  MAX_ALLOWED_IDP_ORIGINS,
-  MAX_AUTH_SETUP_PATH_LIST_ITEMS,
-  MAX_AUTH_SETUP_URL_LENGTH,
   MAX_LOGIN_ATTEMPTS,
-  MAX_LOGIN_POST_ENDPOINTS,
-  MAX_SUCCESS_SELECTOR_LENGTH,
   MIN_LOGIN_ATTEMPTS,
   type AuthSetup,
   type AuthSetupValidationErrorCode,
@@ -37,7 +32,6 @@ import {
 } from '../../src/control/contracts.js';
 import { CONTROL_SCHEMA_NAMES, validateControlDocument } from '../../src/control/control-schema-validator.js';
 import { validateSiteProfile, type ProfileValidationContext } from '../../src/control/profile-policy.js';
-import { MAX_URL_LENGTH } from '../../src/core/limits.js';
 import { FORM_NAVIGATION_SETUP_ITEMS, previousVersionSetupDocumentOf } from '../helpers/auth-setup-samples.js';
 import { createTestConfig } from '../helpers/test-config.js';
 
@@ -126,7 +120,6 @@ describe('T25a: the auth setup contract and its schema', () => {
     expect(AUTH_SETUP_SCHEMA_VERSION_3).toBe('beaksight-auth-setup/3');
     expect(MIN_LOGIN_ATTEMPTS).toBe(1);
     expect(MAX_LOGIN_ATTEMPTS).toBe(3);
-    expect(MAX_AUTH_SETUP_URL_LENGTH).toBe(MAX_URL_LENGTH);
     expect(Object.isFrozen(AUTH_SETUP_VALIDATION_ERROR_CODES)).toBe(true);
     expect(new Set(AUTH_SETUP_VALIDATION_ERROR_CODES).size).toBe(AUTH_SETUP_VALIDATION_ERROR_CODES.length);
   });
@@ -152,16 +145,19 @@ describe('T25a: the auth setup contract and its schema', () => {
     const endpointItem = (endpoints.items ?? {}) as { properties?: Record<string, Record<string, unknown>> };
     const success = (properties.successCondition ?? {}) as { properties?: Record<string, Record<string, unknown>> };
     expect(properties.schemaVersion?.const).toBe(AUTH_SETUP_SCHEMA_VERSION_3);
-    expect(properties.loginStartUrl?.maxLength).toBe(MAX_AUTH_SETUP_URL_LENGTH);
-    expect(endpoints.maxItems).toBe(MAX_LOGIN_POST_ENDPOINTS);
+    // URL-LEN: URL・Origin・path の長さの上限（前は 2,048）はない。
+    expect(properties.loginStartUrl?.maxLength).toBeUndefined();
+    // L11（設計書 `2026-11-09-beaksight-remove-limits-design.md` 4）で直した: ログインの送信先と IdP の Origin の件数の上限は撤廃した。
+    expect(endpoints.maxItems).toBeUndefined();
     // T34a: スクリプトで送るログインは空でよい（フォームの送信で 1 つ以上要るのは、検証の決まり `AUTH_SETUP_LOGIN_POST_ENDPOINTS_REQUIRED`）。
     expect(endpoints.minItems).toBe(0);
-    expect(endpointItem.properties?.origin?.maxLength).toBe(MAX_AUTH_SETUP_URL_LENGTH);
-    expect(endpointItem.properties?.path?.maxLength).toBe(MAX_AUTH_SETUP_URL_LENGTH);
-    expect(success.properties?.selector?.maxLength).toBe(MAX_SUCCESS_SELECTOR_LENGTH);
-    expect(properties.excludedPaths?.maxItems).toBe(MAX_AUTH_SETUP_PATH_LIST_ITEMS);
-    expect(properties.auditPathPrefixes?.maxItems).toBe(MAX_AUTH_SETUP_PATH_LIST_ITEMS);
-    expect(properties.allowedIdpOrigins?.maxItems).toBe(MAX_ALLOWED_IDP_ORIGINS);
+    expect(endpointItem.properties?.origin?.maxLength).toBeUndefined();
+    expect(endpointItem.properties?.path?.maxLength).toBeUndefined();
+    expect(success.properties?.selector?.maxLength).toBeUndefined();
+    // LZ-3a: 除く path と監査の path の件数の上限（前は 50）は撤廃した。
+    expect(properties.excludedPaths?.maxItems).toBeUndefined();
+    expect(properties.auditPathPrefixes?.maxItems).toBeUndefined();
+    expect(properties.allowedIdpOrigins?.maxItems).toBeUndefined();
     expect(properties.maxLoginAttempts?.minimum).toBe(MIN_LOGIN_ATTEMPTS);
     expect(properties.maxLoginAttempts?.maximum).toBe(MAX_LOGIN_ATTEMPTS);
     expect(properties.profileRevision?.minimum).toBe(MIN_PROFILE_REVISION);
@@ -206,11 +202,10 @@ describe('T25a: validateAuthSetup accepts a valid setup', () => {
     })],
     ['the lowest number of login attempts', withSetup({ maxLoginAttempts: MIN_LOGIN_ATTEMPTS })],
     ['the highest number of login attempts', withSetup({ maxLoginAttempts: MAX_LOGIN_ATTEMPTS })],
-    ['the most login post endpoints', withSetup({
-      loginPostEndpoints: Array.from({ length: MAX_LOGIN_POST_ENDPOINTS }, (_value, index) => ({ origin: TEST_ORIGIN, path: `/login/${index}` })),
-    })],
-    ['the most excluded paths', withSetup({
-      excludedPaths: Array.from({ length: MAX_AUTH_SETUP_PATH_LIST_ITEMS }, (_value, index) => `/admin/item-${index}`),
+    // LZ-3a: 件数の上限（前は 50）はない。
+    ['more excluded paths and audit path prefixes than the former limit', withSetup({
+      excludedPaths: Array.from({ length: 51 }, (_value, index) => `/admin/item-${index}`),
+      auditPathPrefixes: Array.from({ length: 51 }, (_value, index) => `/admin/item-${index}`),
     })],
     ['percent-encoded characters in a path', withSetup({ excludedPaths: ['/admin/%E3%81%82'] })],
   ])('accepts %s', (_name, input) => {
@@ -429,20 +424,32 @@ describe('T25a: validateAuthSetup rejects each rule violation with its own code 
   it.each([
     ['a login attempt limit of 0', { maxLoginAttempts: 0 }],
     ['a login attempt limit above the maximum', { maxLoginAttempts: MAX_LOGIN_ATTEMPTS + 1 }],
-    ['too many login post endpoints', {
-      loginPostEndpoints: Array.from({ length: MAX_LOGIN_POST_ENDPOINTS + 1 }, (_value, index) => ({ origin: TEST_ORIGIN, path: `/l/${index}` })),
-    }],
-    ['too many excluded paths', { excludedPaths: Array.from({ length: MAX_AUTH_SETUP_PATH_LIST_ITEMS + 1 }, (_value, index) => `/x/${index}`) }],
-    ['too many audit path prefixes', { auditPathPrefixes: Array.from({ length: MAX_AUTH_SETUP_PATH_LIST_ITEMS + 1 }, (_value, index) => `/x/${index}`) }],
-    ['too many IdP origins', { allowedIdpOrigins: Array.from({ length: MAX_ALLOWED_IDP_ORIGINS + 1 }, (_value, index) => `https://idp${index}.example.invalid`) }],
-    ['a too long login start URL', { loginStartUrl: `${TEST_ORIGIN}/${'a'.repeat(MAX_AUTH_SETUP_URL_LENGTH)}` }],
-    ['a too long path', { excludedPaths: [`/${'a'.repeat(MAX_AUTH_SETUP_URL_LENGTH)}`] }],
-    ['a too long selector', { successCondition: { pathPrefix: '/admin/home', selector: `#${'a'.repeat(MAX_SUCCESS_SELECTOR_LENGTH)}` } }],
-    ['a too long selector in UTF-16 code units', {
-      successCondition: { pathPrefix: '/admin/home', selector: '\u{1f600}'.repeat(MAX_SUCCESS_SELECTOR_LENGTH / 2 + 1) },
-    }],
   ])('rejects %s with AUTH_SETUP_LIMIT_EXCEEDED', (_name, overrides) => {
     expect(codesOf(validate(withSetup(overrides)))).toEqual(['AUTH_SETUP_LIMIT_EXCEEDED']);
+  });
+
+  // LZ-2: 成功の条件のセレクタの長さの上限（前は 256）は撤廃した。
+  it('accepts a success selector longer than the former limit', () => {
+    const result = validate(withSetup({ successCondition: { pathPrefix: '/admin/home', selector: `#${'a'.repeat(256)}` } }));
+    expect(result, JSON.stringify(result)).toMatchObject({ ok: true });
+  });
+
+  // URL-LEN: URL と path の長さの上限（前は 2,048）はない。前の上限を超える長さで `AUTH_SETUP_LIMIT_EXCEEDED` を出さない。
+  it('does not reject a login start URL or a path longer than the former limit', () => {
+    expect(codesOf(validate(withSetup({
+      loginStartUrl: `${TEST_ORIGIN}/${'a'.repeat(2_049)}`, excludedPaths: [`/${'a'.repeat(2_049)}`],
+    })))).toEqual([]);
+  });
+
+  // L11（設計書 `2026-11-09-beaksight-remove-limits-design.md` 4）で直した: ログインの送信先と IdP の Origin の件数の上限は撤廃した。前の上限を超える件数で
+  // `AUTH_SETUP_LIMIT_EXCEEDED` を出さない（IdP の Origin は、今どおり空だけを受ける別の決まりで拒む）。
+  it('does not reject more login post endpoints or IdP origins than the earlier limits by the count (L11)', () => {
+    expect(codesOf(validate(withSetup({
+      loginPostEndpoints: Array.from({ length: 6 }, (_value, index) => ({ origin: TEST_ORIGIN, path: `/l/${index}` })),
+    })))).toEqual([]);
+    expect(codesOf(validate(withSetup({
+      allowedIdpOrigins: Array.from({ length: 6 }, (_value, index) => `https://idp${index}.example.invalid`),
+    })))).not.toContain('AUTH_SETUP_LIMIT_EXCEEDED');
   });
 
   it('returns every rule violation at once', () => {

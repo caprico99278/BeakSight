@@ -7,6 +7,8 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 import { readScenario } from '../../src/control/approval/scenario-store.js';
+import { ruleSetHasHumanItems } from '../../src/control/data-rules/rule-contracts.js';
+import { readRuleSetRevisions } from '../../src/control/data-rules/rule-store.js';
 import { approveForCheck, approveUpdateForChain } from '../../src/control/approval/update-autodraft.js';
 import { closeControlDatabase, openControlDatabase, type ControlDatabase } from '../../src/control/store/control-database.js';
 import { resolveControlDatabasePath } from '../../src/control/store/database-path.js';
@@ -63,6 +65,31 @@ describe('OP-F M-4: the check approves the create and the update together', () =
     prepareScenario(database, latest, CREATE_ID, { approve: false });
     expect(approveForCheck(database, [CREATE_ID], EXTERNAL, clock)).toEqual({ ok: true });
     expect(stateOf(CREATE_ID)).toBe('APPROVED');
+  });
+});
+
+describe('SPEC-4: the check does not use the rules a person saved on the removed rules screen', () => {
+  beforeEach(() => {
+    latest = prepareGrantProfile(database);
+  });
+  // 前の規則の画面で人が保存した固定の値（印のない規則）。
+  const humanContent = {
+    fieldRules: [{ fieldName: 'plan', semanticKind: 'FIXED_LIST' as const, method: 'FROM_FIXED_LIST' as const, range: null, fixedValues: ['a'] }],
+    relations: [],
+    uniqueKeyFieldNames: [],
+  };
+  const attachedRulesOf = (scenarioId: string) => {
+    const reference = readScenario(database, scenarioId)?.current.inputRuleReference ?? null;
+    return readRuleSetRevisions(database, scenarioId).find(({ reference: saved }) => saved.revision === reference?.revision)?.ruleSet ?? null;
+  };
+
+  it.each([['a draft', false], ['an approved scenario', true]] as const)('approves %s with the inferred rules instead of the human rules', (_label, approve) => {
+    prepareScenario(database, latest, CREATE_ID, { approve, ruleContent: humanContent });
+    expect(approveForCheck(database, [CREATE_ID], EXTERNAL, clock)).toEqual({ ok: true });
+    expect(stateOf(CREATE_ID)).toBe('APPROVED');
+    const rules = attachedRulesOf(CREATE_ID);
+    expect(rules).not.toBeNull();
+    expect(ruleSetHasHumanItems(rules!)).toBe(false);
   });
 });
 

@@ -10,7 +10,6 @@ import type { Page, Request, Response } from 'playwright';
 import type { DeadlineOutcome } from '../core/deadline.js';
 import { safeErrorMessage } from '../core/errors.js';
 import type { NavigationOutcomeKind } from '../core/evidence-types.js';
-import { MAX_ERROR_MESSAGE_LENGTH } from '../core/limits.js';
 import { announceOwnMainFrameNavigation } from '../safety/passive-request-guard.js';
 import { isPlaywrightTimeoutError } from './playwright-errors.js';
 
@@ -37,7 +36,7 @@ export interface MainFrameLoadObservation {
    */
   readonly httpStatus: number | null;
   /**
-   * 失敗の、上限（`MAX_ERROR_MESSAGE_LENGTH`）付きのメッセージ。`OK` なら `null`。期限の競争で時間切れになった場合
+   * 失敗のメッセージ（切り詰めない）。`OK` なら `null`。期限の競争で時間切れになった場合
    * （例外がない）も `null`。
    */
   readonly failureDetail: string | null;
@@ -83,6 +82,8 @@ export async function settleMainFrameLoad(
 export interface MainFrameDocumentTracker {
   /** main frame の最後のナビゲーションの要求の応答の status。最後の要求に応答（ヘッダ）を受けていなければ `null`。 */
   latestResponseStatus(): number | null;
+  /** RB-3: その応答の URL（リダイレクトの後の文書の URL。応答を受けていなければ `null`）。 */
+  latestResponseUrl(): string | null;
   /** page の要求と応答の事象の受け口を外す。外した後は、値が変わらない。何度呼んでもよい。 */
   dispose(): void;
 }
@@ -115,6 +116,7 @@ export function trackMainFrameDocument(page: Page): MainFrameDocumentTracker {
 
   return Object.freeze({
     latestResponseStatus: (): number | null => latestStatus,
+    latestResponseUrl: (): string | null => (latestStatus === null ? null : latestRequest?.url() ?? null),
     dispose: (): void => {
       if (disposed) {
         return;
@@ -131,7 +133,7 @@ export function trackMainFrameDocument(page: Page): MainFrameDocumentTracker {
  * - `FULFILLED`: `OK`。`httpStatus` は応答の status（応答が `null` なら追跡の値）。
  * - `DEADLINE_EXCEEDED`: `TIMEOUT`。`httpStatus` は追跡の値。`failureDetail` は `null`。
  * - `REJECTED`: `isPlaywrightTimeoutError` なら `TIMEOUT`、ほかは `FAILED`。`httpStatus` は追跡の値。
- *   `failureDetail` は `safeErrorMessage(reason, MAX_ERROR_MESSAGE_LENGTH)`。
+ *   `failureDetail` は `safeErrorMessage(reason)`。
  */
 export function observeMainFrameLoad(
   tracker: MainFrameDocumentTracker,
@@ -148,7 +150,7 @@ export function observeMainFrameLoad(
       return observation(
         isPlaywrightTimeoutError(settlement.reason) ? 'TIMEOUT' : 'FAILED',
         tracker.latestResponseStatus(),
-        safeErrorMessage(settlement.reason, MAX_ERROR_MESSAGE_LENGTH),
+        safeErrorMessage(settlement.reason),
       );
   }
 }

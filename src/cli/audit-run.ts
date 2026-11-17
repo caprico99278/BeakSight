@@ -3,16 +3,14 @@
  * ワーカー（Task 24 の 4.2）で共用する。新しい実行の経路は作らない（Run の実行は `RunCoordinator`、判定は `run-checkpoint.ts`）。
  *
  * 段の順（今の `run` のコマンドと同じ。中断した Run の再開の設計書 4.7、4.7.1）:
- * 0. 出力先の開始のロック（DEF-057。Task 24 の設計書 4.6。`output-start-lock.ts` の `holdOutputStartLock`）を取る。別の起動が持っていれば
- *    `RUN_ACTIVE`（終了コード 4。実行中の Run があればその ID、なければ `null`）。開始のロックは、1〜4 の開始の段（Run のロックの作成まで）の
- *    間だけ持ち、保存のセッションの始め方の後に離す。例外の経路と、Run のロックを作る前に終わる経路でも、必ず離す。
- * 1. 出力先の実行中の Run を確かめる（`output-start-lock.ts` の `findActiveRunInOutputDirectory`）。あれば `RUN_ACTIVE`（終了コード 4。
- *    `startNew` でも同じ）。Run も出力も作らない。
- * 2. `startNew` でなければ、途中の Run を選ぶ（`chooseRunToResume`）。版が違えば `VERSION_MISMATCH`（終了コード 4）。
- * 3. 再開の判断と開始の知らせ（設定が違う、壊れた保存）を、観測の口 `onRunStarting` に渡す。
- * 4. 保存のセッションを作り、Run Coordinator に、保存のセッション、再開の入力、止める印を渡して、Run を実行する。保存のセッションが始まると、
+ * 0. 出力先の監査中の印（SPEC-2、DEF-057。`src/core/run-exclusion.ts` の `acquireRunExclusion`。OS が持ち主の終わりと同時に放す排他）を取る。
+ *    別の起動が持っていれば `RUN_ACTIVE`（終了コード 4。`startNew` でも同じ）。Run も出力も作らない。印は、Run の終わり（出力と保存の終わり方の
+ *    後）まで持ち、例外の経路と、Run を始めずに終わる経路でも、必ず離す。印を持てたかを決められなかったときは、保存のセッションを始めない（止まる側）。
+ * 1. `startNew` でなければ、途中の Run を選ぶ（`chooseRunToResume`）。版が違えば `VERSION_MISMATCH`（終了コード 4）。
+ * 2. 再開の判断と開始の知らせ（設定が違う、壊れた保存）を、観測の口 `onRunStarting` に渡す。
+ * 3. 保存のセッションを作り、Run Coordinator に、保存のセッション、再開の入力、止める印を渡して、Run を実行する。保存のセッションが始まると、
  *    観測の口 `onRunStarted` に、Run の ID、Run のディレクトリ、再開の判断を渡す。
- * 5. Run の後:
+ * 4. Run の後:
  *    1. `RunDirectoryUnavailableError` なら `RUN_DIRECTORY_UNAVAILABLE`（終了コードは、確定した Run の Run Status のとおり）。
  *    2. `RunResumeUnavailableError` なら `RESUME_UNAVAILABLE`（終了コード 4）。
  *    3. ほかの例外なら、保存の終わり方が `ABANDON` のときに `abandon()` を呼んでから、例外をそのまま返す（呼び出し側が扱う）。
@@ -25,28 +23,32 @@
  * `onProgress` と同じ扱い）。口は待たない。
  * 判定（ロック、再開できるか、設定、版、選び方、保存の終わり方）は、`run-checkpoint.ts` と Run Coordinator の関数を呼ぶだけで、ここには書かない。
  * ファイルの読み書きと削除は、`ArtifactWriter` に任せる（ARCH08）。
- * 認証つきの Run（`AuditRunDependencies.authentication`）では、この Run の書き手を、URL の秘密を伏せる書き手にする（T25f。`writerFor`）。保存、
- * 診断の記録、最後の出力のすべてを、同じ書き手で書く。
+ * 認証つきの Run（`AuditRunDependencies.authentication`）では、この Run の書き手を、URL の秘密を伏せる書き手にする（T25f。`writerFor`）。保存と
+ * 最後の出力のすべてを、同じ書き手で書く。
  */
-import { readFile } from 'node:fs/promises';
+import { createReadStream } from 'node:fs';
+import { readFile, stat } from 'node:fs/promises';
 import { basename, resolve } from 'node:path';
 import { launchChromium } from '../browser/chromium-launch.js';
 import type { AuditConfig } from '../config/types.js';
 import type { NavigationPacer } from '../crawl/navigation-pacer.js';
-import type { AuditRunResult, RunId, RunProgressReport, RunStatus } from '../core/contracts.js';
+import type { AuditRunResult, RunId, RunExecutionAutomaticRelogin, RunProgressReport, RunStatus } from '../core/contracts.js';
+import type { RunPages } from '../core/run-page-store.js';
 import {
   artifactFilePath,
   isPortableRelativeArtifactPath,
   listCheckpointRunDirectories,
   runArtifactDirectory,
 } from '../core/artifact-layout.js';
+import { CHECKED_WRITE_SCREENS_SCOPE, type AuditPageScopeKind } from '../core/audit-page-scope.js';
 import { errorCodeOf } from '../core/errors.js';
-import { isRunId } from '../core/ids.js';
+import { acquireRunExclusion } from '../core/run-exclusion.js';
+import { createSha256FingerprintOfChunks, isRunId } from '../core/ids.js';
+import type { ObservationWindows } from '../core/observation-windows.js';
 import type { RunStageCarry } from '../orchestration/audit-stage-run.js';
 import { authenticatedRunConfig, runCheckpointAuthenticationOf, type RunAuthentication } from '../orchestration/authenticated-run.js';
 import { readPlaywrightVersion, readToolVersion } from '../orchestration/environment.js';
-import { findActiveRunInOutputDirectory, holdOutputStartLock, type OutputLockGraceOptions } from '../orchestration/output-start-lock.js';
-import type { BrowserLauncher } from '../orchestration/preflight.js';
+import type { BrowserLauncher, BrowserLease } from '../orchestration/preflight.js';
 import {
   checkRunCheckpointConsistency,
   checkRunCheckpointPageConsistency,
@@ -60,16 +62,15 @@ import {
 } from '../orchestration/run-checkpoint.js';
 import {
   RunCheckpointSession,
-  RunLockLostError,
   type RunCheckpointSessionOptions,
   type RunCheckpointSessionStart,
   type RunCheckpointSessionStartOptions,
-  type RunCheckpointSessionTimers,
 } from '../orchestration/run-checkpoint-session.js';
 import {
   RunCoordinator,
   RunDirectoryUnavailableError,
   RunResumeUnavailableError,
+  restoredRunPagesCollector,
   type RunCoordinatorCheckpointConclusion,
   type RunCoordinatorDependencies,
   type RunCoordinatorResumeInput,
@@ -77,10 +78,11 @@ import {
   type RunResumeUnavailableReason,
 } from '../orchestration/run-coordinator.js';
 import { ArtifactWriteError, ArtifactWriter } from '../report/artifact-writer.js';
-import { createChatGptBundle, type ReadArtifactFile } from '../report/chatgpt-bundle.js';
-import { renderHtmlReport } from '../report/html-report.js';
+import type { ArtifactFileExists, BundleArtifactFiles } from '../report/artifact-references.js';
+import { prepareChatGptBundleParts, type PreparedChatGptBundle, type ReadArtifactFile } from '../report/chatgpt-bundle.js';
+import { renderHtmlReportChunks } from '../report/html-report.js';
 import { reportSummaryDocumentOf } from '../report/report-summary.js';
-import { buildReportViewModel, type RunSummaryView } from '../report/view-model.js';
+import { buildPublishedReportViewModel, type RunSummaryView } from '../report/view-model.js';
 import { SafetyLedger } from '../safety/safety-ledger.js';
 import { RUN_UNAVAILABLE_EXIT_CODE, exitCodeForRunStatus } from './exit-codes.js';
 
@@ -88,19 +90,29 @@ import { RUN_UNAVAILABLE_EXIT_CODE, exitCodeForRunStatus } from './exit-codes.js
 // 依存と指定
 // ---------------------------------------------------------------------------------------------------------------
 
+/**
+ * Run を行う部品（本番は `RunCoordinator`）。MEM-3b: 確定した Run のページは、置き場所でも配列でもよい（テストの差し替えは配列を返す）。
+ */
+export interface AuditRunCoordinator {
+  run(): Promise<AuditRunResult<RunPages>>;
+  checkpointConclusion(): RunCoordinatorCheckpointConclusion;
+}
+
 /** 監査の中核に注入するもの（本番の既定値は `PRODUCTION_RUN_DEPENDENCIES`）。CLI の `RunCommandDependencies` と同じものである。 */
 export interface AuditRunDependencies {
   /** Chromium を起動する関数。 */
   readonly launchBrowser: BrowserLauncher;
+  /** RB-5: ワーカーの Browser の lease（ワーカーだけが渡す。Run Coordinator の `browserLease`）。CLI の本番の値は持たない。 */
+  readonly browserLease?: BrowserLease | undefined;
   /** 時刻に使う時計。 */
   readonly clock: () => Date;
-  /** 期限と実行時間に使う、現在の時刻（ミリ秒。`Date.now()` と同じ基準）。保存のセッションのロックの時刻と、ロックの判定にも使う。 */
+  /** 期限と実行時間に使う、現在の時刻（ミリ秒。`Date.now()` と同じ基準）。出力先のロックを取った時刻にも使う。 */
   readonly now: () => number;
   /**
    * Run Coordinator を作る関数（テスト用の差し替え口。R17r の Minor-2）。省略すると `new RunCoordinator(dependencies)`。
    * 本番の `run` が、確定した Run を書き出すことと、Run の後に保存の終わり方（`checkpointConclusion()`）に従うことを、テストで確かめるために使う。
    */
-  readonly createRunCoordinator?: (dependencies: RunCoordinatorDependencies) => Pick<RunCoordinator, 'run' | 'checkpointConclusion'>;
+  readonly createRunCoordinator?: (dependencies: RunCoordinatorDependencies) => AuditRunCoordinator;
   /**
    * 止める印（中断した Run の再開の設計書 4.6.1）。省略すると、止めない。Run Coordinator に、そのまま渡す（CLI はシグナル、ワーカーは
    * 止める要求とつなぐ）。
@@ -111,7 +123,7 @@ export interface AuditRunDependencies {
    * 渡す（秘密はメモリだけ）。Run Coordinator に、そのまま渡す。渡したときは、再開の比べ（設定の違い）に、認証つきの Run の有効な設定
    * （`authenticatedRunConfig`。`audit.interactions` が false）を使う（Run Coordinator が保存する有効な設定と同じ形にして、止まった Run を
    * 再開できるようにする）。省略すると、今と完全に同じ（CLI は渡さない）。
-   * T25f: Run のディレクトリの書き出し（`ArtifactWriter`。保存、診断の記録、最後の出力）は、URL の秘密を伏せる書き手（`urlSecretRedaction: true`。
+   * T25f: Run のディレクトリの書き出し（`ArtifactWriter`。保存、最後の出力）は、URL の秘密を伏せる書き手（`urlSecretRedaction: true`。
    * Task 25 の設計書 4.6）にする。T44g: 渡さないとき（公開監査）も同じ書き手にする。
    */
   readonly authentication?: RunAuthentication | undefined;
@@ -126,15 +138,15 @@ export interface AuditRunDependencies {
    */
   readonly sleep?: ((ms: number) => Promise<void>) | undefined;
   /**
+   * RB-2（TEST-TIME-B）: テストだけ。観察の窓の一式。Run Coordinator に、そのまま渡す。省略すると本番の値（CLI と本番の Run の依存 `PRODUCTION_RUN_DEPENDENCIES`
+   * は渡さない。ワーカーは process の組み立てのテストだけの口からだけ渡す）。
+   */
+  readonly observationWindows?: ObservationWindows | undefined;
+  /**
    * FM2d（設計書 `2026-10-19-beaksight-fewer-manual-steps-design.md` 3A.1）: まとめて実行の段の持ち越し（`RunStageCarry`）。ワーカーが渡す。Run Coordinator に、
    * そのまま渡す（使い方は `RunCoordinatorDependencies.stageCarry`）。メモリの中だけで、成果物・保存・ログに書かない。省略すると、今と完全に同じ（CLI は渡さない）。
    */
   readonly stageCarry?: RunStageCarry | undefined;
-  /**
-   * DEF-170: 保存のセッションのハートビートのタイマー（テストの差し替え口。ロックを失った場面で、ハートビートを手で打つ）。省略すると Node の
-   * `setInterval`（CLI とワーカーは渡さない）。
-   */
-  readonly checkpointTimers?: RunCheckpointSessionTimers | undefined;
 }
 
 /** 監査の中核の指定（CLI の引数から決まるもの）。 */
@@ -153,6 +165,16 @@ export interface AuditRunOptions {
    * ない点検）は、今の報告のまま。
    */
   readonly plannedWriteScreenCount?: number | undefined;
+  /**
+   * DEF-200（設計書 `2026-11-04-beaksight-login-session-design.md` 3.4）: ログインの切れの後に、自動ログインでログインし直して自動で始めた実行の印と回数（ワーカーだけが
+   * 入れる）。この実行の記録（保存と `run.json`）に残す。省略（CLI の実行、ふつうの開始）は今のまま。
+   */
+  readonly automaticRelogin?: RunExecutionAutomaticRelogin | undefined;
+  /**
+   * WSO: 「チェックした画面だけ」の点検で読む画面の URL（ワーカーが `START` の `chain.checkedScreenPages` から入れる）。Run Coordinator の `pageScope` にそのまま
+   * 渡し、再開する Run は同じ範囲の Run から選ぶ。省略（CLI の実行、サイトの全部の画面の点検）は今のまま。
+   */
+  readonly pageScope?: readonly string[] | undefined;
 }
 
 /** 監査の中核の指定の既定値（`--new` なし）。 */
@@ -241,7 +263,7 @@ export type AuditRunCheckpointWarning =
 /**
  * 監査の中核の結果の種類の閉じた一覧（今の `run` のコマンドの分岐）。
  * - `RAN`: Run を実行し、出力を書いた（終了コードは、書き出した後の Run Status のとおり）。
- * - `RUN_ACTIVE`: 出力先で別の Run が実行中か、別の起動が開始の段にいる（出力先の開始のロック。DEF-057）ので、Run を始めなかった（終了コード 4）。
+ * - `RUN_ACTIVE`: 出力先で別の起動が Run を動かしている（出力先のロック。SPEC-2、DEF-057）ので、Run を始めなかった（終了コード 4）。
  * - `VERSION_MISMATCH`: 途中の Run の版が違うので、Run を始めなかった（終了コード 4）。
  * - `RUN_DIRECTORY_UNAVAILABLE`: Run のディレクトリを作れなかったので、出力を書かなかった（DEF-009。終了コードは、確定した Run の Run Status
  *   のとおり）。
@@ -273,20 +295,7 @@ export type AuditRunOutcome =
     readonly summary: RunSummaryView;
     readonly checkpointWarnings: readonly AuditRunCheckpointWarning[];
   }
-  | {
-    readonly kind: Extract<AuditRunOutcomeKind, 'RUN_ACTIVE'>;
-    /**
-     * 実行中の Run の ID。別の起動が開始の段にいて（出力先の開始のロックを持っていて。DEF-057）、まだ Run のロックがないときは `null`
-     * （その起動の Run の ID は、まだ決まっていない）。
-     */
-    readonly activeRunId: RunId | null;
-    readonly exitCode: number;
-    /**
-     * DEF-170: この起動が Run を始めた後に、ロックを別の起動に持たれた（ハートビートで分かった）。読み込みを止め、Run のディレクトリに書かずに
-     * 終えた（`activeRunId` は、その Run の ID）。省略は、始める前に別の起動が持っていた（今までの意味）。
-     */
-    readonly lockLost?: true;
-  }
+  | { readonly kind: Extract<AuditRunOutcomeKind, 'RUN_ACTIVE'>; readonly exitCode: number }
   | {
     readonly kind: Extract<AuditRunOutcomeKind, 'VERSION_MISMATCH'>;
     readonly runId: RunId;
@@ -341,11 +350,6 @@ export interface AuditRunObserver {
    * 書き出し、止めたときの片付け）に入る知らせ（Run Coordinator の `onFinalizing`）。ワーカーは、親へ `RUN_FINALIZING` を送る。
    */
   readonly onFinalizing?: (() => void) | undefined;
-  /**
-   * DEF-172: 動いている持ち主のロック（開始のロック、Run のロック）が古く見えるので、取り直す前に、ロックが更新されるかを待って確かめる知らせ
-   * （待つ時間 ms）。CLI は標準出力に示す。
-   */
-  readonly onLockGraceWait?: ((waitMs: number) => void) | undefined;
 }
 
 /** 観測の口を、例外と reject を握りつぶして呼ぶ（Run Coordinator の `#reportProgress` と同じ扱い）。 */
@@ -370,42 +374,30 @@ function notifyObserver<T>(hook: ((value: T) => void) | undefined, value: T): vo
 
 /**
  * 保存のセッションが始まったら、Run のディレクトリを知らせるセッション（`RunCheckpointSession` の意味は変えない）。Run Coordinator は、
- * 新しい Run では Run のディレクトリを作った直後、再開では前の回の Run のディレクトリで、`start` を呼ぶ。その結果が `ok` のときだけ、
- * `onStarted` を呼ぶ（呼び出し側が、例外を握りつぶす）。
+ * 新しい Run では Run のディレクトリを作った直後、再開では前の回の Run のディレクトリで、`start` を呼ぶ。始められたときだけ、`onStarted` を呼ぶ
+ * （呼び出し側が、例外を握りつぶす）。
+ * SPEC-2: 出力先の監査中の印を持てたかを決められなかったとき（`lockFailure`）は、始めずに、その失敗で reject する（印なしでサイトを読まない。
+ * Run Coordinator は、PREFLIGHT の前に Run を止める）。
  */
 class StartNotifyingRunCheckpointSession extends RunCheckpointSession {
   readonly #onStarted: (runDirectory: string) => void;
-  readonly #afterStartAttempt: () => Promise<void>;
+  readonly #lockFailure: { readonly cause: unknown } | null;
 
-  /**
-   * `afterStartAttempt` は、`start` の結果によらず（始められた、始めなかった、reject した）、`start` の後に1回ずつ待つ処理（出力先の開始のロックを
-   * 離す。DEF-057）。reject しないものを渡す。
-   */
-  constructor(options: RunCheckpointSessionOptions, onStarted: (runDirectory: string) => void, afterStartAttempt: () => Promise<void>) {
+  constructor(options: RunCheckpointSessionOptions, onStarted: (runDirectory: string) => void, lockFailure: { readonly cause: unknown } | null) {
     super(options);
     this.#onStarted = onStarted;
-    this.#afterStartAttempt = afterStartAttempt;
+    this.#lockFailure = lockFailure;
   }
 
   override async start(runDirectory: string, options: RunCheckpointSessionStartOptions): Promise<RunCheckpointSessionStart> {
-    let started: RunCheckpointSessionStart;
-    try {
-      started = await super.start(runDirectory, options);
-    } finally {
-      await this.#afterStartAttempt();
+    if (this.#lockFailure !== null) {
+      throw this.#lockFailure.cause;
     }
-    if (started.ok) {
-      this.#onStarted(runDirectory);
-    }
+    const started = await super.start(runDirectory, options);
+    this.#onStarted(runDirectory);
     return started;
   }
 }
-
-// ---------------------------------------------------------------------------------------------------------------
-// 出力先の開始のロック（DEF-057。Task 24 の設計書 4.6）
-// ---------------------------------------------------------------------------------------------------------------
-
-// 開始のロックの取り方と離し方は `src/orchestration/output-start-lock.ts` の `holdOutputStartLock`（CCX-6。ワーカーの Run と同じ部品。DEF-081）。
 
 /**
  * この Run の書き手（T25f。Task 25 の設計書 4.6）。Run のディレクトリに書く値の URL の秘密を伏せる書き手（`urlSecretRedaction: true`）。T44g（Task 44 の
@@ -416,11 +408,6 @@ function writerFor(dependencies: Pick<AuditRunDependencies, 'authentication'>): 
   const serviceOrigins = dependencies.authentication?.auditStage?.approvedServiceOrigins;
   return new ArtifactWriter({ urlSecretRedaction: true, ...(serviceOrigins === undefined ? {} : { serviceOrigins }) });
 }
-
-/** 開始のロックを持たなかった（`UNAVAILABLE`）ときの、離す処理（何もしない）。 */
-const releaseNothing = async (): Promise<void> => undefined;
-/** 開始のロックを持たなかった（`UNAVAILABLE`）ときの、読み直し（確かめるものがないので真。DEF-170）。 */
-const confirmNothing = async (): Promise<boolean> => true;
 
 /**
  * 保存のセッションが始まった Run のディレクトリから、Run の ID を求める。再開なら、再開の判断の Run の ID。新しい Run なら、Run のディレクトリの
@@ -446,39 +433,28 @@ export async function executeAuditRun(
 ): Promise<AuditRunOutcome> {
   const outputDirectory = resolve(config.output.directory);
   const writer = writerFor(dependencies);
-  const nowMs = dependencies.now();
 
-  // 0. 出力先の開始のロック（DEF-057）。別の起動が開始の段にいれば、Run を始めない（実行中の Run がある場合と同じ扱い。その Run の ID が
-  // 分かれば、それを返す）。
-  // DEF-172: 動いている持ち主のロックが古く見えるときは、取り直す前に猶予を置いて読み直す（待ちは注入した `sleep`、待つことを知らせる）。
-  const lockGrace = {
-    ...(dependencies.sleep === undefined ? {} : { wait: dependencies.sleep }),
-    onWait: (waitMs: number) => notifyObserver(observer.onLockGraceWait, waitMs),
-  };
-  const startLock = await holdOutputStartLock(writer, outputDirectory, nowMs, lockGrace);
-  if (startLock.kind === 'HELD_BY_ANOTHER_START') {
-    return {
-      kind: 'RUN_ACTIVE',
-      activeRunId: await findActiveRunInOutputDirectory(writer, outputDirectory, nowMs),
-      exitCode: RUN_UNAVAILABLE_EXIT_CODE,
-    };
+  // 0. 出力先のロック（SPEC-2、DEF-057）。別の起動が持っていれば、Run を始めない。
+  const runLock = await acquireRunExclusion(outputDirectory);
+  if (runLock.kind === 'HELD') {
+    return { kind: 'RUN_ACTIVE', exitCode: RUN_UNAVAILABLE_EXIT_CODE };
   }
-  const releaseStartLock = startLock.kind === 'ACQUIRED' ? startLock.release : releaseNothing;
-  const confirmStartLock = startLock.kind === 'ACQUIRED' ? startLock.confirm : confirmNothing;
   try {
     return await startAndRunAudit({
-      config, dependencies, options, observer, outputDirectory, writer, nowMs, releaseStartLock, confirmStartLock, lockGrace,
+      config, dependencies, options, observer, outputDirectory, writer,
+      lockFailure: runLock.kind === 'UNAVAILABLE' ? { cause: runLock.cause } : null,
     });
   } finally {
-    // 例外の経路と、Run のロックを作る前に終わった経路でも、必ず離す（保存のセッションが始まった後なら、すでに離している）。
-    await releaseStartLock();
+    // Run の終わり（出力と保存の終わり方の後）と、例外の経路と、Run を始めずに終わった経路で、必ず離す。
+    if (runLock.kind === 'ACQUIRED') {
+      await runLock.release();
+    }
   }
 }
 
 /**
- * 開始のロックを持ったまま、開始の段（実行中の Run の確かめ → 再開する Run の選択 → Run のディレクトリとロックの作成）を行い、Run を実行する
- * （`executeAuditRun` の 1〜5。ファイルの先頭の説明）。開始のロックは、保存のセッションの始め方（Run のロックの作成）の後に離す
- * （`releaseStartLock`）。
+ * 出力先の監査中の印を持ったまま、再開する Run を選び、Run を実行する（`executeAuditRun` の 1〜4。ファイルの先頭の説明）。`lockFailure` は、印を
+ * 持てたかを決められなかったときの失敗（保存のセッションを始めない）。
  */
 async function startAndRunAudit(input: {
   readonly config: AuditConfig;
@@ -487,20 +463,11 @@ async function startAndRunAudit(input: {
   readonly observer: AuditRunObserver;
   readonly outputDirectory: string;
   readonly writer: ArtifactWriter;
-  readonly nowMs: number;
-  readonly releaseStartLock: () => Promise<void>;
-  readonly confirmStartLock: () => Promise<boolean>;
-  readonly lockGrace: OutputLockGraceOptions;
+  readonly lockFailure: { readonly cause: unknown } | null;
 }): Promise<AuditRunOutcome> {
-  const { config, dependencies, options, observer, outputDirectory, writer, nowMs, releaseStartLock, confirmStartLock, lockGrace } = input;
+  const { config, dependencies, options, observer, outputDirectory, writer, lockFailure } = input;
 
-  // 1. 出力先の実行中の Run（設計書 4.7.1）。DEF-172: 動いている持ち主のロックが古く見えるときは、猶予の後に読み直す。
-  const activeRunId = await findActiveRunInOutputDirectory(writer, outputDirectory, nowMs, lockGrace);
-  if (activeRunId !== null) {
-    return { kind: 'RUN_ACTIVE', activeRunId, exitCode: RUN_UNAVAILABLE_EXIT_CODE };
-  }
-
-  // 2. 途中の Run を選ぶ（`startNew` のときは探さない）。
+  // 1. 途中の Run を選ぶ（`startNew` のときは探さない）。
   // T25d: 認証つきの Run は、Run Coordinator が保存する有効な設定（`authenticatedRunConfig`）と同じ形で比べる。
   const resumeComparisonConfig = dependencies.authentication === undefined ? config : authenticatedRunConfig(config);
   // T25g-2: Run の種類（認証つきかどうかと、認証の設定を区別する値）も比べる（認証つきの Run と公開監査の Run は、互いに再開しない）。
@@ -509,7 +476,8 @@ async function startAndRunAudit(input: {
     : runCheckpointAuthenticationOf(dependencies.authentication);
   const choice: RunResumeChoice = options.startNew
     ? NEW_RUN_CHOICE
-    : await chooseRunToResume(writer, outputDirectory, resumeComparisonConfig, resumeComparisonKind);
+    : await chooseRunToResume(writer, outputDirectory, resumeComparisonConfig, resumeComparisonKind,
+      options.pageScope === undefined ? null : CHECKED_WRITE_SCREENS_SCOPE);
   if (choice.kind === 'VERSION_DIFFERS') {
     return {
       kind: 'VERSION_MISMATCH',
@@ -520,37 +488,22 @@ async function startAndRunAudit(input: {
     };
   }
   const { resumeDecision, notices } = choice;
-  // DEF-170: Run のロックを作る前に、開始のロックが今も自分のものかを読み直す。ほかの起動に取り直されていれば、別の起動が開始の段にいるときと
-  // 同じに、Run を始めない。
-  if (!(await confirmStartLock())) {
-    return {
-      kind: 'RUN_ACTIVE',
-      activeRunId: await findActiveRunInOutputDirectory(writer, outputDirectory, nowMs),
-      exitCode: RUN_UNAVAILABLE_EXIT_CODE,
-    };
-  }
   notifyObserver(observer.onRunStarting, { resumeDecision, notices });
 
-  // 3. 保存のセッションと Run Coordinator。
-  const session = new StartNotifyingRunCheckpointSession({
-    store: writer,
-    now: dependencies.now,
-    ...(dependencies.checkpointTimers === undefined ? {} : { timers: dependencies.checkpointTimers }),
-    // DEF-172: 読み直しの間と、取り直す前の猶予の待ち（注入した `sleep`）と、待つことの知らせ。
-    ...(lockGrace.wait === undefined ? {} : { wait: lockGrace.wait }),
-    onLockGraceWait: lockGrace.onWait,
-  }, (runDirectory) => {
+  // 2. 保存のセッションと Run Coordinator。
+  const session = new StartNotifyingRunCheckpointSession({ store: writer }, (runDirectory) => {
     const runId = startedRunId(outputDirectory, runDirectory, resumeDecision);
     if (runId !== null) {
       notifyObserver(observer.onRunStarted, { runId, runDirectory, resumeDecision });
     }
-  }, releaseStartLock);
+  }, lockFailure);
   const resumeFrom = choice.kind === 'RESUME' ? choice.resumeFrom : undefined;
   const createRunCoordinator = dependencies.createRunCoordinator
     ?? ((coordinatorDependencies: RunCoordinatorDependencies) => new RunCoordinator(coordinatorDependencies));
   const coordinator = createRunCoordinator({
     config,
     launchBrowser: dependencies.launchBrowser,
+    ...(dependencies.browserLease === undefined ? {} : { browserLease: dependencies.browserLease }),
     createSafetyLedger: () => new SafetyLedger(),
     clock: dependencies.clock,
     now: dependencies.now,
@@ -562,21 +515,21 @@ async function startAndRunAudit(input: {
     onFinalizing: () => notifyObserver(observer.onFinalizing, undefined),
     checkpointSession: session,
     ...(resumeFrom === undefined ? {} : { resumeFrom }),
+    // DEF-200: ログインし直して自動で始めた実行の印と回数（あるときだけ）。
+    ...(options.automaticRelogin === undefined ? {} : { automaticRelogin: options.automaticRelogin }),
+    // WSO: 「チェックした画面だけ」の点検で読む画面（あるときだけ）。
+    ...(options.pageScope === undefined ? {} : { pageScope: options.pageScope }),
     ...(dependencies.stopSignal === undefined ? {} : { stopSignal: dependencies.stopSignal }),
     ...(dependencies.authentication === undefined ? {} : { authentication: dependencies.authentication }),
     ...(dependencies.navigationPacer === undefined ? {} : { navigationPacer: dependencies.navigationPacer }),
     ...(dependencies.sleep === undefined ? {} : { sleep: dependencies.sleep }),
+    ...(dependencies.observationWindows === undefined ? {} : { observationWindows: dependencies.observationWindows }),
     // FM2d: まとめて実行の段の持ち越し（ワーカーだけが渡す。メモリの中だけ）。
     ...(dependencies.stageCarry === undefined ? {} : { stageCarry: dependencies.stageCarry }),
-    // サイトの不調で止めたときの診断の記録（サイトの不調で止めたときの診断の記録の設計書 2.3）。Run Coordinator が渡す Run のディレクトリに、
-    // `ArtifactWriter` が書く（ARCH08。試行の番号は、ファイルの名前に使う）。失敗は Run Coordinator が握りつぶす。
-    writeSiteUnavailableDiagnostic: async (runDirectory, record, attemptNumber) => {
-      await writer.writeSiteUnavailableDiagnostic(runDirectory, record, attemptNumber);
-    },
   });
 
-  // 4. Run の後。
-  let result: AuditRunResult;
+  // 3. Run の後。
+  let result: AuditRunResult<RunPages>;
   try {
     result = await coordinator.run();
   } catch (error) {
@@ -592,17 +545,6 @@ async function startAndRunAudit(input: {
         exitCode: exitCodeForRunStatus(runStatus),
         resumeDecision,
         notices,
-      };
-    }
-    if (error instanceof RunLockLostError) {
-      // DEF-170: ロックを失った。Run のディレクトリには何も書かず（最後の状態・成果物・保存）、ロックのファイルにも触らない（今の持ち主のもの）。
-      // ハートビートを止めるだけ（`abandon` は書かない）。終わり方は、別の起動が Run を持つときと同じ。
-      await session.abandon();
-      return {
-        kind: 'RUN_ACTIVE',
-        activeRunId: error.runId ?? (resumeDecision.kind === 'NEW_RUN' ? null : resumeDecision.runId),
-        exitCode: RUN_UNAVAILABLE_EXIT_CODE,
-        lockLost: true,
       };
     }
     if (error instanceof RunResumeUnavailableError) {
@@ -623,19 +565,9 @@ async function startAndRunAudit(input: {
     throw error;
   }
   const conclusion = coordinator.checkpointConclusion();
-  // DEF-172: 成果物を書く前に、Run のロックが今も自分のものかを読んで確かめる（保存のセッションを始めた Run だけ。始めていなければ終わり方は
-  // `NONE`）。違えば、ロックを失った Run と同じに、何も書かずに終える。
-  if (conclusion.action !== 'NONE' && !(await session.confirmLockHeld())) {
-    await session.abandon();
-    return {
-      kind: 'RUN_ACTIVE',
-      activeRunId: result.run.runId,
-      exitCode: RUN_UNAVAILABLE_EXIT_CODE,
-      lockLost: true,
-    };
-  }
   let outputs: AuditRunOutputs;
   try {
+    // MEM-3d: Run Coordinator の置き場所を、そのまま書き出し・表示用モデル・HTML・バンドルに渡す（全ページを配列に戻さない）。
     outputs = await writeAuditRunOutputs(result, outputDirectory, writer, options.profileName, options.plannedWriteScreenCount);
   } catch (error) {
     await concludeCheckpointAfterOutputFailure(conclusion, session);
@@ -700,6 +632,8 @@ async function chooseRunToResume(
   outputDirectory: string,
   config: AuditConfig,
   currentKind: RunCheckpointAuthentication | null,
+  /** WSO: 今回の点検の範囲（サイトの全部の画面は null）。同じ範囲の Run だけを候補にする。 */
+  currentPageScope: AuditPageScopeKind | null,
 ): Promise<RunResumeChoice> {
   const notices: AuditRunStartNotice[] = [];
   const readable: RunResumeCandidate[] = [];
@@ -711,7 +645,7 @@ async function chooseRunToResume(
       notices.push({ kind: 'CHECKPOINT_UNREADABLE', runId });
     }
   }
-  const selection = selectRunToResume(readable, config, currentKind);
+  const selection = selectRunToResume(readable, config, currentKind, currentPageScope);
   if (selection.kind === 'START_NEW') {
     return { kind: 'NEW_RUN', resumeDecision: NEW_RUN_DECISION, notices };
   }
@@ -730,10 +664,11 @@ async function chooseRunToResume(
   if (versionDifferences.length > 0) {
     return { kind: 'VERSION_DIFFERS', runId: candidate.runId, runDirectory: candidate.runDirectory, differences: versionDifferences };
   }
-  const full = await writer.readCheckpoint(candidate.runDirectory, {
+  // MEM-3c（DEF-266）: ページの保存は 1 つずつ読み、要約と圧縮した本体の置き場所に入れる（全ページの保存を配列で持たない）。
+  const full = await writer.readCheckpointCollected(candidate.runDirectory, {
     checkState: checkRunCheckpointConsistency,
     checkPage: checkRunCheckpointPageConsistency,
-  });
+  }, restoredRunPagesCollector());
   if (!full.ok) {
     return {
       kind: 'NEW_RUN',
@@ -833,17 +768,59 @@ async function concludeCheckpointAfterOutputFailure(
  * 相対パスが安全でない場合は、読まずに `RangeError` を投げる（検証は `isPortableRelativeArtifactPath` の1か所。CC-027）。
  */
 export const artifactFileReader = (runDirectory: string): ReadArtifactFile => async (relativePath) => {
-  if (!isPortableRelativeArtifactPath(relativePath)) {
-    throw new RangeError(`not a portable relative artifact path: ${JSON.stringify(relativePath)}`);
-  }
   try {
-    return await readFile(artifactFilePath(runDirectory, relativePath));
+    return await readFile(portableArtifactFilePath(runDirectory, relativePath));
   } catch (error) {
     if (errorCodeOf(error) === 'ENOENT') {
       return null;
     }
     throw error;
   }
+};
+
+/**
+ * MEM-1（DEF-266）: 書き出し済みのファイルが、Run のディレクトリからの相対パスにあるかを、読まずに（`stat` で）確かめる関数を作る（発表の前の参照の確かめ）。
+ * ファイルがない（`ENOENT`）か、ファイルでなければ偽。ほかの入出力の失敗は、そのまま投げる。相対パスが安全でない場合は `RangeError`（`artifactFileReader` と同じ）。
+ */
+export const artifactFileExistence = (runDirectory: string): ArtifactFileExists => async (relativePath) =>
+  (await existingArtifactFilePathOf(runDirectory, relativePath)) !== null;
+
+/**
+ * MEM-2（DEF-266）: ChatGPT 用バンドルを部ごとに作るための、書き出し済みのファイルの読み方を作る。
+ * - `measure`: 「ない」の決まりは `artifactFileExistence` と同じ（`stat` で、ないかファイルでなければ `null`）。あれば、少しずつ読んで（`createReadStream`）
+ *   大きさと sha256 を測る（中身は持たない）。
+ * - `read`: `artifactFileReader` と同じ。
+ */
+export const artifactBundleFiles = (runDirectory: string): BundleArtifactFiles => ({
+  measure: async (relativePath) => {
+    const path = await existingArtifactFilePathOf(runDirectory, relativePath);
+    return path === null ? null : createSha256FingerprintOfChunks(createReadStream(path));
+  },
+  read: artifactFileReader(runDirectory),
+});
+
+/**
+ * 書き出し済みのファイルのパス（ない（`ENOENT`）か、ファイルでなければ `null`。読まずに `stat` で確かめる）。ほかの入出力の失敗は、そのまま投げる。相対パスが
+ * 安全でない場合は `RangeError`。
+ */
+const existingArtifactFilePathOf = async (runDirectory: string, relativePath: string): Promise<string | null> => {
+  const path = portableArtifactFilePath(runDirectory, relativePath);
+  try {
+    return (await stat(path)).isFile() ? path : null;
+  } catch (error) {
+    if (errorCodeOf(error) === 'ENOENT') {
+      return null;
+    }
+    throw error;
+  }
+};
+
+/** Run のディレクトリからの相対パスのファイルのパス（相対パスが安全でない場合は `RangeError`。検証は `isPortableRelativeArtifactPath` の 1 か所。CC-027）。 */
+const portableArtifactFilePath = (runDirectory: string, relativePath: string): string => {
+  if (!isPortableRelativeArtifactPath(relativePath)) {
+    throw new RangeError(`not a portable relative artifact path: ${JSON.stringify(relativePath)}`);
+  }
+  return artifactFilePath(runDirectory, relativePath);
 };
 
 /** 確定した Run を書き出した結果（`writeAuditRunOutputs`）。 */
@@ -857,16 +834,20 @@ export interface AuditRunOutputs {
   readonly exitCode: number;
   /** 表示用モデルの要約。 */
   readonly summary: RunSummaryView;
+  /** AUD-1d: 書いた ChatGPT 用バンドルの部の数（1 なら今の名前の 1 つの ZIP）。 */
+  readonly bundlePartCount: number;
 }
 
 /**
  * 確定した Run（`AuditRunResult`）を書き出し、表示用モデルの要約と終了コードを返す（設計書 第7章、R17 の指摘2）。表示はしない。
- * Run Coordinator の実行とは分ける。書き出しの順（設計書 6.1.8）:
+ * Run Coordinator の実行とは分ける。MEM-3d（DEF-266）: ページは配列でも置き場所でもよい（Run Coordinator の置き場所を、全ページを戻さずにそのまま渡す。
+ * 本体を戻すのは、writeRun の 2 回と表示用モデルの 1 回）。書き出しの順（設計書 6.1.8）:
  * 1. `ArtifactWriter.writeRun`（スキーマに合わない場合は、ここで Run Status が導き直される）
- * 2. `buildReportViewModel(written.result)`
- * 3. `renderHtmlReport(viewModel)`
- * 4. `createChatGptBundle(viewModel, written.result, readArtifactFile)`
- * 5. `ArtifactWriter.writePresentation(written, { reportHtml, reportSummary, bundle: { bytes, lastExecutionFinishedAt, profileName } })`（PL-R: 報告の小さなまとめ
+ * 2. `buildPublishedReportViewModel(written.result, artifactFileExistence(...))`（AUD-1c: 参照先があるかを確かめてから `buildReportViewModel` で組み立てる。
+ *    MEM-1: 確かめは読まずに `stat` で行う）
+ * 3. `renderHtmlReportChunks(viewModel)`（MEM-4: 断片を順に描き、5. で受け取るたびに書く）
+ * 4. `prepareChatGptBundleParts(viewModel, written.result, artifactBundleFiles(...))`（AUD-1d: 部に分けたバンドル。MEM-2: 部の割り当てと manifest を先に決める）
+ * 5. `ArtifactWriter.writePresentation(written, { reportHtml, reportSummary, bundle: { bytes: 部を 1 つずつ渡すもの, lastExecutionFinishedAt, profileName } })`（PL-R: 報告の小さなまとめ
  *    `report-summary.json` は `reportSummaryDocumentOf(viewModel)`）（バンドルの名前は、最後の
  *    実行の終わりの時刻から作る。結果の行と同じ、表示用モデルの `executions.lastFinishedAt` を使う。ChatGPT 用バンドルのファイル名の
  *    設計書 2.1。PRE42-BN: 画面のジョブは、`profileName`（プロファイルの名前）を名前に入れる。CLI は渡さない）
@@ -878,22 +859,48 @@ export interface AuditRunOutputs {
  * `plannedWriteScreenCount` は省略できる（OP-H。この後に登録・更新するチェックした画面の数。表示用モデルの事実。CLI は渡さない）。
  */
 export async function writeAuditRunOutputs(
-  result: AuditRunResult,
+  result: AuditRunResult<RunPages>,
   outputDirectory: string,
   writer: ArtifactWriter = new ArtifactWriter(),
   profileName: string | undefined = undefined,
   plannedWriteScreenCount: number | undefined = undefined,
 ): Promise<AuditRunOutputs> {
   const written = await writer.writeRun(result, { outputDirectory });
-  const viewModel = buildReportViewModel(written.result, plannedWriteScreenCount === undefined ? {} : { plannedWriteScreenCount });
-  const reportHtml = renderHtmlReport(viewModel);
-  const bundle = await createChatGptBundle(viewModel, written.result, artifactFileReader(written.runDirectory));
+  // AUD-1c: 発表の前に、参照先のファイルがあるかを確かめてから表示用モデルを作る（HTML とバンドルが同じ欠けの数を示す）。
+  const viewModel = await buildPublishedReportViewModel(
+    written.result,
+    artifactFileExistence(written.runDirectory),
+    plannedWriteScreenCount === undefined ? {} : { plannedWriteScreenCount },
+  );
+  // MEM-4: HTML は、断片を順に描きながら書く（全部を 1 つの文字列にしない）。
+  const reportHtml = renderHtmlReportChunks(viewModel);
+  // AUD-1d: 集めた証拠を全部入れ、大きいときは部に分ける（部の名前は `bundleFileName`）。MEM-2: 部の割り当てと manifest を先に決め（参照の確かめもここで
+  // 終える）、部は 1 つずつ作って書く。
+  const prepared = await prepareChatGptBundleParts(viewModel, written.result, artifactBundleFiles(written.runDirectory));
   await writer.writePresentation(written, {
     reportHtml,
     // PL-R: 報告の小さなまとめ（同じ表示用モデルから。画面の作業の画面が問題の数を読む）。
     reportSummary: reportSummaryDocumentOf(viewModel),
-    bundle: { bytes: bundle, lastExecutionFinishedAt: viewModel.summary.executions.lastFinishedAt, profileName },
+    bundle: {
+      bytes: { partCount: prepared.partCount, parts: bundlePartBytesOf(prepared) },
+      lastExecutionFinishedAt: viewModel.summary.executions.lastFinishedAt,
+      profileName,
+    },
   });
   const { runId, runStatus } = written.result.run;
-  return { runId, runDirectory: written.runDirectory, runStatus, exitCode: exitCodeForRunStatus(runStatus), summary: viewModel.summary };
+  return {
+    runId,
+    runDirectory: written.runDirectory,
+    runStatus,
+    exitCode: exitCodeForRunStatus(runStatus),
+    summary: viewModel.summary,
+    bundlePartCount: prepared.partCount,
+  };
+}
+
+/** 用意したバンドルの部の ZIP を、順に 1 つずつ作って渡す（`writePresentation` が受け取るたびに書く）。 */
+async function* bundlePartBytesOf(prepared: PreparedChatGptBundle): AsyncGenerator<Uint8Array, void, undefined> {
+  for await (const part of prepared.parts()) {
+    yield part.bytes;
+  }
 }

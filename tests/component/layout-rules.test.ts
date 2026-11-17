@@ -1,7 +1,9 @@
 import { describe, expect, it } from 'vitest';
 import {
   FIXED_OCCLUSION_MIN_COVERED_RATIO,
+  fixedOcclusionScrollExclusionsOf,
   LAYOUT_RULES,
+  LINE_CLAMP_VISIBLE_LINE_TOLERANCE,
   MAX_ALLOWED_HORIZONTAL_OVERFLOW_PX,
   MAX_IGNORED_CLIPPED_OVERFLOW_PX,
   MIN_DYNAMIC_LAYOUT_SHIFT_SCORE,
@@ -23,6 +25,7 @@ import type {
   LayoutEvidence,
   LayoutEvidencePayload,
   NormalizedHttpUrlEvidence,
+  NotificationFrameEvidence,
   StressLayoutEvidence,
   OutsideViewportEvidence,
   RectangleEvidence,
@@ -30,7 +33,8 @@ import type {
   WebVitalEvidence,
   ZeroSizeInteractiveEvidence,
 } from '../../src/core/evidence-types.js';
-import { VISUALLY_HIDDEN_MAX_DIMENSION_PX } from '../../src/core/evidence-types.js';
+import { INTENDED_CLIPPING_KINDS, VISUALLY_HIDDEN_MAX_DIMENSION_PX } from '../../src/core/evidence-types.js';
+import { NOTIFICATION_OVERLAY_TEXT } from '../../src/presentation/messages.js';
 import { createEvidenceId, createPageId } from '../../src/core/ids.js';
 
 const PAGE_ID = createPageId(3);
@@ -108,6 +112,17 @@ const baseLayout = (overrides: Partial<LayoutEvidence> = {}): LayoutEvidence => 
   ...overrides,
 });
 
+/**
+ * AUD-3a: 文書をスクロールできない高さ（ビューポートと同じ）にした document の事実。下や隅の固定要素の覆いは、スクロールできる文書では数えないので、
+ * スクロールと関係のない決まり（DEF-204・DEF-210 など）を確かめる試験は、これで今までの意図を保つ。
+ */
+const notScrollableDocument = (): LayoutEvidence['document'] => ({
+  ...baseLayout().document,
+  documentElementScrollHeight: VIEWPORT_HEIGHT,
+  bodyScrollHeight: VIEWPORT_HEIGHT,
+  bodyClientHeight: VIEWPORT_HEIGHT,
+});
+
 const layoutRecord = (
   primary: LayoutCollectionResult,
   sequence = 1,
@@ -123,6 +138,35 @@ const layoutRecord = (
 });
 
 const complete = (layout: LayoutEvidence): LayoutCollectionResult => ({ status: 'COMPLETE', layout });
+
+/** DEF-210: 通知の枠の事実 1 つ（digest は `seed` から作る）。 */
+const notificationFrame = (seed: string, overrides: Partial<NotificationFrameEvidence> = {}): NotificationFrameEvidence => ({
+  digest: `sha256:${seed.repeat(64).slice(0, 64)}`,
+  status: 'DISMISSIBLE',
+  pressed: false,
+  dismissed: false,
+  hidden: false,
+  hiddenReason: null,
+  firstSeen: true,
+  ...overrides,
+});
+
+/** DEF-210: layout の Evidence に、主の読み込みの通知の枠の事実（と、任意で閉じる前の layout と、幅の走査の事実）を足す。 */
+const withNotificationOverlay = (
+  record: EvidenceRecord,
+  frames: readonly NotificationFrameEvidence[],
+  extra: Partial<LayoutEvidencePayload> = {},
+): EvidenceRecord => {
+  if (record.type !== 'layout') throw new Error('not a layout record');
+  return {
+    ...record,
+    payload: {
+      ...record.payload,
+      notificationOverlay: { readStatus: 'READ', frames, pressCount: frames.filter((frame) => frame.pressed).length, navigated: false, truncated: false },
+      ...extra,
+    },
+  };
+};
 
 const input = (evidence: readonly EvidenceRecord[], viewport: ViewportProfile = 'desktop'): PageRuleInput => ({
   pageId: PAGE_ID,
@@ -326,6 +370,8 @@ const EXPECTED_RULES = [
   ['CONTENT_COLLISION', 'WARN'],
   ['OVERSIZED_FIXED_ELEMENT', 'WARN'],
   ['DYNAMIC_LAYOUT_SHIFT', 'WARN'],
+  ['NOTIFICATION_NOT_DISMISSIBLE', 'WARN'],
+  ['NOTIFICATION_HANDLED_BEFORE_AUDIT', 'INFO'],
 ] as const;
 
 describe('LAYOUT_RULES の登録', () => {
@@ -571,6 +617,15 @@ describe('ELEMENT_OVERLAP と CONTENT_COLLISION', () => {
     expect(evaluate('CONTENT_COLLISION', [record])).toEqual([]);
   });
 
+  it('EV-1: 行ごとの矩形が重ならない組（外接矩形だけの重なり）は ELEMENT_OVERLAP にしない。REV-SD2 の I-3: 重なりの点の hit-test では消さない', () => {
+    const link = element('#link', 'link', rect(0, 0, 300, 40));
+    const image = element('#image', 'image', rect(200, 20, 100, 40));
+    const withLines = (lineOverlap: NonNullable<ElementOverlapEvidence['lineOverlap']>): EvidenceRecord =>
+      layoutRecord(complete(baseLayout({ elementOverlaps: [{ ...overlap(link, image), lineOverlap }] })));
+    expect(evaluate('ELEMENT_OVERLAP', [withLines({ area: 0, pointCount: 0, bothHitPointCount: 0 })])).toEqual([]);
+    expect(evaluate('ELEMENT_OVERLAP', [withLines({ area: 2000, pointCount: 1, bothHitPointCount: 0 })])).toHaveLength(1);
+  });
+
   it('表（table）と埋め込み（media）を含む組は、どちらの Rule の対象にもしない（RT12r の N3。結果を変えない）', () => {
     const table = element('#table', 'table', rect(100, 0, 200, 200));
     const frame = element('#frame', 'media', rect(100, 0, 200, 200));
@@ -639,6 +694,129 @@ describe('TEXT_CLIPPING', () => {
     })));
     expect(evaluate('TEXT_CLIPPING', [record]).map((draft) => identity(draft, 'selector'))).toEqual(['#cut-caption']);
   });
+
+  it('clip・clip-path で描く面が 0 の要素（祖先を含む）は、大きさが 1 px より大きくても Finding にしない。印のない記録は今のとおり（DEF-205）', () => {
+    const record = layoutRecord(complete(baseLayout({
+      clippedText: [
+        clipped('#skip-link', {
+          rect: rect(0, 0, 44, 44),
+          clientWidth: 44,
+          scrollWidth: 208,
+          overflowX: 'hidden',
+          widthClipped: true,
+          visibility: visibility({ clippedToZeroArea: true }),
+        }),
+        clipped('#really-cut', { visibility: visibility({ clippedToZeroArea: false }) }),
+        clipped('#older-record'),
+      ],
+    })));
+    expect(evaluate('TEXT_CLIPPING', [record]).map((draft) => identity(draft, 'selector'))).toEqual(['#really-cut', '#older-record']);
+  });
+});
+
+describe('AUD-4a: 意図した省略（ellipsis・行数の省略・閉じた折りたたみ）を見切れと区別する', () => {
+  /** 縦だけ見切れる、行の高さ 20 px の箱（表示の高さ = 見える行の数 × 20 px）。 */
+  const clampedBox = (selector: string, clampCount: number, visibleLineCount: number): ClippedTextEvidence => clipped(selector, {
+    clientHeight: visibleLineCount * 20,
+    scrollHeight: 120,
+    rect: rect(0, 100, 300, visibleLineCount * 20),
+    clippingStyle: {
+      textOverflow: 'ellipsis',
+      whiteSpace: 'normal',
+      webkitLineClamp: String(clampCount),
+      lineClamp: '',
+      display: '-webkit-box',
+      webkitBoxOrient: 'vertical',
+      maxHeight: 'none',
+    },
+    lineHeightPx: 20,
+    visibleLineCount,
+    lineClampCount: clampCount,
+    collapsedByControl: false,
+    intendedClipping: 'LINE_CLAMP',
+  });
+  /** 横だけ見切れる 1 行の箱。 */
+  const singleLine = (selector: string, textOverflow: string, intended: boolean): ClippedTextEvidence => clipped(selector, {
+    overflowX: 'hidden',
+    overflowY: 'visible',
+    clientWidth: 200,
+    scrollWidth: 420,
+    clientHeight: 20,
+    scrollHeight: 20,
+    rect: rect(0, 100, 200, 20),
+    widthClipped: true,
+    heightClipped: false,
+    clippingStyle: {
+      textOverflow,
+      whiteSpace: 'nowrap',
+      webkitLineClamp: 'none',
+      lineClamp: '',
+      display: 'block',
+      webkitBoxOrient: 'horizontal',
+      maxHeight: 'none',
+    },
+    lineHeightPx: 20,
+    visibleLineCount: 1,
+    lineClampCount: null,
+    collapsedByControl: false,
+    intendedClipping: intended ? 'INTENDED_ELLIPSIS' : null,
+  });
+  const selectorsOf = (clippedText: readonly ClippedTextEvidence[]): readonly (string | undefined)[] =>
+    evaluate('TEXT_CLIPPING', [layoutRecord(complete(baseLayout({ clippedText })))]).map((draft) => identity(draft, 'selector'));
+
+  it('line-clamp 2 で見える行が 2 なら Finding にしない', () => {
+    expect(selectorsOf([clampedBox('#clamp-2', 2, 2)])).toEqual([]);
+  });
+
+  it('line-clamp 2 で箱の高さが 1.5 行（行の途中で切れる）なら Finding にする', () => {
+    expect(selectorsOf([clampedBox('#clamp-half', 2, 1.5)])).toEqual(['#clamp-half']);
+  });
+
+  it('ellipsis と nowrap で横だけ見切れるものは Finding にしない', () => {
+    expect(selectorsOf([singleLine('#ellipsis', 'ellipsis', true)])).toEqual([]);
+  });
+
+  it('ellipsis のない nowrap で横に見切れるものは Finding にする', () => {
+    expect(selectorsOf([singleLine('#nowrap-cut', 'clip', false)])).toEqual(['#nowrap-cut']);
+  });
+
+  it('ellipsis と nowrap でも、縦にも見切れるものは Finding にする', () => {
+    expect(selectorsOf([clipped('#both', {
+      ...singleLine('#both', 'ellipsis', true),
+      overflowY: 'hidden',
+      clientHeight: 10,
+      scrollHeight: 20,
+      heightClipped: true,
+    })])).toEqual(['#both']);
+  });
+
+  it('閉じた折りたたみ（aria-expanded="false" の操作要素が指す）の中のものは Finding にしない', () => {
+    expect(selectorsOf([clipped('#collapsed-panel', { collapsedByControl: true, intendedClipping: 'COLLAPSED' })])).toEqual([]);
+  });
+
+  it('新しい事実のない古い Evidence は、今の判定のまま Finding にする', () => {
+    expect(selectorsOf([clipped('#older-record')])).toEqual(['#older-record']);
+  });
+
+  it('区分の値は閉じた一覧で、行の数の許しの幅は名前つきの定数', () => {
+    expect(INTENDED_CLIPPING_KINDS).toEqual(['INTENDED_ELLIPSIS', 'LINE_CLAMP', 'COLLAPSED']);
+    expect(LINE_CLAMP_VISIBLE_LINE_TOLERANCE).toBeGreaterThan(0);
+    expect(LINE_CLAMP_VISIBLE_LINE_TOLERANCE).toBeLessThan(0.5);
+    expect(selectorsOf([clampedBox('#within', 2, 2 - LINE_CLAMP_VISIBLE_LINE_TOLERANCE)])).toEqual([]);
+    expect(selectorsOf([clampedBox('#beyond', 2, 2 - LINE_CLAMP_VISIBLE_LINE_TOLERANCE - 0.05)])).toEqual(['#beyond']);
+  });
+});
+
+describe('ELEMENT_OUTSIDE_VIEWPORT と描く面が 0 の要素（DEF-205）', () => {
+  it('clip・clip-path で描く面が 0 の要素は Finding にせず、隠していない要素は今のとおり作る', () => {
+    const record = layoutRecord(complete(baseLayout({
+      boxesOutsideViewport: [
+        outside('#hidden-wide', rect(40, 200, 1500, 300), { visibility: visibility({ clippedToZeroArea: true }) }),
+        outside('#visible-wide', rect(40, 600, 1500, 300), { visibility: visibility({ clippedToZeroArea: false }) }),
+      ],
+    })));
+    expect(evaluate('ELEMENT_OUTSIDE_VIEWPORT', [record]).map((draft) => identity(draft, 'selector'))).toEqual(['#visible-wide']);
+  });
 });
 
 describe('FIXED_ELEMENT_OCCLUSION', () => {
@@ -699,12 +877,100 @@ describe('FIXED_ELEMENT_OCCLUSION', () => {
   it('覆われた割合は、ビューポートの中に見えている面積に対して計る', () => {
     const tallParagraph = element('#long-text', 'paragraph', rect(0, 700, 800, 2000));
     const banner = rect(0, 700, VIEWPORT_WIDTH, 200);
+    // AUD-3a: スクロールできる文書では、下の帯の下の段落はスクロールで外へ出せるので数えない。この試験は割合の分母を確かめるものなので、
+    // 文書をスクロールできない高さ（ビューポートと同じ）にして、今までの意図を保つ。
     const record = layoutRecord(complete(baseLayout({
+      document: notScrollableDocument(),
       elementOverlaps: [overlap(tallParagraph, element('#cookie-banner', 'other', banner, { position: 'fixed' }))],
     })));
     const drafts = evaluate('FIXED_ELEMENT_OCCLUSION', [record]);
     expect(drafts).toHaveLength(1);
     expect(identity(drafts[0], 'overlaySelector')).toBe('#cookie-banner');
+  });
+});
+
+describe('AUD-3a: スクロールすれば固定要素の外へ出せる内容', () => {
+  const MOBILE_WIDTH = 390;
+  const MOBILE_HEIGHT = 844;
+  const bottomNavRect = rect(0, MOBILE_HEIGHT - 64, MOBILE_WIDTH, 64);
+  const bottomNav = element('#bottom-nav', 'other', bottomNavRect, { position: 'fixed', zIndex: '10' });
+  const underNav = element('#card-text', 'paragraph', rect(16, MOBILE_HEIGHT - 60, 358, 40));
+  const mobileLayout = (documentHeight: number, overrides: Partial<LayoutEvidence> = {}): LayoutEvidence => baseLayout({
+    document: {
+      ...baseLayout().document,
+      viewportWidth: MOBILE_WIDTH,
+      viewportHeight: MOBILE_HEIGHT,
+      documentElementClientWidth: MOBILE_WIDTH,
+      documentElementClientHeight: MOBILE_HEIGHT,
+      documentElementScrollWidth: MOBILE_WIDTH,
+      documentElementScrollHeight: documentHeight,
+      bodyScrollWidth: MOBILE_WIDTH,
+      bodyScrollHeight: documentHeight,
+      bodyClientWidth: MOBILE_WIDTH,
+      bodyClientHeight: documentHeight,
+    },
+    ...overrides,
+  });
+
+  it('文書がスクロールできるページの、下の固定の帯の下の内容は数えない', () => {
+    const record = layoutRecord(complete(mobileLayout(2400, { elementOverlaps: [overlap(underNav, bottomNav)] })));
+    expect(evaluate('FIXED_ELEMENT_OCCLUSION', [record])).toEqual([]);
+  });
+
+  it('スクロールできる量が足りず、帯の外へ出しきれない内容は数える', () => {
+    // 文書の高さ 864 → スクロールできる量は 20 px。内容は 20 px しか上がらず、帯（780〜844）と 784+40-20=804 まで重なる。
+    const record = layoutRecord(complete(mobileLayout(MOBILE_HEIGHT + 20, { elementOverlaps: [overlap(underNav, bottomNav)] })));
+    expect(evaluate('FIXED_ELEMENT_OCCLUSION', [record]).map((draft) => identity(draft, 'overlaySelector'))).toEqual(['#bottom-nav']);
+  });
+
+  it('EV-1: 文書は動かず内側の領域がスクロールするページの、下の固定の帯の下の内容は、祖先の動かせる量で数えない', () => {
+    const container = { selector: 'main', rect: rect(0, 0, MOBILE_WIDTH, MOBILE_HEIGHT), scrollTop: 0, scrollRangeY: 2000 };
+    const inner = { ...overlap(underNav, bottomNav), coveredScrollContainer: container };
+    expect(evaluate('FIXED_ELEMENT_OCCLUSION', [layoutRecord(complete(mobileLayout(MOBILE_HEIGHT, { elementOverlaps: [inner] })))])).toEqual([]);
+    // 祖先も動かせる量が足りなければ、今のとおり数える。
+    const short = { ...inner, coveredScrollContainer: { ...container, scrollRangeY: 10 } };
+    expect(evaluate('FIXED_ELEMENT_OCCLUSION', [layoutRecord(complete(mobileLayout(MOBILE_HEIGHT, { elementOverlaps: [short] })))])).toHaveLength(1);
+  });
+
+  it('スクロールできないページの、下の固定の帯の下の内容は、今のとおり数える', () => {
+    const record = layoutRecord(complete(mobileLayout(MOBILE_HEIGHT, { elementOverlaps: [overlap(underNav, bottomNav)] })));
+    const drafts = evaluate('FIXED_ELEMENT_OCCLUSION', [record]);
+    expect(drafts).toHaveLength(1);
+    expect(identity(drafts[0], 'overlaySelector')).toBe('#bottom-nav');
+  });
+
+  it('上の固定のヘッダが、先頭の位置で主要な内容を覆う形は、文書がスクロールできても今の判定のまま数える', () => {
+    const headerRect = rect(0, 0, MOBILE_WIDTH, 56);
+    const record = layoutRecord(complete(mobileLayout(2400, {
+      elementOverlaps: [
+        overlap(element('#top-bar', 'other', headerRect, { position: 'fixed', zIndex: '10' }),
+          element('#page-title', 'heading', rect(16, 0, 358, 48))),
+        overlap(element('#top-bar', 'other', headerRect, { position: 'fixed', zIndex: '10' }),
+          element('#lead', 'paragraph', rect(16, 30, 358, 40))),
+      ],
+    })));
+    const drafts = evaluate('FIXED_ELEMENT_OCCLUSION', [record]);
+    expect(drafts).toHaveLength(1);
+    expect(identity(drafts[0], 'overlaySelector')).toBe('#top-bar');
+    expect(drafts[0]?.message).toContain('2 件');
+  });
+
+  it('sticky の帯は、スクロールで逃がせるとはみなさず、今のとおり数える', () => {
+    const stickyBand = element('#sticky-band', 'other', bottomNavRect, { position: 'sticky', zIndex: '10' });
+    const record = layoutRecord(complete(mobileLayout(2400, { elementOverlaps: [overlap(underNav, stickyBand)] })));
+    expect(evaluate('FIXED_ELEMENT_OCCLUSION', [record]).map((draft) => identity(draft, 'overlaySelector'))).toEqual(['#sticky-band']);
+  });
+
+  it('数えなかった組の数と区分 REACHABLE_BY_SCROLL を、Finding の外の記録として返す', () => {
+    const layout = mobileLayout(2400, {
+      elementOverlaps: [
+        overlap(underNav, bottomNav),
+        overlap(element('#card-link', 'link', rect(16, MOBILE_HEIGHT - 30, 120, 24)), bottomNav),
+      ],
+    });
+    expect(fixedOcclusionScrollExclusionsOf(layout)).toEqual({ reason: 'REACHABLE_BY_SCROLL', pairCount: 2 });
+    expect(fixedOcclusionScrollExclusionsOf(mobileLayout(MOBILE_HEIGHT, { elementOverlaps: [overlap(underNav, bottomNav)] })))
+      .toEqual({ reason: 'REACHABLE_BY_SCROLL', pairCount: 0 });
   });
 });
 
@@ -1050,10 +1316,143 @@ describe('LAYOUT_RULES と Rule Engine', () => {
     })));
     const performance = performanceRecord(observedVital(0.3, { largestShiftTarget: '#x', largestShiftValue: 0.3 }));
     const engine = new RuleEngine({ targetId: 'layout-rules-test', firstFindingSequence: 1, catalog: LAYOUT_RULES });
-    const result = engine.evaluate(input([layout, performance]));
+    const result = engine.evaluate(input([withNotificationOverlay(layout, [notificationFrame('a', { hidden: true, hiddenReason: 'NO_CLOSE_BUTTON' })]),
+      performance]));
     expect(result.failures).toEqual([]);
     expect(new Set(result.findings.map((finding) => finding.ruleId))).toEqual(
       new Set(EXPECTED_RULES.map(([ruleId]) => ruleId)),
     );
+  });
+});
+
+describe('DEF-210: 通知の枠の規則', () => {
+  const corner = rect(VIEWPORT_WIDTH - 380, VIEWPORT_HEIGHT - 306, 380, 306);
+  const covered = element('#corner-text', 'paragraph', rect(VIEWPORT_WIDTH - 380, VIEWPORT_HEIGHT - 300, 380, 200));
+  const header = rect(0, 0, VIEWPORT_WIDTH, 100);
+  const headerCovered = element('#intro', 'paragraph', rect(0, 60, 800, 60));
+
+  it('NOTIFICATION_NOT_DISMISSIBLE は、閉じられない枠ごとに 1 件で、主の読み込みと幅の走査の同じ枠は 1 件にまとめる', () => {
+    const record = withNotificationOverlay(layoutRecord(complete(baseLayout())), [
+      notificationFrame('a', { pressed: true, dismissed: true }),
+      notificationFrame('b', { pressed: true, hidden: true, hiddenReason: 'NOT_DISMISSED' }),
+      notificationFrame('c', { status: 'CLOSE_BUTTON_DISABLED', hidden: true, hiddenReason: 'CLOSE_BUTTON_DISABLED' }),
+      notificationFrame('d', { status: 'NO_CLOSE_BUTTON', hidden: false, hiddenReason: 'NO_CLOSE_BUTTON' }),
+      notificationFrame('e', { status: 'TOO_LARGE' }),
+    ], {
+      stressNotificationOverlays: [{
+        width: 320,
+        overlay: { readStatus: 'READ', frames: [notificationFrame('b', { hidden: true, hiddenReason: 'NOT_DISMISSED' })], pressCount: 1, navigated: false, truncated: false },
+      }],
+    });
+    const drafts = evaluate('NOTIFICATION_NOT_DISMISSIBLE', [record]);
+    expect(drafts.map((draft) => identity(draft, 'notificationFrame'))).toEqual([
+      notificationFrame('b').digest, notificationFrame('c').digest, notificationFrame('d').digest,
+    ]);
+    expect(drafts.every((draft) => draft.severity === 'WARN' && draft.category === 'LAYOUT')).toBe(true);
+    expect(drafts[0]?.message).toContain('押しましたが、枠が残りました');
+    expect(drafts.map((draft) => draft.message).join('')).not.toMatch(/sha256|http/u);
+  });
+
+  it('NOTIFICATION_HANDLED_BEFORE_AUDIT は、閉じたか隠した枠があるビューポートに 1 件の INFO で、文は messages.ts の文', () => {
+    const closedOnly = withNotificationOverlay(layoutRecord(complete(baseLayout()), 1), [notificationFrame('a', { pressed: true, dismissed: true })]);
+    const both = withNotificationOverlay(layoutRecord(complete(baseLayout()), 2), [
+      notificationFrame('a', { pressed: true, dismissed: true }),
+      notificationFrame('b', { hidden: true, hiddenReason: 'NO_CLOSE_BUTTON', status: 'NO_CLOSE_BUTTON' }),
+    ]);
+    const none = withNotificationOverlay(layoutRecord(complete(baseLayout()), 3), [notificationFrame('e', { status: 'TOO_LARGE' })]);
+    expect(evaluate('NOTIFICATION_HANDLED_BEFORE_AUDIT', [closedOnly]).map((draft) => [draft.severity, draft.message]))
+      .toEqual([['INFO', NOTIFICATION_OVERLAY_TEXT.dismissed]]);
+    expect(evaluate('NOTIFICATION_HANDLED_BEFORE_AUDIT', [both]).map((draft) => draft.message)).toEqual([NOTIFICATION_OVERLAY_TEXT.dismissedAndHidden]);
+    expect(evaluate('NOTIFICATION_HANDLED_BEFORE_AUDIT', [none])).toEqual([]);
+    expect(evaluate('NOTIFICATION_HANDLED_BEFORE_AUDIT', [layoutRecord(complete(baseLayout()), 4)])).toEqual([]);
+  });
+
+  it('FIXED_ELEMENT_OCCLUSION は、閉じる前の layout の覆いを 1 回だけ足し、閉じた後も残る固定要素の覆いは重ねない', () => {
+    const fixedHeader = element('#site-header', 'other', header, { position: 'fixed', zIndex: '10' });
+    const notice = element('#notice', 'other', corner, { position: 'fixed', zIndex: '41' });
+    const before = complete(baseLayout({ elementOverlaps: [overlap(fixedHeader, headerCovered), overlap(notice, covered)] }));
+    const after = complete(baseLayout({ elementOverlaps: [overlap(fixedHeader, headerCovered)] }));
+    const record = withNotificationOverlay(layoutRecord(after), [notificationFrame('a', { pressed: true, dismissed: true })], {
+      beforeNotificationDismissal: before,
+    });
+    expect(evaluate('FIXED_ELEMENT_OCCLUSION', [record]).map((draft) => identity(draft, 'overlaySelector')).sort())
+      .toEqual(['#notice', '#site-header']);
+    // 閉じる前の layout がない（2 ページ目からの同じ枠）ときは、閉じた後の状態だけ。
+    expect(evaluate('FIXED_ELEMENT_OCCLUSION', [layoutRecord(after)]).map((draft) => identity(draft, 'overlaySelector'))).toEqual(['#site-header']);
+  });
+
+  it('AUD-3a: 閉じる前の layout の隅の通知の覆いは、スクロールできる文書でも 1 件になる（スクロールの除外を当てない）', () => {
+    const notice = element('#notice', 'other', corner, { position: 'fixed', zIndex: '41' });
+    const before = complete(baseLayout({ elementOverlaps: [overlap(notice, covered)] }));
+    expect(before.status === 'COMPLETE' && before.layout.document.bodyScrollHeight > VIEWPORT_HEIGHT).toBe(true);
+    const record = withNotificationOverlay(layoutRecord(complete(baseLayout())), [notificationFrame('a', { pressed: true, dismissed: true })], {
+      beforeNotificationDismissal: before,
+    });
+    expect(evaluate('FIXED_ELEMENT_OCCLUSION', [record]).map((draft) => identity(draft, 'overlaySelector'))).toEqual(['#notice']);
+  });
+
+  it('AUD-3a: 閉じた後の layout に残る隅の固定要素の覆いは、スクロールできる文書なら除外する', () => {
+    const notice = element('#notice', 'other', corner, { position: 'fixed', zIndex: '41' });
+    const after = complete(baseLayout({ elementOverlaps: [overlap(notice, covered)] }));
+    const record = withNotificationOverlay(layoutRecord(after), [notificationFrame('a', { pressed: true, dismissed: true })], {
+      beforeNotificationDismissal: complete(baseLayout()),
+    });
+    expect(evaluate('FIXED_ELEMENT_OCCLUSION', [record])).toEqual([]);
+    expect(evaluate('FIXED_ELEMENT_OCCLUSION', [layoutRecord(after)])).toEqual([]);
+  });
+});
+
+describe('DEF-204: 描く面がなく押下を受けない固定の入れ物', () => {
+  const full = rect(0, 0, VIEWPORT_WIDTH, VIEWPORT_HEIGHT);
+  const corner = rect(VIEWPORT_WIDTH - 380, VIEWPORT_HEIGHT - 306, 380, 306);
+  const covered = element('#corner-text', 'paragraph', rect(VIEWPORT_WIDTH - 380, VIEWPORT_HEIGHT - 300, 380, 200));
+
+  it('OVERSIZED_FIXED_ELEMENT と FIXED_ELEMENT_OCCLUSION は、入れ物を数えず、中の固定の子と、描く面のある全面の固定要素は数える', () => {
+    const container = fixedElement('#layer', full, { zIndex: '40', paintsOwnSurface: false, pointerEvents: 'none' });
+    const painted = fixedElement('#shade', full, { zIndex: '40', paintsOwnSurface: true, pointerEvents: 'none' });
+    const box = fixedElement('#notice', corner, { zIndex: '41', paintsOwnSurface: true, pointerEvents: 'auto' });
+    // AUD-3a: 隅の通知の下の段落は、スクロールできる文書では外へ出せるので、文書をスクロールできない高さにする。
+    const record = layoutRecord(complete(baseLayout({
+      document: notScrollableDocument(),
+      fixedElements: [container, painted, box],
+      elementOverlaps: [
+        overlap(element('#layer', 'other', full, { position: 'fixed', zIndex: '40' }), covered),
+        overlap(element('#shade', 'other', full, { position: 'fixed', zIndex: '40' }), covered),
+        overlap(element('#notice', 'other', corner, { position: 'fixed', zIndex: '41' }), covered),
+      ],
+    })));
+    expect(evaluate('OVERSIZED_FIXED_ELEMENT', [record]).map((draft) => identity(draft, 'selector'))).toEqual(['#shade']);
+    expect(evaluate('FIXED_ELEMENT_OCCLUSION', [record]).map((draft) => identity(draft, 'overlaySelector')).sort())
+      .toEqual(['#notice', '#shade']);
+  });
+
+  it('描く面がなくても押下を受ける入れ物と、事実の記録のない前の Evidence の固定要素は、今までどおり数える', () => {
+    const clickable = fixedElement('#clickable-layer', full, { paintsOwnSurface: false, pointerEvents: 'auto' });
+    const legacy = fixedElement('#legacy-layer', full);
+    const record = layoutRecord(complete(baseLayout({
+      fixedElements: [clickable, legacy],
+      elementOverlaps: [
+        overlap(element('#clickable-layer', 'other', full, { position: 'fixed' }), covered),
+        overlap(element('#legacy-layer', 'other', full, { position: 'fixed' }), covered),
+      ],
+    })));
+    expect(evaluate('OVERSIZED_FIXED_ELEMENT', [record]).map((draft) => identity(draft, 'selector')))
+      .toEqual(['#clickable-layer', '#legacy-layer']);
+    expect(evaluate('FIXED_ELEMENT_OCCLUSION', [record]).map((draft) => identity(draft, 'overlaySelector')).sort())
+      .toEqual(['#clickable-layer', '#legacy-layer']);
+  });
+});
+
+describe('AUD-9a: layout の Finding の groupingKeys', () => {
+  it('FIXED_ELEMENT_OCCLUSION の Finding に、覆う固定要素の selector を残す', () => {
+    const header = rect(0, 0, VIEWPORT_WIDTH, 100);
+    const record = layoutRecord(complete(baseLayout({
+      elementOverlaps: [overlap(element('#site-header', 'other', header, { position: 'fixed', zIndex: '10' }),
+        element('#intro', 'paragraph', rect(0, 60, 800, 60)))],
+    })));
+    const result = new RuleEngine({ targetId: 'layout-grouping', firstFindingSequence: 1, catalog: [ruleById('FIXED_ELEMENT_OCCLUSION')] })
+      .evaluate(input([record]));
+    expect(result.findings.map((finding) => [finding.schemaVersion, finding.groupingKeys]))
+      .toEqual([['finding-schema/1.1', [{ name: 'overlaySelector', value: '#site-header' }]]]);
   });
 });

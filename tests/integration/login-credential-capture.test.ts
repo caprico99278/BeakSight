@@ -3,22 +3,18 @@
 // 資格情報を結果に付ける。値は、結果の記録（JSON）・文字列・ページの JS に出ない。
 // 通す部品は本物（`runLoginStage`、Guard、fixture）。場面はフォームのログインと、SPA のログイン（token の送信先がアプリと別の Origin）。Chromium はテストの既定の
 // headless と、CLI の起動の設定の両方。値は出力しない（比べは真偽だけ）。
-import type { Browser, Page } from 'playwright';
+import type { Page } from 'playwright';
 import { afterEach, describe, expect, it } from 'vitest';
 import type { AuditConfig } from '../../src/config/types.js';
 import { SCRIPT_REQUEST_TRANSPORT, type AuthSetupV3 } from '../../src/control/auth/auth-setup-contracts.js';
 import { runLoginStage, type LoginStageResult } from '../../src/worker/authenticated-login.js';
 import { CAPTURE_WORLD_NAME, withCapturedLoginCredential } from '../../src/worker/login-credential-capture.js';
-import { launchCliChromium, launchHeadlessChromium } from '../helpers/chromium.js';
+import { BOTH_CHROMIUM_LAUNCHERS } from '../helpers/chromium.js';
 import { fastRunConfig } from '../helpers/run-harness.js';
 import { AUTH_SITE_LOGIN_FIELDS, AUTH_SITE_PATHS, startAuthenticatedSite } from '../helpers/authenticated-site-fixture.js';
 import { SPA_APP_PATHS, SPA_BACKEND_PATHS, SPA_LOGIN_FIELDS, startSpaAuthSite } from '../helpers/spa-auth-site-fixture.js';
 import { FORM_NAVIGATION_SETUP_ITEMS } from '../helpers/auth-setup-samples.js';
 
-const LAUNCHERS: readonly (readonly [string, () => Promise<Browser>])[] = [
-  ['the default test Chromium', () => launchHeadlessChromium()],
-  ['the CLI Chromium', () => launchCliChromium()],
-];
 const TEST_TIMEOUT_MS = 120_000;
 const UI_TIMEOUT_MS = 15_000;
 const LOGIN_STAGE_TIMEOUT_MS = 30_000;
@@ -61,7 +57,7 @@ const capturedMatches = async (result: LoginStageResult, typed: Typed): Promise<
   return withCapturedLoginCredential(result.capturedCredential, async (values) => values.username === typed.username && values.password === typed.password);
 };
 
-describe.each(LAUNCHERS)('OP-1 D2: the manual login stage receives the typed credential with %s', (_label, launch) => {
+describe.each(BOTH_CHROMIUM_LAUNCHERS)('OP-1 D2: the manual login stage receives the typed credential with %s', (_label, launch) => {
   const closers: (() => Promise<void>)[] = [];
 
   afterEach(async () => {

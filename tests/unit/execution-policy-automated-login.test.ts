@@ -16,17 +16,21 @@ describe('executable auth strategies of the automated login (T26d-2)', () => {
   it('accepts AUTOMATED_LOGIN of the authenticated passive audit and of the write mode (MI-5) as a strategy, on any platform', () => {
     const accepted = AUDIT_MODES.flatMap((mode) =>
       AUTH_STRATEGIES.filter((auth) => isExecutableAuthStrategy(mode, auth)).map((auth) => `${mode}/${auth}`));
+    // NL-1（設計書 `2026-11-06-beaksight-no-login-test-site-design.md` 3.1 の 3）: テストの 2 つのモードは、ログインしない方式（`NONE`）も受ける
+    // （保存は loopback の Origin だけ。`profile-policy.ts`）。
     expect(accepted).toEqual([
       'PUBLIC_PASSIVE/NONE',
+      'TEST_AUTH_PASSIVE/NONE',
       'TEST_AUTH_PASSIVE/MANUAL_SESSION',
       'TEST_AUTH_PASSIVE/AUTOMATED_LOGIN',
+      'TEST_APPROVED_WRITE/NONE',
       'TEST_APPROVED_WRITE/MANUAL_SESSION',
       'TEST_APPROVED_WRITE/AUTOMATED_LOGIN',
     ]);
     expect(EXECUTABLE_AUTH_STRATEGIES).toEqual({
       PUBLIC_PASSIVE: ['NONE'],
-      TEST_AUTH_PASSIVE: ['MANUAL_SESSION', 'AUTOMATED_LOGIN'],
-      TEST_APPROVED_WRITE: ['MANUAL_SESSION', 'AUTOMATED_LOGIN'],
+      TEST_AUTH_PASSIVE: ['MANUAL_SESSION', 'AUTOMATED_LOGIN', 'NONE'],
+      TEST_APPROVED_WRITE: ['MANUAL_SESSION', 'AUTOMATED_LOGIN', 'NONE'],
     });
     expect(Object.isFrozen(EXECUTABLE_AUTH_STRATEGIES)).toBe(true);
   });

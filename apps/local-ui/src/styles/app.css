@@ -188,6 +188,14 @@ code {
   max-width: var(--content-max-width);
 }
 
+/*
+ * DEF-196: 表のある画面（表の枠 `.table-wrap` を含む本文）は、本文の最大幅を広げる。広い画面で、右に余白があるのに表が横スクロールになるのを防ぐ。
+ * 狭い画面は、本文の幅がもともと画面の幅で決まるので、今のまま（サイトの一覧は、行ごとの縦の並び）。
+ */
+.content:has(.table-wrap) {
+  max-width: var(--content-wide-max-width);
+}
+
 /* パネル */
 .panel {
   background: var(--color-panel);

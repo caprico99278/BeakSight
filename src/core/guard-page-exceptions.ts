@@ -10,8 +10,6 @@
  * - 限界（T44R3 の M-4）: ページが同じ名前と文言の例外を自分で投げると、見分けられない（Finding にならない）。守りの拒否を包み直して投げる例外
  *   （ライブラリの形。名前や文言が変わる）は、ページの欠陥として Finding に残る（正しい振る舞い）。
  */
-import { MAX_ERROR_MESSAGE_LENGTH } from './limits.js';
-
 /**
  * Service Worker の登録の拒否の、例外の名前（`DOMException`）。M-2: Chromium（CLI の起動の chrome.exe 156）が、クッキーを止めたプロファイルで自分で
  * 登録を断ったときの形（実機で確かめた）に寄せた。
@@ -63,18 +61,13 @@ export interface PageErrorIdentity {
 }
 
 /**
- * Service Worker の登録の拒否の文言の形か（始まり・scope と script の区切り・終わり）。T44R3 の M-4: 切り詰められたときも、上限の内に区切りが
- * あることを求める（始まりだけを真似たページ自身の例外を、守りの例外とみなさない）。scope が長く、区切りが上限の外にくる文言は、見分けられない
- * ので、守りの例外とみなさず、Finding に残す（安全の側に倒す）。T44R4 の M-1: 文言が切り詰められたかは、文言の長さが、Evidence の文言の上限
- * （`MAX_ERROR_MESSAGE_LENGTH`。`console-collector.ts` が同じ定数で切り詰める）に達しているかで判断する（stack だけの切り詰めでは、終わりを比べる）。
- * 上限ちょうどの長さで切り詰められていない文言も、切り詰めた側に数える（ページが同じ形を真似た場合の、見分けの限界の内）。
+ * Service Worker の登録の拒否の文言の形か（始まり・scope と script の区切り・終わり）。LZ-2: Evidence の文言は切り詰めない（前は
+ * `MAX_ERROR_MESSAGE_LENGTH` で切り詰め、上限に達した文言は終わりを比べなかった）ので、いつも始まり・区切り・終わりの全部を比べる。前の版で切り詰めた
+ * 文言は、終わりがないので守りの例外とみなさず、Finding に残す（安全の側に倒す）。
  */
 const isServiceWorkerRegistrationBlockedMessage = (message: string): boolean => {
   const { beforeScope, beforeScript, end } = SERVICE_WORKER_REGISTRATION_BLOCKED_MESSAGE_PARTS;
-  if (!message.startsWith(beforeScope) || !message.includes(beforeScript, beforeScope.length)) {
-    return false;
-  }
-  return message.length >= MAX_ERROR_MESSAGE_LENGTH || message.endsWith(end);
+  return message.startsWith(beforeScope) && message.includes(beforeScript, beforeScope.length) && message.endsWith(end);
 };
 
 /**

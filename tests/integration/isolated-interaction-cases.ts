@@ -14,10 +14,10 @@ import type { Browser, Page } from 'playwright';
 import { startFixtureServer, type FixtureServer } from '../../fixtures/server.js';
 import { BrowserContextFactory, type InteractionGuardedSession } from '../../src/browser/context-factory.js';
 import type { MainFrameLoadObservation } from '../../src/browser/main-frame-load.js';
-import { NAVIGATION_DIAGNOSTICS_START_DEADLINE_MESSAGE } from '../../src/browser/navigation-diagnostics.js';
 import type { AuditConfig, Viewport } from '../../src/config/types.js';
-import type { InteractionStatus, NavigationDiagnostics } from '../../src/core/contracts.js';
+import type { InteractionStatus } from '../../src/core/contracts.js';
 import { wait } from '../../src/core/deadline.js';
+import { createSha256Fingerprint } from '../../src/core/ids.js';
 import {
   INTERACTION_IDENTITY_STATUSES,
   INTERACTION_LIFECYCLE_REASON_CODES,
@@ -33,12 +33,7 @@ import {
 } from '../../src/core/evidence-types.js';
 import { VISIBILITY_CHECK_OPTIONS } from '../../src/core/visibility.js';
 import {
-  changedInteractionAttributeNames,
-  changedInteractionClassNames,
-  compareInteractionAttributeRecords,
-  compareInteractionScrollRecords,
   discoverInteractionCandidates,
-  hasExplicitTabRole,
   inspectInteractionCandidateHandle,
   resolveInteractionCandidateHandle,
   INTERACTION_CANDIDATE_SELECTOR,
@@ -53,20 +48,11 @@ import {
   type InteractionAuditInput,
   type InteractionNonTerminalLifecycle,
 } from '../../src/interaction/isolated-auditor.js';
-import {
-  collectInteractionChangeEvidence,
-  INTERACTION_NON_EVIDENCE_ATTRIBUTES,
-  INTERACTION_NON_EVIDENCE_NAME_PATTERN,
-  MAX_CHANGED_ATTRIBUTE_NAMES,
-  retainPersistentInteractionChanges,
-} from '../../src/evidence/interaction-collector.js';
-import {
-  classifyInteractionCandidate,
-  INTERACTION_CANDIDATE_LIMITS,
-  type InteractionCandidate,
-} from '../../src/safety/interaction-policy.js';
+import { classifyInteractionCandidate, type InteractionCandidate } from '../../src/safety/interaction-policy.js';
+import { destructiveActionFactsOfNames } from '../../src/discovery/destructive-action.js';
+import { CDP_SESSION_DETACHED_MESSAGE } from '../../src/safety/passive-request-guard.js';
 import { SafetyLedger } from '../../src/safety/safety-ledger.js';
-import { launchCliChromium, launchHeadlessChromium, useHeadlessChromium } from '../helpers/chromium.js';
+import { chromiumRunsOf, launchCliChromium, launchHeadlessChromium, useHeadlessChromium } from '../helpers/chromium.js';
 import { createDeferred } from '../helpers/deferred.js';
 import { fakePlaywrightRequest } from '../helpers/fake-playwright-request.js';
 import { guardContextListenerEvents } from '../helpers/passive-guard-harness.js';
@@ -75,8 +61,6 @@ import {
   FROZEN_POPUP_LATE_DELIVERY_SETTLE_MS,
   GATE_INTERACTION_TIMING,
   interactionAuditInput,
-  LOADED_GATE_INTERACTION_TIMING,
-  LOADED_INTERACTION_AUDIT_TEST_TIMEOUT_MS,
   NO_NON_READ_REQUESTS,
   openServerWindow,
   POPUP_SELF_CLOSE_BEACON_PAGE,
@@ -91,9 +75,7 @@ import {
   fakeCandidateReference,
   isRealPage,
   readsFromEvaluateMocks,
-  readsOnPage,
 } from '../helpers/interaction-candidate-reads.js';
-import { LOADED_DEADLINE_FACTOR } from '../helpers/loaded-deadline.js';
 import { createTestConfig, TEST_FACTORY_OPTIONS } from '../helpers/test-config.js';
 import { roundsOf } from '../helpers/test-rounds.js';
 
@@ -116,33 +98,26 @@ type ExpectedStructuredInteractionResult = Awaited<ReturnType<typeof auditIntera
 /**
  * C18n（Task 19 の前の整理の設計書 5.1）: 技術的な詳細（`reasonDetail`）を持つ理由のコード。ほかのコードの詳細は、いつも null。
  * - 整えたエラーの文言（残らなければ null）: 下準備の失敗、click の失敗と期限切れ、作業の失敗、owner の close の失敗
- * - 探し直しの completeness の値: `CANDIDATE_REDISCOVERY_INCOMPLETE`
  * - 切断の後の identityStatus の値: `RETAINED_IDENTITY_LOST`
  */
 const ERROR_DETAIL_REASON_CODES: ReadonlySet<string> = new Set([
   'SCROLL_PREPARATION_FAILED',
-  'HOVER_PREPARATION_FAILED',
-  'FOCUS_PREPARATION_FAILED',
   'CLICK_TIMED_OUT',
   'CLICK_FAILED',
   'EXECUTION_FAILED',
   'OWNER_CLOSE_FAILED',
 ]);
-const REDISCOVERY_INCOMPLETE_DETAILS = ['CANDIDATE_LIMIT_REACHED', 'DOM_WORK_BUDGET_REACHED', 'TEXT_NODE_LIMIT_REACHED'];
 /** 理由のコードの形（英数字と `_`）。英文の理由は、この形にならない。 */
 const REASON_CODE_PATTERN = /^[A-Z][A-Z_]*$/u;
 
-/** 理由の詳細が、コードに合う形か（詳細を持たないコードでは null、エラーの文言は空でない上限内の文字列）。 */
+/** 理由の詳細が、コードに合う形か（詳細を持たないコードでは null、エラーの文言は空でない文字列。LZ-2: 長さの上限（前は 512）はない）。 */
 function expectReasonDetailFits(code: string, detail: string | null): void {
-  if (code === 'CANDIDATE_REDISCOVERY_INCOMPLETE') {
-    expect(REDISCOVERY_INCOMPLETE_DETAILS, code).toContain(detail);
-  } else if (code === 'RETAINED_IDENTITY_LOST') {
+  if (code === 'RETAINED_IDENTITY_LOST') {
     expect(INTERACTION_IDENTITY_STATUSES, code).toContain(detail);
   } else if (ERROR_DETAIL_REASON_CODES.has(code)) {
     if (detail !== null) {
       expect(typeof detail, code).toBe('string');
       expect(detail.length, code).toBeGreaterThan(0);
-      expect(detail.length, code).toBeLessThanOrEqual(512);
     }
   } else {
     expect(detail, code).toBeNull();
@@ -183,6 +158,7 @@ async function auditInteraction(input: InteractionAuditInput): ReturnType<typeof
       sessionFactory: async (viewport) => {
         const session = await sessionFactory(viewport);
         adaptFakePage(session.page);
+        withoutFakeSettling(session.page);
         return session;
       },
     });
@@ -205,6 +181,19 @@ async function auditInteraction(input: InteractionAuditInput): ReturnType<typeof
     expect(result.reasonDetail).toBeNull();
   }
   return result;
+}
+
+/**
+ * SPEC-5: 押した後は、ページの落ち着き（`waitForPageSettled`）を待ってから 1 回だけ観測する。偽の page は読み込みの段も通信の事象も持たないので、
+ * 落ち着きの待ちがすぐ終わる口（事象の登録は何もせず、DOM の準備の待ちは失敗する）を、足りない分だけ足す。本物の page は、そのまま。
+ */
+function withoutFakeSettling(page: object): void {
+  if (isRealPage(page)) return;
+  const fake = page as Record<string, unknown>;
+  fake['on'] ??= () => page;
+  fake['off'] ??= () => page;
+  fake['isClosed'] ??= () => false;
+  fake['waitForLoadState'] ??= async () => { throw new Error('The fake page has no load state'); };
 }
 
 /** 理由のコードと詳細を、まとめて確かめる。 */
@@ -268,16 +257,12 @@ function boundedResolutionEnvelope(handle: {
 }
 
 /**
- * F06b: 凍結の前の下準備（探索・handle の解決・スクロール・hover・focus・安定性の確認・破棄）だけを、DOM の作業量0の別の偽の handle で
- * 受け持つ。凍結の後の経路を確かめる既存のテストで、偽のページの呼び出しの順序・作業量・handle を、これまでどおり凍結の後の経路に
+ * F06b: 凍結の前の下準備（探索・handle の解決・観測・スクロール・hover・観測・破棄。SPEC-5）だけを、DOM の作業量0の別の偽の handle で
+ * 受け持つ。凍結の後の経路を確かめる既存のテストで、偽のページの呼び出しの順序・handle を、これまでどおり凍結の後の経路に
  * 届けるために使う。最初の探索（引数付きの `evaluate`）と、最初の handle の解決（`evaluateHandle`）だけを受け持ち、
- * ほかの呼び出しは元の偽のページに渡す。
- * F16（設計書 4.4.1 の安定性の確認）で是正: 下準備の handle は、安定性の確認で観測される。変わらない候補の記録を返す。
- * `preparedAttributes` を渡すと、その属性の記録も返す（安定性の確認の終わりと click の前の属性を比べられるようにする）。
- * F20（設計書 4.4.2 手順4、R8 の Important-2）で是正: 下準備の focus の前後では、属性の記録を比べ、比べられない場合は凍結せずに終える。
- * 実際のブラウザは記録を必ず返すので、`preparedAttributes` を渡さない場合は、属性のない記録を返す。
+ * ほかの呼び出しは元の偽のページに渡す。下準備の handle の観測は、変わらない候補の記録（属性のない記録）を返す。
  */
-function withScrollPreparation(page: Page, candidate: InteractionCandidate, preparedAttributes?: unknown): Page {
+function withScrollPreparation(page: Page, candidate: InteractionCandidate): Page {
   // T32j-4 fix round 1: 最初の発見と最初の解決を、製品の候補の読み取りの口で受け持つ。ほかの読み取りは、元の page の読み取り（偽の page なら
   // `evaluate`・`evaluateHandle` の差し込みの写し、本物の page なら isolated world の読み取り）に渡す。
   const base: InteractionCandidateReads = isRealPage(page)
@@ -291,11 +276,10 @@ function withScrollPreparation(page: Page, candidate: InteractionCandidate, prep
       status: 'CONNECTED',
       domWorkUsed: 0,
       raw: rawCandidateFor(candidate),
-      attributes: preparedAttributes ?? { complete: true, entries: [] },
+      attributes: { complete: true, entries: [] },
     }),
     scrollIntoViewIfNeeded: async () => undefined,
     hover: async () => undefined,
-    focus: async () => undefined,
     dispose: async () => undefined,
   };
   const reads: InteractionCandidateReads = {
@@ -359,6 +343,7 @@ function rawCandidateFor(candidate: InteractionCandidate) {
     type: candidate.type,
     disabled: candidate.disabled,
     visible: candidate.visible,
+    destructiveFacts: destructiveActionFactsOfNames([candidate.accessibleName]),
     boundingBox: candidate.boundingBox,
   };
 }
@@ -404,6 +389,14 @@ beforeAll(() => {
  * page と Context を閉じる前に、Safety Ledger の違反が0件であることを確かめる。
  */
 const EXPECT_NO_GUARD_VIOLATIONS = Object.freeze({ expectNoViolations: true });
+
+/**
+ * L10（INV-LIMITS の N3・N4）: 本番は DOM の作業量の上限を渡さない（数えるだけで止めない）。上限に達する場面は、テストが上限を注入して確かめる。
+ * `INJECTED_MAX_DOM_WORK` は、`total-dom-budget.html`（祖先 20,000 など）と、前の要素の数を差し込む補助の数え方に合わせた注入の値。
+ * `INJECTED_TEXT_WALK_DOM_WORK` は、子孫の走査（100,000 個・300 個の子孫の fixture）の途中で止める、小さな注入の値。
+ */
+const INJECTED_MAX_DOM_WORK = 16_384;
+const INJECTED_TEXT_WALK_DOM_WORK = 1_000;
 
 // DEF-036 の凍結中のポップアップの要求のくり返しの確かめ（回数 `frozenPopupAudit`）は、TS-f で `safety-gates.test.ts` の GATE-S04 にまとめた。
 // DEF-039 のページ自身が開いて閉じるポップアップの fixture の名前は、`gate-harness.ts` の `POPUP_SELF_CLOSE_BEACON_PAGE`（TS-f。GATE-S04 と、
@@ -476,7 +469,7 @@ async function totalBudgetPage(section?: string): Promise<Page> {
 // 走査を測る補助は、`document` のインスタンスではなく `Document.prototype` の `createTreeWalker` を差し替える（`querySelectorAll` の
 // 差し替えと同じ形）。差し替えはそのページの中だけに効き、各テストが `finally` でページを閉じると、ページごと捨てられて元に戻る。
 async function installTotalTraversalProbe(page: Page): Promise<() => Promise<number>> {
-  await evaluateInCandidateReadWorld(page, () => {
+  await evaluateInCandidateReadWorld(page, (maxNodes) => {
     const original = document.createTreeWalker.bind(document);
     let count = 0;
     Object.defineProperty(Document.prototype, 'createTreeWalker', {
@@ -488,7 +481,7 @@ async function installTotalTraversalProbe(page: Page): Promise<() => Promise<num
             if (property !== 'nextNode') return Reflect.get(target, property, target);
             return () => {
               const node = target.nextNode();
-              if (node !== null && ++count > 16_384) throw new Error('Total DOM traversal exceeded 16,384');
+              if (node !== null && ++count > maxNodes) throw new Error('Total DOM traversal exceeded the injected DOM work limit');
               return node;
             };
           },
@@ -496,7 +489,7 @@ async function installTotalTraversalProbe(page: Page): Promise<() => Promise<num
       },
     });
     Object.defineProperty(globalThis, '__totalDomTraversalCount', { get: () => count });
-  });
+  }, INJECTED_MAX_DOM_WORK);
   return () => evaluateInCandidateReadWorld(page, () => (
     globalThis as typeof globalThis & { readonly __totalDomTraversalCount: number }
   ).__totalDomTraversalCount);
@@ -683,13 +676,13 @@ it('avoids whole-DOM selector enumeration during discovery', async () => {
   } finally { await page.close(); }
 });
 
-it('reports total DOM work exhaustion before a late candidate with immutable completeness', async () => {
+it('reports total DOM work exhaustion before a late candidate with immutable completeness (injected limit)', async () => {
   const page = await totalBudgetPage('no-early-candidate');
   try {
     const count = await installTotalTraversalProbe(page);
-    const result = await discoverInteractionCandidates(page);
+    const result = await discoverInteractionCandidates(page, INJECTED_MAX_DOM_WORK);
     expect(result.completeness).toBe('DOM_WORK_BUDGET_REACHED');
-    expect(result.domWorkUsed).toBe(16_384);
+    expect(result.domWorkUsed).toBe(INJECTED_MAX_DOM_WORK);
     expect(result.candidates).toEqual([]);
     expect(await count()).toBeLessThanOrEqual(result.domWorkUsed);
     expect(Object.isFrozen(result)).toBe(true);
@@ -697,35 +690,70 @@ it('reports total DOM work exhaustion before a late candidate with immutable com
   } finally { await page.close(); }
 });
 
+// L10（N3・N4）: 上限を渡さない（本番の形）と、前の上限（16,384）を超えても文書の終わりまで探し、後ろの候補を見つける。
+it('continues past the former DOM work limit to a late candidate when no limit is given', async () => {
+  const page = await totalBudgetPage('no-early-candidate');
+  try {
+    const result = await discoverInteractionCandidates(page);
+    expect(result.completeness).toBe('COMPLETE');
+    expect(result.domWorkUsed).toBeGreaterThan(INJECTED_MAX_DOM_WORK);
+    expect(result.candidates.map(({ accessibleName }) => accessibleName)).toEqual(['Candidate beyond budget']);
+    const resolution = await resolveInteractionCandidateHandle(page, 0);
+    expect(resolution.status).toBe('FOUND');
+    if (resolution.status !== 'FOUND') throw new Error('Expected the late candidate');
+    try {
+      expect(resolution.domWorkUsed).toBeGreaterThan(INJECTED_MAX_DOM_WORK);
+      await expect(inspectInteractionCandidateHandle(resolution.reference, 0)).resolves.toMatchObject({
+        status: 'CONNECTED',
+        candidate: { ordinal: 0, accessibleName: 'Candidate beyond budget' },
+      });
+    } finally { await resolution.reference.handle.dispose(); }
+  } finally { await page.close(); }
+});
+
 // C3（設計書 2026-09-23 5.5）: 可視判定は祖先をたどらず checkVisibility を1回呼ぶごとに作業量1を消費する。
 // 祖先の走査の消費を前提にしていた旧テストを、可視判定の消費が走査と同じ上限を共有することの検証に置き換えた。
-it('shares visibility-check work and discards a partial early candidate on budget exhaustion', async () => {
+it('shares visibility-check work and discards a partial early candidate on budget exhaustion (injected limit)', async () => {
   const page = await browser.newPage();
   try {
     await page.setContent('<button id="early" type="button" aria-controls="panel" aria-label="Early candidate">x</button><div id="panel">Panel</div>');
-    // 根1 + 前の要素 + 候補の走査と一致判定2 + aria-controls の解決1 + 制御対象の可視判定1 + テキスト1 + 候補の可視判定1 = 16,384
-    await installPrecedingWorkWalker(page, '#early', 16_377);
+    // 根1 + 前の要素 + 候補の走査と一致判定2 + aria-controls の解決1 + 制御対象の可視判定1 + テキスト1 + 候補の可視判定1 = 注入の上限
+    await installPrecedingWorkWalker(page, '#early', INJECTED_MAX_DOM_WORK - 7);
     const readTargetGeometry = await installGeometryReadCounter(page, '#early');
 
-    const result = await discoverInteractionCandidates(page);
+    const result = await discoverInteractionCandidates(page, INJECTED_MAX_DOM_WORK);
 
     expect(result.completeness).toBe('DOM_WORK_BUDGET_REACHED');
-    expect(result.domWorkUsed).toBe(16_384);
+    expect(result.domWorkUsed).toBe(INJECTED_MAX_DOM_WORK);
     expect(result.candidates).toEqual([]);
     expect(await readTargetGeometry()).toBe(0);
   } finally { await page.close(); }
 });
 
-it('uses shared text and enumeration work across candidate subtrees', async () => {
+// L10（N3・N4）: テキストのノードの上限（前は 512。TEXT_NODE_LIMIT_REACHED）は撤廃した。子孫の走査と要素の走査は、注入した DOM の作業量の
+// 上限だけを共有する（100 個の候補の子孫 512 個ずつは、注入の上限の途中で尽きる）。
+it('uses shared text and enumeration work across candidate subtrees (injected limit)', async () => {
   const page = await totalBudgetPage('many-candidate-subtrees');
   try {
     const count = await installTotalTraversalProbe(page);
-    const result = await discoverInteractionCandidates(page);
-    expect(result.completeness).toBe('TEXT_NODE_LIMIT_REACHED');
-    expect(result.domWorkUsed).toBeLessThan(16_384);
-    expect(result.candidates).toEqual([]);
+    const result = await discoverInteractionCandidates(page, INJECTED_MAX_DOM_WORK);
+    expect(result.completeness).toBe('DOM_WORK_BUDGET_REACHED');
+    expect(result.domWorkUsed).toBe(INJECTED_MAX_DOM_WORK);
+    expect(result.candidates.length).toBeGreaterThan(0);
+    expect(result.candidates.length).toBeLessThan(100);
     expect(result.candidates.some(({ accessibleName }) => accessibleName === 'Repeated candidate 99')).toBe(false);
     expect(await count()).toBeLessThanOrEqual(result.domWorkUsed);
+  } finally { await page.close(); }
+});
+
+it('walks every candidate subtree to the end when no limit is given', async () => {
+  const page = await totalBudgetPage('many-candidate-subtrees');
+  try {
+    const result = await discoverInteractionCandidates(page);
+    expect(result.completeness).toBe('COMPLETE');
+    expect(result.domWorkUsed).toBeGreaterThan(INJECTED_MAX_DOM_WORK);
+    expect(result.candidates).toHaveLength(100);
+    expect(result.candidates.at(-1)).toMatchObject({ ordinal: 99, accessibleName: 'Repeated candidate 99' });
   } finally { await page.close(); }
 });
 
@@ -748,17 +776,20 @@ it('bounded exact-handle resolution preserves the child after envelope disposal 
   } finally { await page.close(); }
 });
 
-it('bounded exact-handle resolution distinguishes late-target budget exhaustion from missing', async () => {
+it('bounded exact-handle resolution distinguishes late-target budget exhaustion from missing (injected limit)', async () => {
   const page = await totalBudgetPage('no-early-candidate');
   try {
     const count = await installTotalTraversalProbe(page);
-    expect(await resolveInteractionCandidateHandle(page, 0)).toEqual({ status: 'DOM_WORK_BUDGET_REACHED', domWorkUsed: 16_384 });
-    expect(await count()).toBeLessThanOrEqual(16_384);
+    expect(await resolveInteractionCandidateHandle(page, 0, INJECTED_MAX_DOM_WORK)).toEqual({
+      status: 'DOM_WORK_BUDGET_REACHED',
+      domWorkUsed: INJECTED_MAX_DOM_WORK,
+    });
+    expect(await count()).toBeLessThanOrEqual(INJECTED_MAX_DOM_WORK);
   } finally { await page.close(); }
 });
 
 // C3（設計書 2026-09-23 5.5）: 祖先の走査ではなく、候補自身の可視判定が最後の作業量を消費する形に置き換えた。
-it('retained inspection reports shared visibility-check budget exhaustion distinctly from disconnected', async () => {
+it('retained inspection reports shared visibility-check budget exhaustion distinctly from disconnected (injected limit)', async () => {
   const page = await browser.newPage();
   try {
     await page.setContent('<button id="early" type="button" aria-controls="panel" aria-label="Early candidate">x</button><div id="panel">Panel</div>');
@@ -767,38 +798,44 @@ it('retained inspection reports shared visibility-check budget exhaustion distin
     if (handle === null) throw new Error('Missing early fixture node');
     try {
       // 根1 + 前の要素 + 対象の走査と一致判定2 + 事実の収集の開始1 + aria-controls の解決1 + 制御対象の可視判定1
-      // + テキスト1 + 候補の可視判定1 = 16,384
-      await installPrecedingWorkWalker(page, '#early', 16_376);
+      // + テキスト1 + 候補の可視判定1 = 注入の上限
+      await installPrecedingWorkWalker(page, '#early', INJECTED_MAX_DOM_WORK - 8);
       const readTargetGeometry = await installGeometryReadCounter(page, '#early');
 
-      expect(await inspectInteractionCandidateHandle(handleReference, 0)).toEqual({ status: 'DOM_WORK_BUDGET_REACHED', domWorkUsed: 16_384 });
+      expect(await inspectInteractionCandidateHandle(handleReference, 0, INJECTED_MAX_DOM_WORK)).toEqual({
+        status: 'DOM_WORK_BUDGET_REACHED',
+        domWorkUsed: INJECTED_MAX_DOM_WORK,
+      });
       expect(await readTargetGeometry()).toBe(0);
     } finally { await handle.dispose(); }
   } finally { await page.close(); }
 });
 
-it('retained inspection reports late live-ordinal budget exhaustion distinctly from disconnected', async () => {
+it('retained inspection reports late live-ordinal budget exhaustion distinctly from disconnected (injected limit)', async () => {
   const page = await totalBudgetPage('no-early-candidate');
   const handle = await page.locator('button').elementHandle();
   const handleReference = await candidateReferenceOf(page, 'button');
   if (handle === null) throw new Error('Missing late fixture node');
   try {
     const count = await installTotalTraversalProbe(page);
-    expect(await inspectInteractionCandidateHandle(handleReference, 0)).toEqual({ status: 'DOM_WORK_BUDGET_REACHED', domWorkUsed: 16_384 });
-    expect(await count()).toBeLessThanOrEqual(16_384);
+    expect(await inspectInteractionCandidateHandle(handleReference, 0, INJECTED_MAX_DOM_WORK)).toEqual({
+      status: 'DOM_WORK_BUDGET_REACHED',
+      domWorkUsed: INJECTED_MAX_DOM_WORK,
+    });
+    expect(await count()).toBeLessThanOrEqual(INJECTED_MAX_DOM_WORK);
   } finally { await handle.dispose(); await page.close(); }
 });
 
 // C3（設計書 2026-09-23 5.5）: 可視判定が祖先をたどらなくなったため、候補の事実の側の消費を、制御対象の祖先の鎖から
 // 候補の子孫のテキスト走査に置き換えた。前の要素の走査と事実の収集が、1つの上限を共有することを検証する。
-it('retained inspection shares total DOM work between live ordinal and candidate facts', async () => {
+it('retained inspection shares total DOM work between live ordinal and candidate facts (injected limit)', async () => {
   const page = await browser.newPage();
   try {
     await page.setContent('<button type="button" aria-label="Combined">Combined</button>');
     await page.evaluate(() => {
       const button = document.querySelector('button')!;
       for (let index = 0; index < 16_000; index += 1) button.before(document.createElement('div'));
-      // テキストのノード上限（512）より先に、DOM作業量の上限に達する数の子孫。
+      // 前の要素の走査の後、子孫のテキストの走査の途中で、注入した DOM の作業量の上限に達する数の子孫。
       for (let index = 0; index < 500; index += 1) button.append(document.createElement('span'));
       let precedingNodes = 0;
       for (let preceding = button.previousElementSibling; preceding !== null; preceding = preceding.previousElementSibling) {
@@ -813,7 +850,15 @@ it('retained inspection shares total DOM work between live ordinal and candidate
     const handleReference = await candidateReferenceOf(page, 'button');
     if (handle === null) throw new Error('Missing combined fixture node');
     try {
-      expect(await inspectInteractionCandidateHandle(handleReference, 0)).toEqual({ status: 'DOM_WORK_BUDGET_REACHED', domWorkUsed: 16_384 });
+      expect(await inspectInteractionCandidateHandle(handleReference, 0, INJECTED_MAX_DOM_WORK)).toEqual({
+        status: 'DOM_WORK_BUDGET_REACHED',
+        domWorkUsed: INJECTED_MAX_DOM_WORK,
+      });
+      // L10（N3・N4）: 上限を渡さない（本番の形）と、同じ要素の値を最後まで読む。
+      expect(await inspectInteractionCandidateHandle(handleReference, 0)).toMatchObject({
+        status: 'CONNECTED',
+        candidate: { ordinal: 0, accessibleName: 'Combined', textFingerprint: createSha256Fingerprint('Combined') },
+      });
     } finally { await handle.dispose(); }
   } finally { await page.close(); }
 });
@@ -833,7 +878,7 @@ it('bounded exact-handle resolution and retained inspection distinguish true abs
 });
 
 describe('Task 2 correction boundaries', () => {
-  it('stops before retained candidate facts when exact identity consumes the final work unit', async () => {
+  it('stops before retained candidate facts when exact identity consumes the final work unit (injected limit)', async () => {
     const page = await browser.newPage();
     try {
       await page.setContent('<button type="button" aria-controls="controlled">Boundary</button><div id="controlled"></div>');
@@ -842,7 +887,7 @@ describe('Task 2 correction boundaries', () => {
       if (handle === null) throw new Error('Missing boundary candidate');
       try {
         const readCounts = await installIdentityFactCounters(page, 'button');
-        await evaluateInCandidateReadWorld(page, () => {
+        await evaluateInCandidateReadWorld(page, (maxDomWork) => {
           const target = document.querySelector('button')!;
           const dummy = document.createElement('div');
           const originalCreateTreeWalker = document.createTreeWalker.bind(document);
@@ -858,7 +903,7 @@ describe('Task 2 correction boundaries', () => {
                 return {
                   nextNode(): Node | null {
                     index += 1;
-                    const preceding = counts().rootInspected ? 16_381 : 16_382;
+                    const preceding = counts().rootInspected ? maxDomWork - 3 : maxDomWork - 2;
                     if (index <= preceding) return dummy;
                     if (index === preceding + 1) return target;
                     return null;
@@ -873,11 +918,11 @@ describe('Task 2 correction boundaries', () => {
             configurable: true,
             get: () => ({ descendantWalkers }),
           });
-        });
+        }, INJECTED_MAX_DOM_WORK);
 
-        expect(await inspectInteractionCandidateHandle(handleReference, 0)).toEqual({
+        expect(await inspectInteractionCandidateHandle(handleReference, 0, INJECTED_MAX_DOM_WORK)).toEqual({
           status: 'DOM_WORK_BUDGET_REACHED',
-          domWorkUsed: 16_384,
+          domWorkUsed: INJECTED_MAX_DOM_WORK,
         });
         const counts = await readCounts();
         expect({ rootInspected: counts.rootInspected, factReads: counts.factReads }).toEqual({ rootInspected: true, factReads: 0 });
@@ -896,7 +941,7 @@ describe('Task 2 correction boundaries', () => {
 
   // C3（設計書 2026-09-23 5.5）: 制御対象の祖先の鎖（Proxy）で作業量を消費させる形から、前の要素の走査で消費させ、
   // 制御対象の可視判定（checkVisibility の1回）が最後の作業量を消費する形に置き換えた。
-  it('stops before geometry after the final retained visibility debit', async () => {
+  it('stops before geometry after the final retained visibility debit (injected limit)', async () => {
     const page = await browser.newPage();
     try {
       await page.setContent('<button type="button" aria-controls="controlled" aria-label="Boundary">Boundary</button><div id="controlled" style="width:1px;height:1px"></div>');
@@ -904,13 +949,13 @@ describe('Task 2 correction boundaries', () => {
       const handleReference = await candidateReferenceOf(page, 'button');
       if (handle === null) throw new Error('Missing visibility boundary candidate');
       try {
-        // 根1 + 前の要素 + 対象の走査と一致判定2 + 事実の収集の開始1 + aria-controls の解決1 + 制御対象の可視判定1 = 16,384
-        await installPrecedingWorkWalker(page, 'button', 16_378);
+        // 根1 + 前の要素 + 対象の走査と一致判定2 + 事実の収集の開始1 + aria-controls の解決1 + 制御対象の可視判定1 = 注入の上限
+        await installPrecedingWorkWalker(page, 'button', INJECTED_MAX_DOM_WORK - 6);
         const readControlledGeometry = await installGeometryReadCounter(page, '#controlled');
 
-        expect(await inspectInteractionCandidateHandle(handleReference, 0)).toEqual({
+        expect(await inspectInteractionCandidateHandle(handleReference, 0, INJECTED_MAX_DOM_WORK)).toEqual({
           status: 'DOM_WORK_BUDGET_REACHED',
-          domWorkUsed: 16_384,
+          domWorkUsed: INJECTED_MAX_DOM_WORK,
         });
         expect(await readControlledGeometry()).toBe(0);
       } finally {
@@ -978,7 +1023,8 @@ describe('Task 2 correction boundaries', () => {
     }
   });
 
-  it('reports candidate-limit incompleteness when the exact retained node moves to live ordinal 100', async () => {
+  // L10（N3・N4）: 順番の上限（前は 99。CANDIDATE_LIMIT_REACHED）は撤廃した。前の上限を超えた順番でも、つながった要素として読む。
+  it('keeps the exact retained node connected when it moves to live ordinal 100 beyond the former cap', async () => {
     const page = await browser.newPage();
     try {
       await page.setContent('<button type="button">Target</button>');
@@ -999,12 +1045,10 @@ describe('Task 2 correction boundaries', () => {
         });
 
         const snapshot = await inspectInteractionCandidateHandle(resolution.reference, 0);
-        expect(snapshot).toEqual({
-          status: 'CANDIDATE_LIMIT_REACHED',
-          domWorkUsed: expect.any(Number),
+        expect(snapshot).toMatchObject({
+          status: 'CONNECTED',
+          candidate: { ordinal: 100, accessibleName: 'Target' },
         });
-        expect(snapshot.status).not.toBe('DISCONNECTED');
-        expect(Object.hasOwn(snapshot, 'candidate')).toBe(false);
         expect(Object.isFrozen(snapshot)).toBe(true);
       } finally {
         await resolution.reference.handle.dispose();
@@ -1044,7 +1088,9 @@ describe('Task 2 correction boundaries', () => {
     }
   });
 
-  it('Task 2 fix round 2 shares the secondary text cap across accessible-name and normalized-text work', async () => {
+  // L10（N3・N4）: テキストのノードの上限（前は 512。TEXT_NODE_LIMIT_REACHED）は撤廃した。Task 2 fix round 2 の 3 つの場面は、上限なしで
+  // 名前と本文の子孫を最後まで走査する形に書き直した（ラベル 300 個 + 文字 1 個、本文 300 個 + 文字 1 個 = 602 個）。
+  it('walks the whole label and body text for accessible-name and normalized-text work without a text cap', async () => {
     const page = await browser.newPage();
     try {
       await page.setContent('<div id="label">Label</div><button type="button" aria-labelledby="label">Body</button>');
@@ -1058,16 +1104,17 @@ describe('Task 2 correction boundaries', () => {
 
       const discovery = await discoverInteractionCandidates(page);
 
-      expect(discovery.completeness).toBe('TEXT_NODE_LIMIT_REACHED');
-      expect(discovery.candidates).toEqual([]);
-      expect(await readAcceptedTextNodes()).toBe(INTERACTION_CANDIDATE_LIMITS.maxTextNodes);
-      expect(discovery.domWorkUsed).toBeLessThan(INTERACTION_CANDIDATE_LIMITS.maxDomWork);
+      expect(discovery.completeness).toBe('COMPLETE');
+      expect(discovery.candidates.map(({ accessibleName, textFingerprint }) => [accessibleName, textFingerprint])).toEqual([
+        ['Label', createSha256Fingerprint('Body')],
+      ]);
+      expect(await readAcceptedTextNodes()).toBe(602);
     } finally {
       await page.close();
     }
   });
 
-  it('Task 2 fix round 2 shares the secondary text cap across candidates', async () => {
+  it('walks the whole body text of every candidate without a text cap shared across candidates', async () => {
     const page = await browser.newPage();
     try {
       await page.setContent('<button type="button" aria-label="First">First body</button><button type="button" aria-label="Second">Second body</button>');
@@ -1080,16 +1127,18 @@ describe('Task 2 correction boundaries', () => {
 
       const discovery = await discoverInteractionCandidates(page);
 
-      expect(discovery.completeness).toBe('TEXT_NODE_LIMIT_REACHED');
-      expect(discovery.candidates.map(({ accessibleName }) => accessibleName)).toEqual(['First']);
-      expect(await readAcceptedTextNodes()).toBe(INTERACTION_CANDIDATE_LIMITS.maxTextNodes);
-      expect(discovery.domWorkUsed).toBeLessThan(INTERACTION_CANDIDATE_LIMITS.maxDomWork);
+      expect(discovery.completeness).toBe('COMPLETE');
+      expect(discovery.candidates.map(({ accessibleName, textFingerprint }) => [accessibleName, textFingerprint])).toEqual([
+        ['First', createSha256Fingerprint('First body')],
+        ['Second', createSha256Fingerprint('Second body')],
+      ]);
+      expect(await readAcceptedTextNodes()).toBe(602);
     } finally {
       await page.close();
     }
   });
 
-  it('Task 2 fix round 2 shares the retained secondary text cap across accessible-name and normalized-text work', async () => {
+  it('walks the whole retained label and body text without a text cap', async () => {
     const page = await browser.newPage();
     try {
       await page.setContent('<div id="label">Label</div><button type="button" aria-labelledby="label">Body</button>');
@@ -1104,11 +1153,11 @@ describe('Task 2 correction boundaries', () => {
       try {
         const readAcceptedTextNodes = await installTextTraversalCounter(page);
 
-        await expect(inspectInteractionCandidateHandle(resolution.reference, 0)).resolves.toEqual({
-          status: 'TEXT_NODE_LIMIT_REACHED',
-          domWorkUsed: expect.any(Number),
+        await expect(inspectInteractionCandidateHandle(resolution.reference, 0)).resolves.toMatchObject({
+          status: 'CONNECTED',
+          candidate: { accessibleName: 'Label', textFingerprint: createSha256Fingerprint('Body') },
         });
-        expect(await readAcceptedTextNodes()).toBe(INTERACTION_CANDIDATE_LIMITS.maxTextNodes);
+        expect(await readAcceptedTextNodes()).toBe(602);
       } finally {
         await resolution.reference.handle.dispose();
       }
@@ -1280,7 +1329,7 @@ describe('Task 2 correction resolver ownership and envelope validation', () => {
   it.each([
     ['unknown status', { value: { status: 'UNKNOWN', domWorkUsed: 0 }, paths: [] }],
     ['negative work', { value: { status: 'MISSING', domWorkUsed: -1 }, paths: [] }],
-    ['out-of-range work', { value: { status: 'MISSING', domWorkUsed: 16_385 }, paths: [] }],
+    ['work beyond the injected limit', { value: { status: 'MISSING', domWorkUsed: INJECTED_MAX_DOM_WORK + 1 }, paths: [] }],
     ['fractional work', { value: { status: 'MISSING', domWorkUsed: 1.5 }, paths: [] }],
     ['missing FOUND child', { value: { status: 'FOUND', domWorkUsed: 2 }, paths: [] }],
     ['non-element FOUND child', { value: { status: 'FOUND', domWorkUsed: 2 }, paths: [[0, 1, 0]], summaryFails: true }],
@@ -1288,7 +1337,8 @@ describe('Task 2 correction resolver ownership and envelope validation', () => {
     ['contradictory budget child', { value: { status: 'DOM_WORK_BUDGET_REACHED', domWorkUsed: 2 }, paths: [[0, 1, 0]] }],
   ] as const)('rejects malformed resolver envelope: %s', async (_label, options) => {
     const { page, record } = fakeResolutionPage(options);
-    await expect(resolveInteractionCandidateHandle(page, 0)).rejects.toThrow();
+    // L10（N3・N4）: 作業量の範囲の確かめは、上限を注入したときだけ効く（上限なしの形は、下の受け入れの場面）。
+    await expect(resolveInteractionCandidateHandle(page, 0, INJECTED_MAX_DOM_WORK)).rejects.toThrow();
     expect(record.locatorCalls).toBe(0);
     expect(record.opened).toBeGreaterThan(0);
     expect(record.detached).toBe(record.opened);
@@ -1299,27 +1349,29 @@ describe('Task 2 correction resolver ownership and envelope validation', () => {
     ['array container', []],
     ['unknown status', { status: 'UNKNOWN', domWorkUsed: 0 }],
     ['negative work', { status: 'DISCONNECTED', domWorkUsed: -1 }],
-    ['out-of-range work', { status: 'DOM_WORK_BUDGET_REACHED', domWorkUsed: 16_385 }],
+    ['work beyond the injected limit', { status: 'DOM_WORK_BUDGET_REACHED', domWorkUsed: INJECTED_MAX_DOM_WORK + 1 }],
     ['fractional work', { status: 'DISCONNECTED', domWorkUsed: 1.5 }],
     ['missing CONNECTED raw', { status: 'CONNECTED', domWorkUsed: 1 }],
     ['contradictory DISCONNECTED raw', { status: 'DISCONNECTED', domWorkUsed: 1, raw: {} }],
     ['contradictory budget raw', { status: 'DOM_WORK_BUDGET_REACHED', domWorkUsed: 1, raw: {} }],
     ['contradictory candidate-limit raw', { status: 'CANDIDATE_LIMIT_REACHED', domWorkUsed: 1, raw: {} }],
-    ['out-of-range candidate-limit work', { status: 'CANDIDATE_LIMIT_REACHED', domWorkUsed: 16_385 }],
+    ['candidate-limit work beyond the injected limit', { status: 'CANDIDATE_LIMIT_REACHED', domWorkUsed: INJECTED_MAX_DOM_WORK + 1 }],
   ] as const)('rejects malformed retained snapshot: %s', async (_label, value) => {
     const handle = fakeCandidateReference(async () => value);
-    await expect(inspectInteractionCandidateHandle(handle, 0)).rejects.toThrow();
+    await expect(inspectInteractionCandidateHandle(handle, 0, INJECTED_MAX_DOM_WORK)).rejects.toThrow();
   });
 
-  it('accepts an immutable candidate-limit retained snapshot without a candidate payload', async () => {
-    const handle = fakeCandidateReference(async () => ({ status: 'CANDIDATE_LIMIT_REACHED', domWorkUsed: 205 }));
-
-    const snapshot = await inspectInteractionCandidateHandle(handle, 0);
-
-    expect(snapshot).toEqual({ status: 'CANDIDATE_LIMIT_REACHED', domWorkUsed: 205 });
-    expect(Object.hasOwn(snapshot, 'candidate')).toBe(false);
-    expect(Object.isFrozen(snapshot)).toBe(true);
+  // L10（N3・N4）: 上限を渡さない（本番の形）ときは、前の上限（16,384）を超えた作業量も、そのまま受け取る。
+  it('accepts resolver and retained work beyond the former limit when no limit is given', async () => {
+    const { page, record } = fakeResolutionPage({ value: { status: 'MISSING', domWorkUsed: INJECTED_MAX_DOM_WORK + 1 }, paths: [] });
+    await expect(resolveInteractionCandidateHandle(page, 0)).resolves.toEqual({ status: 'MISSING', domWorkUsed: INJECTED_MAX_DOM_WORK + 1 });
+    expect(record.detached).toBe(record.opened);
+    const handle = fakeCandidateReference(async () => ({ status: 'DISCONNECTED', domWorkUsed: INJECTED_MAX_DOM_WORK + 1 }));
+    await expect(inspectInteractionCandidateHandle(handle, 0)).resolves.toEqual({ status: 'DISCONNECTED', domWorkUsed: INJECTED_MAX_DOM_WORK + 1 });
   });
+
+  // SPEC-5: 保持した要素の観測は、候補の数の上限（L10 で撤廃）で止まった結果（`CANDIDATE_LIMIT_REACHED`）を返さないので、受け取る場面は消した。
+  // その値を不正な値として拒むことは、上の「rejects malformed retained snapshot」の candidate-limit の 2 行で確かめる。
 });
 }
 
@@ -1332,17 +1384,6 @@ function candidateNamed(path: string, name: string): Promise<InteractionCandidat
 function input(path: string, candidate: InteractionCandidate): InteractionAuditInput {
   return interactionAuditInput({ factory, origin: server.origin, viewport, path, candidate });
 }
-
-/**
- * DF-2b（DEF-093）: `input` と同じ監査の入力で、期限を混雑の倍率を掛けた `LOADED_GATE_INTERACTION_TIMING` にしたもの。期限の切れ方を確かめず、
- * 確かめ終わった結果（VERIFIED か、変化がないこと）を確かめる場面が使う（強い混雑の下で、押す前や確かめの途中に期限が切れた回があった）。
- */
-function loadedInput(path: string, candidate: InteractionCandidate): InteractionAuditInput {
-  return interactionAuditInput({ factory, origin: server.origin, viewport, path, candidate, timing: LOADED_GATE_INTERACTION_TIMING });
-}
-
-/** Q2 の画面外の無反応なボタンの場面の Interaction の期限（ms。混雑の倍率を掛ける前の値。押した後の観察を期限で終える短い値）。 */
-const OFFSCREEN_INERT_BUTTON_TIMEOUT_MS = 1_000;
 
 async function installTextTraversalCounter(page: Page): Promise<() => Promise<number>> {
   await evaluateInCandidateReadWorld(page, () => {
@@ -1372,7 +1413,8 @@ async function installTextTraversalCounter(page: Page): Promise<() => Promise<nu
   ).__acceptedTextNodes);
 }
 
-async function installTraversalProbe(page: Page): Promise<() => Promise<number>> {
+/** 子孫の走査（SHOW_ALL）の `nextNode` の呼び出しを数え、`maxNodes` を超えたら投げる（L10: 境は、テストが注入する作業量の上限）。 */
+async function installTraversalProbe(page: Page, maxNodes: number): Promise<() => Promise<number>> {
   await evaluateInCandidateReadWorld(page, (maxNodes) => {
     const original = document.createTreeWalker.bind(document);
     let nextNodeCalls = 0;
@@ -1401,13 +1443,14 @@ async function installTraversalProbe(page: Page): Promise<() => Promise<number>>
       configurable: true,
       get: () => nextNodeCalls,
     });
-  }, INTERACTION_CANDIDATE_LIMITS.maxTextNodes);
+  }, maxNodes);
   return async () => evaluateInCandidateReadWorld(page, () => (
     globalThis as typeof globalThis & { readonly __beakSightTraversalCount: number }
   ).__beakSightTraversalCount);
 }
 
-async function installAggregateTraversalProbe(page: Page): Promise<() => Promise<number>> {
+/** 子孫の走査（SHOW_ALL）で返ったノードを、すべての根を通して数え、`maxNodes` を超えたら投げる。 */
+async function installAggregateTraversalProbe(page: Page, maxNodes: number): Promise<() => Promise<number>> {
   await evaluateInCandidateReadWorld(page, (maxNodes) => {
     const original = document.createTreeWalker.bind(document);
     let nonNullNextNodeCalls = 0;
@@ -1439,7 +1482,7 @@ async function installAggregateTraversalProbe(page: Page): Promise<() => Promise
       configurable: true,
       get: () => nonNullNextNodeCalls,
     });
-  }, INTERACTION_CANDIDATE_LIMITS.maxTextNodes);
+  }, maxNodes);
   return async () => evaluateInCandidateReadWorld(page, () => (
     globalThis as typeof globalThis & { readonly __beakSightAggregateTraversalCount: number }
   ).__beakSightAggregateTraversalCount);
@@ -1479,16 +1522,51 @@ describe('interaction candidate discovery', () => {
     }, EXPECT_NO_GUARD_VIOLATIONS);
   });
 
-  it('retains at most 100 candidates and bounds every persisted name', async () => {
-    const candidates = await discover('/candidate-overflow.html', 'CANDIDATE_LIMIT_REACHED');
+  // L10（N3・N4）: 候補の数の上限（前は 100。CANDIDATE_LIMIT_REACHED）と名前の長さの上限（前は 256）は撤廃した。101 個以上の候補を、
+  // 文書の終わりまで残らず見つけ、名前を切り詰めずに残す（fixture は 105 個。名前は 400 文字と番号）。
+  it('retains every candidate beyond the former 100 and keeps every persisted name in full', async () => {
+    const candidates = await discover('/candidate-overflow.html');
 
-    expect(candidates).toHaveLength(100);
-    expect(candidates.at(-1)?.ordinal).toBe(99);
-    expect(candidates.every((candidate) => candidate.accessibleName.length <= 256)).toBe(true);
+    expect(candidates).toHaveLength(105);
+    expect(candidates.map(({ ordinal }) => ordinal)).toEqual(Array.from({ length: 105 }, (_unused, index) => index));
+    expect(candidates.at(-1)?.accessibleName).toBe(`${'x'.repeat(400)}-104`);
+    expect(candidates.every((candidate, index) => candidate.accessibleName === `${'x'.repeat(400)}-${index}`)).toBe(true);
     expect(candidates.every(Object.isFrozen)).toBe(true);
   });
 
-  it('does not iterate a hostile NodeList or materialize full descendant text during discovery', async () => {
+  it('does not iterate a hostile NodeList or materialize full descendant text during discovery without a limit', async () => {
+    await withGuardedPassivePage(factory, viewport, async (page) => {
+      await page.goto(`${server.origin}/hostile-candidates.html`, { waitUntil: 'load' });
+      await evaluateInCandidateReadWorld(page, () => {
+        Object.defineProperty(NodeList.prototype, Symbol.iterator, {
+          configurable: true,
+          value(): never {
+            throw new Error('NodeList iterator must not be used');
+          },
+        });
+        Object.defineProperty(Node.prototype, 'textContent', {
+          configurable: true,
+          get(): never {
+            throw new Error('full textContent must not be materialized');
+          },
+        });
+        Object.defineProperty(Node.prototype, 'nodeValue', {
+          configurable: true,
+          get(): never {
+            throw new Error('full text-node value must not be materialized');
+          },
+        });
+      });
+
+      const discovery = await discoverInteractionCandidates(page);
+      expect(discovery.completeness).toBe('COMPLETE');
+      expect(discovery.candidates.map(({ accessibleName, textFingerprint }) => [accessibleName, textFingerprint])).toEqual([
+        ['Fallback label', createSha256Fingerprint('must-not-require-unbounded-traversal')],
+      ]);
+    }, EXPECT_NO_GUARD_VIOLATIONS);
+  });
+
+  it('does not iterate a hostile NodeList or materialize full descendant text during discovery (injected limit)', async () => {
     await withGuardedPassivePage(factory, viewport, async (page) => {
       await page.goto(`${server.origin}/hostile-candidates.html`, { waitUntil: 'load' });
       await evaluateInCandidateReadWorld(page, (maxTextNodes) => {
@@ -1533,32 +1611,33 @@ describe('interaction candidate discovery', () => {
             });
           },
         });
-      }, INTERACTION_CANDIDATE_LIMITS.maxTextNodes);
+      }, INJECTED_TEXT_WALK_DOM_WORK);
 
-      const discovery = await discoverInteractionCandidates(page);
-      expect(discovery.completeness).toBe('TEXT_NODE_LIMIT_REACHED');
+      const discovery = await discoverInteractionCandidates(page, INJECTED_TEXT_WALK_DOM_WORK);
+      expect(discovery.completeness).toBe('DOM_WORK_BUDGET_REACHED');
       const candidates = discovery.candidates;
 
       expect(candidates).toEqual([]);
     }, EXPECT_NO_GUARD_VIOLATIONS);
   });
 
-  it('bounds total descendant nodes during discovery with all-node traversal', async () => {
+  it('bounds total descendant nodes during discovery with all-node traversal (injected limit)', async () => {
     await withGuardedPassivePage(factory, viewport, async (page) => {
       await page.goto(`${server.origin}/hostile-candidates.html`, { waitUntil: 'load' });
-      const readNextNodeCalls = await installTraversalProbe(page);
+      const readNextNodeCalls = await installTraversalProbe(page, INJECTED_TEXT_WALK_DOM_WORK);
 
-      const discovery = await discoverInteractionCandidates(page);
-      expect(discovery.completeness).toBe('TEXT_NODE_LIMIT_REACHED');
+      const discovery = await discoverInteractionCandidates(page, INJECTED_TEXT_WALK_DOM_WORK);
+      expect(discovery.completeness).toBe('DOM_WORK_BUDGET_REACHED');
+      expect(discovery.domWorkUsed).toBe(INJECTED_TEXT_WALK_DOM_WORK);
       const candidates = discovery.candidates;
       const nextNodeCalls = await readNextNodeCalls();
 
-      expect(nextNodeCalls).toBeLessThanOrEqual(INTERACTION_CANDIDATE_LIMITS.maxTextNodes);
+      expect(nextNodeCalls).toBeLessThanOrEqual(INJECTED_TEXT_WALK_DOM_WORK);
       expect(candidates).toEqual([]);
     }, EXPECT_NO_GUARD_VIOLATIONS);
   });
 
-  it('bounds total descendant nodes during retained inspection with all-node traversal', async () => {
+  it('bounds total descendant nodes during retained inspection with all-node traversal (injected limit)', async () => {
     await withGuardedPassivePage(factory, viewport, async (page) => {
       await page.goto(`${server.origin}/hostile-candidates.html`, { waitUntil: 'load' });
       const handle = await page.locator(INTERACTION_CANDIDATE_SELECTOR).first().elementHandle();
@@ -1567,36 +1646,66 @@ describe('interaction candidate discovery', () => {
         throw new Error('fixture candidate handle missing');
       }
       try {
-        const readNextNodeCalls = await installTraversalProbe(page);
+        const readNextNodeCalls = await installTraversalProbe(page, INJECTED_TEXT_WALK_DOM_WORK);
 
-        await expect(inspectInteractionCandidateHandle(handleReference, 0)).resolves.toMatchObject({
-          status: 'TEXT_NODE_LIMIT_REACHED',
+        await expect(inspectInteractionCandidateHandle(handleReference, 0, INJECTED_TEXT_WALK_DOM_WORK)).resolves.toEqual({
+          status: 'DOM_WORK_BUDGET_REACHED',
+          domWorkUsed: INJECTED_TEXT_WALK_DOM_WORK,
         });
         const nextNodeCalls = await readNextNodeCalls();
 
-        expect(nextNodeCalls).toBeLessThanOrEqual(INTERACTION_CANDIDATE_LIMITS.maxTextNodes);
+        expect(nextNodeCalls).toBeLessThanOrEqual(INJECTED_TEXT_WALK_DOM_WORK);
       } finally {
         await handle.dispose();
       }
     }, EXPECT_NO_GUARD_VIOLATIONS);
   });
 
-  it('shares the aggregate descendant-node budget across label roots during discovery', async () => {
+  // L10（N3・N4）: 上限を渡さない（本番の形）と、100,000 個の子孫を最後まで走査し、最後の文字を読む。
+  it('walks every descendant node during discovery and retained inspection when no limit is given', async () => {
+    await withGuardedPassivePage(factory, viewport, async (page) => {
+      await page.goto(`${server.origin}/hostile-candidates.html`, { waitUntil: 'load' });
+      const discovery = await discoverInteractionCandidates(page);
+      expect(discovery.completeness).toBe('COMPLETE');
+      expect(discovery.candidates.map(({ textFingerprint }) => textFingerprint)).toEqual([
+        createSha256Fingerprint('must-not-require-unbounded-traversal'),
+      ]);
+      const handle = await page.locator(INTERACTION_CANDIDATE_SELECTOR).first().elementHandle();
+      const handleReference = await candidateReferenceOf(page, INTERACTION_CANDIDATE_SELECTOR);
+      if (handle === null) {
+        throw new Error('fixture candidate handle missing');
+      }
+      try {
+        await expect(inspectInteractionCandidateHandle(handleReference, 0)).resolves.toMatchObject({
+          status: 'CONNECTED',
+          candidate: { textFingerprint: createSha256Fingerprint('must-not-require-unbounded-traversal') },
+        });
+      } finally {
+        await handle.dispose();
+      }
+    }, EXPECT_NO_GUARD_VIOLATIONS);
+  });
+
+  // L10（N3・N4）: 名前の根（ラベル 2 つ。子孫 300 個ずつ）の走査は、注入した DOM の作業量の上限を共有する。前の要素の走査（約 610）の後、
+  // 1 つめの根を走査し終え、2 つめの根の途中で尽きる。
+  it('shares the aggregate descendant-node budget across label roots during discovery (injected limit)', async () => {
     await withGuardedPassivePage(factory, viewport, async (page) => {
       await page.goto(`${server.origin}/multi-root-candidates.html`, { waitUntil: 'load' });
-      const readNextNodeCalls = await installAggregateTraversalProbe(page);
+      const readNextNodeCalls = await installAggregateTraversalProbe(page, INJECTED_TEXT_WALK_DOM_WORK);
 
-      const discovery = await discoverInteractionCandidates(page);
-      expect(discovery.completeness).toBe('TEXT_NODE_LIMIT_REACHED');
+      const discovery = await discoverInteractionCandidates(page, INJECTED_TEXT_WALK_DOM_WORK);
+      expect(discovery.completeness).toBe('DOM_WORK_BUDGET_REACHED');
+      expect(discovery.domWorkUsed).toBe(INJECTED_TEXT_WALK_DOM_WORK);
       const candidates = discovery.candidates;
       const nextNodeCalls = await readNextNodeCalls();
 
-      expect(nextNodeCalls).toBe(INTERACTION_CANDIDATE_LIMITS.maxTextNodes);
+      expect(nextNodeCalls).toBeGreaterThan(300);
+      expect(nextNodeCalls).toBeLessThan(600);
       expect(candidates).toEqual([]);
     }, EXPECT_NO_GUARD_VIOLATIONS);
   });
 
-  it('shares the aggregate descendant-node budget across label roots during retained inspection', async () => {
+  it('walks every label root to the end during discovery and retained inspection when no limit is given', async () => {
     await withGuardedPassivePage(factory, viewport, async (page) => {
       await page.goto(`${server.origin}/multi-root-candidates.html`, { waitUntil: 'load' });
       const handle = await page.locator(INTERACTION_CANDIDATE_SELECTOR).first().elementHandle();
@@ -1605,14 +1714,43 @@ describe('interaction candidate discovery', () => {
         throw new Error('fixture candidate handle missing');
       }
       try {
-        const readNextNodeCalls = await installAggregateTraversalProbe(page);
+        const readNextNodeCalls = await installAggregateTraversalProbe(page, 1_200);
 
+        const discovery = await discoverInteractionCandidates(page);
+        expect(discovery.completeness).toBe('COMPLETE');
+        // ラベルの子孫に文字がないので、名前は title に戻る。
+        expect(discovery.candidates.map(({ accessibleName }) => accessibleName)).toEqual(['Fallback label']);
+        expect(await readNextNodeCalls()).toBe(600);
         await expect(inspectInteractionCandidateHandle(handleReference, 0)).resolves.toMatchObject({
-          status: 'TEXT_NODE_LIMIT_REACHED',
+          status: 'CONNECTED',
+          candidate: { accessibleName: 'Fallback label' },
+        });
+        expect(await readNextNodeCalls()).toBe(1_200);
+      } finally {
+        await handle.dispose();
+      }
+    }, EXPECT_NO_GUARD_VIOLATIONS);
+  });
+
+  it('shares the aggregate descendant-node budget across label roots during retained inspection (injected limit)', async () => {
+    await withGuardedPassivePage(factory, viewport, async (page) => {
+      await page.goto(`${server.origin}/multi-root-candidates.html`, { waitUntil: 'load' });
+      const handle = await page.locator(INTERACTION_CANDIDATE_SELECTOR).first().elementHandle();
+      const handleReference = await candidateReferenceOf(page, INTERACTION_CANDIDATE_SELECTOR);
+      if (handle === null) {
+        throw new Error('fixture candidate handle missing');
+      }
+      try {
+        const readNextNodeCalls = await installAggregateTraversalProbe(page, INJECTED_TEXT_WALK_DOM_WORK);
+
+        await expect(inspectInteractionCandidateHandle(handleReference, 0, INJECTED_TEXT_WALK_DOM_WORK)).resolves.toEqual({
+          status: 'DOM_WORK_BUDGET_REACHED',
+          domWorkUsed: INJECTED_TEXT_WALK_DOM_WORK,
         });
         const nextNodeCalls = await readNextNodeCalls();
 
-        expect(nextNodeCalls).toBe(INTERACTION_CANDIDATE_LIMITS.maxTextNodes);
+        expect(nextNodeCalls).toBeGreaterThan(300);
+        expect(nextNodeCalls).toBeLessThan(600);
       } finally {
         await handle.dispose();
       }
@@ -1644,7 +1782,8 @@ describe('interaction candidate discovery', () => {
     }, EXPECT_NO_GUARD_VIOLATIONS);
   });
 
-  it('keeps a connected retained handle outside the ordinal cap distinct from disconnection', async () => {
+  // L10（N3・N4）: 順番の上限（前は 99）は撤廃した。前の上限を超えた順番の要素も、つながった候補として読む。
+  it('reads a connected retained handle beyond the former ordinal cap as a candidate', async () => {
     await withGuardedPassivePage(factory, viewport, async (page) => {
       await page.goto(`${server.origin}/candidate-overflow.html`, { waitUntil: 'load' });
       const handle = await page.locator(INTERACTION_CANDIDATE_SELECTOR).nth(100).elementHandle();
@@ -1653,9 +1792,9 @@ describe('interaction candidate discovery', () => {
         throw new Error('overflow fixture candidate handle missing');
       }
       try {
-        await expect(inspectInteractionCandidateHandle(handleReference, 99)).resolves.toEqual({
-          status: 'CANDIDATE_LIMIT_REACHED',
-          domWorkUsed: expect.any(Number),
+        await expect(inspectInteractionCandidateHandle(handleReference, 99)).resolves.toMatchObject({
+          status: 'CONNECTED',
+          candidate: { ordinal: 100, accessibleName: `${'x'.repeat(400)}-100` },
         });
       } finally {
         await handle.dispose();
@@ -1904,108 +2043,6 @@ describe('isolated fail-closed interaction audit', () => {
     expect(result.evidence.identityStatus).toBe('UNESTABLISHED');
   });
 
-  it('Task 2 fix round 2 keeps identity unestablished after disconnection and incomplete rediscovery', async () => {
-    const candidate = await candidateNamed('/accordion.html', 'Toggle details');
-    const rawCandidate = rawCandidateFor(candidate);
-    const snapshots = [
-      { status: 'CONNECTED', domWorkUsed: 10, raw: rawCandidate },
-      { status: 'DISCONNECTED', domWorkUsed: 10 },
-    ];
-    let snapshotIndex = 0;
-    let discoveryIndex = 0;
-    const targetHandle = {
-      evaluate: async () => snapshots[snapshotIndex++],
-      click: async () => undefined,
-      dispose: async () => undefined,
-    };
-    const page = {
-      goto: async () => undefined,
-      evaluate: async (_callback: unknown, argument?: unknown) => {
-        if (argument === undefined) return true;
-        discoveryIndex += 1;
-        return discoveryIndex === 1
-          ? { candidates: [rawCandidate], completeness: 'COMPLETE', domWorkUsed: 20 }
-          : { candidates: [], completeness: 'DOM_WORK_BUDGET_REACHED', domWorkUsed: 16_344 };
-      },
-      evaluateHandle: async () => boundedResolutionEnvelope(targetHandle),
-    } as unknown as Page;
-    const session: InteractionGuardedSession = {
-      page: withScrollPreparation(page, candidate),
-      ledger: new SafetyLedger(),
-      activateInteractionFreeze: async () => undefined,
-      ...fakeCloseLifecycle(),
-    };
-
-    const result = await auditInteraction({
-      ...input('/accordion.html', candidate),
-      sessionFactory: async () => session,
-    });
-
-    expect(result.status).toBe('NOT_VERIFIABLE');
-    expectReason(result, 'DOM_WORK_EXHAUSTED');
-    expect(result.evidence.identityStatus).toBe('UNESTABLISHED');
-  });
-
-  it.each(['pre-admission inspection', 'retained observation'] as const)(
-    'Task 11 final quality maps candidate-limit %s directly without disconnected rediscovery',
-    async (branch) => {
-      const candidate = await candidateNamed('/accordion.html', 'Toggle details');
-      const rawCandidate = rawCandidateFor(candidate);
-      const snapshots = branch === 'pre-admission inspection'
-        ? [{ status: 'CANDIDATE_LIMIT_REACHED', domWorkUsed: 205 }]
-        : [
-            { status: 'CONNECTED', domWorkUsed: 10, raw: rawCandidate },
-            { status: 'CANDIDATE_LIMIT_REACHED', domWorkUsed: 205 },
-          ];
-      let snapshotIndex = 0;
-      let discoveryCount = 0;
-      const targetHandle = {
-        evaluate: async () => snapshots[snapshotIndex++],
-        click: async () => {
-          if (branch === 'pre-admission inspection') {
-            throw new Error('candidate-limit pre-admission must not click');
-          }
-        },
-        dispose: async () => undefined,
-      };
-      const page = {
-        goto: async () => undefined,
-        evaluate: async (_callback: unknown, argument?: unknown) => {
-          if (argument === undefined) return true;
-          discoveryCount += 1;
-          if (discoveryCount > 1) {
-            throw new Error('candidate-limit retained inspection must not rediscover');
-          }
-          return { candidates: [rawCandidate], completeness: 'COMPLETE', domWorkUsed: 20 };
-        },
-        evaluateHandle: async () => boundedResolutionEnvelope(targetHandle),
-      } as unknown as Page;
-      const session: InteractionGuardedSession = {
-        page: withScrollPreparation(page, candidate),
-        ledger: new SafetyLedger(),
-        activateInteractionFreeze: async () => undefined,
-        ...fakeCloseLifecycle(),
-      };
-
-      const result = await auditInteraction({
-        ...input('/accordion.html', candidate),
-        sessionFactory: async () => session,
-      });
-
-      expect(result.status).toBe('NOT_VERIFIABLE');
-      expect(result.reason).toBe(branch === 'pre-admission inspection'
-        ? 'TARGET_INSPECTION_CANDIDATE_LIMIT_REACHED'
-        : 'RETAINED_INSPECTION_CANDIDATE_LIMIT_REACHED');
-      expect(result.evidence).toMatchObject({
-        identityStatus: 'UNESTABLISHED',
-        after: null,
-      });
-      expect(result.evidence.identityStatus).not.toBe('MISSING');
-      expect(result.evidence.identityStatus).not.toBe('REPLACED');
-      expect(discoveryCount).toBe(1);
-    },
-  );
-
   it.each(['complete rediscovery absence', 'complete resolution absence'] as const)(
     'Task 2 fix round 2 preserves MISSING for %s',
     async (branch) => {
@@ -2046,67 +2083,6 @@ describe('isolated fail-closed interaction audit', () => {
       expect(result.evidence.identityStatus).toBe('MISSING');
     },
   );
-
-  it.each([
-    'rediscovery',
-    'resolution',
-    'pre-admission inspection',
-    'retained observation',
-  ] as const)('Task 2 correction represents incomplete %s identity as unestablished', async (branch) => {
-    const candidate = await candidateNamed('/accordion.html', 'Toggle details');
-    const rawCandidate = rawCandidateFor(candidate);
-    const snapshots = branch === 'pre-admission inspection'
-      ? [{ status: 'DOM_WORK_BUDGET_REACHED', domWorkUsed: 16_364 }]
-      : branch === 'retained observation'
-        ? [
-            { status: 'CONNECTED', domWorkUsed: 10, raw: rawCandidate },
-            { status: 'DOM_WORK_BUDGET_REACHED', domWorkUsed: 16_354 },
-          ]
-        : [];
-    let snapshotIndex = 0;
-    const targetHandle = {
-      evaluate: async () => snapshots[snapshotIndex++],
-      click: async () => undefined,
-      dispose: async () => undefined,
-    };
-    const property = (value: unknown, element: unknown = null) => ({
-      jsonValue: async () => value,
-      asElement: () => element,
-      dispose: async () => undefined,
-    });
-    const resolutionEnvelope = branch === 'resolution'
-      ? injectedResolutionEnvelope(new Map([
-          ['status', property('DOM_WORK_BUDGET_REACHED')],
-          ['domWorkUsed', property(16_364)],
-        ]))
-      : boundedResolutionEnvelope(targetHandle);
-    const page = {
-      goto: async () => undefined,
-      evaluate: async (_callback: unknown, argument?: unknown) => (
-        argument === undefined
-          ? true
-          : branch === 'rediscovery'
-            ? { candidates: [], completeness: 'DOM_WORK_BUDGET_REACHED', domWorkUsed: 16_384 }
-            : { candidates: [rawCandidate], completeness: 'COMPLETE', domWorkUsed: 20 }
-      ),
-      evaluateHandle: async () => resolutionEnvelope,
-    } as unknown as Page;
-    const session: InteractionGuardedSession = {
-      page: withScrollPreparation(page, candidate),
-      ledger: new SafetyLedger(),
-      activateInteractionFreeze: async () => undefined,
-      ...fakeCloseLifecycle(),
-    };
-
-    const result = await auditInteraction({
-      ...input('/accordion.html', candidate),
-      sessionFactory: async () => session,
-    });
-
-    expect(result.status).toBe('NOT_VERIFIABLE');
-    expectReason(result, 'DOM_WORK_EXHAUSTED');
-    expect(result.evidence.identityStatus).toBe('UNESTABLISHED');
-  });
 
   it('returns immutable result axes for a normal successful audit', async () => {
     const candidate = await candidateNamed('/accordion.html', 'Toggle details');
@@ -2392,7 +2368,7 @@ describe('isolated fail-closed interaction audit', () => {
   });
 
   it.each([
-    ['/missing-button.html', 'Remove candidate', 'MISSING'],
+    ['/missing-button.html', 'Detach candidate', 'MISSING'],
     ['/ambiguous-button.html', 'Duplicate candidate', 'AMBIGUOUS'],
     ['/replacement-button.html', 'Replace candidate', 'REPLACED'],
   ] as const)('reports exact retained-node identity loss for %s', async (path, name, identityStatus) => {
@@ -2418,8 +2394,11 @@ describe('isolated fail-closed interaction audit', () => {
       visible: false,
       boundingBox: { width: 0, height: 0 },
     });
-    // F15（設計書 4.4.1）で是正: 大きさの変化（boundingBox）は根拠にしない。hidden 属性が付くので、対象自身の属性の変化が根拠になる。
-    expect(result.evidence.changedFields).toEqual(['visible', 'attributes']);
+    // F15（設計書 4.4.1）で是正: 大きさの変化（boundingBox）は根拠にしない。
+    // SPEC-5（設計書 2026-11-14 5.1）で是正: 対象自身の属性は ARIA の状態と `open` と class の名前だけを根拠にするので、付いた `hidden` 属性は
+    // 根拠にしない（見え方の変化 `visible` で確かめる）。
+    expect(result.evidence.changedFields).toEqual(['visible']);
+    expect(result.evidence.changedAttributes).toEqual([]);
   });
 
   it('reports an initially duplicated semantic identity as ambiguous in reason and evidence', async () => {
@@ -2463,13 +2442,15 @@ describe('isolated fail-closed interaction audit', () => {
     expect(result.safety.invariantViolations).toEqual([]);
   });
 
-  it('closes the owner session exactly once after a verified audit', async () => {
+  // SREV-SAFE の I-4: 押すと同じ文書の中で `pushState` もする候補（SPA のタブの切り替えの形）も、止めた移動にならず VERIFIED になる。
+  it('closes the owner session exactly once after a verified audit, also when the press pushes a history state', async () => {
     const candidate = await candidateNamed('/accordion.html', 'Toggle details');
     let closeCalls = 0;
     let observedPage: Page | undefined;
     const sessionFactory = async (sessionViewport: Viewport): Promise<InteractionGuardedSession> => {
       const session = await factory.createInteractionSession(sessionViewport);
       observedPage = session.page;
+      await session.page.addInitScript({ content: "document.addEventListener('click', () => history.pushState({}, '', location.pathname + '?tab=2'), true);" });
       return Object.freeze({
         ...session,
         async close(): Promise<void> {
@@ -2481,7 +2462,8 @@ describe('isolated fail-closed interaction audit', () => {
 
     const result = await auditInteraction({ ...input('/accordion.html', candidate), sessionFactory });
 
-    expect(result.status).toBe('VERIFIED');
+    expect(result.status, JSON.stringify(result.safety.blockedInteractionNavigations)).toBe('VERIFIED');
+    expect(result.safety.blockedInteractionNavigations).toEqual([]);
     expect(closeCalls).toBe(1);
     expect(observedPage?.isClosed()).toBe(true);
   });
@@ -2514,7 +2496,7 @@ describe('isolated fail-closed interaction audit', () => {
 
   it('does not click or perform a post evaluation after rediscovery reaches the absolute deadline', async () => {
     const candidate = await candidateNamed('/accordion.html', 'Toggle details');
-    // F16（設計書 4.4.1）で是正: 凍結の前の安定性の確認は、実際に時間が進むのを待つ。偽の時計を実際の時間に合わせて進める。
+    // 下準備の描画の待ちは、実際に時間が進むのを待つ。偽の時計を実際の時間に合わせて進める。
     vi.useFakeTimers({ shouldAdvanceTime: true });
     vi.setSystemTime(1_000);
     let discoveryEvaluations = 0;
@@ -2540,6 +2522,7 @@ describe('isolated fail-closed interaction audit', () => {
       type: candidate.type,
       disabled: candidate.disabled,
       visible: candidate.visible,
+      destructiveFacts: destructiveActionFactsOfNames([candidate.accessibleName]),
       boundingBox: candidate.boundingBox,
     };
     const page = {
@@ -2585,7 +2568,7 @@ describe('isolated fail-closed interaction audit', () => {
 
   it('preserves the deadline outcome when deadline handle dispose failed', async () => {
     const candidate = await candidateNamed('/accordion.html', 'Toggle details');
-    // F16（設計書 4.4.1）で是正: 凍結の前の安定性の確認は、実際に時間が進むのを待つ。偽の時計を実際の時間に合わせて進める。
+    // 下準備の描画の待ちは、実際に時間が進むのを待つ。偽の時計を実際の時間に合わせて進める。
     vi.useFakeTimers({ shouldAdvanceTime: true });
     vi.setSystemTime(1_000);
     let clickCalls = 0;
@@ -2612,6 +2595,7 @@ describe('isolated fail-closed interaction audit', () => {
       type: candidate.type,
       disabled: candidate.disabled,
       visible: candidate.visible,
+      destructiveFacts: destructiveActionFactsOfNames([candidate.accessibleName]),
       boundingBox: candidate.boundingBox,
     };
     const page = {
@@ -2660,7 +2644,7 @@ describe('isolated fail-closed interaction audit', () => {
       });
 
       expect(result.status).toBe('NOT_VERIFIABLE');
-      expectReason(result, 'DEADLINE_DURING_TARGET_HANDLE_ACQUISITION');
+      expectReason(result, 'DEADLINE_BEFORE_EXACT_NODE_CLICK');
       expect(result.evidence.after).toBeNull();
       expect(disposeCalls).toBe(1);
       expect(result.safety.invariantViolations).toContainEqual({
@@ -2687,7 +2671,7 @@ describe('isolated fail-closed interaction audit', () => {
     expectedReason,
   ) => {
     const candidate = await candidateNamed('/accordion.html', 'Toggle details');
-    // F16（設計書 4.4.1）で是正: 凍結の前の安定性の確認は、実際に時間が進むのを待つ。偽の時計を実際の時間に合わせて進める。
+    // 下準備の描画の待ちは、実際に時間が進むのを待つ。偽の時計を実際の時間に合わせて進める。
     vi.useFakeTimers({ shouldAdvanceTime: true });
     vi.setSystemTime(1_000);
     let handleEvaluations = 0;
@@ -2712,6 +2696,7 @@ describe('isolated fail-closed interaction audit', () => {
       type: candidate.type,
       disabled: candidate.disabled,
       visible: candidate.visible,
+      destructiveFacts: destructiveActionFactsOfNames([candidate.accessibleName]),
       boundingBox: candidate.boundingBox,
     };
     const clickError = new Error(expectedReason);
@@ -2789,6 +2774,7 @@ describe('isolated fail-closed interaction audit', () => {
       type: candidate.type,
       disabled: candidate.disabled,
       visible: candidate.visible,
+      destructiveFacts: destructiveActionFactsOfNames([candidate.accessibleName]),
       boundingBox: candidate.boundingBox,
     });
     const clickError = new Error(`${errorKind} after state change`);
@@ -2857,6 +2843,7 @@ describe('isolated fail-closed interaction audit', () => {
       type: candidate.type,
       disabled: candidate.disabled,
       visible: candidate.visible,
+      destructiveFacts: destructiveActionFactsOfNames([candidate.accessibleName]),
       boundingBox: candidate.boundingBox,
     };
     const page = {
@@ -3271,7 +3258,7 @@ describe('isolated fail-closed interaction audit', () => {
       expect(result.safety.invariantViolations).toEqual(expect.arrayContaining([
         {
           code: 'CDP_SESSION_DETACHED',
-          message: 'Document interception session detached while its page remained active',
+          message: CDP_SESSION_DETACHED_MESSAGE,
         },
         {
           code: 'GUARD_LISTENER_CLEANUP_FAILED',
@@ -3302,12 +3289,15 @@ describe('isolated fail-closed interaction audit', () => {
         await rawContextClose();
       });
       const invalidate = (): void => {
-        // frameが分類できないPlaywrightのリクエスト失敗は、freezeイベントを追加することなく
-        // インストール済みの実際のguardを通して無効化されなければならない。
+        // main frame の page を引けない Playwright のリクエスト失敗は、freeze イベントを追加することなく、インストール済みの実際の guard を通して
+        // 無効化されなければならない。SAFE-2 の 4: 前のきっかけ（frame を分類できない失敗）は違反でなく記録になったので、page の引き当ての失敗に替えた。
         const emitter = context as unknown as { emit(event: string, value: unknown): boolean };
-        // CC-094: 偽の要求は共通の補助で作る（frame の口だけ、投げる口に替える）。
+        // CC-094: 偽の要求は共通の補助で作る（frame の口だけ、page を引けない main frame に替える）。
         emitter.emit('requestfailed', fakePlaywrightRequest({ navigation: true }, {
-          frame: () => { throw new Error('lifecycle priority frame classification failed'); },
+          frame: () => ({
+            parentFrame: () => null,
+            page: () => { throw new Error('lifecycle priority page lookup failed'); },
+          }),
         }));
       };
       return Object.freeze({
@@ -3346,7 +3336,6 @@ describe('isolated fail-closed interaction audit', () => {
     expect(result.evidence.identityStatus).toBe('MATCHED');
     expect(result.evidence.changedFields).toEqual(expect.arrayContaining(['ariaExpanded', 'controlledVisible']));
     expect(result.safety.invariantViolations).toEqual(expect.arrayContaining([
-      { code: 'FRAME_CLASSIFICATION_FAILED', message: 'lifecycle priority frame classification failed' },
       { code: 'INTERACTION_OWNER_CLOSE_FAILED', message: 'Passive request guard context was invalidated' },
     ]));
     expect(result.safety.blockedInteractionRequests).toEqual([]);
@@ -3457,7 +3446,7 @@ describe('isolated fail-closed interaction audit', () => {
 
   it('preserves a deadline result when hostile handle dispose rejection normalization fails', async () => {
     const candidate = await candidateNamed('/accordion.html', 'Toggle details');
-    // F16（設計書 4.4.1）で是正: 凍結の前の安定性の確認は、実際に時間が進むのを待つ。偽の時計を実際の時間に合わせて進める。
+    // 下準備の描画の待ちは、実際に時間が進むのを待つ。偽の時計を実際の時間に合わせて進める。
     vi.useFakeTimers({ shouldAdvanceTime: true });
     vi.setSystemTime(1_000);
     let closeCalls = 0;
@@ -3483,6 +3472,7 @@ describe('isolated fail-closed interaction audit', () => {
       type: candidate.type,
       disabled: candidate.disabled,
       visible: candidate.visible,
+      destructiveFacts: destructiveActionFactsOfNames([candidate.accessibleName]),
       boundingBox: candidate.boundingBox,
     };
     const hostileDisposeError = new Proxy(new Error('hidden dispose failure'), {
@@ -3532,7 +3522,7 @@ describe('isolated fail-closed interaction audit', () => {
       });
 
       expect(result.status).toBe('NOT_VERIFIABLE');
-      expectReason(result, 'DEADLINE_DURING_TARGET_HANDLE_ACQUISITION');
+      expectReason(result, 'DEADLINE_BEFORE_EXACT_NODE_CLICK');
       expect(result.evidence.after).toBeNull();
       expect(disposeCalls).toBe(1);
       expect(closeCalls).toBe(1);
@@ -3611,6 +3601,7 @@ describe('isolated fail-closed interaction audit', () => {
       type: candidate.type,
       disabled: candidate.disabled,
       visible: candidate.visible,
+      destructiveFacts: destructiveActionFactsOfNames([candidate.accessibleName]),
       boundingBox: candidate.boundingBox,
     });
     const page = {
@@ -3690,6 +3681,7 @@ describe('isolated fail-closed interaction audit', () => {
       type: candidate.type,
       disabled: candidate.disabled,
       visible: candidate.visible,
+      destructiveFacts: destructiveActionFactsOfNames([candidate.accessibleName]),
       boundingBox: candidate.boundingBox,
     });
     const page = {
@@ -3763,6 +3755,7 @@ describe('isolated fail-closed interaction audit', () => {
       type: candidate.type,
       disabled: candidate.disabled,
       visible: candidate.visible,
+      destructiveFacts: destructiveActionFactsOfNames([candidate.accessibleName]),
       boundingBox: candidate.boundingBox,
     });
     const page = {
@@ -3865,6 +3858,7 @@ describe('isolated fail-closed interaction audit', () => {
       type: candidate.type,
       disabled: candidate.disabled,
       visible: candidate.visible,
+      destructiveFacts: destructiveActionFactsOfNames([candidate.accessibleName]),
       boundingBox: candidate.boundingBox,
     });
     const page = {
@@ -3940,6 +3934,7 @@ describe('isolated fail-closed interaction audit', () => {
       type: candidate.type,
       disabled: candidate.disabled,
       visible: candidate.visible,
+      destructiveFacts: destructiveActionFactsOfNames([candidate.accessibleName]),
       boundingBox: candidate.boundingBox,
     });
     const page = {
@@ -4020,6 +4015,7 @@ describe('isolated fail-closed interaction audit', () => {
       type: candidate.type,
       disabled: candidate.disabled,
       visible: candidate.visible,
+      destructiveFacts: destructiveActionFactsOfNames([candidate.accessibleName]),
       boundingBox: candidate.boundingBox,
     };
     const page = {
@@ -4070,22 +4066,6 @@ describe('isolated fail-closed interaction audit', () => {
   });
 
   describe('Task 11 cleanup deadline and interaction-wide DOM budget', () => {
-    const resolutionEnvelopeWithWork = (handle: unknown, domWorkUsed: number) => {
-      const property = (value: unknown) => ({
-        jsonValue: async () => value,
-        dispose: async () => undefined,
-        asElement: () => value === handle ? handle : null,
-      });
-      return {
-        getProperties: async () => new Map([
-          ['status', property('FOUND')],
-          ['domWorkUsed', property(domWorkUsed)],
-          ['element', property(handle)],
-        ]),
-        dispose: async () => undefined,
-      };
-    };
-
     it('bounds a never-settling real Guard close by one cleanup deadline and one raw close owner', async () => {
       const candidate = await candidateNamed('/accordion.html', 'Toggle details');
       const rawCloseGate = createDeferred<void>();
@@ -4290,142 +4270,8 @@ describe('isolated fail-closed interaction audit', () => {
       expect(cleanupError.lastCloseError).toBeUndefined();
     });
 
-    it('shares one DOM-work remainder across discovery resolution and inspection before click', async () => {
-      const candidate = await candidateNamed('/accordion.html', 'Toggle details');
-      const rawCandidate = rawCandidateFor(candidate);
-      const observedLimits: number[] = [];
-      let disposeCalls = 0;
-      let clickCalls = 0;
-      const targetHandle = {
-        evaluate: async (_callback: unknown, argument: { readonly limits: { readonly maxDomWork: number } }) => {
-          observedLimits.push(argument.limits.maxDomWork);
-          return { status: 'CONNECTED', domWorkUsed: 3_384, raw: rawCandidate };
-        },
-        click: async () => { clickCalls += 1; },
-        dispose: async () => { disposeCalls += 1; },
-      };
-      const page = {
-        goto: async () => undefined,
-        evaluate: async (_callback: unknown, argument?: { readonly limits: { readonly maxDomWork: number } }) => {
-          if (argument === undefined) return true;
-          observedLimits.push(argument.limits.maxDomWork);
-          return { candidates: [rawCandidate], completeness: 'COMPLETE', domWorkUsed: 8_000 };
-        },
-        evaluateHandle: async (_callback: unknown, argument: { readonly limits: { readonly maxDomWork: number } }) => {
-          observedLimits.push(argument.limits.maxDomWork);
-          return resolutionEnvelopeWithWork(targetHandle, 5_000);
-        },
-      } as unknown as Page;
-
-      const result = await auditInteraction({
-        ...input('/accordion.html', candidate),
-        sessionFactory: async () => ({
-          page: withScrollPreparation(page, candidate),
-          ledger: new SafetyLedger(),
-          activateInteractionFreeze: async () => undefined,
-          ...fakeCloseLifecycle(),
-        }),
-      });
-
-      expect(observedLimits).toEqual([16_384, 8_384, 3_384]);
-      expect(observedLimits[0]! - observedLimits[1]!
-        + observedLimits[1]! - observedLimits[2]!
-        + observedLimits[2]!).toBe(16_384);
-      expect(result.status).toBe('NOT_VERIFIABLE');
-      expectReason(result, 'DOM_WORK_EXHAUSTED');
-      expect(clickCalls).toBe(0);
-      expect(disposeCalls).toBe(1);
-    });
-
-    it('shares the remaining DOM budget across repeated observation and disconnected fallback rediscovery', async () => {
-      const candidate = await candidateNamed('/accordion.html', 'Toggle details');
-      const rawCandidate = rawCandidateFor(candidate);
-      const observedLimits: number[] = [];
-      const snapshots = [
-        { status: 'CONNECTED', domWorkUsed: 10, raw: rawCandidate },
-        { status: 'CONNECTED', domWorkUsed: 8_000, raw: rawCandidate },
-        { status: 'DISCONNECTED', domWorkUsed: 100 },
-      ];
-      let snapshotIndex = 0;
-      let discoveryIndex = 0;
-      const targetHandle = {
-        evaluate: async (_callback: unknown, argument: { readonly limits: { readonly maxDomWork: number } }) => {
-          observedLimits.push(argument.limits.maxDomWork);
-          return snapshots[snapshotIndex++];
-        },
-        click: async () => undefined,
-        dispose: async () => undefined,
-      };
-      const page = {
-        goto: async () => undefined,
-        evaluate: async (_callback: unknown, argument?: { readonly limits: { readonly maxDomWork: number } }) => {
-          if (argument === undefined) return true;
-          observedLimits.push(argument.limits.maxDomWork);
-          discoveryIndex += 1;
-          return discoveryIndex === 1
-            ? { candidates: [rawCandidate], completeness: 'COMPLETE', domWorkUsed: 10 }
-            : { candidates: [], completeness: 'DOM_WORK_BUDGET_REACHED', domWorkUsed: 8_254 };
-        },
-        evaluateHandle: async (_callback: unknown, argument: { readonly limits: { readonly maxDomWork: number } }) => {
-          observedLimits.push(argument.limits.maxDomWork);
-          return resolutionEnvelopeWithWork(targetHandle, 10);
-        },
-      } as unknown as Page;
-
-      const result = await auditInteraction({
-        ...input('/accordion.html', candidate),
-        sessionFactory: async () => ({
-          page: withScrollPreparation(page, candidate),
-          ledger: new SafetyLedger(),
-          activateInteractionFreeze: async () => undefined,
-          ...fakeCloseLifecycle(),
-        }),
-      });
-
-      expect(observedLimits).toEqual([16_384, 16_374, 16_364, 16_354, 8_354, 8_254]);
-      expect(result.status).toBe('NOT_VERIFIABLE');
-      expectReason(result, 'DOM_WORK_EXHAUSTED');
-    });
-
-    it('disposes the exact retained handle once when resolution consumes the final DOM-work unit', async () => {
-      const candidate = await candidateNamed('/accordion.html', 'Toggle details');
-      const rawCandidate = rawCandidateFor(candidate);
-      let disposeCalls = 0;
-      let clickCalls = 0;
-      let inspectCalls = 0;
-      const targetHandle = {
-        evaluate: async () => {
-          inspectCalls += 1;
-          return { status: 'CONNECTED', domWorkUsed: 0, raw: rawCandidate };
-        },
-        click: async () => { clickCalls += 1; },
-        dispose: async () => { disposeCalls += 1; },
-      };
-      const page = {
-        goto: async () => undefined,
-        evaluate: async (_callback: unknown, argument?: unknown) => argument === undefined
-          ? true
-          : { candidates: [rawCandidate], completeness: 'COMPLETE', domWorkUsed: 100 },
-        evaluateHandle: async () => resolutionEnvelopeWithWork(targetHandle, 16_284),
-      } as unknown as Page;
-
-      const result = await auditInteraction({
-        ...input('/accordion.html', candidate),
-        sessionFactory: async () => ({
-          page: withScrollPreparation(page, candidate),
-          ledger: new SafetyLedger(),
-          activateInteractionFreeze: async () => undefined,
-          ...fakeCloseLifecycle(),
-        }),
-      });
-
-      expect(result.status).toBe('NOT_VERIFIABLE');
-      expectReason(result, 'DOM_WORK_EXHAUSTED');
-      expect(inspectCalls).toBe(0);
-      expect(clickCalls).toBe(0);
-      expect(disposeCalls).toBe(1);
-    });
-
+    // SPEC-5: 1 回の audit で共有する DOM の作業量（`maxDomWork`）はやめたので、その 3 件は消した。読み取りの部品の作業量の上限（テストが注入する）は、
+    // 発見の側の部品に残るので、0 の場面だけを残す。
     it('returns budget-reached from every DOM operation at zero without browser traversal', async () => {
       const page = {
         evaluate: async (): Promise<never> => { throw new Error('zero budget must not evaluate'); },
@@ -4450,14 +4296,12 @@ describe('isolated fail-closed interaction audit', () => {
 });
 }
 
-/** TS-c: C3 の是正のテストの、どちらの組を登録するか（F16 R5 は重いので、別のファイルで流す）。 */
-export type C3CorrectionCasesPart = 'MAIN' | 'F16';
-
 /**
- * TS-c: C3 の是正のテストのうち、`part` の組を登録する（`MAIN` は `isolated-interaction-corrections.test.ts`、`F16` は
- * `isolated-interaction-evidence.test.ts` が呼ぶ）。どちらも同じ describe の名前と、その直下の補助を使う。本文は、分ける前の位置と字下げのまま。
+ * TS-c: C3 の是正のテストを登録する（`isolated-interaction-corrections.test.ts` が呼ぶ）。本文は、分ける前の位置と字下げのまま。
+ * SLIM BD-5: SPEC-5 の後は F16 R5 の組も軽い（2026-11-15 の測りで 12 秒）ので、前の `isolated-interaction-evidence.test.ts` の組と 1 つにした
+ * （前の組の分かれ目は、字下げを保つために、ただの block のまま残す）。
  */
-export function registerC3CorrectionCases(part: C3CorrectionCasesPart): void {
+export function registerC3CorrectionCases(): void {
 describe('C3 corrections (foundation corrections design 4.2-4.8, 5.5)', () => {
   function toggledRawCandidate(candidate: InteractionCandidate) {
     return {
@@ -4516,7 +4360,7 @@ describe('C3 corrections (foundation corrections design 4.2-4.8, 5.5)', () => {
     };
   }
 
-  if (part === 'MAIN') {
+  {
   describe('C2 follow-up: only frozen-phase downloads block the interaction', () => {
     it('keeps VERIFIED work when the only download was recorded in the Passive phase', async () => {
       const candidate = await candidateNamed('/accordion.html', 'Toggle details');
@@ -4674,20 +4518,8 @@ describe('C3 corrections (foundation corrections design 4.2-4.8, 5.5)', () => {
           'INITIAL_LOAD_AFTER_LOAD',
           'INITIAL_LOAD_BEFORE_RENDER',
           'SCROLL_PREPARATION_DEADLINE',
-          'SCROLL_PREPARATION_SETTLE_DEADLINE',
-          'HOVER_PREPARATION_DEADLINE',
-          'FOCUS_PREPARATION_DEADLINE',
-          'STABILITY_CHECK_DEADLINE',
-          'DEADLINE_AFTER_SAFETY_FREEZE',
-          'DEADLINE_DURING_CANDIDATE_REDISCOVERY',
-          'DEADLINE_BEFORE_TARGET_HANDLE_ACQUISITION',
-          'DEADLINE_DURING_TARGET_HANDLE_ACQUISITION',
-          'DEADLINE_DURING_TARGET_FACT_COLLECTION',
-          'DEADLINE_DURING_EXACT_NODE_ADMISSION',
           'DEADLINE_BEFORE_EXACT_NODE_CLICK',
-          'DEADLINE_BEFORE_POST_CONDITION_OBSERVATION',
           'DEADLINE_DURING_POST_CONDITION_OBSERVATION',
-          'PERSISTENCE_CHECK_DEADLINE',
         ]).toContain(work.reason);
         expect(work.reasonDetail).toBeNull();
       } finally {
@@ -4763,7 +4595,7 @@ describe('C3 corrections (foundation corrections design 4.2-4.8, 5.5)', () => {
 
         const settled = await settleWithin(auditInteraction({
           ...input('/accordion.html', candidate),
-          // F16（設計書 4.4.1）で是正: 凍結の前の安定性の確認（500ms）を終えてから、確かめたい段階に進むよう、期限を延ばした。
+          // 下準備を終えてから、確かめたい段階に進むよう、期限に余裕を持たせる。
           timeoutMs: 1_000,
           sessionFactory: async () => ({
             page: withScrollPreparation(page, candidate),
@@ -4777,7 +4609,7 @@ describe('C3 corrections (foundation corrections design 4.2-4.8, 5.5)', () => {
 
         expect(discoveryCalls).toBe(1);
         expect(result.status).toBe('NOT_VERIFIABLE');
-        expectReason(result, 'DEADLINE_DURING_CANDIDATE_REDISCOVERY');
+        expectReason(result, 'DEADLINE_BEFORE_EXACT_NODE_CLICK');
         lateDiscovery.reject(new Error('late discovery rejection after deadline'));
         await wait(0);
         await wait(0);
@@ -4808,7 +4640,7 @@ describe('C3 corrections (foundation corrections design 4.2-4.8, 5.5)', () => {
 
       const settled = await settleWithin(auditInteraction({
         ...input('/accordion.html', candidate),
-        // F16（設計書 4.4.1）で是正: 凍結の前の安定性の確認（500ms）を終えてから、確かめたい段階に進むよう、期限を延ばした。
+        // 下準備を終えてから、確かめたい段階に進むよう、期限に余裕を持たせる。
         timeoutMs: 1_000,
         sessionFactory: async () => ({
           page: withScrollPreparation(page, candidate),
@@ -4821,7 +4653,7 @@ describe('C3 corrections (foundation corrections design 4.2-4.8, 5.5)', () => {
       const result = settled as Awaited<ReturnType<typeof auditInteraction>>;
 
       expect(result.status).toBe('NOT_VERIFIABLE');
-      expectReason(result, 'DEADLINE_DURING_TARGET_HANDLE_ACQUISITION');
+      expectReason(result, 'DEADLINE_BEFORE_EXACT_NODE_CLICK');
       lateResolution.resolve(boundedResolutionEnvelope(targetHandle));
       await expect.poll(() => disposeCalls).toBe(1);
       expect(clickCalls).toBe(0);
@@ -5001,104 +4833,6 @@ describe('C3 corrections (foundation corrections design 4.2-4.8, 5.5)', () => {
         await page.close();
       }
     });
-
-    it('does not verify an inert offscreen button whose viewport position changes only by click scrolling', async () => {
-      const candidate = await candidateNamed('/offscreen-inert-button.html', 'Offscreen inert');
-      expect(candidate.boundingBox.y).toBeCloseTo(2008, 0);
-
-      // DF-2b（DEF-093）: 前は Interaction の期限を 1 秒にしていたので、混雑の下では押す前に期限が切れ（`STABILITY_CHECK_DEADLINE`）、押す場面を
-      // 通らない回があった。1 秒に混雑の倍率を掛けた期限（全体の期限も倍率を掛けた値）にして、押した後の判定まで通す。この場面は変化を待って
-      // 期限まで観察するので、`LOADED_GATE_INTERACTION_TIMING.timeoutMs`（12 秒）までは延ばさない。
-      const result = await auditInteraction({
-        ...loadedInput('/offscreen-inert-button.html', candidate),
-        timeoutMs: OFFSCREEN_INERT_BUTTON_TIMEOUT_MS * LOADED_DEADLINE_FACTOR,
-      });
-
-      // 期限が切れる時点によって、クリックの後の期限切れの理由の文言が変わる（F04 の発見事項3）。
-      // このテストの目的は、画面外の無反応なボタンを VERIFIED にしないことなので、クリックの後の期限切れの理由のどれかを受け付ける。
-      expect(result.status, JSON.stringify(result)).toBe('NOT_VERIFIABLE');
-      expect(result.status).not.toBe('VERIFIED');
-      expect([
-        'DEADLINE_BEFORE_POST_CONDITION_OBSERVATION',
-        'DEADLINE_DURING_POST_CONDITION_OBSERVATION',
-        'NO_OBSERVABLE_CHANGE',
-      ]).toContain(result.reason);
-      expect(result.evidence.changedFields).toEqual([]);
-      if (result.evidence.after !== null) {
-        expect(result.evidence.after.boundingBox).toEqual(candidate.boundingBox);
-      }
-    }, LOADED_INTERACTION_AUDIT_TEST_TIMEOUT_MS);
-  });
-
-  describe('M1: text-node limit is distinct from the DOM-work budget', () => {
-    it('records the text-node limit reason when rediscovery stops at the text-node limit', async () => {
-      const candidate = await candidateNamed('/accordion.html', 'Toggle details');
-      const page = {
-        goto: async () => undefined,
-        evaluate: async (_callback: unknown, argument?: unknown) => (
-          argument === undefined ? true : { candidates: [], completeness: 'TEXT_NODE_LIMIT_REACHED', domWorkUsed: 530 }
-        ),
-      } as unknown as Page;
-
-      const result = await auditInteraction({
-        ...input('/accordion.html', candidate),
-        sessionFactory: async () => ({
-          page,
-          ledger: new SafetyLedger(),
-          activateInteractionFreeze: async () => undefined,
-          ...fakeCloseLifecycle(),
-        }),
-      });
-
-      expect(result.status).toBe('NOT_VERIFIABLE');
-      expectReason(result, 'CANDIDATE_REDISCOVERY_INCOMPLETE', 'TEXT_NODE_LIMIT_REACHED');
-      expect(result.evidence.identityStatus).toBe('UNESTABLISHED');
-    });
-
-    it.each(['pre-admission inspection', 'retained observation'] as const)(
-      'records the text-node limit reason for %s',
-      async (branch) => {
-        const candidate = await candidateNamed('/accordion.html', 'Toggle details');
-        const rawCandidate = rawCandidateFor(candidate);
-        const snapshots = branch === 'pre-admission inspection'
-          ? [{ status: 'TEXT_NODE_LIMIT_REACHED', domWorkUsed: 530 }]
-          : [
-              { status: 'CONNECTED', domWorkUsed: 10, raw: rawCandidate },
-              { status: 'TEXT_NODE_LIMIT_REACHED', domWorkUsed: 530 },
-            ];
-        let snapshotIndex = 0;
-        let clickCalls = 0;
-        const targetHandle = {
-          evaluate: async () => snapshots[snapshotIndex++],
-          click: async () => { clickCalls += 1; },
-          dispose: async () => undefined,
-        };
-        const page = {
-          goto: async () => undefined,
-          evaluate: async (_callback: unknown, argument?: unknown) => (
-            argument === undefined ? true : { candidates: [rawCandidate], completeness: 'COMPLETE', domWorkUsed: 20 }
-          ),
-          evaluateHandle: async () => boundedResolutionEnvelope(targetHandle),
-        } as unknown as Page;
-
-        const result = await auditInteraction({
-          ...input('/accordion.html', candidate),
-          sessionFactory: async () => ({
-            page: withScrollPreparation(page, candidate),
-            ledger: new SafetyLedger(),
-            activateInteractionFreeze: async () => undefined,
-            ...fakeCloseLifecycle(),
-          }),
-        });
-
-        expect(result.status).toBe('NOT_VERIFIABLE');
-        expect(result.reason).toBe(branch === 'pre-admission inspection'
-          ? 'TARGET_INSPECTION_TEXT_NODE_LIMIT_REACHED'
-          : 'RETAINED_INSPECTION_TEXT_NODE_LIMIT_REACHED');
-        expect(result.evidence.identityStatus).toBe('UNESTABLISHED');
-        expect(clickCalls).toBe(branch === 'pre-admission inspection' ? 0 : 1);
-      },
-    );
   });
 
   describe('M2: mechanically excluded candidates are ledgered separately from external actions', () => {
@@ -5215,7 +4949,7 @@ describe('C3 corrections (foundation corrections design 4.2-4.8, 5.5)', () => {
 
       const settled = await settleWithin(auditInteraction({
         ...input('/accordion.html', candidate),
-        // F16（設計書 4.4.1）で是正: 凍結の前の安定性の確認（500ms）を終えてから、確かめたい段階に進むよう、期限を延ばした。
+        // 下準備を終えてから、確かめたい段階に進むよう、期限に余裕を持たせる。
         timeoutMs: 1_500,
         sessionFactory: async () => toggleSessionWithDispose(candidate, ledger, async () => {
           disposeCalls += 1;
@@ -5241,7 +4975,7 @@ describe('C3 corrections (foundation corrections design 4.2-4.8, 5.5)', () => {
       try {
         const settled = await settleWithin(auditInteraction({
           ...input('/accordion.html', candidate),
-          // F16（設計書 4.4.1）で是正: 凍結の前の安定性の確認（500ms）を終えてから、確かめたい段階に進むよう、期限を延ばした。
+          // 下準備を終えてから、確かめたい段階に進むよう、期限に余裕を持たせる。
           timeoutMs: 1_500,
           sessionFactory: async () => toggleSessionWithDispose(candidate, ledger, () => lateDispose.promise),
         }), 3_000);
@@ -5264,8 +4998,9 @@ describe('C3 corrections (foundation corrections design 4.2-4.8, 5.5)', () => {
     });
   });
 
+  // SPEC-5: 押した後の期限切れの代表（押した後の 1 回の観測を、期限の後に始めない。区分は CHECK_NOT_COMPLETED）。
   describe('F06 R2-N4: a work-phase browser evaluation is not started after the deadline', () => {
-    it('does not start the post-click inspection when the deadline passes after the last remaining-time check', async () => {
+    it('does not start the post-click inspection when the deadline passes after the click', async () => {
       const candidate = await candidateNamed('/accordion.html', 'Toggle details');
       const rawCandidate = rawCandidateFor(candidate);
       const realNow = Date.now.bind(Date);
@@ -5287,8 +5022,7 @@ describe('C3 corrections (foundation corrections design 4.2-4.8, 5.5)', () => {
         ),
         evaluateHandle: async () => boundedResolutionEnvelope(targetHandle),
       } as unknown as Page;
-      // click の後、最初の残り時間の確認（観測ループの先頭）までは期限の前の時刻を返し、その次の時刻の読み取りからは期限を過ぎた時刻を返す。
-      // 観測ループの先頭の確認とブラウザ内の評価の開始の間に期限が過ぎる競合を、決定的に再現する。
+      // click の後、最初の時刻の読み取りは期限の前の時刻を返し、その次の時刻の読み取りからは期限を過ぎた時刻を返す。
       const nowSpy = vi.spyOn(Date, 'now').mockImplementation(() => {
         if (armedCalls === undefined) return realNow();
         armedCalls += 1;
@@ -5309,7 +5043,7 @@ describe('C3 corrections (foundation corrections design 4.2-4.8, 5.5)', () => {
 
         expect(result.status).toBe('NOT_VERIFIABLE');
         expectReason(result, 'DEADLINE_DURING_POST_CONDITION_OBSERVATION');
-        // I15a: click の後の観測を1回も終えないまま期限が切れたので、確かめる手順を終えられなかった区分にする。
+        // I15a: click の後の観測を終えないまま期限が切れたので、確かめる手順を終えられなかった区分にする。
         expect(result.notVerifiableKind).toBe('CHECK_NOT_COMPLETED');
         expect(handleEvaluations).toBe(1);
       } finally {
@@ -5318,36 +5052,9 @@ describe('C3 corrections (foundation corrections design 4.2-4.8, 5.5)', () => {
     });
   });
 
+  // SPEC-5（設計書 2026-11-14 5.1 の案 B）: 凍結の前の下準備は、スクロール・hover・描画 2 回・観測 1 回。残すのは、スクロールで始まる読み込みを
+  // Passive で遮断しないこと・下準備と凍結と押す順・凍結の後に現れた要素を押さないこと・下準備の失敗の代表 1 件。
   describe('F06b R2-N1: the target is scrolled into view in the Passive phase before the safety freeze', () => {
-    /** click の後の期限切れの理由（`:4402` のテストと同じ理由で、どれかを受け付ける）。 */
-    const POST_CLICK_DEADLINE_REASONS = [
-      'DEADLINE_BEFORE_POST_CONDITION_OBSERVATION',
-      'DEADLINE_DURING_POST_CONDITION_OBSERVATION',
-      'NO_OBSERVABLE_CHANGE',
-    ];
-
-    it('does not verify an inert button placed offscreen inside an inner scroll container', async () => {
-      const candidate = await candidateNamed('/inner-scroll-inert-button.html', 'Inner offscreen inert');
-      // 前提: ボタンは内側の領域の画面外にあり、ページ全体はスクロールしない。
-      expect(candidate.boundingBox.y).toBeGreaterThan(viewport.height);
-
-      const result = await auditInteraction({ ...input('/inner-scroll-inert-button.html', candidate), timeoutMs: 1_500 });
-
-      expect(result.status, JSON.stringify(result)).toBe('NOT_VERIFIABLE');
-      expect(POST_CLICK_DEADLINE_REASONS).toContain(result.reason);
-      expect(result.evidence.changedFields).toEqual([]);
-    });
-
-    it('does not verify an inert position-fixed button on a scrolling page', async () => {
-      const candidate = await candidateNamed('/fixed-inert-button.html', 'Fixed inert');
-
-      const result = await auditInteraction({ ...input('/fixed-inert-button.html', candidate), timeoutMs: 1_500 });
-
-      expect(result.status, JSON.stringify(result)).toBe('NOT_VERIFIABLE');
-      expect(POST_CLICK_DEADLINE_REASONS).toContain(result.reason);
-      expect(result.evidence.changedFields).toEqual([]);
-    });
-
     it('verifies an accordion placed offscreen inside an inner scroll container and keeps its scroll-triggered load Passive', async () => {
       const candidate = await candidateNamed('/inner-scroll-accordion.html', 'Inner offscreen toggle');
       expect(candidate.boundingBox.y).toBeGreaterThan(viewport.height);
@@ -5363,86 +5070,47 @@ describe('C3 corrections (foundation corrections design 4.2-4.8, 5.5)', () => {
       expect(result.safety.blockedInteractionRequests).toEqual([]);
     });
 
-    /** 解決と、スクロール・破棄・凍結・click の順序を記録する偽のセッションを作る。 */
+    /** 解決と、スクロール・hover・破棄・凍結・click の順序を記録する偽のセッションを作る。click の前は元の状態、click の後は ariaExpanded が変わった状態を返す。 */
     function preparationSession(
       candidate: InteractionCandidate,
       options: {
         readonly events: string[];
-        readonly scroll?: (options: { readonly timeout: number }) => Promise<void>;
-        readonly hover?: (options: { readonly timeout: number }) => Promise<void>;
-        readonly discoveryWork?: readonly number[];
-        readonly resolutionWork?: number;
-        readonly observedLimits?: number[];
+        readonly hover?: () => Promise<void>;
       },
     ): InteractionGuardedSession {
       const rawCandidate = rawCandidateFor(candidate);
-      // F16（設計書 4.4.1 の安定性の確認）で是正: 以前は観測の回数で記録を切り替えていた。下準備の handle も安定性の確認で
-      // 観測されるので、click の前は元の状態、click の後は ariaExpanded が変わった状態を返す。下準備の観測の作業量は0にする。
-      // F20（設計書 4.4.2 手順4）で是正: 下準備の focus の前後で属性の記録を比べるので、凍結の前は属性のない記録を返す。
       let clicked = false;
-      let frozen = false;
-      let discoveryIndex = 0;
       const targetHandle = {
-        evaluate: async () => (clicked
-          ? { status: 'CONNECTED', domWorkUsed: 10, raw: toggledRawCandidate(candidate) }
-          : frozen
-            ? { status: 'CONNECTED', domWorkUsed: 10, raw: rawCandidate }
-            : { status: 'CONNECTED', domWorkUsed: 0, raw: rawCandidate, attributes: { complete: true, entries: [] } }),
-        scrollIntoViewIfNeeded: async (scrollOptions: { readonly timeout: number }) => {
-          options.events.push('scroll');
-          await options.scroll?.(scrollOptions);
-        },
-        hover: async (hoverOptions: { readonly timeout: number }) => {
+        evaluate: async () => ({ status: 'CONNECTED', domWorkUsed: 0, raw: clicked ? toggledRawCandidate(candidate) : rawCandidate }),
+        scrollIntoViewIfNeeded: async () => { options.events.push('scroll'); },
+        hover: async () => {
           options.events.push('hover');
-          await options.hover?.(hoverOptions);
+          await options.hover?.();
         },
-        focus: async () => { options.events.push('focus'); },
         click: async () => {
           options.events.push('click');
           clicked = true;
         },
         dispose: async () => { options.events.push('dispose'); },
       };
-      const envelopeProperty = (value: unknown) => ({
-        jsonValue: async () => value,
-        dispose: async () => undefined,
-        asElement: () => value === targetHandle ? targetHandle : null,
-      });
       const page = {
         goto: async () => undefined,
-        evaluate: async (_callback: unknown, argument?: { readonly limits: { readonly maxDomWork: number } }) => {
-          if (argument === undefined) return true;
-          options.observedLimits?.push(argument.limits.maxDomWork);
-          const work = options.discoveryWork ?? [20];
-          const domWorkUsed = work[Math.min(discoveryIndex++, work.length - 1)];
-          return { candidates: [rawCandidate], completeness: 'COMPLETE', domWorkUsed };
-        },
-        evaluateHandle: async (_callback: unknown, argument: { readonly limits: { readonly maxDomWork: number } }) => {
-          options.observedLimits?.push(argument.limits.maxDomWork);
+        evaluate: async (_callback: unknown, argument?: unknown) => (
+          argument === undefined ? true : { candidates: [rawCandidate], completeness: 'COMPLETE', domWorkUsed: 0 }
+        ),
+        evaluateHandle: async () => {
           options.events.push('resolve');
-          return {
-            getProperties: async () => new Map([
-              ['status', envelopeProperty('FOUND')],
-              ['domWorkUsed', envelopeProperty(options.resolutionWork ?? 0)],
-              ['element', envelopeProperty(targetHandle)],
-            ]),
-            dispose: async () => undefined,
-          };
+          return boundedResolutionEnvelope(targetHandle);
         },
       } as unknown as Page;
       return {
         page,
         ledger: new SafetyLedger(),
-        activateInteractionFreeze: async () => {
-          options.events.push('freeze');
-          frozen = true;
-        },
+        activateInteractionFreeze: async () => { options.events.push('freeze'); },
         ...fakeCloseLifecycle(),
       };
     }
 
-    // F15（設計書 4.4.2）で是正: 下準備の手順に、スクロールの後の hover を加えた。
-    // F16（設計書 4.4.1）で是正: hover の後に focus を加えた。handle の破棄は、安定性の確認の後に行う。
     it('scrolls, hovers, and disposes the prepared handle before the freeze, then resolves again and clicks', async () => {
       const candidate = await candidateNamed('/accordion.html', 'Toggle details');
       const events: string[] = [];
@@ -5453,10 +5121,11 @@ describe('C3 corrections (foundation corrections design 4.2-4.8, 5.5)', () => {
       });
 
       expect(result.status).toBe('VERIFIED');
-      expect(events).toEqual(['resolve', 'scroll', 'hover', 'focus', 'dispose', 'freeze', 'resolve', 'click', 'dispose']);
+      expect(events).toEqual(['resolve', 'scroll', 'hover', 'dispose', 'freeze', 'resolve', 'click', 'dispose']);
     });
 
-    it('does not freeze or click when the pre-freeze scroll fails', async () => {
+    // 下準備の失敗の代表（スクロールと hover の失敗は、同じ理由のコード）。凍結も click もしない。
+    it('does not freeze or click when the pre-freeze hover fails', async () => {
       const candidate = await candidateNamed('/accordion.html', 'Toggle details');
       const events: string[] = [];
 
@@ -5464,88 +5133,14 @@ describe('C3 corrections (foundation corrections design 4.2-4.8, 5.5)', () => {
         ...input('/accordion.html', candidate),
         sessionFactory: async () => preparationSession(candidate, {
           events,
-          scroll: async () => { throw new Error('scroll target detached'); },
+          hover: async () => { throw new Error('hover target detached'); },
         }),
       });
 
       expect(result.status).toBe('NOT_VERIFIABLE');
-      expectReason(result, 'SCROLL_PREPARATION_FAILED', 'scroll target detached');
+      expectReason(result, 'SCROLL_PREPARATION_FAILED', 'hover target detached');
       expect(result.evidence.identityStatus).toBe('UNESTABLISHED');
-      expect(events).toEqual(['resolve', 'scroll', 'dispose']);
-    });
-
-    it.each([
-      [
-        'ANSI escapes and the Playwright call log',
-        [
-          '\u001b[31melementHandle.scrollIntoViewIfNeeded: Element is not attached to the DOM\u001b[39m',
-          'Call log:',
-          '\u001b[2m  - attempting scroll into view action\u001b[22m',
-        ].join('\n'),
-        'elementHandle.scrollIntoViewIfNeeded: Element is not attached to the DOM',
-      ],
-      ['only control characters', '\u001b[31m\u0007\r\n\u001b[39m', null],
-    ] as const)('normalizes a pre-freeze scroll failure reason with %s', async (_label, message, expectedReasonDetail) => {
-      const candidate = await candidateNamed('/accordion.html', 'Toggle details');
-      const events: string[] = [];
-
-      const result = await auditInteraction({
-        ...input('/accordion.html', candidate),
-        sessionFactory: async () => preparationSession(candidate, {
-          events,
-          scroll: async () => { throw new Error(message); },
-        }),
-      });
-
-      expect(result.status).toBe('NOT_VERIFIABLE');
-      expectReason(result, 'SCROLL_PREPARATION_FAILED', expectedReasonDetail);
-      expect(events).toEqual(['resolve', 'scroll', 'dispose']);
-    });
-
-    it('records the deadline reason when the pre-freeze scroll times out in the browser', async () => {
-      const candidate = await candidateNamed('/accordion.html', 'Toggle details');
-      const events: string[] = [];
-      const timeout = new Error('scroll timed out');
-      timeout.name = 'TimeoutError';
-
-      const result = await auditInteraction({
-        ...input('/accordion.html', candidate),
-        sessionFactory: async () => preparationSession(candidate, {
-          events,
-          scroll: async () => { throw timeout; },
-        }),
-      });
-
-      expect(result.status).toBe('NOT_VERIFIABLE');
-      expectReason(result, 'SCROLL_PREPARATION_DEADLINE');
-      expect(events).toEqual(['resolve', 'scroll', 'dispose']);
-    });
-
-    it('bounds a never-settling pre-freeze scroll by the effective deadline', async () => {
-      const candidate = await candidateNamed('/accordion.html', 'Toggle details');
-      const events: string[] = [];
-      const neverSettles = createDeferred<void>();
-      let scrollTimeout: number | undefined;
-
-      const settled = await settleWithin(auditInteraction({
-        ...input('/accordion.html', candidate),
-        timeoutMs: 200,
-        sessionFactory: async () => preparationSession(candidate, {
-          events,
-          scroll: async ({ timeout }) => {
-            scrollTimeout = timeout;
-            await neverSettles.promise;
-          },
-        }),
-      }), 2_000);
-
-      expect(settled).not.toBe('STILL_PENDING');
-      const result = settled as Awaited<ReturnType<typeof auditInteraction>>;
-      expect(result.status).toBe('NOT_VERIFIABLE');
-      expectReason(result, 'SCROLL_PREPARATION_DEADLINE');
-      expect(scrollTimeout).toBeGreaterThan(0);
-      expect(scrollTimeout).toBeLessThanOrEqual(200);
-      expect(events).toEqual(['resolve', 'scroll', 'dispose']);
+      expect(events).toEqual(['resolve', 'scroll', 'hover', 'dispose']);
     });
 
     it('does not click a target that appeared only after the freeze and was never scrolled into view', async () => {
@@ -5587,215 +5182,15 @@ describe('C3 corrections (foundation corrections design 4.2-4.8, 5.5)', () => {
       expectReason(result, 'TARGET_NOT_SCROLL_PREPARED');
       expect(events).toEqual(['freeze', 'resolve', 'dispose']);
     });
-
-    it('disposes a pre-freeze handle whose resolution settles only after the deadline, without freezing', async () => {
-      const candidate = await candidateNamed('/accordion.html', 'Toggle details');
-      const events: string[] = [];
-      const lateResolution = createDeferred<unknown>();
-      let disposeCalls = 0;
-      const lateHandle = {
-        evaluate: async (): Promise<never> => { throw new Error('late handle must not be inspected'); },
-        scrollIntoViewIfNeeded: async () => { events.push('scroll'); },
-        dispose: async () => { disposeCalls += 1; },
-      };
-      const rawCandidate = rawCandidateFor(candidate);
-      const page = {
-        goto: async () => undefined,
-        evaluate: async (_callback: unknown, argument?: unknown) => (
-          argument === undefined ? true : { candidates: [rawCandidate], completeness: 'COMPLETE', domWorkUsed: 20 }
-        ),
-        evaluateHandle: async () => lateResolution.promise,
-      } as unknown as Page;
-
-      const settled = await settleWithin(auditInteraction({
-        ...input('/accordion.html', candidate),
-        timeoutMs: 100,
-        sessionFactory: async () => ({
-          page,
-          ledger: new SafetyLedger(),
-          activateInteractionFreeze: async () => { events.push('freeze'); },
-          ...fakeCloseLifecycle(),
-        }),
-      }), 2_000);
-      expect(settled).not.toBe('STILL_PENDING');
-      const result = settled as Awaited<ReturnType<typeof auditInteraction>>;
-
-      expect(result.status).toBe('NOT_VERIFIABLE');
-      expectReason(result, 'SCROLL_PREPARATION_DEADLINE');
-      lateResolution.resolve(boundedResolutionEnvelope(lateHandle));
-      await expect.poll(() => disposeCalls).toBe(1);
-      expect(events).toEqual([]);
-    });
-
-    it.each([
-      ['rediscovery', [INTERACTION_CANDIDATE_LIMITS.maxDomWork], 0, []],
-      ['handle resolution', [20], INTERACTION_CANDIDATE_LIMITS.maxDomWork - 20, ['resolve', 'dispose']],
-    ] as const)('records the DOM-work reason when the pre-freeze %s exhausts the shared budget', async (
-      _stage,
-      discoveryWork,
-      resolutionWork,
-      expectedEvents,
-    ) => {
-      const candidate = await candidateNamed('/accordion.html', 'Toggle details');
-      const events: string[] = [];
-
-      const result = await auditInteraction({
-        ...input('/accordion.html', candidate),
-        sessionFactory: async () => preparationSession(candidate, { events, discoveryWork, resolutionWork }),
-      });
-
-      expect(result.status).toBe('NOT_VERIFIABLE');
-      expectReason(result, 'SCROLL_PREPARATION_DOM_WORK_EXHAUSTED');
-      // 凍結も click も起きない。解決した handle は破棄する。
-      expect(events).toEqual(expectedEvents);
-    });
-
-    it('debits the pre-freeze DOM work from the budget shared with the frozen phase', async () => {
-      const candidate = await candidateNamed('/accordion.html', 'Toggle details');
-      const events: string[] = [];
-      const observedLimits: number[] = [];
-
-      const result = await auditInteraction({
-        ...input('/accordion.html', candidate),
-        sessionFactory: async () => preparationSession(candidate, {
-          events,
-          observedLimits,
-          discoveryWork: [1_000, 2_000],
-          resolutionWork: 300,
-        }),
-      });
-
-      expect(result.status).toBe('VERIFIED');
-      const max = INTERACTION_CANDIDATE_LIMITS.maxDomWork;
-      // 下準備の探索（1,000）と解決（300）を差し引いた残りから、凍結の後の探索（2,000）と解決が始まる。
-      expect(observedLimits.slice(0, 4)).toEqual([max, max - 1_000, max - 1_300, max - 3_300]);
-    });
-
-    describe("F15 R''': the target is hovered with a bound before the freeze", () => {
-      const HOVER_DEADLINE_REASON = 'HOVER_PREPARATION_DEADLINE';
-
-      it('does not freeze or click when the pre-freeze hover fails', async () => {
-        const candidate = await candidateNamed('/accordion.html', 'Toggle details');
-        const events: string[] = [];
-
-        const result = await auditInteraction({
-          ...input('/accordion.html', candidate),
-          sessionFactory: async () => preparationSession(candidate, {
-            events,
-            hover: async () => { throw new Error('hover target detached'); },
-          }),
-        });
-
-        expect(result.status).toBe('NOT_VERIFIABLE');
-        expectReason(result, 'HOVER_PREPARATION_FAILED', 'hover target detached');
-        expect(result.evidence.identityStatus).toBe('UNESTABLISHED');
-        expect(events).toEqual(['resolve', 'scroll', 'hover', 'dispose']);
-      });
-
-      it.each([
-        [
-          'ANSI escapes and the Playwright call log',
-          [
-            '\u001b[31melementHandle.hover: Element is not attached to the DOM\u001b[39m',
-            'Call log:',
-            '\u001b[2m  - attempting hover action\u001b[22m',
-          ].join('\n'),
-          'elementHandle.hover: Element is not attached to the DOM',
-        ],
-        ['only control characters', '\u001b[31m\u0007\r\n\u001b[39m', null],
-      ] as const)('normalizes a pre-freeze hover failure reason with %s', async (_label, message, expectedReasonDetail) => {
-        const candidate = await candidateNamed('/accordion.html', 'Toggle details');
-        const events: string[] = [];
-
-        const result = await auditInteraction({
-          ...input('/accordion.html', candidate),
-          sessionFactory: async () => preparationSession(candidate, {
-            events,
-            hover: async () => { throw new Error(message); },
-          }),
-        });
-
-        expect(result.status).toBe('NOT_VERIFIABLE');
-        expectReason(result, 'HOVER_PREPARATION_FAILED', expectedReasonDetail);
-        expect(events).toEqual(['resolve', 'scroll', 'hover', 'dispose']);
-      });
-
-      it('records the hover deadline reason when the pre-freeze hover times out in the browser', async () => {
-        const candidate = await candidateNamed('/accordion.html', 'Toggle details');
-        const events: string[] = [];
-        const timeout = new Error('hover timed out');
-        timeout.name = 'TimeoutError';
-
-        const result = await auditInteraction({
-          ...input('/accordion.html', candidate),
-          sessionFactory: async () => preparationSession(candidate, {
-            events,
-            hover: async () => { throw timeout; },
-          }),
-        });
-
-        expect(result.status).toBe('NOT_VERIFIABLE');
-        expectReason(result, HOVER_DEADLINE_REASON);
-        expect(events).toEqual(['resolve', 'scroll', 'hover', 'dispose']);
-      });
-
-      it('bounds a never-settling pre-freeze hover by the effective deadline', async () => {
-        const candidate = await candidateNamed('/accordion.html', 'Toggle details');
-        const events: string[] = [];
-        const neverSettles = createDeferred<void>();
-        let hoverTimeout: number | undefined;
-
-        const settled = await settleWithin(auditInteraction({
-          ...input('/accordion.html', candidate),
-          timeoutMs: 200,
-          sessionFactory: async () => preparationSession(candidate, {
-            events,
-            hover: async ({ timeout }) => {
-              hoverTimeout = timeout;
-              await neverSettles.promise;
-            },
-          }),
-        }), 2_000);
-
-        expect(settled).not.toBe('STILL_PENDING');
-        const result = settled as Awaited<ReturnType<typeof auditInteraction>>;
-        expect(result.status).toBe('NOT_VERIFIABLE');
-        expectReason(result, HOVER_DEADLINE_REASON);
-        expect(hoverTimeout).toBeGreaterThan(0);
-        expect(hoverTimeout).toBeLessThanOrEqual(200);
-        expect(events).toEqual(['resolve', 'scroll', 'hover', 'dispose']);
-      });
-    });
   });
 
+  // SPEC-5: 判定の結合の代表（何もしないボタンは「効いた」にしない）。位置と大きさは根拠にしない（単体は `tests/unit/interaction-collector.test.ts`）。
   describe("F10 R'1-N1': geometry is not evidence when a scroll ancestor scrolled during the click", () => {
-    const SCROLLED_GEOMETRY_REASON = 'GEOMETRY_ONLY_CHANGED_WHILE_SCROLLED';
-    const UNCOMPARABLE_GEOMETRY_REASON = 'GEOMETRY_ONLY_CHANGED_SCROLL_UNCOMPARABLE';
-    const GEOMETRY_ONLY_REASON = 'GEOMETRY_ONLY_CHANGED';
-
-    /** click の後の期限切れの理由。 */
+    /** click の後の、変化の見えない理由（混雑の下では、落ち着きの待ちが期限まで続くことがある）。 */
     const POST_CLICK_DEADLINE_REASONS = [
-      'DEADLINE_BEFORE_POST_CONDITION_OBSERVATION',
       'DEADLINE_DURING_POST_CONDITION_OBSERVATION',
       'NO_OBSERVABLE_CHANGE',
     ];
-
-    // F15（設計書 4.4.2）で是正: 以前は click の再試行のスクロールで対象の位置が変わり、SCROLLED の理由になることを期待していた。
-    // 下準備の hover が、覆われた対象を再試行のスクロールで帯の外に出すので、そのスクロールは凍結の前に済み、click ではスクロールしない。
-    it('does not verify an inert button offscreen in an inner scroll container and covered by a fixed overlay after preparation', async () => {
-      const candidate = await candidateNamed('/covered-offscreen-inert-button.html', 'Covered offscreen inert');
-      // 前提: ボタンは内側の領域の画面外にある。下準備のスクロールで中央（固定表示の帯 #ov の下）に来る。
-      expect(candidate.boundingBox.y).toBeGreaterThan(viewport.height);
-
-      const result = await auditInteraction({ ...input('/covered-offscreen-inert-button.html', candidate), timeoutMs: 1_500 });
-
-      expect(result.status, JSON.stringify(result)).toBe('NOT_VERIFIABLE');
-      expect(POST_CLICK_DEADLINE_REASONS).toContain(result.reason);
-      expect(result.evidence.identityStatus).toBe('MATCHED');
-      expect(result.evidence.changedFields).toEqual([]);
-      // 下準備の hover の再試行のスクロールは観測の前に済んでいるので、click の前後で対象の位置は変わらない。
-      expect(result.evidence.after?.boundingBox.y).toBeCloseTo(result.evidence.before?.boundingBox.y ?? Number.NaN, 0);
-    });
 
     it('does not verify an inert button that is initially in view but covered by a fixed overlay', async () => {
       const candidate = await candidateNamed('/covered-inview-inert-button.html', 'Covered in-view inert');
@@ -5813,305 +5208,10 @@ describe('C3 corrections (foundation corrections design 4.2-4.8, 5.5)', () => {
       expect(result.evidence.before?.boundingBox.y).not.toBeCloseTo(candidate.boundingBox.y, 0);
       expect(result.evidence.after?.boundingBox.y).toBeCloseTo(result.evidence.before?.boundingBox.y ?? Number.NaN, 0);
     });
-
-    it('does not verify an inert button that is covered only after the hover, when the click retry scrolls', async () => {
-      const candidate = await candidateNamed('/hover-overlay-inert-button.html', 'Hover overlay inert');
-      // 前提: ボタンは初めから画面内にあり、固定表示の帯 #ov（top 300px、高さ 100px）の位置にある。
-      // 帯は、下準備の hover の後の2回目の mousemove（click の移動）で現れるので、click の再試行がスクロールする（設計書 4.4.3）。
-      expect(candidate.boundingBox.y).toBeGreaterThanOrEqual(300);
-      expect(candidate.boundingBox.bottom).toBeLessThanOrEqual(400);
-
-      const result = await auditInteraction({ ...input('/hover-overlay-inert-button.html', candidate), timeoutMs: 2_000 });
-
-      expect(result.status, JSON.stringify(result)).toBe('NOT_VERIFIABLE');
-      expectReason(result, SCROLLED_GEOMETRY_REASON);
-      expect(result.evidence.identityStatus).toBe('MATCHED');
-      expect(result.evidence.changedFields).toEqual([]);
-      // 再現の条件: click の再試行のスクロールで、対象の位置が実際に変わった。
-      expect(result.evidence.after?.boundingBox.y).not.toBeCloseTo(result.evidence.before?.boundingBox.y ?? Number.NaN, 0);
-    });
-
-    it('verifies a covered accordion by its attribute and visibility changes without geometry evidence', async () => {
-      const candidate = await candidateNamed('/covered-offscreen-accordion.html', 'Covered offscreen toggle');
-      expect(candidate.boundingBox.y).toBeGreaterThan(viewport.height);
-
-      const result = await auditInteraction(input('/covered-offscreen-accordion.html', candidate));
-
-      expect(result.status, JSON.stringify(result)).toBe('VERIFIED');
-      expect(result.evidence.changedFields).toEqual(expect.arrayContaining(['ariaExpanded', 'controlledVisible']));
-      expect(result.evidence.changedFields).not.toContain('boundingBox');
-    });
-
-    it('records scroll positions of the document, inner, and open-shadow-root scroll ancestors', async () => {
-      const page = await browser.newPage({ viewport });
-      try {
-        await page.setContent([
-          '<style>html,body{margin:0}#outer{height:200px;overflow-y:auto}.pad{height:1000px}</style>',
-          '<div id="outer"><div id="host"><button type="button">Slotted</button></div><div class="pad"></div></div>',
-          '<div style="height:3000px"></div>',
-        ].join(''));
-        await page.evaluate(() => {
-          const shadow = document.getElementById('host')!.attachShadow({ mode: 'open' });
-          shadow.innerHTML = '<div id="inner" style="height:100px;overflow-y:scroll"><div style="height:50px"></div><slot></slot><div style="height:500px"></div></div>';
-        });
-        const handle = await page.locator('button').elementHandle();
-        const handleReference = await candidateReferenceOf(page, 'button');
-        if (handle === null) throw new Error('Missing slotted candidate');
-        const record = async () => {
-          const snapshot = await inspectInteractionCandidateHandle(handleReference, 0);
-          if (snapshot.status !== 'CONNECTED') throw new Error('Expected connected slotted candidate');
-          return snapshot.scroll;
-        };
-        try {
-          const initial = await record();
-          // 近い祖先から: shadow root の中の #inner、#outer、最後に文書。
-          expect(initial).toEqual({ status: 'RECORDED', offsets: [0, 0, 0, 0, 0, 0] });
-          const scrollers = [
-            ['shadow inner', () => { document.getElementById('host')!.shadowRoot!.getElementById('inner')!.scrollTop = 30; }],
-            ['outer', () => { document.getElementById('outer')!.scrollTop = 40; }],
-            ['document', () => { window.scrollTo(0, 50); }],
-          ] as const;
-          for (const [label, scroll] of scrollers) {
-            await page.evaluate(scroll);
-            expect(compareInteractionScrollRecords(initial, await record()), label).toBe('SCROLLED');
-            await page.evaluate(() => {
-              document.getElementById('host')!.shadowRoot!.getElementById('inner')!.scrollTop = 0;
-              document.getElementById('outer')!.scrollTop = 0;
-              window.scrollTo(0, 0);
-            });
-            expect(compareInteractionScrollRecords(initial, await record()), label).toBe('UNCHANGED');
-          }
-        } finally {
-          await handle.dispose();
-        }
-      } finally {
-        await page.close();
-      }
-    });
-
-    it.each([
-      // 根1 + 前の要素 + 対象の走査と一致判定2 + 事実の収集の開始1 + テキスト1 + 候補の可視判定1 の後、祖先（body、html）に1ずつ。
-      ['completes the ancestor walk on the final work unit', 16_376, { status: 'RECORDED', offsets: [0, 0] }],
-      ['reports an incomplete ancestor walk at the DOM-work budget', 16_377, { status: 'INCOMPLETE' }],
-    ] as const)('%s', async (_label, preceding, expectedScroll) => {
-      const page = await browser.newPage();
-      try {
-        await page.setContent('<button type="button" aria-label="Budget">x</button>');
-        const handle = await page.locator('button').elementHandle();
-        const handleReference = await candidateReferenceOf(page, 'button');
-        if (handle === null) throw new Error('Missing budget candidate');
-        try {
-          await installPrecedingWorkWalker(page, 'button', preceding);
-          const snapshot = await inspectInteractionCandidateHandle(handleReference, 0);
-          expect(snapshot).toMatchObject({ status: 'CONNECTED', domWorkUsed: 16_384, scroll: expectedScroll });
-        } finally {
-          await handle.dispose();
-        }
-      } finally {
-        await page.close();
-      }
-    });
-
-    it.each([
-      ['non-object scroll record', { status: 'CONNECTED', domWorkUsed: 1, scroll: [] }],
-      ['non-boolean completeness', { status: 'CONNECTED', domWorkUsed: 1, scroll: { complete: 'yes', offsets: [0, 0] } }],
-      ['odd offset count', { status: 'CONNECTED', domWorkUsed: 1, scroll: { complete: true, offsets: [0] } }],
-      ['non-finite offset', { status: 'CONNECTED', domWorkUsed: 1, scroll: { complete: true, offsets: [0, null] } }],
-      ['contradictory DISCONNECTED scroll', { status: 'DISCONNECTED', domWorkUsed: 1, scroll: { complete: true, offsets: [0, 0] } }],
-    ] as const)('rejects a malformed retained scroll record: %s', async (_label, value) => {
-      const candidate = await candidateNamed('/accordion.html', 'Toggle details');
-      const snapshot = value.status === 'CONNECTED' ? { ...value, raw: rawCandidateFor(candidate) } : value;
-      const handle = fakeCandidateReference(async () => snapshot);
-
-      await expect(inspectInteractionCandidateHandle(handle, 0)).rejects.toThrow('Invalid bounded interaction handle snapshot');
-    });
-
-    /**
-     * click の前と後の観測で、対象の位置と、スクロールの記録（`scroll`）を返す偽のセッションを作る。
-     * `change` が `'TRANSLATE'` なら対象を下へ平行移動させ、`'RESIZE'` なら位置を変えずに高さを広げる。
-     */
-    function geometrySession(
-      candidate: InteractionCandidate,
-      scroll: { readonly before?: unknown; readonly after?: unknown },
-      change: 'TRANSLATE' | 'RESIZE' = 'TRANSLATE',
-    ): InteractionGuardedSession {
-      const rawCandidate = rawCandidateFor(candidate);
-      const moved = {
-        ...rawCandidate,
-        boundingBox: change === 'TRANSLATE'
-          ? {
-            ...candidate.boundingBox,
-            y: candidate.boundingBox.y + 200,
-            top: candidate.boundingBox.top + 200,
-            bottom: candidate.boundingBox.bottom + 200,
-          }
-          : {
-            ...candidate.boundingBox,
-            height: candidate.boundingBox.height + 200,
-            bottom: candidate.boundingBox.bottom + 200,
-          },
-      };
-      const withScroll = (snapshot: Record<string, unknown>, value: unknown) => (
-        value === undefined ? snapshot : { ...snapshot, scroll: value }
-      );
-      // 期限まで観測を繰り返すので、共有の DOM の作業量の上限に達しないよう、観測の作業量を0にする。
-      const snapshots = [
-        withScroll({ status: 'CONNECTED', domWorkUsed: 0, raw: rawCandidate }, scroll.before),
-        withScroll({ status: 'CONNECTED', domWorkUsed: 0, raw: moved }, scroll.after),
-      ];
-      let snapshotIndex = 0;
-      const targetHandle = {
-        evaluate: async () => snapshots[Math.min(snapshotIndex++, snapshots.length - 1)],
-        click: async () => undefined,
-        dispose: async () => undefined,
-      };
-      const page = {
-        goto: async () => undefined,
-        evaluate: async (_callback: unknown, argument?: unknown) => (
-          argument === undefined ? true : { candidates: [rawCandidate], completeness: 'COMPLETE', domWorkUsed: 20 }
-        ),
-        evaluateHandle: async () => boundedResolutionEnvelope(targetHandle),
-      } as unknown as Page;
-      return {
-        page: withScrollPreparation(page, candidate),
-        ledger: new SafetyLedger(),
-        activateInteractionFreeze: async () => undefined,
-        ...fakeCloseLifecycle(),
-      };
-    }
-
-    // F14（設計書 4.4.1）で是正: 以前は平行移動だけで VERIFIED を期待していた。
-    // F15（設計書 4.4.1 の最終の方針）で是正: 以前は大きさの変化だけで VERIFIED を期待していた。位置も大きさも根拠にしない。
-    it('does not verify a size-only change even when every recorded scroll position is unchanged', async () => {
-      const candidate = await candidateNamed('/accordion.html', 'Toggle details');
-      const recorded = { complete: true, offsets: [0, 120, 0, 0] };
-
-      const result = await auditInteraction({
-        ...input('/accordion.html', candidate),
-        // F16（設計書 4.4.1）で是正: 凍結の前の安定性の確認（500ms）を終えてから、確かめたい段階に進むよう、期限を延ばした。
-        timeoutMs: 1_500,
-        sessionFactory: async () => geometrySession(candidate, { before: recorded, after: { ...recorded } }, 'RESIZE'),
-      });
-
-      expect(result.status, result.reason).toBe('NOT_VERIFIABLE');
-      expectReason(result, GEOMETRY_ONLY_REASON);
-      expect(result.evidence.changedFields).toEqual([]);
-      // 大きさの変化そのものは Evidence に残る。
-      expect(result.evidence.after?.boundingBox.height).toBe(candidate.boundingBox.height + 200);
-    });
-
-    it('does not verify a translation-only change even when every recorded scroll position is unchanged', async () => {
-      const candidate = await candidateNamed('/accordion.html', 'Toggle details');
-      const recorded = { complete: true, offsets: [0, 120, 0, 0] };
-
-      const result = await auditInteraction({
-        ...input('/accordion.html', candidate),
-        // F16（設計書 4.4.1）で是正: 凍結の前の安定性の確認（500ms）を終えてから、確かめたい段階に進むよう、期限を延ばした。
-        timeoutMs: 1_500,
-        sessionFactory: async () => geometrySession(candidate, { before: recorded, after: { ...recorded } }, 'TRANSLATE'),
-      });
-
-      expect(result.status, result.reason).toBe('NOT_VERIFIABLE');
-      expectReason(result, GEOMETRY_ONLY_REASON);
-      expect(result.evidence.changedFields).toEqual([]);
-      // 平行移動そのものは Evidence に残る。
-      expect(result.evidence.after?.boundingBox.y).toBe(candidate.boundingBox.y + 200);
-    });
-
-    it.each(['TRANSLATE', 'RESIZE'] as const)(
-      'drops geometry evidence when a recorded scroll position changed (%s)',
-      async (change) => {
-        const candidate = await candidateNamed('/accordion.html', 'Toggle details');
-
-        const result = await auditInteraction({
-          ...input('/accordion.html', candidate),
-          // F16（設計書 4.4.1）で是正: 凍結の前の安定性の確認（500ms）を終えてから、確かめたい段階に進むよう、期限を延ばした。
-          timeoutMs: 1_500,
-          sessionFactory: async () => geometrySession(candidate, {
-            before: { complete: true, offsets: [0, 120, 0, 0] },
-            after: { complete: true, offsets: [0, 320, 0, 0] },
-          }, change),
-        });
-
-        expect(result.status, result.reason).toBe('NOT_VERIFIABLE');
-        expectReason(result, SCROLLED_GEOMETRY_REASON);
-        expect(result.evidence.changedFields).toEqual([]);
-      },
-    );
-
-    it.each([
-      ['a scroll record is missing', 'TRANSLATE', undefined, undefined],
-      ['the ancestor walk reached the DOM-work budget', 'TRANSLATE', { complete: false, offsets: [] }, { complete: true, offsets: [0, 0] }],
-      ['the scroll ancestor chain changed', 'TRANSLATE', { complete: true, offsets: [0, 0] }, { complete: true, offsets: [0, 0, 0, 0] }],
-      ['a scroll record is missing', 'RESIZE', undefined, undefined],
-      ['the ancestor walk reached the DOM-work budget', 'RESIZE', { complete: false, offsets: [] }, { complete: true, offsets: [0, 0] }],
-      ['the scroll ancestor chain changed', 'RESIZE', { complete: true, offsets: [0, 0] }, { complete: true, offsets: [0, 0, 0, 0] }],
-    ] as const)('drops geometry evidence when %s (%s)', async (_label, change, before, after) => {
-      const candidate = await candidateNamed('/accordion.html', 'Toggle details');
-
-      const result = await auditInteraction({
-        ...input('/accordion.html', candidate),
-        // F16（設計書 4.4.1）で是正: 凍結の前の安定性の確認（500ms）を終えてから、確かめたい段階に進むよう、期限を延ばした。
-        timeoutMs: 1_500,
-        sessionFactory: async () => geometrySession(candidate, { before, after }, change),
-      });
-
-      expect(result.status, result.reason).toBe('NOT_VERIFIABLE');
-      expectReason(result, UNCOMPARABLE_GEOMETRY_REASON);
-      expect(result.evidence.changedFields).toEqual([]);
-    });
   });
 
+  // LZ-2: 押す失敗の理由の文言の整え（制御文字・ANSI・Playwright の call log）。
   describe("F14 R''1: a translation of the target is not evidence of the interaction", () => {
-    const GEOMETRY_ONLY_REASON = 'GEOMETRY_ONLY_CHANGED';
-
-    // F16（設計書 4.4.1 の安定性の確認）で是正: 400ms 後の差し込みは、凍結の前の安定性の確認（500ms）の間に起きるようになった。
-    // click の後に起きる平行移動を確かめるため、900ms 後に差し込む fixture に替え、期限を延ばした。
-    // 400ms 後に差し込む fixture は、下の「安定性の確認の間に起きる」テストで確かめる。
-    it('does not verify an inert button that a late insertion above it shifts after the click', async () => {
-      const candidate = await candidateNamed('/delayed-shift-inert-button.html', 'Delayed shift inert');
-      // 前提: ボタンは画面外にあり、下準備のスクロールで画面に入ると、遅れて直上に要素が差し込まれる。
-      expect(candidate.boundingBox.y).toBeGreaterThan(viewport.height);
-
-      const result = await auditInteraction({ ...input('/delayed-shift-inert-button.html', candidate), timeoutMs: 2_000 });
-
-      expect(result.status, JSON.stringify(result)).toBe('NOT_VERIFIABLE');
-      expectReason(result, GEOMETRY_ONLY_REASON);
-      expect(result.evidence.identityStatus).toBe('MATCHED');
-      expect(result.evidence.changedFields).toEqual([]);
-      // 再現の条件: click の後に、対象が大きさを変えずに下へずれた。ずれは Evidence に記録される。
-      const before = result.evidence.before?.boundingBox;
-      const after = result.evidence.after?.boundingBox;
-      expect(after?.y).toBeCloseTo((before?.y ?? Number.NaN) + 120, 0);
-      expect(after?.x).toBeCloseTo(before?.x ?? Number.NaN, 0);
-      expect(after?.width).toBeCloseTo(before?.width ?? Number.NaN, 0);
-      expect(after?.height).toBeCloseTo(before?.height ?? Number.NaN, 0);
-      expect(result.safety.blockedInteractionRequests).toEqual([]);
-    });
-
-    // F15（設計書 4.4.1 の最終の方針）で是正: 以前は大きさの変化（boundingBox）を根拠にしていた。
-    // click で自分の style 属性が変わるので、対象自身の属性の変化（attributes）が根拠になる。
-    it('verifies a button whose own size grows on click by its own attribute change', async () => {
-      const candidate = await candidateNamed('/self-growing-button.html', 'Grow me');
-
-      const result = await auditInteraction(input('/self-growing-button.html', candidate));
-
-      expect(result.status, JSON.stringify(result)).toBe('VERIFIED');
-      expect(result.evidence.changedFields).toEqual(['attributes']);
-      expect(result.evidence.after?.boundingBox.width).toBeCloseTo(320, 0);
-      expect(result.evidence.after?.boundingBox.height).toBeCloseTo(80, 0);
-    });
-
-    it('still verifies an accordion by its ARIA and controlled-element changes', async () => {
-      const candidate = await candidateNamed('/accordion.html', 'Toggle details');
-
-      const result = await auditInteraction(input('/accordion.html', candidate));
-
-      expect(result.status, JSON.stringify(result)).toBe('VERIFIED');
-      expect(result.evidence.changedFields).toEqual(expect.arrayContaining(['ariaExpanded', 'controlledVisible']));
-      expect(result.evidence.changedFields).not.toContain('boundingBox');
-    });
-
     /** click が `clickError` を投げる偽のセッションを作る。 */
     function failingClickSession(candidate: InteractionCandidate, clickError: Error): InteractionGuardedSession {
       const rawCandidate = rawCandidateFor(candidate);
@@ -6184,7 +5284,7 @@ describe('C3 corrections (foundation corrections design 4.2-4.8, 5.5)', () => {
       expectReason(result.work, expectedReasonCode, null);
     });
 
-    it('replaces stray control characters in a click failure reason and keeps the bounded length', async () => {
+    it('replaces stray control characters in a click failure reason and keeps the whole reason (LZ-2)', async () => {
       const candidate = await candidateNamed('/accordion.html', 'Toggle details');
       const clickError = new Error(`click\u0007 failed\r\n\tbadly\u001b]0;title\u0007 ${'x'.repeat(1_000)}`);
 
@@ -6195,64 +5295,12 @@ describe('C3 corrections (foundation corrections design 4.2-4.8, 5.5)', () => {
 
       expect(result.status).toBe('EXECUTION_FAILED');
       expect(result.reason).toBe('CLICK_FAILED');
-      expect(result.reasonDetail?.startsWith('click failed badly xxx')).toBe(true);
-      expect(result.reasonDetail).not.toMatch(/[\u0000-\u001f\u007f-\u009f]/u);
-      expect(result.reasonDetail?.length).toBeLessThanOrEqual(512);
+      expect(result.reasonDetail).toBe(`click failed badly ${'x'.repeat(1_000)}`);
     });
   });
 
+  // SPEC-5: 根拠になる変化（ARIA の状態・`aria-controls` の先・文字）の結合の代表。根拠の表は単体（`tests/unit/interaction-collector.test.ts`）。
   describe("F15 R''': target geometry alone is never evidence, and the target is hovered before observation", () => {
-    const GEOMETRY_ONLY_REASON = 'GEOMETRY_ONLY_CHANGED';
-    const POST_CLICK_DEADLINE_REASONS = [
-      'DEADLINE_BEFORE_POST_CONDITION_OBSERVATION',
-      'DEADLINE_DURING_POST_CONDITION_OBSERVATION',
-      'NO_OBSERVABLE_CHANGE',
-    ];
-
-    it.each([
-      ['/hover-transform-button.html', 'Hover scale inert'],
-      ['/hover-font-weight-button.html', 'Hover bold inert'],
-      ['/hover-padding-transition-button.html', 'Hover padding inert'],
-      ['/mouseenter-class-button.html', 'Mouseenter class inert'],
-    ] as const)('does not verify an inert button whose hover styling changes its size (%s)', async (path, name) => {
-      const candidate = await candidateNamed(path, name);
-
-      const result = await auditInteraction({ ...input(path, candidate), timeoutMs: 1_500 });
-
-      expect(result.status, JSON.stringify(result)).toBe('NOT_VERIFIABLE');
-      expect([GEOMETRY_ONLY_REASON, ...POST_CLICK_DEADLINE_REASONS]).toContain(result.reason);
-      expect(result.evidence.identityStatus).toBe('MATCHED');
-      expect(result.evidence.changedFields).toEqual([]);
-      // hover は凍結の前の下準備で行うので、観測の前の状態は、すでに hover の後の状態（Passive の探索より大きい）になっている。
-      expect(result.evidence.before?.boundingBox.width).toBeGreaterThan(candidate.boundingBox.width + 1);
-      expect(result.safety.blockedInteractionRequests).toEqual([]);
-    });
-
-    // F16（設計書 4.4.1 の安定性の確認）で是正: 400ms 後の変化は、凍結の前の安定性の確認（500ms）の間に起きるようになった。
-    // click の後に起きる大きさの変化を確かめるため、900ms 後に変わる fixture に替え、期限を延ばした。
-    it.each([
-      ['/delayed-image-in-button.html', 'Delayed image inert'],
-      ['/delayed-flex-neighbor-button.html', 'Delayed flex neighbor inert'],
-    ] as const)('does not verify an inert button whose size changes after the click by a late layout change (%s)', async (
-      path,
-      name,
-    ) => {
-      const candidate = await candidateNamed(path, name);
-      // 前提: ボタンは画面外にあり、下準備のスクロールで画面に入ると、遅れてボタンの大きさが変わる。
-      expect(candidate.boundingBox.y).toBeGreaterThan(viewport.height);
-
-      const result = await auditInteraction({ ...input(path, candidate), timeoutMs: 2_000 });
-
-      expect(result.status, JSON.stringify(result)).toBe('NOT_VERIFIABLE');
-      expectReason(result, GEOMETRY_ONLY_REASON);
-      expect(result.evidence.identityStatus).toBe('MATCHED');
-      expect(result.evidence.changedFields).toEqual([]);
-      // 再現の条件: click の後に、ボタンの高さが実際に伸びた。変化は Evidence に記録される。
-      expect(result.evidence.after?.boundingBox.height)
-        .toBeGreaterThan((result.evidence.before?.boundingBox.height ?? Number.POSITIVE_INFINITY) + 20);
-      expect(result.safety.blockedInteractionRequests).toEqual([]);
-    });
-
     it('verifies an accordion by its ARIA state, its own attribute, and the controlled element', async () => {
       const candidate = await candidateNamed('/accordion.html', 'Toggle details');
 
@@ -6282,244 +5330,6 @@ describe('C3 corrections (foundation corrections design 4.2-4.8, 5.5)', () => {
       expect(result.status, JSON.stringify(result)).toBe('VERIFIED');
       expect(result.evidence.changedFields).toEqual(['textFingerprint']);
     });
-
-    it('records the attributes of the target itself, not of its descendants', async () => {
-      const page = await browser.newPage({ viewport });
-      const content =
-        '<button type="button" class="a" data-state="closed"><span class="inner" data-x="1">Own attributes</span></button>';
-      const changes = [
-        ['descendant attribute', () => { document.querySelector('.inner')!.setAttribute('data-x', '2'); }, 'UNCHANGED'],
-        ['own attribute value', () => { document.querySelector('button')!.setAttribute('data-state', 'open'); }, 'CHANGED'],
-        ['own attribute added', () => { document.querySelector('button')!.setAttribute('open', ''); }, 'CHANGED'],
-        ['own attribute removed', () => { document.querySelector('button')!.removeAttribute('class'); }, 'CHANGED'],
-      ] as const;
-      try {
-        for (const [label, change, expected] of changes) {
-          await page.setContent(content);
-          const handle = await page.locator('button').elementHandle();
-          const handleReference = await candidateReferenceOf(page, 'button');
-          if (handle === null) throw new Error('Missing attribute candidate');
-          const record = async () => {
-            const snapshot = await inspectInteractionCandidateHandle(handleReference, 0);
-            if (snapshot.status !== 'CONNECTED') throw new Error('Expected connected attribute candidate');
-            return snapshot.attributes;
-          };
-          try {
-            const initial = await record();
-            expect(initial, label).toEqual({
-              status: 'RECORDED',
-              entries: ['type', 'button', 'class', 'a', 'data-state', 'closed'],
-            });
-            await page.evaluate(change);
-            expect(compareInteractionAttributeRecords(initial, await record()), label).toBe(expected);
-          } finally {
-            await handle.dispose();
-          }
-        }
-      } finally {
-        await page.close();
-      }
-    });
-
-    it('bounds each recorded attribute name and value by the candidate attribute length', async () => {
-      const page = await browser.newPage({ viewport });
-      try {
-        await page.setContent('<button type="button">Long attribute</button>');
-        await page.evaluate((length) => {
-          document.querySelector('button')!.setAttribute('data-long', 'v'.repeat(length));
-        }, INTERACTION_CANDIDATE_LIMITS.maxAttributeLength + 100);
-        const handle = await page.locator('button').elementHandle();
-        const handleReference = await candidateReferenceOf(page, 'button');
-        if (handle === null) throw new Error('Missing long attribute candidate');
-        try {
-          const snapshot = await inspectInteractionCandidateHandle(handleReference, 0);
-          if (snapshot.status !== 'CONNECTED' || snapshot.attributes.status !== 'RECORDED') {
-            throw new Error('Expected a recorded attribute list');
-          }
-          expect(snapshot.attributes.entries).toEqual([
-            'type',
-            'button',
-            'data-long',
-            'v'.repeat(INTERACTION_CANDIDATE_LIMITS.maxAttributeLength),
-          ]);
-        } finally {
-          await handle.dispose();
-        }
-      } finally {
-        await page.close();
-      }
-    });
-
-    it.each([
-      // 祖先（body、html）の走査が最後の作業量の2つ前で終わり、属性（type、aria-label）に1ずつ使う。
-      ['completes the attribute list on the final work unit', 16_374, { status: 'RECORDED', entries: ['type', 'button', 'aria-label', 'Budget'] }],
-      ['reports an incomplete attribute list at the DOM-work budget', 16_375, { status: 'INCOMPLETE' }],
-    ] as const)('%s', async (_label, preceding, expectedAttributes) => {
-      const page = await browser.newPage();
-      try {
-        await page.setContent('<button type="button" aria-label="Budget">x</button>');
-        const handle = await page.locator('button').elementHandle();
-        const handleReference = await candidateReferenceOf(page, 'button');
-        if (handle === null) throw new Error('Missing budget candidate');
-        try {
-          await installPrecedingWorkWalker(page, 'button', preceding);
-          const snapshot = await inspectInteractionCandidateHandle(handleReference, 0);
-          expect(snapshot).toMatchObject({
-            status: 'CONNECTED',
-            domWorkUsed: 16_384,
-            scroll: { status: 'RECORDED', offsets: [0, 0] },
-            attributes: expectedAttributes,
-          });
-        } finally {
-          await handle.dispose();
-        }
-      } finally {
-        await page.close();
-      }
-    });
-
-    it.each([
-      ['non-object attribute record', { status: 'CONNECTED', domWorkUsed: 1, attributes: [] }],
-      ['non-boolean completeness', { status: 'CONNECTED', domWorkUsed: 1, attributes: { complete: 'yes', entries: [] } }],
-      ['odd entry count', { status: 'CONNECTED', domWorkUsed: 1, attributes: { complete: true, entries: ['class'] } }],
-      ['non-string entry', { status: 'CONNECTED', domWorkUsed: 1, attributes: { complete: true, entries: ['class', 1] } }],
-      // F20b（設計書 4.4.1「長い class」）: class の値だけは class 専用の上限まで受け取り、ほかの名前と値は、これまでの上限とする。
-      [
-        'over-long entry',
-        {
-          status: 'CONNECTED',
-          domWorkUsed: 1,
-          attributes: {
-            complete: true,
-            entries: ['data-long', 'x'.repeat(INTERACTION_CANDIDATE_LIMITS.maxAttributeLength + 1)],
-          },
-        },
-      ],
-      [
-        'over-long class value',
-        {
-          status: 'CONNECTED',
-          domWorkUsed: 1,
-          attributes: {
-            complete: true,
-            entries: ['class', 'x'.repeat(INTERACTION_CANDIDATE_LIMITS.maxClassAttributeLength + 1)],
-          },
-        },
-      ],
-      [
-        'over-long attribute name',
-        {
-          status: 'CONNECTED',
-          domWorkUsed: 1,
-          attributes: { complete: true, entries: ['x'.repeat(INTERACTION_CANDIDATE_LIMITS.maxAttributeLength + 1), 'v'] },
-        },
-      ],
-      [
-        'over-long value of an attribute other than class',
-        {
-          status: 'CONNECTED',
-          domWorkUsed: 1,
-          attributes: {
-            complete: true,
-            entries: ['class', 'a', 'style', 'x'.repeat(INTERACTION_CANDIDATE_LIMITS.maxAttributeLength + 1)],
-          },
-        },
-      ],
-      ['contradictory DISCONNECTED attributes', { status: 'DISCONNECTED', domWorkUsed: 1, attributes: { complete: true, entries: [] } }],
-    ] as const)('rejects a malformed retained attribute record: %s', async (_label, value) => {
-      const candidate = await candidateNamed('/accordion.html', 'Toggle details');
-      const snapshot = value.status === 'CONNECTED' ? { ...value, raw: rawCandidateFor(candidate) } : value;
-      const handle = fakeCandidateReference(async () => snapshot);
-
-      await expect(inspectInteractionCandidateHandle(handle, 0)).rejects.toThrow('Invalid bounded interaction handle snapshot');
-    });
-
-    it('compares attribute records regardless of attribute order and treats missing records as uncomparable', () => {
-      const recorded = (entries: readonly string[]) => ({ status: 'RECORDED' as const, entries });
-      expect(compareInteractionAttributeRecords(recorded(['a', '1', 'b', '2']), recorded(['b', '2', 'a', '1']))).toBe('UNCHANGED');
-      expect(compareInteractionAttributeRecords(recorded(['a', '1']), recorded(['a', '2']))).toBe('CHANGED');
-      expect(compareInteractionAttributeRecords(recorded(['a', '1']), recorded(['a', '1', 'b', '']))).toBe('CHANGED');
-      expect(compareInteractionAttributeRecords({ status: 'UNRECORDED' }, recorded([]))).toBe('UNCOMPARABLE');
-      expect(compareInteractionAttributeRecords(recorded([]), { status: 'INCOMPLETE' })).toBe('UNCOMPARABLE');
-    });
-
-    /** click の前と後の観測で、対象の属性の記録（`attributes`）だけを変える偽のセッションを作る。 */
-    function attributeSession(
-      candidate: InteractionCandidate,
-      attributes: { readonly before?: unknown; readonly after?: unknown },
-    ): InteractionGuardedSession {
-      const rawCandidate = rawCandidateFor(candidate);
-      const withAttributes = (value: unknown) => (
-        value === undefined
-          ? { status: 'CONNECTED', domWorkUsed: 0, raw: rawCandidate }
-          : { status: 'CONNECTED', domWorkUsed: 0, raw: rawCandidate, attributes: value }
-      );
-      const snapshots = [withAttributes(attributes.before), withAttributes(attributes.after)];
-      let snapshotIndex = 0;
-      const targetHandle = {
-        evaluate: async () => snapshots[Math.min(snapshotIndex++, snapshots.length - 1)],
-        click: async () => undefined,
-        dispose: async () => undefined,
-      };
-      const page = {
-        goto: async () => undefined,
-        evaluate: async (_callback: unknown, argument?: unknown) => (
-          argument === undefined ? true : { candidates: [rawCandidate], completeness: 'COMPLETE', domWorkUsed: 0 }
-        ),
-        evaluateHandle: async () => boundedResolutionEnvelope(targetHandle),
-      } as unknown as Page;
-      return {
-        // F16（設計書 4.4.1 の安定性の確認）で是正: 下準備の観測も、click の前と同じ属性の記録を返す。
-        // 記録を比べられない場合は、属性のすべてを「不安定」とみなすためである。
-        // F20（設計書 4.4.2 手順4）で是正: 下準備の focus の前後の記録を比べられない場合は、凍結せずに終える（そのテストは F20 にある）。
-        // ここで確かめるのは click の前の記録なので、click の前の記録が欠けている場合は、下準備では属性のない記録を返す
-        // （下準備の記録と click の前の記録は比べられず、これまでどおり属性のすべてが「不安定」になる）。
-        page: withScrollPreparation(
-          page,
-          candidate,
-          (attributes.before as { readonly complete?: unknown } | undefined)?.complete === false ? undefined : attributes.before,
-        ),
-        ledger: new SafetyLedger(),
-        activateInteractionFreeze: async () => undefined,
-        ...fakeCloseLifecycle(),
-      };
-    }
-
-    it('verifies a change of the target own attributes', async () => {
-      const candidate = await candidateNamed('/accordion.html', 'Toggle details');
-
-      const result = await auditInteraction({
-        ...input('/accordion.html', candidate),
-        // F16（設計書 4.4.1）で是正: 凍結の前の安定性の確認（500ms）を終えてから、確かめたい段階に進むよう、期限を延ばした。
-        timeoutMs: 1_500,
-        sessionFactory: async () => attributeSession(candidate, {
-          before: { complete: true, entries: ['class', 'collapsed'] },
-          after: { complete: true, entries: ['class', 'expanded'] },
-        }),
-      });
-
-      expect(result.status, result.reason).toBe('VERIFIED');
-      expect(result.evidence.changedFields).toEqual(['attributes']);
-    });
-
-    it.each([
-      ['unchanged attributes', { complete: true, entries: ['class', 'a'] }, { complete: true, entries: ['class', 'a'] }],
-      ['a missing attribute record', undefined, { complete: true, entries: ['class', 'b'] }],
-      ['an incomplete attribute record', { complete: false, entries: [] }, { complete: true, entries: ['class', 'b'] }],
-    ] as const)('does not treat %s as evidence', async (_label, before, after) => {
-      const candidate = await candidateNamed('/accordion.html', 'Toggle details');
-
-      const result = await auditInteraction({
-        ...input('/accordion.html', candidate),
-        // F16（設計書 4.4.1）で是正: 凍結の前の安定性の確認（500ms）を終えてから、確かめたい段階に進むよう、期限を延ばした。
-        timeoutMs: 1_500,
-        sessionFactory: async () => attributeSession(candidate, { before, after }),
-      });
-
-      expect(result.status, result.reason).toBe('NOT_VERIFIABLE');
-      expect(POST_CLICK_DEADLINE_REASONS).toContain(result.reason);
-      expect(result.evidence.changedFields).toEqual([]);
-    });
   });
 
   describe("F15 R''' M-3: lifecycle and Ledger reasons are normalized before they are bounded", () => {
@@ -6528,9 +5338,10 @@ describe('C3 corrections (foundation corrections design 4.2-4.8, 5.5)', () => {
       'Call log:',
       '\u001b[2m  - closing context\u001b[22m',
     ].join('\n');
-    /** 512字で先に切り詰めると、ANSI のエスケープシーケンスの途中（`\u001b[3`）で切れる文言。 */
+    /** 前の上限（512 字）で先に切り詰めると、ANSI のエスケープシーケンスの途中（`\u001b[3`）で切れた文言。 */
     const ESCAPE_AT_BOUND = `${'x'.repeat(509)}\u001b[31m${'y'.repeat(100)}`;
-    const ESCAPE_AT_BOUND_REASON = `${'x'.repeat(509)}yyy`;
+    /** LZ-2: 長さの上限はなくなったので、エスケープシーケンスだけを除き、後ろの文字も切り詰めずに残す。 */
+    const ESCAPE_AT_BOUND_REASON = `${'x'.repeat(509)}${'y'.repeat(100)}`;
 
     /** close が `closeError` で拒否されても、終端（CLOSED）に達するセッションを作る。 */
     function rejectingCloseSession(candidate: InteractionCandidate, closeError: Error): InteractionGuardedSession {
@@ -6573,7 +5384,7 @@ describe('C3 corrections (foundation corrections design 4.2-4.8, 5.5)', () => {
         'browserContext.close: Target closed',
         'browserContext.close: Target closed',
       ],
-      ['an escape sequence across the length bound', ESCAPE_AT_BOUND, ESCAPE_AT_BOUND_REASON, ESCAPE_AT_BOUND_REASON],
+      ['an escape sequence across the former length bound', ESCAPE_AT_BOUND, ESCAPE_AT_BOUND_REASON, ESCAPE_AT_BOUND_REASON],
       // C18n: 文言が残らない場合、lifecycle の詳細は null。Ledger の文言は、これまでどおり代わりの文言（設計書 5.1.2）。
       ['only control characters', '\u001b[31m\u0007\r\n\u001b[39m', null, 'Interaction owner close failed'],
     ] as const)('normalizes an owner close rejection with %s in the lifecycle and Ledger reasons', async (
@@ -6639,7 +5450,7 @@ describe('C3 corrections (foundation corrections design 4.2-4.8, 5.5)', () => {
       });
     });
 
-    it('removes an escape sequence across the length bound from a click failure reason', async () => {
+    it('removes an escape sequence across the former length bound from a click failure reason', async () => {
       const candidate = await candidateNamed('/accordion.html', 'Toggle details');
       const rawCandidate = rawCandidateFor(candidate);
       const targetHandle = {
@@ -6671,162 +5482,10 @@ describe('C3 corrections (foundation corrections design 4.2-4.8, 5.5)', () => {
   });
   }
 
-  if (part === 'F16') {
+  {
+  // SPEC-5: 安定と持続の窓・切り詰め・下準備の focus の場面は消した（1 回の観察の判定は単体 `tests/unit/interaction-collector.test.ts` と、
+  // F10 の何もしないボタン・F15 の根拠の結合の代表で確かめる）。残すのは、根拠の結合の 2 件と、押す失敗の文言の整え、読み込みの期限と details の値。
   describe('F16 R5: stability and persistence of evidence, details disclosure, and hover identity', () => {
-    const POST_CLICK_DEADLINE_REASONS = [
-      'DEADLINE_BEFORE_POST_CONDITION_OBSERVATION',
-      'DEADLINE_DURING_POST_CONDITION_OBSERVATION',
-      'NO_OBSERVABLE_CHANGE',
-    ];
-    const STABILITY_DEADLINE_REASON = 'STABILITY_CHECK_DEADLINE';
-    const PERSISTENCE_DEADLINE_REASON = 'PERSISTENCE_CHECK_DEADLINE';
-
-    // N-1・N-3: click と関係なく対象自身の属性を変えるだけの、何もしないボタン。
-    // 下準備の hover と focus の後の安定性の確認で「不安定」になった項目と、すぐ元に戻る変化は、根拠にしない。
-    it.each([
-      ['/timer-class-button.html', 'Timer class inert'],
-      ['/animation-frame-style-button.html', 'Animation frame style inert'],
-      ['/hover-intent-class-button.html', 'Hover intent inert'],
-      ['/transition-end-class-button.html', 'Transition end inert'],
-      ['/focus-state-buttons.html', 'Focus class inert'],
-      ['/focus-state-buttons.html', 'Focus data inert'],
-      ['/ripple-button.html', 'Ripple inert'],
-    ] as const)('does not verify an inert button whose own attributes change without the click (%s, %s)', async (
-      path,
-      name,
-    ) => {
-      const candidate = await candidateNamed(path, name);
-
-      const result = await auditInteraction(input(path, candidate));
-
-      expect(result.status, JSON.stringify(result)).toBe('NOT_VERIFIABLE');
-      expect(POST_CLICK_DEADLINE_REASONS).toContain(result.reason);
-      expect(result.evidence.identityStatus).toBe('MATCHED');
-      expect(result.evidence.changedFields).toEqual([]);
-      expect(result.evidence.changedAttributes).toEqual([]);
-      expect(result.safety.blockedInteractionRequests).toEqual([]);
-    });
-
-    it.each([
-      ['/late-shift-inert-button.html', 'Late shift inert'],
-      ['/late-image-in-button.html', 'Late image inert'],
-      ['/late-flex-neighbor-button.html', 'Flex neighbor inert'],
-    ] as const)('does not verify an inert button whose late layout change happens during the stability check (%s)', async (
-      path,
-      name,
-    ) => {
-      const candidate = await candidateNamed(path, name);
-
-      const result = await auditInteraction(input(path, candidate));
-
-      expect(result.status, JSON.stringify(result)).toBe('NOT_VERIFIABLE');
-      expect(result.evidence.identityStatus).toBe('MATCHED');
-      expect(result.evidence.changedFields).toEqual([]);
-      expect(result.safety.blockedInteractionRequests).toEqual([]);
-    });
-
-    // N-2: 対象が details の summary のときは、親の details の open を開閉の状態として根拠にする。
-    it.each(['Closed disclosure', 'Open disclosure'] as const)(
-      'verifies a details summary by the open state of its details (%s)',
-      async (name) => {
-        const candidate = await candidateNamed('/details-disclosure.html', name);
-
-        const result = await auditInteraction(input('/details-disclosure.html', candidate));
-
-        expect(result.status, JSON.stringify(result)).toBe('VERIFIED');
-        expect(result.evidence.changedFields).toEqual(['detailsOpen']);
-        expect(result.evidence.changedAttributes).toEqual([]);
-      },
-    );
-
-    // N-5: 対象自身の属性が根拠になったときは、変わった属性の名前を Evidence に残す。
-    it.each([
-      ['/accordion.html', 'Toggle details', ['aria-expanded']],
-      ['/stateful-widgets.html', 'Second tab', ['aria-selected']],
-      ['/stateful-widgets.html', 'Class toggle', ['class']],
-      ['/stateful-widgets.html', 'Pressed toggle', ['aria-pressed']],
-      ['/self-growing-button.html', 'Grow me', ['style']],
-    ] as const)('verifies %s %s and records the names of the changed attributes', async (path, name, attributes) => {
-      const candidate = await candidateNamed(path, name);
-
-      const result = await auditInteraction(input(path, candidate));
-
-      expect(result.status, JSON.stringify(result)).toBe('VERIFIED');
-      expect(result.evidence.changedFields).toContain('attributes');
-      expect(result.evidence.changedAttributes).toEqual(attributes);
-      expect(Object.isFrozen(result.evidence.changedAttributes)).toBe(true);
-      expect(result.evidence.changedAttributesTruncated).toBe(false);
-    });
-
-    // F17（F16 の発見事項7）: 変わった属性の名前を上限で切り詰めた場合は、切り詰めたことを Evidence に残す。
-    describe('F17: truncation of the changed attribute names is recorded', () => {
-      const attributeNames = (count: number): readonly string[] => Array.from(
-        { length: count },
-        (_unused, index) => `data-changed-${String(index).padStart(3, '0')}`,
-      );
-      const withAttributes = (
-        before: InteractionCandidate,
-        names: readonly string[],
-      ): InteractionChangeEvidence => collectInteractionChangeEvidence(before, before, {
-        difference: { changedAttributeNames: names, changedClassNames: null, detailsOpen: { before: null, after: null } },
-      });
-
-      it.each([
-        [0, false],
-        [1, false],
-        [MAX_CHANGED_ATTRIBUTE_NAMES, false],
-        [MAX_CHANGED_ATTRIBUTE_NAMES + 1, true],
-        [MAX_CHANGED_ATTRIBUTE_NAMES + 40, true],
-      ] as const)('records %s changed attribute names with changedAttributesTruncated = %s', async (count, truncated) => {
-        const candidate = await candidateNamed('/accordion.html', 'Toggle details');
-        const names = attributeNames(count);
-
-        const evidence = withAttributes(candidate, names);
-
-        expect(evidence.changedAttributes).toEqual(names.slice(0, MAX_CHANGED_ATTRIBUTE_NAMES));
-        expect(evidence.changedAttributesTruncated).toBe(truncated);
-        expect(evidence.changedFields).toEqual(count > 0 ? ['attributes'] : []);
-      });
-
-      it('counts only the attribute names that remain evidence after the stability check', async () => {
-        const candidate = await candidateNamed('/accordion.html', 'Toggle details');
-        const names = attributeNames(MAX_CHANGED_ATTRIBUTE_NAMES + 1);
-
-        const evidence = collectInteractionChangeEvidence(candidate, candidate, {
-          difference: { changedAttributeNames: names, changedClassNames: null, detailsOpen: { before: null, after: null } },
-          instability: { fields: new Set<string>(), attributeNames: new Set([names[0] ?? '']), classNames: new Set<string>() },
-        });
-
-        expect(evidence.changedAttributes).toEqual(names.slice(1));
-        expect(evidence.changedAttributesTruncated).toBe(false);
-      });
-
-      it('keeps the truncation mark through the persistence check when either observation was truncated', async () => {
-        const candidate = await candidateNamed('/accordion.html', 'Toggle details');
-        const many = attributeNames(MAX_CHANGED_ATTRIBUTE_NAMES + 1);
-        const few = many.slice(0, 2);
-
-        expect(retainPersistentInteractionChanges(withAttributes(candidate, many), withAttributes(candidate, many)))
-          .toMatchObject({ changedAttributes: many.slice(0, MAX_CHANGED_ATTRIBUTE_NAMES), changedAttributesTruncated: true });
-        expect(retainPersistentInteractionChanges(withAttributes(candidate, many), withAttributes(candidate, few)))
-          .toMatchObject({ changedAttributes: few, changedAttributesTruncated: true });
-        expect(retainPersistentInteractionChanges(withAttributes(candidate, few), withAttributes(candidate, many)))
-          .toMatchObject({ changedAttributes: few, changedAttributesTruncated: true });
-        expect(retainPersistentInteractionChanges(withAttributes(candidate, few), withAttributes(candidate, few)))
-          .toMatchObject({ changedAttributes: few, changedAttributesTruncated: false });
-      });
-
-      it('records changedAttributesTruncated = false when there is no observation after the click', async () => {
-        const candidate = await candidateNamed('/accordion.html', 'Toggle details');
-
-        const result = await auditInteraction({ ...input('/accordion.html', candidate), timeoutMs: 200 });
-
-        expect(result.status).toBe('NOT_VERIFIABLE');
-        expect(result.evidence.changedAttributesTruncated).toBe(false);
-        expect(result.work.evidence.changedAttributesTruncated).toBe(false);
-      });
-    });
-
     it('verifies a dialog opener by the visibility of its aria-controls target', async () => {
       const candidate = await candidateNamed('/stateful-widgets.html', 'Open dialog');
 
@@ -6846,518 +5505,9 @@ describe('C3 corrections (foundation corrections design 4.2-4.8, 5.5)', () => {
       expect(result.status, JSON.stringify(result)).toBe('VERIFIED');
       expect(result.candidateId).toBe(candidate.candidateId);
       expect(result.evidence.identityStatus).toBe('MATCHED');
-      expect(result.evidence.before?.accessibleName).toBe('Unfollow');
+      expect(result.evidence.before?.accessibleName).toBe('Following (hover)');
       expect(result.evidence.changedFields).toEqual(['attributes']);
       expect(result.evidence.changedAttributes).toEqual(['aria-pressed']);
-    });
-
-    it('records the open state of the parent details only for a summary target', async () => {
-      const page = await browser.newPage({ viewport });
-      try {
-        await page.setContent(
-          '<details><summary>Summary</summary><p>Body</p></details><button type="button">Plain</button>',
-        );
-        const summary = await candidateReferenceOf(page, 'summary');
-        const button = await candidateReferenceOf(page, 'button');
-        const detailsOpen = async (handle: typeof summary, ordinal: number) => {
-          const snapshot = await inspectInteractionCandidateHandle(handle, ordinal);
-          if (snapshot.status !== 'CONNECTED') throw new Error('Expected a connected details candidate');
-          return snapshot.detailsOpen;
-        };
-        try {
-          expect(await detailsOpen(summary, 0)).toBe(false);
-          await page.evaluate(() => { document.querySelector('details')!.open = true; });
-          expect(await detailsOpen(summary, 0)).toBe(true);
-          expect(await detailsOpen(button, 1)).toBeNull();
-        } finally {
-          // T32j-4 fix round 1: 参照には手放す handle がない（読み取りの CDP の session は、読むたびに切る）。
-        }
-      } finally {
-        await page.close();
-      }
-    });
-
-    it('names the changed attributes and treats an empty class or style attribute as absent', () => {
-      const recorded = (entries: readonly string[]) => ({ status: 'RECORDED' as const, entries });
-      expect(changedInteractionAttributeNames(
-        recorded(['type', 'button', 'class', 'a', 'data-x', '1']),
-        recorded(['type', 'button', 'data-x', '2', 'aria-pressed', 'true']),
-      )).toEqual(['aria-pressed', 'class', 'data-x']);
-      // classList.remove や style.x = '' の後に残る、空の class・style は、属性がない場合と同じとみなす。
-      expect(changedInteractionAttributeNames(recorded(['type', 'button']), recorded(['type', 'button', 'class', ' ', 'style', ''])))
-        .toEqual([]);
-      expect(compareInteractionAttributeRecords(recorded(['type', 'button']), recorded(['type', 'button', 'class', ''])))
-        .toBe('UNCHANGED');
-      // 空の値に意味のある属性（hidden、open など）は、加わった属性として扱う。
-      expect(changedInteractionAttributeNames(recorded([]), recorded(['hidden', '', 'open', '']))).toEqual(['hidden', 'open']);
-      expect(changedInteractionAttributeNames({ status: 'INCOMPLETE' }, recorded([]))).toBeNull();
-    });
-
-    it.each([
-      ['non-boolean details state', { status: 'CONNECTED', domWorkUsed: 1, detailsOpen: 'yes' }],
-      ['contradictory DISCONNECTED details state', { status: 'DISCONNECTED', domWorkUsed: 1, detailsOpen: true }],
-    ] as const)('rejects a malformed retained details state: %s', async (_label, value) => {
-      const candidate = await candidateNamed('/accordion.html', 'Toggle details');
-      const snapshot = value.status === 'CONNECTED' ? { ...value, raw: rawCandidateFor(candidate) } : value;
-      const handle = fakeCandidateReference(async () => snapshot);
-
-      await expect(inspectInteractionCandidateHandle(handle, 0)).rejects.toThrow('Invalid bounded interaction handle snapshot');
-    });
-
-    type ScriptedPhase = 'PREPARED' | 'BASELINE' | 'OBSERVED';
-    interface ScriptedSnapshotInput {
-      readonly raw?: Record<string, unknown>;
-      /** 対象自身の属性の記録。null は、記録を返さない（`UNRECORDED`）。 */
-      readonly attributes?: readonly string[] | null;
-      readonly detailsOpen?: boolean | null;
-    }
-
-    /**
-     * 下準備（凍結の前）・凍結の後の click の前・click の後の観測で、それぞれ別の記録を返す偽のセッションを作る。
-     * `snapshot(phase, index)` は、その段階の何回目の観測か（0から）を受け取る。
-     * F20（設計書 4.4.2 手順4、R8 の Important-2）で是正: 下準備の focus の前後では、属性の記録を比べる。実際のブラウザは記録を必ず返すので、
-     * 下準備（`PREPARED`）で `attributes` を指定しない場合は、属性のない記録を返す。記録を返さない場合は、`attributes: null` を指定する。
-     */
-    function scriptedSession(
-      candidate: InteractionCandidate,
-      options: {
-        readonly events: string[];
-        readonly snapshot?: (phase: ScriptedPhase, index: number) => ScriptedSnapshotInput;
-        readonly focus?: () => Promise<void>;
-        readonly click?: () => Promise<void>;
-        readonly preparedWork?: (limit: number, index: number) => number;
-      },
-    ): InteractionGuardedSession {
-      const rawCandidate = rawCandidateFor(candidate);
-      let frozen = false;
-      let clicked = false;
-      const counts: Record<ScriptedPhase, number> = { PREPARED: 0, BASELINE: 0, OBSERVED: 0 };
-      const targetHandle = {
-        evaluate: async (_callback: unknown, argument: { readonly limits: { readonly maxDomWork: number } }) => {
-          const phase: ScriptedPhase = clicked ? 'OBSERVED' : frozen ? 'BASELINE' : 'PREPARED';
-          const index = counts[phase]++;
-          const scripted = options.snapshot?.(phase, index) ?? {};
-          const domWorkUsed = phase === 'PREPARED' ? options.preparedWork?.(argument.limits.maxDomWork, index) ?? 0 : 0;
-          const attributes = scripted.attributes === undefined && phase === 'PREPARED' ? [] : scripted.attributes;
-          return {
-            status: 'CONNECTED',
-            domWorkUsed,
-            raw: { ...rawCandidate, ...scripted.raw },
-            ...(attributes === undefined || attributes === null
-              ? {}
-              : { attributes: { complete: true, entries: attributes } }),
-            ...(scripted.detailsOpen === undefined ? {} : { detailsOpen: scripted.detailsOpen }),
-          };
-        },
-        scrollIntoViewIfNeeded: async () => { options.events.push('scroll'); },
-        hover: async () => { options.events.push('hover'); },
-        focus: async () => {
-          options.events.push('focus');
-          await options.focus?.();
-        },
-        click: async () => {
-          options.events.push('click');
-          await options.click?.();
-          clicked = true;
-        },
-        dispose: async () => { options.events.push('dispose'); },
-      };
-      const page = {
-        goto: async () => undefined,
-        evaluate: async (_callback: unknown, argument?: unknown) => (
-          argument === undefined ? true : { candidates: [rawCandidate], completeness: 'COMPLETE', domWorkUsed: 20 }
-        ),
-        evaluateHandle: async () => {
-          options.events.push('resolve');
-          return boundedResolutionEnvelope(targetHandle);
-        },
-      } as unknown as Page;
-      return {
-        page,
-        ledger: new SafetyLedger(),
-        activateInteractionFreeze: async () => {
-          options.events.push('freeze');
-          frozen = true;
-        },
-        ...fakeCloseLifecycle(),
-      };
-    }
-
-    it('hovers and then focuses the target before the stability check and the freeze', async () => {
-      const candidate = await candidateNamed('/accordion.html', 'Toggle details');
-      const events: string[] = [];
-
-      const result = await auditInteraction({
-        ...input('/accordion.html', candidate),
-        sessionFactory: async () => scriptedSession(candidate, {
-          events,
-          snapshot: (phase) => (phase === 'OBSERVED' ? { raw: toggledRawCandidate(candidate) } : {}),
-        }),
-      });
-
-      expect(result.status, result.reason).toBe('VERIFIED');
-      expect(events).toEqual(['resolve', 'scroll', 'hover', 'focus', 'dispose', 'freeze', 'resolve', 'click', 'dispose']);
-    });
-
-    it.each([
-      [
-        'a focus failure',
-        async () => { throw new Error('focus target detached'); },
-        'FOCUS_PREPARATION_FAILED',
-        'focus target detached',
-      ],
-      [
-        'a focus failure with only control characters',
-        async () => { throw new Error('\u001b[31m\u0007\r\n\u001b[39m'); },
-        'FOCUS_PREPARATION_FAILED',
-        null,
-      ],
-      [
-        'a focus timeout in the browser',
-        async () => {
-          const timeout = new Error('focus timed out');
-          timeout.name = 'TimeoutError';
-          throw timeout;
-        },
-        'FOCUS_PREPARATION_DEADLINE',
-        null,
-      ],
-    ] as const)('does not freeze or click after %s', async (_label, focus, expectedReason, expectedReasonDetail) => {
-      const candidate = await candidateNamed('/accordion.html', 'Toggle details');
-      const events: string[] = [];
-
-      const result = await auditInteraction({
-        ...input('/accordion.html', candidate),
-        sessionFactory: async () => scriptedSession(candidate, { events, focus }),
-      });
-
-      expect(result.status).toBe('NOT_VERIFIABLE');
-      expectReason(result, expectedReason, expectedReasonDetail);
-      expect(result.evidence.identityStatus).toBe('UNESTABLISHED');
-      expect(events).toEqual(['resolve', 'scroll', 'hover', 'focus', 'dispose']);
-    });
-
-    it('bounds a never-settling pre-freeze focus by the effective deadline', async () => {
-      const candidate = await candidateNamed('/accordion.html', 'Toggle details');
-      const events: string[] = [];
-      const neverSettles = createDeferred<void>();
-
-      const settled = await settleWithin(auditInteraction({
-        ...input('/accordion.html', candidate),
-        timeoutMs: 200,
-        sessionFactory: async () => scriptedSession(candidate, { events, focus: () => neverSettles.promise }),
-      }), 2_000);
-
-      expect(settled).not.toBe('STILL_PENDING');
-      const result = settled as Awaited<ReturnType<typeof auditInteraction>>;
-      expect(result.status).toBe('NOT_VERIFIABLE');
-      expectReason(result, 'FOCUS_PREPARATION_DEADLINE');
-      expect(events).toEqual(['resolve', 'scroll', 'hover', 'focus', 'dispose']);
-    });
-
-    it('does not freeze or click when the deadline leaves no time for the stability check', async () => {
-      const candidate = await candidateNamed('/accordion.html', 'Toggle details');
-      const events: string[] = [];
-
-      const result = await auditInteraction({
-        ...input('/accordion.html', candidate),
-        timeoutMs: 300,
-        sessionFactory: async () => scriptedSession(candidate, { events }),
-      });
-
-      expect(result.status).toBe('NOT_VERIFIABLE');
-      expectReason(result, STABILITY_DEADLINE_REASON);
-      expect(events).toEqual(['resolve', 'scroll', 'hover', 'focus', 'dispose']);
-    });
-
-    it('does not hover, focus, or adopt the state of a prepared handle that is not the discovered candidate', async () => {
-      const candidate = await candidateNamed('/accordion.html', 'Toggle details');
-      const events: string[] = [];
-
-      const result = await auditInteraction({
-        ...input('/accordion.html', candidate),
-        sessionFactory: async () => scriptedSession(candidate, {
-          events,
-          // 下準備で解決した handle が、探索と解決の間に差し込まれた別の要素を指している。
-          snapshot: (phase, index) => (phase === 'PREPARED' && index === 0
-            ? { raw: { accessibleName: 'Inserted other', normalizedText: 'Inserted other' } }
-            : {}),
-        }),
-      });
-
-      expect(result.status).toBe('NOT_VERIFIABLE');
-      expectReason(result, 'TARGET_NOT_SCROLL_PREPARED');
-      expect(events).toEqual(['resolve', 'dispose', 'freeze', 'resolve', 'dispose']);
-    });
-
-    // F20（設計書 4.4.2 手順4、R8 の Important-2）で是正: 下準備の観測に、focus の前後の2回が加わった（1 と 2）。
-    // 安定性の確認の観測は 3 から後なので、そこで作業量を使い切らせる。
-    it('debits the stability-check inspections from the shared DOM-work budget', async () => {
-      const candidate = await candidateNamed('/accordion.html', 'Toggle details');
-      const events: string[] = [];
-
-      const result = await auditInteraction({
-        ...input('/accordion.html', candidate),
-        sessionFactory: async () => scriptedSession(candidate, { events, preparedWork: (limit, index) => (index < 3 ? 0 : limit) }),
-      });
-
-      expect(result.status).toBe('NOT_VERIFIABLE');
-      expectReason(result, 'STABILITY_CHECK_DOM_WORK_EXHAUSTED');
-      expect(events).toEqual(['resolve', 'scroll', 'hover', 'focus', 'dispose']);
-    });
-
-    describe('F20 R8 Important-2: the preparatory focus of explicit tabs and focus-driven state changes', () => {
-      const FOCUS_STATE_CHANGED_REASON = 'FOCUS_PREPARATION_STATE_CHANGED';
-      const FOCUS_STATE_UNCOMPARABLE_REASON = 'FOCUS_PREPARATION_STATE_UNCOMPARABLE';
-      const FOCUS_DOM_WORK_EXHAUSTED_REASON = 'FOCUS_PREPARATION_DOM_WORK_EXHAUSTED';
-
-      it('hovers but does not focus a target with an explicit tab role, and verifies it by the click', async () => {
-        const candidate = await candidateNamed('/focus-activated-tabs.html', 'Manual second tab');
-        const events: string[] = [];
-
-        const result = await auditInteraction({
-          ...input('/accordion.html', candidate),
-          sessionFactory: async () => scriptedSession(candidate, {
-            events,
-            snapshot: (phase) => (phase === 'OBSERVED'
-              ? { raw: { ariaSelected: 'true', controlledVisible: true, controlledHidden: false } }
-              : {}),
-          }),
-        });
-
-        expect(result.status, result.reason).toBe('VERIFIED');
-        expect(result.evidence.changedFields).toEqual(['ariaSelected', 'controlledVisible', 'controlledHidden']);
-        expect(events).toEqual(['resolve', 'scroll', 'hover', 'dispose', 'freeze', 'resolve', 'click', 'dispose']);
-      });
-
-      it.each([
-        ['aria-expanded', { raw: { ariaExpanded: 'true' } }],
-        ['aria-selected', { raw: { ariaSelected: 'true' } }],
-        ['the display of the aria-controls target', { raw: { controlledVisible: true, controlledHidden: false } }],
-        ['aria-pressed', { attributes: ['aria-pressed', 'true', 'aria-checked', 'false'] }],
-        ['aria-checked', { attributes: ['aria-pressed', 'false', 'aria-checked', 'true'] }],
-      ] as const)('stops without the freeze when the preparatory focus changes %s', async (_label, focused) => {
-        const candidate = await candidateNamed('/accordion.html', 'Toggle details');
-        const events: string[] = [];
-        let hasFocus = false;
-
-        const result = await auditInteraction({
-          ...input('/accordion.html', candidate),
-          sessionFactory: async () => scriptedSession(candidate, {
-            events,
-            focus: async () => { hasFocus = true; },
-            snapshot: (phase) => (phase === 'PREPARED' && hasFocus
-              ? { attributes: ['aria-pressed', 'false', 'aria-checked', 'false'], ...focused }
-              : { attributes: ['aria-pressed', 'false', 'aria-checked', 'false'] }),
-          }),
-        });
-
-        expect(result.status).toBe('NOT_VERIFIABLE');
-        expectReason(result, FOCUS_STATE_CHANGED_REASON);
-        expect(result.evidence.identityStatus).toBe('UNESTABLISHED');
-        expect(events).toEqual(['resolve', 'scroll', 'hover', 'focus', 'dispose']);
-      });
-
-      it('continues when the preparatory focus changes only attributes other than the ARIA state', async () => {
-        const candidate = await candidateNamed('/accordion.html', 'Toggle details');
-        const events: string[] = [];
-        let hasFocus = false;
-
-        const result = await auditInteraction({
-          ...input('/accordion.html', candidate),
-          sessionFactory: async () => scriptedSession(candidate, {
-            events,
-            focus: async () => { hasFocus = true; },
-            snapshot: (phase) => (phase === 'OBSERVED'
-              ? { raw: toggledRawCandidate(candidate) }
-              : { attributes: hasFocus ? ['class', 'is-focused', 'aria-describedby', 'tip'] : [] }),
-          }),
-        });
-
-        expect(result.status, result.reason).toBe('VERIFIED');
-        expect(events).toEqual(['resolve', 'scroll', 'hover', 'focus', 'dispose', 'freeze', 'resolve', 'click', 'dispose']);
-      });
-
-      it('fails closed when the attributes before and after the preparatory focus cannot be compared', async () => {
-        const candidate = await candidateNamed('/accordion.html', 'Toggle details');
-        const events: string[] = [];
-
-        const result = await auditInteraction({
-          ...input('/accordion.html', candidate),
-          sessionFactory: async () => scriptedSession(candidate, {
-            events,
-            snapshot: (phase) => (phase === 'PREPARED' ? { attributes: null } : {}),
-          }),
-        });
-
-        expect(result.status).toBe('NOT_VERIFIABLE');
-        expectReason(result, FOCUS_STATE_UNCOMPARABLE_REASON);
-        expect(events).toEqual(['resolve', 'scroll', 'hover', 'focus', 'dispose']);
-      });
-
-      // 下準備の観測の順序: 0 は同じ要素かの確認、1 は focus の前、2 は focus の後、3 から後は安定性の確認。
-      it.each([
-        ['before the focus', 1, ['resolve', 'scroll', 'hover', 'dispose']],
-        ['after the focus', 2, ['resolve', 'scroll', 'hover', 'focus', 'dispose']],
-      ] as const)('debits the inspection %s from the shared DOM-work budget', async (_label, exhaustedAt, expectedEvents) => {
-        const candidate = await candidateNamed('/accordion.html', 'Toggle details');
-        const events: string[] = [];
-
-        const result = await auditInteraction({
-          ...input('/accordion.html', candidate),
-          sessionFactory: async () => scriptedSession(candidate, {
-            events,
-            preparedWork: (limit, index) => (index === exhaustedAt ? limit : 0),
-          }),
-        });
-
-        expect(result.status).toBe('NOT_VERIFIABLE');
-        expectReason(result, FOCUS_DOM_WORK_EXHAUSTED_REASON);
-        expect(events).toEqual(expectedEvents);
-      });
-    });
-
-    it('excludes an attribute that changed during the stability check and verifies a stable one', async () => {
-      const candidate = await candidateNamed('/accordion.html', 'Toggle details');
-      const events: string[] = [];
-      const pulse = (index: number) => (index % 2 === 0 ? 'a' : 'b');
-
-      const result = await auditInteraction({
-        ...input('/accordion.html', candidate),
-        sessionFactory: async () => scriptedSession(candidate, {
-          events,
-          snapshot: (phase, index) => ({
-            attributes: ['class', pulse(phase === 'OBSERVED' ? index + 1 : index), 'aria-pressed', phase === 'OBSERVED' ? 'true' : 'false'],
-          }),
-        }),
-      });
-
-      expect(result.status, result.reason).toBe('VERIFIED');
-      expect(result.evidence.changedFields).toEqual(['attributes']);
-      expect(result.evidence.changedAttributes).toEqual(['aria-pressed']);
-    });
-
-    it.each([
-      // F18（R6 の M-2）で是正: class は名前ごとに比べる。click の後の値は、安定性の確認の間に変わった名前（a、b）だけで作る。
-      // 安定性の確認の間に一度も現れなかった名前（例: c）が増えた場合は、安定していた名前の変化として根拠になる（下の F18 のテスト）。
-      ['changed during the stability check', (phase: ScriptedPhase, index: number) => (
-        (phase === 'OBSERVED' ? index + 1 : index) % 2 === 0 ? 'a' : 'b'
-      )],
-      ['changed between the end of the stability check and the pre-click observation', (phase: ScriptedPhase) => (
-        phase === 'BASELINE' ? 'b' : 'a'
-      )],
-    ] as const)('does not treat an attribute that %s as evidence', async (_label, classValue) => {
-      const candidate = await candidateNamed('/accordion.html', 'Toggle details');
-      const events: string[] = [];
-
-      const result = await auditInteraction({
-        ...input('/accordion.html', candidate),
-        timeoutMs: 1_500,
-        sessionFactory: async () => scriptedSession(candidate, {
-          events,
-          snapshot: (phase, index) => ({ attributes: ['class', classValue(phase, index)] }),
-        }),
-      });
-
-      expect(result.status, result.reason).toBe('NOT_VERIFIABLE');
-      expect(POST_CLICK_DEADLINE_REASONS).toContain(result.reason);
-      expect(result.evidence.changedFields).toEqual([]);
-      expect(result.evidence.changedAttributes).toEqual([]);
-    });
-
-    it('does not verify a change that reverts before the end of the persistence window', async () => {
-      const candidate = await candidateNamed('/accordion.html', 'Toggle details');
-      const events: string[] = [];
-
-      const result = await auditInteraction({
-        ...input('/accordion.html', candidate),
-        timeoutMs: 1_500,
-        sessionFactory: async () => scriptedSession(candidate, {
-          events,
-          snapshot: (phase, index) => (phase === 'OBSERVED' && index === 0 ? { raw: toggledRawCandidate(candidate) } : {}),
-        }),
-      });
-
-      expect(result.status, result.reason).toBe('NOT_VERIFIABLE');
-      expect(POST_CLICK_DEADLINE_REASONS).toContain(result.reason);
-      expect(result.evidence.changedFields).toEqual([]);
-    });
-
-    it('verifies only the changes that persist to the end of the persistence window', async () => {
-      const candidate = await candidateNamed('/accordion.html', 'Toggle details');
-      const events: string[] = [];
-
-      const result = await auditInteraction({
-        ...input('/accordion.html', candidate),
-        sessionFactory: async () => scriptedSession(candidate, {
-          events,
-          snapshot: (phase, index) => (phase === 'OBSERVED'
-            ? {
-              raw: toggledRawCandidate(candidate),
-              attributes: ['class', index === 0 ? 'ripple' : '', 'aria-expanded', 'true'],
-            }
-            : { attributes: ['class', '', 'aria-expanded', 'false'] }),
-        }),
-      });
-
-      expect(result.status, result.reason).toBe('VERIFIED');
-      expect(result.evidence.changedFields).toEqual(['ariaExpanded', 'controlledVisible', 'controlledHidden', 'attributes']);
-      expect(result.evidence.changedAttributes).toEqual(['aria-expanded']);
-    });
-
-    it('does not verify a change whose persistence window would end after the deadline', async () => {
-      const candidate = await candidateNamed('/accordion.html', 'Toggle details');
-      const events: string[] = [];
-      let clickStartedAt = 0;
-
-      const result = await auditInteraction({
-        ...input('/accordion.html', candidate),
-        timeoutMs: 1_000,
-        sessionFactory: async () => scriptedSession(candidate, {
-          events,
-          // click の後の観測を、期限の少し前（持続の確認の時間が足りない時点）まで遅らせる。
-          click: async () => { clickStartedAt = Date.now(); await wait(150); },
-          snapshot: (phase) => (phase === 'OBSERVED' ? { raw: toggledRawCandidate(candidate) } : {}),
-        }),
-      });
-
-      expect(clickStartedAt).toBeGreaterThan(0);
-      expect(result.status, result.reason).toBe('NOT_VERIFIABLE');
-      expectReason(result, PERSISTENCE_DEADLINE_REASON);
-      expect(result.evidence.changedFields).toEqual(expect.arrayContaining(['ariaExpanded']));
-    });
-
-    it('verifies a change of the parent details open state from a scripted observation', async () => {
-      const candidate = await candidateNamed('/accordion.html', 'Toggle details');
-      const events: string[] = [];
-
-      const result = await auditInteraction({
-        ...input('/accordion.html', candidate),
-        sessionFactory: async () => scriptedSession(candidate, {
-          events,
-          snapshot: (phase) => ({ detailsOpen: phase === 'OBSERVED' }),
-        }),
-      });
-
-      expect(result.status, result.reason).toBe('VERIFIED');
-      expect(result.evidence.changedFields).toEqual(['detailsOpen']);
-    });
-
-    it('does not treat a details open state that changed during the stability check as evidence', async () => {
-      const candidate = await candidateNamed('/accordion.html', 'Toggle details');
-      const events: string[] = [];
-
-      const result = await auditInteraction({
-        ...input('/accordion.html', candidate),
-        timeoutMs: 1_500,
-        sessionFactory: async () => scriptedSession(candidate, {
-          events,
-          snapshot: (phase, index) => ({ detailsOpen: phase === 'PREPARED' ? index % 2 === 0 : true }),
-        }),
-      });
-
-      expect(result.status, result.reason).toBe('NOT_VERIFIABLE');
-      expect(result.evidence.changedFields).toEqual([]);
     });
 
     /** click が `clickError` を投げる偽のセッションを作る。 */
@@ -7410,7 +5560,8 @@ describe('C3 corrections (foundation corrections design 4.2-4.8, 5.5)', () => {
       expectReason(result, 'CLICK_FAILED', expectedReason);
     });
 
-    it('does not split a surrogate pair when it bounds a click failure reason', async () => {
+    // LZ-2: 理由の詳細の長さの上限（前は 512 で、その境目のサロゲートの組を切らずに落とした）はなくなった。前の境目にまたがる組も、後ろの文字も残す。
+    it('keeps a surrogate pair across the former bound of a click failure reason', async () => {
       const candidate = await candidateNamed('/accordion.html', 'Toggle details');
       const message = `${'x'.repeat(511)}\u{1F600}tail`;
 
@@ -7420,7 +5571,7 @@ describe('C3 corrections (foundation corrections design 4.2-4.8, 5.5)', () => {
       });
 
       expect(result.status).toBe('EXECUTION_FAILED');
-      expectReason(result, 'CLICK_FAILED', 'x'.repeat(511));
+      expectReason(result, 'CLICK_FAILED', message);
       expect(result.reasonDetail).not.toMatch(/[\ud800-\udfff]/u);
     });
 
@@ -7442,19 +5593,9 @@ describe('C3 corrections (foundation corrections design 4.2-4.8, 5.5)', () => {
 
       it('starts the interaction deadline after the initial load and render', async () => {
         const candidate = await candidateNamed('/accordion.html', 'Toggle details');
-        const events: string[] = [];
-        const scripted = scriptedSession(candidate, {
-          events,
-          snapshot: (phase) => (phase === 'OBSERVED' ? { raw: toggledRawCandidate(candidate) } : {}),
-        });
+        const session = fakeToggleSession(candidate, { ledger: new SafetyLedger() });
         // 読み込みに、Interaction の期限の大部分にあたる時間がかかる。
-        const session: InteractionGuardedSession = {
-          ...scripted,
-          page: {
-            ...(scripted.page as unknown as Record<string, unknown>),
-            goto: async () => { await wait(1_200); },
-          } as unknown as Page,
-        };
+        (session.page as unknown as { goto: () => Promise<void> }).goto = async () => { await wait(1_200); };
 
         const result = await auditInteraction({
           ...input('/accordion.html', candidate),
@@ -7544,128 +5685,6 @@ describe('C3 corrections (foundation corrections design 4.2-4.8, 5.5)', () => {
           .rejects.toThrow('Interaction navigation timeout must be a positive finite integer');
       });
 
-      // I-1: style の変化が CSS のカスタムプロパティ（`--*`）だけの場合は、根拠にしない。
-      it('does not verify an inert button whose pointerdown leaves only a CSS custom property in its style', async () => {
-        const path = '/ripple-custom-property-button.html';
-        const candidate = await candidateNamed(path, 'Ripple variable inert');
-
-        const result = await auditInteraction(input(path, candidate));
-
-        expect(result.status, JSON.stringify(result)).toBe('NOT_VERIFIABLE');
-        expect(POST_CLICK_DEADLINE_REASONS).toContain(result.reason);
-        expect(result.evidence.identityStatus).toBe('MATCHED');
-        expect(result.evidence.changedFields).toEqual([]);
-        expect(result.evidence.changedAttributes).toEqual([]);
-      });
-
-      it('verifies a button whose click changes a regular style property next to a CSS custom property', async () => {
-        const path = '/ripple-custom-property-button.html';
-        const candidate = await candidateNamed(path, 'Ripple variable grow');
-
-        const result = await auditInteraction(input(path, candidate));
-
-        expect(result.status, JSON.stringify(result)).toBe('VERIFIED');
-        expect(result.evidence.changedFields).toEqual(['attributes']);
-        expect(result.evidence.changedAttributes).toEqual(['style']);
-      });
-
-      describe('style comparison by declaration', () => {
-        const recorded = (entries: readonly string[]) => ({ status: 'RECORDED' as const, entries });
-        const maxLength = INTERACTION_CANDIDATE_LIMITS.maxAttributeLength;
-        const padded = (prefix: string): string => `${prefix} --pad: ${'x'.repeat(maxLength)}`.slice(0, maxLength);
-
-        it.each([
-          ['a custom property is added', [], ['style', '--rp-start: 10px 4px;'], []],
-          ['a custom property changes next to a regular one', ['style', '--a: 1px; width: 2px;'], ['style', 'width: 2px; --a: 3px;'], []],
-          ['a custom property is removed', ['style', '--a: 1px;'], ['style', ''], []],
-          ['a custom property with a quoted semicolon changes', ['style', '--a: "x;y";'], ['style', '--a: "z;w";'], []],
-          ['a regular property is added next to a custom property', ['style', '--a: 1px;'], ['style', '--a: 1px; width: 320px;'], ['style']],
-          ['a regular property changes', ['style', 'width: 1px;'], ['style', 'width: 2px;'], ['style']],
-          ['a regular property is removed', ['style', '--a: 1px; width: 1px;'], ['style', '--a: 1px;'], ['style']],
-          // 分解できない場合は、これまでの値の比べ方を使う。
-          ['a style with a comment changes', ['style', '--a: 1px; /* note */'], ['style', '--a: 2px; /* note */'], ['style']],
-          ['a style with an unbalanced quote changes', ['style', '--a: "1px;'], ['style', '--a: "2px;'], ['style']],
-          ['a style with a declaration without a colon changes', ['style', '--a: 1px; broken'], ['style', '--a: 2px; broken'], ['style']],
-          ['a style that may be truncated changes', ['style', padded('--a: 1px;')], ['style', padded('--a: 2px;')], ['style']],
-        ] as const)('names style as changed only when a regular declaration changes: %s', (_label, before, after, expected) => {
-          expect(changedInteractionAttributeNames(recorded(before), recorded(after))).toEqual(expected);
-        });
-      });
-
-      // M-2: class は、名前ごとに、安定しているかを判定して比べる。
-      it('verifies a class toggle on a button whose timer toggles another class name', async () => {
-        const path = '/timer-class-toggle-button.html';
-        const candidate = await candidateNamed(path, 'Timer class toggle');
-
-        const result = await auditInteraction(input(path, candidate));
-
-        expect(result.status, JSON.stringify(result)).toBe('VERIFIED');
-        expect(result.evidence.changedFields).toEqual(['attributes']);
-        expect(result.evidence.changedAttributes).toEqual(['class']);
-      });
-
-      it('verifies a class name that stayed absent during the stability check and appears after the click', async () => {
-        const candidate = await candidateNamed('/accordion.html', 'Toggle details');
-        const events: string[] = [];
-        const pulse = (index: number): string => (index % 2 === 0 ? 'a' : 'b');
-
-        const result = await auditInteraction({
-          ...input('/accordion.html', candidate),
-          sessionFactory: async () => scriptedSession(candidate, {
-            events,
-            snapshot: (phase, index) => ({
-              attributes: ['class', phase === 'OBSERVED' ? `${pulse(index + 1)} c` : pulse(index)],
-            }),
-          }),
-        });
-
-        expect(result.status, result.reason).toBe('VERIFIED');
-        expect(result.evidence.changedAttributes).toEqual(['class']);
-      });
-
-      describe('class comparison by name', () => {
-        const recorded = (entries: readonly string[]) => ({ status: 'RECORDED' as const, entries });
-        // F20b（設計書 4.4.1「長い class」）: class の値は、class 専用の上限で切り詰められた可能性があるかを判定する。
-        const maxLength = INTERACTION_CANDIDATE_LIMITS.maxClassAttributeLength;
-
-        it.each([
-          ['a name is added', ['class', 'a pulse'], ['class', 'pulse active a'], ['active']],
-          ['a name is removed and another added', ['class', 'a pulse'], ['class', 'a active'], ['active', 'pulse']],
-          ['the attribute appears', [], ['class', 'x'], ['x']],
-          ['only the order and spacing change', ['class', 'a b'], ['class', ' b\ta '], []],
-        ] as const)('lists the changed class names when %s', (_label, before, after, expected) => {
-          expect(changedInteractionClassNames(recorded(before), recorded(after))).toEqual(expected);
-        });
-
-        it('does not name class as changed when only the order of its names changes', () => {
-          expect(changedInteractionAttributeNames(recorded(['class', 'a b']), recorded(['class', 'b a']))).toEqual([]);
-        });
-
-        it.each([
-          ['an incomplete record', { status: 'INCOMPLETE' as const }, recorded(['class', 'a'])],
-          ['a class value that may be truncated', recorded(['class', 'a '.repeat(maxLength).slice(0, maxLength)]), recorded(['class', 'a'])],
-        ] as const)('cannot compare class names with %s', (_label, before, after) => {
-          expect(changedInteractionClassNames(before, after)).toBeNull();
-        });
-
-        it('treats class as unstable as a whole when its names cannot be compared and some names were unstable', async () => {
-          const candidate = await candidateNamed('/accordion.html', 'Toggle details');
-          const difference = { changedAttributeNames: ['class'], changedClassNames: null, detailsOpen: { before: null, after: null } };
-
-          const unstable = collectInteractionChangeEvidence(candidate, candidate, {
-            difference,
-            instability: { fields: new Set<string>(), attributeNames: new Set<string>(), classNames: new Set(['pulse']) },
-          });
-          const stable = collectInteractionChangeEvidence(candidate, candidate, { difference });
-
-          expect(unstable.changedAttributes).toEqual([]);
-          expect(unstable.changedFields).toEqual([]);
-          // F20b（設計書 4.4.1「長い class」）: 名前ごとに比べられない class の変化は、不安定な名前がなくても根拠にしない（fail-closed）。
-          expect(stable.changedAttributes).toEqual([]);
-          expect(stable.changedFields).toEqual([]);
-        });
-      });
-
       // M-3: LRM、RLM、ALM と、孤立したサロゲートを、理由に残さない。
       it.each([
         ['LRM, RLM, and ALM', 'click‎ failed‏ badly؜', 'click failed badly'],
@@ -7699,183 +5718,21 @@ describe('C3 corrections (foundation corrections design 4.2-4.8, 5.5)', () => {
         expect(result.work.evidence.detailsOpenBefore).toBe(before);
         expect(result.work.evidence.detailsOpenAfter).toBe(after);
       });
-
-      it('records null open states for a target that is not a details summary', async () => {
-        const candidate = await candidateNamed('/accordion.html', 'Toggle details');
-
-        const result = await auditInteraction(input('/accordion.html', candidate));
-
-        expect(result.status, JSON.stringify(result)).toBe('VERIFIED');
-        expect(result.evidence.detailsOpenBefore).toBeNull();
-        expect(result.evidence.detailsOpenAfter).toBeNull();
-      });
-
-      it('records null open states when there is no observation after the click', async () => {
-        const candidate = await candidateNamed('/details-disclosure.html', 'Closed disclosure');
-
-        const result = await auditInteraction({ ...input('/details-disclosure.html', candidate), timeoutMs: 200 });
-
-        expect(result.status).toBe('NOT_VERIFIABLE');
-        expect(result.evidence.detailsOpenBefore).toBeNull();
-        expect(result.evidence.detailsOpenAfter).toBeNull();
-      });
     });
   });
   }
 
-  if (part === 'MAIN') {
-  describe('F19 R7: attributes of tooltips and input modality are not evidence', () => {
-    const PAGE = '/non-evidence-attribute-buttons.html';
-    const POST_CLICK_DEADLINE_REASONS = [
-      'DEADLINE_BEFORE_POST_CONDITION_OBSERVATION',
-      'DEADLINE_DURING_POST_CONDITION_OBSERVATION',
-      'NO_OBSERVABLE_CHANGE',
-    ];
-    // 設計書 2026-09-23 4.4.1「根拠にしない属性」の一覧。
-    // F20（R8 の Important-1）で是正: 設計書の一覧に `data-headlessui-state` が加わった。
-    const DESIGN_NON_EVIDENCE_ATTRIBUTES = [
-      'aria-describedby',
-      'data-state',
-      'data-focus-visible',
-      'data-focused',
-      'data-focus',
-      'data-focus-within',
-      'data-hovered',
-      'data-hover',
-      'data-pressed',
-      'data-active',
-      'data-headlessui-state',
-    ] as const;
-    const differenceOf = (names: readonly string[]) => ({
-      changedAttributeNames: names,
-      changedClassNames: null,
-      detailsOpen: { before: null, after: null },
-    });
-
-    // Important-1: 押したことで tooltip や入力の種類の属性だけが変わったまま残る、何もしないボタン。
-    it.each([
-      ['Radix tooltip inert'],
-      ['Tippy tooltip inert'],
-      ['React Aria focus inert'],
-    ] as const)('does not verify an inert button whose tooltip or modality attributes change on press (%s)', async (name) => {
-      const candidate = await candidateNamed(PAGE, name);
-
-      const result = await auditInteraction(input(PAGE, candidate));
-
-      expect(result.status, JSON.stringify(result)).toBe('NOT_VERIFIABLE');
-      expect(POST_CLICK_DEADLINE_REASONS).toContain(result.reason);
-      expect(result.evidence.identityStatus).toBe('MATCHED');
-      expect(result.evidence.changedFields).toEqual([]);
-      expect(result.evidence.changedAttributes).toEqual([]);
-      expect(result.evidence.changedAttributesTruncated).toBe(false);
-      expect(result.safety.blockedInteractionRequests).toEqual([]);
-    });
-
-    // Radix のアコーディオンの形: data-state と aria-expanded が一緒に変わる。data-state を除いても、ARIA の状態で確かめられる。
-    it('verifies a Radix-style accordion by its ARIA state, without data-state as evidence', async () => {
-      const candidate = await candidateNamed(PAGE, 'Radix accordion toggle');
-
-      const result = await auditInteraction(input(PAGE, candidate));
-
-      expect(result.status, JSON.stringify(result)).toBe('VERIFIED');
-      expect(result.evidence.changedFields).toEqual(
-        expect.arrayContaining(['ariaExpanded', 'controlledVisible', 'controlledHidden', 'attributes']),
-      );
-      expect(result.evidence.changedAttributes).toEqual(['aria-expanded']);
-      expect(result.evidence.changedAttributesTruncated).toBe(false);
-    });
-
-    it('defines the non-evidence attributes in one named constant, as listed in the design', () => {
-      expect([...INTERACTION_NON_EVIDENCE_ATTRIBUTES]).toEqual([...DESIGN_NON_EVIDENCE_ATTRIBUTES]);
-    });
-
-    it.each(DESIGN_NON_EVIDENCE_ATTRIBUTES)('never counts a change of %s as evidence', async (name) => {
-      const candidate = await candidateNamed('/accordion.html', 'Toggle details');
-
-      const evidence = collectInteractionChangeEvidence(candidate, candidate, { difference: differenceOf([name]) });
-
-      expect(evidence.changedFields).toEqual([]);
-      expect(evidence.changedAttributes).toEqual([]);
-      expect(evidence.changedAttributesTruncated).toBe(false);
-    });
-
-    it('keeps only the attributes that are evidence when they change together with non-evidence attributes', async () => {
-      const candidate = await candidateNamed('/accordion.html', 'Toggle details');
-
-      const evidence = collectInteractionChangeEvidence(candidate, candidate, {
-        difference: differenceOf(['aria-expanded', 'data-state', 'aria-describedby', 'data-open']),
-      });
-
-      expect(evidence.changedFields).toEqual(['attributes']);
-      expect(evidence.changedAttributes).toEqual(['aria-expanded', 'data-open']);
-    });
-
-    it('does not count the non-evidence attributes toward the truncation of the changed attribute names', async () => {
-      const candidate = await candidateNamed('/accordion.html', 'Toggle details');
-      const evidenceNames = Array.from(
-        { length: MAX_CHANGED_ATTRIBUTE_NAMES },
-        (_unused, index) => `data-changed-${String(index).padStart(3, '0')}`,
-      );
-
-      const evidence = collectInteractionChangeEvidence(candidate, candidate, {
-        difference: differenceOf([...evidenceNames, ...DESIGN_NON_EVIDENCE_ATTRIBUTES]),
-      });
-
-      expect(evidence.changedAttributes).toEqual(evidenceNames);
-      expect(evidence.changedAttributesTruncated).toBe(false);
-    });
-
-    // Minor-3: 持続の確認で attributes が根拠から外れた場合は、切り詰めの印を残さない。
-    it('clears changedAttributesTruncated when the persistence check drops attributes from the evidence', async () => {
-      const candidate = await candidateNamed('/accordion.html', 'Toggle details');
-      const namesWithPrefix = (prefix: string): readonly string[] => Array.from(
-        { length: MAX_CHANGED_ATTRIBUTE_NAMES + 1 },
-        (_unused, index) => `data-${prefix}-${String(index).padStart(3, '0')}`,
-      );
-      const latest = collectInteractionChangeEvidence(candidate, candidate, { difference: differenceOf(namesWithPrefix('late')) });
-      const earlier = collectInteractionChangeEvidence(candidate, candidate, { difference: differenceOf(namesWithPrefix('early')) });
-      expect(latest.changedAttributesTruncated).toBe(true);
-      expect(earlier.changedAttributesTruncated).toBe(true);
-
-      const persistent = retainPersistentInteractionChanges(latest, earlier);
-
-      expect(persistent.changedFields).toEqual([]);
-      expect(persistent.changedAttributes).toEqual([]);
-      expect(persistent.changedAttributesTruncated).toBe(false);
-    });
-  });
-
+  {
+  // SPEC-5（設計書 2026-11-14 5.1）: 根拠にしない属性の一覧・名前の決まり・タブだけの決まりは、全部の候補に当てる 1 つの決まりにした（属性は ARIA の状態と
+  // `open` と class の名前だけ。style は根拠にしない）。決まりの表は単体（`tests/unit/interaction-collector.test.ts`）。結合は、class・自動で切り替わる
+  // タブ・押しても何も起きないタブ（focus で付く属性と style だけが変わる）の代表だけを残した。
   describe('F20 R8: focus and hover names are not evidence, and explicit tabs are not focused before the freeze', () => {
-    const ATTRIBUTES_PAGE = '/non-evidence-attribute-buttons.html';
     const TABS_PAGE = '/focus-activated-tabs.html';
+    /** click の後の、変化の見えない理由（混雑の下では、落ち着きの待ちが期限まで続くことがある）。 */
     const POST_CLICK_DEADLINE_REASONS = [
-      'DEADLINE_BEFORE_POST_CONDITION_OBSERVATION',
       'DEADLINE_DURING_POST_CONDITION_OBSERVATION',
       'NO_OBSERVABLE_CHANGE',
     ];
-    const FOCUS_STATE_CHANGED_REASON = 'FOCUS_PREPARATION_STATE_CHANGED';
-    const differenceOf = (names: readonly string[], classNames: readonly string[] | null = null) => ({
-      changedAttributeNames: names,
-      changedClassNames: classNames,
-      detailsOpen: { before: null, after: null },
-    });
-
-    // Important-1: Headless UI v2 と MUI の形の、何もしないボタン。押したことで、focus と hover を表す名前だけが変わったまま残る。
-    it.each([
-      ['Headless UI inert'],
-      ['MUI focus visible inert'],
-    ] as const)('does not verify an inert button whose focus or hover names change on press (%s)', async (name) => {
-      const candidate = await candidateNamed(ATTRIBUTES_PAGE, name);
-
-      const result = await auditInteraction(input(ATTRIBUTES_PAGE, candidate));
-
-      expect(result.status, JSON.stringify(result)).toBe('NOT_VERIFIABLE');
-      expect(POST_CLICK_DEADLINE_REASONS).toContain(result.reason);
-      expect(result.evidence.identityStatus).toBe('MATCHED');
-      expect(result.evidence.changedFields).toEqual([]);
-      expect(result.evidence.changedAttributes).toEqual([]);
-      expect(result.safety.blockedInteractionRequests).toEqual([]);
-    });
 
     it('keeps verifying a toggle that switches the .active class', async () => {
       const candidate = await candidateNamed('/stateful-widgets.html', 'Class toggle');
@@ -7887,69 +5744,7 @@ describe('C3 corrections (foundation corrections design 4.2-4.8, 5.5)', () => {
       expect(result.evidence.changedAttributes).toEqual(['class']);
     });
 
-    it('defines the name rule in one named constant that matches focus or hover without regard to case', () => {
-      for (const name of ['focus', 'FOCUS', 'Mui-focusVisible', 'is-focused', 'is-hovered', 'data-focus-ring', 'Hover']) {
-        expect(INTERACTION_NON_EVIDENCE_NAME_PATTERN.test(name), name).toBe(true);
-      }
-      for (const name of ['active', 'is-active', 'open', 'data-open', 'selected']) {
-        expect(INTERACTION_NON_EVIDENCE_NAME_PATTERN.test(name), name).toBe(false);
-      }
-    });
-
-    it.each([
-      ['data-focus-ring'],
-      ['data-is-hovered'],
-      ['data-HOVER-state'],
-      ['data-headlessui-state'],
-    ] as const)('never counts a change of the data attribute %s as evidence', async (name) => {
-      const candidate = await candidateNamed('/accordion.html', 'Toggle details');
-
-      const evidence = collectInteractionChangeEvidence(candidate, candidate, { difference: differenceOf([name]) });
-
-      expect(evidence.changedFields).toEqual([]);
-      expect(evidence.changedAttributes).toEqual([]);
-    });
-
-    it('keeps a changed attribute whose name contains focus or hover but is not a data attribute', async () => {
-      const candidate = await candidateNamed('/accordion.html', 'Toggle details');
-
-      const evidence = collectInteractionChangeEvidence(candidate, candidate, { difference: differenceOf(['onfocus']) });
-
-      expect(evidence.changedFields).toEqual(['attributes']);
-      expect(evidence.changedAttributes).toEqual(['onfocus']);
-    });
-
-    it.each([
-      [['Mui-focusVisible']],
-      [['is-focused']],
-      [['is-hovered', 'IS-FOCUS']],
-    ] as const)('never counts a change of only the class names %j as evidence', async (classNames) => {
-      const candidate = await candidateNamed('/accordion.html', 'Toggle details');
-
-      const evidence = collectInteractionChangeEvidence(candidate, candidate, {
-        difference: differenceOf(['class'], classNames),
-      });
-
-      expect(evidence.changedFields).toEqual([]);
-      expect(evidence.changedAttributes).toEqual([]);
-    });
-
-    it.each([
-      [['active']],
-      [['is-active']],
-      [['is-focused', 'is-open']],
-    ] as const)('counts a change of the class names %j as evidence', async (classNames) => {
-      const candidate = await candidateNamed('/accordion.html', 'Toggle details');
-
-      const evidence = collectInteractionChangeEvidence(candidate, candidate, {
-        difference: differenceOf(['class'], classNames),
-      });
-
-      expect(evidence.changedFields).toEqual(['attributes']);
-      expect(evidence.changedAttributes).toEqual(['class']);
-    });
-
-    // Important-2: 自動で切り替わるタブは、下準備で focus しないので、click で切り替わったことを確かめられる。
+    // Important-2: 自動で切り替わるタブは、凍結の前に focus しないので、click で切り替わったことを確かめられる。
     it('verifies an automatically activated tab that is selected on focus', async () => {
       const candidate = await candidateNamed(TABS_PAGE, 'Auto second tab');
 
@@ -7961,80 +5756,13 @@ describe('C3 corrections (foundation corrections design 4.2-4.8, 5.5)', () => {
       expect(result.evidence.changedAttributes).not.toContain('class');
     });
 
-    it('keeps verifying a manually activated tab', async () => {
-      const candidate = await candidateNamed(TABS_PAGE, 'Manual second tab');
-
-      const result = await auditInteraction(input(TABS_PAGE, candidate));
-
-      expect(result.status, JSON.stringify(result)).toBe('VERIFIED');
-      expect(result.evidence.changedFields).toEqual(expect.arrayContaining(['ariaSelected', 'controlledVisible', 'attributes']));
-      expect(result.evidence.changedAttributes).toContain('aria-selected');
-      expect(result.evidence.changedAttributes).not.toContain('class');
-    });
-
+    // 押すと focus で付く `focused` 属性・inline の style（R9 の Important-1）だけが変わる、選ばれているタブ。属性は ARIA の状態と `open` だけを
+    // 根拠にするので、何も起きないのに VERIFIED にはならない。
     it.each([
-      ['tab', true],
-      ['tab button', true],
-      ['\ttab\n', true],
-      ['button tab', true],
-      ['tablist', false],
-      ['tabpanel', false],
-      ['button', false],
-      ['', false],
-      [null, false],
-    ] as const)('judges whether the role %j explicitly contains tab', (role, expected) => {
-      expect(hasExplicitTabRole(role)).toBe(expected);
-    });
-
-    it('does not verify a target without a tab role whose ARIA state changes on the preparatory focus', async () => {
-      const candidate = await candidateNamed(TABS_PAGE, 'Focus disclosure');
-
-      const result = await auditInteraction(input(TABS_PAGE, candidate));
-
-      expect(result.status, JSON.stringify(result)).toBe('NOT_VERIFIABLE');
-      expectReason(result, FOCUS_STATE_CHANGED_REASON);
-      expect(result.evidence.identityStatus).toBe('UNESTABLISHED');
-      expect(result.safety.blockedInteractionRequests).toEqual([]);
-    });
-  });
-
-  describe('F21 R9: attribute changes of an explicit tab are not evidence', () => {
-    const TABS_PAGE = '/focus-activated-tabs.html';
-    const POST_CLICK_DEADLINE_REASONS = [
-      'DEADLINE_BEFORE_POST_CONDITION_OBSERVATION',
-      'DEADLINE_DURING_POST_CONDITION_OBSERVATION',
-      'NO_OBSERVABLE_CHANGE',
-    ];
-    const differenceOf = (names: readonly string[], classNames: readonly string[] | null = null) => ({
-      changedAttributeNames: names,
-      changedClassNames: classNames,
-      detailsOpen: { before: null, after: null },
-    });
-
-    it('serves Radix-shaped triggers that all start without a tab stop', async () => {
-      const page = await browser.newPage({ viewport });
-      try {
-        await page.goto(`${server.origin}${TABS_PAGE}`);
-        const tabIndexes = await page.evaluate(() => Array.from(
-          document.querySelectorAll('[role="tablist"][data-roving-activation] [role="tab"]'),
-          (tab) => tab.getAttribute('tabindex'),
-        ));
-        expect(tabIndexes).toEqual(['-1', '-1', '-1', '-1']);
-      } finally {
-        await page.close();
-      }
-    });
-
-    // 修正前は、mousedown と focus で変わる tabindex、focus で付く `focused` 属性、focus で変わる inline の style が根拠になり、
-    // 何も起きないのに VERIFIED になっていた。
-    it.each([
-      ['Radix auto first tab'],
-      ['Radix manual first tab'],
       ['Focused attribute first tab'],
       ['Box shadow first tab'],
     ] as const)('does not verify pressing the already selected tab (%s)', async (name) => {
       const candidate = await candidateNamed(TABS_PAGE, name);
-      expect(hasExplicitTabRole(candidate.role)).toBe(true);
 
       const result = await auditInteraction(input(TABS_PAGE, candidate));
 
@@ -8045,226 +5773,6 @@ describe('C3 corrections (foundation corrections design 4.2-4.8, 5.5)', () => {
       expect(result.evidence.changedAttributes).toEqual([]);
       expect(result.evidence.changedAttributesTruncated).toBe(false);
       expect(result.safety.blockedInteractionRequests).toEqual([]);
-    });
-
-    it.each([
-      ['Radix auto second tab'],
-      ['Radix manual second tab'],
-      ['Focused attribute second tab'],
-      ['Box shadow second tab'],
-    ] as const)('verifies switching to an unselected tab only by the ARIA state and the display (%s)', async (name) => {
-      const candidate = await candidateNamed(TABS_PAGE, name);
-
-      const result = await auditInteraction(input(TABS_PAGE, candidate));
-
-      expect(result.status, JSON.stringify(result)).toBe('VERIFIED');
-      expect(result.evidence.changedFields).toEqual(expect.arrayContaining(['ariaSelected', 'controlledVisible']));
-      expect(result.evidence.changedAttributes).toEqual(['aria-selected']);
-      expect(result.evidence.changedAttributes).not.toContain('tabindex');
-      expect(result.evidence.changedAttributesTruncated).toBe(false);
-    });
-
-    it.each([
-      ['Plain active toggle', '/focus-activated-tabs.html'],
-      ['Plain open toggle', '/focus-activated-tabs.html'],
-      ['Class toggle', '/stateful-widgets.html'],
-    ] as const)('keeps verifying the attribute change of a target without a role (%s)', async (name, path) => {
-      const candidate = await candidateNamed(path, name);
-      expect(hasExplicitTabRole(candidate.role)).toBe(false);
-
-      // DF-2b（DEF-093）: 混雑の下で、続くことの確かめの途中に期限が切れた回（`PERSISTENCE_CHECK_DEADLINE`）があったので、期限は混雑の倍率を掛けた値。
-      const result = await auditInteraction(loadedInput(path, candidate));
-
-      expect(result.status, JSON.stringify(result)).toBe('VERIFIED');
-      expect(result.evidence.changedFields).toEqual(['attributes']);
-      expect(result.evidence.changedAttributes).toEqual(['class']);
-    }, LOADED_INTERACTION_AUDIT_TEST_TIMEOUT_MS);
-
-    it('counts only the ARIA state attributes when attributes other than the ARIA state are not evidence', async () => {
-      const candidate = await candidateNamed(TABS_PAGE, 'Radix auto first tab');
-
-      const evidence = collectInteractionChangeEvidence(candidate, candidate, {
-        difference: differenceOf(['aria-checked', 'aria-pressed', 'class', 'focused', 'style', 'tabindex'], ['is-open']),
-        ariaStateAttributesOnly: true,
-      });
-
-      expect(evidence.changedFields).toEqual(['attributes']);
-      expect(evidence.changedAttributes).toEqual(['aria-checked', 'aria-pressed']);
-      expect(evidence.changedAttributesTruncated).toBe(false);
-    });
-
-    it('leaves changedAttributes empty and not truncated when only attributes other than the ARIA state change', async () => {
-      const candidate = await candidateNamed(TABS_PAGE, 'Radix auto first tab');
-      const names = Array.from({ length: MAX_CHANGED_ATTRIBUTE_NAMES + 1 }, (_unused, index) => `x-${String(index).padStart(3, '0')}`);
-
-      const evidence = collectInteractionChangeEvidence(candidate, candidate, {
-        difference: differenceOf([...names, 'tabindex']),
-        ariaStateAttributesOnly: true,
-      });
-
-      expect(evidence.changedFields).toEqual([]);
-      expect(evidence.changedAttributes).toEqual([]);
-      expect(evidence.changedAttributesTruncated).toBe(false);
-    });
-
-    it('does not count an ARIA state attribute that changed during the stability check', async () => {
-      const candidate = await candidateNamed(TABS_PAGE, 'Radix auto first tab');
-
-      const evidence = collectInteractionChangeEvidence(candidate, candidate, {
-        difference: differenceOf(['aria-pressed', 'tabindex']),
-        instability: {
-          fields: new Set<string>(),
-          attributeNames: new Set(['aria-pressed']),
-          classNames: new Set<string>(),
-        },
-        ariaStateAttributesOnly: true,
-      });
-
-      expect(evidence.changedFields).toEqual([]);
-      expect(evidence.changedAttributes).toEqual([]);
-    });
-  });
-
-  describe('F20b: long class values are recorded up to the class limit and are not evidence when they may be truncated', () => {
-    const PAGE = '/non-evidence-attribute-buttons.html';
-    const POST_CLICK_DEADLINE_REASONS = [
-      'DEADLINE_BEFORE_POST_CONDITION_OBSERVATION',
-      'DEADLINE_DURING_POST_CONDITION_OBSERVATION',
-      'NO_OBSERVABLE_CHANGE',
-    ];
-    const recorded = (entries: readonly string[]) => ({ status: 'RECORDED' as const, entries });
-
-    it('serves fixture buttons whose class lengths straddle the attribute limit and the class limit', async () => {
-      const page = await browser.newPage({ viewport });
-      try {
-        await page.goto(`${server.origin}${PAGE}`);
-        const lengths: Record<string, number> = await page.evaluate(() => Object.fromEntries(
-          ['long-class-focus', 'long-class-toggle', 'huge-class-toggle', 'huge-class-aria-toggle']
-            .map((id) => [id, document.getElementById(id)?.getAttribute('class')?.length ?? 0]),
-        ));
-        for (const id of ['long-class-focus', 'long-class-toggle']) {
-          expect(lengths[id], id).toBeGreaterThan(INTERACTION_CANDIDATE_LIMITS.maxAttributeLength);
-          expect(lengths[id], id).toBeLessThan(INTERACTION_CANDIDATE_LIMITS.maxClassAttributeLength - 64);
-        }
-        for (const id of ['huge-class-toggle', 'huge-class-aria-toggle']) {
-          expect(lengths[id], id).toBeGreaterThan(INTERACTION_CANDIDATE_LIMITS.maxClassAttributeLength);
-        }
-      } finally {
-        await page.close();
-      }
-    });
-
-    it('records the class value up to the class limit and the other values up to the attribute limit', async () => {
-      const page = await browser.newPage({ viewport });
-      try {
-        await page.setContent('<button type="button">Long class</button>');
-        await page.evaluate(({ classLength, attributeLength }) => {
-          const button = document.querySelector('button')!;
-          button.setAttribute('class', 'c'.repeat(classLength));
-          button.setAttribute('data-long', 'v'.repeat(attributeLength));
-        }, {
-          classLength: INTERACTION_CANDIDATE_LIMITS.maxClassAttributeLength + 100,
-          attributeLength: INTERACTION_CANDIDATE_LIMITS.maxAttributeLength + 100,
-        });
-        const handle = await page.locator('button').elementHandle();
-        const handleReference = await candidateReferenceOf(page, 'button');
-        if (handle === null) throw new Error('Missing long class candidate');
-        try {
-          const snapshot = await inspectInteractionCandidateHandle(handleReference, 0);
-          if (snapshot.status !== 'CONNECTED' || snapshot.attributes.status !== 'RECORDED') {
-            throw new Error('Expected a recorded attribute list');
-          }
-          expect(snapshot.attributes.entries).toEqual([
-            'type',
-            'button',
-            'class',
-            'c'.repeat(INTERACTION_CANDIDATE_LIMITS.maxClassAttributeLength),
-            'data-long',
-            'v'.repeat(INTERACTION_CANDIDATE_LIMITS.maxAttributeLength),
-          ]);
-        } finally {
-          await handle.dispose();
-        }
-      } finally {
-        await page.close();
-      }
-    });
-
-    it('compares a class value longer than the attribute limit by name', () => {
-      const utilities = Array.from({ length: 80 }, (_unused, index) => `tw-utility-${index}`).join(' ');
-      expect(utilities.length).toBeGreaterThan(INTERACTION_CANDIDATE_LIMITS.maxAttributeLength);
-
-      expect(changedInteractionClassNames(recorded(['class', `btn ${utilities}`]), recorded(['class', `btn focus-visible ${utilities}`])))
-        .toEqual(['focus-visible']);
-      expect(changedInteractionAttributeNames(recorded(['class', `btn ${utilities}`]), recorded(['class', `${utilities} btn`])))
-        .toEqual([]);
-    });
-
-    it('does not count a class change as evidence when the class value may be truncated at the class limit', async () => {
-      const candidate = await candidateNamed('/accordion.html', 'Toggle details');
-      const truncated = (prefix: string): string => `${prefix} ${'u '.repeat(INTERACTION_CANDIDATE_LIMITS.maxClassAttributeLength)}`
-        .slice(0, INTERACTION_CANDIDATE_LIMITS.maxClassAttributeLength);
-      const before = recorded(['class', truncated('btn')]);
-      const after = recorded(['class', truncated('btn is-open')]);
-
-      const evidence = collectInteractionChangeEvidence(candidate, candidate, {
-        difference: {
-          changedAttributeNames: changedInteractionAttributeNames(before, after),
-          changedClassNames: changedInteractionClassNames(before, after),
-          detailsOpen: { before: null, after: null },
-        },
-      });
-
-      expect(changedInteractionAttributeNames(before, after)).toEqual(['class']);
-      expect(changedInteractionClassNames(before, after)).toBeNull();
-      expect(evidence.changedFields).toEqual([]);
-      expect(evidence.changedAttributes).toEqual([]);
-    });
-
-    it('does not verify an inert button with a long class whose focus-visible name is removed on press', async () => {
-      const candidate = await candidateNamed(PAGE, 'Long class focus visible inert');
-
-      const result = await auditInteraction(input(PAGE, candidate));
-
-      expect(result.status, JSON.stringify(result)).toBe('NOT_VERIFIABLE');
-      expect(POST_CLICK_DEADLINE_REASONS).toContain(result.reason);
-      expect(result.evidence.identityStatus).toBe('MATCHED');
-      expect(result.evidence.changedFields).toEqual([]);
-      expect(result.evidence.changedAttributes).toEqual([]);
-      expect(result.safety.blockedInteractionRequests).toEqual([]);
-    });
-
-    it('verifies a toggle with a long class that switches the is-open class name', async () => {
-      const candidate = await candidateNamed(PAGE, 'Long class toggle');
-
-      const result = await auditInteraction(input(PAGE, candidate));
-
-      expect(result.status, JSON.stringify(result)).toBe('VERIFIED');
-      expect(result.evidence.changedFields).toEqual(['attributes']);
-      expect(result.evidence.changedAttributes).toEqual(['class']);
-    });
-
-    it('does not verify a toggle whose class exceeds the class limit when it has no ARIA state (fail-closed)', async () => {
-      const candidate = await candidateNamed(PAGE, 'Huge class toggle');
-
-      const result = await auditInteraction(input(PAGE, candidate));
-
-      expect(result.status, JSON.stringify(result)).toBe('NOT_VERIFIABLE');
-      expect(POST_CLICK_DEADLINE_REASONS).toContain(result.reason);
-      expect(result.evidence.identityStatus).toBe('MATCHED');
-      expect(result.evidence.changedFields).toEqual([]);
-      expect(result.evidence.changedAttributes).toEqual([]);
-      expect(result.safety.blockedInteractionRequests).toEqual([]);
-    });
-
-    it('verifies a toggle whose class exceeds the class limit by its ARIA state', async () => {
-      const candidate = await candidateNamed(PAGE, 'Huge class ARIA toggle');
-
-      const result = await auditInteraction(input(PAGE, candidate));
-
-      expect(result.status, JSON.stringify(result)).toBe('VERIFIED');
-      expect(result.evidence.changedFields).toEqual(expect.arrayContaining(['ariaExpanded', 'attributes']));
-      expect(result.evidence.changedAttributes).toEqual(['aria-expanded']);
     });
   });
   }
@@ -8272,8 +5780,8 @@ describe('C3 corrections (foundation corrections design 4.2-4.8, 5.5)', () => {
 }
 
 /**
- * TS-c: Interaction の session の区分・期限・読み込みの観測・出口の中継の記録・凍結の直後の close の競合のテストを登録する
- * （`isolated-interaction-audit.test.ts` が呼ぶ）。本文は、分ける前の位置と字下げのまま。
+ * TS-c: Interaction の session の区分・期限・読み込みの観測・出口の中継の記録のテストを登録する（SLIM BD-5: 既定の Chromium だけなので、速い組の
+ * `isolated-interaction-discovery.test.ts` が呼ぶ。凍結の直後の close の競合は `registerFrozenCloseRaceCases`）。本文は、分ける前の位置と字下げのまま。
  */
 export function registerInteractionSessionCases(): void {
 // I15a（Task 14〜17 の設計書 5.4.1）: NOT_VERIFIABLE の区分。確かめる手順を最後まで行って変化が見えなかったか、サイトの振る舞いのために
@@ -8310,7 +5818,6 @@ describe('I15a: the kind of NOT_VERIFIABLE in Interaction Evidence', () => {
       }),
       scrollIntoViewIfNeeded: async () => { throw timeoutError('scroll timed out'); },
       hover: async () => undefined,
-      focus: async () => undefined,
       dispose: async () => undefined,
     };
     const page = {
@@ -8341,16 +5848,6 @@ describe('I15a: the kind of NOT_VERIFIABLE in Interaction Evidence', () => {
     expect(Object.keys(result.work).sort()).toEqual(['evidence', 'reason', 'reasonDetail', 'status']);
   });
 
-  it('gives OBSERVED_NO_CHANGE to a button whose state changes on the preparatory focus', async () => {
-    const candidate = await candidateNamed('/focus-activated-tabs.html', 'Focus disclosure');
-
-    const result = await auditInteraction(input('/focus-activated-tabs.html', candidate));
-
-    expect(result.status, JSON.stringify(result)).toBe('NOT_VERIFIABLE');
-    expectReason(result, 'FOCUS_PREPARATION_STATE_CHANGED');
-    expect(result.notVerifiableKind).toBe('OBSERVED_NO_CHANGE');
-  });
-
   it('gives CHECK_NOT_COMPLETED to a load that exceeds the navigation timeout', async () => {
     const candidate = await candidateNamed('/accordion.html', 'Toggle details');
 
@@ -8374,33 +5871,6 @@ describe('I15a: the kind of NOT_VERIFIABLE in Interaction Evidence', () => {
 
     expect(result.status).toBe('NOT_VERIFIABLE');
     expectReason(result, 'SCROLL_PREPARATION_DEADLINE');
-    expect(result.notVerifiableKind).toBe('CHECK_NOT_COMPLETED');
-  });
-
-  it('gives CHECK_NOT_COMPLETED when the DOM work budget is exhausted', async () => {
-    const candidate = await candidateNamed('/accordion.html', 'Toggle details');
-    const rawCandidate = rawCandidateFor(candidate);
-    const page = {
-      goto: async () => undefined,
-      evaluate: async (_callback: unknown, argument?: unknown) => (
-        argument === undefined
-          ? true
-          : { candidates: [rawCandidate], completeness: 'COMPLETE', domWorkUsed: INTERACTION_CANDIDATE_LIMITS.maxDomWork }
-      ),
-    } as unknown as Page;
-
-    const result = await auditInteraction({
-      ...input('/accordion.html', candidate),
-      sessionFactory: async () => ({
-        page: withScrollPreparation(page, candidate),
-        ledger: new SafetyLedger(),
-        activateInteractionFreeze: async () => undefined,
-        ...fakeCloseLifecycle(),
-      }),
-    });
-
-    expect(result.status).toBe('NOT_VERIFIABLE');
-    expectReason(result, 'DOM_WORK_EXHAUSTED');
     expect(result.notVerifiableKind).toBe('CHECK_NOT_COMPLETED');
   });
 
@@ -8446,13 +5916,11 @@ describe('I15a: the kind of NOT_VERIFIABLE in Interaction Evidence', () => {
   });
 
   it('lists every NOT_VERIFIABLE reason once in the reason table, each with a kind', async () => {
-    // C18n: 対応表は、コードの一覧（`INTERACTION_NOT_VERIFIABLE_REASON_CODES`）のすべてのコードから区分への対応だけを持つ。
-    // 英文は持たない（Evidence の理由はコードにし、詳細は `reasonDetail` に入れる）。
+    // C18n: 対応表は、今の版が書くコードから区分への対応だけを持つ。英文は持たない（Evidence の理由はコードにし、詳細は `reasonDetail` に入れる）。
+    // SPEC-5: 書くコードと読むだけのコードの和がコードの一覧になることは、単体（`tests/unit/interaction-open-ended.test.ts`）で確かめる。
     const table: Readonly<Record<string, unknown>> = INTERACTION_NOT_VERIFIABLE_REASONS;
     const entries = Object.entries(table);
     expect(Object.isFrozen(table)).toBe(true);
-    expect(entries).toHaveLength(55);
-    expect(Object.keys(table)).toEqual([...INTERACTION_NOT_VERIFIABLE_REASON_CODES]);
     expect(new Set(INTERACTION_NOT_VERIFIABLE_REASON_CODES).size).toBe(INTERACTION_NOT_VERIFIABLE_REASON_CODES.length);
     for (const [code, kind] of entries) {
       expect(code).toMatch(REASON_CODE_PATTERN);
@@ -8715,38 +6183,18 @@ describe('the observation of the target load of an interaction candidate (site u
     return interactionAuditInput({ factory: statusFactory, origin: statusOrigin, viewport, path, candidate });
   }
 
-  /**
-   * `target`（凍結されていないもの）を包み、`overrides` にある名前の値だけを差し替える。ほかの関数は、`target` に束縛して返す（Playwright の
-   * page のメソッドが、包んだものではなく本物の `this` で動くようにする）。
-   */
-  function withBoundMethods<T extends object>(target: T, overrides: Readonly<Record<string, unknown>>): T {
-    return new Proxy(target, {
-      get(original, property) {
-        if (typeof property === 'string' && Object.hasOwn(overrides, property)) {
-          return overrides[property];
-        }
-        const value = Reflect.get(original, property, original) as unknown;
-        return typeof value === 'function' ? (value as (...args: unknown[]) => unknown).bind(original) : value;
-      },
-    });
-  }
-
-  // D3（サイトの不調で止めたときの診断の記録の設計書 2.2 の 2026-10-07 の改訂）: 受け口には、観測に加えて、候補の読み込みの間のページ本体の
-  // 要求の観察の結果（`startNavigationDiagnostics` の結果）を渡す。本物の Chromium では観察できる（`OBSERVED`）。
   it.each(Object.entries(STATUS_PATHS) as [StatusPath, number][])(
-    'passes the observation of the target load of %s (HTTP %d) and its navigation diagnostics to afterTargetLoad, and audits as without it',
+    'passes the observation of the target load of %s (HTTP %d) to afterTargetLoad, and audits as without it',
     async (path, status) => {
       const candidate = await discoverInteractionCandidate(statusFactory, statusOrigin, viewport, path, CANDIDATE_NAME, {
         expectedCompleteness: 'COMPLETE',
       });
       const observations: MainFrameLoadObservation[] = [];
-      const diagnostics: NavigationDiagnostics[] = [];
 
       const observed = await auditInteraction({
         ...statusInput(path, candidate),
-        afterTargetLoad: (observation, navigationDiagnostics) => {
+        afterTargetLoad: (observation) => {
           observations.push(observation);
-          diagnostics.push(navigationDiagnostics);
         },
       });
       // 受け口を省略した監査（今までの呼び出し）と、結果の状態と理由が同じである（受け口は判定をせず、結果を変えない）。
@@ -8754,86 +6202,12 @@ describe('the observation of the target load of an interaction candidate (site u
 
       expect(observations).toEqual([{ navigationOutcome: 'OK', httpStatus: status, failureDetail: null }]);
       expect(Object.isFrozen(observations[0])).toBe(true);
-      // D3: 候補の読み込みの観察。文書の要求は1つ（リダイレクトなし）で、ヘッダを送り、応答（status）を受け、読み込みが終わった。
-      expect(diagnostics).toHaveLength(1);
-      const [targetLoad] = diagnostics;
-      expect(targetLoad?.status, JSON.stringify(targetLoad)).toBe('OBSERVED');
-      if (targetLoad?.status !== 'OBSERVED') {
-        throw new Error('the target load was not observed');
-      }
-      expect(Object.isFrozen(targetLoad)).toBe(true);
-      expect(targetLoad.documentRequests).toHaveLength(1);
-      expect(targetLoad.omittedDocumentRequestCount).toBe(0);
-      expect(targetLoad.omittedEventCount).toBe(0);
-      const [request] = targetLoad.documentRequests;
-      expect(request?.hops).toHaveLength(1);
-      expect(request?.hops[0]).toMatchObject({ url: `${statusOrigin}${path}`, method: 'GET', httpStatus: status, remoteIpAddress: '127.0.0.1' });
-      expect(request?.hops[0]?.requestHeadersSentAtMs).toEqual(expect.any(Number));
-      expect(request?.hops[0]?.responseHeadersReceivedAtMs).toEqual(expect.any(Number));
-      expect(request?.loadingFinishedAtMs).toEqual(expect.any(Number));
-      expect(request?.loadingFailure).toBeNull();
-      expect(targetLoad.observationStartedAtMs).toBeLessThanOrEqual(request?.hops[0]?.issuedAtMs ?? Number.NEGATIVE_INFINITY);
-      expect(targetLoad.observationEndedAtMs).toBeGreaterThanOrEqual(request?.loadingFinishedAtMs ?? Number.POSITIVE_INFINITY);
       expect({ status: observed.status, reason: observed.reason })
         .toEqual({ status: unobserved.status, reason: unobserved.reason });
     },
   );
 
-  // D3R の Minor-1（診断の記録の設計書 2.2「長く待たない」）: 観察の開始は、読み込みの期限と、今から `sessionOpenTimeoutMs` 後の早い方まで
-  // しか待たない（Passive と幅の走査の観察と同じ）。読み込みの期限は変えない（観察を始められなくても、読み込みは今までどおり行う）。
-  it('gives up starting the navigation diagnostics sessionOpenTimeoutMs after now, and loads the target as without it', async () => {
-    /** 注入する、session の作成と観察の開始を待つ上限（ms）。session は先に作っておくので、作成はこの上限の中で終わる。 */
-    const SHORT_SESSION_OPEN_TIMEOUT_MS = 200;
-    /** 観察の開始の期限を過ぎてから、読み込みが終わって受け口が呼ばれるまでの上限（ms）。読み込みの期限（5,000ms）まで待つ場合と区別する。 */
-    const RECEIVER_CALL_LIMIT_MS = 2_500;
-    const path: StatusPath = '/available.html';
-    const candidate = await discoverInteractionCandidate(statusFactory, statusOrigin, viewport, path, CANDIDATE_NAME, {
-      expectedCompleteness: 'COMPLETE',
-    });
-    // 本物の session の page を包み、Context の CDP の session を開く求め（観察の開始）だけを、いつまでも開かないようにする。本物の
-    // session は凍結されているので、包まずに、page だけを差し替えた session を作る（ほかは本物に委ねる）。
-    const neverOpeningContext = { newCDPSession: (): Promise<never> => new Promise<never>(() => undefined) };
-    const realSession = await statusFactory.createInteractionSession(viewport);
-    const session: InteractionGuardedSession = {
-      page: withBoundMethods(realSession.page, { context: () => neverOpeningContext }),
-      ledger: realSession.ledger,
-      isClosed: () => realSession.isClosed(),
-      activateInteractionFreeze: () => realSession.activateInteractionFreeze(),
-      close: () => realSession.close(),
-    };
-    // T32j-4 fix round 1: 候補の読み取りも CDP の session を開くので、観察の開始（Context の CDP の session）だけを開かないようにし、候補の
-    // 読み取りは本物の page で行う（差し替えるのは観察の開始だけ、という今までの準備のとおり）。
-    withInteractionCandidateReads(session.page, readsOnPage(realSession.page));
-    const observations: MainFrameLoadObservation[] = [];
-    const diagnostics: NavigationDiagnostics[] = [];
-    /** 受け口が呼ばれた時刻（`Date.now()`）。 */
-    const receiverCalledAtMs: number[] = [];
-    const startedAtMs = Date.now();
-
-    const observed = await auditInteraction({
-      ...statusInput(path, candidate),
-      sessionFactory: async () => session,
-      sessionOpenTimeoutMs: SHORT_SESSION_OPEN_TIMEOUT_MS,
-      afterTargetLoad: (observation, navigationDiagnostics) => {
-        receiverCalledAtMs.push(Date.now());
-        observations.push(observation);
-        diagnostics.push(navigationDiagnostics);
-      },
-    });
-    const unobserved = await auditInteraction(statusInput(path, candidate));
-
-    expect(receiverCalledAtMs).toHaveLength(1);
-    const receiverDelayMs = (receiverCalledAtMs[0] ?? Number.POSITIVE_INFINITY) - startedAtMs;
-    expect(receiverDelayMs).toBeGreaterThanOrEqual(SHORT_SESSION_OPEN_TIMEOUT_MS);
-    expect(receiverDelayMs).toBeLessThan(RECEIVER_CALL_LIMIT_MS);
-    expect(diagnostics).toEqual([{ status: 'NOT_OBSERVED', reason: NAVIGATION_DIAGNOSTICS_START_DEADLINE_MESSAGE }]);
-    // 読み込みと監査の結果は、観察を始められなくても、受け口を省略した監査と同じである。
-    expect(observations).toEqual([{ navigationOutcome: 'OK', httpStatus: STATUS_OK, failureDetail: null }]);
-    expect({ status: observed.status, reason: observed.reason }).toEqual({ status: unobserved.status, reason: unobserved.reason });
-    expect(realSession.isClosed()).toBe(true);
-  });
-
-  it('does not call afterTargetLoad nor start the navigation diagnostics when no budget is left to start the target load', async () => {
+  it('does not call afterTargetLoad when no budget is left to start the target load', async () => {
     const candidate = await candidateNamed('/accordion.html', 'Toggle details');
     // 偽の時計の始まりの時刻と、読み込みの期限（ms）。session の作成が読み込みの期限の時刻に終わるので、読み込みの予算は 0 になる。
     const startedAtMs = 1_000;
@@ -8844,12 +6218,8 @@ describe('the observation of the target load of an interaction candidate (site u
     vi.useFakeTimers();
     vi.setSystemTime(startedAtMs);
     const session: InteractionGuardedSession = {
-      // D3: 読み込みを始めない候補では、ページ本体の要求の観察（CDP の session）も始めない。
       page: {
         goto: async () => { gotoCalls += 1; },
-        context: () => {
-          throw new Error('must not open a CDP session');
-        },
       } as unknown as Page,
       ledger: new SafetyLedger(),
       activateInteractionFreeze: async () => undefined,
@@ -8939,7 +6309,13 @@ describe('DEF-046: the egress proxy records do not make the Interaction result B
     expectReason(result, 'SAFETY_FREEZE_BLOCKED');
   });
 });
+}
 
+/**
+ * SLIM BD-5: 凍結の直後の close の競合（DEF-045）のテストを登録する（`isolated-interaction-audit.test.ts` が呼ぶ。両方の Chromium に広げる組は
+ * `chromiumRunsOf` を通す）。本文は、分ける前の位置と字下げのまま。
+ */
+export function registerFrozenCloseRaceCases(): void {
 /** DEF-045 の実機の確かめで、1 ms ごとに POST を出すページ（`fixtures/site/`）。 */
 const FROZEN_CLOSE_RACE_PAGE = '/frozen-close-race-posts.html';
 /**
@@ -8967,11 +6343,11 @@ const FROZEN_CLOSE_RACE_TEST_TIMEOUT_MS = FROZEN_CLOSE_RACE_ROUNDS * FROZEN_CLOS
  * `FROZEN_POPUP_LATE_DELIVERY_SETTLE_MS` 待ってから、GET・HEAD 以外の要求がサーバに届いていないことを確かめる。テストの既定の
  * headless shell と、CLI の起動の設定（`chromiumLaunchOptions`）の両方で確かめる。
  */
-describe.each([
+describe.each(chromiumRunsOf([
   { name: 'the headless shell (test default)', launch: (): Promise<Browser> => launchHeadlessChromium() },
   // EL-12: 本番と同じ起動の部品（`launchCliChromium`）で起動する。
   { name: 'the CLI Chromium (chromiumLaunchOptions, headless)', launch: (): Promise<Browser> => launchCliChromium() },
-])('DEF-045: the owner close right after the freeze of a page that keeps posting, with $name', ({ name, launch }) => {
+]))('DEF-045: the owner close right after the freeze of a page that keeps posting, with $name', ({ name, launch }) => {
   let raceBrowser: Browser;
   let raceFactory: BrowserContextFactory;
 

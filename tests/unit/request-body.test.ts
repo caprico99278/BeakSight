@@ -9,7 +9,9 @@ import { describe, expect, it } from 'vitest';
 import { requestBodyTextOf, type RequestBodyText } from '../../src/safety/login-credential-guard.js';
 import { apiWriteBodyOf, writeSubmissionBodyOf } from '../../src/safety/passive-request-guard.js';
 import { decodeBase64BodyParts } from '../../src/safety/request-body.js';
-import { MAX_WRITE_PAYLOAD_BYTES } from '../../src/safety/write-payload-policy.js';
+
+/** L12b の前の書き込みの本文の大きさの上限（1MiB。定数は LZ-1 で消した）。 */
+const MAX_WRITE_PAYLOAD_BYTES = 1_048_576;
 
 type PausedEvent = Parameters<typeof apiWriteBodyOf>[0];
 type Part = { readonly bytes?: string };

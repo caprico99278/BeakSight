@@ -1,11 +1,19 @@
 // BN-c・BN-d（設計書 `doc/design/2026-10-23-beaksight-bundle-beaksight-block-noise-design.md` 5 章の受け入れ条件 1・2。指示書の 3 で読み替えた場面）:
 // 127.0.0.1 の自前のサイトを Run Coordinator で実際の Chromium（テストの既定の headless）で監査し、書き出した Run から表示用モデルとバンドルを作る。
-// - 読み込みの最中に BeakSight が止めた script（1 画面の要求の上限）: その SCRIPT_LOAD_FAILED は `CAUSED`。敏感な Rule（MISSING_TITLE）は `POSSIBLE`、
-//   敏感でない Rule（HTTP_4XX）は `NONE`。
+// - 読み込みの最中に BeakSight が止めた POST（READ_ONLY。データの遮断）の画面: 敏感な Rule（MISSING_TITLE）は `POSSIBLE`、敏感でない Rule（HTTP_4XX）は `NONE`。
+// - 止めた main frame の移動でエラーの画面に替わる画面: DEF-250 の案 c で、そのビューポートをその場で終える（`DOCUMENT_LEFT_DURING_AUDIT`）。エラーの画面は
+//   測らないので、その Evidence と指摘はない。FIN-1（SD-2 の 2.4）: その移動は止めない（許可 Origin の外の .invalid の宛先なので、移った先は誤りの画面になる）。
+// L10（INV-LIMITS の S5 の撤廃）で、読み込みの最中に BeakSight が script を止める場面（前は 1 画面の要求の上限 1000 を超えた後の script。その SCRIPT_LOAD_FAILED を
+// `CAUSED` にした）は作れなくなったので外した。監査の段で読み取りを止める決まりを新しく置くことは「サイトの通信は止めない」の方針に反するので置かない（設計者の判断 (a)）。
+// 案 c の後は、この画面の組で `CAUSED` になる指摘はない。`CAUSED` の判定は単体の `beaksight-block-relation.test.ts` が確かめる。`POSSIBLE` は READ_ONLY で止めた
+// POST の遮断で確かめる。
 // - 閉じる途中に要求を出す画面: 閉じる途中の遮断（`blockedClosingRequests`・時点 `CLOSING`）は `POSSIBLE` の元にしない（MISSING_TITLE は `NONE`）。
 // - 遮断のない画面: すべて `NONE`。
-// - バンドルの本体（findings.json）に、`CAUSED`・`POSSIBLE`・SAFETY の指摘が入らない。外した指摘は beaksight-related-findings.json に理由つきで残る。
-// サイトへの負荷: 3 ページ（と入口）。上限の画面は、1 画面の要求の上限（1000）を超えるため、1 つの読み込みで約 1000 の同期の XHR を出す（127.0.0.1 の自前のサーバだけ）。
+// - バンドルの本体（指摘のファイルの `main`）に、`CAUSED`・`POSSIBLE`・SAFETY の指摘が入らない。外した指摘は `excluded` に理由つきで残る（REC-4）。
+// - BN-a（もと beaksight-block-records。SAFE-B2 でまとめた）: 同じ Run の page.json に、読み込みの最中に止めた要求の時点（`LOAD`）・種類（`resourceType`）・
+//   読み込みの印（`PAGE_AUDIT`）、network の失敗の BeakSight の遮断の印が残る。閉じる途中の遮断は止めた要求の一覧と数・SAFETY の指摘に入れない。読み取りで
+//   ない要求はサーバに届かない。
+// サイトへの負荷: 6 ページ（と入口）。どの画面も、読み込みで出す要求は数個（127.0.0.1 の自前のサーバだけ）。
 import { mkdtemp, readFile, rm } from 'node:fs/promises';
 import type { IncomingMessage, ServerResponse } from 'node:http';
 import { tmpdir } from 'node:os';
@@ -13,12 +21,14 @@ import { join } from 'node:path';
 import { unzipSync } from 'fflate';
 import { afterAll, beforeAll, describe, expect, it } from 'vitest';
 import { artifactFilePath } from '../../src/core/artifact-layout.js';
-import type { AuditRunResult, EvidenceRecordFor, Finding } from '../../src/core/contracts.js';
-import { PAGE_SUBRESOURCE_REQUEST_LIMIT } from '../../src/safety/passive-request-guard.js';
+import type { AuditRunResult, Finding } from '../../src/core/contracts.js';
+import type { NetworkEvidence, SafetyEventsEvidence } from '../../src/core/evidence-types.js';
+import { validateArtifact } from '../../src/core/schema-validator.js';
 import { ArtifactWriter, type ArtifactWriteResult } from '../../src/report/artifact-writer.js';
-import { beaksightBlockRelationOf, indexBeakSightBlocks } from '../../src/report/beaksight-block-relation.js';
 import { createChatGptBundle } from '../../src/report/chatgpt-bundle.js';
 import { buildReportViewModel, type FindingView, type ReportViewModel } from '../../src/report/view-model.js';
+import { bundledFindingsOf } from '../helpers/bundle-findings.js';
+import { READ_METHODS } from '../helpers/leak-places.js';
 import { startLoopbackHttpServer, type LoopbackHttpServer } from '../helpers/loopback-server.js';
 import { createRunLauncher, runWithCoordinator } from '../helpers/run-harness.js';
 import { createTestConfig } from '../helpers/test-config.js';
@@ -28,7 +38,7 @@ const HTTP_OK = 200;
 const HTTP_NOT_FOUND = 404;
 
 const INDEX_PATH = '/bn-c/index.html';
-const LIMITED_PATH = '/bn-c/limited.html';
+const POSTED_PATH = '/bn-c/posted.html';
 const CLOSING_PATH = '/bn-c/closing.html';
 const CLEAN_PATH = '/bn-c/clean.html';
 const ANALYTICS_PATH = '/bn-c/analytics.html';
@@ -37,24 +47,17 @@ const NAVLATE_PATH = '/bn-c/navlate.html';
 /** 測った後に移動するまでの時間（ms。BN-R1 の確かめ直しの `/admin/navlate-1500` と同じ）。 */
 const NAVLATE_DELAY_MS = 1_500;
 const MISSING_IMAGE_PATH = '/bn-c/img/missing.png';
-const DATA_PATH = '/bn-c/data';
-const LATE_SCRIPT_PATH = '/bn-c/late.js';
-/** 上限を確実に超える同期の XHR の数（超えた分は BeakSight が止める）。 */
-const SYNC_REQUEST_COUNT = PAGE_SUBRESOURCE_REQUEST_LIMIT + 5;
 
 const INDEX_HTML = `<!doctype html><html lang="ja"><head><meta charset="utf-8"><link rel="icon" href="data:,"><title>入口</title></head>
-<body><main><h1>入口</h1><a href="${LIMITED_PATH}">上限</a> <a href="${CLOSING_PATH}">閉じる</a> <a href="${CLEAN_PATH}">遮断なし</a> <a href="${ANALYTICS_PATH}">計測</a> <a href="${NAVAWAY_PATH}">離れる</a> <a href="${NAVLATE_PATH}">遅い移動</a></main></body></html>`;
+<body><main><h1>入口</h1><a href="${POSTED_PATH}">送信</a> <a href="${CLOSING_PATH}">閉じる</a> <a href="${CLEAN_PATH}">遮断なし</a> <a href="${ANALYTICS_PATH}">計測</a> <a href="${NAVAWAY_PATH}">離れる</a> <a href="${NAVLATE_PATH}">遅い移動</a></main></body></html>`;
 
-/** 1 画面の要求の上限を同期の XHR で超え、その後に script を読み込む（その script を BeakSight が止める）。題がない（MISSING_TITLE）。404 で返す（HTTP_4XX）。 */
-const LIMITED_HTML = `<!doctype html><html lang="ja"><head><meta charset="utf-8"><link rel="icon" href="data:,"></head>
-<body><main><h1>上限</h1></main><script>
-for (let i = 0; i < ${SYNC_REQUEST_COUNT}; i += 1) {
-  try { const x = new XMLHttpRequest(); x.open('GET', '${DATA_PATH}?i=' + i, false); x.send(); } catch (error) { /* 上限の後は止められる */ }
-}
-// 先読み（preload scanner）が上限の前に読まないよう、XHR の後に script の要素を足す。
-const late = document.createElement('script');
-late.src = '${LATE_SCRIPT_PATH}';
-document.body.appendChild(late);
+/**
+ * 読み込みの最中にデータを POST する画面（READ_ONLY では BeakSight が止める。データの遮断）。題がない（MISSING_TITLE）。404 で返す（HTTP_4XX。サーバが返した応答の
+ * 事実で、遮断では変わらない）。
+ */
+const POSTED_HTML = `<!doctype html><html lang="ja"><head><meta charset="utf-8"><link rel="icon" href="data:,"></head>
+<body><main><h1>送信</h1></main><script>
+fetch('/bn-c/save', { method: 'POST', body: 'state=1' }).catch(() => 0);
 </script></body></html>`;
 
 /** 閉じるときに要求を出す画面（BN-a の結合テストと同じ形）。題がない（MISSING_TITLE）。 */
@@ -82,7 +85,7 @@ fetch('/bn-c/collect', { method: 'POST', body: 'e=view', keepalive: true }).catc
 </script></body></html>`;
 
 /**
- * BN-R1 の I-1: 読み込みの後に、ページが自分で許可 Origin の外へ移動する画面（Guard が main frame の移動を止め、BeakSight は止めた後のエラーの画面を測る）。
+ * BN-R1 の I-1: 読み込みの後に、ページが自分で許可 Origin の外へ移動する画面（Guard が main frame の移動を止め、BeakSight はエラーの画面に替わったビューポートを測らずに終える。DEF-250 の案 c）。
  * 行き先は名前の解決できない `.invalid` で、Guard が送る前に止める（どこにも接続しない）。
  */
 const NAVAWAY_HTML = `<!doctype html><html lang="ja"><head><meta charset="utf-8"><link rel="icon" href="data:,"><title>離れる</title></head>
@@ -98,14 +101,19 @@ const NAVLATE_HTML = `<!doctype html><html><head><meta charset="utf-8"><link rel
 const HTML_PAGES: Readonly<Record<string, readonly [number, string]>> = Object.freeze({
   [NAVLATE_PATH]: [HTTP_OK, NAVLATE_HTML],
   [INDEX_PATH]: [HTTP_OK, INDEX_HTML],
-  [LIMITED_PATH]: [HTTP_NOT_FOUND, LIMITED_HTML],
+  [POSTED_PATH]: [HTTP_NOT_FOUND, POSTED_HTML],
   [CLOSING_PATH]: [HTTP_OK, CLOSING_HTML],
   [CLEAN_PATH]: [HTTP_OK, CLEAN_HTML],
   [ANALYTICS_PATH]: [HTTP_OK, ANALYTICS_HTML],
   [NAVAWAY_PATH]: [HTTP_OK, NAVAWAY_HTML],
 });
 
+/** BN-a: Guard が正規化した、ページの fetch の要求の種類（keepalive の fetch を、Chromium は `xhr` として渡すことがある）。 */
+const FETCH_RESOURCE_TYPES: readonly string[] = ['fetch', 'xhr'];
+
 let app: LoopbackHttpServer;
+/** サーバに届いた、読み取りでない要求（`<method> <path>`。READ_ONLY の Run では空）。 */
+const nonReadArrivals: string[] = [];
 let outputDirectory: string;
 const runLauncher = createRunLauncher();
 let written: ArtifactWriteResult;
@@ -117,13 +125,14 @@ beforeAll(async () => {
     request.on('data', () => undefined);
     request.on('end', () => {
       const path = new URL(request.url ?? '/', 'http://127.0.0.1').pathname;
+      if (!READ_METHODS.has(request.method ?? '')) {
+        nonReadArrivals.push(`${request.method ?? ''} ${path}`);
+      }
       const html = HTML_PAGES[path];
       if (html !== undefined) {
         response.writeHead(html[0], { 'content-type': 'text/html; charset=utf-8' }).end(html[1]);
       } else if (path === MISSING_IMAGE_PATH) {
         response.writeHead(HTTP_NOT_FOUND, { 'content-type': 'text/plain' }).end('not found');
-      } else if (path === LATE_SCRIPT_PATH) {
-        response.writeHead(HTTP_OK, { 'content-type': 'text/javascript' }).end('window.lateLoaded = true;');
       } else if (path.startsWith('/bn-c/')) {
         response.writeHead(HTTP_OK, { 'content-type': 'application/json' }).end('{}');
       } else {
@@ -166,21 +175,12 @@ const relationsOf = (views: readonly FindingView[]): readonly (string | null)[] 
 const jsonOf = (path: string): unknown => JSON.parse(new TextDecoder().decode(bundle[path] ?? new Uint8Array())) as unknown;
 
 describe('BN-c・BN-d: the relation of the Findings to the BeakSight blocks on the fixture site', () => {
-  it('makes the SCRIPT_LOAD_FAILED of the script that BeakSight blocked while loading (the request limit) CAUSED', () => {
-    const scriptFailures = findingsOf(LIMITED_PATH, 'SCRIPT_LOAD_FAILED');
-    expect(scriptFailures.length).toBeGreaterThan(0);
-    expect(relationsOf(scriptFailures).every((relation) => relation === 'CAUSED'), JSON.stringify(relationsOf(scriptFailures))).toBe(true);
-    for (const view of scriptFailures) {
-      expect(view.beaksightBlockRelation?.reason).toBe('TARGET_REQUEST_BLOCKED');
-      expect(view.beaksightBlockRelation?.blocks.some((block) => block.requestKind === 'SCRIPT' && block.url?.includes(LATE_SCRIPT_PATH) === true)).toBe(true);
-    }
-  });
-
-  it('makes a sensitive Rule POSSIBLE and a Rule that a block cannot change NONE on the page with the blocks while loading', () => {
-    const titles = findingsOf(LIMITED_PATH, 'MISSING_TITLE');
+  // L10（S5 の撤廃）: 前の「止めた script の SCRIPT_LOAD_FAILED を CAUSED にする」場面は外した（ファイルの頭の注記）。CAUSED の判定は単体で確かめる。
+  it('makes a sensitive Rule POSSIBLE and a Rule that a block cannot change NONE on the page whose POST was blocked while loading (READ_ONLY)', () => {
+    const titles = findingsOf(POSTED_PATH, 'MISSING_TITLE');
     expect(titles.length).toBeGreaterThan(0);
     expect(relationsOf(titles).every((relation) => relation === 'POSSIBLE'), JSON.stringify(relationsOf(titles))).toBe(true);
-    const statuses = findingsOf(LIMITED_PATH, 'HTTP_4XX');
+    const statuses = findingsOf(POSTED_PATH, 'HTTP_4XX');
     expect(statuses.length).toBeGreaterThan(0);
     expect(relationsOf(statuses).every((relation) => relation === 'NONE'), JSON.stringify(relationsOf(statuses))).toBe(true);
   });
@@ -216,40 +216,27 @@ describe('BN-c・BN-d: the relation of the Findings to the BeakSight blocks on t
     }
   });
 
-  // BN-R1 の I-1: 止めた main frame の移動の後に測ったエラーの画面の指摘は、遮断が原因。
-  // BN-R1 の N-1: エラーの画面を測ったと記録から分かる Evidence（パフォーマンスの Evidence の navigation timing の URL が止めた移動の行き先で、その後に記録した
-  // Evidence）の指摘だけを遮断が原因にし、分からない Evidence（DOM・axe はパフォーマンスより先に記録する）の指摘は影響の可能性にとどめる。
-  it('makes the Findings of the error page after a blocked main frame navigation CAUSED only when the records show the error page, and POSSIBLE otherwise', () => {
+  // DEF-250 の案 c: main frame の移動でエラーの画面に替わったら、そのビューポートをその場で終える（`DOCUMENT_LEFT_DURING_AUDIT`）。エラーの画面は測らないので、
+  // その Evidence と指摘はない。FIN-1（SD-2）: 移動は止めないので、止めた記録は残らない。
+  it('ends the viewport when the page own main frame navigation replaces the page, without measuring the error page, and records no stop of it', () => {
     const navaway = written.result.pages.find((value) => new URL(value.pageUrl).pathname === NAVAWAY_PATH);
     expect(navaway, 'the page that navigates away').toBeDefined();
-    const performances = (navaway?.evidence ?? []).filter((record): record is EvidenceRecordFor<'performance'> => record.type === 'performance');
-    const blockedUrls = (navaway?.evidence ?? []).flatMap((record) =>
-      (record.type === 'safety' ? record.payload.blockedNavigations.filter((event) => event.phase === 'LOAD').map((event) => event.url) : []));
-    // 記録の手がかり: パフォーマンスの Evidence が測った文書の URL が、止めた移動の行き先（エラーの画面）。
-    const errorPagePerformances = performances.filter((record) => blockedUrls.includes(record.payload.navigationTiming?.url ?? ''));
-    expect(errorPagePerformances.length, JSON.stringify(performances.map((record) => record.payload.navigationTiming?.url))).toBeGreaterThan(0);
-    const since = new Map(errorPagePerformances.map((record) => [record.viewport, record.observedAt] as const));
-    const observedAtOf = new Map((navaway?.evidence ?? []).map((record) => [record.evidenceId, record] as const));
-
-    const measured = model.findings.filter(({ finding, beaksightBlockRelation }) =>
-      finding.pageUrl !== null && new URL(finding.pageUrl).pathname === NAVAWAY_PATH && beaksightBlockRelation !== null && finding.ruleId !== 'HTTP_4XX');
-    expect(measured.length, 'the error page has Findings').toBeGreaterThan(0);
-    for (const view of measured) {
-      const afterErrorPage = view.finding.evidenceRefs.some((evidenceId) => {
-        const record = observedAtOf.get(evidenceId);
-        const start = record === undefined ? undefined : since.get(record.viewport);
-        return record !== undefined && start !== undefined && record.observedAt >= start;
-      });
-      expect(view.beaksightBlockRelation, view.finding.ruleId).toMatchObject(afterErrorPage
-        ? { relation: 'CAUSED', reason: 'MAIN_FRAME_NAVIGATION_BLOCKED' }
-        : { relation: 'POSSIBLE', reason: 'MAIN_FRAME_NAVIGATION_BLOCKED_UNCONFIRMED' });
+    const evidence = navaway?.evidence ?? [];
+    for (const viewport of ['desktop', 'mobile'] as const) {
+      expect(navaway?.viewports[viewport].incompleteReasons.map(({ code }) => code), viewport).toContain('DOCUMENT_LEFT_DURING_AUDIT');
+      // FIN-1（SD-2 の 2.4）: ページ自身の main frame の移動は、許可 Origin の外でも止めない（止めた記録は残らない）。
+      const blocked = evidence.flatMap((record) => (record.type === 'safety' && record.viewport === viewport
+        ? record.payload.blockedNavigations.map((event) => new URL(event.url).hostname)
+        : []));
+      expect(blocked, viewport).not.toContain('beaksight-bn-r1.invalid');
     }
-    // 本当の記録で、エラーの画面を測ったパフォーマンスの Evidence を参照する指摘は、遮断が原因になる。
-    const [errorPagePerformance] = errorPagePerformances;
-    if (errorPagePerformance !== undefined && navaway !== undefined) {
-      const probe: Finding = { ...(measured[0]?.finding as Finding), ruleId: 'POOR_LCP', viewport: errorPagePerformance.viewport, evidenceRefs: [errorPagePerformance.evidenceId] };
-      expect(beaksightBlockRelationOf(indexBeakSightBlocks(written.result), probe)).toMatchObject({ relation: 'CAUSED', reason: 'MAIN_FRAME_NAVIGATION_BLOCKED' });
-    }
+    // 止めた移動の後は、その画面を測らない（パフォーマンスも DOM も測らない）。エラーの画面の Evidence はない。
+    const measuredTypes = new Set(['performance', 'dom', 'accessibility', 'layout']);
+    expect(evidence.filter((record) => measuredTypes.has(record.type)).map((record) => `${record.viewport ?? ''}:${record.type}`)).toEqual([]);
+    // エラーの画面の指摘（止めた移動が原因の指摘）はない。
+    const navawayFindings = model.findings.filter(({ finding }) => finding.pageUrl !== null && new URL(finding.pageUrl).pathname === NAVAWAY_PATH);
+    expect(navawayFindings.filter((view) => view.beaksightBlockRelation?.reason === 'MAIN_FRAME_NAVIGATION_BLOCKED'
+      || view.beaksightBlockRelation?.reason === 'MAIN_FRAME_NAVIGATION_BLOCKED_UNCONFIRMED').map((view) => view.finding.ruleId)).toEqual([]);
   });
 
   // BN-R1 の N-1: 測った後に移動する画面の、元の画面の本当の欠陥（lang の欠け）は、遮断が原因にしない。
@@ -259,16 +246,24 @@ describe('BN-c・BN-d: the relation of the Findings to the BeakSight blocks on t
     expect(relationsOf(langs).some((relation) => relation === 'CAUSED'), JSON.stringify(langs.map((view) => view.beaksightBlockRelation))).toBe(false);
   });
 
-  it('keeps the CAUSED, POSSIBLE and SAFETY Findings out of findings.json, and puts them in the related file with their relation', () => {
-    const body = jsonOf('findings.json') as readonly { readonly finding: Finding }[];
-    const related = jsonOf('beaksight-related-findings.json') as readonly { readonly finding: Finding; readonly beaksightBlockRelation: { readonly relation: string } | null }[];
+  // REC-4: 指摘はページごとの指摘のファイルにある（本体は `main`、外した指摘は `excluded`）。
+  it('keeps the CAUSED, POSSIBLE and SAFETY Findings out of main, and puts them in excluded with their relation', () => {
+    const body = bundledFindingsOf<{ readonly finding: Finding }>(bundle, 'main');
+    const related = bundledFindingsOf<{ readonly finding: Finding; readonly beaksightBlockRelation: { readonly relation: string } | null }>(bundle, 'excluded');
     const excludedIds = new Set(model.excludedFindings.map((view) => view.finding.findingId));
-    expect(model.excludedFindings.some((view) => view.beaksightBlockRelation?.relation === 'CAUSED')).toBe(true);
+    // この画面の組で `CAUSED` になる本当の指摘はない（ファイルの頭の注記。`CAUSED` の判定は単体の `beaksight-block-relation.test.ts` が確かめる）。ここでは、
+    // `CAUSED`・`POSSIBLE` の指摘があれば、どれも本体から外れることを確かめる（`POSSIBLE` は必ずある）。
+    for (const view of model.findings) {
+      const relation = view.beaksightBlockRelation?.relation;
+      if (relation === 'CAUSED' || relation === 'POSSIBLE') {
+        expect(excludedIds.has(view.finding.findingId), `${view.finding.ruleId} ${relation}`).toBe(true);
+      }
+    }
     expect(model.excludedFindings.some((view) => view.beaksightBlockRelation?.relation === 'POSSIBLE')).toBe(true);
     expect(body.some((entry) => excludedIds.has(entry.finding.findingId))).toBe(false);
     expect(body.some((entry) => entry.finding.severity === 'SAFETY')).toBe(false);
-    expect(body.map((entry) => entry.finding.findingId)).toEqual(model.mainFindings.map((view) => view.finding.findingId));
-    expect(related.map((entry) => entry.finding.findingId)).toEqual([...excludedIds]);
+    expect(body.map((entry) => entry.finding.findingId).sort()).toEqual(model.mainFindings.map((view) => view.finding.findingId).sort());
+    expect(related.map((entry) => entry.finding.findingId).sort()).toEqual([...excludedIds].sort());
     for (const entry of related) {
       expect(entry.beaksightBlockRelation === null ? entry.finding.severity : entry.beaksightBlockRelation.relation).not.toBe('NONE');
     }
@@ -279,5 +274,48 @@ describe('BN-c・BN-d: the relation of the Findings to the BeakSight blocks on t
     expect(summary.beaksightBlockRelation.mainFindingCounts.total).toBe(model.mainFindings.length);
     const readme = new TextDecoder().decode(bundle['README.md'] ?? new Uint8Array());
     expect(readme).toContain(`: ${String(model.mainFindings.length)}件`);
+  });
+
+  // BN-a（設計書 3.1。もと beaksight-block-records）: 本物の Guard と PageAuditor が書いた page.json の、止めた記録の時点・種類・読み込みの印。記録の形の網羅は
+  // 単体の `beaksight-block-marks.test.ts` が確かめる（この Run は READ_ONLY。SD-2 の後、PASS_EXCEPT_DELETE では離れるときの DELETE が届くことは
+  // `guard-audit-send-revisit-close.test.ts` の P1-2 が確かめる）。
+  it('BN-a: writes the block during the load with phase LOAD and its resource type, marks the network failures, and keeps the closing blocks apart', async () => {
+    const pageOf = (path: string) => written.result.pages.find((value) => new URL(value.pageUrl).pathname === path);
+    const posted = pageOf(POSTED_PATH);
+    const closing = pageOf(CLOSING_PATH);
+    expect(posted, 'the posted page').toBeDefined();
+    expect(closing, 'the closing page').toBeDefined();
+    for (const page of [posted, closing]) {
+      const validation = await validateArtifact('page', page);
+      expect(validation.ok ? [] : validation.errors).toEqual([]);
+    }
+    const pageAuditSafetyOf = (page: typeof posted, viewport: 'desktop' | 'mobile'): SafetyEventsEvidence | undefined => (page?.evidence ?? [])
+      .flatMap((record) => (record.type === 'safety' && record.viewport === viewport ? [record.payload as SafetyEventsEvidence] : []))
+      .find(({ load }) => load?.kind === 'PAGE_AUDIT');
+    for (const viewport of ['desktop', 'mobile'] as const) {
+      const postedSafety = pageAuditSafetyOf(posted, viewport);
+      expect(postedSafety, viewport).toBeDefined();
+      const blocked = (postedSafety?.blockedRequests ?? []).map(({ method, url, reason, resourceType, phase }) => ({ method, path: new URL(url).pathname, reason, resourceType, phase }));
+      expect(blocked, viewport).toEqual([{ method: 'POST', path: '/bn-c/save', reason: 'NON_READ_METHOD', resourceType: expect.any(String), phase: 'LOAD' }]);
+      expect(FETCH_RESOURCE_TYPES).toContain(blocked[0]?.resourceType);
+      const network = (posted?.evidence ?? []).flatMap((record) => (record.type === 'network' && record.viewport === viewport ? [record.payload as NetworkEvidence] : []));
+      const failures = network.flatMap(({ failures: rows }) => rows);
+      expect(failures.map(({ url, resourceType, blockedByBeakSight, phase }) => ({ path: new URL(url).pathname, resourceType, blockedByBeakSight, phase })), viewport)
+        .toEqual(expect.arrayContaining([{ path: '/bn-c/save', resourceType: 'fetch', blockedByBeakSight: true, phase: 'LOAD' }]));
+      for (const failure of failures) {
+        expect(typeof failure.blockedByBeakSight).toBe('boolean');
+        expect(failure.phase).toBe('LOAD');
+      }
+      // 閉じる途中に止めた要求（ブラウザの内部の順に左右されるので、あれば）は、止めた要求の一覧と数には入れない。
+      const closingSafety = pageAuditSafetyOf(closing, viewport);
+      expect(closingSafety?.blockedRequests, viewport).toEqual([]);
+      expect(closingSafety?.blockedRequestsByMethod, viewport).toEqual({});
+      for (const event of closingSafety?.blockedClosingRequests?.events ?? []) {
+        expect(event.phase).toBe('CLOSING');
+      }
+    }
+    expect(closing?.findings.filter(({ category }) => category === 'SAFETY')).toEqual([]);
+    // 止める決まりは変わらない（読み込みの最中の POST・計測の POST・閉じるときの DELETE は届かない）。
+    expect(nonReadArrivals).toEqual([]);
   });
 });

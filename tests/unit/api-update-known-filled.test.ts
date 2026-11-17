@@ -9,9 +9,7 @@
 import { readFileSync } from 'node:fs';
 import { resolve } from 'node:path';
 import { describe, expect, it } from 'vitest';
-import { MAX_SUBMITTED_VALUE_LENGTH } from '../../src/control/actions/action-contracts.js';
 import { knownKeptValuesOf, type RecordValueWrite } from '../../src/control/actions/write-result-facts.js';
-import { MAX_SCENARIO_API_KEYS } from '../../src/control/approval/scenario-contracts.js';
 
 const SCHEMA = JSON.parse(readFileSync(resolve(process.cwd(), 'schemas', 'control', 'worker-message.schema.json'), 'utf8')) as {
   readonly $defs: Record<string, { readonly properties: Record<string, Record<string, unknown>> }>;
@@ -72,19 +70,24 @@ describe('T41R3-fix-B: the schema of the known kept values', () => {
     const update = SCHEMA.$defs['startApiWrite']?.properties['update'] as Record<string, unknown>;
     expect(update['required']).toEqual(['targetRecordId', 'knownKeptValues']);
     const properties = update['properties'] as Record<string, unknown>;
-    expect(Object.keys(properties).sort()).toEqual(['knownKeptValues', 'targetRecordId']);
+    // LU-8（一覧の行の更新の設計書 5.5 の最後の段）: 一覧の行の更新の行の選び方（任意。`api-list-row-update-start.test.ts`）を足した。名前だけの一覧は持たない。
+    // DEF-198（設計書 5.9 の 3）: ほかの filter の照らす値（任意。`api-tenant-filter-update.test.ts`）を足した。
+    // DEF-203（設計書 5.10 の 1）: 台帳の登録の値と照らす鍵の値（任意。`api-ledger-page-key-update.test.ts`）を足した。
+    expect(Object.keys(properties).sort()).toEqual(['knownKeptValues', 'ledgerKeyValues', 'listRow', 'otherFilterValues', 'targetRecordId']);
     expect(properties['knownKeptValues']).toMatchObject({
       type: 'array',
-      maxItems: MAX_SCENARIO_API_KEYS,
       items: {
         type: 'object',
         additionalProperties: false,
         required: ['key', 'value'],
         properties: {
           key: { $ref: 'urn:beaksight:schema:control:scenario:1#/$defs/apiKey' },
-          value: { type: 'string', maxLength: MAX_SUBMITTED_VALUE_LENGTH },
+          // L12b（設計書 `2026-11-09-beaksight-remove-limits-design.md` 6.2。S18）: 値の長さの上限（前は `MAX_SUBMITTED_VALUE_LENGTH`）を撤廃した。
+          value: { type: 'string' },
         },
       },
     });
+    // L13（N25）: 鍵の数の上限（前は 64）はない。
+    expect(properties['knownKeptValues']).not.toHaveProperty('maxItems');
   });
 });

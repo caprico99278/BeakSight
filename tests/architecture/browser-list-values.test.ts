@@ -8,7 +8,7 @@
  * - (b) 画面のブラウザ側（`apps/local-ui/src/` の `server/` の外）は、型で縛った値の書き写しを置かない（`'<値>' satisfies …`、`[…] satisfies readonly …[]`、
  *   この Gate の一覧の型での `: <型> = '<値>'`・`new Set<型>([`）。組 UI-K3: 承認と規則の一覧（再承認が要る理由、下書きを拒む理由、照合の READ の
  *   期待の種類、規則の値の作り方と出どころ）も core に移したので、除外は 0 件にした（除外の仕組みは残す。使われない除外は落とす）。
- * - (c) 画面（`apps/local-ui/src/`。サーバを含む）は、まとめて実行の状態（`chain.state`・`stageChain?.state`・`writeChain?.state`）、段の状態（`stage.state`）、
+ * - (c) 画面（`apps/local-ui/src/`。サーバを含む）は、まとめて実行の状態（`chain.state`・`stageChain?.state`）、段の状態（`stage.state`）、
  *   認証の設定の新しさ（`…freshness`）、認証の状態（`…AuthState`）を、文字列リテラルと比べない（左右どちらでも）。core の名前つきの定数を読む。
  *   組 UI-K3: 範囲を `src/` にも広げた（ジョブの管理 `audit-job-manager.ts` の連鎖と段の状態、新しさ、認証の状態）。
  * - (c′) 組 Z: 連鎖と段の状態を読むファイルは、連鎖・段の状態の文字列リテラルを `.state` への代入とオブジェクトの値（`state: '<値>'`）にも書かない。
@@ -16,7 +16,7 @@
  * - (e) 組 UI-K3: 画面のブラウザ側は、READ の確かめの期待の種類（`…expectation.kind`）を文字列リテラルと比べず、`case '<種類>'` と `kind: '<種類>'` も
  *   書かない（core の名前つきの定数を読む）。表示の関数の、型で網羅を縛った `switch`（`display/read-checks.ts`）は、寄せない決まり（台帳の CC-113 の D）なので、
  *   ファイルと形の組で、理由を付けて除外する。
- * - (d) core に置いた部分の一覧（まだ決まっていない続けて更新する状態、行の数を照らす期待の種類、連絡先の欄の型）と同じ集合の、文字列リテラルだけの配列を、
+ * - (d) core に置いた部分の一覧（行の数を照らす期待の種類、連絡先の欄の型）と同じ集合の、文字列リテラルだけの配列を、
  *   owner の外（`src/` と画面）に書かない（順は問わない。`new Set([...])` の中を含む。型をつけない書き写しも止める。`field-type-lists-ownership` と同じ作り）。
  * - 判定は、Node.js 標準の `fs`、正規表現、文字列の検索だけで行う（近似の検査。コメントは数えない）。1 秒以内に終える。
  */
@@ -24,7 +24,6 @@ import { describe, expect, it } from 'vitest';
 import { AUTH_SETUP_FRESHNESS_VALUES } from '../../src/control/store/auth-setup-store.js';
 import { CHAIN_STAGE_STATES, CHAIN_STATES } from '../../src/control/job/stage-chain-policy.js';
 import { WORKER_AUTH_STATES } from '../../src/control/worker-protocol.js';
-import { PENDING_WRITE_CHAIN_STATES, WRITE_CHAIN_STATES } from '../../apps/local-ui/src/server/write-chain-policy.js';
 import { CONTACT_CANDIDATE_FIELD_TYPES } from '../../src/discovery/candidate-contracts.js';
 import { READ_CHECK_EXPECTATION_KINDS, ROW_COUNT_EXPECTATION_KINDS } from '../../src/discovery/read-check-contracts.js';
 import { VERIFICATION_EXPECTATION_KINDS } from '../../src/control/approval/scenario-contracts.js';
@@ -79,12 +78,6 @@ const LIST_OWNERS: readonly ListOwner[] = [
       ['NOT_STARTED_CHAIN_STAGE_STATE', 'NOT_STARTED'],
       ['NOT_NEEDED_CHAIN_STAGE_STATE', 'NOT_NEEDED'],
     ],
-  },
-  {
-    owner: 'src/core/write-chain-states.ts',
-    reexporter: `${LOCAL_UI_SERVER_DIRECTORY}write-chain-policy.ts`,
-    lists: ['WRITE_CHAIN_STATES', 'PENDING_WRITE_CHAIN_STATES'],
-    constants: [],
   },
   {
     owner: 'src/core/auth-setup-freshness.ts',
@@ -153,7 +146,7 @@ const LIST_OWNERS: readonly ListOwner[] = [
 
 /** (b) この Gate の一覧の型（`: <型> = '<値>'`・`new Set<型>([` を数える）。 */
 const OWNED_TYPES = [
-  'WorkerAuthState', 'ChainState', 'ChainStageState', 'WriteChainState', 'WriteChainStateValue', 'AuthSetupFreshness',
+  'WorkerAuthState', 'ChainState', 'ChainStageState', 'AuthSetupFreshness',
   'AuditJobStartRejectionReason', 'ReadCheckExpectationKind', 'CandidateFieldType',
   // 組 UI-K3。
   'ApprovalInvalidityReason', 'ScenarioDraftRejectionReason', 'VerificationExpectationKind', 'GenerationMethod', 'RuleOrigin',
@@ -174,7 +167,7 @@ const TYPED_COPY_EXCLUSIONS: ReadonlyMap<string, string> = new Map([]);
 const PREFIX = String.raw`(?:[\w$]+\s*\??\.\s*)*`;
 const alternativesOf = (values: readonly string[]): string => [...new Set(values)].join('|');
 const COMPARED_RECEIVERS: readonly (readonly [string, readonly string[]])[] = [
-  [String.raw`${PREFIX}[\w$]*[cC]hain\s*\??\.\s*state(?![\w$])`, [...CHAIN_STATES, ...WRITE_CHAIN_STATES]],
+  [String.raw`${PREFIX}[\w$]*[cC]hain\s*\??\.\s*state(?![\w$])`, CHAIN_STATES],
   [String.raw`${PREFIX}\bstage\s*\??\.\s*state(?![\w$])`, CHAIN_STAGE_STATES],
   [String.raw`${PREFIX}[\w$]*[fF]reshness(?![\w$])`, AUTH_SETUP_FRESHNESS_VALUES],
   [String.raw`${PREFIX}[\w$]*[aA]uthState(?![\w$])`, WORKER_AUTH_STATES],
@@ -218,7 +211,6 @@ const EXPECTATION_KIND_EXCLUSIONS: ReadonlyMap<string, string> = new Map(READ_CH
 
 /** (d) core に置いた部分の一覧（名前、要素、owner）。 */
 const GUARDED_SUBSETS: readonly (readonly [string, readonly string[], string])[] = [
-  ['PENDING_WRITE_CHAIN_STATES', PENDING_WRITE_CHAIN_STATES, 'src/core/write-chain-states.ts'],
   ['ROW_COUNT_EXPECTATION_KINDS', ROW_COUNT_EXPECTATION_KINDS, 'src/core/read-check-expectation-kinds.ts'],
   ['CONTACT_CANDIDATE_FIELD_TYPES', CONTACT_CANDIDATE_FIELD_TYPES, 'src/core/candidate-field-types.ts'],
   // 組 UI-K3: 照合の READ の期待の種類。
@@ -330,13 +322,10 @@ describe('Architecture Gate: the closed list values the browser side reads (PRE4
     // (d) 組 UI-K2 の前の書き写し（`ScenarioApiFields.tsx`・`ReadCheckForm.tsx`・`$jobId.tsx` の形）と、より大きな一覧。
     expect(findSubsetCopies('a.tsx', "const CONTACT_FIELD_TYPES: ReadonlySet<string> = new Set(['email', 'tel']);")).toHaveLength(1);
     expect(findSubsetCopies('a.tsx', "const R = new Set<ReadCheckExpectationKind>(['ROW_COUNT_AT_LEAST', 'ROW_COUNT_EQUALS']);")).toHaveLength(1);
-    expect(findSubsetCopies('a.tsx', "const P = new Set(['CREATING', 'WAITING_LOGIN_INTERVAL'] satisfies readonly WriteChainStateValue[]);")).toHaveLength(1);
     expect(findSubsetCopies('a.ts', "export const USERNAME_INPUT_TYPES: ReadonlySet<string> = new Set(['text', 'email', 'tel']);")).toHaveLength(0);
     expect(findSubsetCopies('a.ts', "// new Set(['email', 'tel'])\nconst c = new Set<string>(CONTACT_CANDIDATE_FIELD_TYPES);")).toHaveLength(0);
     expect(findTypedCopies("const CURRENT_FRESHNESS = 'CURRENT' satisfies AuthSetupFreshness;")).toHaveLength(1);
     expect(findTypedCopies("const S = 'AWAITING_LOGIN' satisfies NonNullable<AuditJobDetailView['lastAuthState']>;")).toHaveLength(1);
-    expect(findTypedCopies("const P: ReadonlySet<string> = new Set(['CREATING', 'WAITING_LOGIN_INTERVAL'] satisfies readonly WriteChainStateValue[]);"))
-      .toHaveLength(1);
     expect(findTypedCopies("const C = new Set(['email', 'tel'] as const satisfies readonly CandidateFieldType[]);")).toHaveLength(1);
     expect(findTypedCopies("const TEXT_CONTAINS_KIND: ReadCheckExpectationKind = 'TEXT_CONTAINS';")).toHaveLength(1);
     expect(findTypedCopies("const R = new Set<ReadCheckExpectationKind>(['ROW_COUNT_EQUALS', 'ROW_COUNT_AT_LEAST']);")).toHaveLength(1);
@@ -361,7 +350,6 @@ describe('Architecture Gate: the closed list values the browser side reads (PRE4
     expect(findTypedCopies("// const X = 'CURRENT' satisfies AuthSetupFreshness;\nconst y = 1;")).toHaveLength(0);
     expect(findLiteralComparisons("{chain.state !== 'RUNNING' ? null : <p />}")).toEqual(["chain.state !== 'RUNNING'"]);
     expect(findLiteralComparisons("return data?.stageChain?.state === 'RUNNING';")).toEqual(["data?.stageChain?.state === 'RUNNING'"]);
-    expect(findLiteralComparisons("const pending = data?.writeChain?.state === 'CREATING';")).toHaveLength(1);
     expect(findLiteralComparisons("chain.stages.some((stage) => stage.state === 'STOPPED')")).toEqual(["stage.state === 'STOPPED'"]);
     expect(findLiteralComparisons("if (stored.freshness === 'STALE' || 'CURRENT' !== setup.freshness) {}")).toHaveLength(2);
     expect(findLiteralComparisons("if (job.lastAuthState === 'AWAITING_LOGIN') {}")).toHaveLength(1);

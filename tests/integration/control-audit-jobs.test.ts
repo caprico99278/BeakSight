@@ -88,6 +88,8 @@ const managerWith = (
     readonly timing?: Partial<AuditJobTiming>;
     /** DEF-146: 結果の前に終わったワーカーの終わり方の受け手。 */
     readonly onUnexpectedWorkerExit?: AuditJobManagerOptions['onUnexpectedWorkerExit'];
+    /** RB-2: ジョブの管理の時計。 */
+    readonly now?: AuditJobManagerOptions['now'];
   } = {},
 ): AuditJobManager => {
   manager = createFakeWorkerJobManager({
@@ -98,6 +100,7 @@ const managerWith = (
     forkWorker: options.forkWorker ?? countingFork,
     ...(options.timing === undefined ? {} : { timing: options.timing }),
     ...(options.onUnexpectedWorkerExit === undefined ? {} : { onUnexpectedWorkerExit: options.onUnexpectedWorkerExit }),
+    ...(options.now === undefined ? {} : { now: options.now }),
   });
   return manager;
 };
@@ -281,14 +284,19 @@ describe('audit jobs: one job at a time', () => {
     expect(await jobManager.startAuditJob(START_REQUEST)).toMatchObject({ ok: false, reason: 'JOB_ALREADY_ACTIVE' });
   }, TEST_TIMEOUT_MS);
 
-  it('accepts the next start after the job ended', async () => {
-    const jobManager = managerWith(fakeWorker('finish'));
+  it('accepts the next start after the job ended, and passes the end of the previous worker on the clock of the job manager (RB-2)', async () => {
+    const clockMs = Date.UTC(2030, 0, 1);
+    const worker = fakeWorker('finish');
+    const jobManager = managerWith(worker, { now: () => new Date(clockMs) });
     const first = await startedJob(jobManager);
     await waitForJob(jobManager, first.jobId, isJobEnded);
     await expectWorkersExited(children, { requireExitEvent: true });
 
     const second = await jobManager.startAuditJob(START_REQUEST);
     expect(second.ok).toBe(true);
+    await waitForJob(jobManager, second.ok ? second.job.jobId : '', isJobEnded);
+    const starts = worker.received().filter((message) => message['type'] === 'START');
+    expect(starts.at(-1)?.['previousNavigationAtMs']).toBe(clockMs);
   }, TEST_TIMEOUT_MS);
 
   it('allows only one job manager in a process', async () => {
@@ -328,7 +336,7 @@ describe('audit jobs: the messages of the worker', () => {
     expect(worker.received()).toEqual([{
       protocol: WORKER_PROTOCOL_VERSION, type: 'START', jobId: job.jobId, jobKind: 'AUDIT', targetConfigPath: PUBLIC_TARGET_PATH, startNew: true,
       targetConfigSha256: targetConfigDigestOf(new TextEncoder().encode(TARGET_CONFIG_TEXT)), showJobBrowser: true,
-      // AS-b: 監査の段の送信の扱いも、ジョブの開始のときに読んで入れる。OP-I（I1）: 行のないサイトの既定は、削除のほかを通す。
+      // AS-b: 監査の段の送信の扱いも、ジョブの開始のときに読んで入れる。OP-I（I1）: 行のないサイトの既定は、サイトの通信を止めない（`PASS_EXCEPT_DELETE`）。
       auditSendPolicy: 'PASS_EXCEPT_DELETE',
       // PRE42-BN: 監査のジョブは、プロファイルの名前（画面の「名前（profileId）」）を入れる（ChatGPT 用バンドルのファイル名だけに使う）。
       profileName: PROFILE_ID,

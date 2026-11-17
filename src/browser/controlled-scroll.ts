@@ -1,9 +1,12 @@
-import type { Page } from 'playwright';
+import type { ElementHandle, JSHandle, Page } from 'playwright';
 import type { PartialFailureReason } from '../core/contracts.js';
 import { awaitBeforeDeadline, wait } from '../core/deadline.js';
 import {
   SCROLL_TARGETS,
+  type InnerScrollContainerEvidence,
   type InnerScrollScanEvidence,
+  type InnerScrollStopReason,
+  type ScrollCompleteReason,
   type ScrollEvidence,
   type ScrollIncompleteReason,
   type ScrollObservationEvidence,
@@ -12,15 +15,29 @@ import {
   type ScrollTargetEvidence,
 } from '../core/evidence-types.js';
 import { isNonNegativeSafeInteger, isPositiveFiniteNumber, isRecord } from '../core/guards.js';
+import type { ProgressSignals } from '../core/progress-watch.js';
 import { VISIBILITY_CHECK_OPTIONS } from '../core/visibility.js';
+import { watchCollection, type CollectorWatchEnd } from './collector-watch.js';
 import { composeInPage, type StandardReaders } from './in-page-readers.js';
 import { pageFailureReason } from './page-failure.js';
 
+/**
+ * controlled scroll の指定。
+ *
+ * L9（設計書 `2026-11-09-beaksight-remove-limits-design.md` 4・5 の 1・6 の L9）: 期限（`deadlineAtMs`）は任意。省くと期限を置かず、進みの見張り（L0）で
+ * 待つ（新しい位置・高さ・作りを読んだときだけ中身の進みの印を付ける。同じ値の繰り返しは進みに数えない）。全く反応がない・静まらないときだけ、それまでの
+ * 記録で `PARTIAL`（`STAGE_UNRESPONSIVE`・`STAGE_NEVER_QUIET`）を返す。段の見張りの口（`progress`）を渡すと、自分では見張らず、その口だけを使う（口の
+ * abort で、待たずに、それまでの記録を返す。L1b）。期限を渡したときの扱いは、今までどおり（呼ぶ側が渡さなくなるまで残す）。
+ */
 export interface ControlledScrollOptions {
-  readonly deadlineAtMs: number;
+  readonly deadlineAtMs?: number | undefined;
   readonly stepViewportFraction: number;
   readonly stepWaitMs: number;
   readonly stableWindowMs: number;
+  /** L9: 段の見張りの口（page-auditor の scroll の段）。 */
+  readonly progress?: ProgressSignals | undefined;
+  /** L9: 口も期限もないときの、自分の見張りの反応なしの長さ（ms。省略は `PROGRESS_WATCH_QUIET_LIMIT_MS`。テストが短くする）。 */
+  readonly quietLimitMs?: number | undefined;
 }
 
 // 結果の型の定義は `src/core/evidence-types.ts` に1か所だけ置き、ここでは型の別名として公開する（R'2 の I-2）。
@@ -46,35 +63,34 @@ export type ScrollResult = ScrollEvidence;
 /** スクロール位置と高さを比べるときの許容誤差（CSSピクセル）。 */
 const SCROLL_EPSILON_PX = 1;
 const MAX_STEP_VIEWPORT_FRACTION = 0.9;
+// L9（INV-LIMITS の表 A の N16・N18）: 内側のスクロール領域を探すときに調べる要素の数（前は 16,384）と、測定の記録の数（前は 500・先頭 100）の上限は
+// 撤廃した（全部を調べ、全部を記録する。`omittedObservationCount` は常に 0）。定数は LZ-1 で消した。
 /**
- * 内側のスクロール領域を探すときに調べる要素の最大数（open な shadow root の中の要素を含む）。
- * 超えた場合は `scanLimitReached` を記録する。
+ * L9（N15）: 期限のない呼び出しでは使わない（たどる対象の切り替えは回数で止めず、同じ対象を同じ量で 2 度たどることになったら止める。状態で終える）。
+ * 期限（`deadlineAtMs`）を渡す呼び出しだけが、前の決まり（切り替えは 1 回まで）で使う。
  */
-const MAX_INNER_SCROLL_SCAN_ELEMENTS = 16_384;
-/** 完了と判定する前の測り直しで、文書と body のうち大きいほうが変わっていた場合に、対象を切り替える最大の回数。 */
-const MAX_SCROLL_TARGET_SWITCHES = 1;
-/**
- * scroll の Evidence に記録する測定（`observations`）の最大件数（設計書 foundation-corrections 5.8）。
- * 期限まで高さが増え続けるページや、待ち時間の短い設定でも、Evidence の大きさを抑える。
- * 超えた場合は、最初の `MAX_LEADING_SCROLL_OBSERVATIONS` 件と、最後の残りの件数を残し、その間を切り捨てて
- * 切り捨てた件数を `omittedObservationCount` に記録する。
- */
-export const MAX_SCROLL_OBSERVATIONS = 500;
-/**
- * 上限を超えた場合に残す、最初の測定の件数。最初の測定は、たどる対象を決めた時点の状態と、初めの高さの増え方を示す。
- * 残り（`MAX_SCROLL_OBSERVATIONS - MAX_LEADING_SCROLL_OBSERVATIONS` 件）は最後の測定に充てる。最後の測定は、
- * 完了や `PARTIAL` の判定の直前の状態（最下部での安定の待ち、対象の切り替えの前後）を示し、`finalSnapshot` を含む。
- */
-export const MAX_LEADING_SCROLL_OBSERVATIONS = 100;
+export const MAX_SCROLL_TARGET_SWITCHES = 1;
 
 type OriginArgument = Readonly<{ phase: 'RESET' | 'RESTORE'; absoluteDeadlineMs: number | null; awaitFrame: boolean }>;
 type MeasureArgument = Readonly<{ phase: 'MEASURE'; lockedTarget: ScrollTarget | null; epsilonPx: number }>;
-type StepArgument = Readonly<{ phase: 'STEP'; target: ScrollTarget | null; top: number; absoluteDeadlineMs: number }>;
+/** LZ-3b: ページの中の期限の引数は、期限を受けないときは `null`（比べない。前は番兵の `Number.MAX_SAFE_INTEGER`）。`OriginArgument` と同じ形。 */
+type StepArgument = Readonly<{ phase: 'STEP'; target: ScrollTarget | null; top: number; absoluteDeadlineMs: number | null }>;
 type InnerScrollScanArgument = Readonly<{
-  phase: 'INNER_SCROLL_SCAN';
-  maxElements: number;
+  /** `INNER_SCROLL_SCAN` は数えた結果（`InnerScrollScan`）を、`INNER_SCROLL_LOCATE` は見つけた全部の領域の要素（文書の順）を返す（L9）。 */
+  phase: 'INNER_SCROLL_SCAN' | 'INNER_SCROLL_LOCATE';
   visibilityOptions: typeof VISIBILITY_CHECK_OPTIONS;
 }>;
+type InnerMeasureArgument = Readonly<{ phase: 'INNER_MEASURE' }>;
+type InnerStepArgument = Readonly<{ phase: 'INNER_STEP'; top: number; absoluteDeadlineMs: number | null }>;
+type InnerRestoreArgument = Readonly<{ phase: 'INNER_RESTORE'; top: number; absoluteDeadlineMs: number | null }>;
+
+/** 内側のスクロール領域の1回の測定（DEF-207。Evidence には記録しない）。 */
+interface RawInnerScrollMeasurement {
+  readonly connected: boolean;
+  readonly scrollTop: number;
+  readonly clientHeight: number;
+  readonly scrollHeight: number;
+}
 
 interface RawScrollMeasurement {
   readonly scrollTarget: ScrollTarget | null;
@@ -166,7 +182,7 @@ const measureScrollInPage = composeInPage(measureScrollReader);
  * 部品（`R`）を `composeInPage` で組み込んで `page.evaluate` に渡すため、この関数の外にあるものを参照しない。
  */
 function stepScrollReader(R: StandardReaders, argument: StepArgument): 'MUTATED' | 'DEADLINE_EXCEEDED' {
-  if (Date.now() >= argument.absoluteDeadlineMs) {
+  if (argument.absoluteDeadlineMs !== null && Date.now() >= argument.absoluteDeadlineMs) {
     return 'DEADLINE_EXCEEDED';
   }
   // DOM clobbering（DEF-073）: 名前つきの img・form など（`<img name="body">` など）は、`document` の同じ名前のプロパティを隠すので、
@@ -181,11 +197,11 @@ function stepScrollReader(R: StandardReaders, argument: StepArgument): 'MUTATED'
 const stepScrollInPage = composeInPage(stepScrollReader);
 
 /**
- * ブラウザ内で、文書の要素を上限付きで走査し、内側のスクロール領域を数える（定義は `InnerScrollScan`）。
- * open な shadow root の中の要素もたどり、上限の数に含める（R'2 の I-3）。shadow root の中は、その host の直後にたどる。
+ * ブラウザ内で、文書の全部の要素を走査し、内側のスクロール領域を数える（定義は `InnerScrollScan`）か、見つけた全部の領域を文書の順に返す（L9）。
+ * open な shadow root の中の要素もたどる（R'2 の I-3）。shadow root の中は、その host の直後にたどる。L9: 調べる要素の数の上限は置かない。
  * 部品（`R`）を `composeInPage` で組み込んで `page.evaluate` に渡すため、この関数の外にあるものを参照しない。
  */
-function scanInnerScrollContainersReader(R: StandardReaders, argument: InnerScrollScanArgument): InnerScrollScan {
+function scanInnerScrollContainersReader(R: StandardReaders, argument: InnerScrollScanArgument): InnerScrollScan | Element[] {
   // DOM clobbering（DEF-072・DEF-073）: form の中の名前つきの入力の欄は form の、名前つきの img・form などは `document` の、同じ名前の
   // プロパティとメソッドを隠す（`<input name="children">`、`<img name="documentElement">` など）。たどる要素（form になりうる）と `document` の
   // 標準のプロパティとメソッドは、標準の prototype の getter とメソッドで読む（getter は部品の `standardGetter`。`src/browser/in-page-readers.ts`。CC-068）。
@@ -215,15 +231,10 @@ function scanInnerScrollContainersReader(R: StandardReaders, argument: InnerScro
     }
   };
   let scannedElementCount = 0;
-  let scanLimitReached = false;
-  let containerCount = 0;
+  const containers: Element[] = [];
   let representative: { clientHeight: number; scrollHeight: number } | null = null;
   let representativeRange = 0;
   for (let element = pending.pop(); element !== undefined; element = pending.pop()) {
-    if (scannedElementCount >= argument.maxElements) {
-      scanLimitReached = true;
-      break;
-    }
     scannedElementCount += 1;
     pushChildren(childrenOf(element));
     const shadowRoot = shadowRootOf(element);
@@ -245,18 +256,114 @@ function scanInnerScrollContainersReader(R: StandardReaders, argument: InnerScro
     if (!checkVisibilityOf(element, argument.visibilityOptions)) {
       continue;
     }
-    containerCount += 1;
+    containers.push(element);
     if (representative === null || scrollHeight - clientHeight > representativeRange) {
       representative = { clientHeight, scrollHeight };
       representativeRange = scrollHeight - clientHeight;
     }
   }
-  return { scannedElementCount, scanLimitReached, containerCount, representative };
+  if (argument.phase === 'INNER_SCROLL_LOCATE') {
+    return containers;
+  }
+  return { scannedElementCount, scanLimitReached: false, containerCount: containers.length, representative };
 }
 const scanInnerScrollContainersInPage = composeInPage(scanInnerScrollContainersReader);
 
+/**
+ * L9: ブラウザ内で、`scope` の要素（`null` なら文書の根）の中の全部の要素の作りの印（値を含まない）の集合を返す。伸び続ける画面を、新しい作りが
+ * 出なくなったら止めるための、唯一の判定の材料（`scrollStructureSignaturesOf`）。
+ * 作りの印は、COV-0 の構造の鍵の考え方（`src/discovery/state-keys.ts`。文字の値を入れない作りの事実）に合わせ、要素の名前・`role`・class の語の
+ * 並び・属性の名前の並び・親の要素の名前で作る。属性の値と文字は入れない。class の語と属性の名前の中の数字の並びは `{n}` にまとめる（行ごとの番号で、
+ * 同じ作りの行が別の作りに見えないように）。open な shadow root の中の要素も含める。数の上限は置かない。
+ * 部品（`R`）を `composeInPage` で組み込んで `page.evaluate`・`ElementHandle.evaluate` に渡すため、この関数の外にあるものを参照しない。
+ */
+function structureSignaturesReader(R: StandardReaders, scope: unknown): string[] {
+  const { standardGetter } = R;
+  const childrenOf = standardGetter<HTMLCollection>(Element.prototype, 'children');
+  const shadowRootOf = standardGetter<ShadowRoot | null>(Element.prototype, 'shadowRoot');
+  const localNameOf = standardGetter<string>(Element.prototype, 'localName');
+  const root = scope instanceof Element ? scope : standardGetter<HTMLElement>(Document.prototype, 'documentElement')(document);
+  const normalized = (token: string): string => token.replace(/[0-9]+/gu, '{n}');
+  const signatures = new Set<string>();
+  const pending: Array<readonly [Element, string]> = [[root, '']];
+  for (let item = pending.pop(); item !== undefined; item = pending.pop()) {
+    const [element, parentName] = item;
+    const name = localNameOf(element);
+    const role = Element.prototype.getAttribute.call(element, 'role') ?? '';
+    const classes = [...new Set((Element.prototype.getAttribute.call(element, 'class') ?? '').split(/\s+/u).filter((token) => token.length > 0).map(normalized))].sort();
+    const attributeNames = [...new Set(Element.prototype.getAttributeNames.call(element)
+      .filter((attribute) => attribute !== 'class' && attribute !== 'id' && attribute !== 'style')
+      .map(normalized))].sort();
+    signatures.add(JSON.stringify([parentName, name, role, classes, attributeNames]));
+    const children = childrenOf(element);
+    for (let index = children.length - 1; index >= 0; index -= 1) {
+      pending.push([children[index] as Element, name]);
+    }
+    const shadowRoot = shadowRootOf(element);
+    if (shadowRoot !== null) {
+      for (let index = shadowRoot.children.length - 1; index >= 0; index -= 1) {
+        pending.push([shadowRoot.children[index] as Element, name]);
+      }
+    }
+  }
+  return [...signatures];
+}
+/**
+ * L9 の作りの印の読み取り（ページの中で動く。引数は `scope`）。COV-2c（SREV-COV の I-1）: 操作さがしの押す部品も、押した後に「同じ作りの部品が増えただけか」を
+ * 見分けるために、同じ読み取り（isolated world で `null` を渡して文書の全体）と同じ判定（`scrollStructureSignaturesOf`）を使う（作りの印を 2 か所に書かない）。
+ */
+export const structureSignaturesInPage = composeInPage(structureSignaturesReader);
+
+/** L9: 内側の領域の、文書の根からの位置（`elementPathOf`。位置で表せなければ `null`）。 */
+function containerPathReader(R: StandardReaders, element: Element): number[] | null {
+  return R.elementPathOf(element);
+}
+const containerPathInPage = composeInPage(containerPathReader);
+
+/**
+ * ブラウザ内で、内側のスクロール領域の位置と高さを読む（DEF-207）。位置は変えない。
+ * DOM clobbering（DEF-072）: 領域が form のとき、名前つきの入力の欄が同じ名前のプロパティを隠すので、標準の prototype の getter で読む。
+ * 部品（`R`）を `composeInPage` で組み込んで `ElementHandle.evaluate` に渡すため、この関数の外にあるものを参照しない。
+ */
+function measureInnerScrollReader(R: StandardReaders, element: Element, _argument: InnerMeasureArgument): RawInnerScrollMeasurement {
+  const { standardGetter } = R;
+  return {
+    connected: standardGetter<boolean>(Node.prototype, 'isConnected')(element),
+    scrollTop: standardGetter<number>(Element.prototype, 'scrollTop')(element),
+    clientHeight: standardGetter<number>(Element.prototype, 'clientHeight')(element),
+    scrollHeight: standardGetter<number>(Element.prototype, 'scrollHeight')(element),
+  };
+}
+const measureInnerScrollInPage = composeInPage(measureInnerScrollReader);
+
+/**
+ * ブラウザ内で、内側のスクロール領域を縦方向の位置 `top` へ移動する（DEF-207。文書の `stepScrollReader` と同じ動かし方）。
+ * 部品（`R`）を `composeInPage` で組み込んで `ElementHandle.evaluate` に渡すため、この関数の外にあるものを参照しない。
+ */
+function stepInnerScrollReader(_R: StandardReaders, element: Element, argument: InnerStepArgument): 'MUTATED' | 'DEADLINE_EXCEEDED' {
+  if (argument.absoluteDeadlineMs !== null && Date.now() >= argument.absoluteDeadlineMs) {
+    return 'DEADLINE_EXCEEDED';
+  }
+  (Element.prototype.scrollTo as (this: Element, options: ScrollToOptions) => void).call(element, { top: argument.top, behavior: 'instant' });
+  return 'MUTATED';
+}
+const stepInnerScrollInPage = composeInPage(stepInnerScrollReader);
+
+/**
+ * ブラウザ内で、内側のスクロール領域を元の位置 `top` へ戻し、戻した後の `scrollTop` を返す（DEF-207。文書の `restoreOrigin` と同じ考え方）。
+ * 部品（`R`）を `composeInPage` で組み込んで `ElementHandle.evaluate` に渡すため、この関数の外にあるものを参照しない。
+ */
+function restoreInnerScrollReader(R: StandardReaders, element: Element, argument: InnerRestoreArgument): number | 'DEADLINE_EXCEEDED' {
+  if (argument.absoluteDeadlineMs !== null && Date.now() >= argument.absoluteDeadlineMs) {
+    return 'DEADLINE_EXCEEDED';
+  }
+  (Element.prototype.scrollTo as (this: Element, options: ScrollToOptions) => void).call(element, { top: argument.top, behavior: 'instant' });
+  return R.standardGetter<number>(Element.prototype, 'scrollTop')(element);
+}
+const restoreInnerScrollInPage = composeInPage(restoreInnerScrollReader);
+
 function validateOptions(options: ControlledScrollOptions): void {
-  if (!Number.isFinite(options.deadlineAtMs)) {
+  if (options.deadlineAtMs !== undefined && !Number.isFinite(options.deadlineAtMs)) {
     throw new Error('Controlled scroll deadline must be finite');
   }
   if (
@@ -292,11 +399,18 @@ function isRawScrollMeasurement(value: unknown): value is RawScrollMeasurement {
     && Number.isFinite(value.bodyScrollRange);
 }
 
+function isRawInnerScrollMeasurement(value: unknown): value is RawInnerScrollMeasurement {
+  return isRecord(value)
+    && typeof value.connected === 'boolean'
+    && Number.isFinite(value.scrollTop)
+    && Number.isFinite(value.clientHeight)
+    && Number.isFinite(value.scrollHeight);
+}
+
 function isInnerScrollScan(value: unknown): value is InnerScrollScan {
   if (
     !isRecord(value)
     || !isNonNegativeSafeInteger(value.scannedElementCount)
-    || value.scannedElementCount > MAX_INNER_SCROLL_SCAN_ELEMENTS
     || typeof value.scanLimitReached !== 'boolean'
     || !isNonNegativeSafeInteger(value.containerCount)
     || value.containerCount > value.scannedElementCount
@@ -328,6 +442,10 @@ function freezeInnerScrollScan(scan: InnerScrollScan): Readonly<InnerScrollScan>
   });
 }
 
+/** L9: 作りの印の並びとして、ブラウザが返した値を確かめる。 */
+const isSignatureList = (value: unknown): value is string[] =>
+  Array.isArray(value) && value.every((item) => typeof item === 'string');
+
 function notRestored(
   reason: Extract<ScrollOriginRestoration, { readonly status: 'NOT_RESTORED' }>['reason'],
   position: ScrollPosition | null = null,
@@ -349,92 +467,285 @@ function restorationFromPosition(position: ScrollPosition): ScrollOriginRestorat
 function immutableResult(result: ScrollResult): ScrollResult {
   const observations = Object.freeze(result.observations.map((observation) => Object.freeze({ ...observation })));
   const finalSnapshot = result.finalSnapshot === null ? null : Object.freeze({ ...result.finalSnapshot });
-  return Object.freeze({ ...result, observations, finalSnapshot }) as ScrollResult;
+  const innerScrollContainers = result.innerScrollContainers === undefined
+    ? undefined
+    : Object.freeze(result.innerScrollContainers.map((container) => Object.freeze({ ...container })));
+  return Object.freeze({
+    ...result,
+    observations,
+    finalSnapshot,
+    ...(innerScrollContainers === undefined ? {} : { innerScrollContainers }),
+  }) as ScrollResult;
+}
+
+// ---------------------------------------------------------------------------------------------------------------
+// L9: たどる途中の記録と、ブラウザの呼び出しの待ち方
+// ---------------------------------------------------------------------------------------------------------------
+
+/** 内側の領域 1 つをたどる途中の記録（見張りが段を終えても残す）。 */
+interface MutableInnerContainerRecord {
+  selector: string | null;
+  originTop: number | null;
+  clientHeight: number | null;
+  initialScrollHeight: number | null;
+  finalScrollHeight: number | null;
+  maxScrollTop: number | null;
+  reachedBottom: boolean;
+  stepCount: number;
+  heightGrowthCount: number;
+  stopReason: InnerScrollStopReason | null;
+  restored: boolean | null;
+}
+
+/** たどる途中の記録（L9。見張りが段を終えたときは、ここまでで結果を作る）。 */
+interface ScrollProgressState {
+  readonly observations: ScrollObservation[];
+  heightGrowthCount: number;
+  targetSwitchCount: number;
+  innerScrollScan: Readonly<InnerScrollScan> | null;
+  readonly innerContainers: MutableInnerContainerRecord[];
+  /** 内側の領域を探したか（探していなければ、結果に `innerScrollContainers` を書かない）。 */
+  innerContainersLocated: boolean;
+}
+
+function freezeInnerContainer(record: MutableInnerContainerRecord, fallback: InnerScrollStopReason): InnerScrollContainerEvidence {
+  return Object.freeze({
+    selector: record.selector,
+    originTop: record.originTop,
+    clientHeight: record.clientHeight,
+    initialScrollHeight: record.initialScrollHeight,
+    finalScrollHeight: record.finalScrollHeight,
+    maxScrollTop: record.maxScrollTop,
+    reachedBottom: record.reachedBottom,
+    stepCount: record.stepCount,
+    heightGrowthCount: record.heightGrowthCount,
+    stopReason: record.stopReason ?? fallback,
+    restored: record.restored,
+  });
+}
+
+/** ブラウザの呼び出しの結果（期限を受けたときは期限切れもある）。 */
+type CallOutcome<T> =
+  | Readonly<{ status: 'FULFILLED'; value: T }>
+  | Readonly<{ status: 'REJECTED' }>
+  | Readonly<{ status: 'DEADLINE_EXCEEDED' }>;
+
+/**
+ * たどる文脈。期限を受けたときは、今までどおり期限で待つ（`deadlineAtMs`）。期限を受けないときは、期限を置かずに待ち（`deadlineAtMs` は
+ * `undefined`。LZ-3b: 前は番兵の `Infinity`）、見張りの口の abort（`signal`）で、繰り返しを止める。中身の進みの印（`markProgress`）は、新しい値を読んだときだけ付ける。
+ */
+interface ScrollContext {
+  readonly deadlineAtMs: number | undefined;
+  readonly signal: AbortSignal | null;
+  readonly markProgress: () => void;
+}
+
+const hasDeadline = (context: ScrollContext): context is ScrollContext & { readonly deadlineAtMs: number } => context.deadlineAtMs !== undefined;
+
+/** 期限を受けていて、その期限を過ぎたか（期限を受けないときは比べない）。 */
+const pastDeadline = (context: ScrollContext, atMs: number = Date.now()): boolean => hasDeadline(context) && atMs >= context.deadlineAtMs;
+
+/** 段を続けられないか（期限を過ぎた、見張りが段を終えた）。 */
+const stopped = (context: ScrollContext): boolean => context.signal?.aborted === true || pastDeadline(context);
+
+/** ページの中の期限の引数（期限を受けないときは `null`。ページの中で比べない）。 */
+const inPageDeadlineOf = (context: ScrollContext): number | null => (hasDeadline(context) ? context.deadlineAtMs : null);
+
+async function call<T>(context: ScrollContext, operation: Promise<T>): Promise<CallOutcome<T>> {
+  const outcome = await awaitBeforeDeadline(operation, context.deadlineAtMs);
+  return outcome.status === 'REJECTED' ? Object.freeze({ status: 'REJECTED' }) : outcome;
+}
+
+/** 待つ（期限を受けたときは、残りの時間より長く待たない）。 */
+async function pause(context: ScrollContext, ms: number): Promise<void> {
+  await wait(hasDeadline(context) ? Math.max(0, Math.min(ms, context.deadlineAtMs - Date.now())) : ms);
 }
 
 /**
- * 測定の記録。件数が `MAX_SCROLL_OBSERVATIONS` を超えたら、最初の `MAX_LEADING_SCROLL_OBSERVATIONS` 件の直後の
- * 測定（残している最後の側で最も古いもの）を切り捨て、切り捨てた件数を数える。最後の測定は切り捨てない。
+ * L9: 伸び続ける画面の止め方の唯一の判定（文書と内側の領域で共用）。今までに見た作りの印の集合 `seen` に、新しく読んだ印 `read` を足し、新しい作りが
+ * 1 つでもあったかを返す。
  */
-interface ObservationLog {
-  readonly observations: ScrollObservation[];
-  omittedCount: number;
-}
-
-function createObservationLog(): ObservationLog {
-  return { observations: [], omittedCount: 0 };
-}
-
-function recordObservation(log: ObservationLog, observation: ScrollObservation): void {
-  log.observations.push(observation);
-  if (log.observations.length > MAX_SCROLL_OBSERVATIONS) {
-    log.observations.splice(MAX_LEADING_SCROLL_OBSERVATIONS, 1);
-    log.omittedCount += 1;
+export function scrollStructureSignaturesOf(seen: Set<string>, read: readonly string[]): boolean {
+  let added = false;
+  for (const signature of read) {
+    if (!seen.has(signature)) {
+      seen.add(signature);
+      added = true;
+    }
   }
+  return added;
+}
+
+// ---------------------------------------------------------------------------------------------------------------
+// RB-9（再構築の設計書 3 章。案 2 章の 2）: 1 回の測定の判定（純粋）。文書の輪と内側の領域の輪が共有する唯一の判定。
+// ---------------------------------------------------------------------------------------------------------------
+
+/** 1 回の測定の判定の、前の測定から持ち越す状態。 */
+export interface ScrollStepState {
+  readonly previousHeight: number | undefined;
+  /** 前の測定で、最下部の近く（あと 1 画面の内）にいたか。 */
+  readonly previousNearBottom: boolean;
+  /** 最下部で高さが変わらなくなった時刻。 */
+  readonly bottomStableSinceMs: number | undefined;
+  /** 進めることを頼んだ時の位置（頼まなかったときは undefined）。 */
+  readonly advanceRequestedFrom: number | undefined;
+}
+
+export const INITIAL_SCROLL_STEP_STATE: ScrollStepState = Object.freeze({
+  previousHeight: undefined,
+  previousNearBottom: false,
+  bottomStableSinceMs: undefined,
+  advanceRequestedFrom: undefined,
+});
+
+/** 1 回の測定（位置・見える高さ・スクロールの高さ）。`canAdvance`: 動かす対象があり、進んだかを確かめられるか（文書の対象がないときは偽）。 */
+export interface ScrollStepMeasurement {
+  readonly atMs: number;
+  readonly position: number;
+  readonly viewportHeight: number;
+  readonly scrollHeight: number;
+  readonly canAdvance: boolean;
+}
+
+/** 判定。`STEP` は次に動かす位置（今の位置と同じこともある）。 */
+export type ScrollStepVerdict =
+  | Readonly<{ kind: 'STEP'; top: number }>
+  | Readonly<{ kind: 'BOTTOM_STABLE' }>
+  | Readonly<{ kind: 'NOT_ADVANCED' }>
+  | Readonly<{ kind: 'NO_NEW_STRUCTURE' }>;
+
+/** 1 回の測定の判定の結果。`heightGrew`: 高さが伸びた。`atBottom`: 最下部にいる。 */
+export interface ScrollStep {
+  readonly state: ScrollStepState;
+  readonly verdict: ScrollStepVerdict;
+  readonly heightGrew: boolean;
+  readonly atBottom: boolean;
+}
+
+/**
+ * L9: 伸び続ける画面の止め方のために、作りの印を読み直すか（最下部の近くで高さが伸びたときだけ）。読んだ結果（新しい作りがあったか）を `scrollStep` に渡す。
+ */
+export const scrollStructureCheckNeeded = (state: ScrollStepState, measurement: Pick<ScrollStepMeasurement, 'scrollHeight'>): boolean =>
+  state.previousHeight !== undefined && measurement.scrollHeight > state.previousHeight && state.previousNearBottom;
+
+/**
+ * 1 回の測定の判定（純粋）。
+ * - `newStructure` が偽（読み直して、新しい作りが出なかった）なら、伸び続ける画面として止める（`NO_NEW_STRUCTURE`）。
+ * - 進めることを頼んだのに、高さが変わらず位置も進まなければ止める（`NOT_ADVANCED`）。
+ * - 最下部で高さが変わらない状態が `stableWindowMs` 続いたら止める（`BOTTOM_STABLE`）。
+ * - ほかは、見える高さの `stepViewportFraction` だけ進める（最下部を越えない）。
+ */
+/** 最下部にいるか（測定の記録と判定の、唯一の式）。 */
+const isAtScrollBottom = (position: number, viewportHeight: number, scrollHeight: number): boolean =>
+  position + viewportHeight >= scrollHeight - SCROLL_EPSILON_PX;
+/** 前の測定より高さが伸びたか（測定の記録と判定の、唯一の式）。 */
+const heightGrewFrom = (previousHeight: number | undefined, scrollHeight: number): boolean =>
+  previousHeight !== undefined && scrollHeight > previousHeight;
+
+export function scrollStep(
+  state: ScrollStepState,
+  measurement: ScrollStepMeasurement,
+  policy: { readonly stableWindowMs: number; readonly stepViewportFraction: number },
+  newStructure: boolean | undefined,
+): ScrollStep {
+  const { atMs, position, viewportHeight, scrollHeight } = measurement;
+  const heightChanged = state.previousHeight !== undefined && scrollHeight !== state.previousHeight;
+  const heightGrew = heightGrewFrom(state.previousHeight, scrollHeight);
+  const atBottom = isAtScrollBottom(position, viewportHeight, scrollHeight);
+  const result = (verdict: ScrollStepVerdict, next: ScrollStepState = state): ScrollStep =>
+    Object.freeze({ state: next, verdict: Object.freeze(verdict), heightGrew, atBottom });
+  if (newStructure === false) {
+    return result({ kind: 'NO_NEW_STRUCTURE' });
+  }
+  if (state.advanceRequestedFrom !== undefined && !heightChanged && position <= state.advanceRequestedFrom) {
+    return result({ kind: 'NOT_ADVANCED' });
+  }
+  let bottomStableSinceMs: number | undefined;
+  if (atBottom && !heightChanged) {
+    bottomStableSinceMs = state.bottomStableSinceMs ?? atMs;
+    if (atMs - bottomStableSinceMs >= policy.stableWindowMs) {
+      return result({ kind: 'BOTTOM_STABLE' }, Object.freeze({ ...state, bottomStableSinceMs }));
+    }
+  }
+  const stepPx = Math.max(1, Math.floor(viewportHeight * policy.stepViewportFraction));
+  const top = Math.min(position + stepPx, Math.max(0, scrollHeight - viewportHeight));
+  return result({ kind: 'STEP', top }, Object.freeze({
+    previousHeight: scrollHeight,
+    previousNearBottom: position + 2 * viewportHeight >= scrollHeight - SCROLL_EPSILON_PX,
+    bottomStableSinceMs,
+    advanceRequestedFrom: measurement.canAdvance && !atBottom && top > position ? position : undefined,
+  }));
 }
 
 function partial(
   reason: ControlledScrollPartialReason,
-  log: ObservationLog,
-  heightGrowthCount: number,
-  targetSwitchCount: number,
+  state: ScrollProgressState,
   restoration: ScrollOriginRestoration,
-  innerScrollScan: Readonly<InnerScrollScan> | null = null,
+  innerFallback: InnerScrollStopReason = 'EVALUATION_FAILED',
 ): ScrollResult {
   return immutableResult({
     status: 'PARTIAL',
     reason,
-    observations: log.observations,
-    omittedObservationCount: log.omittedCount,
-    heightGrowthCount,
-    targetSwitchCount,
+    observations: state.observations,
+    omittedObservationCount: 0,
+    heightGrowthCount: state.heightGrowthCount,
+    targetSwitchCount: state.targetSwitchCount,
     restoration,
-    innerScrollScan,
-    finalSnapshot: log.observations.at(-1) ?? null,
+    innerScrollScan: state.innerScrollScan,
+    ...innerContainersOf(state, innerFallback),
+    finalSnapshot: state.observations.at(-1) ?? null,
   });
 }
 
+function innerContainersOf(
+  state: ScrollProgressState,
+  fallback: InnerScrollStopReason,
+): { readonly innerScrollContainers?: readonly InnerScrollContainerEvidence[] } {
+  return state.innerContainersLocated
+    ? { innerScrollContainers: state.innerContainers.map((record) => freezeInnerContainer(record, fallback)) }
+    : {};
+}
+
 function completeBeforeDeadline(
-  deadlineAtMs: number,
-  log: ObservationLog,
-  heightGrowthCount: number,
-  targetSwitchCount: number,
+  context: ScrollContext,
+  reason: ScrollCompleteReason,
+  state: ScrollProgressState,
   finalSnapshot: ScrollObservation,
   restoration: ScrollOriginRestoration,
-  innerScrollScan: Readonly<InnerScrollScan> | null,
 ): ScrollResult {
-  if (Date.now() >= deadlineAtMs) {
-    return partial('DEADLINE_EXCEEDED', log, heightGrowthCount, targetSwitchCount, restoration, innerScrollScan);
+  if (pastDeadline(context)) {
+    return partial('DEADLINE_EXCEEDED', state, restoration, 'DEADLINE_EXCEEDED');
   }
   const complete = immutableResult({
     status: 'COMPLETE',
-    reason: 'BOTTOM_AND_HEIGHT_STABLE',
-    observations: log.observations,
-    omittedObservationCount: log.omittedCount,
-    heightGrowthCount,
-    targetSwitchCount,
+    reason,
+    observations: state.observations,
+    omittedObservationCount: 0,
+    heightGrowthCount: state.heightGrowthCount,
+    targetSwitchCount: state.targetSwitchCount,
     restoration,
-    innerScrollScan,
+    innerScrollScan: state.innerScrollScan,
+    ...innerContainersOf(state, 'EVALUATION_FAILED'),
     finalSnapshot,
   });
-  return Date.now() >= deadlineAtMs
-    ? partial('DEADLINE_EXCEEDED', log, heightGrowthCount, targetSwitchCount, restoration, innerScrollScan)
+  return pastDeadline(context)
+    ? partial('DEADLINE_EXCEEDED', state, restoration, 'DEADLINE_EXCEEDED')
     : complete;
 }
 
 /** 文書のスクロール位置を先頭へ戻す。期限を過ぎていれば、ブラウザ内の処理を始めずに記録だけ返す。 */
-async function restoreOrigin(page: Page, deadlineAtMs: number): Promise<ScrollOriginRestoration> {
+async function restoreOrigin(page: Page, context: ScrollContext): Promise<ScrollOriginRestoration> {
   if (page.isClosed()) {
     return notRestored('PAGE_CLOSED');
   }
-  if (Date.now() >= deadlineAtMs) {
+  if (pastDeadline(context)) {
     return notRestored('DEADLINE_EXCEEDED');
   }
-  const restored = await awaitBeforeDeadline(page.evaluate(scrollDocumentToOriginInPage, {
+  const restored = await call(context, page.evaluate(scrollDocumentToOriginInPage, {
     phase: 'RESTORE',
-    absoluteDeadlineMs: deadlineAtMs,
+    absoluteDeadlineMs: inPageDeadlineOf(context),
     awaitFrame: false,
-  } satisfies OriginArgument), deadlineAtMs);
+  } satisfies OriginArgument));
   if (restored.status === 'REJECTED') {
     return notRestored(pageFailureReason(page));
   }
@@ -501,15 +812,15 @@ type MeasureOutcome =
 
 async function measure(
   page: Page,
-  deadlineAtMs: number,
+  context: ScrollContext,
   lockedTarget: ScrollTarget | null,
   previousHeight: number | undefined,
 ): Promise<MeasureOutcome> {
-  const evaluated = await awaitBeforeDeadline(page.evaluate(measureScrollInPage, {
+  const evaluated = await call(context, page.evaluate(measureScrollInPage, {
     phase: 'MEASURE',
     lockedTarget,
     epsilonPx: SCROLL_EPSILON_PX,
-  } satisfies MeasureArgument), deadlineAtMs);
+  } satisfies MeasureArgument));
   if (evaluated.status === 'REJECTED') {
     return { status: 'REJECTED' };
   }
@@ -517,7 +828,7 @@ async function measure(
     return { status: 'DEADLINE_EXCEEDED' };
   }
   const observedAtMs = Date.now();
-  if (observedAtMs >= deadlineAtMs) {
+  if (pastDeadline(context, observedAtMs)) {
     return { status: 'DEADLINE_EXCEEDED' };
   }
   const state: unknown = evaluated.value;
@@ -535,8 +846,8 @@ async function measure(
       contentHeight: state.contentHeight,
       documentScrollRange: state.documentScrollRange,
       bodyScrollRange: state.bodyScrollRange,
-      heightGrew: previousHeight !== undefined && state.scrollHeight > previousHeight,
-      atBottom: state.scrollY + state.viewportHeight >= state.scrollHeight - SCROLL_EPSILON_PX,
+      heightGrew: heightGrewFrom(previousHeight, state.scrollHeight),
+      atBottom: isAtScrollBottom(state.scrollY, state.viewportHeight, state.scrollHeight),
     },
   };
 }
@@ -545,13 +856,12 @@ type InnerScrollScanOutcome =
   | Readonly<{ status: 'SCANNED'; scan: Readonly<InnerScrollScan> }>
   | Readonly<{ status: 'FAILED'; reason: PartialFailureReason }>;
 
-/** 内側のスクロール領域を、期限までに上限付きで探す。 */
-async function scanInnerScrollContainers(page: Page, deadlineAtMs: number): Promise<InnerScrollScanOutcome> {
-  const evaluated = await awaitBeforeDeadline(page.evaluate(scanInnerScrollContainersInPage, {
+/** 内側のスクロール領域を探す（L9: 数の上限なし）。 */
+async function scanInnerScrollContainers(page: Page, context: ScrollContext): Promise<InnerScrollScanOutcome> {
+  const evaluated = await call(context, page.evaluate(scanInnerScrollContainersInPage, {
     phase: 'INNER_SCROLL_SCAN',
-    maxElements: MAX_INNER_SCROLL_SCAN_ELEMENTS,
     visibilityOptions: VISIBILITY_CHECK_OPTIONS,
-  } satisfies InnerScrollScanArgument), deadlineAtMs);
+  } satisfies InnerScrollScanArgument));
   if (evaluated.status === 'REJECTED') {
     return { status: 'FAILED', reason: pageFailureReason(page) };
   }
@@ -563,6 +873,244 @@ async function scanInnerScrollContainers(page: Page, deadlineAtMs: number): Prom
     return { status: 'FAILED', reason: 'EVALUATION_FAILED' };
   }
   return { status: 'SCANNED', scan: freezeInnerScrollScan(scan) };
+}
+
+/** L9: `scope` の要素（`null` なら文書）の作りの印を読む。読めなければ `null`。 */
+async function readStructureSignatures(
+  page: Page,
+  context: ScrollContext,
+  scope: ElementHandle<Element> | null,
+): Promise<readonly string[] | null> {
+  const read = await call(context, scope === null
+    ? page.evaluate(structureSignaturesInPage, null)
+    : scope.evaluate(structureSignaturesInPage));
+  return read.status === 'FULFILLED' && isSignatureList(read.value) ? read.value : null;
+}
+
+/** 位置（`elementPathOf` の並び）を CSS の selector にする（最初の段は文書の根の要素）。 */
+const selectorOfPath = (path: readonly number[]): string =>
+  [':root', ...path.slice(1).map((index) => `:nth-child(${String(index + 1)})`)].join(' > ');
+
+/** 内側のスクロール領域を、元の位置 `originTop` へ戻す（DEF-207）。戻せたかを返す（確かめられなければ `null`）。 */
+async function restoreInnerOrigin(
+  page: Page,
+  container: ElementHandle<Element>,
+  originTop: number,
+  context: ScrollContext,
+): Promise<boolean | null> {
+  if (page.isClosed() || stopped(context)) {
+    return null;
+  }
+  const restored = await call(context, container.evaluate(restoreInnerScrollInPage, {
+    phase: 'INNER_RESTORE',
+    top: originTop,
+    absoluteDeadlineMs: inPageDeadlineOf(context),
+  } satisfies InnerRestoreArgument));
+  if (restored.status !== 'FULFILLED' || restored.value === 'DEADLINE_EXCEEDED' || !Number.isFinite(restored.value)) {
+    return null;
+  }
+  return Math.abs(restored.value - originTop) <= SCROLL_EPSILON_PX;
+}
+
+/** 止めた理由（ページが閉じた・期限・見張り・読み取りの失敗）を、内側の領域の止めた理由にする。 */
+const innerStopOf = (page: Page, context: ScrollContext, failed: 'REJECTED' | 'DEADLINE_EXCEEDED'): InnerScrollStopReason => {
+  if (failed === 'DEADLINE_EXCEEDED' || pastDeadline(context)) {
+    return 'DEADLINE_EXCEEDED';
+  }
+  return page.isClosed() ? 'PAGE_CLOSED' : 'EVALUATION_FAILED';
+};
+
+/**
+ * 内側のスクロール領域 1 つを、文書と同じ決まり（1 回の動きの量、落ち着きの待ち、作りの印での止め方）でたどり、最後に元の位置へ戻す（DEF-207・L9）。
+ * 要素の特定と動かす操作は、文書と同じ world（`page.evaluateHandle` と `ElementHandle.evaluate`）で行い、クリックや入力はしない。途中の記録は `record` に入れる。
+ */
+async function traverseInnerScrollContainer(
+  page: Page,
+  container: ElementHandle<Element>,
+  context: ScrollContext,
+  options: ControlledScrollOptions,
+  record: MutableInnerContainerRecord,
+): Promise<void> {
+  const path = await call(context, container.evaluate(containerPathInPage));
+  if (path.status === 'FULFILLED' && Array.isArray(path.value) && path.value.every((step) => isNonNegativeSafeInteger(step))) {
+    record.selector = selectorOfPath(path.value);
+  }
+  const seenStructure = new Set<string>();
+  let step: ScrollStepState = INITIAL_SCROLL_STEP_STATE;
+  const finish = async (reason: InnerScrollStopReason): Promise<void> => {
+    record.stopReason = reason;
+    if (record.originTop !== null) {
+      record.restored = await restoreInnerOrigin(page, container, record.originTop, context);
+    }
+  };
+  // 伸び続ける領域の止め方（作りの印）。期限を受けたとき（今までの決まり）は使わない。
+  const structureStop = !hasDeadline(context);
+  if (structureStop) {
+    const initial = await readStructureSignatures(page, context, container);
+    if (initial !== null) {
+      scrollStructureSignaturesOf(seenStructure, initial);
+    }
+  }
+  while (!stopped(context)) {
+    const evaluated = await call(context, container.evaluate(measureInnerScrollInPage, {
+      phase: 'INNER_MEASURE',
+    } satisfies InnerMeasureArgument));
+    if (evaluated.status !== 'FULFILLED') {
+      await finish(innerStopOf(page, context, evaluated.status));
+      return;
+    }
+    const observedAtMs = Date.now();
+    const state: unknown = evaluated.value;
+    if (!isRawInnerScrollMeasurement(state)) {
+      await finish('EVALUATION_FAILED');
+      return;
+    }
+    if (!state.connected) {
+      await finish('DISCONNECTED');
+      return;
+    }
+    const firstMeasurement = record.originTop === null;
+    record.originTop ??= state.scrollTop;
+    record.clientHeight = state.clientHeight;
+    record.initialScrollHeight ??= state.scrollHeight;
+    record.finalScrollHeight = state.scrollHeight;
+    // 新しい位置か高さを読んだときだけ、中身の進みの印を付ける。
+    if (firstMeasurement || record.maxScrollTop === null || state.scrollTop > record.maxScrollTop || state.scrollHeight !== step.previousHeight) {
+      context.markProgress();
+    }
+    record.maxScrollTop = Math.max(record.maxScrollTop ?? state.scrollTop, state.scrollTop);
+    const measurement: ScrollStepMeasurement = {
+      atMs: observedAtMs, position: state.scrollTop, viewportHeight: state.clientHeight, scrollHeight: state.scrollHeight, canAdvance: true,
+    };
+    // 最下部の近くで読み込まれた内容が、新しい作りを出さなければ止める（伸び続ける画面）。
+    let newStructure: boolean | undefined;
+    if (structureStop && scrollStructureCheckNeeded(step, measurement)) {
+      const read = await readStructureSignatures(page, context, container);
+      newStructure = read === null ? undefined : scrollStructureSignaturesOf(seenStructure, read);
+    }
+    const judged = scrollStep(step, measurement, options, newStructure);
+    if (judged.heightGrew) {
+      record.heightGrowthCount += 1;
+    }
+    if (judged.verdict.kind === 'NO_NEW_STRUCTURE' || judged.verdict.kind === 'NOT_ADVANCED') {
+      await finish(judged.verdict.kind);
+      return;
+    }
+    record.reachedBottom ||= judged.atBottom;
+    if (judged.verdict.kind === 'BOTTOM_STABLE') {
+      await finish('BOTTOM_AND_HEIGHT_STABLE');
+      return;
+    }
+    step = judged.state;
+    const top = judged.verdict.top;
+    const moved = await call(context, container.evaluate(stepInnerScrollInPage, {
+      phase: 'INNER_STEP',
+      top,
+      absoluteDeadlineMs: inPageDeadlineOf(context),
+    } satisfies InnerStepArgument));
+    if (moved.status !== 'FULFILLED') {
+      await finish(innerStopOf(page, context, moved.status));
+      return;
+    }
+    if (moved.value === 'DEADLINE_EXCEEDED') {
+      await finish('DEADLINE_EXCEEDED');
+      return;
+    }
+    if (top > state.scrollTop) {
+      record.stepCount += 1;
+    }
+    await pause(context, options.stepWaitMs);
+  }
+  if (record.stopReason === null && hasDeadline(context)) {
+    await finish('DEADLINE_EXCEEDED');
+  }
+}
+
+/**
+ * L9（COV-5・AUD-5）: 見つけた全部の内側のスクロール領域を、文書の順に、1 つずつたどる。内側の量が文書の量以下でも、たどる。どれか 1 つでも
+ * たどり終えなかった（`BOTTOM_AND_HEIGHT_STABLE`・`NO_NEW_STRUCTURE` のほか）ら、`INNER_SCROLL_CONTAINER_NOT_TRAVERSED` を返す（ほかの領域は続けてたどる）。
+ */
+async function traverseAllInnerScrollContainers(
+  page: Page,
+  context: ScrollContext,
+  options: ControlledScrollOptions,
+  state: ScrollProgressState,
+): Promise<'TRAVERSED' | ControlledScrollPartialReason> {
+  const located = await call(context, page.evaluateHandle(scanInnerScrollContainersInPage, {
+    phase: 'INNER_SCROLL_LOCATE',
+    visibilityOptions: VISIBILITY_CHECK_OPTIONS,
+  } satisfies InnerScrollScanArgument));
+  if (located.status === 'REJECTED') {
+    return pageFailureReason(page);
+  }
+  if (located.status === 'DEADLINE_EXCEEDED') {
+    return 'DEADLINE_EXCEEDED';
+  }
+  const list: JSHandle = located.value;
+  const handles: ElementHandle<Element>[] = [];
+  try {
+    const properties = await call(context, list.getProperties());
+    if (properties.status !== 'FULFILLED') {
+      return properties.status === 'DEADLINE_EXCEEDED' ? 'DEADLINE_EXCEEDED' : pageFailureReason(page);
+    }
+    for (const [name, property] of [...properties.value.entries()].sort(([left], [right]) => Number(left) - Number(right))) {
+      const element = /^\d+$/u.test(name) ? property.asElement() as ElementHandle<Element> | null : null;
+      if (element === null) {
+        void property.dispose().catch(() => undefined);
+      } else {
+        handles.push(element);
+      }
+    }
+    // 見つけた全部の領域の記録を先に作る（途中で止まっても、たどらなかった領域が記録に残る）。
+    const records = handles.map((): MutableInnerContainerRecord => ({
+      selector: null,
+      originTop: null,
+      clientHeight: null,
+      initialScrollHeight: null,
+      finalScrollHeight: null,
+      maxScrollTop: null,
+      reachedBottom: false,
+      stepCount: 0,
+      heightGrowthCount: 0,
+      stopReason: null,
+      restored: null,
+    }));
+    for (const record of records) {
+      state.innerContainers.push(record);
+    }
+    state.innerContainersLocated = true;
+    for (const [index, handle] of handles.entries()) {
+      const record = records[index] as MutableInnerContainerRecord;
+      if (stopped(context)) {
+        // 期限で止めたときは、たどらなかった領域にも理由を書く（見張りが終えたときは、結果を作るときに、見張りの理由を書く）。
+        if (context.signal?.aborted !== true) {
+          record.stopReason = 'DEADLINE_EXCEEDED';
+        }
+        continue;
+      }
+      await traverseInnerScrollContainer(page, handle, context, options, record);
+    }
+  } finally {
+    // 手放すのを待たない（ページが止まっていても待たない）。
+    void list.dispose().catch(() => undefined);
+    for (const handle of handles) {
+      void handle.dispose().catch(() => undefined);
+    }
+  }
+  const notTraversed = state.innerContainers.some((record) =>
+    record.stopReason !== 'BOTTOM_AND_HEIGHT_STABLE' && record.stopReason !== 'NO_NEW_STRUCTURE');
+  return notTraversed ? 'INNER_SCROLL_CONTAINER_NOT_TRAVERSED' : 'TRAVERSED';
+}
+
+/**
+ * 文書のスクロール位置を戻した結果と、内側の領域を戻した結果をまとめる（DEF-207・L9）。文書を戻せなかったときは文書の記録を、
+ * 文書を戻せて内側の領域のどれかを戻せなかったときは `POSITION_NOT_AT_ORIGIN` を残す。
+ */
+function combineRestorations(documentRestoration: ScrollOriginRestoration, state: ScrollProgressState): ScrollOriginRestoration {
+  if (documentRestoration.status === 'NOT_RESTORED') {
+    return documentRestoration;
+  }
+  return state.innerContainers.some((record) => record.restored === false) ? notRestored('POSITION_NOT_AT_ORIGIN') : documentRestoration;
 }
 
 /**
@@ -584,54 +1132,97 @@ function alternativeDocumentTarget(
   }
 }
 
+/** 見張りが段を終えた理由を、scroll の記録の理由にする（Run の時間の上限は期限切れ）。 */
+const scrollEndReasonOf = (end: CollectorWatchEnd): ControlledScrollPartialReason & InnerScrollStopReason => end;
+
 export async function controlledScroll(page: Page, options: ControlledScrollOptions): Promise<ScrollResult> {
   validateOptions(options);
-  const deadlineAtMs = options.deadlineAtMs;
-  const stepWaitMs = options.stepWaitMs;
-  const stableWindowMs = options.stableWindowMs;
-  const stepViewportFraction = options.stepViewportFraction;
-  const observationLog = createObservationLog();
-  let heightGrowthCount = 0;
-  // 完了と判定する前の測り直しで、たどる対象を切り替えた回数（上限は `MAX_SCROLL_TARGET_SWITCHES`）。
-  let targetSwitchCount = 0;
+  const state: ScrollProgressState = {
+    observations: [],
+    heightGrowthCount: 0,
+    targetSwitchCount: 0,
+    innerScrollScan: null,
+    innerContainers: [],
+    innerContainersLocated: false,
+  };
+  if (options.deadlineAtMs !== undefined && options.progress === undefined) {
+    return scrollDocument(page, options, { deadlineAtMs: options.deadlineAtMs, signal: null, markProgress: () => undefined }, state);
+  }
+  // L9: 期限を置かずに、進みの見張りで待つ。ブラウザの呼び出しは返るたびに印を付けず（`track` を使わない）、新しい値を読んだときだけ印を付ける。
+  const caller = options.progress;
+  const outcome = await watchCollection(
+    page,
+    (signals) => scrollDocument(page, options, {
+      deadlineAtMs: options.deadlineAtMs,
+      signal: signals.signal,
+      markProgress: () => signals.mark('BROWSER_RESPONSE'),
+    }, state),
+    caller === undefined
+      ? { quietLimitMs: options.quietLimitMs }
+      : { progress: Object.freeze({ signal: caller.signal, mark: caller.mark, track: <T>(operation: PromiseLike<T>): Promise<T> => Promise.resolve(operation) }) },
+  );
+  switch (outcome.status) {
+    case 'FULFILLED':
+      return outcome.value;
+    case 'REJECTED':
+      return partial('EVALUATION_FAILED', state, notRestored('EVALUATION_FAILED'));
+    case 'ENDED': {
+      // 見張りが段を終えた（全く反応がない・静まらない・Run の時間の上限）。戻すのは待たず（止まったページを待たない）、それまでの記録を返す。
+      const reason = scrollEndReasonOf(outcome.end);
+      return partial(reason, state, notRestored(reason), reason);
+    }
+  }
+}
+
+/** 文書（か body）をたどり、続けて内側の領域を全部たどる（`controlledScroll` の本体）。 */
+async function scrollDocument(
+  page: Page,
+  options: ControlledScrollOptions,
+  context: ScrollContext,
+  state: ScrollProgressState,
+): Promise<ScrollResult> {
+  const { stepWaitMs } = options;
 
   if (page.isClosed()) {
-    return partial('PAGE_CLOSED', observationLog, heightGrowthCount, targetSwitchCount, notRestored('PAGE_CLOSED'));
+    return partial('PAGE_CLOSED', state, notRestored('PAGE_CLOSED'));
   }
 
-  const reset = await awaitBeforeDeadline(page.evaluate(scrollDocumentToOriginInPage, {
+  const reset = await call(context, page.evaluate(scrollDocumentToOriginInPage, {
     phase: 'RESET',
-    absoluteDeadlineMs: deadlineAtMs,
+    absoluteDeadlineMs: inPageDeadlineOf(context),
     awaitFrame: true,
-  } satisfies OriginArgument), deadlineAtMs);
+  } satisfies OriginArgument));
   if (reset.status === 'REJECTED') {
     const reason = pageFailureReason(page);
-    return partial(reason, observationLog, heightGrowthCount, targetSwitchCount, notRestored(reason));
+    return partial(reason, state, notRestored(reason));
   }
   if (reset.status === 'DEADLINE_EXCEEDED' || reset.value === 'DEADLINE_EXCEEDED') {
-    return partial('DEADLINE_EXCEEDED', observationLog, heightGrowthCount, targetSwitchCount, notRestored('DEADLINE_EXCEEDED'));
+    return partial('DEADLINE_EXCEEDED', state, notRestored('DEADLINE_EXCEEDED'));
   }
+  context.markProgress();
 
-  let innerScrollScan: Readonly<InnerScrollScan> | null = null;
   // 部分結果を返す前にも、先頭へ戻すことを試み、その結果を記録する。
-  const finish = async (reason: ControlledScrollPartialReason): Promise<ScrollResult> => (
-    partial(
-      reason,
-      observationLog,
-      heightGrowthCount,
-      targetSwitchCount,
-      await restoreOrigin(page, deadlineAtMs),
-      innerScrollScan,
-    )
-  );
+  const finish = async (reason: ControlledScrollPartialReason): Promise<ScrollResult> =>
+    partial(reason, state, combineRestorations(await restoreOrigin(page, context), state));
+
+  // L9: 伸び続ける画面の止め方（作りの印）。期限を受けたとき（今までの決まり）は使わない。
+  const structureStop = !hasDeadline(context);
+  const seenStructure = new Set<string>();
+  if (structureStop) {
+    const initial = await readStructureSignatures(page, context, null);
+    if (initial !== null) {
+      scrollStructureSignaturesOf(seenStructure, initial);
+    }
+  }
+  // L9（N15）: 完了の前に切り替えた対象と、そのときの量（同じ対象を同じ量で 2 度たどることになったら、揺れ続ける画面として止める）。
+  const switchedStates = new Set<string>();
 
   let lockedTarget: ScrollTarget | null = null;
-  let previousHeight: number | undefined;
-  let bottomStableSinceMs: number | undefined;
-  let advanceRequestedFromY: number | undefined;
+  let step: ScrollStepState = INITIAL_SCROLL_STEP_STATE;
   let advanced = false;
-  while (Date.now() < deadlineAtMs) {
-    const measured = await measure(page, deadlineAtMs, lockedTarget, previousHeight);
+  let maxScrollY = -1;
+  while (!stopped(context)) {
+    const measured = await measure(page, context, lockedTarget, step.previousHeight);
     if (measured.status === 'REJECTED') {
       return finish(pageFailureReason(page));
     }
@@ -639,7 +1230,12 @@ export async function controlledScroll(page: Page, options: ControlledScrollOpti
       return finish('DEADLINE_EXCEEDED');
     }
     const observation = measured.observation;
-    recordObservation(observationLog, observation);
+    state.observations.push(observation);
+    // 新しい位置か高さを読んだときだけ、中身の進みの印を付ける（同じ値の繰り返しは進みに数えない）。
+    if (observation.scrollY > maxScrollY || (step.previousHeight !== undefined && observation.scrollHeight !== step.previousHeight)) {
+      context.markProgress();
+    }
+    maxScrollY = Math.max(maxScrollY, observation.scrollY);
     lockedTarget ??= observation.scrollTarget;
     if (observation.scrollY > SCROLL_EPSILON_PX) {
       advanced = true;
@@ -648,102 +1244,95 @@ export async function controlledScroll(page: Page, options: ControlledScrollOpti
     if (observation.scrollTarget === null && contentExceedsViewport) {
       return finish('SCROLL_TARGET_UNRESOLVED');
     }
-    const heightChanged = previousHeight !== undefined && observation.scrollHeight !== previousHeight;
-    if (
-      advanceRequestedFromY !== undefined
-      && !heightChanged
-      && observation.scrollY <= advanceRequestedFromY
-    ) {
+    const measurement: ScrollStepMeasurement = {
+      atMs: observation.observedAtMs,
+      position: observation.scrollY,
+      viewportHeight: observation.viewportHeight,
+      scrollHeight: observation.scrollHeight,
+      canAdvance: observation.scrollTarget !== null,
+    };
+    // L9: 最下部の近くで読み込まれた内容が、新しい作りを出さなければ止める（伸び続ける画面）。
+    let newStructure: boolean | undefined;
+    if (structureStop && scrollStructureCheckNeeded(step, measurement)) {
+      const read = await readStructureSignatures(page, context, null);
+      newStructure = read === null ? undefined : scrollStructureSignaturesOf(seenStructure, read);
+      if (newStructure !== false) {
+        context.markProgress();
+      }
+    }
+    const judged = scrollStep(step, measurement, options, newStructure);
+    if (judged.verdict.kind === 'NOT_ADVANCED') {
       return finish('SCROLL_NOT_ADVANCED');
     }
-    if (observation.heightGrew) {
-      heightGrowthCount += 1;
+    if (judged.heightGrew) {
+      state.heightGrowthCount += 1;
     }
-
-    if (observation.atBottom && !heightChanged) {
-      bottomStableSinceMs ??= observation.observedAtMs;
-      if (observation.observedAtMs - bottomStableSinceMs >= stableWindowMs) {
-        if (!advanced && contentExceedsViewport) {
-          return finish('SCROLL_NOT_ADVANCED');
-        }
-        // 内側のスクロール領域のほうが大きくスクロールできるページを COMPLETE にしないよう、内側の領域を探して比べる
-        // （R4 の N1。文書が body の余白の分だけスクロールできる場合も、本文が内側の領域にあることがある）。
-        const scanned = await scanInnerScrollContainers(page, deadlineAtMs);
-        if (scanned.status === 'FAILED') {
-          return finish(scanned.reason);
-        }
-        innerScrollScan = scanned.scan;
-        const traversedRange = observation.scrollTarget === null
-          ? 0
-          : observation.scrollHeight - observation.viewportHeight;
-        const innerRange = innerScrollScan.representative === null
-          ? 0
-          : innerScrollScan.representative.scrollHeight - innerScrollScan.representative.clientHeight;
-        // 完了と判定する前に、候補のスクロールできる量を比べ直す（R'2 の I-1）。最初の測定の後に、たどっていないほう
-        // （文書か body）が大きくなっていれば、1回だけ対象を切り替えてたどり直す。2回目も変わっていれば完了にしない。
-        const alternative = alternativeDocumentTarget(observation);
-        if (
-          alternative.range > SCROLL_EPSILON_PX
-          && alternative.range > traversedRange
-          && alternative.range >= innerRange
-        ) {
-          if (targetSwitchCount >= MAX_SCROLL_TARGET_SWITCHES) {
-            return finish('SCROLL_TARGET_UNSTABLE');
-          }
-          targetSwitchCount += 1;
-          lockedTarget = alternative.target;
-          previousHeight = undefined;
-          bottomStableSinceMs = undefined;
-          advanceRequestedFromY = undefined;
-          advanced = false;
-          continue;
-        }
-        if (innerScrollScan.containerCount > 0 && innerRange > traversedRange) {
-          return finish('INNER_SCROLL_CONTAINER_NOT_TRAVERSED');
-        }
-        if (observation.scrollTarget === null && innerScrollScan.scanLimitReached) {
-          return finish('INNER_SCROLL_SCAN_LIMIT_REACHED');
-        }
-        const restoration = await restoreOrigin(page, deadlineAtMs);
-        return completeBeforeDeadline(
-          deadlineAtMs,
-          observationLog,
-          heightGrowthCount,
-          targetSwitchCount,
-          observation,
-          restoration,
-          innerScrollScan,
-        );
+    if (judged.verdict.kind !== 'STEP') {
+      if (judged.verdict.kind === 'BOTTOM_STABLE' && !advanced && contentExceedsViewport) {
+        return finish('SCROLL_NOT_ADVANCED');
       }
-    } else {
-      bottomStableSinceMs = undefined;
+      const endReason: ScrollCompleteReason = judged.verdict.kind === 'NO_NEW_STRUCTURE' ? 'NO_NEW_STRUCTURE' : 'BOTTOM_AND_HEIGHT_STABLE';
+      // 内側のスクロール領域を探し、記録する（R4 の N1）。
+      const scanned = await scanInnerScrollContainers(page, context);
+      if (scanned.status === 'FAILED') {
+        return finish(scanned.reason);
+      }
+      state.innerScrollScan = scanned.scan;
+      const traversedRange = observation.scrollTarget === null
+        ? 0
+        : observation.scrollHeight - observation.viewportHeight;
+      const innerRange = state.innerScrollScan.representative === null
+        ? 0
+        : state.innerScrollScan.representative.scrollHeight - state.innerScrollScan.representative.clientHeight;
+      // 完了と判定する前に、候補のスクロールできる量を比べ直す（R'2 の I-1）。たどっていないほう（文書か body）が大きくなっていれば、対象を
+      // 切り替えてたどり直す。L9: 回数で止めず、同じ対象を同じ量でもう一度たどることになったら、揺れ続ける画面として止める。
+      const alternative = alternativeDocumentTarget(observation);
+      if (
+        endReason === 'BOTTOM_AND_HEIGHT_STABLE'
+        && alternative.range > SCROLL_EPSILON_PX
+        && alternative.range > traversedRange
+        && (hasDeadline(context) ? alternative.range >= innerRange : true)
+      ) {
+        const switchState = `${alternative.target}:${String(alternative.range)}`;
+        if (hasDeadline(context) ? state.targetSwitchCount >= MAX_SCROLL_TARGET_SWITCHES : switchedStates.has(switchState)) {
+          return finish('SCROLL_TARGET_UNSTABLE');
+        }
+        switchedStates.add(switchState);
+        state.targetSwitchCount += 1;
+        lockedTarget = alternative.target;
+        step = INITIAL_SCROLL_STEP_STATE;
+        advanced = false;
+        maxScrollY = -1;
+        continue;
+      }
+      // DEF-207・L9: 見つけた全部の内側の領域を、文書と同じ決まりでたどり、元の位置へ戻す。期限を受けたとき（今までの決まり）は、内側の領域が
+      // 文書より大きくスクロールできるときだけたどる。
+      if (state.innerScrollScan.containerCount > 0 && (!hasDeadline(context) || innerRange > traversedRange)) {
+        const traversal = await traverseAllInnerScrollContainers(page, context, options, state);
+        if (traversal !== 'TRAVERSED') {
+          return finish(traversal);
+        }
+      }
+      if (context.signal?.aborted === true) {
+        return finish('DEADLINE_EXCEEDED');
+      }
+      const restoration = combineRestorations(await restoreOrigin(page, context), state);
+      return completeBeforeDeadline(context, endReason, state, observation, restoration);
     }
-    previousHeight = observation.scrollHeight;
-
-    const stepPx = Math.max(1, Math.floor(observation.viewportHeight * stepViewportFraction));
-    const maxScrollY = Math.max(0, observation.scrollHeight - observation.viewportHeight);
-    const top = Math.min(observation.scrollY + stepPx, maxScrollY);
-    advanceRequestedFromY = observation.scrollTarget !== null && !observation.atBottom && top > observation.scrollY
-      ? observation.scrollY
-      : undefined;
-    const moved = await awaitBeforeDeadline(page.evaluate(stepScrollInPage, {
+    step = judged.state;
+    const moved = await call(context, page.evaluate(stepScrollInPage, {
       phase: 'STEP',
       target: observation.scrollTarget,
-      top,
-      absoluteDeadlineMs: deadlineAtMs,
-    } satisfies StepArgument), deadlineAtMs);
+      top: judged.verdict.top,
+      absoluteDeadlineMs: inPageDeadlineOf(context),
+    } satisfies StepArgument));
     if (moved.status === 'REJECTED') {
       return finish(pageFailureReason(page));
     }
     if (moved.status === 'DEADLINE_EXCEEDED' || moved.value === 'DEADLINE_EXCEEDED') {
       return finish('DEADLINE_EXCEEDED');
     }
-
-    const remainingMs = deadlineAtMs - Date.now();
-    if (remainingMs <= 0) {
-      break;
-    }
-    await wait(Math.min(stepWaitMs, remainingMs));
+    await pause(context, stepWaitMs);
   }
 
   return finish('DEADLINE_EXCEEDED');

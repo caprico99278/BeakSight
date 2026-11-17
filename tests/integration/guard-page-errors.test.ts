@@ -4,7 +4,8 @@
 // でも文言の違うもの）も起こす。
 // - 守りの例外は、PAGE_ERROR の Finding にならない（desktop と mobile のどちらでも）。
 // - ページ自身の例外は、今どおり PAGE_ERROR の Finding になる。
-// - page.json の Evidence（記録した事実）には、守りの例外も残る（Rule の側だけで見分ける）。
+// - page.json の Evidence（記録した事実）には、守りの例外も残る（Rule の側だけで見分ける）。FIN-1: 監査の Context は WebRTC を塞がない（RB-4b）ので、
+//   WebRTC の例外はこの Run では起きない（Finding にしない判定は単体が確かめる）。
 // BN-b（`2026-10-23-beaksight-bundle-beaksight-block-noise-design.md` の 3.2）: BeakSight の起動の引数（`--disable-shared-workers`）で
 // SharedWorker がないときに、ページが捕捉せずに `new SharedWorker` を呼んで起こる `ReferenceError` も、PAGE_ERROR の Finding にしない。
 // ページ自身の `ReferenceError`（別の名前の未定義）は、今どおり Finding になる。
@@ -15,7 +16,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import type { Browser } from 'playwright';
 import { afterAll, beforeAll, describe, expect, it } from 'vitest';
-import { launchCliChromium, launchHeadlessChromium } from '../helpers/chromium.js';
+import { BOTH_CHROMIUM_LAUNCHERS } from '../helpers/chromium.js';
 import { startLoopbackHttpServer, type LoopbackHttpServer } from '../helpers/loopback-server.js';
 import { cliTargetConfig, readRunArtifactFiles, runCliInProcess } from '../helpers/run-harness.js';
 
@@ -33,10 +34,6 @@ const PAGE = `<!doctype html><html lang="ja"><head><meta charset="utf-8"><link r
 <script>throw new DOMException('${PAGE_OWN_NOT_SUPPORTED_ERROR}', 'NotSupportedError');</script>
 </body></html>`;
 
-const LAUNCHERS: readonly (readonly [string, () => Promise<Browser>])[] = [
-  ['the default test Chromium', () => launchHeadlessChromium()],
-  ['the CLI Chromium', () => launchCliChromium()],
-];
 
 /** ページ自身の、別の名前の未定義の関数（SharedWorker の例外と、名前は同じで文言が違う `ReferenceError` を起こす）。 */
 const PAGE_OWN_UNDEFINED_FUNCTION = 'pageOwnUndefinedFunction';
@@ -61,11 +58,13 @@ async function pageErrorsOfRun(runDirectory: string): Promise<{ readonly pageErr
     if (file === undefined) throw new Error(`missing ${path}`);
     return Buffer.from(file.bytes).toString('utf8');
   };
+  // REC-2: audit.json は目録（ページの page.json のパスの一覧と、Run だけの Finding）。ページの Finding は page.json から読む。
   const audit = JSON.parse(textOf('audit.json')) as {
     readonly findings?: readonly AuditFinding[];
-    readonly pages?: readonly { readonly findings?: readonly AuditFinding[] }[];
+    readonly pages?: readonly string[];
   };
-  const findings = [...(audit.findings ?? []), ...(audit.pages ?? []).flatMap((page) => page.findings ?? [])];
+  const pageFindings = (audit.pages ?? []).flatMap((path) => (JSON.parse(textOf(path)) as { readonly findings?: readonly AuditFinding[] }).findings ?? []);
+  const findings = [...(audit.findings ?? []), ...pageFindings];
   return {
     pageErrorMessages: findings.filter((finding) => finding.ruleId === 'PAGE_ERROR').map((finding) => finding.message ?? ''),
     pageJson: textOf('pages/PAGE-000001/page.json'),
@@ -102,7 +101,7 @@ function runSinglePageAudit(directory: string, name: string, origin: string, lau
   });
 }
 
-describe.each(LAUNCHERS)('T44R2 I-4: the exceptions raised by the guards are not PAGE_ERROR findings, with %s', (_label, launch) => {
+describe.each(BOTH_CHROMIUM_LAUNCHERS)('T44R2 I-4: the exceptions raised by the guards are not PAGE_ERROR findings, with %s', (_label, launch) => {
   let server: LoopbackHttpServer;
   let directory: string;
 
@@ -127,11 +126,11 @@ describe.each(LAUNCHERS)('T44R2 I-4: the exceptions raised by the guards are not
     expect(pageErrorMessages.filter((message) => message.includes(PAGE_OWN_NOT_SUPPORTED_ERROR)).length).toBeGreaterThan(0);
     // Evidence（記録した事実）は変えない: 守りの例外も page.json に残る。
     expect(pageJson).toContain('Failed to register a ServiceWorker');
-    expect(pageJson).toContain("Failed to construct 'RTCPeerConnection'");
+    // FIN-1: RB-4b から、WebRTC の入口を塞ぐのは凍結しうる Context だけ（公開の監査の Context では塞がないので、構築子の例外は起きない）。
   }, TEST_TIMEOUT_MS);
 });
 
-describe.each(LAUNCHERS)('BN-b: the SharedWorker exception caused by the launch arguments is not a PAGE_ERROR finding, with %s', (_label, launch) => {
+describe.each(BOTH_CHROMIUM_LAUNCHERS)('BN-b: the SharedWorker exception caused by the launch arguments is not a PAGE_ERROR finding, with %s', (_label, launch) => {
   let server: LoopbackHttpServer;
   let directory: string;
 

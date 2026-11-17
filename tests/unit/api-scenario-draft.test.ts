@@ -13,7 +13,9 @@ import {
   DRAFT_PROBE_PATH_TEMPLATE,
   apiScenarioDraftInputOf,
   apiScenarioFormOf,
+  isUnnamedOpenerUpdateOf,
   isUsableRecordIdSegment,
+  listRowOpenerOf,
   type ApiScenarioExistingScenario,
 } from '../../src/control/approval/api-scenario-draft.js';
 import {
@@ -323,5 +325,32 @@ describe('FM2a: the origin mark of a draft value', () => {
     expect(value).toEqual({ value: 'id', origin: 'INFERRED', ground: 'RECORD_ID_KEY_FROM_UPDATE_FILTER' });
     expect(Object.isFrozen(value)).toBe(true);
     expect(draftValueOf(['email'], 'HUMAN_CHOICE').origin).toBe('HUMAN');
+  });
+});
+
+// LU-13 fix round 1（設計書 `2026-11-02-beaksight-list-row-update-design.md` 4.0 の D3、5.6）: 更新の候補が、名前のない開き手（アイコンだけ）から出たものか。
+// 判定の事実は、一覧の行の更新の開き手（`listRowOpenerOf`）と同じ `opener.hasName`（フォームは `rowOpener.hasName`）。
+describe('LU-13 fix round 1: an update candidate that opens only from an opener without a name', () => {
+  const LIST_PATH = '/admin/members';
+  const OPENER_DIGEST = 'sha256:opener';
+  const openerProbeOf = (hasName: boolean): SubmissionProbeRecord =>
+    observedSubmissionProbeOf({ shapes: [shapeOf(LIST_PATH, 'PATCH', `${API}/rest/v1/members?id=eq.1&select=*`, MEMBER_BODY)], nonReadRequestCount: 1, readRequestCount: 0,
+      unrecordedShapeCount: 0 }, { filledFieldCount: MARKED_FIELDS.length, skippedFieldCount: 0 }, MARKED_FIELDS, [],
+    { identityDigest: OPENER_DIGEST, hasName, openerWords: [] });
+
+  it('is true only for an update from an opener without a name', () => {
+    const unnamed = buttonOf(LIST_PATH, openerProbeOf(false));
+    const named = buttonOf(LIST_PATH, openerProbeOf(true));
+    expect(unnamed.submissionProbe?.result).toBe('API_UPDATE');
+    expect(isUnnamedOpenerUpdateOf(unnamed)).toBe(true);
+    expect(listRowOpenerOf(unnamed.submissionProbe as SubmissionProbeRecord)).toBeNull();
+    expect(isUnnamedOpenerUpdateOf(named)).toBe(false);
+    expect(listRowOpenerOf(named.submissionProbe as SubmissionProbeRecord)).toMatchObject({ identityDigest: OPENER_DIGEST, hasName: true });
+    // 開き手のない更新・登録は当たらない。
+    expect(isUnnamedOpenerUpdateOf(UPDATE_CANDIDATE)).toBe(false);
+    expect(isUnnamedOpenerUpdateOf(CREATE_CANDIDATE)).toBe(false);
+    // フォームの形: 同じ行の開き手（`rowOpener`）の名前で決める。
+    expect(isUnnamedOpenerUpdateOf({ ...buttonOf(LIST_PATH, undefined), rowOpener: { identityDigest: OPENER_DIGEST, hasName: false, openerWords: [] } })).toBe(true);
+    expect(isUnnamedOpenerUpdateOf({ ...buttonOf(LIST_PATH, undefined), rowOpener: { identityDigest: OPENER_DIGEST, hasName: true, openerWords: [] } })).toBe(false);
   });
 });

@@ -1,16 +1,19 @@
 // T41d（Task 41 の設計書 3.4 の 1）: API の更新の前の読み取りの、値の落ち着きの待ち（`src/browser/api-write-submitter.ts` の `settledFieldValues`）。
-// 間隔を置いて 2 回読み、同じになるまで繰り返す。上限の回数（`API_WRITE_VALUE_SETTLE_MAX_READS`）まで落ち着かなければ読めなかったとする
+// 間隔を置いて 2 回読み、同じになるまで繰り返す。回数の上限を渡したときは、その回数まで落ち着かなければ読めなかったとする
 // （`PAGE_UNREADABLE`）。読めない誤りは、そのまま返す。値はメモリの中だけで扱う。
 import { describe, expect, it } from 'vitest';
 import {
-  API_WRITE_VALUE_QUIET_TIMEOUT_MS,
-  API_WRITE_VALUE_SETTLE_INTERVAL_MS,
-  API_WRITE_VALUE_SETTLE_MAX_READS,
   settledFieldValues,
   settledFieldValuesWhenQuiet,
   type ApiWriteFieldValues,
 } from '../../src/browser/api-write-submitter.js';
-import { DISCOVERY_SETTLE_TIMEOUT_MS } from '../../src/discovery/settle.js';
+import { PRODUCTION_OBSERVATION_WINDOWS } from '../../src/core/observation-windows.js';
+
+/** RB-11: 省略したときの間隔（本番の観察の窓の一式）。 */
+const API_WRITE_VALUE_SETTLE_INTERVAL_MS = PRODUCTION_OBSERVATION_WINDOWS.write.apiValueSettleIntervalMs;
+
+/** L12b の前の既定の読む回数の上限（10 回。定数は LZ-1 で消した）。今は指定したときだけ当てるので、テストが渡す値として使う。 */
+const API_WRITE_VALUE_SETTLE_MAX_READS = 10;
 
 /** 決めた順に結果を返す読み取りと、待った時間の記録。 */
 const scripted = (results: readonly ApiWriteFieldValues[]) => {
@@ -39,7 +42,6 @@ const values = (...items: string[]): ApiWriteFieldValues => ({ ok: true, values:
 describe('T41d: the settled values of the fields (settledFieldValues)', () => {
   it('has named limits', () => {
     expect(API_WRITE_VALUE_SETTLE_INTERVAL_MS).toBeGreaterThan(0);
-    expect(API_WRITE_VALUE_SETTLE_MAX_READS).toBeGreaterThanOrEqual(2);
   });
 
   it('returns the values when two reads an interval apart are the same', async () => {
@@ -55,11 +57,33 @@ describe('T41d: the settled values of the fields (settledFieldValues)', () => {
     expect(reader.reads).toBe(4);
   });
 
-  it('gives up as unreadable when the values do not settle within the limit', async () => {
+  // L12b（設計書 `2026-11-09-beaksight-remove-limits-design.md` 6.2。T25）: 回数の上限（前は既定で `API_WRITE_VALUE_SETTLE_MAX_READS`）は、指定したときだけ当てる。
+  it('gives up as unreadable when the values do not settle within a given limit', async () => {
     const changing = Array.from({ length: API_WRITE_VALUE_SETTLE_MAX_READS + 2 }, (_value, index) => values(String(index)));
     const reader = scripted(changing);
-    expect(await settledFieldValues(reader.read, reader.wait)).toEqual({ ok: false, reason: 'PAGE_UNREADABLE' });
+    expect(await settledFieldValues(reader.read, reader.wait, API_WRITE_VALUE_SETTLE_INTERVAL_MS, API_WRITE_VALUE_SETTLE_MAX_READS))
+      .toEqual({ ok: false, reason: 'PAGE_UNREADABLE' });
     expect(reader.reads).toBe(API_WRITE_VALUE_SETTLE_MAX_READS);
+  });
+
+  it('keeps reading past the former limit until the values settle when no limit is given (L12b)', async () => {
+    const changing = [...Array.from({ length: API_WRITE_VALUE_SETTLE_MAX_READS + 5 }, (_value, index) => values(String(index))), values('end')];
+    const reader = scripted(changing);
+    expect(await settledFieldValues(reader.read, reader.wait)).toEqual(values('end'));
+    expect(reader.reads).toBe(API_WRITE_VALUE_SETTLE_MAX_READS + 7);
+  });
+
+  it('stops as unreadable when the watch ends (L12b)', async () => {
+    const stop = new AbortController();
+    let reads = 0;
+    const read = (): Promise<ApiWriteFieldValues> => {
+      reads += 1;
+      if (reads === 4) stop.abort();
+      return Promise.resolve(values(String(reads)));
+    };
+    expect(await settledFieldValues(read, () => Promise.resolve(), API_WRITE_VALUE_SETTLE_INTERVAL_MS, undefined, stop.signal))
+      .toEqual({ ok: false, reason: 'PAGE_UNREADABLE' });
+    expect(reads).toBe(4);
   });
 
   it('returns a read failure at once', async () => {
@@ -92,15 +116,23 @@ describe('T41R-fix: the values of the fields settled after the requests stopped 
     expect(reader.waits).toEqual([API_WRITE_VALUE_SETTLE_INTERVAL_MS]);
   });
 
-  it('gives up as unreadable when the fallback reads do not settle', async () => {
-    const changing = Array.from({ length: API_WRITE_VALUE_SETTLE_MAX_READS + 2 }, (_value, index) => values(String(index)));
-    const reader = scripted(changing);
-    expect(await settledFieldValuesWhenQuiet(quietSince(() => null), reader.read, POLICY, reader.wait)).toEqual({ ok: false, reason: 'PAGE_UNREADABLE' });
+  // L12b（T25）: 補いの読み取りも回数の上限を置かず、見張りが終えたら読めなかったとする。
+  it('gives up as unreadable when the fallback reads do not settle before the watch ends', async () => {
+    const stop = new AbortController();
+    let reads = 0;
+    const read = (): Promise<ApiWriteFieldValues> => {
+      reads += 1;
+      if (reads === API_WRITE_VALUE_SETTLE_MAX_READS + 2) stop.abort();
+      return Promise.resolve(values(String(reads)));
+    };
+    expect(await settledFieldValuesWhenQuiet(quietSince(() => null), read, POLICY, () => Promise.resolve(), undefined, stop.signal))
+      .toEqual({ ok: false, reason: 'PAGE_UNREADABLE' });
   });
 
   it('has a named limit for the wait for the requests, shorter than the limit of the settle of a page', () => {
-    expect(API_WRITE_VALUE_QUIET_TIMEOUT_MS).toBeGreaterThan(0);
-    expect(API_WRITE_VALUE_QUIET_TIMEOUT_MS).toBeLessThan(DISCOVERY_SETTLE_TIMEOUT_MS);
+    const { busyTimeoutMs, timeoutMs } = PRODUCTION_OBSERVATION_WINDOWS.discoverySettle;
+    expect(busyTimeoutMs).toBeGreaterThan(0);
+    expect(busyTimeoutMs).toBeLessThan(timeoutMs);
   });
 
   it('returns the values once the requests have stopped and two reads are the same', async () => {

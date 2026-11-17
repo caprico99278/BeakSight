@@ -14,6 +14,7 @@ import {
   authSetupDraftOf,
   authSetupProposalProfileOf,
   entryCheckAuthSetupDecisionOf,
+  entryCheckSwitchesToNoLogin,
   proposedAuthSetupBodyOf,
   proposedAuthSetupOf,
 } from '../../src/control/auth/auth-setup-proposal.js';
@@ -172,5 +173,18 @@ describe('MI-3: whether the job manager saves the proposal after an entry check'
     expect(authSetupProposalProfileOf('TEST_AUTH_PASSIVE', 'MANUAL_SESSION')).toEqual({ usesAuthSetup: true, automated: false });
     expect(authSetupProposalProfileOf('TEST_AUTH_PASSIVE', 'AUTOMATED_LOGIN')).toEqual({ usesAuthSetup: true, automated: true });
     expect(authSetupProposalProfileOf('PUBLIC_PASSIVE', 'NONE')).toEqual({ usesAuthSetup: false, automated: false });
+  });
+});
+
+// NL-3（設計書 `2026-11-06-beaksight-no-login-test-site-design.md` 3.3 の 2）: 入口の確かめがログインの画面を見なかった手動のログインのプロファイルは、
+// ログインなし（`NONE`）の次の改訂の保存を試す（保存できるか（loopback か）は、プロファイルの検証が決める。ここでは規則を写さない）。
+describe('NL-3: whether the job manager tries to save the profile without login after an entry check', () => {
+  it('tries only for a MANUAL_SESSION profile whose entry check read a page that is not a login page', () => {
+    expect(entryCheckSwitchesToNoLogin('MANUAL_SESSION', 'NOT_LOGIN_PAGE')).toBe(true);
+    for (const decision of ['NOT_USED', 'PRESENT', 'NOT_CHECKED', 'NOT_READ', 'PROPOSE'] as const) {
+      expect(entryCheckSwitchesToNoLogin('MANUAL_SESSION', decision), decision).toBe(false);
+    }
+    expect(entryCheckSwitchesToNoLogin('AUTOMATED_LOGIN', 'NOT_LOGIN_PAGE')).toBe(false);
+    expect(entryCheckSwitchesToNoLogin('NONE', 'NOT_LOGIN_PAGE')).toBe(false);
   });
 });

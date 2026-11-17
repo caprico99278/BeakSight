@@ -454,6 +454,10 @@ describe('renderHtmlReport: contents (plan Task 16 Step 4)', () => {
             invariantViolationCount: 5,
             invariantViolations: [{ code: 'TEST_VIOLATION', message: HOSTILE_TEXT }],
             recordTruncated: true,
+            // SAFE-2 の 4: 違反にしない止めた記録と、外部スキームへの移動の試みの数。
+            frameClassificationFailureCount: 6,
+            readNavigationFailureCount: 7,
+            externalSchemeNavigationCount: 8,
           },
         },
       }),
@@ -463,6 +467,9 @@ describe('renderHtmlReport: contents (plan Task 16 Step 4)', () => {
     expect(safety).toContain(keyValue(text.guard, escapeHtml(text.guardEnabled)));
     expect(safety).toContain(keyValue(text.blockedActions.requests, formatCount(3)));
     expect(safety).toContain(keyValue(text.blockedActions.popups, formatCount(1)));
+    expect(safety).toContain(keyValue(text.blockedActions.frameChecks, formatCount(6)));
+    expect(safety).toContain(keyValue(text.blockedActions.readNavigations, formatCount(7)));
+    expect(safety).toContain(keyValue(text.blockedActions.externalApps, formatCount(8)));
     expect(safety).toContain(keyValue(text.excludedInteractionCandidates, formatCount(4)));
     expect(safety).toContain(keyValue(text.invariantViolationCount, formatCount(5)));
     expect(safety).toContain(escapeHtml(text.lowerBoundNote));
@@ -575,7 +582,7 @@ describe('renderHtmlReport: the site load in the summary (L6)', () => {
       escapeHtml(formatRequestsWithPeak(origin));
     const expected = [
       keyValue(items.minNavigationInterval, escapeHtml(formatDuration(load.minNavigationIntervalMs))),
-      keyValue(items.maxInteractionsPerPage, escapeHtml(formatCount(load.maxInteractionsPerPage))),
+      keyValue(items.maxInteractionsPerPage, escapeHtml(formatCount(load.maxInteractionsPerPage ?? Number.NaN))),
       keyValue(items.navigationCount, escapeHtml(formatTimes(load.navigationCount))),
       keyValue(items.pacingWait, escapeHtml(formatElapsedTime(load.pacingWaitMs))),
       keyValue(RUN_SUMMARY_TEXT.allowedOriginRequests, withPeak(requests.allowedOrigins)),
@@ -593,6 +600,11 @@ describe('renderHtmlReport: the site load in the summary (L6)', () => {
     // 待った時間の合計は、経過時間の書式（時間・分・秒。L7）で示す（見本は 98,765ms）。
     expect(part).toContain(keyValue(items.pacingWait, escapeHtml('1分38秒')));
     expect(part).not.toContain('<table');
+    // L14: 1 ページの操作の上限を指定していない Run は「指定なし」。
+    const unlimited = loadRun();
+    const { maxInteractionsPerPage: _omitted, ...withoutLimit } = unlimited.run.load;
+    const unlimitedPart = loadPart(renderHtmlReport(buildReportViewModel({ ...unlimited, run: { ...unlimited.run, load: withoutLimit } })));
+    expect(unlimitedPart).toContain(keyValue(items.maxInteractionsPerPage, escapeHtml(RUN_SUMMARY_TEXT.limitNotSpecified)));
   });
 
   it('uses the site load of the view model as it is (does not count or compute again)', () => {
@@ -757,20 +769,20 @@ describe('renderHtmlReport: the executions in the summary (R6)', () => {
   });
 });
 
-describe('renderHtmlReport: the Safety events (design 6.1.10)', () => {
-  /** PAGE-000001: 再試行の前の試行の Safety（popup 1件）と、最終の試行の Safety（すべての種類）。 */
-  const safetyEventsRun = (): AuditRunResult => {
-    const retried = safety(20, PAGE_1, 'desktop', {
-      scope: 'INTERACTION',
-      blockedPopups: [{ url: fixtureUrl('/retry-popup.html'), reason: 'INTERACTION_FROZEN' }],
-    });
-    const all = safety(21, PAGE_1, 'mobile', safetyEventSamples());
-    return auditRun({
-      run: { retries: [retry(fixtureUrl('/'), 1, [retried])] },
-      pages: [page(PAGE_1, '/', 'AUDITED', [retried, all])],
-    });
-  };
+/** PAGE-000001: 再試行の前の試行の Safety（popup 1件）と、最終の試行の Safety（すべての種類）。 */
+const safetyEventsRun = (): AuditRunResult => {
+  const retried = safety(20, PAGE_1, 'desktop', {
+    scope: 'INTERACTION',
+    blockedPopups: [{ url: fixtureUrl('/retry-popup.html'), reason: 'INTERACTION_FROZEN' }],
+  });
+  const all = safety(21, PAGE_1, 'mobile', safetyEventSamples());
+  return auditRun({
+    run: { retries: [retry(fixtureUrl('/'), 1, [retried])] },
+    pages: [page(PAGE_1, '/', 'AUDITED', [retried, all])],
+  });
+};
 
+describe('renderHtmlReport: the Safety events (design 6.1.10)', () => {
   /** Safety の節の、事象の一覧の小見出しから節の終わりまで。 */
   // OP-3: 事象の一覧は、記録の段の安全の技術の記録の中。
   const eventsPart = (html: string): string => sliceBetween(html, 'safety-events', toAnchorId('record', 'pages'));
@@ -961,14 +973,6 @@ describe('renderHtmlReport: the Safety events (design 6.1.10)', () => {
     expect(part).not.toContain('<table');
   });
 
-  it('uses only safe anchors, each once, with the events table', () => {
-    const html = render(safetyEventsRun());
-    const ids = idsOf(html);
-    expect(new Set(ids).size).toBe(ids.length);
-    for (const target of fragmentTargetsOf(html)) {
-      expect(ids, target).toContain(target);
-    }
-  });
 });
 
 describe('renderHtmlReport: the view model is used as it is (design 6.1.10)', () => {
@@ -1000,7 +1004,19 @@ describe('renderHtmlReport: the view model is used as it is (design 6.1.10)', ()
     const viewModel = buildReportViewModel(auditRun());
     const html = renderHtmlReport(viewModel);
     const depthLabel = escapeHtml(HTML_REPORT_TEXT.summary.limits.maxDepth);
-    expect(html).toContain(`<tr><td>${depthLabel}</td><td>${formatInteger(viewModel.summary.limits.maxDepth)}</td>`);
+    // L14: 深さの上限を指定していない Run は「指定なし」。指定した Run は formatInteger。
+    expect(viewModel.summary.limits.maxDepth).toBeUndefined();
+    expect(html).toContain(`<tr><td>${depthLabel}</td><td>${escapeHtml(RUN_SUMMARY_TEXT.limitNotSpecified)}</td>`);
+    const chosen = auditRun();
+    const { effectiveConfig } = chosen.run;
+    const withDepth = { ...chosen, run: { ...chosen.run, effectiveConfig: { ...effectiveConfig, crawl: { ...effectiveConfig.crawl, maxDepth: 7 } } } };
+    expect(renderHtmlReport(buildReportViewModel(withDepth))).toContain(`<tr><td>${depthLabel}</td><td>${formatInteger(7)}</td>`);
+    // L14 の後の段: ページの数と点検の時間の上限も、指定していない Run は「指定なし」。
+    const { maxPages: _pages, maxRuntimeMs: _runtime, ...withoutLimits } = effectiveConfig.crawl;
+    const unlimitedHtml = renderHtmlReport(buildReportViewModel({ ...chosen, run: { ...chosen.run, effectiveConfig: { ...effectiveConfig, crawl: withoutLimits } } }));
+    for (const label of [HTML_REPORT_TEXT.summary.limits.maxPages, HTML_REPORT_TEXT.summary.limits.maxRuntime]) {
+      expect(unlimitedHtml).toContain(`<tr><td>${escapeHtml(label)}</td><td>${escapeHtml(RUN_SUMMARY_TEXT.limitNotSpecified)}</td>`);
+    }
     expect(sliceBetween(html, `page-viewports-${PAGE_1}`, null)).toContain(`<td>${formatInteger(200)}</td>`);
 
     // 観測できなかった値は、ほかの書式と同じく「未観測」にする（`formatDecimal(値, 0)` のように `NaN` や `-1` と書かない）。
@@ -1080,20 +1096,13 @@ describe('renderHtmlReport: retries (design 6.1.9)', () => {
 });
 
 describe('renderHtmlReport: safety of the output (plan Task 16 Step 3, design 6.1.6)', () => {
-  it('shows mailto: and tel: URLs as text, never as links', () => {
+  it('escapes <script>, "onerror= and javascript: taken from the Evidence and the Run, and shows mailto: and tel: URLs as text, never as links', () => {
     const html = render(edgeCaseAuditRun());
     expect(html).toContain(escapeHtml(SPECIAL_SCHEME_URLS.mailto));
     expect(html).toContain(escapeHtml(SPECIAL_SCHEME_URLS.tel));
-    expect(html).not.toContain('href="mailto:');
-    expect(html).not.toContain('href="tel:');
-    expect(html).not.toMatch(/href="\s*(?:mailto|tel):/iu);
-  });
-
-  it('escapes <script>, "onerror= and javascript: taken from the Evidence and the Run', () => {
-    const html = render(edgeCaseAuditRun());
     expect(html).not.toContain('<script');
     expect(html).not.toContain(HOSTILE_STRINGS.attributeBreak);
-    expect(html).not.toMatch(/href="\s*javascript:/iu);
+    expect(html).not.toMatch(/href="\s*(?:mailto|tel|javascript):/iu);
     expect(html).toContain(escapeHtml(HOSTILE_STRINGS.scriptTag));
     expect(html).toContain(escapeHtml(HOSTILE_STRINGS.attributeBreak));
     expect(html).toContain(escapeHtml(HOSTILE_STRINGS.javascriptUrl));
@@ -1105,8 +1114,9 @@ describe('renderHtmlReport: safety of the output (plan Task 16 Step 3, design 6.
     expect(rest).not.toMatch(/\son[a-z]+=/iu);
   });
 
+  // 6.1.10: 安全の事象の表を持つ Run（`safetyEventsRun`）も含める。
   it('uses only safe anchors, each once, and every in-document link points to an anchor of the document', () => {
-    for (const result of [auditRun(), edgeCaseAuditRun()]) {
+    for (const result of [auditRun(), edgeCaseAuditRun(), safetyEventsRun()]) {
       const html = render(result);
       const ids = idsOf(html);
       expect(ids.length).toBeGreaterThan(0);

@@ -29,7 +29,7 @@ import { normalizeUrl } from '../../src/crawl/normalize-url.js';
 import { IdAllocator } from '../../src/orchestration/id-allocator.js';
 import { PageAuditor } from '../../src/orchestration/page-auditor.js';
 import { SafetyLedger } from '../../src/safety/safety-ledger.js';
-import { BROWSER_DEFAULT_FAVICON_PATH, launchCliChromium, testContextsOf, useHeadlessChromium } from '../helpers/chromium.js';
+import { BROWSER_DEFAULT_FAVICON_PATH, chromiumRunsOf, launchCliChromium, testContextsOf, useHeadlessChromium } from '../helpers/chromium.js';
 import { startLoopbackHttpServer } from '../helpers/loopback-server.js';
 import { createTestNavigationPacer } from '../helpers/navigation-pacer.js';
 import { closePassiveResources } from '../helpers/passive-cleanup.js';
@@ -41,6 +41,8 @@ const AUDIT_TEST_TIMEOUT_MS = 180_000;
 const RESOURCE_PAGE = '/resource-delivery.html';
 /** クリックの後に、`RESOURCE_PAGE` が読む画像（`ALLOWED_IMAGE`）を読もうとするページ。読み込みのときには読まない。 */
 const AFTER_CLICK_PAGE = '/resource-delivery-after-click.html';
+/** `AFTER_CLICK_PAGE` と同じボタンで、同じ押下で POST（`/__mutation`）も送ろうとするページ（L10 の後の安全の側の設計の変更の確かめ）。 */
+const AFTER_CLICK_POST_PAGE = '/resource-delivery-after-click-post.html';
 const ALLOWED_IMAGE = '/resource-delivery.svg';
 const ALLOWED_SCRIPT = '/resource-delivery.js';
 /** 2つ目の Origin の画像（同じパスで、読み込みごとに違うクエリの計測の画像も読む。サーバの記録のパスはクエリを含まない）。 */
@@ -181,11 +183,15 @@ describe('the Run cache and resource delivery through the Page Auditor (L5b)', (
 
     const outcome = await auditPage(cached, allowed.origin, resourcePagePath(other), pacer);
 
-    // Passive の Desktop と Mobile に加えて、幅の走査（1つ）と Interaction（候補1つ）の読み込み直しを行った。
+    // Passive の Desktop と Mobile に加えて、幅の走査（1つ）と Interaction（候補1つ）と、その候補で開いた状態の中の入れ子の押下（1つ）の読み込み直しを
+    // 行った。COV-4 の入れ子の開いた状態（設計者の判断 2026-11-10。重なりではない）: 開いた状態は、まだ見ていない（状態・候補）の組なので、その中の候補を
+    // もう一度押す（開閉の部品そのものも押し直す）。
     const navigationCount = pacer.snapshot().navigationCount;
     const revisitLoads = navigationCount - PRIMARY_LOADS_PER_PAGE;
-    expect(revisitLoads).toBe(2);
-    expect(evidenceOf(outcome, 'interaction', 'desktop').map((record) => record.payload.status)).toEqual(['VERIFIED']);
+    expect(revisitLoads).toBe(3);
+    expect(evidenceOf(outcome, 'interaction', 'desktop').filter((record) => record.payload.pressTrail === undefined).map((record) => record.payload.status))
+      .toEqual(['VERIFIED']);
+    expect(evidenceOf(outcome, 'interaction', 'desktop').filter((record) => record.payload.pressTrail !== undefined)).toHaveLength(1);
     expect(outcome.result.viewports.desktop.status).toBe('AUDITED');
     expect(outcome.safety.invariantViolationCount).toBe(0);
 
@@ -225,38 +231,77 @@ describe('the Run cache and resource delivery through the Page Auditor (L5b)', (
       const network = evidenceOf(outcome, 'network', viewport);
       expect(network, viewport).toHaveLength(1);
       const payload = network[0]!.payload;
+      // 設計者の判断 2026-11-11: 同じ宛先（Origin と path）への成功した読み取りのくり返し（2 つ目の Origin の画像と、その計測の画像）は、最初の 1 件の記録と、
+      // まとめた記録（`repeatedReads`）になる。宛先ごとに、1 件の記録か、まとめた記録があり、どれも 200 で届いた。
       for (const url of resourceUrls) {
-        expect(payload.requests.map((request) => request.url), `${viewport} ${url}`).toContain(url);
-        expect(payload.responses.filter((response) => response.url === url).map((response) => response.status), `${viewport} ${url}`)
-          .toEqual([200]);
+        const listed = payload.responses.filter((response) => response.url === url).map((response) => response.status);
+        const grouped = (payload.repeatedReads ?? []).filter((repeated) => `${repeated.origin}${repeated.path}` === url);
+        expect(listed.length + grouped.length, `${viewport} ${url}`).toBeGreaterThan(0);
+        expect([...listed, ...grouped.map((repeated) => repeated.status)].every((status) => status === 200), `${viewport} ${url}`).toBe(true);
       }
       expect(payload.failures, viewport).toEqual([]);
     }
   }, AUDIT_TEST_TIMEOUT_MS);
 
-  it('does not serve a cached image requested after the freeze; the Guard blocks it and records it in the Safety Evidence', async () => {
+  // L10 の後の安全の側の設計の変更（設計者の判断）: Isolated Interaction Context でも、凍結の後の読み取り（`isFrozenReadAdmissible` に当たる GET）を、監査の段と同じ
+  // 判定にかけて通す。前は、クリックの後の画像の要求を凍結で止め（`INTERACTION_FROZEN`）、`BLOCKED_BY_SAFETY` にしていた。今は通し、凍結の記録に残さない。
+  it('admits an image requested after the freeze as a frozen read, and records no frozen block', async () => {
     const { allowed, other } = await startServers();
     const cached = cachedFactory(allowed);
     // 先に、画像（`ALLOWED_IMAGE`）を読むページを監査し、Run 全体のキャッシュに入れる。
     await auditPage(cached, allowed.origin, resourcePagePath(other));
     expect(receivedCount(allowed, ALLOWED_IMAGE)).toBe(NETWORK_LOADS_OF_CACHED_RESOURCES);
     const before = cached.meter.snapshot();
+    const imageReceivedBefore = receivedCount(allowed, ALLOWED_IMAGE);
+    const otherRequestsBefore = other.getRequestObservations().length;
     const imageUrl = `${allowed.origin}${ALLOWED_IMAGE}`;
 
     const outcome = await auditPage(cached, allowed.origin, AFTER_CLICK_PAGE);
 
-    // クリックの後の画像の要求は、キャッシュにあっても、Guard が凍結で止め、Interaction の Safety の記録に残す。
+    // クリックの後の画像の要求は、凍結の読み取りとして通る（BLOCKED_BY_SAFETY にならず、凍結の記録に残らない）。押す場面の数は、同じ部品を確かめ直す網羅の
+    // 決まり（COV-4）によるので、数は見ない。
     const interactions = evidenceOf(outcome, 'interaction', 'desktop');
-    expect(interactions.map((record) => record.payload.status)).toEqual(['BLOCKED_BY_SAFETY']);
+    expect(interactions.length).toBeGreaterThan(0);
+    expect(interactions.map((record) => record.payload.status).every((status) => status !== 'BLOCKED_BY_SAFETY')).toBe(true);
     const interactionSafety = evidenceOf(outcome, 'safety', 'desktop').filter((record) => record.payload.scope === 'INTERACTION');
-    expect(interactionSafety).toHaveLength(1);
-    expect(interactionSafety[0]?.payload.blockedInteractionRequests).toEqual([
-      expect.objectContaining({ method: 'GET', url: imageUrl, reason: 'INTERACTION_FROZEN' }),
-    ]);
-    // キャッシュから返していない（数が増えていない）し、サーバにも届いていない。
-    expect(cached.meter.snapshot().servedFromCache).toBe(before.servedFromCache);
+    expect(interactionSafety.flatMap((record) => record.payload.blockedInteractionRequests)
+      .filter((event) => event.url === imageUrl && event.reason === 'INTERACTION_FROZEN')).toEqual([]);
+    // 通した読み取りは、実際に届いた（Run のキャッシュから返したか、サーバに届いたか。どちらかの数が増えた）。
+    const servedFromCacheDelta = cached.meter.snapshot().servedFromCache - before.servedFromCache;
+    const imageReceivedDelta = receivedCount(allowed, ALLOWED_IMAGE) - imageReceivedBefore;
+    expect(servedFromCacheDelta + imageReceivedDelta).toBeGreaterThan(0);
+    // 2 つ目の Origin へは送らない: このページは 2 つ目の Origin を読まないので、送らなかった数も、2 つ目の Origin のサーバが受け取った数も変わらない。
     expect(cached.meter.snapshot().withheldOtherOrigins).toBe(before.withheldOtherOrigins);
-    expect(receivedCount(allowed, ALLOWED_IMAGE)).toBe(NETWORK_LOADS_OF_CACHED_RESOURCES);
+    expect(other.getRequestObservations()).toHaveLength(otherRequestsBefore);
+    expectOnlyReadRequests(allowed.getCounters(), allowed.getRequestObservations());
+    expect(outcome.safety.invariantViolationCount).toBe(0);
+  }, AUDIT_TEST_TIMEOUT_MS);
+
+  // L10 の後の安全の側の設計の変更: 凍結の後の読み取りを通しても、同じ押下の書き込み（POST）は、今どおり凍結で止まり、サーバに届かない。
+  it('still blocks a POST sent with the same click after the freeze at INTERACTION_FROZEN, while the read of the same click passes', async () => {
+    const { allowed, other } = await startServers();
+    const cached = cachedFactory(allowed);
+    await auditPage(cached, allowed.origin, resourcePagePath(other));
+    const before = cached.meter.snapshot();
+    const imageReceivedBefore = receivedCount(allowed, ALLOWED_IMAGE);
+    const otherRequestsBefore = other.getRequestObservations().length;
+
+    const outcome = await auditPage(cached, allowed.origin, AFTER_CLICK_POST_PAGE);
+
+    const interactions = evidenceOf(outcome, 'interaction', 'desktop');
+    expect(interactions.length).toBeGreaterThan(0);
+    // 書き込みを止めたので、押下の結果は BLOCKED_BY_SAFETY（止めた事象のある押下。前と同じ扱い）。
+    expect(interactions.map((record) => record.payload.status).every((status) => status === 'BLOCKED_BY_SAFETY')).toBe(true);
+    const blocked = evidenceOf(outcome, 'safety', 'desktop').filter((record) => record.payload.scope === 'INTERACTION')
+      .flatMap((record) => record.payload.blockedInteractionRequests);
+    expect(blocked).toContainEqual(expect.objectContaining({ method: 'POST', url: `${allowed.origin}/__mutation`, reason: 'INTERACTION_FROZEN' }));
+    expect(blocked.filter((event) => event.method === 'GET' && event.url === `${allowed.origin}${ALLOWED_IMAGE}`)).toEqual([]);
+    // POST はサーバに届かない（読み取りだけが届く）。同じ押下の画像の読み取りは届いた。
+    expectOnlyReadRequests(allowed.getCounters(), allowed.getRequestObservations());
+    expect(cached.meter.snapshot().servedFromCache - before.servedFromCache + receivedCount(allowed, ALLOWED_IMAGE) - imageReceivedBefore)
+      .toBeGreaterThan(0);
+    expect(cached.meter.snapshot().withheldOtherOrigins).toBe(before.withheldOtherOrigins);
+    expect(other.getRequestObservations()).toHaveLength(otherRequestsBefore);
     expect(outcome.safety.invariantViolationCount).toBe(0);
   }, AUDIT_TEST_TIMEOUT_MS);
 });
@@ -573,10 +618,10 @@ describe('Passive (PRIMARY) loads use the Run cache (DEF-031)', () => {
     }
   });
 
-  it.each([
+  it.each(chromiumRunsOf([
     { name: 'the default test Chromium (headless shell)', browserOf: (): Browser => browser },
     { name: 'the Chromium of the CLI (chromiumLaunchOptions, headless)', browserOf: (): Browser => cliBrowser! },
-  ])('takes images, scripts, stylesheets, fonts, and videos from the network only on the first Passive load: $name', async ({ browserOf }) => {
+  ]))('takes images, scripts, stylesheets, fonts, and videos from the network only on the first Passive load: $name', async ({ browserOf }) => {
     const targetBrowser = browserOf();
     const allowed = await startResourceServer('allowed', video);
     resourceServers.push(allowed);

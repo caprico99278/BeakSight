@@ -8,15 +8,9 @@
 // - 下書きに検証の指定がなければ、すべて未指定（承認はできるが、実行の許可は出せない）。
 // - PL-6a（設計書 `2026-10-26-beaksight-plain-ui-design.md` 8.1、設計者の判断 (a)〜(c)・(f)）: 成功の条件と入力の誤りの条件はなくした。結果の判定のしかたの
 //   印（`resultJudgement`）は下書きの確かめが送り方から付ける（form は `FORM_STRUCTURE`。入れるなら同じ値）。form の ID の取り方は ID の型の一覧
-//   （`URL_PATH_PATTERNS`、1〜2 件）だけ。照合の READ は照合の専用の印（`verificationOnly`）を持てる。前に保存した文書の成否の条件は、読むときに捨てる。
+//   （`URL_PATH_PATTERNS`、1 件以上。LZ-3c: 前の 2 件までの上限は撤廃）だけ。照合の READ は照合の専用の印（`verificationOnly`）を持てる。前に保存した文書の成否の条件は、読むときに捨てる。
 import { describe, expect, it } from 'vitest';
 import {
-  MAX_FORM_RECORD_ID_PATTERNS,
-  MAX_RECORD_ID_PATH_PATTERN_LENGTH,
-  MAX_VERIFICATION_BINDINGS,
-  MAX_VERIFICATION_EXPECTATIONS,
-  MAX_VERIFICATION_ROW_COUNT,
-  MAX_VERIFICATION_SELECTOR_LENGTH,
   MIN_VERIFICATION_ROW_COUNT,
   RECORD_ID_PLACEHOLDER,
   RECORD_ID_SOURCES,
@@ -33,14 +27,7 @@ import {
   validateScenarioDraft,
   type ScenarioDraftValidationResult,
 } from '../../src/control/approval/scenario-policy.js';
-import { MAX_SUCCESS_SELECTOR_LENGTH } from '../../src/control/auth/auth-setup-contracts.js';
-import { MAX_CANDIDATE_URL_PART_LENGTH } from '../../src/discovery/candidate-contracts.js';
-import {
-  MAX_READ_CHECK_EXPECTATIONS,
-  MAX_READ_CHECK_PARAMETERS,
-  MAX_READ_CHECK_ROW_COUNT,
-  READ_CHECK_EXPECTATION_KINDS,
-} from '../../src/discovery/read-check-contracts.js';
+import { READ_CHECK_EXPECTATION_KINDS } from '../../src/discovery/read-check-contracts.js';
 import { CREATE_CANDIDATE, FULL_VERIFICATION, READ_CHECK_FACTS, sampleDraft, sampleScenario } from './approval-samples.js';
 
 const codesOf = (result: ScenarioDraftValidationResult): readonly string[] => (result.ok ? [] : result.errors.map(({ code }) => code));
@@ -56,7 +43,6 @@ describe('scenario verification spec contracts (T30a)', () => {
   it('has the frozen closed lists and the named limits', () => {
     expect(SCENARIO_VERIFICATION_ITEMS).toEqual(['resultJudgement', 'recordId', 'readVerification']);
     expect(RECORD_ID_SOURCES).toEqual(['URL_PATH_PATTERN', 'ELEMENT', 'URL_PATH_PATTERNS']);
-    expect(MAX_FORM_RECORD_ID_PATTERNS).toBe(2);
     expect(VERIFICATION_EXPECTATION_KINDS).toEqual(['ROW_COUNT_EQUALS', 'TEXT_CONTAINS', 'DETAIL_FIELD_EQUALS']);
     expect(VERIFICATION_EXPECTATION_KINDS.every((kind) => (READ_CHECK_EXPECTATION_KINDS as readonly string[]).includes(kind))).toBe(true);
     expect(VERIFICATION_EXPECTATION_KINDS).not.toContain('ROW_COUNT_AT_LEAST');
@@ -64,11 +50,8 @@ describe('scenario verification spec contracts (T30a)', () => {
       expect(Object.isFrozen(list)).toBe(true);
     }
     expect(RECORD_ID_PLACEHOLDER).toBe('{id}');
-    expect(MAX_RECORD_ID_PATH_PATTERN_LENGTH).toBe(MAX_CANDIDATE_URL_PART_LENGTH);
-    expect(MAX_VERIFICATION_SELECTOR_LENGTH).toBe(MAX_SUCCESS_SELECTOR_LENGTH);
-    expect([MIN_VERIFICATION_ROW_COUNT, MAX_VERIFICATION_ROW_COUNT]).toEqual([1, MAX_READ_CHECK_ROW_COUNT]);
-    expect(MAX_VERIFICATION_BINDINGS).toBe(MAX_READ_CHECK_PARAMETERS);
-    expect(MAX_VERIFICATION_EXPECTATIONS).toBe(MAX_READ_CHECK_EXPECTATIONS);
+    // LZ-3a: 行の数・結び付け・期待の数の上限（前は 100,000・50・10）は撤廃した。下限だけを残す。
+    expect(MIN_VERIFICATION_ROW_COUNT).toBe(1);
     expect(UNSPECIFIED_VERIFICATION).toEqual({ resultJudgement: null, recordId: null, readVerification: null });
     expect(Object.isFrozen(UNSPECIFIED_VERIFICATION)).toBe(true);
   });
@@ -112,8 +95,9 @@ describe('scenario draft validation of the verification spec (T30a)', () => {
     }
   });
 
-  it('accepts path patterns with the path characters of Task 26 (percent encoding, sub-delims), two at most, in the input order', () => {
-    const patterns = ['/members/%E7%99%BB%E9%8C%B2;done/{id}', '/{id}'];
+  it('accepts path patterns with the path characters of Task 26 (percent encoding, sub-delims) of any length and number, in the input order', () => {
+    // URL-LEN: 前の上限（2,048）より長い path の型も受ける。LZ-3c: 型の数の上限（前は 2）もない。
+    const patterns = ['/members/%E7%99%BB%E9%8C%B2;done/{id}', `/${'m'.repeat(2_049)}/{id}`, '/c/{id}'];
     const result = validateScenarioDraft(withItem({ recordId: { source: 'URL_PATH_PATTERNS', pathPatterns: patterns } }), CREATE_CANDIDATE, READ_CHECK_FACTS);
     expect(result.ok && result.content.verification.recordId).toEqual({ source: 'URL_PATH_PATTERNS', pathPatterns: patterns });
   });
@@ -122,6 +106,12 @@ describe('scenario draft validation of the verification spec (T30a)', () => {
     const { resultJudgement: _omitted, ...withoutJudgement } = FULL_VERIFICATION;
     const result = validateScenarioDraft(draftWith(withoutJudgement), CREATE_CANDIDATE, READ_CHECK_FACTS);
     expect(result.ok && result.content.verification.resultJudgement).toBe('FORM_STRUCTURE');
+  });
+
+  // LZ-3a: 期待の数（前は 10 まで）と行の数（前は 100,000 まで）の上限はない。
+  it('accepts more expectations and a larger row count than the former limits', () => {
+    const expectations = Array.from({ length: 11 }, (_value, index) => ({ kind: 'ROW_COUNT_EQUALS', count: 100_001 + index }));
+    expect(validateScenarioDraft(withRead({ expectations }), CREATE_CANDIDATE, READ_CHECK_FACTS).ok).toBe(true);
   });
 
   it('keeps the verification only mark of the READ verification only when it is true', () => {
@@ -146,8 +136,6 @@ describe('scenario draft validation of the verification spec (T30a)', () => {
     }
   });
 
-  const longText = (length: number): string => 'a'.repeat(length);
-
   it.each<readonly [string, unknown]>([
     ['a verification spec that is not an object', 'yes'],
     ['an unknown verification item', { ...FULL_VERIFICATION, extra: null }],
@@ -160,7 +148,6 @@ describe('scenario draft validation of the verification spec (T30a)', () => {
     // PL-6a: form の ID の取り方は ID の型の一覧だけ（1〜2 件、重なりなし）。API の取り方（型 1 つ、要素）は受けない。
     ['a single path pattern of an API scenario', { ...FULL_VERIFICATION, recordId: { source: 'URL_PATH_PATTERN', pathPattern: '/members/{id}' } }],
     ['no path pattern', { ...FULL_VERIFICATION, recordId: { source: 'URL_PATH_PATTERNS', pathPatterns: [] } }],
-    ['three path patterns', { ...FULL_VERIFICATION, recordId: { source: 'URL_PATH_PATTERNS', pathPatterns: ['/a/{id}', '/b/{id}', '/c/{id}'] } }],
     ['the same path pattern twice', { ...FULL_VERIFICATION, recordId: { source: 'URL_PATH_PATTERNS', pathPatterns: ['/a/{id}', '/a/{id}'] } }],
     ['path patterns that are not an array', { ...FULL_VERIFICATION, recordId: { source: 'URL_PATH_PATTERNS', pathPatterns: '/a/{id}' } }],
     ['a verification only mark that is not a boolean', { ...FULL_VERIFICATION, readVerification: { ...READ, verificationOnly: 'yes' } }],
@@ -176,17 +163,11 @@ describe('scenario draft validation of the verification spec (T30a)', () => {
     ['a path pattern that does not start with "/"', { ...FULL_VERIFICATION, recordId: { source: 'URL_PATH_PATTERNS', pathPatterns: ['members/{id}'] } }],
     ['a path pattern with a query', { ...FULL_VERIFICATION, recordId: { source: 'URL_PATH_PATTERNS', pathPatterns: ['/members/{id}?x=1'] } }],
     ['the second path pattern broken', { ...FULL_VERIFICATION, recordId: { source: 'URL_PATH_PATTERNS', pathPatterns: ['/members/{id}', '/members/{id}/{id}'] } }],
-    ['a too long path pattern', {
-      ...FULL_VERIFICATION, recordId: { source: 'URL_PATH_PATTERNS', pathPatterns: [`/{id}/${longText(MAX_RECORD_ID_PATH_PATTERN_LENGTH)}`] },
-    }],
     ['an element source without a selector', { ...FULL_VERIFICATION, recordId: { source: 'ELEMENT', selector: ' ' } }],
     ['an element source with a path pattern', { ...FULL_VERIFICATION, recordId: { source: 'ELEMENT', pathPattern: '/members/{id}' } }],
     ['a bad READ check id', { ...FULL_VERIFICATION, readVerification: { ...READ, readCheckId: 'RC 1' } }],
     ['a zero READ check revision', { ...FULL_VERIFICATION, readVerification: { ...READ, revision: 0 } }],
     ['no binding', { ...FULL_VERIFICATION, readVerification: { ...READ, bindings: [] } }],
-    ['too many bindings', { ...FULL_VERIFICATION, readVerification: {
-      ...READ, bindings: Array.from({ length: MAX_VERIFICATION_BINDINGS + 1 }, (_value, index) => ({ parameterName: `p${index}`, fieldName: 'name' })),
-    } }],
     ['a duplicate binding parameter', { ...FULL_VERIFICATION, readVerification: {
       ...READ, bindings: [{ parameterName: 'q', fieldName: 'name' }, { parameterName: 'q', fieldName: 'email' }],
     } }],
@@ -195,14 +176,8 @@ describe('scenario draft validation of the verification spec (T30a)', () => {
     ['a duplicate expectation', { ...FULL_VERIFICATION, readVerification: {
       ...READ, expectations: [{ kind: 'ROW_COUNT_EQUALS', count: 1 }, { kind: 'ROW_COUNT_EQUALS', count: 1 }],
     } }],
-    ['too many expectations', { ...FULL_VERIFICATION, readVerification: {
-      ...READ, expectations: Array.from({ length: MAX_VERIFICATION_EXPECTATIONS + 1 }, () => ({ kind: 'ROW_COUNT_EQUALS', count: 1 })),
-    } }],
     ['an expectation of at least rows', { ...FULL_VERIFICATION, readVerification: { ...READ, expectations: [{ kind: 'ROW_COUNT_AT_LEAST', count: 1 }] } }],
     ['an expectation of zero rows', { ...FULL_VERIFICATION, readVerification: { ...READ, expectations: [{ kind: 'ROW_COUNT_EQUALS', count: 0 }] } }],
-    ['an expectation of too many rows', {
-      ...FULL_VERIFICATION, readVerification: { ...READ, expectations: [{ kind: 'ROW_COUNT_EQUALS', count: MAX_VERIFICATION_ROW_COUNT + 1 }] },
-    }],
     ['a text expectation with a fixed text', { ...FULL_VERIFICATION, readVerification: { ...READ, expectations: [{ kind: 'TEXT_CONTAINS', text: 'x' }] } }],
     ['a detail expectation without the detail field', {
       ...FULL_VERIFICATION, readVerification: { ...READ, expectations: [{ kind: 'DETAIL_FIELD_EQUALS', fieldName: 'name' }] },
@@ -254,12 +229,12 @@ describe('scenario draft validation of the verification spec (T30a)', () => {
         ...FULL_VERIFICATION,
         readVerification: { ...READ, bindings: [{ parameterName: 'q', fieldName: 'include_disabled' }] },
       },
-      approvalTtlDays: 31,
+      limits: { maxCreatesPerRun: 2, maxCumulativeCreates: 20 },
     }), CREATE_CANDIDATE, READ_CHECK_FACTS);
     expect(codesOf(result)).toEqual([
       'SCENARIO_READ_CHECK_CANCELED',
       'SCENARIO_VERIFICATION_FIELD_NOT_SENT',
-      'SCENARIO_TTL_ABOVE_DEFAULT',
+      'SCENARIO_LIMIT_ABOVE_DEFAULT',
     ]);
   });
 });
@@ -332,7 +307,8 @@ describe('T37d fix round 1: the verification READ of a page path definition', ()
 
   it('has the reason after the reasons before it in the closed list', () => {
     // T38b で API の下書きの理由を、この後に足した。
-    expect(SCENARIO_DRAFT_REJECTION_REASONS[SCENARIO_DRAFT_REJECTION_REASONS.indexOf('SCENARIO_TTL_ABOVE_DEFAULT') + 1])
+    // LZ-3c: 前の期限の日数の理由を捨てたので、1 回の Run の上限の理由の次。
+    expect(SCENARIO_DRAFT_REJECTION_REASONS[SCENARIO_DRAFT_REJECTION_REASONS.indexOf('SCENARIO_LIMIT_ABOVE_DEFAULT') + 1])
       .toBe('SCENARIO_VERIFICATION_READ_CHECK_PAGE_TARGET');
   });
 

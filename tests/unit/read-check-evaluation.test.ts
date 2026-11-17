@@ -12,10 +12,8 @@ import { describe, expect, it } from 'vitest';
 import type { DiscoveredCandidate, DiscoveryCandidate } from '../../src/discovery/candidate-contracts.js';
 import { classifyCandidate } from '../../src/discovery/classify.js';
 import { computeCandidateDigests } from '../../src/discovery/fingerprint.js';
-import { MAX_READ_CHECK_EXPECTATIONS, MAX_READ_CHECKS_PER_JOB, type ReadCheckExpectation } from '../../src/discovery/read-check-contracts.js';
+import type { ReadCheckExpectation } from '../../src/discovery/read-check-contracts.js';
 import {
-  MAX_READ_EVIDENCE_OBSERVED_TEXT_LENGTH,
-  MAX_READ_EVIDENCE_STRUCTURE_COUNTS,
   READ_CHECK_DETAIL_RESULTS,
   READ_CHECK_DETAILS,
   READ_EVIDENCE_ARTIFACT_SCHEMA_VERSION,
@@ -35,7 +33,6 @@ import {
   type ReadPageStructure,
 } from '../../src/discovery/read-check-evaluation.js';
 import { validateArtifact } from '../../src/core/schema-validator.js';
-import { MAX_URL_LENGTH } from '../../src/core/limits.js';
 import { OBSERVABLE_HTTP_STATUS_RANGE, isHttpErrorOrNonStandardStatus } from '../../src/core/http-status.js';
 import { SAMPLE_ALLOWED_ORIGINS, SAMPLE_ORIGIN, sampleAction, sampleField, sampleForm, NO_JS_BINDING } from './discovery-candidate-samples.js';
 
@@ -138,13 +135,15 @@ describe('T27e: building the READ URL', () => {
     expect(READ_CHECK_DETAIL_RESULTS.PARAMETER_DANGEROUS_WORD).toBe('READ_BLOCKED_BY_POLICY');
   });
 
-  it('keeps a path that looks like another host on the action origin, and does not build a non-http(s) or too long URL', () => {
+  it('keeps a path that looks like another host on the action origin, and does not build a non-http(s) URL', () => {
     const lookalike = buildReadCheckUrl({ origin: SAMPLE_ORIGIN, path: '//other.example.invalid/x' }, { q: 'x' });
     expect(lookalike.ok ? new URL(lookalike.url).origin : null).toBe(SAMPLE_ORIGIN);
     expect(buildReadCheckUrl({ origin: SAMPLE_ORIGIN, path: 'relative' }, {})).toEqual({ ok: false, detail: 'URL_NOT_BUILT' });
     expect(buildReadCheckUrl({ origin: 'null', path: '/x' }, {})).toEqual({ ok: false, detail: 'URL_NOT_BUILT' });
     expect(buildReadCheckUrl({ origin: 'ftp://127.0.0.1', path: '/x' }, {})).toEqual({ ok: false, detail: 'URL_NOT_BUILT' });
-    expect(buildReadCheckUrl(action, { q: 'x'.repeat(MAX_URL_LENGTH) })).toEqual({ ok: false, detail: 'URL_NOT_BUILT' });
+    // URL-LEN: 前の URL の上限（2,048）より長い URL も組み立てる（長さでは拒まない）。
+    const long = buildReadCheckUrl(action, { q: 'x'.repeat(2_049) });
+    expect(long.ok ? new URL(long.url).searchParams.get('q') : null).toBe('x'.repeat(2_049));
   });
 });
 
@@ -195,10 +194,11 @@ describe('T27e: comparing a page structure with the expectations', () => {
     const duplicated = structureOf({ detailEntries: [{ term: '名前', value: 'a' }, { term: '名前', value: 'b' }] });
     expect(evaluateReadExpectation(duplicated, { kind: 'DETAIL_FIELD_EQUALS', field: '名前', value: 'a' }))
       .toMatchObject({ result: 'UNDETERMINED', undeterminedReason: 'STRUCTURE_AMBIGUOUS' });
-    const long = structureOf({ detailEntries: [{ term: '名前', value: 'x'.repeat(MAX_READ_EVIDENCE_OBSERVED_TEXT_LENGTH * 2) }] });
+    // LZ-2: 取れた値は切り詰めない（前は 256 まで）。
+    const long = structureOf({ detailEntries: [{ term: '名前', value: 'x'.repeat(257) }] });
     const evidence = evaluateReadExpectation(long, { kind: 'DETAIL_FIELD_EQUALS', field: '名前', value: 'x' });
-    expect(evidence.expectation.kind === 'DETAIL_FIELD_EQUALS' && 'observedValue' in evidence ? evidence.observedValue?.length : null)
-      .toBe(MAX_READ_EVIDENCE_OBSERVED_TEXT_LENGTH);
+    expect(evidence.expectation.kind === 'DETAIL_FIELD_EQUALS' && 'observedValue' in evidence ? evidence.observedValue : null)
+      .toBe('x'.repeat(257));
   });
 
   it('does not judge a page that did not settle, except a text that was found', () => {
@@ -220,13 +220,14 @@ describe('T27e: comparing a page structure with the expectations', () => {
     expect(readCheckResultOf([])).toBe('UNDETERMINED');
   });
 
-  it('summarizes the structure with counts only', () => {
-    const counts = Array.from({ length: MAX_READ_EVIDENCE_STRUCTURE_COUNTS + 3 }, (_, index) => index);
+  // L4（INV-LIMITS の N33）: 構造ごとの数は、件数で切らずに全部を書く（前の上限 50 を超える数で確かめる）。
+  it('summarizes the structure with counts only, every count of each structure', () => {
+    const counts = Array.from({ length: 53 }, (_, index) => index);
     expect(readStructureSummaryOf(structureOf({ tableRowCounts: counts, listItemCounts: [3], detailEntries: [{ term: 'a', value: 'b' }], text: ' a  b ' })))
       .toEqual({
         region: 'MAIN',
         tables: counts.length,
-        tableRowCounts: counts.slice(0, MAX_READ_EVIDENCE_STRUCTURE_COUNTS),
+        tableRowCounts: counts,
         lists: 1,
         listItemCounts: [3],
         detailFields: 1,
@@ -287,42 +288,44 @@ describe('T27e: the read-evidence.json document', () => {
     expect(await validateArtifact('read-evidence', sample())).toEqual({ ok: true });
     const document = sample();
     const [first] = document.checks;
+    // URL-LEN: 前の URL の上限（2,048）より長い読んだ URL も記録できる。
+    const longUrl = { ...document, checks: [{ ...first, url: `${SAMPLE_ORIGIN}/search?q=${'x'.repeat(2_049)}` }] };
+    expect(await validateArtifact('read-evidence', JSON.parse(JSON.stringify(longUrl)))).toEqual({ ok: true });
     for (const [name, value] of [
       ['another schema version', { ...document, schemaVersion: 'read-evidence-schema/0.9' }],
       ['an unknown result', { ...document, checks: [{ ...first, result: 'PASSED' }] }],
       ['an unknown detail', { ...document, checks: [{ ...first, detail: 'OTHER' }] }],
       ['a copied row', { ...document, checks: [{ ...first, rows: [['A-1']] }] }],
-      ['too many checks', { ...document, checks: Array.from({ length: MAX_READ_CHECKS_PER_JOB + 1 }, () => first) }],
-      ['too many expectations', { ...document, checks: [{ ...first, expectations: Array.from({ length: MAX_READ_CHECK_EXPECTATIONS + 1 }, () => first?.state === 'EXECUTED' ? first.expectations[0] : null) }] }],
-      ['a long observed value', { ...document, checks: [{ ...first, expectations: [{ expectation: { kind: 'DETAIL_FIELD_EQUALS', field: 'a', value: 'b' }, result: 'MATCHED', undeterminedReason: null, observedValue: 'x'.repeat(MAX_READ_EVIDENCE_OBSERVED_TEXT_LENGTH + 1) }] }] }],
+      // L4: 定義の数・期待の数の上限はない（`read-check-limits-removed.test.ts` が、前の上限を超える成果物を受けることを確かめる）。
       ['a not executed check with a result', { ...document, checks: [{ readCheckId: 'read-3', readCheckRevision: 1, targetIdentityDigest: DIGEST, state: 'NOT_EXECUTED', reason: 'COMPLETED' }] }],
     ] as const) {
       expect((await validateArtifact('read-evidence', JSON.parse(JSON.stringify(value)))).ok, name).toBe(false);
     }
   });
 
-  it('keeps the limits of the schema equal to the named constants', () => {
+  it('keeps the limits of the schema equal to the named constants, and has no count limit (L4)', () => {
     const schema = JSON.parse(readFileSync(resolve(process.cwd(), 'schemas', 'read-evidence.schema.json'), 'utf8')) as {
-      readonly properties: { readonly checks: { readonly maxItems: number } };
+      readonly properties: { readonly checks: { readonly maxItems?: number } };
       readonly $defs: {
         readonly executed: {
           readonly properties: {
-            readonly expectations: { readonly maxItems: number };
+            readonly expectations: { readonly maxItems?: number };
             readonly httpStatus: { readonly anyOf: readonly { readonly minimum?: number; readonly maximum?: number }[] };
           };
         };
-        readonly structure: { readonly properties: { readonly tableRowCounts: { readonly maxItems: number }; readonly listItemCounts: { readonly maxItems: number } } };
+        readonly structure: { readonly properties: { readonly tableRowCounts: { readonly maxItems?: number }; readonly listItemCounts: { readonly maxItems?: number } } };
         readonly detailEvidence: { readonly properties: { readonly observedValue: { readonly anyOf: readonly { readonly maxLength?: number }[] } } };
       };
     };
-    expect(schema.properties.checks.maxItems).toBe(MAX_READ_CHECKS_PER_JOB);
+    // L4（COV-7・N33）: 定義の数・期待の数・構造ごとの数に上限を置かない。
+    expect(schema.properties.checks.maxItems).toBeUndefined();
     // DEF-164: `httpStatus` の範囲は、観察して記録できる status の範囲（core の名前つきの範囲）と同じ。
     const [statusRange] = schema.$defs.executed.properties.httpStatus.anyOf;
     expect({ min: statusRange?.minimum, max: statusRange?.maximum }).toEqual({ ...OBSERVABLE_HTTP_STATUS_RANGE });
-    expect(schema.$defs.executed.properties.expectations.maxItems).toBe(MAX_READ_CHECK_EXPECTATIONS);
-    expect(schema.$defs.structure.properties.tableRowCounts.maxItems).toBe(MAX_READ_EVIDENCE_STRUCTURE_COUNTS);
-    expect(schema.$defs.structure.properties.listItemCounts.maxItems).toBe(MAX_READ_EVIDENCE_STRUCTURE_COUNTS);
-    expect(schema.$defs.detailEvidence.properties.observedValue.anyOf[0]?.maxLength).toBe(MAX_READ_EVIDENCE_OBSERVED_TEXT_LENGTH);
+    expect(schema.$defs.executed.properties.expectations.maxItems).toBeUndefined();
+    expect(schema.$defs.structure.properties.tableRowCounts.maxItems).toBeUndefined();
+    expect(schema.$defs.structure.properties.listItemCounts.maxItems).toBeUndefined();
+    expect(schema.$defs.detailEvidence.properties.observedValue.anyOf[0]?.maxLength).toBeUndefined();
   });
 
   // DEF-164: Chromium が渡しうる 600 以上の status も記録できる（判定は今どおり誤り）。範囲の外は記録できない。

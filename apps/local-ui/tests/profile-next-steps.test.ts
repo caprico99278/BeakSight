@@ -8,7 +8,7 @@
  * - 前の T43a の「次にすること」の表（手順ごとの状態）は、3 章の形（要点＋主のボタン 1 つ＋詳しい内容 1 つ）に置き換えた。
  */
 import { describe, expect, it } from 'vitest';
-import { AUDIT_JOB_START_REJECTION_DESCRIPTIONS, LOCAL_UI_NEXT_STEP_TEXT } from '../../../src/presentation/messages.js';
+import { AUDIT_JOB_START_REJECTION_DESCRIPTIONS, LOCAL_UI_JOB_SUMMARY_TEXT, LOCAL_UI_NEXT_STEP_TEXT } from '../../../src/presentation/messages.js';
 import {
   PROFILE_ACTIONS,
   PROFILE_NEXT_STEPS,
@@ -17,6 +17,7 @@ import {
   nextStepAfter,
   profileStageAfterAuditArrivalOf,
   profileStageOf,
+  profileStageShowsContinue,
   type ProfileStageFacts,
 } from '../src/display/next-steps';
 
@@ -249,5 +250,63 @@ describe('OP-1: the stage of an automated login profile that logs in by hand eve
     expect(profileStageOf(facts)).toMatchObject({ stage: 'AUDIT_AGAIN', primary: 'AUDIT_START' });
     expect(profileStageOf({ ...facts, lastAudit: null })).toMatchObject({ stage: 'AUDIT_MANUAL_LOGIN', primary: 'AUDIT_START' });
     expect(profileStageOf({ ...facts, manualLoginEveryTime: false })).toMatchObject({ stage: 'AUDIT_AUTOMATED_LOGIN' });
+  });
+});
+
+// DEF-197: まとめて実行の連鎖の途中（どれかの段のジョブが動いている）は、点検をしている段にする。主のボタンも二次のボタンも出さず（「結果を見る」と
+// 「点検を始める」も出さない）、一覧の行に「続ける」を出さない。始められない理由があっても、動いていることを先に言う（取り消したサイトは、取り消しのまま）。
+describe('DEF-197: the stage while the audit (a stage of the chain) is running', () => {
+  const FINISHED_WITH_REPORT: ProfileStageFacts = Object.freeze({
+    ...MANUAL_AFTER_AUDIT,
+    lastAudit: { finished: true, automatedLogin: false, report: true },
+  });
+
+  it('says the audit is running and offers nothing to press, even after the audit stage of the chain finished', () => {
+    const running = profileStageOf({ ...FINISHED_WITH_REPORT, running: true });
+    expect(running).toEqual({ stage: 'AUDIT_RUNNING', primary: null, secondary: null, laterOffers: [] });
+    expect(LOCAL_UI_NEXT_STEP_TEXT.stages.AUDIT_RUNNING).toBe(LOCAL_UI_JOB_SUMMARY_TEXT.chainStage.AUDIT);
+    expect(LOCAL_UI_NEXT_STEP_TEXT.listStages.AUDIT_RUNNING).toBe(LOCAL_UI_JOB_SUMMARY_TEXT.chainStage.AUDIT);
+    expect(profileStageShowsContinue(running)).toBe(false);
+    // 点検から移ってきた印があっても、「結果を見る」を主のボタンにしない。
+    expect(profileStageAfterAuditArrivalOf(running)).toEqual(running);
+    // 始められない理由（自動ログインの間隔の中など）より、動いていることを先に言う。
+    expect(profileStageOf({ ...FINISHED_WITH_REPORT, auditStartBlocker: 'AUTO_LOGIN_RATE_LIMITED', running: true }).stage).toBe('AUDIT_RUNNING');
+    // 取り消したサイトは、取り消しのまま。
+    expect(profileStageOf({ ...FINISHED_WITH_REPORT, status: 'RETIRED', running: true }).stage).toBe('SITE_RETIRED');
+  });
+
+  it('goes back to the usual stage when nothing runs, and the rows other than the retired one and the running one show "continue"', () => {
+    const idle = profileStageOf({ ...FINISHED_WITH_REPORT, running: false });
+    expect(idle).toEqual({ stage: 'AUDIT_AGAIN', primary: 'AUDIT_RESULT', secondary: 'AUDIT_START', laterOffers: [] });
+    expect(profileStageShowsContinue(idle)).toBe(true);
+    expect(profileStageShowsContinue(profileStageOf({ ...FINISHED_WITH_REPORT, status: 'RETIRED' }))).toBe(false);
+  });
+});
+
+// NL-3（設計書 `doc/design/2026-11-06-beaksight-no-login-test-site-design.md` 3.3 の 4）: ログインのないテスト用のサイト（テストのモード × `NONE`）の次にすることの段は、
+// ログインの語を出さない（公開の画面の段とも分ける。公開のサイトではない）。ログインの設定・ID とパスワードの手順も使わない。
+describe('NL-3: the stage of a test site without login has no login word', () => {
+  const LOGIN_WORD = 'ログイン';
+  const noLoginSite: ProfileStageFacts = {
+    ...MANUAL_BEFORE_ENTRY_CHECK, auth: 'NONE', auditStartBlocker: null, authSetupProposal: 'NOT_USED',
+  };
+
+  it('starts the audit with its own stage in both test modes, and the texts have no login word', () => {
+    for (const mode of ['TEST_AUTH_PASSIVE', 'TEST_APPROVED_WRITE'] as const) {
+      expect(profileStageOf({ ...noLoginSite, mode })).toEqual({ stage: 'AUDIT_NO_LOGIN', primary: 'AUDIT_START', secondary: null, laterOffers: [] });
+    }
+    expect(PROFILE_STAGES).toContain('AUDIT_NO_LOGIN');
+    expect(LOCAL_UI_NEXT_STEP_TEXT.stages.AUDIT_NO_LOGIN).not.toContain(LOGIN_WORD);
+    expect(LOCAL_UI_NEXT_STEP_TEXT.listStages.AUDIT_NO_LOGIN).not.toContain(LOGIN_WORD);
+    expect(LOCAL_UI_NEXT_STEP_TEXT.stages.AUDIT_AGAIN).not.toContain(LOGIN_WORD);
+    expect(profileStageOf({ ...noLoginSite, lastAudit: { finished: true, automatedLogin: false, report: true } }))
+      .toEqual({ stage: 'AUDIT_AGAIN', primary: 'AUDIT_RESULT', secondary: 'AUDIT_START', laterOffers: [] });
+    // 公開のサイトは、今のとおり公開の画面の段。
+    expect(profileStageOf({ ...noLoginSite, mode: 'PUBLIC_PASSIVE' }).stage).toBe('AUDIT_PUBLIC');
+  });
+
+  it('skips the login setup and the credential steps after saving', () => {
+    expect(nextStepAfter('AUTH_SETUP', 'TEST_AUTH_PASSIVE', 'NONE')).toBe('AUDIT_START');
+    expect(nextStepAfter('AUDIT_START', 'TEST_APPROVED_WRITE', 'NONE')).toBeNull();
   });
 });

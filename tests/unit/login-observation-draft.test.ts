@@ -51,6 +51,17 @@ describe('T43d: the destination of a blocked request row', () => {
     expect(loginStageRegistrationOf(row({ path: '/auth/v1/token', reason: 'TOKEN_REQUEST_QUERY_MISMATCH', query: TOKEN_QUERY })))
       .toEqual({ kind: 'MANUAL', reason: 'ALREADY_REGISTERED' });
   });
+
+  // DEF-194（設計書 `2026-11-04-beaksight-login-session-design.md` 3.3 の 2）: 自動ログインの段で通した行と、その通し方の決まり（削除・危険な語）で止めた行は、
+  // 登録の対象にしない（token の送信の形の query があっても）。決まりで止めたのでない登録のない行は、今のとおり登録の案になる。
+  it('gives no registration for the rows passed as the site sends and the rows blocked by the send rule (DEF-194)', () => {
+    for (const reason of ['AUTOMATED_LOGIN_PASSED', 'AUTOMATED_LOGIN_RULE_BLOCKED'] as const) {
+      expect(loginStageRegistrationOf(row({ reason }))).toEqual({ kind: 'MANUAL', reason: 'NOT_NEEDED' });
+      expect(loginStageRegistrationOf(row({ path: '/auth/v1/token', reason, query: TOKEN_QUERY }))).toEqual({ kind: 'MANUAL', reason: 'NOT_NEEDED' });
+      expect(observedDraftOfRegistration(loginStageRegistrationOf(row({ reason })))).toBeNull();
+    }
+    expect(loginStageRegistrationOf(row({ reason: 'UNREGISTERED_NON_READ' })).kind).toBe('SIDE_REQUEST');
+  });
 });
 
 describe('T43d: the draft of the auth setup screen (never saved by itself)', () => {
@@ -80,6 +91,9 @@ describe('T43d: the draft of the auth setup screen (never saved by itself)', () 
       successSelector: '#logout',
     };
     expect(parseObservedAuthSetupDraft(draft)).toEqual(draft);
+    // URL-LEN: 前の上限（1,024）より長い path も受ける。
+    const longPath = { scriptLogin: { ...draft.scriptLogin, path: `/${'p'.repeat(1_025)}` } };
+    expect(parseObservedAuthSetupDraft(longPath)).toEqual(longPath);
     for (const broken of [
       null, 'x', [], {},
       { ...draft, extra: 1 },
@@ -95,7 +109,6 @@ describe('T43d: the draft of the auth setup screen (never saved by itself)', () 
       { scriptLogin: { ...draft.scriptLogin, path: '/../x' } },
       { scriptLogin: { ...draft.scriptLogin, path: '/x%2E%2E/y' } },
       { scriptLogin: { ...draft.scriptLogin, path: '/x y' } },
-      { scriptLogin: { ...draft.scriptLogin, path: `/${'p'.repeat(1_024)}` } },
       { sideRequests: [{ origin: SERVICE, path: '/../x', method: 'POST' }] },
       // T43R-fix の C-1: 鍵の名前の全体と、利用者の名前が入る CSS は受けない。
       { storageKey: { origin: APP, name: 'example-auth-token' } },

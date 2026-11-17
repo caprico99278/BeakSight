@@ -4,6 +4,7 @@
 //   通るもの。事実は、送り方ごとの部品（フォームの形 `formUpdateChangedFieldOf`）が求める。
 // - 選ぶ順: 登録で送った欄 → 登録の画面にある欄 → ほかの欄（同じ段の中は、渡された順。候補の欄・鍵の順）。1 つだけ選ぶ。
 // - 選べなければ `UPDATE_CHANGED_FIELD_NOT_FOUND`（画面の一覧の行は、チェックできない形にし、理由の 1 行を出す）。
+// - LU-11 fix round 2（設計者の判断。一覧の行の更新の設計書 5.4 の 4）: 除く欄（`excludedFieldNames`。一覧の行の更新の行を選ぶ欄）は選ばない。判定の 1 か所。
 // - 値が決まり毎回変わるかの判定（`updateChangedValueVaries`）は、入れる値の決まりの owner（`data-rules/`）の推しと判定をそのまま使う（書き写さない）。
 import type { CandidateField, CandidateFieldType, DiscoveryCandidate } from '../../discovery/candidate-contracts.js';
 import { NO_FIELD_CONSTRAINTS, planRuleSet, type EvaluationScenario } from '../data-rules/field-evaluation.js';
@@ -88,9 +89,12 @@ export const apiKeyFieldOf = (key: string, type: CandidateFieldType): CandidateF
   hasValue: false,
 });
 
-/** 規則 F で、変える欄を 1 つ選ぶ（選べなければ理由）。 */
-export const chooseUpdateChangedField = (facts: readonly UpdateChangedFieldFact[]): UpdateChangedFieldChoice => {
-  const usable = facts.filter((fact) => fact.usable);
+/** 規則 F で、変える欄を 1 つ選ぶ（選べなければ理由）。LU-11 fix round 2: 除く欄（一覧の行の更新の行を選ぶ欄）は選ばない。 */
+export const chooseUpdateChangedField = (
+  facts: readonly UpdateChangedFieldFact[],
+  excludedFieldNames: readonly string[] = [],
+): UpdateChangedFieldChoice => {
+  const usable = facts.filter((fact) => fact.usable && !excludedFieldNames.includes(fact.name));
   for (const ground of UPDATE_CHANGED_FIELD_GROUNDS) {
     const found = usable.find(GROUND_TESTS[ground]);
     if (found !== undefined) {

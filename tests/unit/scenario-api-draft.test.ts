@@ -9,12 +9,6 @@ import { resolve } from 'node:path';
 import { describe, expect, it } from 'vitest';
 import {
   BROWSER_SUPPLIED_HEADER_NAMES,
-  MAX_SCENARIO_API_FIELD_SELECTOR_LENGTH,
-  MAX_SCENARIO_API_HEADER_NAMES,
-  MAX_SCENARIO_API_KEY_LENGTH,
-  MAX_SCENARIO_API_KEYS,
-  MAX_SCENARIO_API_MEDIA_TYPE_LENGTH,
-  MAX_SCENARIO_API_PATH_LENGTH,
   SCENARIO_API_FIELD_IDENTITY_KINDS,
   SCENARIO_API_METHODS,
   SCENARIO_API_RECORD_ID_SOURCES,
@@ -24,26 +18,18 @@ import {
 } from '../../src/control/approval/scenario-contracts.js';
 import {
   SCENARIO_DRAFT_REJECTION_REASONS,
+  apiRequestTargetOfProbe,
   storedScenarioRevisionOf,
   validateScenarioDraft,
   type ScenarioDraftContext,
   type ScenarioDraftValidationResult,
 } from '../../src/control/approval/scenario-policy.js';
 import { validateControlDocument } from '../../src/control/control-schema-validator.js';
-import {
-  MAX_API_SHAPE_BODY_KEYS,
-  MAX_API_SHAPE_HEADER_NAMES,
-  MAX_API_SHAPE_MEDIA_TYPE_LENGTH,
-  MAX_API_SHAPE_NAME_LENGTH,
-  MAX_API_SHAPE_PATH_LENGTH,
-  apiRequestShapeOf,
-  type ApiRequestShape,
-} from '../../src/core/api-request-shape.js';
+import { apiRequestShapeOf, type ApiRequestShape } from '../../src/core/api-request-shape.js';
 import { apiShapeDigestOf } from '../../src/discovery/api-shape-classification.js';
 import { fieldNameHasStateWord } from '../../src/discovery/classify.js';
 import type { DiscoveryCandidate } from '../../src/discovery/candidate-contracts.js';
 import {
-  MAX_SUBMISSION_PROBE_FIELD_SELECTOR_LENGTH,
   observedSubmissionProbeOf,
   type SubmissionProbeInputField,
   type SubmissionProbeRecord,
@@ -166,20 +152,15 @@ describe('T38b: the contract of an API scenario', () => {
       expect(Object.isFrozen(list)).toBe(true);
     }
     expect(BROWSER_SUPPLIED_HEADER_NAMES).toEqual(expect.arrayContaining(['accept', 'user-agent', 'referer', 'origin']));
-    // 上限は probe の型と欄の識別の上限と同じ（型にない長さの値は持たない）。
-    expect([MAX_SCENARIO_API_KEYS, MAX_SCENARIO_API_HEADER_NAMES, MAX_SCENARIO_API_KEY_LENGTH, MAX_SCENARIO_API_PATH_LENGTH, MAX_SCENARIO_API_MEDIA_TYPE_LENGTH,
-      MAX_SCENARIO_API_FIELD_SELECTOR_LENGTH]).toEqual([MAX_API_SHAPE_BODY_KEYS, MAX_API_SHAPE_HEADER_NAMES, MAX_API_SHAPE_NAME_LENGTH, MAX_API_SHAPE_PATH_LENGTH,
-      MAX_API_SHAPE_MEDIA_TYPE_LENGTH, MAX_SUBMISSION_PROBE_FIELD_SELECTOR_LENGTH]);
+    // LZ-2: 欄の識別の CSS の長さの上限（前は 512）はない。
+    expect(SCHEMA.$defs['apiFieldSelector']).not.toHaveProperty('maxLength');
+    // URL-LEN: path の型と Origin の長さの上限（前は 1,024・2,048）はない。L13（N25）: 鍵・ヘッダの名前の数、鍵の名前と媒体の型の長さの上限もない。
     const api = SCHEMA.$defs['api']?.properties ?? {};
-    expect(api['keyFields']).toMatchObject({ maxItems: MAX_SCENARIO_API_KEYS });
-    expect(api['pageKeys']).toMatchObject({ maxItems: MAX_SCENARIO_API_KEYS });
-    expect(api['headerNames']).toMatchObject({ maxItems: MAX_SCENARIO_API_HEADER_NAMES });
-    expect(SCHEMA.$defs['apiKey']).toMatchObject({ maxLength: MAX_SCENARIO_API_KEY_LENGTH });
-    expect(SCHEMA.$defs['apiRequest']?.properties['pathShape']).toMatchObject({ maxLength: MAX_SCENARIO_API_PATH_LENGTH });
-    expect(SCHEMA.$defs['apiRequest']?.properties['contentType']?.['anyOf']).toEqual([
-      { type: 'string', minLength: 1, maxLength: MAX_SCENARIO_API_MEDIA_TYPE_LENGTH }, { type: 'null' },
-    ]);
-    expect(SCHEMA.$defs['apiFieldSelector']).toMatchObject({ maxLength: MAX_SCENARIO_API_FIELD_SELECTOR_LENGTH });
+    for (const name of ['keyFields', 'pageKeys', 'headerNames']) expect(api[name]?.['maxItems'], name).toBeUndefined();
+    expect(SCHEMA.$defs['apiKey']).not.toHaveProperty('maxLength');
+    expect(SCHEMA.$defs['apiRequest']?.properties['pathShape']?.['maxLength']).toBeUndefined();
+    expect(SCHEMA.$defs['apiRequest']?.properties['origin']?.['maxLength']).toBeUndefined();
+    expect(SCHEMA.$defs['apiRequest']?.properties['contentType']?.['anyOf']).toEqual([{ type: 'string', minLength: 1 }, { type: 'null' }]);
   });
 
   it('reads a FORM scenario document of the previous shape (no transport) as it is, as a FORM scenario', () => {
@@ -268,7 +249,8 @@ describe('T38b: the draft of an API scenario', () => {
   });
 
   it('has the reasons of an API draft at the end of the closed list', () => {
-    expect(SCENARIO_DRAFT_REJECTION_REASONS.slice(-17)).toEqual([
+    // ARR-2: 一覧の最後に、一覧の鍵の 4 つを足した（`def-226-array-key-approval.test.ts`）。ARR-3: さらに 1 つ（`arr-3-array-rows.test.ts`）。ARR-5: さらに 2 つ。ARR-5 fix round 1: さらに 2 つ。
+    expect(SCENARIO_DRAFT_REJECTION_REASONS.slice(-26, -9)).toEqual([
       'SCENARIO_API_CANDIDATE_NOT_API',
       'SCENARIO_API_STATE_KEY',
       'SCENARIO_API_METHOD_OVERRIDE',
@@ -368,12 +350,18 @@ describe('T38b: the draft of an API scenario', () => {
       ['a shape digest of another form', draftOf(CREATE_CANDIDATE, {}, { shapeDigest: 'x' })],
       ['an unknown property of the API spec', draftOf(CREATE_CANDIDATE, {}, { headerNames: ['x'] })],
       ['a record id of another source', draftOf(CREATE_CANDIDATE, {}, { recordId: { source: 'HEADER', key: 'id' } })],
-      ['too many page keys', draftOf(CREATE_CANDIDATE, {}, { pageKeys: Array.from({ length: MAX_SCENARIO_API_KEYS + 1 }, (_value, index) => `k${index}`) })],
     ] as const) {
       const codes = codesOf(validate(JSON.parse(JSON.stringify(draft)) as unknown, CREATE_CANDIDATE));
       expect(codes.length, name).toBeGreaterThan(0);
       expect([...new Set(codes)], name).toEqual(['SCENARIO_INPUT_INVALID']);
     }
+  });
+
+  // L13（N25）: 鍵の数と名前の長さで形の誤りにしない（前は 64 個・64 文字）。
+  it('does not reject many page keys or a long key name as a shape error', () => {
+    const pageKeys = [...Array.from({ length: 65 }, (_value, index) => `k${String(index)}`), 'k'.repeat(100)];
+    const codes = codesOf(validate(JSON.parse(JSON.stringify(draftOf(CREATE_CANDIDATE, {}, { pageKeys }))) as unknown, CREATE_CANDIDATE));
+    expect(codes).not.toContain('SCENARIO_INPUT_INVALID');
   });
 
   it('still rejects an API candidate as a FORM draft (not a POST form)', () => {
@@ -465,5 +453,32 @@ describe('T38c: the verification READ of a page path template for an API scenari
     ])('rejects %s', (_label, run, codes) => {
       expect(codesOf(run())).toEqual(codes);
     });
+  });
+});
+
+describe('DEF-220: the draft of an API scenario to an approved test Origin (APPROVED_TEST)', () => {
+  /** テスト用のサイト自身の Origin の `/api/members` への登録の型（承認したテストの Origin の番号 0）。 */
+  const testShape = apiRequestShapeOf({
+    method: 'POST', resourceType: 'fetch', url: `${SAMPLE_ORIGIN}/api/members`, origin: { kind: 'APPROVED_TEST', index: 0 },
+    headers: { 'content-type': 'application/json' },
+    body: { kind: 'TEXT', text: JSON.stringify({ name: MARKERS[0], email: MARKERS[1], note: Number(MARKERS[2]), tenant_id: 'tenant-1' }) },
+  }, { pagePath: NEW_PATH, markers: MARKERS });
+  const candidate = buttonOf(NEW_PATH, probeOf(testShape));
+  const TEST_CONTEXT: ScenarioDraftContext = { ...CONTEXT, approvedServiceOrigins: [API], approvedTestOrigins: [SAMPLE_ORIGIN] };
+
+  it('resolves the index with the approved test Origins of the context and keeps the Origin in the request of the content', () => {
+    expect(candidate.submissionProbe?.result).toBe('API_CREATE');
+    const result = validate(draftOf(candidate), candidate, TEST_CONTEXT);
+    expect(codesOf(result)).toEqual([]);
+    if (!result.ok) return;
+    expect(result.content.api?.request).toMatchObject({ method: 'POST', origin: SAMPLE_ORIGIN, pathShape: '/api/members' });
+    expect(apiRequestTargetOfProbe(probeOf(testShape), TEST_CONTEXT)).toEqual({ origin: SAMPLE_ORIGIN, pathShape: '/api/members' });
+  });
+
+  it('rejects the shape when the Origin is not an approved test Origin (the service Origins do not resolve the index of a test Origin)', () => {
+    expect(codesOf(validate(draftOf(candidate), candidate, { ...CONTEXT, approvedTestOrigins: [] }))).toEqual(['SCENARIO_API_ORIGIN_NOT_APPROVED']);
+    expect(codesOf(validate(draftOf(candidate), candidate, { ...CONTEXT, approvedServiceOrigins: [SAMPLE_ORIGIN] })))
+      .toEqual(['SCENARIO_API_ORIGIN_NOT_APPROVED']);
+    expect(apiRequestTargetOfProbe(probeOf(testShape), { approvedServiceOrigins: [SAMPLE_ORIGIN] })).toBeNull();
   });
 });

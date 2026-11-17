@@ -3,23 +3,19 @@
 // - ログインの画面を離れた（パスワードの欄が見えず、path がセッションの切れの path の外）。
 // - 新しい状態の名前（Cookie・ローカル ストレージの鍵・IndexedDB の名前）が、ログインの画面を開いたときより増えた。
 // 前は、空の成功の条件が、ログインの画面を開いた直後に当たり、人がログインする前に「成功」になっていた（DEF-181）。「ログインを終えた」は押さない。
-// 通す部品は本物（`runLoginStage`、Guard、fixture）。Chromium はテストの既定の headless と、CLI の起動の設定の両方。値は出力しない。
-import type { Browser, Page } from 'playwright';
+// 通す部品は本物（`runLoginStage`、Guard、fixture）。Chromium はテストの既定の headless だけ（TEST-SLIM）。値は出力しない。
+import type { Page } from 'playwright';
 import { afterEach, describe, expect, it } from 'vitest';
 import { wait } from '../../src/core/deadline.js';
 import type { AuditConfig } from '../../src/config/types.js';
 import { SCRIPT_REQUEST_TRANSPORT, type AuthSetupV3 } from '../../src/control/auth/auth-setup-contracts.js';
 import { runLoginStage, type LoginStageResult } from '../../src/worker/authenticated-login.js';
-import { launchCliChromium, launchHeadlessChromium } from '../helpers/chromium.js';
+import { DEFAULT_CHROMIUM_LAUNCHERS } from '../helpers/chromium.js';
 import { fastRunConfig } from '../helpers/run-harness.js';
 import { AUTH_SITE_LOGIN_FIELDS, AUTH_SITE_PATHS, startAuthenticatedSite, type AuthenticatedSite } from '../helpers/authenticated-site-fixture.js';
 import { SPA_APP_PATHS, SPA_LOGIN_FIELDS, startSpaAuthSite, type SpaAuthSite } from '../helpers/spa-auth-site-fixture.js';
 import { FORM_NAVIGATION_SETUP_ITEMS } from '../helpers/auth-setup-samples.js';
 
-const LAUNCHERS: readonly (readonly [string, () => Promise<Browser>])[] = [
-  ['the default test Chromium', () => launchHeadlessChromium()],
-  ['the CLI Chromium', () => launchCliChromium()],
-];
 const TEST_TIMEOUT_MS = 120_000;
 const UI_TIMEOUT_MS = 15_000;
 const LOGIN_STAGE_TIMEOUT_MS = 30_000;
@@ -76,7 +72,7 @@ const expectNoSecretsInRecords = (secrets: readonly string[], result: LoginStage
   }
 };
 
-describe.each(LAUNCHERS)('OP-1 D3: the manual login stage detects the end of the login by itself with %s', (_label, launch) => {
+describe.each(DEFAULT_CHROMIUM_LAUNCHERS)('OP-1 D3: the manual login stage detects the end of the login by itself with %s', (_label, launch) => {
   const closers: (() => Promise<void>)[] = [];
 
   afterEach(async () => {

@@ -11,10 +11,12 @@
 //   確かめが共用する）と、その知らせ（`ServiceRequestPacingNotice`）。待った回数と時間は、`authentication` と保存の数に入る。
 import type { AuditStageServiceRequests, AuthenticatedStorageState, BrowserContextFactoryOptions } from '../browser/context-factory.js';
 import {
+  SERVICE_UNAUTHORIZED_DETAIL,
   SESSION_KEY_LOST_DETAIL,
   type IncompleteReason,
   type IncompleteReasonCode,
   type RunAuthenticationSummary,
+  type ServiceUnauthorizedDetail,
   type SessionKeyLostDetail,
 } from '../core/contracts.js';
 import { saturatingAdd, saturatingIncrement } from '../core/saturating-count.js';
@@ -119,6 +121,7 @@ export function intervalTrackingNavigationPacer(
   return Object.freeze({
     pacer: Object.freeze({
       beforeNavigation: () => pacer.beforeNavigation(),
+      waitUntilNextNavigationDue: () => pacer.waitUntilNextNavigationDue(),
       snapshot: () => pacer.snapshot(),
       raiseMinimumInterval: (raised: number): void => {
         pacer.raiseMinimumInterval(raised);
@@ -200,15 +203,14 @@ export function recordRunStageCarry(
  * 前の段の窓 `carriedWindowMs` から始める）。
  */
 export function createAuditStageRunState(
-  auditStage: AuditStageServiceRequests,
   now: () => number,
   previous: RunCheckpointAuditStageCounts | undefined,
   carriedWindowMs: readonly number[] = [],
 ): AuditStageRunState {
   const counts = previous ?? EMPTY_AUDIT_STAGE_COUNTS;
   return {
+    // LZ-3c: 数える部品は上限を受けない（前は監査の段の口の `serviceRequestLimits` を渡した）。
     budget: createServiceRequestBudget({
-      ...auditStage.serviceRequestLimits,
       now,
       initialAdmitted: counts.serviceRequestsAdmitted,
       initialWindowTimesMs: carriedWindowMs,
@@ -323,7 +325,7 @@ export function jobContextFactoryOptions(
   }
   const passed: AuditStageServiceRequests = readRequests === 'REGISTERED' ? auditStage : { ...auditStage, auditReadRequests: [] };
   // FM2d: まとめて実行の次の段は、前の段の 1 分の窓から始める（省略は空。今のまま）。
-  const state = createAuditStageRunState(passed, now, undefined, carriedWindowMs);
+  const state = createAuditStageRunState(now, undefined, carriedWindowMs);
   return {
     factoryOptions: {
       authentication: authenticatedContextOptions({ ...authentication, auditStage: passed }),
@@ -333,11 +335,8 @@ export function jobContextFactoryOptions(
   };
 }
 
-/**
- * 次のページ（ジョブでは次の画面・定義）を始める前の、承認したサービスの Origin への要求の上限に届いたかの判定（T37a。Run Coordinator・発見・READ の
- * 確かめが共有する 1 か所）。状態がなければ偽。
- */
-export const isServiceRequestLimitReached = (state: AuditStageRunState | null | undefined): boolean => state?.budget.isLimitReached() === true;
+// LZ-3c: 次のページを始める前の、承認したサービスの Origin への要求の上限に届いたかの判定（前の T37a の `isServiceRequestLimitReached`）は、L11 から
+// いつも偽なので捨てた（呼ぶ側の分岐も捨てた）。
 
 /**
  * ページ（画面）を読んだ後の、ログインの状態の鍵の消失によるセッションの切れの詳しい理由（T37a。Run Coordinator・発見・READ の確かめが共有する 1 か所）。
@@ -345,6 +344,28 @@ export const isServiceRequestLimitReached = (state: AuditStageRunState | null | 
  */
 export const sessionKeyLostDetailOf = (state: AuditStageRunState | null | undefined): SessionKeyLostDetail | null =>
   (state?.sessionKeyLost === true ? SESSION_KEY_LOST_DETAIL : null);
+
+/** DEF-233: この実行で受けた、承認したサービスの Origin からの 401 の数（読み込みの前に読み、後と比べる）。状態がなければ `null`。 */
+export const serviceUnauthorizedCountOf = (state: AuditStageRunState | null | undefined): number | null =>
+  (state === null || state === undefined ? null : state.serviceUnauthorizedResponses);
+
+/**
+ * DEF-233（設計書 `2026-11-09-beaksight-discovery-token-refresh-design.md` 2.3）: ページ（画面・定義）を読んだ後の、承認したサービスの Origin の 401 による
+ * セッションの切れの詳しい理由（操作さがし・READ の確かめ・監査の段が共有する 1 か所。K = 1 画面）。読み込みの前（`before`。`serviceUnauthorizedCountOf`）より
+ * 401 が増え、その画面が描けなかった（`unreadable`。操作さがしと READ の確かめは `SERVICE_READ_REFUSED` の判定 `isAuditStageReadObstructed`、監査は 401 そのもの）
+ * なら `SERVICE_UNAUTHORIZED`。ほかと、状態がなければ `null`。書き込みの段は呼ばない（今のとおり）。
+ * fix round 1（設計書 2.3 の 4）: 自動でログインし直せないプロファイル（`automatedRelogin` が偽。手動のログイン）では、いつも `null`（止めずに、今のとおり
+ * `SERVICE_READ_REFUSED` を付けて続ける）。
+ */
+export const serviceUnauthorizedSessionLostDetailOf = (
+  state: AuditStageRunState | null | undefined,
+  before: number | null,
+  unreadable: boolean,
+  automatedRelogin: boolean,
+): ServiceUnauthorizedDetail | null =>
+  (automatedRelogin && state !== null && state !== undefined && before !== null && unreadable && state.serviceUnauthorizedResponses > before
+    ? SERVICE_UNAUTHORIZED_DETAIL
+    : null);
 
 /**
  * この実行で、上限で断った要求と、承認したサービスの Origin からの 401 の応答の数の和（T37a。読み込みの前と後の差で、その画面に、サービスの読み取りが
@@ -432,7 +453,8 @@ export function runAuthenticationSummaryOf(state: AuditStageRunState): RunAuthen
     tokenRefreshBlocked: counts.tokenRefreshBlocked,
     otherNonReadBlocked: counts.otherNonReadBlocked,
     serviceUnauthorizedResponses: counts.serviceUnauthorizedResponses,
-    serviceRequestLimitReached: state.budget.isLimitReached() || counts.serviceRequestLimitRefused > 0,
+    // LZ-3c: 上限はないので、前の実行で断った要求の記録があるときだけ真（前の記録のため）。
+    serviceRequestLimitReached: counts.serviceRequestLimitRefused > 0,
     // T37R-fix-B2（設計書 8 章の最後の行）: 許可 Origin への `fetch`・`xhr` の読み取りでない要求を止めた数（記録だけ。判定には使わない）。
     allowedOriginDataRequestsBlocked: counts.allowedOriginDataRequestsBlocked,
     // DEF-141: 1 分あたりの上限で次の読み込みの前に待った回数と時間（Run の全体）。

@@ -3,12 +3,14 @@
 // （`checkWritePayload`）の指定の確かめに通ることも確かめる。
 import { describe, expect, it } from 'vitest';
 import {
+  updateBasePayloadFieldsOf,
+  updateDeferredPriorValuesOf,
   updatePayloadFieldsOf,
   type UpdateFormValues,
   type WriteFormFieldSpec,
   type WriteUpdateFormSpec,
 } from '../../src/browser/write-form-submitter.js';
-import { checkWritePayload, type WritePayloadExpectation } from '../../src/safety/write-payload-policy.js';
+import { checkWritePayload, writeExpectationWithPriorValues, type WritePayloadExpectation } from '../../src/safety/write-payload-policy.js';
 
 const ORIGIN = 'http://127.0.0.1:8080';
 const PATH = '/items/12';
@@ -210,5 +212,101 @@ describe('T31R2-fix-1: the invisible choices, the disabled fields and the secret
     ['a disabled field with the name of a kept field', [...FIELDS, field('memo', 'text', { disabled: true })], 'SPEC_INVALID'],
   ])('rejects a form with %s', (_label, fields, reason) => {
     expect(updatePayloadFieldsOf(specOf({ candidateFields: fields }), PRIOR, NEW_VALUES)).toEqual({ ok: false, reason });
+  });
+});
+
+// LU-12a fix round 1（設計者の判断 (b)）: 前の値を後から入れる印の作り手（`updateDeferredPriorValuesOf`。純粋）。鍵の集合は承認の時の欄の役割から作り、
+// ページの値から作らない。前の値に null を入れてよい欄（`nullableFieldNames`）は、作り手（`updatePayloadFieldsOf`）と同じ判定（checkbox・radio・select）。
+describe('LU-12a fix round 1: the maker of the mark for the prior values supplied later (updateDeferredPriorValuesOf)', () => {
+  const E8_FIELDS: readonly WriteFormFieldSpec[] = [
+    ...FIELDS,
+    field('member[addresses][0][_destroy]', 'checkbox', { hidden: true }),
+    field('owner_id', 'select-one', { hidden: true }),
+  ];
+
+  it('makes the names from the roles of the fields, and allows null only for the checkbox, radio and select fields', () => {
+    const result = updateDeferredPriorValuesOf(specOf({ candidateFields: E8_FIELDS }), NEW_VALUES);
+    expect(result.ok).toBe(true);
+    if (!result.ok) return;
+    expect(result.mark.keptFieldNames).toEqual(['memo', 'plan', 'contact', 'newsletter', 'notify']);
+    expect(result.mark.keptCheckboxPairNames).toEqual(['published']);
+    expect(result.mark.changedCheckboxPairs).toEqual([]);
+    expect([...result.mark.checkedPassthroughNames].sort()).toEqual(['active', 'lock_version', 'member[addresses][0][_destroy]', 'owner_id', 'ref_no']);
+    expect([...result.mark.nullableFieldNames].sort()).toEqual(['contact', 'member[addresses][0][_destroy]', 'newsletter', 'notify', 'owner_id', 'plan']);
+    expect(Object.isFrozen(result.mark)).toBe(true);
+  });
+
+  it('agrees with the expectation maker: a null kept text field is refused by both', () => {
+    const made = updateDeferredPriorValuesOf(specOf(), NEW_VALUES);
+    expect(made.ok && made.mark.nullableFieldNames.includes('memo')).toBe(false);
+    expect(updatePayloadFieldsOf(specOf(), { ...PRIOR, fields: { ...PRIOR.fields, memo: null } }, NEW_VALUES)).toEqual({ ok: false, reason: 'SPEC_INVALID' });
+    expect(made.ok && made.mark.nullableFieldNames.includes('notify')).toBe(true);
+  });
+
+  it('puts a changed pair with the new checked value', () => {
+    // 状態の語の名前（`published`）は変える欄にできないので、今の作り手のテストと同じ、状態の語でない組の画面で確かめる。
+    const pairFields = [hiddenField('agree'), field('agree', 'checkbox'), field('customer_name', 'text')];
+    const spec = specOf({ candidateFields: pairFields, changedFieldNames: ['agree'], keptFieldNames: ['customer_name'], methodOverride: null });
+    expect(updateDeferredPriorValuesOf(spec, { agree: null })).toEqual({
+      ok: true,
+      mark: { keptFieldNames: ['customer_name'], checkedPassthroughNames: [], keptCheckboxPairNames: [], changedCheckboxPairs: [{ name: 'agree', checkedValue: null }], nullableFieldNames: [] },
+    });
+  });
+
+  it('refuses the values that do not have exactly the changed field names, and an invalid spec', () => {
+    expect(updateDeferredPriorValuesOf(specOf(), {})).toEqual({ ok: false, reason: 'SPEC_INVALID' });
+    expect(updateDeferredPriorValuesOf(specOf(), { ...NEW_VALUES, memo: 'x' })).toEqual({ ok: false, reason: 'SPEC_INVALID' });
+    expect(updateDeferredPriorValuesOf(specOf({ candidateFields: [...FIELDS, hiddenField('code')] }), NEW_VALUES)).toEqual({ ok: false, reason: 'SECRET_LIKE_PASSTHROUGH_FIELD' });
+  });
+});
+
+// LU-12b（LU-12a の実装者の提案）: 前の値に頼らない基本の期待（`updateBasePayloadFieldsOf`）は、今の作り手と同じ部品から作る。基本の期待に、印と前の値を入れた
+// 期待は、今の作り手の期待と同じ欄の集まりになる（並びは一覧ごとに比べない）。
+describe('LU-12b: the base expectation that does not depend on the prior values (updateBasePayloadFieldsOf)', () => {
+  const sorted = (names: readonly string[] | undefined): readonly string[] => [...(names ?? [])].sort();
+  const pairsOf = (expectation: Pick<WritePayloadExpectation, 'checkboxPairs'>) =>
+    [...(expectation.checkboxPairs ?? [])].map((pair) => JSON.stringify(pair)).sort();
+  const fieldsOf = (fields: readonly { readonly name: string; readonly value: string }[] | undefined) =>
+    [...(fields ?? [])].map((entry) => JSON.stringify([entry.name, entry.value])).sort();
+
+  it('has only the parts that do not depend on the prior values', () => {
+    const base = updateBasePayloadFieldsOf(specOf(), NEW_VALUES);
+    expect(base.ok).toBe(true);
+    if (!base.ok) return;
+    expect(base.fields.submittedFields).toEqual([{ name: 'customer_name', value: NEW_VALUES['customer_name'] }]);
+    expect(base.fields.checkedPassthroughFields).toEqual([]);
+    expect(base.fields.checkboxPairs).toEqual([]);
+    expect(base.fields.absentFieldNames).toEqual(['archived_at']);
+    expect(Object.isFrozen(base.fields)).toBe(true);
+  });
+
+  it('becomes the expectation of the current maker after the mark and the prior values are put in', () => {
+    const spec = specOf();
+    const base = updateBasePayloadFieldsOf(spec, NEW_VALUES);
+    const mark = updateDeferredPriorValuesOf(spec, NEW_VALUES);
+    const full = updatePayloadFieldsOf(spec, PRIOR, NEW_VALUES);
+    if (!base.ok || !mark.ok || !full.ok) throw new Error('the expectations were not made');
+    const request = { origin: ORIGIN, path: PATH, enctype: spec.enctype };
+    const supplied = writeExpectationWithPriorValues({ request, ...base.fields, deferredPriorValues: mark.mark }, {
+      keptFields: mark.mark.keptFieldNames.map((name) => ({ name, value: PRIOR.fields[name] ?? null })),
+      checkedPassthroughFields: mark.mark.checkedPassthroughNames.map((name) => ({
+        name, value: Object.hasOwn(PRIOR.stateHiddenValues, name) ? PRIOR.stateHiddenValues[name] ?? null : PRIOR.passthroughValues[name] ?? null,
+      })),
+      checkboxPairs: mark.mark.keptCheckboxPairNames.map((name) => ({ name, offValue: PRIOR.pairOffValues[name] ?? '', checkedValue: PRIOR.fields[name] ?? null })),
+    });
+    if (supplied === null) throw new Error('the prior values were not put in');
+    expect(fieldsOf(supplied.submittedFields)).toEqual(fieldsOf(full.fields.submittedFields));
+    expect(fieldsOf(supplied.checkedPassthroughFields)).toEqual(fieldsOf(full.fields.checkedPassthroughFields));
+    expect(pairsOf(supplied)).toEqual(pairsOf(full.fields));
+    expect(sorted(supplied.absentFieldNames)).toEqual(sorted(full.fields.absentFieldNames));
+    expect(sorted(supplied.passthroughFieldNames)).toEqual(sorted(full.fields.passthroughFieldNames));
+    expect(sorted(supplied.emptyFileFieldNames)).toEqual(sorted(full.fields.emptyFileFieldNames));
+  });
+
+  it('refuses the same inputs as the current maker', () => {
+    expect(updateBasePayloadFieldsOf(specOf(), {})).toEqual({ ok: false, reason: 'SPEC_INVALID' });
+    expect(updateBasePayloadFieldsOf(specOf(), { customer_name: null })).toEqual({ ok: false, reason: 'SPEC_INVALID' });
+    expect(updateBasePayloadFieldsOf(specOf({ candidateFields: [...FIELDS, hiddenField('code')] }), NEW_VALUES))
+      .toEqual({ ok: false, reason: 'SECRET_LIKE_PASSTHROUGH_FIELD' });
   });
 });

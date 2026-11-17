@@ -2,18 +2,16 @@ import { performance } from 'node:perf_hooks';
 import type { Browser, BrowserContext, Page } from 'playwright';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import { BrowserContextFactory } from '../../src/browser/context-factory.js';
-import {
-  controlledScroll,
-  MAX_LEADING_SCROLL_OBSERVATIONS,
-  MAX_SCROLL_OBSERVATIONS,
-} from '../../src/browser/controlled-scroll.js';
+import { controlledScroll } from '../../src/browser/controlled-scroll.js';
 import { waitForPageSettled } from '../../src/browser/page-settling.js';
-import { VISIBILITY_CHECK_OPTIONS } from '../../src/core/visibility.js';
 import { SafetyLedger } from '../../src/safety/safety-ledger.js';
 import { startFixtureServer, type FixtureServer } from '../../fixtures/server.js';
 import { useHeadlessChromium } from '../helpers/chromium.js';
 import { closePassiveResources } from '../helpers/passive-cleanup.js';
 import { createTestConfig } from '../helpers/test-config.js';
+
+/** L9 の前の測定の記録の数の上限（定数は LZ-1 で消した）。 */
+const MAX_SCROLL_OBSERVATIONS = 500;
 
 let browser: Browser;
 let server: FixtureServer;
@@ -173,9 +171,9 @@ describe('page settling and controlled scrolling', () => {
 
   });
 
-  it('returns PARTIAL when an inner container scrolls more than the document scrolls by the default body margin', async () => {
+  it('traverses an inner container that scrolls more than the document scrolls by the default body margin (DEF-207)', async () => {
     // R4 の N1 の再現条件(2): body の余白は既定のまま、`<div style="height:100vh;overflow:auto">` の中に高さ 5000px の要素がある。
-    // 文書は余白の分だけスクロールできるが、スクロールできる量が最も大きいのは内側の領域なので、COMPLETE にしない。
+    // 文書は余白の分だけスクロールできるが、スクロールできる量が最も大きいのは内側の領域なので、文書の後にその領域をたどる（DEF-207）。
     const page = await openFixturePage('/inner-scroll-default-margin.html');
 
     const result = await controlledScroll(page, { deadlineAtMs: Date.now() + 5_000, ...REAL_PAGE_SCROLL_OPTIONS });
@@ -191,15 +189,16 @@ describe('page settling and controlled scrolling', () => {
     });
 
     expect(fixtureState.rootScrollRange).toBeGreaterThan(1);
-    expect(result.status, JSON.stringify(result)).toBe('PARTIAL');
-    expect(result.reason).toBe('INNER_SCROLL_CONTAINER_NOT_TRAVERSED');
+    expect(result.status, JSON.stringify(result)).toBe('COMPLETE');
+    expect(result.reason).toBe('BOTTOM_AND_HEIGHT_STABLE');
     expect(result.innerScrollScan).toMatchObject({
       containerCount: 1,
       scanLimitReached: false,
       representative: { clientHeight: fixtureState.clientHeight, scrollHeight: fixtureState.scrollHeight },
     });
-    // 内側の領域はたどらない。
+    // たどった後、内側の領域の位置を元（0）に戻す。
     expect(fixtureState.shellScrollTop).toBe(0);
+    expect(result.restoration).toEqual({ status: 'RESTORED', position: { scrollX: 0, scrollY: 0 } });
 
   });
 
@@ -235,8 +234,8 @@ describe('page settling and controlled scrolling', () => {
 
   });
 
-  it('returns PARTIAL when an inner container inside an open shadow root scrolls more than the document (R\'2 I-3)', async () => {
-    // R'2 の I-3: 内側の領域を探す走査は、open な shadow root の中にも入る。
+  it('traverses an inner container inside an open shadow root that scrolls more than the document (R\'2 I-3, DEF-207)', async () => {
+    // R'2 の I-3: 内側の領域を探す走査は、open な shadow root の中にも入る。DEF-207: 見つけた領域をたどる。
     const page = await openFixturePage('/shadow-inner-scroll.html');
 
     const result = await controlledScroll(page, { deadlineAtMs: Date.now() + 5_000, ...REAL_PAGE_SCROLL_OPTIONS });
@@ -252,28 +251,15 @@ describe('page settling and controlled scrolling', () => {
     });
 
     expect(fixtureState.rootScrollRange).toBeGreaterThan(1);
-    expect(result.status, JSON.stringify(result.innerScrollScan)).toBe('PARTIAL');
-    expect(result.reason).toBe('INNER_SCROLL_CONTAINER_NOT_TRAVERSED');
+    expect(result.status, JSON.stringify(result.innerScrollScan)).toBe('COMPLETE');
+    expect(result.reason).toBe('BOTTOM_AND_HEIGHT_STABLE');
     expect(result.innerScrollScan).toMatchObject({
       containerCount: 1,
       scanLimitReached: false,
       representative: { clientHeight: fixtureState.clientHeight, scrollHeight: fixtureState.scrollHeight },
     });
     expect(fixtureState.shellScrollTop).toBe(0);
-
-  });
-
-  it('counts the elements inside open shadow roots toward the inner container scan limit (R\'2 I-3)', async () => {
-    // light DOM の要素は少なく、shadow root の中に上限を超える数の要素がある。文書は余白の分だけスクロールできる。
-    const page = await openFixturePage('/shadow-scan-limit.html');
-
-    const result = await controlledScroll(page, { deadlineAtMs: Date.now() + 10_000, ...REAL_PAGE_SCROLL_OPTIONS });
-    const lightElementCount = await page.evaluate(() => document.getElementsByTagName('*').length);
-
-    expect(result.status, JSON.stringify(result.innerScrollScan)).toBe('COMPLETE');
-    expect(result.finalSnapshot?.scrollTarget).toBe('SCROLLING_ELEMENT');
-    expect(result.innerScrollScan?.scanLimitReached).toBe(true);
-    expect(result.innerScrollScan?.scannedElementCount).toBeGreaterThan(lightElementCount);
+    expect(result.restoration).toEqual({ status: 'RESTORED', position: { scrollX: 0, scrollY: 0 } });
 
   });
 
@@ -303,9 +289,9 @@ describe('page settling and controlled scrolling', () => {
 
   });
 
-  it('returns PARTIAL when only an inner container scrolls while html and body cannot scroll', async () => {
+  it('traverses the only inner container while html and body cannot scroll, and returns it to its origin (DEF-207)', async () => {
     // C4 の発見事項6: html と body が overflow:hidden（高さ100%）で、内側の div だけがスクロールし、
-    // その中に遅延読み込みの内容があるページ。内側の領域は追わないので、COMPLETE にしてはいけない。
+    // その中に遅延読み込みの内容があるページ。DEF-207: 文書の後に、その領域を文書と同じ決まりでたどり、遅延読み込みを最後まで待つ。
     const page = await openFixturePage('/inner-scroll-container.html');
 
     const result = await controlledScroll(page, { deadlineAtMs: Date.now() + 5_000, ...REAL_PAGE_SCROLL_OPTIONS });
@@ -319,22 +305,57 @@ describe('page settling and controlled scrolling', () => {
       };
     });
 
-    expect(result.status, JSON.stringify(result)).toBe('PARTIAL');
-    expect(result.reason).toBe('INNER_SCROLL_CONTAINER_NOT_TRAVERSED');
+    expect(result.status, JSON.stringify(result)).toBe('COMPLETE');
+    expect(result.reason).toBe('BOTTOM_AND_HEIGHT_STABLE');
     expect(result.finalSnapshot?.scrollTarget).toBeNull();
     expect(result.innerScrollScan).toMatchObject({
       containerCount: 1,
       scanLimitReached: false,
-      representative: { clientHeight: fixtureState.clientHeight, scrollHeight: fixtureState.scrollHeight },
     });
     expect(result.innerScrollScan?.representative?.scrollHeight)
       .toBeGreaterThan(result.innerScrollScan?.representative?.clientHeight ?? Infinity);
     expect(result.innerScrollScan?.scannedElementCount).toBeGreaterThan(0);
     expect(Object.isFrozen(result.innerScrollScan)).toBe(true);
     expect(Object.isFrozen(result.innerScrollScan?.representative)).toBe(true);
-    // 内側の領域を動かしていないので、遅延読み込みは起きていない。
-    expect(fixtureState).toMatchObject({ batches: 0, shellScrollTop: 0 });
+    // 内側の領域を最下部までたどったので、遅延読み込みは2回とも起き、終わった後に領域の位置は元（0）に戻っている。
+    expect(fixtureState).toMatchObject({ batches: 2, shellScrollTop: 0 });
+    expect(result.restoration).toEqual({ status: 'RESTORED', position: { scrollX: 0, scrollY: 0 } });
 
+  });
+
+  it('draws the late content at the bottom of the inner container and keeps it after the traversal (DEF-207)', async () => {
+    const page = await openFixturePage('/inner-scroll-late-heading.html');
+
+    const result = await controlledScroll(page, { deadlineAtMs: Date.now() + 5_000, ...REAL_PAGE_SCROLL_OPTIONS });
+    const fixtureState = await page.evaluate(() => ({
+      lateHeadings: [...document.querySelectorAll('[data-late-section] h2')].map((heading) => heading.textContent),
+      shellScrollTop: document.querySelector('#app-shell')?.scrollTop ?? -1,
+    }));
+
+    expect(result.status, JSON.stringify(result)).toBe('COMPLETE');
+    expect(result.reason).toBe('BOTTOM_AND_HEIGHT_STABLE');
+    expect(fixtureState).toEqual({ lateHeadings: ['Late inner heading'], shellScrollTop: 0 });
+    expect(result.restoration).toEqual({ status: 'RESTORED', position: { scrollX: 0, scrollY: 0 } });
+  });
+
+  it('L9: stops an inner container that keeps adding batches of the same structure without a deadline (NO_NEW_STRUCTURE)', async () => {
+    const page = await openFixturePage('/inner-scroll-endless.html');
+
+    const result = await controlledScroll(page, REAL_PAGE_SCROLL_OPTIONS);
+    const state = await page.evaluate(() => ({
+      batches: document.querySelectorAll('[data-endless-batch]').length,
+      shellScrollTop: document.querySelector('#app-shell')?.scrollTop ?? -1,
+    }));
+
+    expect(result.status, JSON.stringify(result.innerScrollContainers)).toBe('COMPLETE');
+    expect(result.innerScrollContainers).toEqual([expect.objectContaining({
+      stopReason: 'NO_NEW_STRUCTURE',
+      originTop: 0,
+      restored: true,
+    })]);
+    expect(result.innerScrollContainers?.[0]?.heightGrowthCount).toBeGreaterThan(0);
+    expect(state.batches).toBeGreaterThan(0);
+    expect(state.shellScrollTop).toBe(0);
   });
 
   it('keeps COMPLETE for a page that fits in the viewport and ignores hidden, clipped, or fitting boxes', async () => {
@@ -360,64 +381,6 @@ describe('page settling and controlled scrolling', () => {
     expect(result.finalSnapshot?.scrollTarget).toBe('SCROLLING_ELEMENT');
     expect(result.innerScrollScan).toMatchObject({ containerCount: 0, scanLimitReached: false, representative: null });
 
-  });
-
-  it('returns PARTIAL with the recorded fact when the inner container scan reaches its limit', async () => {
-    vi.useFakeTimers();
-    vi.setSystemTime(34_000);
-    const scanArguments: unknown[] = [];
-    const fakePage = {
-      isClosed: () => false,
-      evaluate: vi.fn(async (_callback: unknown, argument: unknown) => {
-        const record = argument as Record<string, unknown>;
-        if (record.phase === 'INNER_SCROLL_SCAN') {
-          scanArguments.push(argument);
-          return {
-            scannedElementCount: record.maxElements,
-            scanLimitReached: true,
-            containerCount: 0,
-            representative: null,
-          };
-        }
-        if (record.phase === 'RESET' || record.phase === 'RESTORE') {
-          return { scrollX: 0, scrollY: 0 };
-        }
-        if (record.phase === 'STEP') {
-          return 'MUTATED';
-        }
-        return {
-          scrollTarget: null,
-          scrollY: 0,
-          viewportHeight: 100,
-          scrollHeight: 100,
-          contentHeight: 100,
-          documentScrollRange: 0,
-          bodyScrollRange: 0,
-        };
-      }),
-    } as unknown as Page;
-
-    const resultPromise = controlledScroll(fakePage, {
-      deadlineAtMs: 35_000,
-      stepViewportFraction: 0.5,
-      stepWaitMs: 8,
-      stableWindowMs: 15,
-    });
-    await vi.advanceTimersByTimeAsync(100);
-    const result = await resultPromise;
-
-    expect(result).toMatchObject({ status: 'PARTIAL', reason: 'INNER_SCROLL_SCAN_LIMIT_REACHED' });
-    expect(scanArguments).toHaveLength(1);
-    const scanArgument = scanArguments[0] as Record<string, unknown>;
-    expect(scanArgument.visibilityOptions).toEqual(VISIBILITY_CHECK_OPTIONS);
-    expect(Number.isSafeInteger(scanArgument.maxElements) && (scanArgument.maxElements as number) > 0).toBe(true);
-    expect(result.innerScrollScan).toEqual({
-      scannedElementCount: scanArgument.maxElements,
-      scanLimitReached: true,
-      containerCount: 0,
-      representative: null,
-    });
-    expect(result.restoration).toEqual({ status: 'RESTORED', position: { scrollX: 0, scrollY: 0 } });
   });
 
   it('keeps COMPLETE when the traversed document scrolls more than the largest inner container', async () => {
@@ -467,57 +430,6 @@ describe('page settling and controlled scrolling', () => {
 
     expect(result).toMatchObject({ status: 'COMPLETE', reason: 'BOTTOM_AND_HEIGHT_STABLE' });
     expect(result.innerScrollScan).toEqual(smallerInnerScan);
-  });
-
-  it('keeps COMPLETE and records the scan limit when the scan reaches its limit after traversing the document (R\'2 m1)', async () => {
-    // 設計書 foundation-corrections 5.1（F08 の判断）: 文書をたどった後に走査が上限に達しても COMPLETE のままにし、
-    // 上限に達したことを `innerScrollScan.scanLimitReached` に記録する。
-    vi.useFakeTimers();
-    vi.setSystemTime(40_000);
-    const fakePage = {
-      isClosed: () => false,
-      evaluate: vi.fn(async (_callback: unknown, argument: unknown) => {
-        const record = argument as Record<string, unknown>;
-        if (record.phase === 'INNER_SCROLL_SCAN') {
-          return {
-            scannedElementCount: record.maxElements,
-            scanLimitReached: true,
-            containerCount: 0,
-            representative: null,
-          };
-        }
-        if (record.phase === 'RESET' || record.phase === 'RESTORE') {
-          return { scrollX: 0, scrollY: 0 };
-        }
-        if (record.phase === 'STEP') {
-          return 'MUTATED';
-        }
-        // 文書は 200px スクロールでき、最下部にいる。
-        return {
-          scrollTarget: 'SCROLLING_ELEMENT',
-          scrollY: 200,
-          viewportHeight: 100,
-          scrollHeight: 300,
-          contentHeight: 300,
-          documentScrollRange: 200,
-          bodyScrollRange: 0,
-        };
-      }),
-    } as unknown as Page;
-
-    const resultPromise = controlledScroll(fakePage, {
-      deadlineAtMs: 41_000,
-      stepViewportFraction: 0.5,
-      stepWaitMs: 8,
-      stableWindowMs: 15,
-    });
-    await vi.advanceTimersByTimeAsync(100);
-    const result = await resultPromise;
-
-    expect(result).toMatchObject({ status: 'COMPLETE', reason: 'BOTTOM_AND_HEIGHT_STABLE' });
-    expect(result.finalSnapshot?.scrollTarget).toBe('SCROLLING_ELEMENT');
-    expect(result.innerScrollScan).toMatchObject({ scanLimitReached: true, containerCount: 0, representative: null });
-    expect(result.restoration).toEqual({ status: 'RESTORED', position: { scrollX: 0, scrollY: 0 } });
   });
 
   it('returns PARTIAL SCROLL_TARGET_UNSTABLE when the larger candidate changes again after the one switch (R\'2 I-1)', async () => {
@@ -582,9 +494,8 @@ describe('page settling and controlled scrolling', () => {
     expect(result.restoration).toEqual({ status: 'RESTORED', position: { scrollX: 0, scrollY: 0 } });
   });
 
-  it('caps the recorded observations, keeps the first and the last ones, and records the omitted count (F11)', async () => {
-    // 設計書 foundation-corrections 5.8: 期限まで高さが増え続ける敵対的なページでも、観測の記録の件数に上限を設け、
-    // 切り捨てた件数を記録する。最初の測定と、判定の直前の最後の測定を残す。
+  it('L9: records every observation beyond the former limit and omits none (F11, N18)', async () => {
+    // L9（INV-LIMITS の表 A の N18）: 測定の記録の件数の上限は撤廃した。期限まで高さが増え続けるページでも、全部の測定を記録する。
     vi.useFakeTimers();
     vi.setSystemTime(44_000);
     const measuredScrollYs: number[] = [];
@@ -625,62 +536,16 @@ describe('page settling and controlled scrolling', () => {
     await vi.advanceTimersByTimeAsync(MAX_SCROLL_OBSERVATIONS * 3 + 100);
     const result = await resultPromise;
 
-    const trailingCount = MAX_SCROLL_OBSERVATIONS - MAX_LEADING_SCROLL_OBSERVATIONS;
     expect(result).toMatchObject({ status: 'PARTIAL', reason: 'DEADLINE_EXCEEDED' });
     expect(measuredScrollYs.length).toBeGreaterThan(MAX_SCROLL_OBSERVATIONS);
-    expect(result.observations).toHaveLength(MAX_SCROLL_OBSERVATIONS);
-    expect(result.omittedObservationCount).toBe(measuredScrollYs.length - MAX_SCROLL_OBSERVATIONS);
-    expect(result.observations.map((observation) => observation.scrollY)).toEqual([
-      ...measuredScrollYs.slice(0, MAX_LEADING_SCROLL_OBSERVATIONS),
-      ...measuredScrollYs.slice(-trailingCount),
-    ]);
-    // 最後の測定は切り捨てず、`finalSnapshot` と一致する。高さが増えた回数は、切り捨てた測定も含めて数える。
+    expect(result.observations).toHaveLength(measuredScrollYs.length);
+    expect(result.omittedObservationCount).toBe(0);
+    expect(result.observations.map((observation) => observation.scrollY)).toEqual(measuredScrollYs);
+    // 最後の測定は `finalSnapshot` と一致する。
     expect(result.finalSnapshot).toEqual(result.observations.at(-1));
     expect(result.finalSnapshot?.scrollY).toBe(measuredScrollYs.at(-1));
     expect(result.heightGrowthCount).toBe(measuredScrollYs.length - 1);
     expect(Object.isFrozen(result.observations)).toBe(true);
-  });
-
-  it('records no omitted observation while the observations stay within the limit (F11)', async () => {
-    vi.useFakeTimers();
-    vi.setSystemTime(46_000);
-    const fakePage = {
-      isClosed: () => false,
-      evaluate: vi.fn(async (_callback: unknown, argument: unknown) => {
-        const record = argument as Record<string, unknown>;
-        if (record.phase === 'INNER_SCROLL_SCAN') {
-          return EMPTY_INNER_SCROLL_SCAN;
-        }
-        if (record.phase === 'RESET' || record.phase === 'RESTORE') {
-          return { scrollX: 0, scrollY: 0 };
-        }
-        if (record.phase === 'STEP') {
-          return 'MUTATED';
-        }
-        return {
-          scrollTarget: 'SCROLLING_ELEMENT',
-          scrollY: 200,
-          viewportHeight: 100,
-          scrollHeight: 300,
-          contentHeight: 300,
-          documentScrollRange: 200,
-          bodyScrollRange: 0,
-        };
-      }),
-    } as unknown as Page;
-
-    const resultPromise = controlledScroll(fakePage, {
-      deadlineAtMs: 47_000,
-      stepViewportFraction: 0.5,
-      stepWaitMs: 8,
-      stableWindowMs: 15,
-    });
-    await vi.advanceTimersByTimeAsync(100);
-    const result = await resultPromise;
-
-    expect(result).toMatchObject({ status: 'COMPLETE', omittedObservationCount: 0, targetSwitchCount: 0 });
-    expect(result.observations.length).toBeGreaterThan(0);
-    expect(result.observations.length).toBeLessThan(MAX_SCROLL_OBSERVATIONS);
   });
 
   it('treats an invalid inner container scan result as an evaluation failure', async () => {
@@ -799,6 +664,94 @@ describe('page settling and controlled scrolling', () => {
     expect(result.restoration).toEqual({ status: 'NOT_RESTORED', reason: 'EVALUATION_FAILED', position: null });
   });
 
+  it('records POSITION_NOT_AT_ORIGIN when the traversed inner container does not return to its origin (DEF-207)', async () => {
+    vi.useFakeTimers();
+    vi.setSystemTime(44_000);
+    const innerState = { scrollTop: 0, disposed: false };
+    const innerPhases: unknown[] = [];
+    const fakeHandle = {
+      asElement: () => fakeHandle,
+      dispose: async () => {
+        innerState.disposed = true;
+      },
+      evaluate: vi.fn(async (_callback: unknown, argument: unknown) => {
+        // L9: 領域の位置（selector の元）の読み取りは、入力を渡さない。
+        if (argument === undefined) {
+          return [0, 1, 0];
+        }
+        const record = argument as Record<string, unknown>;
+        innerPhases.push(record.phase);
+        if (record.phase === 'INNER_STEP') {
+          innerState.scrollTop = record.top as number;
+          return 'MUTATED';
+        }
+        if (record.phase === 'INNER_RESTORE') {
+          // ページの作りが、入れ物を元の位置へ戻させない。
+          return 50;
+        }
+        return { connected: true, scrollTop: innerState.scrollTop, clientHeight: 100, scrollHeight: 300 };
+      }),
+    };
+    const fakePage = {
+      isClosed: () => false,
+      // L9: 見つけた全部の領域の並び（JSHandle）を返す。
+      evaluateHandle: vi.fn(async (_callback: unknown, argument: unknown) => {
+        expect((argument as Record<string, unknown>).phase).toBe('INNER_SCROLL_LOCATE');
+        return { getProperties: async () => new Map([['0', fakeHandle]]), dispose: async () => undefined };
+      }),
+      evaluate: vi.fn(async (_callback: unknown, argument: unknown) => {
+        const record = argument as Record<string, unknown>;
+        if (record.phase === 'INNER_SCROLL_SCAN') {
+          return {
+            scannedElementCount: 5,
+            scanLimitReached: false,
+            containerCount: 1,
+            representative: { clientHeight: 100, scrollHeight: 300 },
+          };
+        }
+        if (record.phase === 'RESET' || record.phase === 'RESTORE') {
+          return { scrollX: 0, scrollY: 0 };
+        }
+        if (record.phase === 'STEP') {
+          return 'MUTATED';
+        }
+        // 文書は動かない（内側の入れ物だけが動く）。
+        return {
+          scrollTarget: null,
+          scrollY: 0,
+          viewportHeight: 100,
+          scrollHeight: 100,
+          contentHeight: 100,
+          documentScrollRange: 0,
+          bodyScrollRange: 0,
+        };
+      }),
+    } as unknown as Page;
+
+    const resultPromise = controlledScroll(fakePage, {
+      deadlineAtMs: 45_000,
+      stepViewportFraction: 0.5,
+      stepWaitMs: 8,
+      stableWindowMs: 15,
+    });
+    await vi.advanceTimersByTimeAsync(300);
+    const result = await resultPromise;
+
+    expect(result).toMatchObject({ status: 'COMPLETE', reason: 'BOTTOM_AND_HEIGHT_STABLE' });
+    expect(innerPhases).toContain('INNER_STEP');
+    expect(innerPhases.at(-1)).toBe('INNER_RESTORE');
+    expect(result.restoration).toEqual({ status: 'NOT_RESTORED', reason: 'POSITION_NOT_AT_ORIGIN', position: null });
+    expect(result.innerScrollContainers).toEqual([expect.objectContaining({
+      selector: ':root > :nth-child(2) > :nth-child(1)',
+      originTop: 0,
+      maxScrollTop: 200,
+      reachedBottom: true,
+      stopReason: 'BOTTOM_AND_HEIGHT_STABLE',
+      restored: false,
+    })]);
+    expect(innerState.disposed).toBe(true);
+  });
+
   it('returns honest PARTIAL metadata at the absolute deadline without hanging', async () => {
     const page = await openLazyPage();
     const startedAt = performance.now();
@@ -822,108 +775,6 @@ describe('page settling and controlled scrolling', () => {
       expect(result.finalSnapshot.atBottom).toBe(false);
     }
 
-  });
-
-  it('never promotes a settling observation completed at the absolute deadline', async () => {
-    vi.useFakeTimers();
-    vi.setSystemTime(1_000);
-    const deadlineAtMs = 1_050;
-    const fakePage = {
-      isClosed: () => false,
-      waitForLoadState: vi.fn(async () => undefined),
-      evaluate: vi.fn(() => Promise.resolve().then(() => {
-        vi.setSystemTime(deadlineAtMs);
-        return { readyState: 'complete' as const, scrollHeight: 100 };
-      })),
-    } as unknown as Page;
-
-    const result = await waitForPageSettled(fakePage, {
-      deadlineAtMs,
-      pollIntervalMs: 10,
-      stableWindowMs: 10,
-    });
-
-    expect(result.status).toBe('PARTIAL');
-    expect(result.reason).toBe('DEADLINE_EXCEEDED');
-    expect(result.observations.every((observation) => observation.observedAtMs < deadlineAtMs)).toBe(true);
-    vi.useRealTimers();
-  });
-
-  it('never promotes a scroll observation completed at the absolute deadline', async () => {
-    vi.useFakeTimers();
-    vi.setSystemTime(2_000);
-    const deadlineAtMs = 2_050;
-    let evaluateCall = 0;
-    const fakePage = {
-      isClosed: () => false,
-      evaluate: vi.fn(() => {
-        evaluateCall += 1;
-        if (evaluateCall === 1) {
-          return Promise.resolve('MUTATED');
-        }
-        return Promise.resolve().then(() => {
-          vi.setSystemTime(deadlineAtMs);
-          return { scrollY: 0, viewportHeight: 100, scrollHeight: 100 };
-        });
-      }),
-    } as unknown as Page;
-
-    const result = await controlledScroll(fakePage, {
-      deadlineAtMs,
-      stepViewportFraction: 0.5,
-      stepWaitMs: 10,
-      stableWindowMs: 10,
-    });
-
-    expect(result.status).toBe('PARTIAL');
-    expect(result.reason).toBe('DEADLINE_EXCEEDED');
-    expect(result.observations.every((observation) => observation.observedAtMs < deadlineAtMs)).toBe(true);
-    vi.useRealTimers();
-  });
-
-  it('cannot mutate scroll after returning deadline PARTIAL when evaluate starts late', async () => {
-    const initialScrollY = 73;
-    let scrollY = initialScrollY;
-    let releaseEvaluate: (() => void) | undefined;
-    let finishLateCallback: (() => void) | undefined;
-    const evaluateStarted = new Promise<void>((resolve) => {
-      releaseEvaluate = resolve;
-    });
-    const lateCallbackFinished = new Promise<void>((resolve) => {
-      finishLateCallback = resolve;
-    });
-    const scrollTo = vi.fn((_x: number, y: number) => {
-      scrollY = y;
-    });
-    const fakeWindow = { scrollTo };
-    const fakePage = {
-      isClosed: () => false,
-      evaluate: vi.fn(async (callback: (argument: { readonly deadlineAtMs: number }) => unknown, argument: { readonly deadlineAtMs: number }) => {
-        await evaluateStarted;
-        const previousWindow = globalThis.window;
-        Object.defineProperty(globalThis, 'window', { value: fakeWindow, configurable: true });
-        try {
-          return callback(argument);
-        } finally {
-          Object.defineProperty(globalThis, 'window', { value: previousWindow, configurable: true });
-          finishLateCallback?.();
-        }
-      }),
-    } as unknown as Page;
-
-    const resultPromise = controlledScroll(fakePage, {
-      deadlineAtMs: Date.now() + 20,
-      stepViewportFraction: 0.5,
-      stepWaitMs: 10,
-      stableWindowMs: 10,
-    });
-    const result = await resultPromise;
-
-    expect(result).toMatchObject({ status: 'PARTIAL', reason: 'DEADLINE_EXCEEDED' });
-    releaseEvaluate?.();
-    await lateCallbackFinished;
-    expect(scrollTo).not.toHaveBeenCalled();
-    expect(scrollY).toBe(initialScrollY);
   });
 
   it('requires a new full stable window after document height shrinks', async () => {
@@ -994,182 +845,13 @@ describe('page settling and controlled scrolling', () => {
     expect(result.heightGrowthCount).toBe(0);
   });
 
-  it('classifies late DOM-readiness rejection as deadline but preserves an early rejection', async () => {
-    vi.useFakeTimers();
-    vi.setSystemTime(10_000);
-    const lateDeadline = 10_050;
-    const latePage = {
-      isClosed: () => false,
-      waitForLoadState: vi.fn(() => Promise.resolve().then(() => {
-        vi.setSystemTime(lateDeadline);
-        throw new Error('late DOM failure');
-      })),
-    } as unknown as Page;
-
-    const late = await waitForPageSettled(latePage, {
-      deadlineAtMs: lateDeadline,
-      pollIntervalMs: 10,
-      stableWindowMs: 10,
-    });
-    expect(late).toMatchObject({ status: 'PARTIAL', reason: 'DEADLINE_EXCEEDED' });
-
-    vi.setSystemTime(11_000);
-    const earlyPage = {
-      isClosed: () => false,
-      waitForLoadState: vi.fn(async () => {
-        throw new Error('early DOM failure');
-      }),
-    } as unknown as Page;
-    const early = await waitForPageSettled(earlyPage, {
-      deadlineAtMs: 11_050,
-      pollIntervalMs: 10,
-      stableWindowMs: 10,
-    });
-    expect(early).toMatchObject({ status: 'PARTIAL', reason: 'DOM_READINESS_FAILED' });
-  });
-
-  it('classifies late settling-evaluation rejection as deadline but preserves an early rejection', async () => {
-    vi.useFakeTimers();
-    vi.setSystemTime(12_000);
-    const lateDeadline = 12_050;
-    const latePage = {
-      isClosed: () => false,
-      waitForLoadState: vi.fn(async () => undefined),
-      evaluate: vi.fn(() => Promise.resolve().then(() => {
-        vi.setSystemTime(lateDeadline);
-        throw new Error('late settling evaluation failure');
-      })),
-    } as unknown as Page;
-    const late = await waitForPageSettled(latePage, {
-      deadlineAtMs: lateDeadline,
-      pollIntervalMs: 10,
-      stableWindowMs: 10,
-    });
-    expect(late).toMatchObject({ status: 'PARTIAL', reason: 'DEADLINE_EXCEEDED' });
-
-    vi.setSystemTime(13_000);
-    const earlyPage = {
-      isClosed: () => false,
-      waitForLoadState: vi.fn(async () => undefined),
-      evaluate: vi.fn(async () => {
-        throw new Error('early settling evaluation failure');
-      }),
-    } as unknown as Page;
-    const early = await waitForPageSettled(earlyPage, {
-      deadlineAtMs: 13_050,
-      pollIntervalMs: 10,
-      stableWindowMs: 10,
-    });
-    expect(early).toMatchObject({ status: 'PARTIAL', reason: 'EVALUATION_FAILED' });
-  });
-
-  it('classifies a settling-evaluation rejection through pageFailureReason when isClosed throws (C8, F04)', async () => {
-    let isClosedCalls = 0;
-    const page = {
-      isClosed: () => {
-        isClosedCalls += 1;
-        if (isClosedCalls > 2) {
-          throw new Error('page state is unavailable');
-        }
-        return false;
-      },
-      waitForLoadState: vi.fn(async () => undefined),
-      evaluate: vi.fn(async () => {
-        throw new Error('settling evaluation failure');
-      }),
-    } as unknown as Page;
-
-    const result = await waitForPageSettled(page, {
-      deadlineAtMs: Date.now() + 5_000,
-      pollIntervalMs: 10,
-      stableWindowMs: 10,
-    });
-
-    expect(result).toMatchObject({ status: 'PARTIAL', reason: 'EVALUATION_FAILED' });
-    expect(isClosedCalls).toBe(3);
-  });
-
-  it('classifies late scroll-reset rejection as deadline but preserves an early rejection', async () => {
-    vi.useFakeTimers();
-    vi.setSystemTime(14_000);
-    const lateDeadline = 14_050;
-    const latePage = {
-      isClosed: () => false,
-      evaluate: vi.fn(() => Promise.resolve().then(() => {
-        vi.setSystemTime(lateDeadline);
-        throw new Error('late reset failure');
-      })),
-    } as unknown as Page;
-    const late = await controlledScroll(latePage, {
-      deadlineAtMs: lateDeadline,
-      stepViewportFraction: 0.5,
-      stepWaitMs: 10,
-      stableWindowMs: 10,
-    });
-    expect(late).toMatchObject({ status: 'PARTIAL', reason: 'DEADLINE_EXCEEDED' });
-
-    vi.setSystemTime(15_000);
-    const earlyPage = {
-      isClosed: () => false,
-      evaluate: vi.fn(async () => {
-        throw new Error('early reset failure');
-      }),
-    } as unknown as Page;
-    const early = await controlledScroll(earlyPage, {
-      deadlineAtMs: 15_050,
-      stepViewportFraction: 0.5,
-      stepWaitMs: 10,
-      stableWindowMs: 10,
-    });
-    expect(early).toMatchObject({ status: 'PARTIAL', reason: 'EVALUATION_FAILED' });
-  });
-
-  it('classifies late scroll-measure rejection as deadline but preserves an early rejection', async () => {
-    vi.useFakeTimers();
-    vi.setSystemTime(16_000);
-    const lateDeadline = 16_050;
-    let lateCall = 0;
-    const latePage = {
-      isClosed: () => false,
-      evaluate: vi.fn(() => {
-        lateCall += 1;
-        return lateCall === 1
-          ? Promise.resolve('MUTATED')
-          : Promise.resolve().then(() => {
-            vi.setSystemTime(lateDeadline);
-            throw new Error('late measure failure');
-          });
-      }),
-    } as unknown as Page;
-    const late = await controlledScroll(latePage, {
-      deadlineAtMs: lateDeadline,
-      stepViewportFraction: 0.5,
-      stepWaitMs: 10,
-      stableWindowMs: 10,
-    });
-    expect(late).toMatchObject({ status: 'PARTIAL', reason: 'DEADLINE_EXCEEDED' });
-
-    vi.setSystemTime(17_000);
-    let earlyCall = 0;
-    const earlyPage = {
-      isClosed: () => false,
-      evaluate: vi.fn(() => {
-        earlyCall += 1;
-        return earlyCall === 1
-          ? Promise.resolve('MUTATED')
-          : Promise.reject(new Error('early measure failure'));
-      }),
-    } as unknown as Page;
-    const early = await controlledScroll(earlyPage, {
-      deadlineAtMs: 17_050,
-      stepViewportFraction: 0.5,
-      stepWaitMs: 10,
-      stableWindowMs: 10,
-    });
-    expect(early).toMatchObject({ status: 'PARTIAL', reason: 'EVALUATION_FAILED' });
-  });
-
-  it('classifies late scroll-step rejection as deadline but preserves an early rejection', async () => {
+  // L9: 本番は controlledScroll に期限を渡さないので、期限を過ぎた失敗の分け方の確かめは外した（期限の代表は
+  // 'returns honest PARTIAL metadata at the absolute deadline without hanging'）。ブラウザの中の失敗は、どの段でも EVALUATION_FAILED にする。
+  it.each([
+    ['reset', 0],
+    ['measure', 1],
+    ['step', 2],
+  ] as const)('classifies a scroll-%s rejection as an evaluation failure', async (phase, succeededCalls) => {
     const tallMeasurement = {
       scrollTarget: 'SCROLLING_ELEMENT',
       scrollY: 0,
@@ -1180,110 +862,22 @@ describe('page settling and controlled scrolling', () => {
       bodyScrollRange: 0,
     };
     vi.useFakeTimers();
-    vi.setSystemTime(18_000);
-    const lateDeadline = 18_050;
-    let lateCall = 0;
-    const latePage = {
+    vi.setSystemTime(15_000);
+    let call = 0;
+    const page = {
       isClosed: () => false,
       evaluate: vi.fn(() => {
-        lateCall += 1;
-        if (lateCall === 1) return Promise.resolve('MUTATED');
-        if (lateCall === 2) return Promise.resolve(tallMeasurement);
-        return Promise.resolve().then(() => {
-          vi.setSystemTime(lateDeadline);
-          throw new Error('late step failure');
-        });
+        call += 1;
+        if (call > succeededCalls) return Promise.reject(new Error(`${phase} failure`));
+        return Promise.resolve(call === 1 ? 'MUTATED' : tallMeasurement);
       }),
     } as unknown as Page;
-    const late = await controlledScroll(latePage, {
-      deadlineAtMs: lateDeadline,
+    const result = await controlledScroll(page, {
+      deadlineAtMs: 15_050,
       stepViewportFraction: 0.5,
       stepWaitMs: 10,
       stableWindowMs: 10,
     });
-    expect(late).toMatchObject({ status: 'PARTIAL', reason: 'DEADLINE_EXCEEDED' });
-
-    vi.setSystemTime(19_000);
-    let earlyCall = 0;
-    const earlyPage = {
-      isClosed: () => false,
-      evaluate: vi.fn(() => {
-        earlyCall += 1;
-        if (earlyCall === 1) return Promise.resolve('MUTATED');
-        if (earlyCall === 2) return Promise.resolve(tallMeasurement);
-        return Promise.reject(new Error('early step failure'));
-      }),
-    } as unknown as Page;
-    const early = await controlledScroll(earlyPage, {
-      deadlineAtMs: 19_050,
-      stepViewportFraction: 0.5,
-      stepWaitMs: 10,
-      stableWindowMs: 10,
-    });
-    expect(early).toMatchObject({ status: 'PARTIAL', reason: 'EVALUATION_FAILED' });
-  });
-
-  it('downgrades terminal settling and scroll success when freezing crosses the deadline', async () => {
-    vi.useFakeTimers();
-    vi.setSystemTime(20_000);
-    let activeDeadline = 20_100;
-    const originalFreeze = Object.freeze;
-    vi.spyOn(Object, 'freeze').mockImplementation(((value: object) => {
-      if (
-        'status' in value
-        && (value.status === 'SETTLED' || value.status === 'COMPLETE')
-      ) {
-        vi.setSystemTime(activeDeadline);
-      }
-      return originalFreeze(value);
-    }) as typeof Object.freeze);
-    const settlingPage = {
-      isClosed: () => false,
-      waitForLoadState: vi.fn(async () => undefined),
-      evaluate: vi.fn(async () => ({ readyState: 'complete' as const, scrollHeight: 100 })),
-    } as unknown as Page;
-    const settlingPromise = waitForPageSettled(settlingPage, {
-      deadlineAtMs: activeDeadline,
-      pollIntervalMs: 10,
-      stableWindowMs: 10,
-    });
-    await vi.advanceTimersByTimeAsync(10);
-    const settling = await settlingPromise;
-    expect(settling).toMatchObject({ status: 'PARTIAL', reason: 'DEADLINE_EXCEEDED' });
-    expect(settling.observations.every((observation) => observation.observedAtMs < activeDeadline)).toBe(true);
-
-    vi.setSystemTime(21_000);
-    activeDeadline = 21_100;
-    let scrollCall = 0;
-    const scrollPage = {
-      isClosed: () => false,
-      evaluate: vi.fn(async (_callback: unknown, argument: unknown) => {
-        if ((argument as { readonly phase?: unknown }).phase === 'INNER_SCROLL_SCAN') {
-          return EMPTY_INNER_SCROLL_SCAN;
-        }
-        scrollCall += 1;
-        return scrollCall % 2 === 1
-          ? 'MUTATED'
-          : {
-              scrollTarget: null,
-              scrollY: 0,
-              viewportHeight: 100,
-              scrollHeight: 100,
-              contentHeight: 100,
-              documentScrollRange: 0,
-              bodyScrollRange: 0,
-            };
-      }),
-    } as unknown as Page;
-    const scrollPromise = controlledScroll(scrollPage, {
-      deadlineAtMs: activeDeadline,
-      stepViewportFraction: 0.5,
-      stepWaitMs: 10,
-      stableWindowMs: 10,
-    });
-    await vi.advanceTimersByTimeAsync(10);
-    const scroll = await scrollPromise;
-    expect(scroll).toMatchObject({ status: 'PARTIAL', reason: 'DEADLINE_EXCEEDED' });
-    expect(scroll.observations.every((observation) => observation.observedAtMs < activeDeadline)).toBe(true);
+    expect(result).toMatchObject({ status: 'PARTIAL', reason: 'EVALUATION_FAILED' });
   });
 });

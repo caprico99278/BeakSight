@@ -15,7 +15,6 @@ import { DEFAULT_CONFIG } from '../../src/config/defaults.js';
 import { loadConfig } from '../../src/config/load-config.js';
 import {
   GENERATED_TARGET_CRAWL_LIMITS,
-  MAX_GENERATED_ALLOWED_ORIGINS,
   TARGET_CONFIG_CREATION_FAILURES,
   TARGET_SITE_PROBLEMS,
   allowedOriginsProblemOf,
@@ -30,7 +29,6 @@ import {
   targetSiteProblemsOf,
 } from '../../src/config/target-config-draft.js';
 import { validateConfig } from '../../src/config/validate-config.js';
-import { MAX_URL_LENGTH } from '../../src/core/limits.js';
 import { isAcceptedTargetConfigPath } from '../../src/control/profile-policy.js';
 import { validateControlDocument } from '../../src/control/control-schema-validator.js';
 import { LOCAL_TARGET_CONFIG_DIRECTORY, TARGET_CONFIG_EXTENSION } from '../../src/control/target-config-locations.js';
@@ -59,7 +57,8 @@ describe('T43b: the start URL', () => {
     expect(startUrlProblemOf('https://user@example.test/')).toBe('START_URL_HAS_CREDENTIALS');
     expect(startUrlProblemOf('https://example.test/#top')).toBe('START_URL_HAS_FRAGMENT');
     expect(startUrlProblemOf('https://example.test/#')).toBe('START_URL_HAS_FRAGMENT');
-    expect(startUrlProblemOf(`https://example.test/${'a'.repeat(MAX_URL_LENGTH)}`)).toBe('START_URL_TOO_LONG');
+    // L14（表 A の N23）: 長さでは拒まない。
+    expect(startUrlProblemOf(`https://example.test/${'a'.repeat(2_049)}`)).toBeNull();
   });
 
   it('gives the origin and the path of the start URL (nothing for a rejected URL)', () => {
@@ -83,9 +82,12 @@ describe('MI-C: the same start URL of a target configuration', () => {
 
   it('compares the start URLs after the normalization of the audit start', () => {
     expect(startsAtSameUrl(configOf('https://example.test/admin/'), 'https://example.test/admin/')).toBe(true);
-    // 追跡の引数と、許していない引数と、空白は、開始の URL を変えない。
+    // 追跡の引数と、空白は、開始の URL を変えない。
     expect(startsAtSameUrl(configOf('https://example.test/admin/?utm_source=mail'), ' https://example.test/admin/ ')).toBe(true);
-    expect(startsAtSameUrl(configOf('https://example.test/admin/?tab=1'), 'https://example.test/admin/')).toBe(true);
+    // L14: 残す名前を選んでいなければ、query は開始の URL の一部（秘密に見える名前は捨てる）。
+    expect(startsAtSameUrl(configOf('https://example.test/admin/?tab=1'), 'https://example.test/admin/')).toBe(false);
+    expect(startsAtSameUrl(configOf('https://example.test/admin/?tab=1'), 'https://example.test/admin/?tab=1')).toBe(true);
+    expect(startsAtSameUrl(configOf('https://example.test/admin/?token=1'), 'https://example.test/admin/')).toBe(true);
     expect(startsAtSameUrl(configOf('https://Example.TEST:443/admin/'), 'https://example.test/admin/')).toBe(true);
     // 許した引数は開始の URL の一部。
     expect(startsAtSameUrl(configOf('https://example.test/admin/?tab=1', ['tab']), 'https://example.test/admin/')).toBe(false);
@@ -105,14 +107,14 @@ describe('T43b: the allowed origins', () => {
     expect(allowedOriginsProblemOf(['https://cdn.example.test', 'https://example.test'], 'https://example.test/')).toBeNull();
   });
 
-  it('rejects an empty list, a value that is not a canonical origin, too many origins and a list without the start origin', () => {
+  it('rejects an empty list, a value that is not a canonical origin and a list without the start origin (LZ-3a: any number of origins)', () => {
     expect(allowedOriginsProblemOf([], 'https://example.test/')).toBe('ALLOWED_ORIGINS_REQUIRED');
     expect(allowedOriginsProblemOf(['https://example.test/'], 'https://example.test/')).toBe('ALLOWED_ORIGIN_INVALID');
     expect(allowedOriginsProblemOf(['https://example.test/path'], 'https://example.test/')).toBe('ALLOWED_ORIGIN_INVALID');
     expect(allowedOriginsProblemOf(['ftp://example.test'], 'https://example.test/')).toBe('ALLOWED_ORIGIN_INVALID');
     expect(allowedOriginsProblemOf(['https://user@example.test'], 'https://example.test/')).toBe('ALLOWED_ORIGIN_INVALID');
-    const tooMany = Array.from({ length: MAX_GENERATED_ALLOWED_ORIGINS + 1 }, (_, index) => `https://site${index}.example.test`);
-    expect(allowedOriginsProblemOf(tooMany, 'https://site0.example.test/')).toBe('ALLOWED_ORIGINS_TOO_MANY');
+    const many = Array.from({ length: 17 }, (_, index) => `https://site${index}.example.test`);
+    expect(allowedOriginsProblemOf(many, 'https://site0.example.test/')).toBeNull();
     expect(allowedOriginsProblemOf(['https://other.example.test'], 'https://example.test/')).toBe('ALLOWED_ORIGINS_MISSING_START');
   });
 
@@ -132,11 +134,10 @@ describe('T43b: the generated target configuration file', () => {
     expect(isAcceptedTargetConfigPath(`${LOCAL_TARGET_CONFIG_DIRECTORY}example-test${TARGET_CONFIG_EXTENSION}`)).toBe(true);
   });
 
-  // T43b fix round 2（設計書 7 章の最後の行。設計者の既定）: 最初の読み込みのための控えめな負荷（最大 3 ページ、間隔 10 秒）。CLI の既定値は変えない。
-  it('uses the modest first-load limits (3 pages, 10 seconds) and keeps the CLI defaults unchanged', () => {
-    expect(GENERATED_TARGET_CRAWL_LIMITS).toEqual({ maxPages: 3, minNavigationIntervalMs: 10_000 });
+  // T43b fix round 2: 最初の読み込みの間隔 10 秒。L14 の後の段: ページの上限 3 は書かない（利用者が指定したときだけ効く）。
+  it('uses the modest first-load navigation interval (10 seconds) without a page limit', () => {
+    expect(GENERATED_TARGET_CRAWL_LIMITS).toEqual({ minNavigationIntervalMs: 10_000 });
     expect(Object.isFrozen(GENERATED_TARGET_CRAWL_LIMITS)).toBe(true);
-    expect([DEFAULT_CONFIG.crawl.maxPages, DEFAULT_CONFIG.crawl.minNavigationIntervalMs]).toEqual([500, 5_000]);
   });
 
   it('holds the target id, the site, the first-load limits and the other load and output settings from the defaults, and passes validateConfig', () => {
@@ -148,7 +149,8 @@ describe('T43b: the generated target configuration file', () => {
     expect(document).toEqual({
       target: { id: 'example-test' },
       site: { startUrl: 'https://example.test/admin/', allowedOrigins: ['https://example.test'] },
-      crawl: { ...DEFAULT_CONFIG.crawl, maxPages: 3, minNavigationIntervalMs: 10_000 },
+      // L14: 最初の読み込みの値だけを書く（隠れた既定の値を書き込まない）。
+      crawl: { minNavigationIntervalMs: 10_000 },
       output: DEFAULT_CONFIG.output,
     });
     // 既定値の部品と参照を共有しない（書き出す値を変えても、既定値は変わらない）。
@@ -203,14 +205,15 @@ describe('T43b: the generated target configuration file', () => {
 
 describe('T43b: the create input schema', () => {
   const schema = JSON.parse(readFileSync('schemas/control/ui-profile-create.schema.json', 'utf8')) as {
-    properties: { newTargetSite: { properties: { startUrl: { maxLength: number }; allowedOrigins: { maxItems: number; items: { maxLength: number } } } } };
+    properties: { newTargetSite: { properties: { startUrl: { maxLength?: number }; allowedOrigins: { maxItems?: number; items: { maxLength?: number } } } } };
   };
 
   it('has the same limits as the draft module', () => {
     const site = schema.properties.newTargetSite.properties;
-    expect(site.startUrl.maxLength).toBe(MAX_URL_LENGTH);
-    expect(site.allowedOrigins.maxItems).toBe(MAX_GENERATED_ALLOWED_ORIGINS);
-    expect(site.allowedOrigins.items.maxLength).toBe(MAX_URL_LENGTH);
+    // URL-LEN: 開始の URL と Origin の長さの上限（前は 2,048）はない。LZ-3a: Origin の件数の上限（前は 16）もない。
+    expect(site.startUrl.maxLength).toBeUndefined();
+    expect(site.allowedOrigins.maxItems).toBeUndefined();
+    expect(site.allowedOrigins.items.maxLength).toBeUndefined();
   });
 
   it('accepts the profile alone (the existing file) and the profile with a new target site, and nothing else', () => {

@@ -93,13 +93,19 @@ export const replaceLoneSurrogates = (value: string): string => value.toWellForm
 export const truncateWellFormed = (value: string, maxLength: number): string => value.slice(0, maxLength).toWellFormed();
 
 /**
+ * LU-SFIX3-A（LU-SREV3 の Minor-1）: 比べるための Unicode の互換の正規化の形の名前（唯一の定義）。`foldNfkcCase` と、ページの中の関数に入力で渡す
+ * 部品（一覧の行の値の比べ `src/discovery/read-executor.ts`。ページの中では import できない）が使う。
+ */
+export const UNICODE_COMPATIBILITY_NORMALIZATION_FORM = 'NFKC';
+
+/**
  * 比べるための畳み込み（CCX-15。共通化の台帳の CC-069）: Unicode の正規化（NFKC）の後に、`toUpperCase` の後に `toLowerCase` をかけた形。
  * `ſ`（U+017F）は `s` に、ケルビン記号（U+212A）は `k` に、全角の英字と記号（`／`、`；` を含む）は ASCII に、`ß` は `ss` に、合字（U+FB01）は
  * `fi` になる（順序は変えない。`toLowerCase` だけでは `ß` が残る）。ロケールに依存しない。要求の判定の owner の、除外のパスと危険な語の
  * 比べ（`src/safety/request-policy.ts`）と、発見の候補の分類（`src/discovery/classify.ts`）が使う。NFKC の正規化は、ここだけに書く
  * （`tests/architecture/text-character-classes.test.ts` の Gate）。
  */
-export const foldNfkcCase = (value: string): string => value.normalize('NFKC').toUpperCase().toLowerCase();
+export const foldNfkcCase = (value: string): string => value.normalize(UNICODE_COMPATIBILITY_NORMALIZATION_FORM).toUpperCase().toLowerCase();
 
 /** 結合文字（Unicode の一般カテゴリ M）。 */
 const COMBINING_MARKS = /\p{M}/gu;

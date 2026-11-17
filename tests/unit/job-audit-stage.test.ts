@@ -39,7 +39,6 @@ import {
 } from '../../src/discovery/read-check-evaluation.js';
 import {
   SESSION_KEY_LOST_DETAIL,
-  isServiceRequestLimitReached,
   jobContextFactoryOptions,
   serviceReadRefusalCountOf,
   sessionKeyLostDetailOf,
@@ -59,7 +58,6 @@ const AUDIT_STAGE: AuditStageServiceRequests = {
   approvedServiceOrigins: [SERVICE_ORIGIN],
   auditReadRequests: [{ origin: SERVICE_ORIGIN, path: LIST_RPC_PATH, method: 'POST', maxPerPageLoad: 1 }],
   scriptLogin: { origin: SERVICE_ORIGIN, path: '/auth/v1/token', requiredQuery: [{ name: 'grant_type', value: 'password' }] },
-  serviceRequestLimits: { perMinute: 2, perRun: 2 },
 };
 const authentication = (stage: AuditStageServiceRequests | undefined): RunAuthentication => ({
   initialState: { cookies: [], origins: [] },
@@ -126,10 +124,13 @@ describe('T37a: the closed lists of the end reasons and the page reasons', () =>
     expect(READ_CHECK_NOT_EXECUTED_REASONS).toContain(LIMIT_REASON);
   });
 
-  it('has SERVICE_READ_REFUSED at the end of the page reasons, and session-key as the only detail of the end', () => {
+  it('has SERVICE_READ_REFUSED in the page reasons after the reasons of reading itself, and session-key and SERVICE_UNAUTHORIZED (DEF-233) as the details of the end', () => {
     expect(SERVICE_READ_REFUSED_REASON).toBe('SERVICE_READ_REFUSED');
-    expect(INCOMPLETE_REASONS.at(-1)).toBe(SERVICE_READ_REFUSED_REASON);
-    expect(JOB_END_REASON_DETAILS).toEqual(['session-key']);
+    // L6/L3-1: 閉じた一覧の末尾に、1 画面の見張りの理由（`STAGE_UNRESPONSIVE`・`STAGE_NEVER_QUIET`）を足したので、末尾の位置では確かめない。確かめたいのは、
+    // T37a の理由が一覧にあり、読み取りそのものの理由（読み切れない・上限など）の後に並ぶこと（記録の理由は一覧の順に並ぶ。下の `withServiceReadRefused` の確かめ）。
+    expect(INCOMPLETE_REASONS).toContain(SERVICE_READ_REFUSED_REASON);
+    expect(INCOMPLETE_REASONS.indexOf(SERVICE_READ_REFUSED_REASON)).toBeGreaterThan(INCOMPLETE_REASONS.indexOf('INCOMPLETE_LIMIT_REACHED'));
+    expect(JOB_END_REASON_DETAILS).toEqual(['session-key', 'SERVICE_UNAUTHORIZED']);
     // 詳しい理由の値は Task 35 と同じ（owner は `src/core/contracts.ts`。Run Coordinator と同じ値を使う）。
     expect(SESSION_KEY_LOST_DETAIL).toBe(CORE_SESSION_KEY_LOST_DETAIL);
     expect(SESSION_KEY_LOST_DETAIL).toBe('session-key');
@@ -283,18 +284,15 @@ describe('T37a: the audit stage of the jobs without the Run Coordinator', () => 
     if (state === null) {
       throw new Error('the state was not made');
     }
-    expect(isServiceRequestLimitReached(null)).toBe(false);
     expect(sessionKeyLostDetailOf(null)).toBeNull();
-    expect(isServiceRequestLimitReached(state)).toBe(false);
     expect(serviceReadRefusalCountOf(state)).toBe(0);
-    expect([state.budget.tryConsume(), state.budget.tryConsume()]).toEqual([true, true]);
-    // `perRun` まで数えたら、次の画面を始めない（断った要求はまだない）。
-    expect(isServiceRequestLimitReached(state)).toBe(true);
+    // L11 で直した: 前の上限（2 件）を超えても断らず、上限に届いたとも言わない（次の画面を始める。LZ-3c: 上限の値も、届いたかの判定も捨てた）。
+    expect([state.budget.tryConsume(), state.budget.tryConsume(), state.budget.tryConsume()]).toEqual([true, true, true]);
+    expect(state.budget.snapshot()).toMatchObject({ refused: 0, limitReached: false });
     expect(serviceReadRefusalCountOf(state)).toBe(0);
-    expect(state.budget.tryConsume()).toBe(false);
     factoryOptions.onServiceUnauthorizedResponse?.();
-    // 断った要求と 401 の数の和（画面ごとの差で、その画面の不完全の理由を決める）。
-    expect(serviceReadRefusalCountOf(state)).toBe(2);
+    // 断った要求（今は 0）と 401 の数の和（画面ごとの差で、その画面の不完全の理由を決める）。
+    expect(serviceReadRefusalCountOf(state)).toBe(1);
     expect(sessionKeyLostDetailOf(state)).toBeNull();
     factoryOptions.onSessionKeyLost?.();
     expect(sessionKeyLostDetailOf(state)).toBe(SESSION_KEY_LOST_DETAIL);

@@ -233,12 +233,11 @@ export interface ApprovalView {
   readonly receiptId: string;
   readonly approvalDigest: string;
   readonly approvedAtText: string;
-  readonly expiresAtText: string;
   readonly approver: string;
   readonly revokedAtStartText: string;
   readonly inputRuleText: string;
+  /** 1 回の件数（LZ-3c: 承認の期限・期限の日数・累積の上限は、判定に使わない名残なので出さない）。 */
   readonly limitsText: string;
-  readonly approvalTtlDaysText: string;
   readonly sideEffects: readonly { readonly label: string; readonly confirmedText: string }[];
   readonly grantId: string;
   readonly grantIssuedAtText: string;
@@ -500,12 +499,10 @@ const approvalOf = (summary: ApprovalSummaryReportInput): ApprovalView => {
     receiptId: summary.approval.receiptId,
     approvalDigest: summary.approval.approvalDigest,
     approvedAtText: timeText(summary.approval.approvedAt),
-    expiresAtText: timeText(summary.approval.expiresAt),
     approver: summary.approval.approver,
     revokedAtStartText: booleanText(summary.revokedAtStart),
     inputRuleText: rule === null ? ACTION_REPORT_TEXT.none : ACTION_REPORT_TEXT.inputRuleValue(rule.ruleSetId, formatInteger(rule.revision), rule.digest),
-    limitsText: ACTION_REPORT_TEXT.limitsValue(formatInteger(summary.limits.maxCreatesPerRun), formatInteger(summary.limits.maxCumulativeCreates)),
-    approvalTtlDaysText: ACTION_REPORT_TEXT.approvalTtlDaysValue(formatInteger(summary.approvalTtlDays)),
+    limitsText: ACTION_REPORT_TEXT.limitsValue(formatInteger(summary.limits.maxCreatesPerRun)),
     sideEffects: sideEffectItems.map((item) => ({
       label: SIDE_EFFECT_CONFIRMATION_CATALOG[item].label,
       confirmedText: summary.sideEffectConfirmations[item] ? ACTION_REPORT_TEXT.sideEffectConfirmed : ACTION_REPORT_TEXT.sideEffectNotConfirmed,
@@ -516,7 +513,7 @@ const approvalOf = (summary: ApprovalSummaryReportInput): ApprovalView => {
     grantConsumedAtText: timeText(summary.grantAtStart.consumedAt),
     reservationCountText: formatInteger(summary.reservationAtStart.count),
     reservedAtText: timeText(summary.reservationAtStart.reservedAt),
-    cumulativeText: ACTION_REPORT_TEXT.cumulativeValue(formatInteger(summary.cumulativeAtStart.used), formatInteger(summary.cumulativeAtStart.limit)),
+    cumulativeText: ACTION_REPORT_TEXT.cumulativeValue(formatInteger(summary.cumulativeAtStart.used)),
     capturedAtText: timeText(summary.capturedAt),
     humanDecisions: sortByDisplayOrder(summary.humanDecisions, HUMAN_DECISION_CATALOG).map((item) => HUMAN_DECISION_CATALOG[item]),
     automatedActions: sortByDisplayOrder(summary.automatedActions, AUTOMATED_ACTION_CATALOG).map((item) => AUTOMATED_ACTION_CATALOG[item]),

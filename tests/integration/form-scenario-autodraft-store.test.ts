@@ -199,7 +199,7 @@ const createFormDraft = (): { readonly scenarioId: string; readonly revision: nu
   expect(createScenario(database, { scenarioId, draft: create.draft, discovery: DISCOVERY, at: CREATED_AT })).toMatchObject({ ok: true });
   const { revision, varying } = attachRules(scenarioId, RULES_AT);
   const choice = formAnswerReadChoiceOf({
-    answerRead: create.answerRead.value, definitions: readCheckFactsOf(), verificationOnlyReadCheckIds: readVerificationOnlyReadCheckIds(database, PROFILE_ID), maxDefinitions: 20,
+    answerRead: create.answerRead.value, definitions: readCheckFactsOf(), verificationOnlyReadCheckIds: readVerificationOnlyReadCheckIds(database, PROFILE_ID),
   });
   if (choice.kind !== 'CREATE') {
     throw new Error(`the answer check is ${choice.kind}`);

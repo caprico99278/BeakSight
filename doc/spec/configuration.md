@@ -28,16 +28,16 @@
 
 | 項目 | 既定値 | 意味 |
 | --- | --- | --- |
-| `crawl.maxPages` | `500` | 監査するページの数の上限。`1` 以上 `100000` 以下にする必要があります（`MAX_CRAWL_MAX_PAGES`。承認したサービスの Origin への要求の 1 回の Run の上限の既定を、ページの上限から作るため。Task 44 のレビューの M-3） |
-| `crawl.maxDepth` | `20` | 開始の URL からのリンクの深さの上限 |
-| `crawl.maxRuntimeMs` | `3600000`（60分） | 1回の起動ごとの実行時間の上限。この時間を過ぎたら、新しいページの監査を始めません（監査中のページは続けます）。再開した起動は、その起動の開始から数えます。上限で止まった Run は、同じコマンドで続きから再開できます（「[中断と再開](resume.md#中断と再開)」） |
-| `crawl.navigationTimeoutMs` | `30000` | ページを開く処理の期限 |
-| `crawl.overallPageTimeoutMs` | `60000` | 1つのページの監査の期限 |
-| `crawl.resourceSettlingTimeoutMs` | `5000` | リソースの読み込みが落ち着くのを待つ期限 |
-| `crawl.interactionTimeoutMs` | `3000` | Interaction の1つの候補を確かめる期限 |
+| `crawl.maxPages` | なし | 監査するページの数の上限。書いたときだけ効きます。書かなければ上限はなく、報告と画面には「指定なし」と出ます。`1` 以上の整数にします（上限はありません） |
+| `crawl.maxDepth` | なし | 開始の URL からたどるリンクの深さの上限。書いたときだけ効きます（`1` 以上） |
+| `crawl.maxRuntimeMs` | なし | 1回の起動の時間の上限（ミリ秒）。書いたときだけ効きます。書かなければ期限はなく、報告と画面には「指定なし」と出ます。この時間を過ぎたら、新しいページの監査を始めません（監査中のページは続けます）。再開した起動は、その起動の開始から数えます。上限で止まった Run は、同じコマンドで続きから再開できます（「[中断と再開](resume.md#中断と再開)」） |
+| `crawl.navigationTimeoutMs` | なし | ページを開く処理の期限（ミリ秒）。書いたときだけ効きます。書かなければ、ページが反応している間は待ちます |
+| `crawl.overallPageTimeoutMs` | なし | 前の版の項目です。ページの監査の期限には使いません。ただし、Interaction を行う設定で、この項目と `crawl.navigationTimeoutMs`・`crawl.interactionTimeoutMs` をすべて書いたときは、この値が `crawl.navigationTimeoutMs + 2 × crawl.interactionTimeoutMs` 以上でないと、設定の誤りになります |
+| `crawl.resourceSettlingTimeoutMs` | なし | 前の版の項目です。書いても、今は使いません |
+| `crawl.interactionTimeoutMs` | なし | Interaction の1つの候補を確かめる期限（ミリ秒）。書いたときだけ効きます（`1000` より大きい値） |
 | `crawl.minNavigationIntervalMs` | `5000`（5秒） | ページの読み込みの最小の間隔（ミリ秒）。ページの読み込みの要求がサイトに届く間隔が、この時間以上になるように、次の読み込みを始めます（前の読み込みの開始、その要求をサイトに送った時刻、その応答を受けた時刻のうち、最も遅い時刻から数えます。自動ログインの読み込みも含みます）。`1000` 以上にする必要があります。ただし、`site.allowedOrigins` がすべてループバックのアドレス（`127.0.0.1`、`[::1]`、`localhost`）の場合は、`0` 以上にできます。方針と、監査にかかる時間への影響は「[サイトへの負荷](site-load.md#サイトへの負荷)」を見てください |
-| `crawl.maxInteractionsPerPage` | `20` | 1つのページで、Interaction で確かめる候補の数の上限。`1` 以上 `100` 以下にする必要があります（`100` は、1つのページで見つける候補の数の上限です）。上限を超えた候補の扱いは「[サイトへの負荷](site-load.md#サイトへの負荷)」を見てください |
-| `crawl.allowedQueryParameters` | `[]` | URL の正規化で残すクエリの名前。一覧にないクエリは、URL から除きます。秘密に見える名前（`token`、`session`、`code`、`state` など）を入れると、監査は設定の誤り（`CONFIG_ERROR`）で始まりません（公開の監査と認証つきの監査の両方。Task 44 の P4-1） |
+| `crawl.maxInteractionsPerPage` | なし | 1つのページで、Interaction で確かめる候補の数の上限。書いたときだけ効きます（`1` 以上）。書かなければ、見つけた候補をすべて確かめます |
+| `crawl.allowedQueryParameters` | `[]`（指定なし） | URL の正規化で残すクエリの名前。名前を書いたときは、一覧にないクエリを URL から除きます。空（`[]`）か書かないときは、クエリを残します（追跡用の名前・秘密に見える名前・`#` の後ろは除きます）。空と書かないことは同じ意味です。秘密に見える名前（`token`、`session`、`code`、`state` など）を入れると、監査は設定の誤り（`CONFIG_ERROR`）で始まりません（公開の監査と認証つきの監査の両方。Task 44 の P4-1） |
 | `browser.headed` | `false` | ブラウザの画面を表示するか |
 | `browser.locale` | `"ja-JP"` | ブラウザのロケール |
 | `browser.timezone` | `"Asia/Tokyo"` | ブラウザのタイムゾーン |
@@ -48,13 +48,13 @@
 | `audit.accessibility` | `true` | アクセシビリティの Evidence を集めるか |
 | `audit.interactions` | `true` | Interaction の段階を行うか |
 | `audit.screenshots` | `true` | スクリーンショットを撮るか |
-| `audit.sendPolicy` | `"READ_ONLY"` | 監査の段の送信の扱い。`"READ_ONLY"`（ページが出す読み取りでない送信をすべて止める）か `"PASS_EXCEPT_DELETE"`（ページが自分で出す送信のうち、削除と危険な語の送信のほかを通す）。通すもの・止めるもの・限界は「[監査の段の送信の扱い](safety.md#監査の段の送信の扱い)」を見てください |
+| `audit.sendPolicy` | `"PASS_EXCEPT_DELETE"` | 監査の段の送信の扱い。`"READ_ONLY"`（ページが出す読み取りでない送信をすべて止める）か `"PASS_EXCEPT_DELETE"`（ページが自分で出す送信を止めずに通す。2026-11-16 から、削除と危険な語の送信も止めません。名前は前の設定を読むために残しています）。通すもの・止めるもの・限界は「[監査の段の送信の扱い](safety.md#監査の段の送信の扱い)」を見てください |
 | `output.directory` | `"artifacts"` | 出力先のディレクトリ |
 
-- 期限の値には、組み合わせの条件があります。たとえば、Interaction を行う場合は、`crawl.overallPageTimeoutMs` を `crawl.navigationTimeoutMs + 2 × crawl.interactionTimeoutMs` 以上にする必要があります。
+- 上限と期限の項目（既定値が「なし」のもの）に、前の版の既定と同じ値を書くと、選んでいない値とみなして使いません。たとえば `crawl.maxPages` の `500` と `3`、`crawl.maxRuntimeMs` の `3600000`、`crawl.maxDepth` の `20` です。前の版の画面が、選んでいない値も設定のファイルに書いていたためです。
 - 条件に合わない値は、`validate-config` が英語の技術的な詳細で示します。
-- `audit.sendPolicy` の実効の値は、`run.json` の `effectiveConfig.audit.sendPolicy` と `safety.auditSend` に残ります。中断した Run の再開では、この値も比べます（違えば再開しません）。この項目を持たない古い Run の保存は `"READ_ONLY"` と読むので、今の既定のままなら再開できます。
-- 画面から始めるジョブは、設定のファイルの値ではなく、プロファイルの設定（「[ローカルの管理画面](local-ui.md)」の表示の設定の欄）を使います。画面のサイトの既定は `"PASS_EXCEPT_DELETE"` です（2026-10-29 から。この表の既定 `"READ_ONLY"` は、CLI の設定のファイルのものです）。書き込みのジョブは、値を入れる前などの一部にだけ当てます（「[監査の段の送信の扱い](safety.md#監査の段の送信の扱い)」の「当てない段」の後）。ログインの確かめ・入口の確かめは、いつも `"READ_ONLY"` で読みます。
+- `audit.sendPolicy` の実効の値は、`run.json` の `effectiveConfig.audit.sendPolicy` と `safety.auditSend` に残ります。中断した Run の再開では、設定の値をすべて比べます。違えば、続きからは再開せず、新しい Run を始めます。この項目を持たない古い Run の保存や、前の版の既定の上限を持つ古い Run の保存も、設定が違うので続きからは再開しません。
+- 画面から始めるジョブは、設定のファイルの値ではなく、プロファイルの設定（「[ローカルの管理画面](local-ui.md)」の表示の設定の欄）を使います。画面のサイトの既定も `"PASS_EXCEPT_DELETE"` です。書き込みのジョブは、値を入れる前などの一部にだけ当てます（「[監査の段の送信の扱い](safety.md#監査の段の送信の扱い)」の「当てない段」の後）。ログインの確かめ・入口の確かめは、いつも `"READ_ONLY"` で読みます。
 
 ## `config/targets/` と `local/` の使い分け
 

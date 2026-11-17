@@ -1,6 +1,6 @@
 /**
  * 画面から動かす認証つきの監査のテストの補助（Task 25 の設計書 4.4、4.5。T25e）。
- * - 監査のワーカーの入口の差し替え: 一時の root の `dist/worker/audit-worker.js`（画面のサーバが fork する入口。リポジトリの `dist/` ではない）を、
+ * - 監査のワーカーの入口の差し替え: 一時の root の `TEST_WORKER_ENTRY`（画面のサーバが fork する入口。リポジトリの `dist/` ではない）を、
  *   テストだけの入口に書き換える。本番の process の組み立て（`runAuditWorkerProcess`）を、テストだけの口（関数の引数。T25d）で、ログイン用の
  *   Browser を CLI の起動の設定の headless に替え、待つ時間を短くして呼ぶ。監査の Browser は、本番と同じく headless。本番の入口は変えない
  *   （`tests/integration/audit-worker-auth-fork.test.ts` と同じ考え方。入口の本文は、`tests/helpers/test-login-worker-entry.ts` を共用する。CCX-23）。
@@ -15,12 +15,15 @@
 import { mkdirSync, writeFileSync } from 'node:fs';
 import type { ServerResponse } from 'node:http';
 import { startLoopbackHttpServer } from '../../../../tests/helpers/loopback-server.js';
+import { TEST_CLI_CHROMIUM_LAUNCH_SOURCE } from '../../../../tests/helpers/test-chromium-args.js';
 import { testLoginWorkerEntrySource } from '../../../../tests/helpers/test-login-worker-entry.js';
+import { TEST_WAITS_HOOK_SOURCE } from '../../../../tests/helpers/test-waits.js';
+import { BUILT_DIST_URL, TEST_WORKER_ENTRY } from './local-server.ts';
 
-/** 画面のサーバが fork する、一時の root の中の監査のワーカーの入口（`localUiWorkerPath` の写しの場所）。 */
-const WORKER_ENTRY_PATH = 'dist/worker/audit-worker.js';
-/** 入口（`dist/worker/` の中）から見た、ビルドの `dist/` の場所。 */
-const WORKER_ENTRY_DIST_PREFIX = '../';
+/** 画面のサーバが fork する、一時の root の中の監査のワーカーの入口（RB-7。`ui-test-launcher.ts` が入れる場所）。 */
+const WORKER_ENTRY_PATH = TEST_WORKER_ENTRY;
+/** 入口から見た、ビルドの `dist/` の場所（リポジトリの `dist/` の絶対の URL）。 */
+const WORKER_ENTRY_DIST_PREFIX = BUILT_DIST_URL;
 
 /** T25f: テストだけの入口が書き足す記録のファイルの名前（ワーカーが親へ送ったメッセージ、標準出力、標準エラー）。 */
 export const WORKER_RECORD_FILES = Object.freeze({ ipc: 'ipc.jsonl', stdout: 'stdout.log', stderr: 'stderr.log' } as const);
@@ -81,7 +84,8 @@ export const installTestAuthWorkerEntry = (
     prelude: recording,
     credentialsExpression: `fetch(${JSON.stringify(relayUrl)}).then((response) => response.json())`,
     // TS-g: 画面のテストのジョブのブラウザは headless（`local-server.ts` の入口と同じテストだけの口。プロファイルの表示の設定の既定は表示）。
-    additionalHooks: '\n  hideJobBrowser: true,',
+    // TEST-TIME-B: 押した後の静まりの窓と probe の観察も短くする（テストだけの口 `observationWindows`。RB-2）。
+    additionalHooks: `\n  hideJobBrowser: true,${TEST_WAITS_HOOK_SOURCE}`,
   });
   writeFileSync(`${root}/${WORKER_ENTRY_PATH}`, source, 'utf8');
 };
@@ -158,6 +162,7 @@ export const writeAuthTargetConfig = (
   name: string,
   origin: string,
   startPath: string,
+  /** L14: 前の既定と同じ値（3・500）は、読むときに「選んでいない」とみなされて捨てられる（上限なしになる）。上限の意図があれば別の値にする。 */
   maxPages: number,
   minNavigationIntervalMs = 0,
 ): string => {
@@ -176,7 +181,8 @@ export const writeAuthTargetConfig = (
 
 /**
  * T26e（Task 26 の設計書 4.6、6 章）: 自動ログインのジョブ（ログインの確かめ）のための、テストだけの入口。本番の process の組み立て
- * （`runAuditWorkerProcess`）を、自動ログインの段は本番のまま（資格情報のファイルの部品も、Browser の起動も本番の既定。headless）で呼ぶ。手動の
+ * （`runAuditWorkerProcess`）を、自動ログインの段は本番のまま（資格情報のファイルの部品は本番の既定。Browser の起動は本番の起動の部品に、テストだけの外へ出ない
+ * 引数を足したもの（RB-4 fix の M-1。Run の Browser も同じ）。headless）で呼ぶ。手動の
  * ログインの段の口が呼ばれたら、記録のフォルダの `manual-login-stage.log` に書いて止める（自動ログインが手動へ切り替えないことの確かめ）。記録の
  * フォルダには、ワーカーが親へ送ったメッセージと、標準出力と標準エラーも書き足す（`WORKER_RECORD_FILES`）。資格情報の値は、入口に書かない。
  * TS-g: ジョブのブラウザは headless（テストだけの口 `hideJobBrowser`。Gate `ui-test-job-browser-hidden`）。
@@ -184,9 +190,12 @@ export const writeAuthTargetConfig = (
 const AUTOMATED_ENTRY_SOURCE = String.raw`
 __RECORDING__
 import { appendFileSync as appendManualRecord } from 'node:fs';
-import { runAuditWorkerProcess } from './audit-worker-process.js';
+import { chromiumLaunchOptions, launchChromiumWith } from '${BUILT_DIST_URL}browser/chromium-launch.js';
+import { runAuditWorkerProcess } from '${BUILT_DIST_URL}worker/audit-worker-process.js';
 const MANUAL_RECORD = __MANUAL__;
 runAuditWorkerProcess(process, {
+  launchRunBrowser: () => ${TEST_CLI_CHROMIUM_LAUNCH_SOURCE},
+  automatedLoginStage: { launchAutomatedLoginBrowser: () => ${TEST_CLI_CHROMIUM_LAUNCH_SOURCE} },
   loginStage: {
     launchLoginBrowser: async () => {
       appendManualRecord(MANUAL_RECORD, 'launchLoginBrowser\n');
@@ -194,7 +203,7 @@ runAuditWorkerProcess(process, {
     },
     onLoginPageReady: async () => appendManualRecord(MANUAL_RECORD, 'onLoginPageReady\n'),
   },
-  hideJobBrowser: true,
+  hideJobBrowser: true,${TEST_WAITS_HOOK_SOURCE}
 });
 `;
 

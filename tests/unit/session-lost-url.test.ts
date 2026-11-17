@@ -85,6 +85,14 @@ describe('sessionLostUrlOf: the session lost judgement after a navigation (fixed
   it.each(cases)('$name', ({ pageUrl, events, expected }) => {
     expect(sessionLostUrlOf(pageAt(pageUrl), ledgerWith(events), PREFIX)).toBe(expected);
   });
+
+  // RB-14a（X11）: 見るだけの点検の押す期間の移動は止めないので、Guard が数えた行き先（許可 Origin だけ）も見る。
+  it('looks at the moves of the close press period to the allowed Origin, only when the allowed Origins are given', () => {
+    const page = { url: () => `${ORIGIN}/admin/items`, pressNavigationTargets: () => ['https://other.example.com/login', `${ORIGIN}/login?next=1`] };
+    expect(sessionLostUrlOf(page, ledgerWith([]), PREFIX, [ORIGIN])).toBe(`${ORIGIN}/login?next=1`);
+    expect(sessionLostUrlOf(page, ledgerWith([]), PREFIX)).toBeNull();
+    expect(sessionLostUrlOf({ ...page, pressNavigationTargets: () => ['https://other.example.com/login'] }, ledgerWith([]), PREFIX, [ORIGIN])).toBeNull();
+  });
 });
 
 // DF-3（DEF-167）: 確かめる時機の一覧と、時機を付けて判定を呼ぶ補助。判定の条件は、どの時機でも `sessionLostUrlOf` と同じ。

@@ -74,6 +74,8 @@ const PURE_DISCOVERY_FILES: readonly string[] = [
   'src/discovery/discovery-result.ts',
   // T27e（設計書 4.5）: READ の確かめの候補の確かめ・URL の組み立て・照合・成果物 `read-evidence.json` の形（純粋。ワーカーとジョブの管理から使う）。
   'src/discovery/read-check-evaluation.ts',
+  // DEF-235（設計書 `2026-11-09-beaksight-read-check-record-id-fill-design.md`）: 番号の入る画面の型の番号の元の選び方と、一致の決まり（純粋。ワーカーとジョブの管理から使う）。
+  'src/discovery/read-check-record-ids.ts',
   // T37b（Task 37 の設計書 3.3、3.4）: 送らずに観察した型の分類と、型の digest（純粋。ページを操作しない）。
   'src/discovery/api-shape-classification.ts',
   // T37c（Task 37 の設計書 3.2、3.4）: 送らずに観察する probe の契約（対象の選び方、目印、結果の形。純粋。押す部品は `src/interaction/submission-probe.ts`）。
@@ -82,6 +84,11 @@ const PURE_DISCOVERY_FILES: readonly string[] = [
   'src/discovery/entry-check-selectors.ts',
   // T43d（Task 43 の設計書 4.4）: ログインの段で観察したことの記録の形（query の名前、鍵の名前の差分、成功の画面のセレクタの案の選び方。純粋）。
   'src/discovery/login-observation.ts',
+  // COV-0（設計書 `2026-11-09-beaksight-coverage-by-state-design.md` 3.1、3.2）: 状態の鍵（場所・構造）と、辺つきの待ち行列（純粋。ページを操作しない）。
+  'src/discovery/state-keys.ts',
+  'src/discovery/coverage-queue.ts',
+  // SD-1（設計書 `2026-11-16-beaksight-action-based-delete-guard-design.md` 2.2）: 削除に関する操作の、操作の前の判定（純粋。ページを操作しない・読まない）。
+  'src/discovery/destructive-action.ts',
 ];
 
 /** (v): 発見のブラウザの部品（T27b）。純粋な部品の一覧には含めない。 */
@@ -97,6 +104,8 @@ const BROWSER_DISCOVERY_FILES: readonly string[] = [
   'src/discovery/isolated-read.ts',
   // T38a: CSS の当たる数の数え方（入口の確かめ、ログインの段の観察、送らずに観察する probe の欄の CSS が共有する。isolated world で動かす読み取り）。
   'src/discovery/selector-count.ts',
+  // L6/L3-1（設計書 `2026-11-09-beaksight-remove-limits-design.md` 5 の 1）: 操作さがしの 1 画面の進みの見張りと、page ごとの見張りの口。
+  'src/discovery/screen-watch.ts',
 ];
 
 /** (e)・(c)（DEF-087）: isolated world の読み取りの部品と、CDP の session の共通の部品。 */
@@ -122,6 +131,8 @@ const ISOLATED_READ_CALLER_FILES: readonly string[] = [
   'src/worker/entry-check-page.ts',
   // T43d（Task 43 の設計書 4.4）: ログインの段の観察（鍵の名前と、成功の画面のセレクタの案を作るために読む。読み取りは isolated world の部品だけ）。
   'src/worker/login-stage-observation.ts',
+  // NO-1（設計書 `2026-11-06-beaksight-notification-overlay-design.md` 3.1）: 通知の枠の見分け方の読み取り（閉じるボタンを押す前に読む。読み取りは isolated world の部品だけ）。
+  'src/interaction/notification-overlay.ts',
 ];
 
 /** (v): 発見の部品のフォルダ。 */
@@ -351,14 +362,14 @@ describe('Discovery boundary detectors', () => {
     }
   });
 
-  it('(x) follows runtime imports transitively, and skips type-only imports', () => {
+  // 型だけの import を飛ばすことは、`module-references.test.ts` の共通の補助（`findTransitiveForbiddenReferences`）の自己検査が確かめる。
+  it('(x) follows runtime imports transitively to the forbidden parts, and allows node:crypto', () => {
     const files = new Map<string, ScannedSource>([
-      ['src/discovery/a.ts', scanSource("import { b } from '../core/b.js';\nimport type { T } from '../core/t.js';")],
+      ['src/discovery/a.ts', scanSource("import { b } from '../core/b.js';")],
       ['src/core/b.ts', scanSource("import { c } from '../crawl/c.js';")],
       ['src/crawl/c.ts', scanSource("import { readFileSync } from 'node:fs';")],
-      ['src/core/t.ts', scanSource("import { chromium } from 'playwright';")],
       ['src/discovery/clean.ts', scanSource("import { d } from '../core/d.js';")],
-      ['src/core/d.ts', scanSource("import { createHash } from 'node:crypto';\nimport type { T } from '../core/t.js';")],
+      ['src/core/d.ts', scanSource("import { createHash } from 'node:crypto';")],
       ['src/discovery/engine.ts', scanSource("export * from '../core/e.js';")],
       ['src/core/e.ts', scanSource("import '../safety/request-policy.js';")],
     ]);
@@ -550,7 +561,6 @@ describe('Discovery boundary detectors', () => {
       { path: 'src/discovery/read-executor.ts', ...scanSource('await session.send(method, params);') },
       { path: 'src/discovery/discover-page.ts', ...scanSource('const session = await page.context().newCDPSession(page);') },
       { path: CDP_SESSION_FILE, ...scanSource('const opening = page.context().newCDPSession(page);\nawait session.send(method, params as never);') },
-      { path: 'src/browser/navigation-diagnostics.ts', ...scanSource("await session.send('Network.enable');") },
     ])).toEqual([
       'src/discovery/probe.ts: Runtime.evaluate',
       'src/discovery/settle.ts: Input.dispatchMouseEvent',

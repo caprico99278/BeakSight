@@ -47,14 +47,13 @@ const candidateOf = (checkpoint: RunCheckpoint): RunResumeCandidate => {
   return { runId, runDirectory: `output/${runId}`, checkpoint };
 };
 
-// T35a（Task 35 の設計書 3.2）: 監査の段の口（`auditStage`。承認したサービスの Origin、読み取りの手続きの呼び出し、token の送信先、要求の上限）を
-// Run の種類の値に入れる。口のない Run の値は変わらない（固定の値。T35a の前のコードで求めた）。
+// T35a（Task 35 の設計書 3.2）: 監査の段の口（`auditStage`。承認したサービスの Origin、読み取りの手続きの呼び出し、token の送信先。LZ-3c: 要求の上限は
+// 口から外したので入らない）を Run の種類の値に入れる。口のない Run の値は変わらない（固定の値。T35a の前のコードで求めた）。
 const RUN_KIND_DIGEST_BEFORE_T35A = 'sha256:fde44d223a644ed8ec637c51d3baeced6a309accbf87c0db8ac42b944776c4a2';
 const AUDIT_STAGE = Object.freeze({
   approvedServiceOrigins: ['http://127.0.0.1:5173'],
   auditReadRequests: [{ origin: 'http://127.0.0.1:5173', path: '/rest/v1/rpc/list_members', method: 'POST', maxPerPageLoad: 2 }],
   scriptLogin: { origin: 'http://127.0.0.1:5173', path: '/auth/v1/token', requiredQuery: [{ name: 'grant_type', value: 'password' }] },
-  serviceRequestLimits: { perMinute: 60, perRun: 300 },
 } as const);
 
 describe('T35a: the audit stage of a script login Run in the kind of the Run', () => {
@@ -66,7 +65,6 @@ describe('T35a: the audit stage of a script login Run in the kind of the Run', (
       { approvedServiceOrigins: [] },
       { auditReadRequests: [] },
       { scriptLogin: { ...AUDIT_STAGE.scriptLogin, path: '/auth/v1/other' } },
-      { serviceRequestLimits: { perMinute: 60, perRun: 299 } },
     ]) {
       expect(runCheckpointAuthenticationOf({ ...settings(), auditStage: { ...AUDIT_STAGE, ...change } }), JSON.stringify(change)).not.toEqual(base);
     }

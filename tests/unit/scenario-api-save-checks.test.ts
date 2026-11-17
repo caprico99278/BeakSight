@@ -9,10 +9,10 @@ import { describe, expect, it } from 'vitest';
 import { SCENARIO_DRAFT_REJECTION_REASONS, validateScenarioDraft, type ScenarioDraftValidationResult } from '../../src/control/approval/scenario-policy.js';
 import { apiRequestShapeOf } from '../../src/core/api-request-shape.js';
 import type { DiscoveryCandidate } from '../../src/discovery/candidate-contracts.js';
-import { recordIdOfPathPattern, recordIdPatternMatchesPagePath } from '../../src/core/record-id-path-pattern.js';
+import { recordIdOfPathPattern } from '../../src/core/record-id-path-pattern.js';
 import { GENERATED_VALUE_EXPECTATION_KINDS, hasGeneratedValueExpectation } from '../../src/discovery/read-check-contracts.js';
 import { observedSubmissionProbeOf, type SubmissionProbeInputField } from '../../src/discovery/submission-probe-contracts.js';
-import { LOCAL_UI_WRITE_TEXT, SCENARIO_DRAFT_REJECTION_DESCRIPTIONS } from '../../src/presentation/messages.js';
+import { SCENARIO_DRAFT_REJECTION_DESCRIPTIONS } from '../../src/presentation/messages.js';
 import { ALL_CONFIRMED, CREATE_CANDIDATE as FORM_CANDIDATE, FULL_VERIFICATION, PROFILE_ID, READ_CHECK_FACTS, candidateOf, sampleDraft } from './approval-samples.js';
 import { NO_JS_BINDING, SAMPLE_ORIGIN, sampleButton } from './discovery-candidate-samples.js';
 
@@ -100,7 +100,15 @@ describe('T40R-fix-B: the shared parts of the save checks', () => {
 describe('T40R-fix-B (a): the page path template READ of an API scenario needs an expectation compared with a generated value', () => {
   it('adds the reason at the end of the closed list, with its description', () => {
     // T40R2-fix: ID の型の理由は注意に下げたので、一覧の最後は (a) の理由だけ。T41a: その後ろに 2 つを足した（`scenario-api-update-contract.test.ts`）。
-    expect(SCENARIO_DRAFT_REJECTION_REASONS.slice(-3, -2)).toEqual(['SCENARIO_API_READ_VERIFICATION_NOT_BOUND']);
+    // ARR-2・ARR-3・ARR-5（DEF-234 を含む）でも、その後ろに理由を足したので、末尾からの位置では確かめない。足した時の並び（T38R-fix の理由の後、
+    // T41a の 2 つの前）で確かめる。
+    const index = SCENARIO_DRAFT_REJECTION_REASONS.indexOf('SCENARIO_API_READ_VERIFICATION_NOT_BOUND');
+    expect(SCENARIO_DRAFT_REJECTION_REASONS.slice(index - 1, index + 3)).toEqual([
+      'SCENARIO_API_RECORD_ID_KEY_SECRET_LIKE',
+      'SCENARIO_API_READ_VERIFICATION_NOT_BOUND',
+      'SCENARIO_API_PAGE_KEY_NOT_IDENTIFIABLE',
+      'SCENARIO_API_FILTER_NOT_BOUND_TO_LEDGER_ID',
+    ]);
     expect(SCENARIO_DRAFT_REJECTION_DESCRIPTIONS.SCENARIO_API_READ_VERIFICATION_NOT_BOUND.description.length).toBeGreaterThan(0);
   });
 
@@ -121,17 +129,16 @@ describe('T40R-fix-B (a): the page path template READ of an API scenario needs a
 });
 
 // T40R2-fix（Task 40 の設計書 7 章の「T40R2」の行。使える度合い）: 書き込みの画面に当たる ID の型は、保存で拒まない（正当な REST の組を拒むだけで、
-// 取り違えはワーカーの押す前の値との比べと、毎回変わる値の照合で防ぐ）。保存の画面と詳細の画面に注意を出す（判定は core の
-// `recordIdPatternMatchesPagePath`。`recordIdOfPathPattern` をそのまま使う）。理由のコードは閉じた一覧から外した（拒む理由ではないため）。
-describe('T40R2-fix: the record id pattern the page of the write matches is saved, with a caution', () => {
-  it.each<readonly [string, Record<string, unknown> | null, boolean]>([
-    ['a pattern the page of the write matches (new as the id)', { source: 'URL_PATH_PATTERN', pathPattern: '/admin/members/{id}' }, true],
-    ['a pattern of another depth', { source: 'URL_PATH_PATTERN', pathPattern: '/admin/members/{id}/edit' }, false],
-    ['an element', { source: 'ELEMENT', selector: '#member-id' }, false],
-    ['no record id of the verification spec (the response body key)', null, false],
-  ])('saves %s, and tells whether to show the caution', (_label, recordId, caution) => {
+// 取り違えはワーカーの押す前の値との比べと、毎回変わる値の照合で防ぐ）。理由のコードは閉じた一覧から外した（拒む理由ではないため）。SPEC-4: 詳細の画面の
+// 注意は、使う画面がなくなったので、判定（`recordIdPatternMatchesPagePath`）と文言ごと捨てた。
+describe('T40R2-fix: the record id pattern the page of the write matches is saved', () => {
+  it.each<readonly [string, Record<string, unknown> | null]>([
+    ['a pattern the page of the write matches (new as the id)', { source: 'URL_PATH_PATTERN', pathPattern: '/admin/members/{id}' }],
+    ['a pattern of another depth', { source: 'URL_PATH_PATTERN', pathPattern: '/admin/members/{id}/edit' }],
+    ['an element', { source: 'ELEMENT', selector: '#member-id' }],
+    ['no record id of the verification spec (the response body key)', null],
+  ])('saves %s', (_label, recordId) => {
     expect(codesOf(validateApi(apiDraftOf(templateRead([TEXT_OF_EMAIL]), recordId)))).toEqual([]);
-    expect(recordIdPatternMatchesPagePath(recordId as Parameters<typeof recordIdPatternMatchesPagePath>[0], NEW_PATH)).toBe(caution);
   });
 
   it('also saves the pattern when the API takes no record id from the response body, and no longer lists the reason', () => {
@@ -139,7 +146,6 @@ describe('T40R2-fix: the record id pattern the page of the write matches is save
       .toEqual([]);
     expect(SCENARIO_DRAFT_REJECTION_REASONS as readonly string[]).not.toContain('SCENARIO_API_RECORD_ID_PATTERN_MATCHES_FORM_PAGE');
     expect(Object.keys(SCENARIO_DRAFT_REJECTION_DESCRIPTIONS)).not.toContain('SCENARIO_API_RECORD_ID_PATTERN_MATCHES_FORM_PAGE');
-    expect(LOCAL_UI_WRITE_TEXT.recordIdPatternCaution.length).toBeGreaterThan(0);
   });
 
   it('keeps the FORM scenario as it is (out of this check; the form page /members/new against /members/{id})', () => {

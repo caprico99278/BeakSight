@@ -9,7 +9,6 @@ import { readFileSync } from 'node:fs';
 import { resolve } from 'node:path';
 import { describe, expect, it } from 'vitest';
 import { WORKER_JOB_ID_PATTERN } from '../../src/control/worker-protocol.js';
-import { MAX_URL_LENGTH } from '../../src/core/limits.js';
 import { validateArtifact } from '../../src/core/schema-validator.js';
 import {
   CANDIDATE_REASON_CLASSIFICATIONS,
@@ -23,7 +22,6 @@ import {
   DISCOVERY_END_REASONS,
   DISCOVERY_UNREAD_REASONS,
   DUPLICATE_IDENTITY_CONFLICT_REASON,
-  MAX_DISCOVERY_READ_PAGE_PATHS,
   discoveryReadPagePaths,
   discoveryRunStatusOf,
   discoverySummaryOf,
@@ -200,10 +198,11 @@ describe('T27d: the read pages, the summary and the Run Status of a discovery do
     ].map(isDiscoveryPageReadInFull)).toEqual([true, true, true, false, false, false, false, false, false]);
   });
 
-  it('caps the read page paths (the rest become NOT_REVISITED, never MISSING)', () => {
-    const pages = Array.from({ length: MAX_DISCOVERY_READ_PAGE_PATHS + 2 }, (_value, index) => readEntry(`/p/${String(index).padStart(6, '0')}`, []));
+  // LZ-3a: 読み切れた画面の path の数の上限（前は 10,000）は撤廃した。読み切れた画面は残らず残す。
+  it('keeps every read page path, more than the former limit', () => {
+    const pages = Array.from({ length: 10_001 }, (_value, index) => readEntry(`/p/${String(index).padStart(6, '0')}`, []));
     const paths = discoveryReadPagePaths(documentOf(pages));
-    expect(paths).toHaveLength(MAX_DISCOVERY_READ_PAGE_PATHS);
+    expect(paths).toHaveLength(10_001);
     expect(paths[0]).toBe('/p/000000');
   });
 
@@ -239,12 +238,15 @@ describe('T27d: the discovery.json schema (the candidates are the candidate sche
   it('uses the job id pattern of the IPC contract, the limits of the contracts and the schema version constant', () => {
     const schema = JSON.parse(readFileSync(resolve(process.cwd(), 'schemas', 'discovery.schema.json'), 'utf8')) as {
       properties: { jobId: { pattern: string }; schemaVersion: { enum: readonly string[] } };
-      $defs: { url: { maxLength: number } };
+      $defs: { url: { minLength: number; maxLength?: number } };
     };
     expect(schema.properties.jobId.pattern).toBe(WORKER_JOB_ID_PATTERN.source);
     // T37a fix round 1: 読み手は前の版も受ける（enum）。書き手の版は、その最後。
     expect(schema.properties.schemaVersion.enum.at(-1)).toBe(DISCOVERY_ARTIFACT_SCHEMA_VERSION);
-    expect(schema.$defs.url.maxLength).toBe(MAX_URL_LENGTH);
+    // L14（上限の撤廃の設計書の N23）: 画面の URL の長さの上限（前は `MAX_URL_LENGTH` の 2,048 字）は撤廃した。成果物のスキーマは、空でない文字列だけを求める
+    // （長い URL の画面も、打ち切らずに記録する）。
+    expect(schema.$defs.url.minLength).toBe(1);
+    expect(schema.$defs.url.maxLength).toBeUndefined();
   });
 
   it('accepts a document with read and unread pages and candidates', async () => {

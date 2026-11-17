@@ -31,9 +31,11 @@ const BASE_SCHEMA_FILE = 'src/control/store/control-schema-v17.ts';
 
 /** (b) 表ごとの、表の名前を SQL に書いてよいファイル。 */
 const TABLE_OWNERS: ReadonlyMap<string, readonly string[]> = new Map([
-  ['discovery_candidates', [DISCOVERY_INDEX_OWNER, BASE_SCHEMA_FILE]],
-  ['discovery_jobs', [DISCOVERY_INDEX_OWNER, BASE_SCHEMA_FILE]],
-  ['read_checks', [READ_CHECK_OWNER, BASE_SCHEMA_FILE]],
+  // URL-LEN: 版 20 の文（`control-schema-v20.ts`）も、発見の索引と READ の確かめの定義の表を作り直す。
+  ['discovery_candidates', [DISCOVERY_INDEX_OWNER, BASE_SCHEMA_FILE, 'src/control/store/control-schema-v18.ts', 'src/control/store/control-schema-v20.ts']],
+  // LZ-3a: 版 21 の文（`control-schema-v21.ts`）も、発見のジョブの表を作り直す。
+  ['discovery_jobs', [DISCOVERY_INDEX_OWNER, BASE_SCHEMA_FILE, 'src/control/store/control-schema-v21.ts']],
+  ['read_checks', [READ_CHECK_OWNER, BASE_SCHEMA_FILE, 'src/control/store/control-schema-v20.ts']],
   ['read_check_results', [READ_CHECK_OWNER, BASE_SCHEMA_FILE]],
 ]);
 

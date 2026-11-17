@@ -15,8 +15,6 @@ import {
 } from '../../src/control/auth/auth-setup-contracts.js';
 import { MIN_CREDENTIAL_VALUE_LENGTH } from '../../src/control/credentials/credential-store.js';
 import {
-  MAX_WORKER_LOGIN_STAGE_BLOCKED_PATH_LENGTH,
-  MAX_WORKER_LOGIN_STAGE_BLOCKED_REQUESTS,
   WORKER_LOGIN_STAGE_BLOCK_REASONS,
   WORKER_LOGIN_CREDENTIAL_BLOCK_REASON,
   WORKER_REQUEST_RESOURCE_TYPES,
@@ -27,8 +25,6 @@ import {
 } from '../../src/control/worker-protocol.js';
 import {
   LOGIN_STAGE_BLOCKED_REQUEST_REASONS,
-  MAX_LOGIN_STAGE_BLOCKED_PATH_LENGTH,
-  MAX_LOGIN_STAGE_BLOCKED_REQUESTS,
   type LoginStageBlockedRequest,
   type LoginStageBlockedRequests,
 } from '../../src/safety/login-stage-blocked-requests.js';
@@ -73,11 +69,10 @@ describe('T34c: the script login definitions on both sides of the control and sa
 // T34e: ログインの段で止めた要求の一覧も、境界の両側にある（要求の判定と Guard の側の一覧、IPC の側の一覧）。
 describe('T34e: the blocked request list definitions on both sides of the control and safety boundary agree', () => {
   // T34e fix round 1: path の値に見える区切りの判定と伏せた印は `src/core/url-path-redaction.ts` の 1 か所（両側の写しはない）。
-  it('has the same reasons, resource types and limits', () => {
+  // LZ-3a: 行の数の上限（前は両側に 8）は撤廃した。
+  it('has the same reasons and resource types', () => {
     expect(WORKER_LOGIN_STAGE_BLOCK_REASONS).toEqual(LOGIN_STAGE_BLOCKED_REQUEST_REASONS);
     expect(WORKER_REQUEST_RESOURCE_TYPES).toEqual(REQUEST_RESOURCE_TYPES);
-    expect(MAX_WORKER_LOGIN_STAGE_BLOCKED_REQUESTS).toBe(MAX_LOGIN_STAGE_BLOCKED_REQUESTS);
-    expect(MAX_WORKER_LOGIN_STAGE_BLOCKED_PATH_LENGTH).toBe(MAX_LOGIN_STAGE_BLOCKED_PATH_LENGTH);
   });
 
   it('has the same shape of a blocked request (checked by the type checker)', () => {

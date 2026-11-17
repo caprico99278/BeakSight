@@ -54,9 +54,9 @@ const CHARACTER_CLASS_USERS: readonly string[] = [
   'src/control/credentials/dpapi-protector.ts',
   'src/control/credentials/credential-store.ts',
   // PRE42-CC 組 4（CC-052・053 の残り）: `toWellFormed()` を `replaceLoneSurrogates`・`truncateWellFormed` に替えた場所。
+  // DEF-256: `src/worker/audit-worker-session.ts` は、LZ-2 で切り詰め（`truncateWellFormed`）をやめ、文字の種類の確かめを持たなくなったので外した。
   'src/discovery/read-check-evaluation.ts',
   'src/safety/job-safety-violation.ts',
-  'src/worker/audit-worker-session.ts',
 ];
 
 /** 禁止の形（名前 → 検出の正規表現）。 */

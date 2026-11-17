@@ -1,6 +1,8 @@
 // T37b（Task 37 の設計書 3.3 の表、3.4 の `shapeDigest`）: 送らずに観察した型の分類（`src/discovery/api-shape-classification.ts`。純粋な関数）。
 // - 上から順に当てる: `NO_REQUEST` → `NOT_EXECUTABLE`（理由の閉じた一覧）→ `API_UPDATE` → `API_CREATE` → `NOT_EXECUTABLE`（`UNRECOGNIZED`）。
-// - 型の digest（`shapeDigest`）は、版の印 `beaksight:api-shape/1` つきの正規化した型の SHA-256（並びの順によらない）。
+// - 型の digest（`shapeDigest`）は、版の印 `beaksight:api-shape/4`（LU-2 の v3 に、DEF-220 の区分 `APPROVED_TEST` を足した版）つきの正規化した型の SHA-256（並びの順によらない）。
+// - DEF-220（設計書 `2026-11-08-beaksight-same-origin-api-and-spa-routes-design.md` 3.1）: 承認したテストの Origin の区分（`APPROVED_TEST`）も、承認した API の
+//   Origin と同じ規則で分類する（登録・更新になり、DELETE・PUT・手続きの呼び出し・JSON でない本文などは今のとおり止める）。許可 Origin（`ALLOWED`）は今のまま。
 import { describe, expect, it } from 'vitest';
 import { REDACTED } from '../../src/core/redaction.js';
 import { apiRequestShapeOf, type ApiRequestShape, type ApiRequestShapeInput } from '../../src/core/api-request-shape.js';
@@ -42,12 +44,15 @@ const createShape = (overrides: Partial<Omit<ApiRequestShapeInput, 'origin'>> = 
 const classify = (shapes: readonly ApiRequestShape[], nonReadRequestCount = shapes.length) =>
   classifyApiShapeObservation({ shapes, nonReadRequestCount });
 
+const classifyFromRow = (shapes: readonly ApiRequestShape[]) =>
+  classifyApiShapeObservation({ shapes, nonReadRequestCount: shapes.length, openedFromRow: true });
+
 describe('classifyApiShapeObservation (T37b: the table of the design 3.3)', () => {
   it('keeps the closed lists', () => {
     expect(API_SHAPE_CLASSIFICATIONS).toEqual(['NO_REQUEST', 'NOT_EXECUTABLE', 'API_UPDATE', 'API_CREATE']);
     expect(API_SHAPE_NOT_EXECUTABLE_REASONS).toEqual([
       'DELETE_METHOD', 'PUT_METHOD', 'METHOD_OVERRIDE', 'UNAPPROVED_ORIGIN', 'PROCEDURE_CALL_PATH', 'UPSERT', 'ARRAY_BODY', 'NON_JSON_BODY', 'MULTIPLE_REQUESTS',
-      'SOFT_DELETE_KEY', 'SHAPE_TRUNCATED', 'FILTER_MISSING', 'FILTER_MULTIPLE', 'FILTER_NOT_PAGE_VALUE', 'UNRECOGNIZED',
+      'SOFT_DELETE_KEY', 'SHAPE_TRUNCATED', 'FILTER_MISSING', 'FILTER_MULTIPLE', 'FILTER_NOT_PAGE_VALUE', 'CREATE_PATH_HAS_ID', 'UNRECOGNIZED',
     ]);
   });
 
@@ -78,7 +83,9 @@ describe('classifyApiShapeObservation (T37b: the table of the design 3.3)', () =
     ['SOFT_DELETE_KEY', () => shapeOf({ body: { kind: 'TEXT', text: '{"name":"n","deleted":true}' } })],
     ['SOFT_DELETE_KEY', () => createShape({ body: { kind: 'TEXT', text: '{"name":"n","is_active":false}' } })],
     ['FILTER_MISSING', () => shapeOf({ url: `${API}/rest/v1/members` })],
-    ['FILTER_MULTIPLE', () => shapeOf({ url: `${API}/rest/v1/members?id=eq.42&email=eq.x` })],
+    // DEF-198（一覧の行の更新の設計書 5.9 の 1）: 画面の番号の filter のほかが名前の重ならない `eq` だけの形は更新になったので（`api-tenant-filter-update.test.ts`）、
+    // ほかの filter が `eq` でない形で確かめる。
+    ['FILTER_MULTIPLE', () => shapeOf({ url: `${API}/rest/v1/members?id=eq.42&email=neq.x` })],
     ['FILTER_NOT_PAGE_VALUE', () => shapeOf({ url: `${API}/rest/v1/members?id=eq.43` })],
     ['FILTER_NOT_PAGE_VALUE', () => shapeOf({ url: `${API}/rest/v1/members?id=gt.0` })],
     ['UNRECOGNIZED', () => createShape({ url: `${API}/rest/v1/members?id=eq.42` })],
@@ -108,7 +115,6 @@ describe('classifyApiShapeObservation (T37b: the table of the design 3.3)', () =
   it('does not take a hidden query name as the closed list (select)', () => {
     const shape = { ...shapeOf(), queryNames: ['id', REDACTED] };
     expect(classify([shape])).toMatchObject({ classification: 'NOT_EXECUTABLE', reason: 'UNRECOGNIZED' });
-    expect(classify([{ ...shapeOf(), omittedQueryNameCount: 1 }])).toMatchObject({ reason: 'UNRECOGNIZED' });
   });
 });
 
@@ -132,30 +138,26 @@ describe('classifyApiShapeObservation (T37R-fix-A: I-3 and M-1)', () => {
     expect(classify([createShape({ url: `${API}/rest/v1/rpcs_log` })])).toMatchObject({ classification: 'API_CREATE' });
   });
 
-  it('is NOT_EXECUTABLE (SOFT_DELETE_KEY) for a state key beyond the key limit or with a hidden (too long) name', () => {
-    const overflow = createShape({ body: bodyOf({ ...manyKeys(64), status: 'deleted' }) });
-    expect(overflow.body.omittedKeyCount).toBe(1);
-    expect(overflow.body.stateKeyPresent).toBe(true);
-    expect(classify([overflow])).toMatchObject({ classification: 'NOT_EXECUTABLE', reason: 'SOFT_DELETE_KEY' });
-    const longName = createShape({ body: bodyOf({ name: 'n', [`deleted_${'x'.repeat(70)}`]: true }) });
-    expect(longName.body.keys.map(({ name }) => name)).toEqual([REDACTED, 'name']);
-    expect(JSON.stringify(longName)).not.toContain('deleted_');
-    expect(classify([longName])).toMatchObject({ classification: 'NOT_EXECUTABLE', reason: 'SOFT_DELETE_KEY' });
+  it('is NOT_EXECUTABLE (SOFT_DELETE_KEY) for a state key after many keys or with a hidden name', () => {
+    const many = createShape({ body: bodyOf({ ...manyKeys(64), deleted_at: null }) });
+    expect(classify([many])).toMatchObject({ classification: 'NOT_EXECUTABLE', reason: 'SOFT_DELETE_KEY' });
+    const hidden = createShape({ body: bodyOf({ name: 'n', deleted_AbCdEfGhIjKlMnOpQrStUv12: true }) });
+    expect(hidden.body.keys.map(({ name }) => name)).toEqual([REDACTED, 'name']);
+    expect(classify([hidden])).toMatchObject({ classification: 'NOT_EXECUTABLE', reason: 'SOFT_DELETE_KEY' });
   });
 
-  it('is NOT_EXECUTABLE (SHAPE_TRUNCATED) when the body keys were cut at the limit or a key name was hidden', () => {
-    expect(classify([createShape({ body: bodyOf(manyKeys(65)) })])).toMatchObject({ classification: 'NOT_EXECUTABLE', reason: 'SHAPE_TRUNCATED' });
-    expect(classify([shapeOf({ body: bodyOf({ name: 'n', [`note_${'x'.repeat(70)}`]: 'v' }) })]))
-      .toMatchObject({ classification: 'NOT_EXECUTABLE', reason: 'SHAPE_TRUNCATED' });
+  // L13（N25）: 鍵の数と名前の長さでは「分類できない」にしない（前は 65 個目からの切り詰めと 64 文字を超えた名前で SHAPE_TRUNCATED）。
+  it('classifies a body with many keys or long key names, and is SHAPE_TRUNCATED only for a hidden key name', () => {
+    expect(classify([createShape({ body: bodyOf(manyKeys(65)) })])).toMatchObject({ classification: 'API_CREATE' });
+    expect(classify([shapeOf({ body: bodyOf({ name: 'n', [`note_${'x'.repeat(70)}`]: 'v' }) })])).toMatchObject({ classification: 'API_UPDATE' });
     expect(classify([createShape({ body: bodyOf({ name: 'n', AbCdEfGhIjKlMnOpQrStUv12: 'v' }) })]))
       .toMatchObject({ classification: 'NOT_EXECUTABLE', reason: 'SHAPE_TRUNCATED' });
-    expect(classify([createShape({ body: bodyOf(manyKeys(64)) })])).toMatchObject({ classification: 'API_CREATE' });
   });
 
   it('compares the filter value with the last ID-like segment of the page path only (M-1)', () => {
     const page = '/orgs/7/members/1/edit';
     const orgFilter = shapeOf({ url: `${API}/rest/v1/members?org_id=eq.7` }, page);
-    expect(orgFilter.filters).toEqual([{ name: 'org_id', operator: 'eq', valueMatchesPagePath: false }]);
+    expect(orgFilter.filters).toEqual([{ name: 'org_id', operator: 'eq', valueMatchesPagePath: false, valueIsRecordIdLike: true }]);
     expect(classify([orgFilter])).toMatchObject({ classification: 'NOT_EXECUTABLE', reason: 'FILTER_NOT_PAGE_VALUE' });
     expect(classify([shapeOf({ url: `${API}/rest/v1/members?id=eq.1` }, page)])).toMatchObject({ classification: 'API_UPDATE' });
     // 列の名前は見ない（限界。文書に書く）: 最後の ID と同じ値なら、別の列でも `API_UPDATE`。
@@ -175,10 +177,12 @@ describe('classifyApiShapeObservation (T37R2-fix-A: M-1 and M-2)', () => {
     expect(classify([createShape({ url })])).toMatchObject({ classification: 'NOT_EXECUTABLE', reason: 'PROCEDURE_CALL_PATH' });
   });
 
-  it('is NOT_EXECUTABLE (SHAPE_TRUNCATED) when the whole path was hidden for its length', () => {
+  // URL-LEN: 長い path も伏せずに型にする（前は 1,024 を超えたら全体を伏せ、SHAPE_TRUNCATED で実行できないとした）。
+  it('keeps the whole shape of a long path and classifies it as the short one', () => {
     const shape = createShape({ url: `${API}/${'a/'.repeat(600)}members` });
-    expect(shape.pathShape).toBe(REDACTED);
-    expect(classify([shape])).toMatchObject({ classification: 'NOT_EXECUTABLE', reason: 'SHAPE_TRUNCATED' });
+    expect(shape.pathShape).toBe(`/${'a/'.repeat(600)}members`);
+    expect(classify([shape])).toMatchObject({ classification: classify([createShape({ url: `${API}/a/members` })]).classification });
+    expect(classify([shape])).not.toMatchObject({ reason: 'SHAPE_TRUNCATED' });
   });
 
   it.each([
@@ -226,18 +230,11 @@ describe('classifyApiShapeObservation (T39R-fix: M-5)', () => {
     expect(classify([shapeOf(withPrefer('return=representation, return=headers-only'))])).toMatchObject({ classification: 'API_UPDATE' });
     expect(classify([createShape({ headers: { 'content-type': 'application/json' } })])).toMatchObject({ classification: 'API_CREATE' });
   });
-
-  it('is NOT_EXECUTABLE (UNRECOGNIZED) for a body over the byte limit of the write stage check', () => {
-    const big = (length: number): ApiRequestShapeInput['body'] => ({ kind: 'TEXT', text: JSON.stringify({ name: 'é'.repeat(length) }) });
-    expect(classify([createShape({ body: big(40_000) })])).toMatchObject({ classification: 'NOT_EXECUTABLE', reason: 'UNRECOGNIZED' });
-    expect(classify([shapeOf({ body: big(40_000) })])).toMatchObject({ classification: 'NOT_EXECUTABLE', reason: 'UNRECOGNIZED' });
-    expect(classify([createShape({ body: big(1_000) })])).toMatchObject({ classification: 'API_CREATE' });
-  });
 });
 
 describe('apiShapeDigestOf (T37b: the shape digest)', () => {
   it('is the SHA-256 of the normalized shape with the version mark', () => {
-    expect(API_SHAPE_DIGEST_FORMAT).toBe('beaksight:api-shape/2');
+    expect(API_SHAPE_DIGEST_FORMAT).toBe('beaksight:api-shape/4');
     expect(apiShapeDigestOf(shapeOf())).toMatch(/^sha256:[0-9a-f]{64}$/u);
   });
 
@@ -277,7 +274,7 @@ describe('apiShapeDigestOf (T37b: the shape digest)', () => {
         Origin: 'https://app.example.test', Referer: 'https://app.example.test/',
       },
     }))).toBe(base);
-    expect(apiShapeDigestOf({ ...shapeOf(), headerNames: [...shapeOf().headerNames, 'accept-language'], omittedHeaderNameCount: 3 })).toBe(base);
+    expect(apiShapeDigestOf({ ...shapeOf(), headerNames: [...shapeOf().headerNames, 'accept-language'] })).toBe(base);
   });
 
   it('changes when the names the page supplies differ, without depending on the case or the order (digest v2)', () => {
@@ -300,6 +297,8 @@ describe('apiShapeDigestOf (T37b: the shape digest)', () => {
       shapeOf({ method: 'POST' }),
       { ...shape, origin: { kind: 'APPROVED_API', index: 1 } },
       { ...shape, origin: { kind: 'ALLOWED' } },
+      // DEF-220: 承認したテストの Origin の区分は、同じ番号の承認したサービスの Origin と別の型。
+      { ...shape, origin: { kind: 'APPROVED_TEST', index: 0 } },
       shapeOf({ url: `${API}/rest/v1/teams?id=eq.42` }),
       shapeOf({ url: `${API}/rest/v1/members?id=eq.42&select=*` }),
       shapeOf({ url: `${API}/rest/v1/members?id=eq.43` }),
@@ -315,6 +314,65 @@ describe('apiShapeDigestOf (T37b: the shape digest)', () => {
     for (const other of changed) {
       expect(apiShapeDigestOf(other)).not.toBe(base);
     }
+  });
+});
+
+// ARR-1（設計書 `2026-11-08-beaksight-api-array-keys-design.md` 3.2 の 3）: 型の digest に一覧の要素の情報と、一覧の中の印を入れる。一覧の鍵のない型の
+// digest は今と同じ値（版の印は上げない。今の承認を無効にしない）。固定の値は ARR-1 の前の実装で計算した値。
+describe('apiShapeDigestOf (ARR-1: the elements of an array key)', () => {
+  const fixedShapeOf = (body: unknown, markers: readonly string[] = []): ApiRequestShape => apiRequestShapeOf({
+    method: 'POST',
+    resourceType: 'fetch',
+    url: `${API}/rest/v1/members`,
+    origin: { kind: 'APPROVED_API', index: 0 },
+    headers: { 'content-type': 'application/json', prefer: 'return=representation', 'x-csrf-token': 't' },
+    body: { kind: 'TEXT', text: JSON.stringify(body) },
+  }, { pagePath: '/admin/members/new', markers, isStateKeyName: fieldNameHasStateWord });
+
+  it('keeps the digest of a shape without an array key (the value computed before ARR-1)', () => {
+    expect(API_SHAPE_DIGEST_FORMAT).toBe('beaksight:api-shape/4');
+    expect(apiShapeDigestOf(fixedShapeOf({ name: 'mkA1', email: 'e', note: 'x', age: 3, active: true, extra: null, meta: {} }, ['mkA1'])))
+      .toBe('sha256:a1b0be9337ea710251ef1a1053cc21c4d8ec0ae0adc7dbde70485913af85e6fb');
+  });
+
+  it('changes the digest of a shape with an array key (the element information is in it)', () => {
+    expect(apiShapeDigestOf(fixedShapeOf({ name: 'n', tags: ['a'] })))
+      .not.toBe('sha256:70353f0c9974d56945ac7171e9f6dc4919c330b20e904101aa41ba14ebe11f4e');
+  });
+
+  it('changes when the element types, the count, the nesting or the mark of a marker in an array differ', () => {
+    const base = apiShapeDigestOf(fixedShapeOf({ tags: ['a'] }));
+    const changed = [
+      fixedShapeOf({ tags: [1] }),
+      fixedShapeOf({ tags: ['a', 'b'] }),
+      fixedShapeOf({ tags: [] }),
+      fixedShapeOf({ tags: [{}] }),
+      fixedShapeOf({ tags: ['mkB2'] }, ['mkB2']),
+    ];
+    for (const other of changed) {
+      expect(apiShapeDigestOf(other)).not.toBe(base);
+    }
+    // 値が違うだけ（型・数・印が同じ）なら同じ。L13 fix round 1: 文字の長さの上限はないので、長い文字も同じ。
+    expect(apiShapeDigestOf(fixedShapeOf({ tags: ['b'] }))).toBe(base);
+    expect(apiShapeDigestOf(fixedShapeOf({ tags: ['x'.repeat(201)] }))).toBe(base);
+    const marked = fixedShapeOf({ tags: ['mkB2'] }, ['mkB2']);
+    const unmarkedSameKeys: ApiRequestShape = {
+      ...marked,
+      body: { ...marked.body, markerKeys: marked.body.markerKeys.map(({ key, markers }) => ({ key, markers })) },
+    };
+    expect(apiShapeDigestOf(unmarkedSameKeys)).not.toBe(apiShapeDigestOf(marked));
+  });
+
+  it('does not depend on the order of the element types', () => {
+    const shape = fixedShapeOf({ tags: ['a', 1] });
+    const reordered: ApiRequestShape = {
+      ...shape,
+      body: {
+        ...shape.body,
+        keys: shape.body.keys.map((key) => (key.elements === undefined ? key : { ...key, elements: { ...key.elements, types: [...key.elements.types].reverse() } })),
+      },
+    };
+    expect(apiShapeDigestOf(reordered)).toBe(apiShapeDigestOf(shape));
   });
 });
 
@@ -362,5 +420,94 @@ describe('classifyApiShapeObservation (DEF-147: the publication state keys are n
   it('does not change the shape digest of a shape with a publication state key (the observation flag stays as it was)', () => {
     const shape = createShape({ url: `${API}/rest/v1/notes`, body: bodyOf({ title: 't', status: 'draft' }) });
     expect(shape.body.stateKeyPresent).toBe(true);
+  });
+});
+
+// LU-2（設計書 `2026-11-02-beaksight-list-row-update-design.md` 5.2 の 3〜5、K4）: 一覧の行から開いた入力の更新（filter・path の番号）と、番号のある送り先への POST。
+describe('classifyApiShapeObservation (LU-2: the update from a row of a list)', () => {
+  const LIST_PAGE = '/items';
+  const itemShape = (method: string, path: string): ApiRequestShape => shapeOf({ method, url: `${API}${path}` }, LIST_PAGE);
+
+  it('is API_UPDATE for a PATCH with one eq filter of a record number only when the input was opened from a row', () => {
+    const shape = itemShape('PATCH', '/api/items?id=eq.3');
+    expect(classifyFromRow([shape])).toEqual({ classification: 'API_UPDATE', reason: null, shape, shapeDigest: apiShapeDigestOf(shape) });
+    // 開き手がない（既定）なら今のまま。
+    expect(classify([shape])).toMatchObject({ classification: 'NOT_EXECUTABLE', reason: 'FILTER_NOT_PAGE_VALUE' });
+    expect(classifyApiShapeObservation({ shapes: [shape], nonReadRequestCount: 1, openedFromRow: false }))
+      .toMatchObject({ classification: 'NOT_EXECUTABLE', reason: 'FILTER_NOT_PAGE_VALUE' });
+    expect(classifyFromRow([itemShape('PATCH', '/api/items?id=eq.550e8400-e29b-41d4-a716-446655440000')])).toMatchObject({ classification: 'API_UPDATE' });
+  });
+
+  it('does not make an update from a row when the filter value is not a record number, not eq, or not one filter', () => {
+    expect(classifyFromRow([itemShape('PATCH', '/api/items?id=eq.abc')])).toMatchObject({ classification: 'NOT_EXECUTABLE', reason: 'FILTER_NOT_PAGE_VALUE' });
+    expect(classifyFromRow([itemShape('PATCH', '/api/items?id=gt.3')])).toMatchObject({ classification: 'NOT_EXECUTABLE', reason: 'FILTER_NOT_PAGE_VALUE' });
+    expect(classifyFromRow([itemShape('PATCH', '/api/items?id=eq.3&owner=eq.4')])).toMatchObject({ classification: 'NOT_EXECUTABLE', reason: 'FILTER_MULTIPLE' });
+    expect(classifyFromRow([itemShape('PATCH', '/api/items')])).toMatchObject({ classification: 'NOT_EXECUTABLE', reason: 'FILTER_MISSING' });
+    // 古い型（番号の形の印がない）は、番号の形とみなさない。
+    const legacy = itemShape('PATCH', '/api/items?id=eq.3');
+    const legacyShape = { ...legacy, filters: legacy.filters.map(({ name, operator, valueMatchesPagePath }) => ({ name, operator, valueMatchesPagePath })) } as unknown as ApiRequestShape;
+    expect(classifyFromRow([legacyShape])).toMatchObject({ classification: 'NOT_EXECUTABLE', reason: 'FILTER_NOT_PAGE_VALUE' });
+  });
+
+  it('is API_UPDATE for a PATCH without a filter whose path shape ends with {id}', () => {
+    const shape = itemShape('PATCH', '/api/items/4');
+    expect(shape.pathShape).toBe('/api/items/{id}');
+    expect(classify([shape])).toEqual({ classification: 'API_UPDATE', reason: null, shape, shapeDigest: apiShapeDigestOf(shape) });
+    expect(classifyFromRow([shape])).toMatchObject({ classification: 'API_UPDATE' });
+    // 行ごとに番号が違っても、型と digest は同じ。
+    expect(apiShapeDigestOf(itemShape('PATCH', '/api/items/5'))).toBe(apiShapeDigestOf(shape));
+    // 途中の番号だけの path は今のまま（filter がない）。
+    expect(classify([itemShape('PATCH', '/projects/7/items')])).toMatchObject({ classification: 'NOT_EXECUTABLE', reason: 'FILTER_MISSING' });
+    // object でない本文・閉じた一覧の外の query は更新にしない。
+    expect(classify([shapeOf({ method: 'PATCH', url: `${API}/api/items/4`, body: { kind: 'NONE' } }, LIST_PAGE)]))
+      .toMatchObject({ classification: 'NOT_EXECUTABLE', reason: 'UNRECOGNIZED' });
+    expect(classify([itemShape('PATCH', '/api/items/4?select=*')])).toMatchObject({ classification: 'API_UPDATE' });
+  });
+
+  it('keeps a PUT not executable (PUT_METHOD), also to a path that ends with a record number', () => {
+    expect(classifyFromRow([itemShape('PUT', '/api/items/4')])).toMatchObject({ classification: 'NOT_EXECUTABLE', reason: 'PUT_METHOD' });
+    expect(classifyFromRow([itemShape('PUT', '/api/items?id=eq.3')])).toMatchObject({ classification: 'NOT_EXECUTABLE', reason: 'PUT_METHOD' });
+  });
+
+  it('is NOT_EXECUTABLE (CREATE_PATH_HAS_ID) for a POST whose path shape ends with {id} (K4)', () => {
+    const shape = itemShape('POST', '/api/items/4');
+    expect(classify([shape])).toEqual({ classification: 'NOT_EXECUTABLE', reason: 'CREATE_PATH_HAS_ID', shape, shapeDigest: apiShapeDigestOf(shape) });
+    expect(classifyFromRow([shape])).toMatchObject({ classification: 'NOT_EXECUTABLE', reason: 'CREATE_PATH_HAS_ID' });
+    // 番号のない送り先への POST は今のまま登録。
+    expect(classify([itemShape('POST', '/api/items')])).toMatchObject({ classification: 'API_CREATE', reason: null });
+    expect(classify([itemShape('POST', '/projects/7/items')])).toMatchObject({ classification: 'API_CREATE', reason: null });
+  });
+});
+
+describe('DEF-220: the shape to an approved test Origin (APPROVED_TEST)', () => {
+  /** 承認したテストの Origin（`approvedTestOrigins` の番号 0）への要求の型。 */
+  const testShape = (method: string, path: string, body: ApiRequestShapeInput['body'] = { kind: 'TEXT', text: JSON.stringify({ name: 'n' }) }): ApiRequestShape =>
+    apiRequestShapeOf({
+      method, resourceType: 'fetch', url: `${APP}${path}`, origin: { kind: 'APPROVED_TEST', index: 0 }, headers: { 'content-type': 'application/json' }, body,
+    }, { pagePath: PAGE_PATH, markers: [], isStateKeyName: fieldNameHasStateWord });
+
+  it('is API_CREATE for a POST and API_UPDATE for a PATCH with the filter of the page path value', () => {
+    const create = testShape('POST', '/api/members');
+    expect(create.origin).toEqual({ kind: 'APPROVED_TEST', index: 0 });
+    expect(classify([create])).toEqual({ classification: 'API_CREATE', reason: null, shape: create, shapeDigest: apiShapeDigestOf(create) });
+    expect(classify([testShape('PATCH', '/api/members?id=eq.42')])).toMatchObject({ classification: 'API_UPDATE', reason: null });
+  });
+
+  it.each([
+    ['DELETE_METHOD', () => testShape('DELETE', '/api/members?id=eq.42', { kind: 'NONE' })],
+    ['PUT_METHOD', () => testShape('PUT', '/api/members?id=eq.42')],
+    ['PROCEDURE_CALL_PATH', () => testShape('POST', '/api/rpc/add_member')],
+    ['PROCEDURE_CALL_PATH', () => testShape('POST', '/functions/v1/add-member')],
+    ['UPSERT', () => testShape('POST', '/api/members?on_conflict=id')],
+    ['ARRAY_BODY', () => testShape('POST', '/api/members', { kind: 'TEXT', text: '[{"name":"n"}]' })],
+    ['NON_JSON_BODY', () => testShape('POST', '/api/members', { kind: 'TEXT', text: 'name=n' })],
+    ['SOFT_DELETE_KEY', () => testShape('PATCH', '/api/members?id=eq.42', { kind: 'TEXT', text: '{"deleted_at":"x"}' })],
+  ] as const)('keeps the rule %s', (reason, make) => {
+    expect(classify([make()])).toMatchObject({ classification: 'NOT_EXECUTABLE', reason });
+  });
+
+  it('keeps a request to an allowed Origin that is not an approved test Origin not executable (UNAPPROVED_ORIGIN)', () => {
+    const allowed = { ...testShape('POST', '/api/members'), origin: { kind: 'ALLOWED' } as const };
+    expect(classify([allowed])).toMatchObject({ classification: 'NOT_EXECUTABLE', reason: 'UNAPPROVED_ORIGIN' });
   });
 });

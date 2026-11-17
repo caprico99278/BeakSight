@@ -21,6 +21,7 @@ import {
   AUTO_DRAFT_READ_CHECK_PLACEHOLDER_EXPECTATIONS,
   inferredReadExpectationOf,
   isAutoDraftDiscoveryStale,
+  listRowUpdateFieldsOf,
   type AutoDraftPlanInput,
   type AutoDraftScenarioFact,
 } from './api-scenario-autodraft.js';
@@ -32,8 +33,8 @@ import {
 } from './api-scenario-draft.js';
 import {
   autoDraftDefinitionChoiceOf,
-  autoDraftRecordIdTemplatesOf,
   formAutoDraftRowsOf,
+  formUpdateTemplatesOf,
   type AutoDraftDefinitionChoice,
   type AutoDraftDefinitionFact,
   type FormAutoDraftRow,
@@ -42,6 +43,7 @@ import { draftValueOf, type DraftValue } from './draft-value-origin.js';
 import {
   chooseUpdateChangedField,
   updateChangedValueVaries,
+  type UpdateChangedFieldFact,
   type UpdateChangedFieldGround,
   type UpdateChangedFieldUnavailableReason,
 } from './update-changed-field.js';
@@ -51,13 +53,13 @@ import {
   DEFAULT_MAX_CREATES_PER_RUN,
   DEFAULT_MAX_CUMULATIVE_CREATES,
   FORM_RECORD_ID_SOURCE,
-  MAX_FORM_RECORD_ID_PATTERNS,
   RECORD_ID_PLACEHOLDER,
   SCENARIO_API_FIELD_JSON_TYPES,
   UPDATE_SCENARIO_KIND,
   type FormRecordIdSpec,
   type ReadCheckReference,
   type ScenarioKindFact,
+  type ScenarioListRow,
   type ScenarioReadVerification,
   type ScenarioVerificationRecordId,
 } from './scenario-contracts.js';
@@ -115,6 +117,8 @@ export type FormAutoDraftUpdatePlan =
     readonly changedFieldNames: readonly string[];
     readonly keepFieldNames: readonly string[];
     readonly ground: UpdateChangedFieldGround;
+    /** LU-11 fix round 2: 規則 F の欄の事実（一覧の行の更新で、行を選ぶ欄を除いて選び直すため。見えていて編集できる欄の順）。 */
+    readonly changedFieldFacts: readonly UpdateChangedFieldFact[];
   }
   | { readonly status: 'NO_CHANGED_FIELD'; readonly row: FormAutoDraftRow; readonly reason: UpdateChangedFieldUnavailableReason }
   | { readonly status: 'EXISTING'; readonly row: FormAutoDraftRow; readonly scenarioId: string }
@@ -229,7 +233,7 @@ const withoutTrailingSeparator = (path: string): string => path.replace(/\/+$/u,
 
 /**
  * 登録の ID の型（推測。根拠 `FORM_RECORD_ID_FROM_UPDATE_CANDIDATE`。なければ `FORM_RECORD_ID_FROM_CREATE_ACTION`）: 同じ表の書き換えの候補（送信先が同じ Origin で、送信先の型の `{id}` の前の path が登録の
- * 送信先の path）の、送信先の型と画面の型（同じなら 1 つ。`MAX_FORM_RECORD_ID_PATTERNS` まで）。候補の順で最初の 1 つ。なければ null。
+ * 送信先の path）の、送信先の型と画面の型（同じなら 1 つ）。候補の順で最初の 1 つ。なければ null。
  */
 export const formRecordIdOf = (create: DiscoveryCandidate, candidates: readonly DiscoveryCandidate[]): DraftValue<FormRecordIdSpec> | null => {
   const fromUpdate = formRecordIdFromUpdateOf(create, candidates);
@@ -260,13 +264,15 @@ export const formRecordIdFromUpdateOf = (create: DiscoveryCandidate, candidates:
   }
   const tablePath = withoutTrailingSeparator(action.path);
   for (const { kind, candidate } of formAutoDraftRowsOf(candidates)) {
-    const templates = kind === UPDATE_SCENARIO_KIND ? autoDraftRecordIdTemplatesOf(candidate) : null;
+    // LU-11: 行の下に広がるフォームの書き換えも同じ推しの 1 か所（`formUpdateTemplatesOf`）。画面の型に `{id}` がなければ、送信先の型だけを型にする。
+    const templates = kind === UPDATE_SCENARIO_KIND ? formUpdateTemplatesOf(candidate) : null;
     // Origin の比べ方は URL の意味の owner（`isOriginInAllowedOrigins`。GATE-ARCH04）。
     if (templates === null || candidate.action === null || !isOriginInAllowedOrigins([action.origin], candidate.action.origin)
       || templates.actionPathTemplate.slice(0, templates.actionPathTemplate.indexOf(`${PATH_SEPARATOR}${RECORD_ID_PLACEHOLDER}`)) !== tablePath) {
       continue;
     }
-    const pathPatterns = [...new Set([templates.actionPathTemplate, templates.formPathTemplate])].slice(0, MAX_FORM_RECORD_ID_PATTERNS);
+    const pathPatterns = [...new Set([templates.actionPathTemplate, templates.formPathTemplate])]
+      .filter((pattern) => pattern.includes(RECORD_ID_PLACEHOLDER));
     return draftValueOf(Object.freeze({ source: FORM_RECORD_ID_SOURCE, pathPatterns: Object.freeze(pathPatterns) }), 'FORM_RECORD_ID_FROM_UPDATE_CANDIDATE');
   }
   return null;
@@ -317,19 +323,17 @@ export const formAnswerReadDefinitionOf = (answerRead: FormAnswerRead): {
 
 /**
  * 照合の専用の定義の選び方: 同じ候補で同じ送る値の、照合の専用の印で参照される定義（`verificationOnlyReadCheckIds`）が既にあれば使う（人が作った定義は、
- * 単独の READ の作業から外さないため使わない）。上限なら作らない。
+ * 単独の READ の作業から外さないため使わない）。定義の数では止めない（L4。COV-7）。
  */
 export const formAnswerReadChoiceOf = (input: {
   readonly answerRead: FormAnswerRead;
   readonly definitions: readonly AutoDraftDefinitionFact[];
   readonly verificationOnlyReadCheckIds: readonly string[];
-  readonly maxDefinitions: number;
 }): AutoDraftDefinitionChoice<ReturnType<typeof formAnswerReadDefinitionOf>> => autoDraftDefinitionChoiceOf({
   definitions: input.definitions,
   isSame: ({ readCheckId, targetIdentityDigest, parameterNames }) => input.verificationOnlyReadCheckIds.includes(readCheckId)
     && targetIdentityDigest === input.answerRead.candidate.identityDigest
     && JSON.stringify(parameterNames ?? []) === JSON.stringify([input.answerRead.parameterName]),
-  maxDefinitions: input.maxDefinitions,
   definition: formAnswerReadDefinitionOf(input.answerRead),
 });
 
@@ -408,6 +412,8 @@ export type FormUpdateChangedFieldChoice =
     readonly changedFieldNames: readonly string[];
     readonly keepFieldNames: readonly string[];
     readonly ground: UpdateChangedFieldGround;
+    /** LU-11 fix round 2: 規則 F の欄の事実（見えていて編集できる欄の順）。 */
+    readonly facts: readonly UpdateChangedFieldFact[];
   }
   | { readonly kind: 'UNAVAILABLE'; readonly reason: UpdateChangedFieldUnavailableReason };
 
@@ -446,6 +452,7 @@ export const formUpdateChangedFieldOf = (
     changedFieldNames: Object.freeze([choice.fieldName]),
     keepFieldNames: Object.freeze(editable.filter((name) => name !== choice.fieldName)),
     ground: choice.ground,
+    facts: Object.freeze(facts.map(({ name, usable, sentInLedger, onCreateScreen }) => Object.freeze({ name, usable, sentInLedger, onCreateScreen }))),
   });
 };
 
@@ -465,7 +472,10 @@ const updatePlanOf = (input: AutoDraftPlanInput, row: FormAutoDraftRow): FormAut
   const create = sameTableCreateOf(row.candidate, input.candidates);
   const choice = formUpdateChangedFieldOf(input.profileId, row.candidate, create, create === null ? null : formCreateFieldNamesOf(input.profileId, create));
   return choice.kind === 'CHOSEN'
-    ? { status: 'NEW', row, changedFieldNames: choice.changedFieldNames, keepFieldNames: choice.keepFieldNames, ground: choice.ground }
+    ? {
+      status: 'NEW', row, changedFieldNames: choice.changedFieldNames, keepFieldNames: choice.keepFieldNames, ground: choice.ground,
+      changedFieldFacts: choice.facts,
+    }
     : { status: 'NO_CHANGED_FIELD', row, reason: choice.reason };
 };
 
@@ -502,14 +512,14 @@ export interface FormAutoDraftUpdatePreset {
 }
 
 /**
- * 書き換えの作成の画面で前もって選ぶ値: 型は共通の部品（`autoDraftRecordIdTemplatesOf`）。台帳は、同じプロファイルの登録のシナリオのうち、登録の ID の取り方が
- * 送信先の型に結び付くもの（唯一の判定 `isUpdatePathBoundToLedger`）がちょうど 1 つのとき。
+ * 書き換えの作成の画面で前もって選ぶ値: 型は共通の部品（`formUpdateTemplatesOf`。LU-11: 行の下に広がるフォームは、画面 = 一覧の path、送信先 = 送信先の型）。
+ * 台帳は、同じプロファイルの登録のシナリオのうち、登録の ID の取り方が送信先の型に結び付くもの（唯一の判定 `isUpdatePathBoundToLedger`）がちょうど 1 つのとき。
  */
 export const formUpdateDraftPresetOf = (
   update: DiscoveryCandidate,
   ledgers: readonly (Pick<ScenarioKindFact, 'scenarioId' | 'kind'> & { readonly recordId: ScenarioVerificationRecordId | null })[],
 ): FormAutoDraftUpdatePreset => {
-  const templates = autoDraftRecordIdTemplatesOf(update);
+  const templates = formUpdateTemplatesOf(update);
   const bound = templates === null
     ? []
     : ledgers.filter(({ kind, recordId }) => kind === CREATE_SCENARIO_KIND && isUpdatePathBoundToLedger(templates.actionPathTemplate, recordId));
@@ -526,3 +536,39 @@ export const formUpdateDraftPresetOf = (
 /** 送る欄のうち、文字の欄（欄の名前の順のまま）。書き換えの検証の指定を台帳から写すときの、変える文字の欄に使う。 */
 export const formTextFieldNamesOf = (candidate: DiscoveryCandidate, fieldNames: readonly string[]): readonly string[] =>
   Object.freeze(fieldNames.filter((name) => isTextFieldName(candidate, name)));
+
+/** LU-11: 行の下に広がるフォームの書き換えの、行の選び方と欄（`formListRowUpdateOf`）。 */
+export interface FormListRowUpdate {
+  readonly listRow: ScenarioListRow;
+  readonly changedFieldNames: readonly string[];
+  readonly keepFieldNames: readonly string[];
+}
+
+/**
+ * LU-11（設計書 `2026-11-02-beaksight-list-row-update-design.md` 5.4 の 1・4、D3・D5）: 行の下に広がるフォームの書き換えの、行の選び方と欄（作らないときは null）。
+ * 同じ行の名前のある開き手（`rowOpener`。名前がなければ作らない D3）があり、画面の型が一覧の path（`{id}` なし）のときだけ。一覧の path は候補の画面の path、
+ * 開き手の識別の digest は `rowOpener.identityDigest`。LU-11 fix round 2: 行を選ぶ欄と変える欄は API の形と同じ決め方（`listRowUpdateFieldsOf`。行を選ぶ欄を
+ * 先に決め、変える欄はそれを除いて規則 F で選び直す）。決められなければ null。
+ */
+export const formListRowUpdateOf = (input: {
+  readonly update: DiscoveryCandidate;
+  readonly formPathTemplate: string;
+  readonly facts: readonly UpdateChangedFieldFact[];
+  readonly ledgerFact: Pick<ScenarioKindFact, 'uniqueEachRunFieldNames'> | undefined;
+  readonly listShownFieldNames: readonly string[];
+}): FormListRowUpdate | null => {
+  const opener = input.update.rowOpener;
+  if (opener?.hasName !== true || input.formPathTemplate !== input.update.page.path || input.formPathTemplate.includes(RECORD_ID_PLACEHOLDER)) {
+    return null;
+  }
+  const fields = listRowUpdateFieldsOf({
+    facts: input.facts, uniqueEachRunFieldNames: input.ledgerFact?.uniqueEachRunFieldNames, listShownFieldNames: input.listShownFieldNames,
+  });
+  return fields === null
+    ? null
+    : Object.freeze({
+      listRow: Object.freeze({ listPagePath: input.update.page.path, openerIdentityDigest: opener.identityDigest, rowKeyField: fields.rowKeyField }),
+      changedFieldNames: fields.changedFieldNames,
+      keepFieldNames: fields.keepFieldNames,
+    });
+};

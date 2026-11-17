@@ -224,9 +224,9 @@ describe('scenario store (T28c): create', () => {
   });
 
   it('rejects a draft that validateScenarioDraft rejects, with its errors', () => {
-    const result = create({ fieldNames: ['API-Key', 'plan'], approvalTtlDays: 31 });
+    const result = create({ fieldNames: ['API-Key', 'plan'], limits: { maxCreatesPerRun: 2, maxCumulativeCreates: 20 } });
     expect(result.ok ? null : [result.reason, result.draftErrors.map(({ code }) => code)])
-      .toEqual(['SCENARIO_DRAFT_INVALID', ['SCENARIO_FIELD_SECRET_LIKE', 'SCENARIO_TTL_ABOVE_DEFAULT']]);
+      .toEqual(['SCENARIO_DRAFT_INVALID', ['SCENARIO_FIELD_SECRET_LIKE', 'SCENARIO_LIMIT_ABOVE_DEFAULT']]);
     expect(reasonOf(create({ candidateIdentityDigest: READ_CANDIDATE.identityDigest, fieldNames: [] }, 'scenario-read')))
       .toBe('SCENARIO_DRAFT_INVALID');
   });
@@ -311,7 +311,9 @@ describe('scenario store (T28c): approval and revocation', () => {
     }));
     expect(readScenarioApprovalStatus(database, 'scenario-1', EXTERNAL, IN_TTL)?.validity)
       .toEqual({ approved: true, receiptId: 'receipt-1', expiresAt: EXPIRES_AT });
-    expect(readScenarioApprovalStatus(database, 'scenario-1', EXTERNAL, AFTER_TTL)?.validity).toEqual({ approved: false, reasons: ['EXPIRED'] });
+    // L12b（設計書 `2026-11-09-beaksight-remove-limits-design.md` 6.2。S16）: 承認の有効期間を撤廃した（前は `EXPIRED`）。保存済みの `expiresAt` を過ぎても有効。
+    expect(readScenarioApprovalStatus(database, 'scenario-1', EXTERNAL, AFTER_TTL)?.validity)
+      .toEqual({ approved: true, receiptId: 'receipt-1', expiresAt: EXPIRES_AT });
   });
 
   it('rejects an old revision, a digest computed from other facts, and unconfirmed side effects, and writes nothing', () => {

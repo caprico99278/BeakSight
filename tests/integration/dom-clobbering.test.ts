@@ -2,7 +2,7 @@
 // （`collectDomEvidence`）と Interaction の候補の発見（`discoverInteractionCandidates`、保持した要素の読み取り）が落ちずに、標準の値を記録する
 // ことを確かめる。fixture（`fixtures/site/dom-clobbered-forms.html`）は、名前ごとに 1 つの form を持ち、その form の中に、その名前の入力の欄と
 // 送信のボタンを置く。form 自身も候補（`aria-expanded`）にして、候補の発見が form そのものを読む経路も確かめる。
-// Chromium は headless だけ（テストの既定と、CLI の起動の設定の両方）。サーバは 127.0.0.1 の fixture のサーバだけ。
+// Chromium は headless のテストの既定だけ。サーバは 127.0.0.1 の fixture のサーバだけ。
 import type { Browser, Page } from 'playwright';
 import { afterAll, beforeAll, describe, expect, it } from 'vitest';
 import { startFixtureServer, type FixtureServer } from '../../fixtures/server.js';
@@ -13,12 +13,7 @@ import {
   inspectInteractionCandidateHandle,
   resolveInteractionCandidateHandle,
 } from '../../src/interaction/discover-candidates.js';
-import { launchCliChromium, launchHeadlessChromium } from '../helpers/chromium.js';
-
-const LAUNCHERS = [
-  ['the default test Chromium', () => launchHeadlessChromium()],
-  ['the CLI launch settings', () => launchCliChromium()],
-] as const;
+import { DEFAULT_CHROMIUM_LAUNCHERS } from '../helpers/chromium.js';
 
 const FIXTURE_PATH = '/dom-clobbered-forms.html';
 
@@ -69,7 +64,7 @@ afterAll(async () => {
   await server.close();
 });
 
-describe.each(LAUNCHERS)('DEF-069: DOM clobbering of form properties (%s)', (_name, launch) => {
+describe.each(DEFAULT_CHROMIUM_LAUNCHERS)('DEF-069: DOM clobbering of form properties (%s)', (_name, launch) => {
   let browser: Browser;
 
   beforeAll(async () => {
@@ -142,7 +137,7 @@ describe.each(LAUNCHERS)('DEF-069: DOM clobbering of form properties (%s)', (_na
     });
   });
 
-  it('inspects the retained forms and buttons with complete scroll and attribute records', async () => {
+  it('inspects the retained forms and buttons with complete attribute records', async () => {
     await withFixturePage(async (page) => {
       const discovery = await discoverInteractionCandidates(page);
       expect(discovery.candidates).toHaveLength(CLOBBERING_FIELD_NAMES.length * CANDIDATES_PER_FORM);
@@ -154,7 +149,6 @@ describe.each(LAUNCHERS)('DEF-069: DOM clobbering of form properties (%s)', (_na
           expect(snapshot).toMatchObject({
             status: 'CONNECTED',
             candidate: { candidateId: candidate.candidateId, ordinal: candidate.ordinal },
-            scroll: { status: 'RECORDED' },
             attributes: { status: 'RECORDED' },
           });
         } finally {

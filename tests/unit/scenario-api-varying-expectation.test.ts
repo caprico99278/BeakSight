@@ -8,16 +8,20 @@
 // - FORM のシナリオと、候補の READ（結び付けで生成した値を送る）は対象の外。
 import { describe, expect, it } from 'vitest';
 import { EXECUTION_GRANT_REJECTION_REASONS } from '../../src/control/approval/execution-grant.js';
-import type { ScenarioRevision } from '../../src/control/approval/scenario-contracts.js';
+import type { ScenarioRevision, VerificationExpectation } from '../../src/control/approval/scenario-contracts.js';
 import { validateScenarioDraft } from '../../src/control/approval/scenario-policy.js';
 import { planRuleSet } from '../../src/control/data-rules/field-evaluation.js';
 import type { FieldRule } from '../../src/control/data-rules/rule-contracts.js';
-import { readVerificationVaryingRejectionOf, uniqueEachRunFieldNamesOf, varyingFieldNamesOf } from '../../src/control/data-rules/varying-values.js';
+import {
+  readVerificationUniqueRejectionOf,
+  readVerificationVaryingRejectionOf,
+  uniqueEachRunFieldNamesOf,
+  varyingFieldNamesOf,
+} from '../../src/control/data-rules/varying-values.js';
 import { apiRequestShapeOf } from '../../src/core/api-request-shape.js';
 import type { DiscoveryCandidate } from '../../src/discovery/candidate-contracts.js';
 import { hasGeneratedValueExpectation } from '../../src/discovery/read-check-contracts.js';
 import { observedSubmissionProbeOf, type SubmissionProbeInputField } from '../../src/discovery/submission-probe-contracts.js';
-import { EXECUTION_GRANT_REJECTION_DESCRIPTIONS } from '../../src/presentation/messages.js';
 import { ALL_CONFIRMED, PROFILE_ID, candidateOf, sampleScenario } from './approval-samples.js';
 import { ruleSetFor } from './data-rule-scenario-samples.js';
 import { sampleFieldRule } from './data-rule-samples.js';
@@ -100,11 +104,10 @@ describe('T40R2-fix M-1: which fields vary from run to run', () => {
 });
 
 describe('T40R2-fix M-1: the expectation of a READ without a value to send must compare with a varying value', () => {
-  it('adds the grant rejection reason with its description', () => {
+  it('adds the grant rejection reason', () => {
     // T41b: その後ろに、API の更新の台帳の結び付けの理由を足した（`api-update-grant-start.test.ts`）。MI-F1: さらに後ろに、副作用の確認の済んでいない版の
     // 理由を足した。
     expect(EXECUTION_GRANT_REJECTION_REASONS.at(-3)).toBe('READ_VERIFICATION_NOT_VARYING');
-    expect(EXECUTION_GRANT_REJECTION_DESCRIPTIONS.READ_VERIFICATION_NOT_VARYING.description.length).toBeGreaterThan(0);
   });
 
   it.each<readonly [string, Expectations, readonly FieldRule[], string | null]>([
@@ -156,5 +159,47 @@ describe('OP-REV6 I-1: the expectation of a list page READ must compare with a v
   ])('judges %s', (_label, expectations, rules, path, reason) => {
     const scenario = apiScenarioOf('rc-page', [], expectations);
     expect(readVerificationVaryingRejectionOf(ruleSetFor(scenario, rules), scenario, CANDIDATE, path)).toBe(reason);
+  });
+});
+
+// LU-7 fix round 2（一覧の行の更新の設計書 5.5 の 7、K3）: 一覧の画面の照合と一覧の行の更新の「毎回違う欄」の判定は 1 か所（`readVerificationUniqueRejectionOf`）。
+// 許可の発行（`readVerificationVaryingRejectionOf` を通す）と書き込みの開始（`writeStartSpecOf`）が使う。一覧の行の更新は、行を選ぶ欄で前の登録の行と区別するので、
+// 行を選ぶ欄が台帳の登録の毎回違う欄にあることを求め、変える欄（照合の期待の欄）が毎回違う欄であることは求めない。一覧の行のない照合は今のまま。
+describe('LU-7 fix round 2: the unique each run judgement of a list page READ and a list row update', () => {
+  const LIST_ROW = { rowKeyField: 'email' };
+  const textOf = (fieldName: string): VerificationExpectation => ({ kind: 'TEXT_CONTAINS', fieldName });
+  const base = { expectations: [textOf('name')], listPage: true, uniqueEachRunFieldNames: [], listRow: null, ledgerUniqueEachRunFieldNames: null } as const;
+
+  it('passes a list row update whose row key field differs each run in the ledger, even when the changed field does not', () => {
+    expect(readVerificationUniqueRejectionOf({ ...base, listRow: LIST_ROW, ledgerUniqueEachRunFieldNames: ['email'] })).toBeNull();
+    // 照合の READ の画面によらない（LU-8 の開始の確かめ直しと同じ判定）。
+    expect(readVerificationUniqueRejectionOf({ ...base, listPage: false, listRow: LIST_ROW, ledgerUniqueEachRunFieldNames: ['email'] })).toBeNull();
+  });
+
+  it('rejects a list row update whose row key field does not differ each run in the ledger, or when the ledger facts are unknown', () => {
+    expect(readVerificationUniqueRejectionOf({ ...base, listRow: LIST_ROW, ledgerUniqueEachRunFieldNames: ['name'] })).toBe('READ_VERIFICATION_NOT_VARYING');
+    expect(readVerificationUniqueRejectionOf({ ...base, listRow: LIST_ROW, ledgerUniqueEachRunFieldNames: null })).toBe('READ_VERIFICATION_NOT_VARYING');
+    expect(readVerificationUniqueRejectionOf({ ...base, listPage: false, listRow: LIST_ROW, ledgerUniqueEachRunFieldNames: [] }))
+      .toBe('READ_VERIFICATION_NOT_VARYING');
+  });
+
+  it('keeps the judgement of a list page READ without a list row, and leaves the other READs out', () => {
+    expect(readVerificationUniqueRejectionOf(base)).toBe('READ_VERIFICATION_NOT_VARYING');
+    expect(readVerificationUniqueRejectionOf({ ...base, expectations: [textOf('email')], uniqueEachRunFieldNames: ['email'] })).toBeNull();
+    expect(readVerificationUniqueRejectionOf({ ...base, listPage: false })).toBeNull();
+  });
+
+  it('judges the grant of a list row update on the list page by the row key field of the ledger', () => {
+    const scenario = apiScenarioOf('rc-page', [], [TEXT_OF('name')]);
+    const listRowScenario = {
+      ...scenario,
+      api: { ...scenario.api, ledger: { targetCreateScenarioId: 'scenario-ledger', formPathTemplate: '/admin/members', listRow: { ...LIST_ROW, listPagePath: '/admin/members', openerIdentityDigest: `sha256:${'1'.repeat(64)}` } } },
+    } as ScenarioRevision;
+    const rules = ruleSetFor(scenario, [SCORE_RANGE, fixed('name', ['試験 太郎', '試験 次郎'])]);
+    expect(readVerificationVaryingRejectionOf(rules, listRowScenario, CANDIDATE, '/admin/members', ['email'])).toBeNull();
+    expect(readVerificationVaryingRejectionOf(rules, listRowScenario, CANDIDATE, '/admin/members', [])).toBe('READ_VERIFICATION_NOT_VARYING');
+    expect(readVerificationVaryingRejectionOf(rules, listRowScenario, CANDIDATE, '/admin/members')).toBe('READ_VERIFICATION_NOT_VARYING');
+    // 一覧の行のない照合は今のまま（変える欄の固定の一覧は、一覧の画面では毎回違う欄でない）。
+    expect(readVerificationVaryingRejectionOf(rules, scenario, CANDIDATE, '/admin/members', ['email'])).toBe('READ_VERIFICATION_NOT_VARYING');
   });
 });

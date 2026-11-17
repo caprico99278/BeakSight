@@ -11,6 +11,7 @@
     { "$ref": "#/$defs/credentialSaveAllowed" },
     { "$ref": "#/$defs/loginRegistered" },
     { "$ref": "#/$defs/loginRegistrationSkipped" },
+    { "$ref": "#/$defs/reloginStage" },
     { "$ref": "#/$defs/ready" },
     { "$ref": "#/$defs/runStarted" },
     { "$ref": "#/$defs/progress" },
@@ -25,7 +26,7 @@
     { "$ref": "#/$defs/credentialSaved" }
   ],
   "$defs": {
-    "protocol": { "const": "beaksight-worker-message/7" },
+    "protocol": { "const": "beaksight-worker-message/9" },
     "count": { "type": "integer", "minimum": 0, "maximum": 9007199254740991 },
     "path": { "type": "string", "minLength": 1, "maxLength": 1024 },
     "runId": { "type": "string", "pattern": "^RUN-[0-9]{6,}$" },
@@ -49,7 +50,6 @@
         "readChecks": {
           "type": "array",
           "minItems": 1,
-          "maxItems": 20,
           "items": { "$ref": "#/$defs/startReadCheck" }
         },
         "write": { "oneOf": [{ "$ref": "#/$defs/startWrite" }, { "$ref": "#/$defs/startApiWrite" }] },
@@ -73,7 +73,7 @@
           "additionalProperties": false,
           "required": ["stages"],
           "properties": {
-            "stages": { "type": "array", "minItems": 2, "maxItems": 3, "items": { "$ref": "#/$defs/chainStageKind" } },
+            "stages": { "type": "array", "minItems": 1, "maxItems": 3, "items": { "$ref": "#/$defs/chainStageKind" } },
             "writeStages": {
               "description": "OP-2: the worker may run the write stages (WRITE_CREATE, WRITE_UPDATE) after the read stages, each started by a NEXT_STAGE with the write specification. Only true; absent means no write stage.",
               "const": true
@@ -83,6 +83,20 @@
               "type": "integer",
               "minimum": 1,
               "maximum": 9007199254740991
+            },
+            "checkedScreenPages": {
+              "description": "WSO (version 9): the screens that the audit stage reads in the inspection of the checked screens only (origin and path; no query). Required together with the audit stage only sequence and writeStages, and allowed only with them (checked by worker-protocol.ts). The worker reads only these screens and does not follow links to other screens.",
+              "type": "array",
+              "minItems": 1,
+              "items": {
+                "type": "object",
+                "additionalProperties": false,
+                "required": ["origin", "path"],
+                "properties": {
+                  "origin": { "type": "string", "minLength": 1 },
+                  "path": { "type": "string", "minLength": 1 }
+                }
+              }
             }
           }
         }
@@ -127,8 +141,8 @@
           "additionalProperties": false,
           "required": ["origin", "path"],
           "properties": {
-            "origin": { "type": "string", "minLength": 1, "maxLength": 2048 },
-            "path": { "type": "string", "minLength": 1, "maxLength": 2048 }
+            "origin": { "type": "string", "minLength": 1 },
+            "path": { "type": "string", "minLength": 1 }
           }
         },
         "candidate": {
@@ -142,13 +156,12 @@
         },
         "candidateFields": {
           "type": "array",
-          "maxItems": 200,
           "items": {
             "type": "object",
             "additionalProperties": false,
             "required": ["name", "type", "readonly", "hidden", "disabled"],
             "properties": {
-              "name": { "type": "string", "maxLength": 256 },
+              "name": { "type": "string" },
               "type": { "$ref": "urn:beaksight:schema:control:candidate:1#/$defs/field/properties/type" },
               "readonly": { "type": "boolean" },
               "hidden": { "type": "boolean" },
@@ -158,9 +171,8 @@
         },
         "values": {
           "type": "object",
-          "maxProperties": 200,
-          "propertyNames": { "minLength": 1, "maxLength": 256 },
-          "additionalProperties": { "anyOf": [{ "type": "string", "maxLength": 8192 }, { "type": "null" }] }
+          "propertyNames": { "minLength": 1 },
+          "additionalProperties": { "anyOf": [{ "type": "string" }, { "type": "null" }] }
         },
         "update": {
           "description": "The update block of a WRITE_UPDATE START (T31f; Task 31 design 4 'IPC'): the id of the target record copied from the execution grant, the templated identity digest of the approved candidate, and the names of the changed and the kept fields. No value.",
@@ -168,20 +180,42 @@
           "additionalProperties": false,
           "required": ["targetRecordId", "templatedIdentityDigest", "changedFieldNames", "keptFieldNames"],
           "properties": {
-            "targetRecordId": { "type": "string", "pattern": "^[A-Za-z0-9_-]+$", "minLength": 1, "maxLength": 64 },
+            "targetRecordId": { "type": "string", "pattern": "^[A-Za-z0-9_-]+$", "minLength": 1 },
             "templatedIdentityDigest": { "type": "string", "pattern": "^sha256:[a-f0-9]{64}$" },
             "changedFieldNames": {
               "type": "array",
               "minItems": 1,
-              "maxItems": 200,
               "uniqueItems": true,
-              "items": { "type": "string", "minLength": 1, "maxLength": 256 }
+              "items": { "type": "string", "minLength": 1 }
             },
             "keptFieldNames": {
               "type": "array",
-              "maxItems": 200,
               "uniqueItems": true,
-              "items": { "type": "string", "minLength": 1, "maxLength": 256 }
+              "items": { "type": "string", "minLength": 1 }
+            },
+            "knownKeptValues": {
+              "description": "LU-12b (list row update design 5.5 and the user decision of 2026-11-03 to compare a list row form update with the ledger): the last value known by the ledger of each kept field (the empty value too), required with listRow and allowed only then (worker-protocol.ts checks it and that the names are kept fields, each once). The values are the test values BeakSight made, as for the values.",
+              "type": "array",
+              "items": {
+                "type": "object",
+                "additionalProperties": false,
+                "required": ["key", "value"],
+                "properties": {
+                  "key": { "type": "string", "minLength": 1 },
+                  "value": { "type": "string" }
+                }
+              }
+            },
+            "listRow": {
+              "description": "LU-12b (list row update design 4.0 D5, 5.5): the way to choose the row of a list row form update (the form below or in the row), required when the approved update has a list row and allowed only then. The list page path is the page of the write (no record id; worker-protocol.ts checks that the form page is this path), the opener identity digest is the approved opener of the row, and the row key value is the last value known by the ledger of the row key field (a test value BeakSight made, as for the values; only in this message, never in a record or a log).",
+              "type": "object",
+              "additionalProperties": false,
+              "required": ["listPagePath", "openerIdentityDigest", "rowKeyValue"],
+              "properties": {
+                "listPagePath": { "type": "string", "pattern": "^/" },
+                "openerIdentityDigest": { "type": "string", "pattern": "^sha256:[a-f0-9]{64}$" },
+                "rowKeyValue": { "type": "string", "minLength": 1 }
+              }
             }
           }
         },
@@ -221,9 +255,8 @@
         "values": {
           "type": "object",
           "minProperties": 1,
-          "maxProperties": 64,
-          "propertyNames": { "minLength": 1, "maxLength": 64 },
-          "additionalProperties": { "anyOf": [{ "type": "string", "maxLength": 8192 }, { "type": "null" }] }
+          "propertyNames": { "minLength": 1 },
+          "additionalProperties": { "anyOf": [{ "type": "string" }, { "type": "null" }] }
         },
         "verification": {
           "description": "T40a-fix (Task 40 design 7, the designer's decision on the verification spec of an API scenario): an API write has no way to judge the result of a form (PL-6a: resultJudgement is always null); the record id way of the verification spec may be null when the API spec takes the record id from a key of the response body (worker-protocol.ts rejects both null).",
@@ -247,14 +280,61 @@
             "knownKeptValues": {
               "description": "T41R3-fix-B (Task 41 design 8, T41R3 C-3 and the user decision to compare an API update with the ledger; it replaced the T41R2-fix-B list of names): the last value known by the ledger (the registration and the verified updates, the empty value too) of each kept key. The values are the test values BeakSight made, as for the values. worker-protocol.ts checks that the keys are kept keys of the API spec, each once.",
               "type": "array",
-              "maxItems": 64,
               "items": {
                 "type": "object",
                 "additionalProperties": false,
                 "required": ["key", "value"],
                 "properties": {
                   "key": { "$ref": "urn:beaksight:schema:control:scenario:1#/$defs/apiKey" },
-                  "value": { "type": "string", "maxLength": 8192 }
+                  "value": { "type": "string" }
+                }
+              }
+            },
+            "listRow": {
+              "description": "LU-8 (list row update design 5.5, the last paragraph on the IPC): the way to choose the row of a list row update, required when the ledger of the API spec has a list row and allowed only then (worker-protocol.ts checks it). The row key value is the last value known by the ledger of the row key field of the list row (a test value BeakSight made, as for the values; only in this message, never in a record or a log). The deferred prior values mark has the names of the kept keys of the API spec in the same order (worker-protocol.ts checks it) and no value; the worker reads the prior values after it pressed the opener and supplies them to the guard once. The opener identity digest and the row key field name are in the list row of the ledger of the API spec and are not copied here.",
+              "type": "object",
+              "additionalProperties": false,
+              "required": ["rowKeyValue", "deferredPriorValues"],
+              "properties": {
+                "rowKeyValue": { "type": "string", "minLength": 1 },
+                "deferredPriorValues": {
+                  "type": "object",
+                  "additionalProperties": false,
+                  "required": ["keptKeys"],
+                  "properties": {
+                    "keptKeys": {
+                      "type": "array",
+                      "items": { "$ref": "urn:beaksight:schema:control:scenario:1#/$defs/apiKey" }
+                    }
+                  }
+                }
+              }
+            },
+            "otherFilterValues": {
+              "description": "DEF-198 (list row update design 5.9 3): the value to compare for each other filter of the API spec (the value decided by the page for the key of the same name at the registration of the same inspection; the parent takes it from the checked artifact of the registration and keeps it only in memory; never in a record or a log). Required when the API spec has other filter names and allowed only then (worker-protocol.ts checks the names).",
+              "type": "array",
+              "minItems": 1,
+              "items": {
+                "type": "object",
+                "additionalProperties": false,
+                "required": ["key", "value"],
+                "properties": {
+                  "key": { "$ref": "urn:beaksight:schema:control:scenario:1#/$defs/apiKey" },
+                  "value": { "anyOf": [{ "type": "string", "minLength": 1 }, { "type": "number" }] }
+                }
+              }
+            },
+            "ledgerKeyValues": {
+              "description": "DEF-203 (list row update design 5.10 1): the value to compare for each key to compare with the ledger of the API spec (ledgerPageKeys; the value decided by the page for the key of the same name at the registration of the same inspection, as a JSON scalar; the same source as otherFilterValues, kept only in memory; never in a record or a log). Required when the API spec has keys to compare and allowed only then (worker-protocol.ts checks the names).",
+              "type": "array",
+              "minItems": 1,
+              "items": {
+                "type": "object",
+                "additionalProperties": false,
+                "required": ["key", "value"],
+                "properties": {
+                  "key": { "$ref": "urn:beaksight:schema:control:scenario:1#/$defs/apiKey" },
+                  "value": { "anyOf": [{ "type": "string" }, { "type": "number" }, { "type": "boolean" }, { "type": "null" }] }
                 }
               }
             }
@@ -277,14 +357,20 @@
               "additionalProperties": false,
               "required": ["origin", "path"],
               "properties": {
-                "origin": { "type": "string", "minLength": 1, "maxLength": 2048 },
-                "path": { "type": "string", "minLength": 1, "maxLength": 2048 }
+                "origin": { "type": "string", "minLength": 1 },
+                "path": { "type": "string", "minLength": 1 }
               }
             },
             { "type": "null" }
           ]
         },
-        "definition": { "$ref": "urn:beaksight:schema:control:read-check-definition:1" }
+        "definition": { "$ref": "urn:beaksight:schema:control:read-check-definition:1" },
+        "recordIds": {
+          "description": "Optional (DEF-235): the record ids that the parent found for a page path template of the READ check stage (nearest source first, all of them, each once; no item limit). Only for a page path template (worker-protocol.ts).",
+          "type": "array",
+          "minItems": 1,
+          "items": { "type": "string", "minLength": 1, "pattern": "^[A-Za-z0-9_-]+$" }
+        }
       }
     },
     "startAuthentication": {
@@ -292,20 +378,21 @@
       "additionalProperties": false,
       "required": ["setup", "approvedTestOrigins", "authenticationSha256"],
       "properties": {
-        "setup": { "$ref": "urn:beaksight:schema:control:auth-setup:3" },
+        "setup": {
+          "description": "The auth setup checked by the parent, or null for a test site without a login (NL-2; no login design 3.2 of 2026-11-06: TEST x NONE). With null, the worker runs no login stage, the login rules are not applied, and automatedLogin and loginRegistration are not allowed (worker-protocol.ts).",
+          "anyOf": [{ "$ref": "urn:beaksight:schema:control:auth-setup:3" }, { "type": "null" }]
+        },
         "approvedTestOrigins": {
           "type": "array",
           "minItems": 1,
-          "maxItems": 100,
           "uniqueItems": true,
-          "items": { "type": "string", "minLength": 1, "maxLength": 2048 }
+          "items": { "type": "string", "minLength": 1 }
         },
         "approvedServiceOrigins": {
-          "description": "The approved service origins of the profile (T34a; Task 34 design 3.1, 3.2). Optional; absent is the same as empty. Not in authenticationSha256.",
+          "description": "The approved service origins of the profile (T34a; Task 34 design 3.1, 3.2). Optional; absent is the same as empty. Not in authenticationSha256. L11: no limit of the number of items.",
           "type": "array",
-          "maxItems": 4,
           "uniqueItems": true,
-          "items": { "type": "string", "minLength": 1, "maxLength": 2048 }
+          "items": { "type": "string", "minLength": 1 }
         },
         "authenticationSha256": { "type": "string", "pattern": "^[0-9a-f]{64}$" },
         "automatedLogin": { "$ref": "#/$defs/startAutomatedLogin" },
@@ -370,7 +457,7 @@
       "properties": {
         "protocol": { "$ref": "#/$defs/protocol" },
         "type": { "const": "CREDENTIAL_SAVE_ALLOWED" },
-        "loginOrigin": { "type": "string", "minLength": 1, "maxLength": 2048 }
+        "loginOrigin": { "type": "string", "minLength": 1 }
       }
     },
     "loginRegistered": {
@@ -427,11 +514,25 @@
         "type": { "const": "NEXT_STAGE" },
         "jobId": { "type": "string", "pattern": "^[a-z0-9][a-z0-9-]{0,63}$" },
         "jobKind": { "enum": ["DISCOVERY", "READ_CHECK", "WRITE_CREATE", "WRITE_UPDATE"] },
-        "readChecks": { "type": "array", "minItems": 1, "maxItems": 20, "items": { "$ref": "#/$defs/startReadCheck" } },
+        "readChecks": { "type": "array", "minItems": 1, "items": { "$ref": "#/$defs/startReadCheck" } },
         "write": {
           "description": "OP-2: the write specification of a write stage of the chained run (the same shape as the START write; required for the write stages only). The parent issued, consumed and recorded the grant of this stage before it sent it.",
           "oneOf": [{ "$ref": "#/$defs/startWrite" }, { "$ref": "#/$defs/startApiWrite" }]
         }
+      }
+    },
+    "reloginStage": {
+      "description": "DEF-200: sign in again with the automated login after the sign-in was lost, and continue the same stage as a new job (parent to worker). Sent once after the FINISHED of a stage that ended with the session loss, after the parent closed the job row of the stage and created the new job row with its auto login attempt. count is the number of the re-logins of the stage (1 to 2).",
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["protocol", "type", "jobId", "jobKind", "count"],
+      "properties": {
+        "protocol": { "$ref": "#/$defs/protocol" },
+        "type": { "const": "RELOGIN_STAGE" },
+        "jobId": { "type": "string", "pattern": "^[a-z0-9][a-z0-9-]{0,63}$" },
+        "jobKind": { "enum": ["AUDIT", "DISCOVERY", "READ_CHECK"] },
+        "count": { "type": "integer", "minimum": 1, "maximum": 2 },
+        "readChecks": { "type": "array", "minItems": 1, "items": { "$ref": "#/$defs/startReadCheck" } }
       }
     },
     "chainEnd": {
@@ -517,7 +618,6 @@
           "required": [
             "pagesFinished",
             "pagesDiscovered",
-            "maxPages",
             "elapsedMs",
             "navigationCount",
             "pacingWaitMs",
@@ -550,6 +650,11 @@
                 "allowedOrigins": { "$ref": "#/$defs/count" },
                 "otherOrigins": { "$ref": "#/$defs/count" }
               }
+            },
+            "currentPageUrl": {
+              "description": "L0: the URL of the page the audit just started (only in the progress sent when a page starts; URL-LEN: never truncated).",
+              "type": "string",
+              "minLength": 1
             }
           }
         }
@@ -561,7 +666,7 @@
       "required": ["kind", "url", "delayMs", "attempt", "maxAttempts"],
       "properties": {
         "kind": { "const": "SITE_UNAVAILABLE_RECHECK" },
-        "url": { "type": "string", "minLength": 1, "maxLength": 2048 },
+        "url": { "type": "string", "minLength": 1 },
         "delayMs": { "$ref": "#/$defs/count" },
         "attempt": { "$ref": "#/$defs/count" },
         "maxAttempts": { "$ref": "#/$defs/count" }
@@ -614,7 +719,7 @@
         "state": {
           "enum": ["AWAITING_LOGIN", "AUTHENTICATED", "AUTH_SETUP_REQUIRED", "UNSUPPORTED_AUTH_STATE", "SESSION_LOST", "LOGIN_TIMEOUT", "LOGIN_ATTEMPTS_EXCEEDED", "AUTOMATED_LOGIN_FAILED"]
         },
-        "sessionLostUrl": { "anyOf": [{ "type": "string", "minLength": 1, "maxLength": 2048 }, { "type": "null" }] },
+        "sessionLostUrl": { "anyOf": [{ "type": "string", "minLength": 1 }, { "type": "null" }] },
         "automatedLogin": { "$ref": "#/$defs/automatedLoginReport" },
         "scriptLogin": { "$ref": "#/$defs/scriptLoginCounts" },
         "blockedRequests": { "$ref": "#/$defs/loginStageBlockedRequests" },
@@ -646,8 +751,8 @@
                   "additionalProperties": false,
                   "required": ["origin", "path"],
                   "properties": {
-                    "origin": { "type": "string", "minLength": 1, "maxLength": 2048 },
-                    "path": { "type": "string", "minLength": 1, "maxLength": 2048 }
+                    "origin": { "type": "string", "minLength": 1 },
+                    "path": { "type": "string", "minLength": 1 }
                   }
                 },
                 { "type": "null" }
@@ -680,13 +785,12 @@
       "properties": {
         "rows": {
           "type": "array",
-          "maxItems": 16,
           "items": {
             "type": "object",
             "additionalProperties": false,
             "required": ["origin", "shape", "outcome", "count"],
             "properties": {
-              "origin": { "type": "string", "minLength": 1, "maxLength": 2048 },
+              "origin": { "type": "string", "minLength": 1 },
               "shape": { "$ref": "#/$defs/loginStateNameShape" },
               "outcome": { "$ref": "#/$defs/loginStateNameOutcome" },
               "count": { "type": "integer", "minimum": 1, "maximum": 9007199254740991 }
@@ -709,7 +813,6 @@
           "properties": {
             "rows": {
               "type": "array",
-              "maxItems": 16,
               "items": {
                 "type": "object",
                 "additionalProperties": false,
@@ -741,11 +844,10 @@
           "additionalProperties": false,
           "required": ["origin", "shapes", "omitted"],
           "properties": {
-            "origin": { "type": "string", "minLength": 1, "maxLength": 2048 },
+            "origin": { "type": "string", "minLength": 1 },
             "shapes": {
               "type": "array",
               "minItems": 1,
-              "maxItems": 4,
               "items": {
                 "type": "object",
                 "additionalProperties": false,
@@ -764,7 +866,7 @@
           "additionalProperties": false,
           "required": ["selector", "kind", "logoutWord"],
           "properties": {
-            "selector": { "type": "string", "minLength": 1, "maxLength": 256 },
+            "selector": { "type": "string", "minLength": 1 },
             "kind": { "enum": ["LOGOUT_CONTROL"] },
             "logoutWord": { "enum": ["logout", "signout", "sign-out", "log-out", "ログアウト"] }
           }
@@ -776,16 +878,15 @@
           "additionalProperties": false,
           "required": ["username", "password", "submit"],
           "properties": {
-            "username": { "type": ["string", "null"], "minLength": 1, "maxLength": 256 },
-            "password": { "type": ["string", "null"], "minLength": 1, "maxLength": 256 },
-            "submit": { "type": ["string", "null"], "minLength": 1, "maxLength": 256 }
+            "username": { "type": ["string", "null"], "minLength": 1 },
+            "password": { "type": ["string", "null"], "minLength": 1 },
+            "submit": { "type": ["string", "null"], "minLength": 1 }
           }
         },
         "successPathPrefix": {
           "description": "OP-1 (D3): the first path segment of the success screen of the manual login (the form /admin; never a value-like segment), observed to fill an empty success condition.",
           "type": "string",
-          "minLength": 2,
-          "maxLength": 256
+          "minLength": 2
         }
       }
     },
@@ -797,19 +898,18 @@
       "properties": {
         "requests": {
           "type": "array",
-          "maxItems": 8,
           "items": {
             "type": "object",
             "additionalProperties": false,
             "required": ["origin", "path", "resourceType", "reason", "count"],
             "properties": {
-              "origin": { "type": "string", "minLength": 1, "maxLength": 2048 },
-              "path": { "type": "string", "minLength": 1, "maxLength": 1024 },
+              "origin": { "type": "string", "minLength": 1 },
+              "path": { "type": "string", "minLength": 1 },
               "resourceType": {
                 "enum": ["document", "stylesheet", "image", "media", "font", "script", "texttrack", "xhr", "fetch", "prefetch", "eventsource", "websocket", "manifest", "signedexchange", "ping", "cspviolationreport", "preflight", "fedcm", "other"]
               },
               "reason": {
-                "enum": ["TOKEN_REQUEST_OVER_LIMIT", "TOKEN_REQUEST_NOT_SCRIPT", "TOKEN_REQUEST_QUERY_MISMATCH", "SIDE_REQUEST_OVER_LIMIT", "SIDE_REQUEST_NOT_SCRIPT", "UNREGISTERED_NON_READ", "NON_READ_METHOD"]
+                "enum": ["TOKEN_REQUEST_OVER_LIMIT", "TOKEN_REQUEST_NOT_SCRIPT", "TOKEN_REQUEST_QUERY_MISMATCH", "SIDE_REQUEST_OVER_LIMIT", "SIDE_REQUEST_NOT_SCRIPT", "UNREGISTERED_NON_READ", "NON_READ_METHOD", "AUTOMATED_LOGIN_PASSED", "AUTOMATED_LOGIN_RULE_BLOCKED"]
               },
               "count": { "type": "integer", "minimum": 1, "maximum": 9007199254740991 },
               "beforeToken": {
@@ -822,7 +922,7 @@
                 "additionalProperties": false,
                 "required": ["names", "omitted", "values"],
                 "properties": {
-                  "names": { "type": "array", "minItems": 1, "maxItems": 4, "items": { "type": "string", "minLength": 1, "maxLength": 64 } },
+                  "names": { "type": "array", "minItems": 1, "items": { "type": "string", "minLength": 1, "maxLength": 64 } },
                   "omitted": { "$ref": "#/$defs/count" },
                   "values": {
                     "type": "array",
@@ -852,7 +952,7 @@
       "required": ["tokenRequestsAllowed", "sideRequestsAllowed", "serviceOriginReads", "blockedByReason"],
       "properties": {
         "tokenRequestsAllowed": { "$ref": "#/$defs/count" },
-        "sideRequestsAllowed": { "type": "array", "maxItems": 8, "items": { "$ref": "#/$defs/count" } },
+        "sideRequestsAllowed": { "type": "array", "items": { "$ref": "#/$defs/count" } },
         "serviceOriginReads": { "$ref": "#/$defs/count" },
         "blockedByReason": {
           "type": "object",
@@ -938,10 +1038,10 @@
         "incompleteReasonCodes": {
           "description": "FM2d: the incomplete reason codes of a stage of the chained run (codes only; no detail, no URL; INCOMPLETE_REASON_CODES of src/core/contracts.ts). Only for the outcome kind RAN.",
           "type": "array",
-          "maxItems": 41,
+          "maxItems": 46,
           "uniqueItems": true,
           "items": {
-            "enum": ["DEADLINE_EXCEEDED", "EVALUATION_FAILED", "PAGE_CLOSED", "NAVIGATION_FAILED", "DOM_READINESS_FAILED", "SCROLL_TARGET_UNRESOLVED", "SCROLL_NOT_ADVANCED", "INNER_SCROLL_CONTAINER_NOT_TRAVERSED", "INNER_SCROLL_SCAN_LIMIT_REACHED", "SCROLL_TARGET_UNSTABLE", "POSITION_NOT_AT_ORIGIN", "LAYOUT_COMPARISON_LIMIT_REACHED", "RESOURCE_LIMIT_REACHED", "INVALID_BROWSER_DATA", "PAGE_NAVIGATION_LIMIT_REACHED", "PAGE_SUBRESOURCE_LIMIT_REACHED", "PREFLIGHT_FAILED", "RUN_DIRECTORY_UNAVAILABLE", "SAFETY_INVARIANT_VIOLATION", "SAFETY_LEDGER_TRUNCATED", "UNHANDLED_FAILURE", "MAX_PAGES_REACHED", "MAX_DEPTH_REACHED", "MAX_RUNTIME_REACHED", "REQUIRED_ARTIFACT_INVALID", "EXECUTION_INCOMPLETE", "REQUIRED_WORK_SKIPPED", "REQUIRED_WORK_BLOCKED", "REQUIRED_WORK_TIMED_OUT", "REQUIRED_WORK_NOT_OBSERVED", "REQUIRED_WORK_NOT_VERIFIED", "REQUIRED_WORK_FAILED", "COLLECTOR_INCOMPLETE", "RULE_EVALUATION_FAILED", "PAGE_CRASHED", "SAFETY_VIOLATION_ABORT", "CHECKPOINT_WRITE_FAILED", "RUN_INTERRUPTED", "SITE_UNAVAILABLE", "AUTH_SESSION_LOST", "SERVICE_REQUEST_LIMIT_REACHED"]
+            "enum": ["DEADLINE_EXCEEDED", "EVALUATION_FAILED", "PAGE_CLOSED", "NAVIGATION_FAILED", "DOM_READINESS_FAILED", "SCROLL_TARGET_UNRESOLVED", "SCROLL_NOT_ADVANCED", "INNER_SCROLL_CONTAINER_NOT_TRAVERSED", "INNER_SCROLL_SCAN_LIMIT_REACHED", "SCROLL_TARGET_UNSTABLE", "POSITION_NOT_AT_ORIGIN", "LAYOUT_COMPARISON_LIMIT_REACHED", "RESOURCE_LIMIT_REACHED", "INVALID_BROWSER_DATA", "PAGE_NAVIGATION_LIMIT_REACHED", "PAGE_SUBRESOURCE_LIMIT_REACHED", "NOTIFICATION_DISMISSAL_NAVIGATION_BLOCKED", "DOCUMENT_LEFT_DURING_AUDIT", "DOWNLOAD_RESPONSE", "PREFLIGHT_FAILED", "RUN_DIRECTORY_UNAVAILABLE", "SAFETY_INVARIANT_VIOLATION", "SAFETY_LEDGER_TRUNCATED", "UNHANDLED_FAILURE", "MAX_PAGES_REACHED", "MAX_DEPTH_REACHED", "MAX_RUNTIME_REACHED", "REQUIRED_ARTIFACT_INVALID", "EXECUTION_INCOMPLETE", "REQUIRED_WORK_SKIPPED", "REQUIRED_WORK_BLOCKED", "REQUIRED_WORK_TIMED_OUT", "REQUIRED_WORK_NOT_OBSERVED", "REQUIRED_WORK_NOT_VERIFIED", "REQUIRED_WORK_FAILED", "COLLECTOR_INCOMPLETE", "RULE_EVALUATION_FAILED", "PAGE_CRASHED", "SAFETY_VIOLATION_ABORT", "CHECKPOINT_WRITE_FAILED", "RUN_INTERRUPTED", "SITE_UNAVAILABLE", "AUTH_SESSION_LOST", "SERVICE_REQUEST_LIMIT_REACHED", "STAGE_UNRESPONSIVE", "STAGE_NEVER_QUIET"]
           }
         }
       }
@@ -962,8 +1062,8 @@
       "additionalProperties": false,
       "required": ["checks", "executed"],
       "properties": {
-        "checks": { "type": "integer", "minimum": 0, "maximum": 20 },
-        "executed": { "type": "integer", "minimum": 0, "maximum": 20 },
+        "checks": { "type": "integer", "minimum": 0, "maximum": 9007199254740991 },
+        "executed": { "type": "integer", "minimum": 0, "maximum": 9007199254740991 },
         "authentication": { "$ref": "#/$defs/auditStageSummary" },
         "safetyViolation": { "$ref": "#/$defs/jobSafetyViolation" }
       }
@@ -996,7 +1096,7 @@
         "protocol": { "$ref": "#/$defs/protocol" },
         "type": { "const": "FAILED" },
         "reason": { "enum": ["CONFIG_ERROR", "ARTIFACT_WRITE_FAILED", "UNEXPECTED_FAILURE", "PROTOCOL_VIOLATION", "START_TIMEOUT", "CONFIG_CHANGED", "AUTH_SETUP_CHANGED", "AUTH_SETUP_REQUIRED", "UNSUPPORTED_AUTH_STATE", "LOGIN_TIMEOUT", "LOGIN_ATTEMPTS_EXCEEDED", "INVALID_CREDENTIALS", "ACCOUNT_LOCKED", "MFA_REQUIRED", "CREDENTIAL_EXPIRED", "RATE_LIMITED", "AUTH_RESULT_UNKNOWN", "LOGIN_FORM_INVALID", "LOGIN_FORM_INPUT_FAILED", "CREDENTIAL_CHANGED", "CREDENTIAL_UNAVAILABLE", "UNEXPECTED_LOGIN_REQUEST", "JOB_KIND_NOT_SUPPORTED"] },
-        "detail": { "type": "string", "maxLength": 1024 }
+        "detail": { "type": "string" }
       }
     }
   }

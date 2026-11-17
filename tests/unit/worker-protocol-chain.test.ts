@@ -68,7 +68,8 @@ const errorsOf = (result: ReturnType<typeof validateParentToWorkerMessage>): rea
 
 describe('FM2d: the IPC contract of the chained run', () => {
   it('accepts the START with the closed list of the stage sequences only', () => {
-    expect(WORKER_CHAIN_STAGE_SEQUENCES).toEqual([['AUDIT', 'DISCOVERY', 'READ_CHECK']]);
+    // WSO: 「チェックした画面だけ」の点検の段 1 つの並びを足した（書き込みの段と読む画面と一緒だけ。`checked-screens-scope.test.ts`）。
+    expect(WORKER_CHAIN_STAGE_SEQUENCES).toEqual([['AUDIT', 'DISCOVERY', 'READ_CHECK'], ['AUDIT']]);
     expect(validateParentToWorkerMessage(start('AUDIT', { stages: ['AUDIT', 'DISCOVERY', 'READ_CHECK'] })).ok).toBe(true);
     // MI-C（MI-5 の発見事項）: 発見 → READ の確かめの並びは、MI-5 で書き込みのモードも監査から始まるようになり、どのモードも使わない。契約から外したので、
     // その並びの START は拒む。

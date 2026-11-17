@@ -43,13 +43,17 @@ import {
   sortByDisplayOrder,
   type DisplaySpec,
 } from '../presentation/catalog.js';
-import { formatCount } from '../presentation/format.js';
+import { formatCount, formatPixels } from '../presentation/format.js';
 import {
   REPORT_COMPONENT_TEXT,
   blockedEventPhaseCountText,
   describeBeakSightBlockRelationReason,
+  findingImageRegionLinkText,
+  findingImageRegionPlaceText,
   ruleVersionText,
   screenshotLinkText,
+  screenshotMissingText,
+  screenshotStressWidthText,
 } from '../presentation/messages.js';
 import { REPORT_CLASS_NAMES, REPORT_STYLESHEET, toneClassName } from './html-tokens.js';
 
@@ -360,6 +364,10 @@ export interface ScreenshotRefInput {
   readonly relativePath: string;
   readonly viewport: ViewportProfile;
   readonly captureType: ScreenshotCaptureType;
+  /** AUD-1c: 発表の前の確かめで、ファイルがなかったか（真なら、リンクにせず、易しい文 `screenshotMissingText` を添える）。省略は偽。 */
+  readonly missing?: boolean;
+  /** AUD-3d: 幅の走査の幅の画像なら、その幅（px。リンクの文言に添える）。省略と `null` は主の画像。 */
+  readonly stressWidth?: number | null;
 }
 
 /** スクリーンショットの参照の出し方（OP-3。省略したときは、前と同じく Evidence の ID を添える）。 */
@@ -371,16 +379,20 @@ export interface ScreenshotRefOptions {
 /**
  * スクリーンショットの参照。ビューポートと撮り方のラベルでリンクし、Evidence の ID を添える。
  * `relativePath` が安全な相対パス（`isPortableRelativeArtifactPath`）なら、区切りごとにパーセント符号化してリンクにする。そうでない場合は、
- * リンクにせず、パスを文字として示す（設計書 6.1.11）。
+ * リンクにせず、パスを文字として示す（設計書 6.1.11）。AUD-1c: ファイルがなかった画像（`missing`）は、リンクにせず、易しい文を添える。
  */
 export const renderScreenshotRef = (input: ScreenshotRefInput, options: ScreenshotRefOptions = {}): SafeHtml<'fragment'> => {
+  const stressWidth = input.stressWidth ?? null;
   const label = escapeHtml(
-    screenshotLinkText(VIEWPORT_PROFILE_CATALOG[input.viewport].label, SCREENSHOT_CAPTURE_TYPE_CATALOG[input.captureType].label),
+    screenshotLinkText(VIEWPORT_PROFILE_CATALOG[input.viewport].label, SCREENSHOT_CAPTURE_TYPE_CATALOG[input.captureType].label)
+    + (stressWidth === null ? '' : screenshotStressWidthText(formatPixels(stressWidth))),
   );
   const evidence = renderEvidenceRef(input.evidenceId, null).html;
   const href = relativePathHref(input.relativePath);
   const target =
-    href === null
+    input.missing === true
+      ? `<span class="${REPORT_CLASS_NAMES.screenshotRef}">${label}</span> <span class="${REPORT_CLASS_NAMES.muted}">${escapeHtml(screenshotMissingText)}</span>`
+      : href === null
       ? `<span class="${REPORT_CLASS_NAMES.screenshotRef}">${label}</span> <span class="${REPORT_CLASS_NAMES.urlText}">${escapeHtml(input.relativePath)}</span>`
       : `<a class="${REPORT_CLASS_NAMES.screenshotRef}" href="${escapeHtml(href)}">${label}</a>`;
   return trusted(options.withEvidenceId === false ? target : `${target} ${evidence}`);
@@ -424,7 +436,45 @@ export interface FindingRowInput {
    * OP-R2（PL 設計書 14 章）: 内容の欄に出す文（表示用モデルの `FindingView.plainMessage`。やさしい語の行が渡す）。省略したときは、Rule の文（`finding.message`）。
    */
   readonly plainMessage?: string;
+  /**
+   * AUD-3d: 問題の場所の画像（表示用モデルの `FindingView.imageRegion` の参照のあるもの）と、画像の上の対象の矩形（指摘の要素と覆う部品だけ。覆われた要素は
+   * 出さない）。スクリーンショットの欄の先頭に、易しい文で示す。省略と `null` は出さない。
+   */
+  readonly imageRegion?: FindingImageRegionInput | null;
 }
+
+/** AUD-3d: 問題の場所の画像の入力。 */
+export interface FindingImageRegionInput {
+  /** 画像の相対パス（EV-2: 画像の参照がなく、保留の文だけを出す指摘は `null`）。 */
+  readonly relativePath: string | null;
+  readonly stressWidth: number | null;
+  readonly missing: boolean;
+  readonly rects: readonly { readonly x: number; readonly y: number; readonly width: number; readonly height: number }[];
+  /** EV-2: 保留の理由の、利用者向けの 1 文（なければ `null`）。 */
+  readonly holdText: string | null;
+}
+
+/** AUD-3d: 問題の場所の画像へのリンクと、画像の上の場所の易しい説明。EV-2: 保留の理由の 1 文を後に添える。 */
+const imageRegionHtml = (input: FindingImageRegionInput): string => {
+  const hold = input.holdText === null ? [] : [mutedText(input.holdText)];
+  if (input.relativePath === null) {
+    return hold.join(' ');
+  }
+  const label = escapeHtml(findingImageRegionLinkText + (input.stressWidth === null ? '' : screenshotStressWidthText(formatPixels(input.stressWidth))));
+  const href = relativePathHref(input.relativePath);
+  const link = input.missing
+    ? `<span class="${REPORT_CLASS_NAMES.screenshotRef}">${label}</span> ${mutedText(screenshotMissingText)}`
+    : href === null
+      ? `<span class="${REPORT_CLASS_NAMES.screenshotRef}">${label}</span>`
+      : `<a class="${REPORT_CLASS_NAMES.screenshotRef}" href="${escapeHtml(href)}">${label}</a>`;
+  const places = input.rects.map((rect) => mutedText(findingImageRegionPlaceText(
+    formatPixels(Math.max(0, Math.round(rect.x))),
+    formatPixels(Math.max(0, Math.round(rect.y))),
+    formatPixels(Math.round(rect.width)),
+    formatPixels(Math.round(rect.height)),
+  )));
+  return [link, ...places, ...hold].join(' ');
+};
 
 /** Finding の表の列の見出し（`renderFindingRow` のセルの順）。 */
 export const FINDING_TABLE_COLUMNS: readonly string[] = REPORT_COMPONENT_TEXT.findingColumns;
@@ -495,7 +545,10 @@ export const renderFindingRow = (input: FindingRowInput): SafeHtml<'row'> => {
         ),
       ]
       : []),
-    referenceList(input.screenshots.map((screenshot) => renderScreenshotRef(screenshot, { withEvidenceId: technical }).html)),
+    referenceList([
+      ...(input.imageRegion === undefined || input.imageRegion === null ? [] : [imageRegionHtml(input.imageRegion)]),
+      ...input.screenshots.map((screenshot) => renderScreenshotRef(screenshot, { withEvidenceId: technical }).html),
+    ]),
   ];
   const idAttribute = input.anchored === false ? '' : `id="${escapeHtml(toAnchorId('finding', finding.findingId))}" `;
   return trustedRow(
@@ -563,13 +616,18 @@ const headingHtml = (input: SectionHeadingInput): string => {
 /** 節の見出しとアンカー。 */
 export const renderSectionHeading = (input: SectionHeadingInput): SafeHtml<'fragment'> => trusted(headingHtml(input));
 
+/** 節の始まり（`<section>` の開きタグと見出し）。`<section>` は、見出しの `id` で名前を付ける。 */
+const sectionStartHtml = (input: SectionHeadingInput): string =>
+  `<section class="${REPORT_CLASS_NAMES.section}" aria-labelledby="${escapeHtml(assertSafeAnchor(input.anchorId))}">${headingHtml(input)}`;
+
+/** 節の終わり。 */
+const SECTION_END_HTML = '</section>';
+
 /** 節（見出しと中身）。`<section>` は、見出しの `id` で名前を付ける。 */
 export const renderSection = (
   input: SectionHeadingInput & { readonly content: readonly SafeHtml<'fragment'>[] },
 ): SafeHtml<'fragment'> =>
-  trusted(
-    `<section class="${REPORT_CLASS_NAMES.section}" aria-labelledby="${escapeHtml(assertSafeAnchor(input.anchorId))}">${headingHtml(input)}${input.content.map((part) => contentHtml(part)).join('')}</section>`,
-  );
+  trusted(`${sectionStartHtml(input)}${input.content.map((part) => contentHtml(part)).join('')}${SECTION_END_HTML}`);
 
 /** 段落。 */
 export const renderParagraph = (content: HtmlContent): SafeHtml<'fragment'> => trusted(`<p>${contentHtml(content)}</p>`);
@@ -601,8 +659,12 @@ export interface DocumentInput {
  * 文書の骨組み。`<html lang="ja">`、UTF-8、唯一のスタイルシート（`REPORT_STYLESHEET`）を持つ、静的な HTML の文字列を返す
  * （改行は LF、末尾に改行を1つ付ける）。
  */
-export const renderDocument = (input: DocumentInput): string => {
-  const title = escapeHtml(input.title);
+export const renderDocument = (input: DocumentInput): string =>
+  [documentStartHtml(input.title), ...input.content.map((part) => `\n${contentHtml(part)}`), DOCUMENT_END_HTML].join('');
+
+/** 文書の始まり（`<h1>` の題まで。改行は LF）。 */
+const documentStartHtml = (documentTitle: string): string => {
+  const title = escapeHtml(documentTitle);
   return [
     '<!DOCTYPE html>',
     '<html lang="ja">',
@@ -616,10 +678,29 @@ export const renderDocument = (input: DocumentInput): string => {
     '<body>',
     '<main>',
     `<h1>${title}</h1>`,
-    ...input.content.map((part) => contentHtml(part)),
-    '</main>',
-    '</body>',
-    '</html>',
-    '',
   ].join('\n');
 };
+
+/** 文書の終わり（末尾に改行を 1 つ付ける）。 */
+const DOCUMENT_END_HTML = '\n</main>\n</body>\n</html>\n';
+
+/** MEM-4: 断片を順に返す文書の、節 1 つ（見出しと、順に返す中身）。 */
+export interface StreamedSectionInput extends SectionHeadingInput {
+  readonly content: Iterable<SafeHtml<'fragment'>>;
+}
+
+/**
+ * MEM-4（DEF-266）: `renderDocument` と同じ文書を、断片を順に返す形で描く（全部を 1 つの文字列にしない）。断片は、文書の始まり、節の始まり（開きタグと見出し）、
+ * 節の中身の 1 つずつ、節の終わり、文書の終わり。つなぐと、同じ節を `renderSection` で描いて `renderDocument` に渡した文字列と同じになる。
+ */
+export function* renderDocumentChunks(input: { readonly title: string; readonly sections: Iterable<StreamedSectionInput> }): Generator<string, void, undefined> {
+  yield documentStartHtml(input.title);
+  for (const section of input.sections) {
+    yield `\n${sectionStartHtml(section)}`;
+    for (const part of section.content) {
+      yield contentHtml(part);
+    }
+    yield SECTION_END_HTML;
+  }
+  yield DOCUMENT_END_HTML;
+}

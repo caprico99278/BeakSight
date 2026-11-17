@@ -7,67 +7,59 @@ import {
   type MainFrameLoadObservation,
   type MainFrameLoadSettlement,
 } from '../browser/main-frame-load.js';
-import { startNavigationDiagnostics } from '../browser/navigation-diagnostics.js';
 import { isPlaywrightTimeoutError } from '../browser/playwright-errors.js';
 import type { Viewport } from '../config/types.js';
-import type { InteractionStatus, NavigationDiagnostics } from '../core/contracts.js';
-import { awaitBeforeDeadline, deadlineWithinTimeoutAtMs, wait, yieldMacrotask } from '../core/deadline.js';
+import type { InteractionStatus } from '../core/contracts.js';
+import { awaitBeforeDeadline, deadlineWithinTimeoutAtMs, yieldMacrotask } from '../core/deadline.js';
 import { safeErrorMessage } from '../core/errors.js';
 import {
   CONTEXT_CLOSE_TIMEOUT_MS,
-  INTERACTION_PERSISTENCE_WINDOW_MS,
-  INTERACTION_STABILITY_WINDOW_MS,
+  PAGE_SETTLING_PACING,
   SESSION_OPEN_TIMEOUT_MS,
 } from '../core/limits.js';
+import type { ProgressSignals } from '../core/progress-watch.js';
+import { attachPageProgressSignals } from '../browser/page-progress-signals.js';
+import { waitForPageSettled } from '../browser/page-settling.js';
+import { DataActivityCollector } from '../evidence/network-collector.js';
 import type {
   InteractionChangeEvidence,
   InteractionClosedLifecycle,
   InteractionEvidence,
   InteractionLifecycleReasonCode,
   InteractionNotVerifiableKind,
-  InteractionNotVerifiableReasonCode,
   InteractionReasonCodeFor,
   InteractionWorkOutcome,
+  InteractionWrittenNotVerifiableReasonCode,
 } from '../core/evidence-types.js';
-import { isPositiveSafeInteger, isNonNegativeSafeInteger } from '../core/guards.js';
+import { isPositiveSafeInteger } from '../core/guards.js';
 import {
   normalizeWhitespace,
   removeBidiControls,
   removeLoneSurrogates,
   replaceControlCharacters,
-  truncateText,
 } from '../core/text.js';
 import { isHttpProtocol } from '../crawl/normalize-url.js';
+import { auditScopeLeftUrl, type AuditScopeJudge } from '../orchestration/audit-scope-watch.js';
 import {
   collectInteractionChangeEvidence,
   collectDisconnectedInteractionEvidence,
-  interactionGeometryChanged,
-  interactionStateChanges,
-  interactionTargetStateChanged,
-  retainPersistentInteractionChanges,
-  type InteractionInstability,
   type InteractionStateDifference,
 } from '../evidence/interaction-collector.js';
 import { isBlockedExternalActionReason, SafetyLedger, type SafetyLedgerSnapshot } from '../safety/safety-ledger.js';
 import {
   classifyInteractionCandidate,
   freezeInteractionCandidate,
-  INTERACTION_CANDIDATE_LIMITS,
   interactionRejectionLedgerRecord,
   type InteractionCandidate,
 } from '../safety/interaction-policy.js';
 import {
   changedInteractionAttributeNames,
   changedInteractionClassNames,
-  compareInteractionScrollRecords,
   discoverInteractionCandidates,
-  hasExplicitTabRole,
   inspectInteractionCandidateHandle,
   resolveInteractionCandidateHandle,
   type InteractionAttributeRecord,
-  type InteractionCandidateReference,
   type InteractionHandleResolution,
-  type InteractionScrollComparison,
 } from './discover-candidates.js';
 
 export type InteractionAuditSession = InteractionGuardedSession;
@@ -107,16 +99,68 @@ export interface InteractionAuditInput {
    */
   readonly releaseLateSessionFailure?: ((error: unknown) => void) | undefined;
   /**
-   * 候補の対象のページの読み込み（`page.goto`）の観測と、その読み込みの間のページ本体の要求の観察の結果を受け取る口（サイトが応答しない
-   * ときに Run を止める設計書 2.1。サイトの不調で止めたときの診断の記録の設計書 2.2 の 2026-10-07 の改訂）。読み込みを始めた場合に1回、
+   * 候補の対象のページの読み込み（`page.goto`）の観測を受け取る口（サイトが応答しないときに Run を止める設計書 2.1）。読み込みを始めた場合に1回、
    * 読み込みが終わった（応答か例外が返った）直後に呼ぶ。読み込みを始めなかった場合（読み込みの予算が 0）は呼ばない。
-   * 観測は `src/browser/main-frame-load.ts` の部品で作る。観察は `src/browser/navigation-diagnostics.ts` の部品で、`goto` の直前に
-   * 始め（期限は、読み込みの期限。始める処理は読み込みの予算を消費する）、`goto` の直後に、結果によらず止める。始められなくても読み込みは
-   * 行い、`NOT_OBSERVED` の結果を渡す。Interaction は判定をしない（判定は、受け取った Page Auditor が行う）。
-   * 結果と例外の扱いは、受け口の有無で変わらない。省略できる。省略すると、観測を作らず、page の事象の受け口も付けず、観察も始めない。
+   * 観測は `src/browser/main-frame-load.ts` の部品で作る。Interaction は判定をしない（判定は、受け取った Page Auditor が行う）。
+   * 結果と例外の扱いは、受け口の有無で変わらない。省略できる。省略すると、観測を作らず、page の事象の受け口も付けない。
    * 関数でない値は、session を開かずに例外を投げる。
    */
-  readonly afterTargetLoad?: ((observation: MainFrameLoadObservation, diagnostics: NavigationDiagnostics) => void) | undefined;
+  readonly afterTargetLoad?: ((observation: MainFrameLoadObservation) => void) | undefined;
+  /**
+   * L5（INV-LIMITS の表 A の T11・T21。設計者の判断 2026-11-10）: 進みの見張り（`watchProgress`）の口。渡すと、呼び出し側は期限を置かない（利用者が期限を
+   * 指定していない）とみなし、次のように振る舞う。
+   * - 隔離した page の自発の変化に、見張りの印を付ける（`attachPageProgressSignals`）。
+   * - 押した後の落ち着きの待ち（`waitForPageSettled`）に、見張りを渡す（期限を置かない）。
+   * - 見張りが終えたら（`signal` の abort）、session を閉じて待ちを終わらせ、結果を `NOT_VERIFIABLE`（理由は `STAGE_UNRESPONSIVE`・`STAGE_NEVER_QUIET`）にする。
+   * 省略すると、落ち着きの待ちを期限で終える（SPEC-5: どちらも、落ち着いた後に 1 回だけ観測する）。
+   */
+  readonly progress?: ProgressSignals | undefined;
+  /**
+   * L5: 後片付け（owner の close）の期限（ms）。BeakSight 自身の処理の守り（Safety Ledger の不変条件の違反に結び付く）なので残す。省略は `timeoutMs`。
+   */
+  readonly cleanupTimeoutMs?: number | undefined;
+  /**
+   * COV-4 の区切り 3（設計者の判断 2026-11-10）: 確かめ終えた（`VERIFIED`）操作で開いた状態の page を受け取る口（後片付けの前に 1 回呼ぶ）。page は凍結した
+   * ままなので、サイトへの送信は Guard が止めたまま。呼び出し側は、読み込み直さずに今の段を当てる。口の例外は封じ込める（操作の結果を変えない）。
+   */
+  readonly afterVerified?: ((page: Page) => Promise<void>) | undefined;
+  /**
+   * COV-4 の区切り 3（入れ子の開いた状態。設計者の判断 2026-11-10）: 対象の候補を押す前に、開いた状態まで押し直す押下の並び（候補の ID と、同じ ID の中の順番。
+   * 読み込みの後、凍結してから順に押す）。渡すと、凍結の前の下準備（スクロール・hover）を凍結の後に行う（入れ子の対象だけ。送信を伴わない
+   * 操作なので、サイトへ届く送信は増えない）。押し直せなかった・再現を確かめる口（`verifyTrail`）が偽を返したら `TRAIL_NOT_REPRODUCED`。省略・空は今までどおり。
+   */
+  readonly pressTrail?: readonly InteractionPressStep[] | undefined;
+  /** COV-4 の区切り 3: 押し直した後の page が、記録した開いた状態と同じ構造かを確かめる口（偽なら `TRAIL_NOT_REPRODUCED`）。 */
+  readonly verifyTrail?: ((page: Page) => Promise<boolean>) | undefined;
+  /**
+   * REV-SD の I-1: URL が点検の範囲の外か（呼ぶ側が Run の範囲で作る）。凍結の後と押す直前に、隔離した page の main frame の URL を見直し（判定は
+   * `auditScopeLeftUrl`）、範囲の外へ移っていれば押さない（`INITIAL_LOAD_AFTER_LOAD`。詳細は `OUTSIDE_AUDIT_SCOPE`）。省略は見ない。
+   */
+  readonly isOutsideAuditScope?: AuditScopeJudge | undefined;
+}
+
+/** REV-SD の I-1: 範囲の外へ移った page で押さなかったときの詳細。 */
+const OUTSIDE_AUDIT_SCOPE_DETAIL = 'OUTSIDE_AUDIT_SCOPE';
+
+/** REV-SD の I-1: 隔離した page の main frame が、点検の範囲の外へ移ったか（判定は `auditScopeLeftUrl` の 1 か所）。 */
+const movedOutsideAuditScope = (session: InteractionAuditSession, input: InteractionAuditInput): boolean =>
+  input.isOutsideAuditScope !== undefined && auditScopeLeftUrl(session.page.url(), input.isOutsideAuditScope) !== null;
+
+/** COV-4 の区切り 3: 押し直す押下の 1 つ（候補の ID と、同じ ID の中の順番）。 */
+export interface InteractionPressStep {
+  readonly candidateId: string;
+  readonly ordinal: number;
+}
+
+/**
+ * L5: 進みの見張りが終えた理由から、Interaction の理由のコード（見張りが終えていない・Run の時間の上限などは `null`）。判定はここだけ。
+ */
+export function interactionStageEndReasonOf(signal: AbortSignal | undefined): 'STAGE_UNRESPONSIVE' | 'STAGE_NEVER_QUIET' | null {
+  if (signal === undefined || !signal.aborted) {
+    return null;
+  }
+  const reason: unknown = signal.reason;
+  return reason === 'STAGE_UNRESPONSIVE' || reason === 'STAGE_NEVER_QUIET' ? reason : null;
 }
 
 /** Interaction の Evidence（`InteractionEvidence`）と、その Interaction の Context の Safety Ledger の記録。 */
@@ -134,8 +178,6 @@ export interface InteractionNonTerminalLifecycle {
   readonly reasonDetail: string | null;
 }
 
-/** 理由の詳細（`reasonDetail`）と、Ledger に記録する文言の、長さの上限。 */
-const MAX_INTERACTION_REASON_LENGTH = 512;
 const INTERACTION_OWNER_CLOSE_ATTEMPT_LIMIT = 2;
 const INTERACTION_OWNER_CLEANUP_EXHAUSTED_MESSAGE = 'Interaction owner cleanup retry budget exhausted';
 /** owner の close が期限を過ぎたときの、Ledger の違反の文言（lifecycle の理由のコードは `OWNER_CLOSE_TIMED_OUT`）。 */
@@ -150,7 +192,8 @@ const INTERACTION_FREEZE_DEADLINE_MESSAGE = 'Interaction freeze activation did n
  * NOT_VERIFIABLE の理由のコードと、区分（`InteractionNotVerifiableKind`）の対応表（Task 14〜17 の設計書 5.4.1、I15a。
  * Task 19 の前の整理の設計書 5.1）。コードの一覧は `src/core/evidence-types.ts` の `INTERACTION_NOT_VERIFIABLE_REASON_CODES`。
  * NOT_VERIFIABLE の結果は、この表のコードを受け取る `notVerifiable` だけが作るので、区分はコードと1対1に決まる。
- * 型（`satisfies`）で、一覧のすべてのコードに区分があり、一覧にないコードがないことを保証する。
+ * 型（`satisfies`）で、今の版が書くすべてのコードに区分があり、ほかのコードがないことを保証する。前の版だけが書いたコード
+ * （`INTERACTION_LEGACY_NOT_VERIFIABLE_REASON_CODES`。読むだけ）は、この表に持たない（SPEC-5）。
  * - `OBSERVED_NO_CHANGE`: 確かめる手順を最後まで行い、変化が見えなかったか、サイトの振る舞いのために確かめられないと結論した。
  * - `CHECK_NOT_COMPLETED`: 確かめる手順を終えられなかった（期限切れ、下準備の失敗、作業量や探索の上限、比べられない、対象を特定できない）。
  *   判断に迷う理由も、完了の偽りを避けるために、こちらに寄せる。
@@ -167,60 +210,21 @@ export const INTERACTION_NOT_VERIFIABLE_REASONS = Object.freeze({
   INITIAL_LOAD_AFTER_LOAD: 'CHECK_NOT_COMPLETED',
   INITIAL_LOAD_BEFORE_RENDER: 'CHECK_NOT_COMPLETED',
 
-  // 凍結の前の下準備（スクロール・hover・focus・落ち着くのを待つ）。
+  // 凍結の前の下準備（SPEC-5: スクロール・hover・描画 2 回・観測 1 回。focus と安定の窓はやめた）。
+  /** 下準備（スクロール・hover・描画の待ち・観測）を、期限までに終えられなかった。 */
   SCROLL_PREPARATION_DEADLINE: 'CHECK_NOT_COMPLETED',
-  SCROLL_PREPARATION_DOM_WORK_EXHAUSTED: 'CHECK_NOT_COMPLETED',
-  /** 下準備のスクロールの失敗。詳細は、整えたエラーの文言。文言から詳細に使える部分が残らなければ、詳細は null。 */
+  /** 下準備のスクロールか hover の失敗。詳細は、整えたエラーの文言。文言から詳細に使える部分が残らなければ、詳細は null。 */
   SCROLL_PREPARATION_FAILED: 'CHECK_NOT_COMPLETED',
-  SCROLL_PREPARATION_SETTLE_DEADLINE: 'CHECK_NOT_COMPLETED',
-  HOVER_PREPARATION_DEADLINE: 'CHECK_NOT_COMPLETED',
-  /** 下準備の hover の失敗。詳細の作り方は `SCROLL_PREPARATION_FAILED` と同じ。 */
-  HOVER_PREPARATION_FAILED: 'CHECK_NOT_COMPLETED',
-  FOCUS_PREPARATION_DEADLINE: 'CHECK_NOT_COMPLETED',
-  /** 下準備の focus の失敗。詳細の作り方は `SCROLL_PREPARATION_FAILED` と同じ。 */
-  FOCUS_PREPARATION_FAILED: 'CHECK_NOT_COMPLETED',
-  FOCUS_PREPARATION_DOM_WORK_EXHAUSTED: 'CHECK_NOT_COMPLETED',
-  FOCUS_PREPARATION_TARGET_DISCONNECTED: 'CHECK_NOT_COMPLETED',
-  FOCUS_PREPARATION_CANDIDATE_LIMIT_REACHED: 'CHECK_NOT_COMPLETED',
-  FOCUS_PREPARATION_TEXT_NODE_LIMIT_REACHED: 'CHECK_NOT_COMPLETED',
-  /**
-   * 下準備の focus の前後で、対象の ARIA の状態か `aria-controls` の先の表示の状態が変わった（R8 の Important-2）。
-   * この変化は、click で起きる変化と区別できないので、凍結せずに終える。サイトの振る舞いのために確かめられないと結論した場合である。
-   */
-  FOCUS_PREPARATION_STATE_CHANGED: 'OBSERVED_NO_CHANGE',
-  /** 下準備の focus の前後の、対象の状態を比べられない（fail-closed。R8 の Important-2）。 */
-  FOCUS_PREPARATION_STATE_UNCOMPARABLE: 'CHECK_NOT_COMPLETED',
-
-  // 凍結の前の安定性の確認（同じ要素かの確認を含む）。
-  /** 安定性の確認を、期限までに終えられない（始める時点で時間が足りない場合を含む）。 */
-  STABILITY_CHECK_DEADLINE: 'CHECK_NOT_COMPLETED',
-  STABILITY_CHECK_DOM_WORK_EXHAUSTED: 'CHECK_NOT_COMPLETED',
-  STABILITY_CHECK_TARGET_DISCONNECTED: 'CHECK_NOT_COMPLETED',
-  STABILITY_CHECK_CANDIDATE_LIMIT_REACHED: 'CHECK_NOT_COMPLETED',
-  STABILITY_CHECK_TEXT_NODE_LIMIT_REACHED: 'CHECK_NOT_COMPLETED',
 
   // 凍結の後の、探し直し・handle の解決・受け入れの判定・click。
-  DEADLINE_AFTER_SAFETY_FREEZE: 'CHECK_NOT_COMPLETED',
-  DEADLINE_DURING_CANDIDATE_REDISCOVERY: 'CHECK_NOT_COMPLETED',
-  /** 1回の audit で共有する DOM の作業量の上限を使い切った。 */
-  DOM_WORK_EXHAUSTED: 'CHECK_NOT_COMPLETED',
-  /** 探し直しが完了しなかった。詳細は、探し直しの completeness の値。 */
-  CANDIDATE_REDISCOVERY_INCOMPLETE: 'CHECK_NOT_COMPLETED',
   CANDIDATE_IDENTITY_NOT_REDISCOVERED: 'CHECK_NOT_COMPLETED',
   CANDIDATE_IDENTITY_AMBIGUOUS: 'CHECK_NOT_COMPLETED',
-  DEADLINE_BEFORE_TARGET_HANDLE_ACQUISITION: 'CHECK_NOT_COMPLETED',
-  DEADLINE_DURING_TARGET_HANDLE_ACQUISITION: 'CHECK_NOT_COMPLETED',
   TARGET_HANDLE_NOT_RESOLVED: 'CHECK_NOT_COMPLETED',
-  TARGET_HANDLE_RESOLUTION_DOM_WORK_EXHAUSTED: 'CHECK_NOT_COMPLETED',
-  DEADLINE_DURING_TARGET_FACT_COLLECTION: 'CHECK_NOT_COMPLETED',
-  TARGET_INSPECTION_DOM_WORK_EXHAUSTED: 'CHECK_NOT_COMPLETED',
-  TARGET_INSPECTION_CANDIDATE_LIMIT_REACHED: 'CHECK_NOT_COMPLETED',
-  TARGET_INSPECTION_TEXT_NODE_LIMIT_REACHED: 'CHECK_NOT_COMPLETED',
   TARGET_DISCONNECTED_BEFORE_ADMISSION: 'CHECK_NOT_COMPLETED',
   TARGET_CHANGED_DURING_EXACT_NODE_RESOLUTION: 'CHECK_NOT_COMPLETED',
-  DEADLINE_DURING_EXACT_NODE_ADMISSION: 'CHECK_NOT_COMPLETED',
   /** 下準備をしなかった（凍結の前に対象を一意に特定できなかったなど）対象が、凍結の後に受け入れられた。click しない。 */
   TARGET_NOT_SCROLL_PREPARED: 'CHECK_NOT_COMPLETED',
+  /** 凍結の後、click を始める前に、期限が切れた（探し直し・handle の解決・押す前の観測のどこでも）。 */
   DEADLINE_BEFORE_EXACT_NODE_CLICK: 'CHECK_NOT_COMPLETED',
   /**
    * click が期限切れになった。詳細は、整えた click のエラーの文言（残らなければ null）。click のほかの失敗は、
@@ -228,86 +232,26 @@ export const INTERACTION_NOT_VERIFIABLE_REASONS = Object.freeze({
    */
   CLICK_TIMED_OUT: 'CHECK_NOT_COMPLETED',
 
-  // click の後の観測。
-  /** click の後の観測を1回も終えないうちに、期限が切れた。 */
-  DEADLINE_BEFORE_POST_CONDITION_OBSERVATION: 'CHECK_NOT_COMPLETED',
-  /** click の後の観測の途中で、期限が切れた（変化の見えない観測を終えた後の期限切れは `NO_OBSERVABLE_CHANGE`）。 */
+  // click の後の観測（SPEC-5: 落ち着きを待ってから 1 回だけ観測する）。
+  /** click の後の 1 回の観測を、期限までに終えられなかった（落ち着きの待ちが期限まで続いた場合を含む）。 */
   DEADLINE_DURING_POST_CONDITION_OBSERVATION: 'CHECK_NOT_COMPLETED',
-  /** 持続の確認の時間が、期限までに終わらない。 */
-  PERSISTENCE_CHECK_DEADLINE: 'CHECK_NOT_COMPLETED',
-  /** click の後の観測を終え、期限まで根拠となる変化が見えなかった。 */
-  NO_OBSERVABLE_CHANGE: 'OBSERVED_NO_CHANGE',
   /**
-   * 観測できた変化が対象の `boundingBox` の変化だけだった（設計書 2026-09-23 4.4.1、4.4.3）。位置と大きさの変化は、根拠にしない。
-   * 対象のスクロールする祖先がスクロールした場合と、スクロールはなく位置か大きさが変わっただけの場合は、観測を終えて変化が見えなかった。
-   * スクロールしたかを比べられない場合は、比べる手順を終えられなかったので、CHECK_NOT_COMPLETED に寄せる。
+   * click の後の観測を終え、根拠となる変化が見えなかった。位置と大きさ（`boundingBox`）だけの変化も、ここに寄せる（SPEC-5。前の版の
+   * `GEOMETRY_ONLY_*` は読むだけ）。
    */
-  GEOMETRY_ONLY_CHANGED_WHILE_SCROLLED: 'OBSERVED_NO_CHANGE',
-  GEOMETRY_ONLY_CHANGED_SCROLL_UNCOMPARABLE: 'CHECK_NOT_COMPLETED',
-  GEOMETRY_ONLY_CHANGED: 'OBSERVED_NO_CHANGE',
-  RETAINED_INSPECTION_DOM_WORK_EXHAUSTED: 'CHECK_NOT_COMPLETED',
-  RETAINED_INSPECTION_CANDIDATE_LIMIT_REACHED: 'CHECK_NOT_COMPLETED',
-  RETAINED_INSPECTION_TEXT_NODE_LIMIT_REACHED: 'CHECK_NOT_COMPLETED',
+  NO_OBSERVABLE_CHANGE: 'OBSERVED_NO_CHANGE',
   /**
    * click の後に、保持した対象が切断され、同じ要素と確かめられなくなった。詳細は、切断の後の identityStatus の値。
    * click と観測を終えたうえで、サイトの振る舞い（対象の置き換えや削除）のために確かめられないと結論した場合である。
    */
   RETAINED_IDENTITY_LOST: 'OBSERVED_NO_CHANGE',
-} as const satisfies Readonly<Record<InteractionNotVerifiableReasonCode, InteractionNotVerifiableKind>>);
+  // L5: 利用者が期限を指定していない操作を、L0 の進みの見張りが終えた（確かめる手順を終えられなかった）。
+  STAGE_UNRESPONSIVE: 'CHECK_NOT_COMPLETED',
+  STAGE_NEVER_QUIET: 'CHECK_NOT_COMPLETED',
+  // COV-4 の区切り 3: 入れ子の開いた状態まで押し直す並びを再現できなかった（確かめる手順を終えられなかった）。
+  TRAIL_NOT_REPRODUCED: 'CHECK_NOT_COMPLETED',
+} as const satisfies Readonly<Record<InteractionWrittenNotVerifiableReasonCode, InteractionNotVerifiableKind>>);
 
-/**
- * 凍結の前に下準備の handle で対象を観測したときの、凍結せずに終える理由の code。観測の目的（安定性の確認、focus の前後の比較）ごとに持つ。
- * - `deadline`: 観測を期限までに終えられなかった。
- * - `domWorkExhausted`: 観測で、共有の DOM の作業量の上限に達した。
- * - `inspection`: 観測が、対象の事実を得られずに終わった。
- */
-interface PreparedObservationReasons {
-  readonly deadline: InteractionNotVerifiableReasonCode;
-  readonly domWorkExhausted: InteractionNotVerifiableReasonCode;
-  readonly inspection: Readonly<
-    Record<'DISCONNECTED' | 'CANDIDATE_LIMIT_REACHED' | 'TEXT_NODE_LIMIT_REACHED', InteractionNotVerifiableReasonCode>
-  >;
-}
-
-/** 安定性の確認（同じ要素かの確認を含む）の観測の理由。 */
-const STABILITY_CHECK_OBSERVATION_REASONS: PreparedObservationReasons = Object.freeze({
-  deadline: 'STABILITY_CHECK_DEADLINE',
-  domWorkExhausted: 'STABILITY_CHECK_DOM_WORK_EXHAUSTED',
-  inspection: Object.freeze({
-    DISCONNECTED: 'STABILITY_CHECK_TARGET_DISCONNECTED',
-    CANDIDATE_LIMIT_REACHED: 'STABILITY_CHECK_CANDIDATE_LIMIT_REACHED',
-    TEXT_NODE_LIMIT_REACHED: 'STABILITY_CHECK_TEXT_NODE_LIMIT_REACHED',
-  }),
-});
-
-/** 下準備の focus の前後の比較（設計書 2026-09-23 4.4.2 手順4、R8 の Important-2）の観測の理由。 */
-const FOCUS_PREPARATION_OBSERVATION_REASONS: PreparedObservationReasons = Object.freeze({
-  deadline: 'FOCUS_PREPARATION_DEADLINE',
-  domWorkExhausted: 'FOCUS_PREPARATION_DOM_WORK_EXHAUSTED',
-  inspection: Object.freeze({
-    DISCONNECTED: 'FOCUS_PREPARATION_TARGET_DISCONNECTED',
-    CANDIDATE_LIMIT_REACHED: 'FOCUS_PREPARATION_CANDIDATE_LIMIT_REACHED',
-    TEXT_NODE_LIMIT_REACHED: 'FOCUS_PREPARATION_TEXT_NODE_LIMIT_REACHED',
-  }),
-});
-
-/** 安定性の確認の間に、対象を観測する間隔。観測のたびに、共有の DOM の作業量を差し引く。 */
-const STABILITY_SAMPLE_INTERVAL_MS = 100;
-/**
- * 観測できた変化が対象の `boundingBox` の変化だけだった場合の区別（設計書 2026-09-23 4.4.1、4.4.3）。
- * 位置と大きさの変化は、どの場合も VERIFIED の根拠にしない。区別は NOT_VERIFIABLE の理由にだけ使う。
- * - `SCROLLED`・`UNCOMPARABLE`: click の再試行などで、対象のスクロールする祖先がスクロールした場合と、スクロールしたかを判定できない場合。
- * - `GEOMETRY`: スクロールはなく、対象の位置か大きさが変わっただけの場合。
- */
-type GeometryOnlyChange = Exclude<InteractionScrollComparison, 'UNCHANGED'> | 'GEOMETRY';
-
-/** `GeometryOnlyChange` ごとの、NOT_VERIFIABLE の理由の code。 */
-const GEOMETRY_ONLY_CHANGE_REASONS: Readonly<Record<GeometryOnlyChange, InteractionNotVerifiableReasonCode>> =
-  Object.freeze({
-    SCROLLED: 'GEOMETRY_ONLY_CHANGED_WHILE_SCROLLED',
-    UNCOMPARABLE: 'GEOMETRY_ONLY_CHANGED_SCROLL_UNCOMPARABLE',
-    GEOMETRY: 'GEOMETRY_ONLY_CHANGED',
-  });
 /** 下準備の hover の後、凍結の前に待つ描画の回数。 */
 const SCROLL_PREPARATION_SETTLE_FRAMES = 2;
 const UNINSPECTABLE_INTERACTION_ERROR_MESSAGE = 'Interaction error could not be safely normalized';
@@ -374,27 +318,9 @@ export class InteractionOwnerCleanupError extends Error {
   }
 }
 
-/**
- * エラーの文言を、切り詰めずに取り出す。切り詰めは、不要な部分を除いた後に `interactionFailureDetail` が行う
- * （先に切り詰めると、途中で切れた ANSI のエスケープシーケンスの断片が残るため）。
- */
+/** エラーの文言を、切り詰めずに取り出す（LZ-2: 理由の詳細と Ledger の文言の長さの上限（前は 512）は置かない）。 */
 function fullErrorMessage(error: unknown): string {
-  return safeErrorMessage(error, Number.MAX_SAFE_INTEGER, UNINSPECTABLE_INTERACTION_ERROR_MESSAGE);
-}
-
-/** 文言を上限の長さで切り詰める。切り詰めた位置でサロゲートペアが分かれる場合は、残った上位サロゲートも除く（R5 の N-6）。 */
-function boundedReason(reason: string): string {
-  const { text, truncated } = truncateText(reason, MAX_INTERACTION_REASON_LENGTH);
-  if (!truncated) {
-    return text;
-  }
-  const last = text.charCodeAt(text.length - 1);
-  return last >= 0xd800 && last <= 0xdbff ? text.slice(0, -1) : text;
-}
-
-/** 理由の詳細を上限の長さで切り詰める。詳細がなければ null のまま。 */
-function boundedReasonDetail(reasonDetail: string | null): string | null {
-  return reasonDetail === null ? null : boundedReason(reasonDetail);
+  return safeErrorMessage(error, UNINSPECTABLE_INTERACTION_ERROR_MESSAGE);
 }
 
 function emptyEvidence(
@@ -449,7 +375,7 @@ function outcome<S extends Exclude<InteractionStatus, typeof NOT_VERIFIABLE_STAT
   evidence: InteractionChangeEvidence,
 ): ClassifiedWorkOutcome {
   return Object.freeze({
-    work: Object.freeze({ status, reason, reasonDetail: boundedReasonDetail(reasonDetail), evidence }),
+    work: Object.freeze({ status, reason, reasonDetail, evidence }),
     notVerifiableKind: null,
   });
 }
@@ -459,7 +385,7 @@ function outcome<S extends Exclude<InteractionStatus, typeof NOT_VERIFIABLE_STAT
  * 技術的な詳細（completeness の値、identityStatus の値、整えたエラーの文言）は `reasonDetail` に渡す。詳細がなければ null。
  */
 function notVerifiable(
-  code: InteractionNotVerifiableReasonCode,
+  code: InteractionWrittenNotVerifiableReasonCode,
   evidence: InteractionChangeEvidence,
   reasonDetail: string | null = null,
 ): ClassifiedWorkOutcome {
@@ -467,16 +393,11 @@ function notVerifiable(
     work: Object.freeze({
       status: NOT_VERIFIABLE_STATUS,
       reason: code,
-      reasonDetail: boundedReasonDetail(reasonDetail),
+      reasonDetail,
       evidence,
     }),
     notVerifiableKind: INTERACTION_NOT_VERIFIABLE_REASONS[code],
   });
-}
-
-/** 候補の探し直しが完了しなかった場合の結果。詳細は、探し直しの completeness の値。 */
-function incompleteRediscovery(completeness: string, evidence: InteractionChangeEvidence): ClassifiedWorkOutcome {
-  return notVerifiable('CANDIDATE_REDISCOVERY_INCOMPLETE', evidence, completeness);
 }
 
 /** 終端（`CLOSED`）に達した lifecycle。理由がなければ、理由も詳細も null。 */
@@ -487,7 +408,7 @@ function closedLifecycle(
   return Object.freeze({
     status: 'CLOSED',
     reason,
-    reasonDetail: reason === null ? null : boundedReasonDetail(reasonDetail),
+    reasonDetail: reason === null ? null : reasonDetail,
   });
 }
 
@@ -498,7 +419,7 @@ function nonTerminalLifecycle(
   return Object.freeze({
     status: 'NON_TERMINAL',
     reason,
-    reasonDetail: boundedReasonDetail(reasonDetail),
+    reasonDetail,
   });
 }
 
@@ -507,7 +428,7 @@ function nonTerminalLifecycle(
  * Ledger に記録する文言（`interactionFailureMessage`）は、すべてこの関数で整形する。
  * エスケープシーケンス（制御文字列の本体を含む）と、Playwright の `Call log:` から後ろと、双方向の制御文字と、孤立したサロゲートを除き、
  * 残った制御文字と連続する空白を1つの空白にする。何も残らなかった場合は null を返す。
- * 最後に、上限（`MAX_INTERACTION_REASON_LENGTH`）で、サロゲートペアを分けずに切り詰める。
+ * LZ-2: 切り詰めない（前は `MAX_INTERACTION_REASON_LENGTH` 512 まで）。
  */
 function interactionFailureDetail(error: unknown): string | null {
   const withoutAnsi = fullErrorMessage(error).replace(ANSI_ESCAPE_SEQUENCE_PATTERN, '');
@@ -517,12 +438,12 @@ function interactionFailureDetail(error: unknown): string | null {
     // 双方向の制御文字（ALM・LRM・RLM、埋め込み・上書き、分離）と、孤立したサロゲートを除く（R6 の M-3）。残った Cc は空白にする。
     replaceControlCharacters(removeLoneSurrogates(removeBidiControls(summary)), CONTROL_CHARACTER_REPLACEMENT),
   );
-  return cleaned === '' ? null : boundedReason(cleaned);
+  return cleaned === '' ? null : cleaned;
 }
 
 /** Ledger に記録する失敗の文言。整えたエラーの文言で、何も残らなかった場合は `fallbackMessage`。 */
 function interactionFailureMessage(error: unknown, fallbackMessage: string): string {
-  return interactionFailureDetail(error) ?? boundedReason(fallbackMessage);
+  return interactionFailureDetail(error) ?? fallbackMessage;
 }
 
 /**
@@ -547,14 +468,18 @@ function clickFailureOutcome(
  * `2026-10-08-beaksight-def-044-046-review-fixes-design.md` 3）。出口の中継の記録（`INTERACTION_FROZEN_EGRESS`、
  * `EGRESS_UPSTREAM_DENIED`）は、ネットワークの層の記録で、Chromium 自身の通信を含みうるので数えない（Ledger には残る）。
  */
-function hasFreezeEvent(snapshot: SafetyLedgerSnapshot): boolean {
+export function interactionFreezeEventRecorded(snapshot: SafetyLedgerSnapshot): boolean {
   return snapshot.blockedInteractionRequests.some(({ reason }) => reason === 'INTERACTION_FROZEN')
     || snapshot.blockedInteractionNavigations.length > 0
     || snapshot.blockedPopups.length > 0
     || snapshot.blockedDownloads.some(({ reason }) => reason === 'INTERACTION_FROZEN')
     || snapshot.blockedInteractionWebSockets.length > 0
-    || snapshot.externalSchemeNavigations.some(({ phase }) => phase === 'INTERACTION');
+    || snapshot.externalSchemeNavigations.some(({ phase }) => phase === 'INTERACTION')
+    // SAFE-2 の 4 の後: 凍結の後の `window.open` の外部スキームは、frame の判定の失敗にだけ残るので、凍結の後のその記録も作用として見る。
+    || (snapshot.frameClassificationFailures?.events.some(({ phase }) => phase === 'INTERACTION') ?? false);
 }
+
+const hasFreezeEvent = interactionFreezeEventRecorded;
 
 /**
  * 終端（`CLOSED`）に達した後の最終結果を決める。非終端の場合は結果を返さないので、ここには来ない。
@@ -819,7 +744,7 @@ interface TargetObservation {
   readonly detailsOpen: boolean | null;
 }
 
-/** 2回の観測の間の、候補の事実の外にある状態の変化。 */
+/** 押す前と押した後の観測の間の、候補の事実の外にある状態の変化。 */
 function targetStateDifference(before: TargetObservation, after: TargetObservation): InteractionStateDifference {
   return Object.freeze({
     changedAttributeNames: changedInteractionAttributeNames(before.attributes, after.attributes),
@@ -828,90 +753,45 @@ function targetStateDifference(before: TargetObservation, after: TargetObservati
   });
 }
 
-/** 安定性の確認で不安定になった項目を集める。 */
-class InstabilityRecorder {
-  readonly #fields = new Set<string>();
-  readonly #attributeNames = new Set<string>();
-  readonly #classNames = new Set<string>();
-
-  /** 2回の観測の間に変わった項目を、不安定な項目に加える。class は、中の名前ごとに加える（R6 の M-2）。 */
-  record(before: TargetObservation, after: TargetObservation): void {
-    const changes = interactionStateChanges(before.candidate, after.candidate, targetStateDifference(before, after));
-    for (const field of changes.fields) this.#fields.add(field);
-    for (const name of changes.attributeNames) this.#attributeNames.add(name);
-    for (const name of changes.classNames) this.#classNames.add(name);
-  }
-
-  snapshot(): InteractionInstability {
-    return Object.freeze({
-      fields: new Set(this.#fields) as ReadonlySet<string>,
-      attributeNames: new Set(this.#attributeNames) as ReadonlySet<string>,
-      classNames: new Set(this.#classNames) as ReadonlySet<string>,
-    });
-  }
-}
-
 /**
- * 凍結の前の下準備の結果（設計書 2026-09-23 4.4、選択肢 A）。
- * - `SCROLLED`: 対象を画面内にスクロールし、hover し、focus し、ページが落ち着くのを待ち、安定性の確認を終えた。
- *   `observation` は安定性の確認の時間の終わりの対象の状態で、凍結の後の探し直しの目印にする（R5 の N-4）。
- *   `recorder` は、安定性の確認で不安定になった項目を持つ。
- * - `SKIPPED`: 対象を一意に特定できなかった、または受け入れの判定で除外される見込みなので、スクロールしなかった。
- *   結果は凍結の後の、これまでと同じ判定で決まる。受け入れられた場合は、click せずに `NOT_VERIFIABLE` にする。
- * - `STOPPED`: 期限切れ・DOM の作業量の上限・スクロール、hover、focus、安定性の確認の失敗。凍結せずに、その結果で終える。
+ * 凍結の前の下準備の結果（設計書 2026-09-23 4.4、選択肢 A。SPEC-5 で focus と安定の窓をやめた）。
+ * - `PREPARED`: 対象を画面内にスクロールし、hover し、描画を 2 回待ち、対象を 1 回観測した。`candidateId` はその観測の候補の ID で、
+ *   凍結の後の探し直しの目印にする（hover で文字が変わる対象のため。R5 の N-4）。
+ * - `SKIPPED`: 対象を一意に特定できなかった、同じ要素と確かめられなかった、または受け入れの判定で除外される見込みなので、下準備をしなかった。
+ *   結果は凍結の後の、これまでと同じ判定で決まる。受け入れられた場合は、click せずに `TARGET_NOT_SCROLL_PREPARED` にする。
+ * - `STOPPED`: 期限切れか、スクロール・hover の失敗。凍結せずに、その結果で終える。
  */
-type ScrollPreparation =
-  | {
-      readonly status: 'SCROLLED';
-      readonly observation: TargetObservation;
-      readonly recorder: InstabilityRecorder;
-    }
+type TargetPreparation =
+  | { readonly status: 'PREPARED'; readonly candidateId: string }
   | { readonly status: 'SKIPPED' }
-  | StoppedPreparation;
-
-type StoppedPreparation = { readonly status: 'STOPPED'; readonly outcome: ClassifiedWorkOutcome };
-
-/** 凍結せずに終える結果を作る。`reasonDetail` は、整えたエラーの文言などの詳細（`notVerifiable` と同じ）。 */
-type StopPreparation = (code: InteractionNotVerifiableReasonCode, reasonDetail?: string | null) => StoppedPreparation;
-
-interface SharedDomWork {
-  readonly remaining: () => number;
-  /** 使った作業量を差し引く。上限を使い切った場合は true を返す。 */
-  readonly debit: (domWorkUsed: number) => boolean;
-}
+  | { readonly status: 'STOPPED'; readonly outcome: ClassifiedWorkOutcome };
 
 /**
- * 凍結の前（Passive フェーズ）に、候補を探し直して handle を解決し、期限付きで画面内にスクロールし、期限付きで対象に hover し、
- * focus し、ページが落ち着くのを待ってから、安定性の確認を行い、handle を破棄する。click のときにスクロールが起きないようにし、
- * hover と focus による変化を観測の前の状態に含め、click と関係なく変わる項目を根拠から外すためである（設計書 2026-09-23 4.4.1、4.4.2）。
- * `role="tab"` を明示した要素には focus をせず、それ以外の要素で focus が対象の ARIA の状態か `aria-controls` の先の表示を変えた場合は、
- * 凍結せずに NOT_VERIFIABLE で終える（4.4.2 手順4、R8 の Important-2）。
- * DOM の作業量は、1回の audit で共有する上限から差し引く。この間の通信は Passive フェーズの通信として Guard の判定を受ける。
+ * 凍結の前（Passive フェーズ）の下準備（設計書 2026-09-23 4.4.2 を SPEC-5 で置き換え。設計書 2026-11-14 5.1 の案 B）。候補を探し直して handle を
+ * 解決し、同じ要素かを 1 回の観測で確かめ、期限付きで画面内にスクロールし、期限付きで対象に hover し、描画を 2 回待ってから、対象を 1 回観測して、
+ * handle を破棄する。click のときにスクロールが起きないようにし、hover による変化を押す前の状態に含め、スクロールと hover で始まる遅延読み込みなどの
+ * 通信を、凍結の前（Passive フェーズの通信として Guard の判定を受ける）に始めさせるためである。focus と安定の窓は持たない。
  * 探索や解決がブラウザから不正な値を受け取った場合は、凍結の後と同じく例外をそのまま投げる。
  */
-async function prepareTargetScroll(
+async function prepareTarget(
   session: InteractionAuditSession,
   candidate: InteractionCandidate,
   effectiveDeadlineAtMs: number,
-  domWork: SharedDomWork,
-): Promise<ScrollPreparation> {
-  const stop: StopPreparation = (code, reasonDetail) => Object.freeze({
+): Promise<TargetPreparation> {
+  const stop = (
+    code: 'SCROLL_PREPARATION_DEADLINE' | 'SCROLL_PREPARATION_FAILED',
+    reasonDetail: string | null = null,
+  ): TargetPreparation => Object.freeze({
     status: 'STOPPED' as const,
     outcome: notVerifiable(code, emptyEvidence(candidate), reasonDetail),
   });
-  const skipped: ScrollPreparation = Object.freeze({ status: 'SKIPPED' });
+  const stopByError = (error: unknown): TargetPreparation => (isPlaywrightTimeoutError(error)
+    ? stop('SCROLL_PREPARATION_DEADLINE')
+    : stop('SCROLL_PREPARATION_FAILED', interactionFailureDetail(error)));
+  const skipped: TargetPreparation = Object.freeze({ status: 'SKIPPED' });
 
-  const discoveryWork = await awaitBrowserWork(
-    () => discoverInteractionCandidates(session.page, domWork.remaining()),
-    effectiveDeadlineAtMs,
-  );
+  const discoveryWork = await awaitBrowserWork(() => discoverInteractionCandidates(session.page), effectiveDeadlineAtMs);
   if (discoveryWork.status === 'PENDING_AT_DEADLINE') {
-    return stop('SCROLL_PREPARATION_DEADLINE');
-  }
-  if (domWork.debit(discoveryWork.value.domWorkUsed)) {
-    return stop('SCROLL_PREPARATION_DOM_WORK_EXHAUSTED');
-  }
-  if (Date.now() >= effectiveDeadlineAtMs) {
     return stop('SCROLL_PREPARATION_DEADLINE');
   }
   const matching = discoveryWork.value.candidates.filter((item) => item.candidateId === candidate.candidateId);
@@ -924,7 +804,7 @@ async function prepareTargetScroll(
   }
 
   const resolutionWork = await awaitBrowserWork(
-    () => resolveInteractionCandidateHandle(session.page, prepared.ordinal, domWork.remaining()),
+    () => resolveInteractionCandidateHandle(session.page, prepared.ordinal),
     effectiveDeadlineAtMs,
     disposeLateResolvedHandle(session),
   );
@@ -932,255 +812,81 @@ async function prepareTargetScroll(
     return stop('SCROLL_PREPARATION_DEADLINE');
   }
   const resolution = resolutionWork.value;
-  const resolutionExhaustedBudget = domWork.debit(resolution.domWorkUsed);
   if (resolution.status !== 'FOUND') {
-    return resolutionExhaustedBudget || resolution.status === 'DOM_WORK_BUDGET_REACHED'
-      ? stop('SCROLL_PREPARATION_DOM_WORK_EXHAUSTED')
-      : skipped;
+    return skipped;
   }
-  try {
-    if (resolutionExhaustedBudget) {
-      return stop('SCROLL_PREPARATION_DOM_WORK_EXHAUSTED');
-    }
-    // 下準備の handle が、探索で見つけた候補と同じ要素かを、hover の前に確かめる（R5 の N-4）。安定性の確認で読んだ状態を、
-    // 凍結の後の探し直しの目印にするので、探索と解決の間に別の要素が差し込まれた場合に、別の要素を目印にしないためである。
-    // 同じ要素でなければ、下準備をせずに（SKIPPED）、凍結の後のこれまでと同じ判定に任せる。
-    const identity = await observePreparedTarget(
-      resolution.reference,
-      prepared.ordinal,
+  const { reference } = resolution;
+  /** 下準備の handle で対象を 1 回観測する。期限切れは undefined、つながっていなければ null。 */
+  const observe = async (): Promise<InteractionCandidate | null | undefined> => {
+    const inspectionWork = await awaitBrowserWork(
+      () => inspectInteractionCandidateHandle(reference, prepared.ordinal),
       effectiveDeadlineAtMs,
-      domWork,
-      stop,
-      STABILITY_CHECK_OBSERVATION_REASONS,
     );
-    if ('outcome' in identity) {
-      return identity;
+    if (inspectionWork.status === 'PENDING_AT_DEADLINE') {
+      return undefined;
     }
-    if (identity.candidate.candidateId !== prepared.candidateId) {
-      return skipped;
-    }
-    const scrollBudgetMs = Math.max(0, effectiveDeadlineAtMs - Date.now());
-    if (scrollBudgetMs === 0) {
+    return inspectionWork.value.status === 'CONNECTED' ? inspectionWork.value.candidate : null;
+  };
+  try {
+    // 下準備の handle が、探索で見つけた候補と同じ要素かを、スクロールの前に確かめる（R5 の N-4）。探索と解決の間に別の要素が差し込まれた
+    // 場合に、別の要素を下準備しないためである。同じ要素でなければ、下準備をせずに（SKIPPED）、凍結の後のこれまでと同じ判定に任せる。
+    const identity = await observe();
+    if (identity === undefined) {
       return stop('SCROLL_PREPARATION_DEADLINE');
+    }
+    if (identity === null || identity.candidateId !== prepared.candidateId) {
+      return skipped;
     }
     try {
       const scrollWork = await awaitBrowserWork(
-        () => resolution.reference.handle.scrollIntoViewIfNeeded({ timeout: scrollBudgetMs }),
+        () => reference.handle.scrollIntoViewIfNeeded({ timeout: Math.max(1, effectiveDeadlineAtMs - Date.now()) }),
         effectiveDeadlineAtMs,
       );
       if (scrollWork.status === 'PENDING_AT_DEADLINE') {
         return stop('SCROLL_PREPARATION_DEADLINE');
       }
-    } catch (error) {
-      return isPlaywrightTimeoutError(error)
-        ? stop('SCROLL_PREPARATION_DEADLINE')
-        : stop('SCROLL_PREPARATION_FAILED', interactionFailureDetail(error));
-    }
-    // 対象に hover し、hover の後の状態を観測の前の状態にする（設計書 2026-09-23 4.4.1、4.4.2）。
-    // CSS の `:hover` や JavaScript の hover の処理による変化を前後の差に出さないためである。
-    // 凍結の前に行うので、hover で始まる通信は Passive フェーズの通信として Guard の判定を受ける。
-    const hoverBudgetMs = Math.max(0, effectiveDeadlineAtMs - Date.now());
-    if (hoverBudgetMs === 0) {
-      return stop('HOVER_PREPARATION_DEADLINE');
-    }
-    try {
+      // 対象に hover し、hover の後の状態を押す前の状態にする（設計書 2026-09-23 4.4.1）。CSS の `:hover` や JavaScript の hover の処理による
+      // 変化を、押す前と後の差に出さないためである。
       const hoverWork = await awaitBrowserWork(
-        () => resolution.reference.handle.hover({ timeout: hoverBudgetMs }),
+        () => reference.handle.hover({ timeout: Math.max(1, effectiveDeadlineAtMs - Date.now()) }),
         effectiveDeadlineAtMs,
       );
       if (hoverWork.status === 'PENDING_AT_DEADLINE') {
-        return stop('HOVER_PREPARATION_DEADLINE');
+        return stop('SCROLL_PREPARATION_DEADLINE');
       }
     } catch (error) {
-      return isPlaywrightTimeoutError(error)
-        ? stop('HOVER_PREPARATION_DEADLINE')
-        : stop('HOVER_PREPARATION_FAILED', interactionFailureDetail(error));
+      return stopByError(error);
     }
-    // hover の後に、対象に focus する（設計書 2026-09-23 4.4.1、R5 の N-3）。focus で付く class や属性
-    // （UI の部品集の focus の監視など）を、観測の前の状態に含めるためである。ただし、`role="tab"` を明示した要素には
-    // focus をしない（R8 の Important-2）。自動で切り替わるタブは、focus だけで切り替わるためである。
-    if (!hasExplicitTabRole(identity.candidate.role)) {
-      const focusFailure = await focusPreparedTarget(
-        resolution.reference,
-        prepared.ordinal,
-        effectiveDeadlineAtMs,
-        domWork,
-        stop,
-      );
-      if (focusFailure !== null) {
-        return focusFailure;
-      }
-    }
-    // ページが落ち着くのを待つ。スクロールと hover の後の最初の描画で IntersectionObserver の通知が task として積まれるので、
-    // 次の描画まで待ち、遅延読み込みなどの通信を凍結の前（Passive フェーズ）に始めさせる。
+    // スクロールと hover の後の最初の描画で IntersectionObserver の通知が task として積まれるので、次の描画まで待ち、遅延読み込みなどの通信を
+    // 凍結の前（Passive フェーズ）に始めさせる。
     for (let frame = 0; frame < SCROLL_PREPARATION_SETTLE_FRAMES; frame += 1) {
       if (!await awaitInitialRender(session.page, effectiveDeadlineAtMs)) {
-        return stop('SCROLL_PREPARATION_SETTLE_DEADLINE');
+        return stop('SCROLL_PREPARATION_DEADLINE');
       }
     }
-    // 安定性の確認は、下準備の handle で観測する。同じ要素の、hover と focus の後の状態を得るためである（R5 の N-4）。
-    // そのため、handle の破棄は、安定性の確認の後に行う。
-    return await observePreparedStability(
-      resolution.reference,
-      prepared.ordinal,
-      effectiveDeadlineAtMs,
-      domWork,
-      stop,
-    );
+    // hover の後の同じ要素の候補の ID を、凍結の後の探し直しの目印にする（hover で文字が変わる対象は、別の候補の ID になるため。R5 の N-4）。
+    const hovered = await observe();
+    if (hovered === undefined) {
+      return stop('SCROLL_PREPARATION_DEADLINE');
+    }
+    return hovered === null ? skipped : Object.freeze({ status: 'PREPARED', candidateId: hovered.candidateId });
   } finally {
-    await disposeRetainedHandleUntil(session, resolution.reference.handle, effectiveDeadlineAtMs);
+    await disposeRetainedHandleUntil(session, reference.handle, effectiveDeadlineAtMs);
   }
-}
-
-/**
- * 下準備の focus（設計書 2026-09-23 4.4.1、4.4.2 手順4）。focus の前後で下準備の handle で対象を観測し、対象の ARIA の状態か
- * `aria-controls` の先の表示の状態が変わった場合は、凍結せずに終える結果を返す（R8 の Important-2）。focus による状態の変化は、
- * click で起きる変化と区別できないためである。観測の DOM の作業量は、共有の上限から差し引く。前後の状態を比べられない場合も、
- * 凍結せずに終える（fail-closed）。focus の失敗・期限切れも、凍結せずに終える。問題がなければ null を返す。
- * Playwright の focus は期限を受け取らないので、作業フェーズのブラウザ内の処理と同じく、実効の期限で待つ。
- */
-async function focusPreparedTarget(
-  handle: InteractionCandidateReference,
-  ordinal: number,
-  effectiveDeadlineAtMs: number,
-  domWork: SharedDomWork,
-  stop: StopPreparation,
-): Promise<StoppedPreparation | null> {
-  const observe = (): Promise<TargetObservation | StoppedPreparation> => observePreparedTarget(
-    handle,
-    ordinal,
-    effectiveDeadlineAtMs,
-    domWork,
-    stop,
-    FOCUS_PREPARATION_OBSERVATION_REASONS,
-  );
-  const beforeFocus = await observe();
-  if ('outcome' in beforeFocus) {
-    return beforeFocus;
-  }
-  try {
-    const focusWork = await awaitBrowserWork(() => handle.handle.focus(), effectiveDeadlineAtMs);
-    if (focusWork.status === 'PENDING_AT_DEADLINE') {
-      return stop('FOCUS_PREPARATION_DEADLINE');
-    }
-  } catch (error) {
-    return isPlaywrightTimeoutError(error)
-      ? stop('FOCUS_PREPARATION_DEADLINE')
-      : stop('FOCUS_PREPARATION_FAILED', interactionFailureDetail(error));
-  }
-  const afterFocus = await observe();
-  if ('outcome' in afterFocus) {
-    return afterFocus;
-  }
-  const changed = interactionTargetStateChanged(
-    beforeFocus.candidate,
-    afterFocus.candidate,
-    changedInteractionAttributeNames(beforeFocus.attributes, afterFocus.attributes),
-  );
-  if (changed === null) {
-    return stop('FOCUS_PREPARATION_STATE_UNCOMPARABLE');
-  }
-  return changed ? stop('FOCUS_PREPARATION_STATE_CHANGED') : null;
-}
-
-/**
- * 凍結の前に、下準備の handle で対象を1回観測する（同じ要素かの確認、focus の前後の比較、安定性の確認に使う）。期限付きで行い、
- * DOM の作業量を共有の上限から差し引く。期限切れ・作業量の上限・対象の事実を得られなかった場合は、凍結せずに終える結果を返す。
- * 理由は、観測の目的ごとの `reasons` を使う（同じ要素かの確認は、安定性の確認の最初の観測として扱い、安定性の確認の理由を使う）。
- */
-async function observePreparedTarget(
-  handle: Parameters<typeof inspectInteractionCandidateHandle>[0],
-  ordinal: number,
-  effectiveDeadlineAtMs: number,
-  domWork: SharedDomWork,
-  stop: StopPreparation,
-  reasons: PreparedObservationReasons,
-): Promise<TargetObservation | StoppedPreparation> {
-  const inspectionWork = await awaitBrowserWork(
-    () => inspectInteractionCandidateHandle(handle, ordinal, domWork.remaining()),
-    effectiveDeadlineAtMs,
-  );
-  if (inspectionWork.status === 'PENDING_AT_DEADLINE') {
-    return stop(reasons.deadline);
-  }
-  const snapshot = inspectionWork.value;
-  if (domWork.debit(snapshot.domWorkUsed) || snapshot.status === 'DOM_WORK_BUDGET_REACHED') {
-    return stop(reasons.domWorkExhausted);
-  }
-  if (snapshot.status !== 'CONNECTED') {
-    return stop(reasons.inspection[snapshot.status]);
-  }
-  if (Date.now() >= effectiveDeadlineAtMs) {
-    return stop(reasons.deadline);
-  }
-  return Object.freeze({
-    candidate: snapshot.candidate,
-    attributes: snapshot.attributes,
-    detailsOpen: snapshot.detailsOpen,
-  });
-}
-
-/**
- * 安定性の確認（設計書 2026-09-23 4.4.1、R5 の N-1）。凍結の前に、`INTERACTION_STABILITY_WINDOW_MS` の間、`STABILITY_SAMPLE_INTERVAL_MS` ごとに
- * 下準備の handle で対象を観測し、続く2回の観測の間に変わった項目を「不安定」として記録する。観測する項目は、click の後の根拠になる
- * 項目と同じである。観測の前の状態（凍結の後の探し直しの目印）は、この時間の終わりの観測とする。
- * 期限の内側で行い、始める時点で時間が足りない場合と、途中で期限を過ぎた場合は、凍結せずに NOT_VERIFIABLE にする。
- * 観測の DOM の作業量は、1回の audit で共有する上限から差し引く。
- */
-async function observePreparedStability(
-  handle: Parameters<typeof inspectInteractionCandidateHandle>[0],
-  ordinal: number,
-  effectiveDeadlineAtMs: number,
-  domWork: SharedDomWork,
-  stop: StopPreparation,
-): Promise<ScrollPreparation> {
-  if (effectiveDeadlineAtMs - Date.now() <= INTERACTION_STABILITY_WINDOW_MS) {
-    return stop('STABILITY_CHECK_DEADLINE');
-  }
-  const windowEndsAtMs = Date.now() + INTERACTION_STABILITY_WINDOW_MS;
-  const observe = (): Promise<TargetObservation | StoppedPreparation> => observePreparedTarget(
-    handle,
-    ordinal,
-    effectiveDeadlineAtMs,
-    domWork,
-    stop,
-    STABILITY_CHECK_OBSERVATION_REASONS,
-  );
-  const recorder = new InstabilityRecorder();
-  let previous = await observe();
-  if ('outcome' in previous) {
-    return previous;
-  }
-  while (Date.now() < windowEndsAtMs) {
-    const nextObservationAtMs = deadlineWithinTimeoutAtMs(windowEndsAtMs, STABILITY_SAMPLE_INTERVAL_MS);
-    await wait(Math.max(0, nextObservationAtMs - Date.now()));
-    const current = await observe();
-    if ('outcome' in current) {
-      return current;
-    }
-    recorder.record(previous, current);
-    previous = current;
-  }
-  return Object.freeze({ status: 'SCROLLED', observation: previous, recorder });
 }
 
 /**
  * 隔離された Context で対象のページを読み込み、初期描画を待つ（設計書 2026-09-23 4.4.1、R6 の I-2）。どちらも読み込みの期限
  * （`navigationDeadlineAtMs`）で待つ。期限を過ぎた場合は、読み込みの期限切れと分かる理由の NOT_VERIFIABLE を返し、終えた場合は null を返す。
  * 読み込みのほかの失敗は、そのまま投げる（`auditInteraction` が EXECUTION_FAILED にする）。
- * `afterTargetLoad` を渡した場合は、読み込みの前に main frame の文書の追跡を付け、ページ本体の要求の観察を始め、読み込みの結果（応答は
- * `FULFILLED`、例外は `REJECTED`）から観測を作って、読み込みの直後に止めた観察の結果とともに渡し、追跡を外す（サイトが応答しないときに
- * Run を止める設計書 2.1。サイトの不調で止めたときの診断の記録の設計書 2.2）。読み込みを始めなかった場合は、観察も始めず、呼ばない。
- * 観察を始める処理は、読み込みの期限（`navigationDeadlineAtMs`）を消費するが、読み込みの期限と、今から `sessionOpenTimeoutMs` 後の
- * 早い方までしか待たない（設計書 2.2「長く待たない」。session の作成と Passive の観察の開始と同じ。D3R の Minor-1）。読み込みの期限は
- * 変えない。
+ * `afterTargetLoad` を渡した場合は、読み込みの前に main frame の文書の追跡を付け、読み込みの結果（応答は `FULFILLED`、例外は `REJECTED`）から
+ * 観測を作って渡し、追跡を外す（サイトが応答しないときに Run を止める設計書 2.1）。読み込みを始めなかった場合は、呼ばない。
  */
 async function loadInteractionTarget(
   session: InteractionAuditSession,
   targetUrl: string,
   candidate: InteractionCandidate,
   navigationDeadlineAtMs: number,
-  sessionOpenTimeoutMs: number,
   afterTargetLoad: InteractionAuditInput['afterTargetLoad'],
 ): Promise<ClassifiedWorkOutcome | null> {
   const navigationBudgetMs = Math.max(0, navigationDeadlineAtMs - Date.now());
@@ -1188,24 +894,11 @@ async function loadInteractionTarget(
     return notVerifiable('INITIAL_LOAD_BEFORE_LOAD', emptyEvidence(candidate));
   }
   const tracker = afterTargetLoad === undefined ? null : trackMainFrameDocument(session.page);
-  const recorder = afterTargetLoad === undefined
-    ? null
-    : await startNavigationDiagnostics(session.page, {
-      deadlineAtMs: deadlineWithinTimeoutAtMs(navigationDeadlineAtMs, sessionOpenTimeoutMs),
-    });
-  // 観察を始める処理が使った時間の分だけ、読み込みの予算を減らす（読み込みの期限は変えない）。予算は 0 にしない（Playwright の `timeout: 0`
-  // は期限なしのため）。観察を始めない場合（受け口なし）の予算は、今までどおりである。
-  const remainingBudgetMs = recorder === null ? navigationBudgetMs : Math.max(1, navigationDeadlineAtMs - Date.now());
   let loaded: MainFrameLoadSettlement;
   try {
-    let diagnostics: NavigationDiagnostics | null = null;
-    try {
-      loaded = await settleMainFrameLoad(session.page, targetUrl, { waitUntil: 'load', timeoutMs: remainingBudgetMs });
-    } finally {
-      diagnostics = recorder === null ? null : await recorder.finish();
-    }
-    if (tracker !== null && afterTargetLoad !== undefined && diagnostics !== null) {
-      afterTargetLoad(observeMainFrameLoad(tracker, loaded), diagnostics);
+    loaded = await settleMainFrameLoad(session.page, targetUrl, { waitUntil: 'load', timeoutMs: navigationBudgetMs });
+    if (tracker !== null && afterTargetLoad !== undefined) {
+      afterTargetLoad(observeMainFrameLoad(tracker, loaded));
     }
   } finally {
     tracker?.dispose();
@@ -1225,76 +918,113 @@ async function loadInteractionTarget(
   return null;
 }
 
+/**
+ * COV-4 の区切り 3（入れ子の開いた状態。設計者の判断 2026-11-10）: 凍結の中で、押下の並びを順に押し直す。各押下は、探し直して同じ候補の ID と順番の要素を見つけ、
+ * 安全の判定（`classifyInteractionCandidate`）で拒む要素は押さず、押した後はページの落ち着き（`waitForPageSettled` と口ごとの静まり）を待つ。見つからない・
+ * 拒む・押せない・期限を過ぎたら偽（押し直しが再現しない）。凍結の中なので、押下が出す送信は Guard が止める（止めた事実は Ledger に残り、呼び出し側が見る）。
+ */
+async function replayPressTrail(
+  session: InteractionAuditSession,
+  trail: readonly InteractionPressStep[],
+  deadlineAtMs: number,
+  progress: ProgressSignals | undefined,
+): Promise<boolean> {
+  for (const step of trail) {
+    if (Date.now() >= deadlineAtMs || session.isClosed()) {
+      return false;
+    }
+    const discovered = await discoverInteractionCandidates(session.page, undefined, deadlineAtMs);
+    const found = discovered.candidates.find(({ candidateId, ordinal }) => candidateId === step.candidateId && ordinal === step.ordinal);
+    if (found === undefined || classifyInteractionCandidate(found).action === 'REJECT') {
+      return false;
+    }
+    const resolution = await resolveInteractionCandidateHandle(session.page, step.ordinal, undefined, deadlineAtMs);
+    if (resolution.status !== 'FOUND') {
+      return false;
+    }
+    // 落ち着きの待ちのためだけなので、要求ごとの記録を持たない口にする（設計者の判断 2026-11-11）。
+    const network = DataActivityCollector.attach(session.page);
+    try {
+      await resolution.reference.handle.click({ timeout: Math.max(1, deadlineAtMs - Date.now()) });
+      await waitForPageSettled(session.page, {
+        deadlineAtMs,
+        ...PAGE_SETTLING_PACING,
+        ...(progress === undefined ? {} : { progress }),
+        dataActivity: () => network.dataRequestActivity(),
+      });
+    } catch {
+      return false;
+    } finally {
+      network.detach();
+      await resolution.reference.handle.dispose().catch(() => undefined);
+    }
+  }
+  return true;
+}
+
 async function executeInteraction(
   session: InteractionAuditSession,
   input: InteractionAuditInput,
   candidate: InteractionCandidate,
   navigationDeadlineAtMs: number,
-  sessionOpenTimeoutMs: number,
 ): Promise<ClassifiedWorkOutcome> {
   const loadFailure = await loadInteractionTarget(
     session,
     input.targetUrl,
     candidate,
     navigationDeadlineAtMs,
-    sessionOpenTimeoutMs,
     input.afterTargetLoad,
   );
   if (loadFailure !== null) {
     return loadFailure;
   }
   // Interaction の期限は、読み込みと初期描画が終わったここから数える（設計書 2026-09-23 4.4.1、R6 の I-2）。
-  // 読み込みの遅いページで、読み込みの時間が、下準備・安定性の確認・click・持続の確認の時間を削らないようにするためである。
+  // 読み込みの遅いページで、読み込みの時間が、下準備・click・押した後の観測の時間を削らないようにするためである。
   const effectiveDeadlineAtMs = deadlineWithinTimeoutAtMs(input.deadlineAtMs, input.timeoutMs);
   const remaining = (): number => Math.max(0, effectiveDeadlineAtMs - Date.now());
-  let domWorkRemaining = INTERACTION_CANDIDATE_LIMITS.maxDomWork;
-  const debitDomWork = (domWorkUsed: number): boolean => {
-    if (!isNonNegativeSafeInteger(domWorkUsed) || domWorkUsed > domWorkRemaining) {
-      throw new Error('Interaction DOM work exceeded the remaining bounded contract');
-    }
-    domWorkRemaining -= domWorkUsed;
-    return domWorkRemaining === 0;
-  };
-  const domWorkExhausted = (before: InteractionCandidate): ClassifiedWorkOutcome => notVerifiable(
-    'DOM_WORK_EXHAUSTED',
-    emptyEvidence(before, 'UNESTABLISHED'),
+  // SPEC-5: 凍結の後、click を始める前の期限切れは、どの段（探し直し・handle の解決・押す前の観測）でも 1 つの理由にする。
+  const deadlineBeforeClick = (evidence: InteractionChangeEvidence): ClassifiedWorkOutcome => notVerifiable(
+    'DEADLINE_BEFORE_EXACT_NODE_CLICK',
+    evidence,
   );
-  const scrollPreparation = await prepareTargetScroll(session, candidate, effectiveDeadlineAtMs, {
-    remaining: () => domWorkRemaining,
-    debit: debitDomWork,
-  });
-  if (scrollPreparation.status === 'STOPPED') {
-    return scrollPreparation.outcome;
+  // L10・SPEC-5: DOM の作業量は数えない（前の上限と、1 回の audit で共有する作業量の差し引き（`maxDomWork`）は撤廃した）。読み取りの部品に上限を
+  // 渡さないので、部品は作業量の上限に達した結果（`DOM_WORK_BUDGET_REACHED`）を返さない。
+  // COV-4 の区切り 3（入れ子の開いた状態）: 押し直す並びがあれば、凍結してから押し直し、同じ構造まで再現したかを確かめる。凍結の前の下準備は、凍結の後に行う。
+  const nested = (input.pressTrail?.length ?? 0) > 0;
+  if (nested) {
+    await activateFreezeBeforeDeadline(session, input.freezeActivationTimeoutMs ?? CONTEXT_CLOSE_TIMEOUT_MS);
+    // REV-SD の I-1: 押し直す前に、範囲の外へ移った page では押さない。
+    if (movedOutsideAuditScope(session, input)) {
+      return notVerifiable('INITIAL_LOAD_AFTER_LOAD', emptyEvidence(candidate), OUTSIDE_AUDIT_SCOPE_DETAIL);
+    }
+    const replayed = await replayPressTrail(session, input.pressTrail ?? [], effectiveDeadlineAtMs, input.progress);
+    if (hasFreezeEvent(session.ledger.snapshot())) {
+      return outcome('BLOCKED_BY_SAFETY', 'SAFETY_FREEZE_BLOCKED', null, emptyEvidence(candidate));
+    }
+    if (!replayed || (input.verifyTrail !== undefined && !(await input.verifyTrail(session.page)))) {
+      return notVerifiable('TRAIL_NOT_REPRODUCED', emptyEvidence(candidate));
+    }
   }
-  await activateFreezeBeforeDeadline(session, input.freezeActivationTimeoutMs ?? CONTEXT_CLOSE_TIMEOUT_MS);
-  if (remaining() === 0) {
-    return notVerifiable('DEADLINE_AFTER_SAFETY_FREEZE', emptyEvidence(candidate));
+  // REV-SD の I-1: 下準備（スクロール・hover）の前にも見直す。
+  if (movedOutsideAuditScope(session, input)) {
+    return notVerifiable('INITIAL_LOAD_AFTER_LOAD', emptyEvidence(candidate), OUTSIDE_AUDIT_SCOPE_DETAIL);
+  }
+  const preparation = await prepareTarget(session, candidate, effectiveDeadlineAtMs);
+  if (preparation.status === 'STOPPED') {
+    return preparation.outcome;
+  }
+  if (!nested) {
+    await activateFreezeBeforeDeadline(session, input.freezeActivationTimeoutMs ?? CONTEXT_CLOSE_TIMEOUT_MS);
   }
 
-  const rediscoveryWork = await awaitBrowserWork(
-    () => discoverInteractionCandidates(session.page, domWorkRemaining),
-    effectiveDeadlineAtMs,
-  );
-  if (rediscoveryWork.status === 'PENDING_AT_DEADLINE') {
-    return notVerifiable('DEADLINE_DURING_CANDIDATE_REDISCOVERY', emptyEvidence(candidate));
+  const rediscoveryWork = await awaitBrowserWork(() => discoverInteractionCandidates(session.page), effectiveDeadlineAtMs);
+  if (rediscoveryWork.status === 'PENDING_AT_DEADLINE' || remaining() === 0) {
+    return deadlineBeforeClick(emptyEvidence(candidate));
   }
-  const rediscoveredResult = rediscoveryWork.value;
-  if (debitDomWork(rediscoveredResult.domWorkUsed)) {
-    return domWorkExhausted(candidate);
-  }
-  if (remaining() === 0) {
-    return notVerifiable('DEADLINE_DURING_CANDIDATE_REDISCOVERY', emptyEvidence(candidate));
-  }
-  const rediscovered = rediscoveredResult.candidates;
-  // 下準備を終えた場合は、下準備の handle で読んだ、hover と focus の後の同じ要素の状態を目印にして探し直す（R5 の N-4）。
+  // 下準備を終えた場合は、下準備の handle で読んだ、hover の後の同じ要素の候補の ID を目印にして探し直す（R5 の N-4）。
   // hover で文字が変わる対象は、同じ要素でも、凍結の前の探索とは別の候補の ID になるためである。受け入れの判定は、この後に行う。
-  const expectedCandidateId = scrollPreparation.status === 'SCROLLED'
-    ? scrollPreparation.observation.candidate.candidateId
-    : candidate.candidateId;
-  const matching = rediscovered.filter((item) => item.candidateId === expectedCandidateId);
-  if (matching.length === 0 && rediscoveredResult.completeness !== 'COMPLETE') {
-    return incompleteRediscovery(rediscoveredResult.completeness, emptyEvidence(candidate, 'UNESTABLISHED'));
-  }
+  const expectedCandidateId = preparation.status === 'PREPARED' ? preparation.candidateId : candidate.candidateId;
+  const matching = rediscoveryWork.value.candidates.filter((item) => item.candidateId === expectedCandidateId);
   if (matching.length === 0) {
     return notVerifiable('CANDIDATE_IDENTITY_NOT_REDISCOVERED', emptyEvidence(candidate, 'MISSING'));
   }
@@ -1302,83 +1032,35 @@ async function executeInteraction(
     return notVerifiable('CANDIDATE_IDENTITY_AMBIGUOUS', emptyEvidence(candidate, 'AMBIGUOUS'));
   }
   const before = matching[0] as InteractionCandidate;
-  if (remaining() === 0) {
-    return notVerifiable('DEADLINE_BEFORE_TARGET_HANDLE_ACQUISITION', emptyEvidence(before));
-  }
   const resolutionWork = await awaitBrowserWork(
-    () => resolveInteractionCandidateHandle(session.page, before.ordinal, domWorkRemaining),
+    () => resolveInteractionCandidateHandle(session.page, before.ordinal),
     effectiveDeadlineAtMs,
     disposeLateResolvedHandle(session),
   );
   if (resolutionWork.status === 'PENDING_AT_DEADLINE') {
-    return notVerifiable('DEADLINE_DURING_TARGET_HANDLE_ACQUISITION', emptyEvidence(before));
+    return deadlineBeforeClick(emptyEvidence(before));
   }
   const resolution = resolutionWork.value;
-  const resolutionExhaustedInteractionBudget = debitDomWork(resolution.domWorkUsed);
-  if (resolution.status !== 'FOUND' && resolutionExhaustedInteractionBudget) {
-    return domWorkExhausted(before);
-  }
-  if (resolution.status === 'MISSING') {
+  if (resolution.status !== 'FOUND') {
     return notVerifiable('TARGET_HANDLE_NOT_RESOLVED', emptyEvidence(before, 'MISSING'));
-  }
-  if (resolution.status === 'DOM_WORK_BUDGET_REACHED') {
-    return notVerifiable(
-      'TARGET_HANDLE_RESOLUTION_DOM_WORK_EXHAUSTED',
-      emptyEvidence(before, 'UNESTABLISHED'),
-    );
   }
   const targetReference = resolution.reference;
 
   try {
-    if (resolutionExhaustedInteractionBudget) {
-      return domWorkExhausted(before);
-    }
-    if (remaining() === 0) {
-      return notVerifiable('DEADLINE_DURING_TARGET_HANDLE_ACQUISITION', emptyEvidence(before));
-    }
     const resolvedSnapshotWork = await awaitBrowserWork(
-      () => inspectInteractionCandidateHandle(targetReference, before.ordinal, domWorkRemaining),
+      () => inspectInteractionCandidateHandle(targetReference, before.ordinal),
       effectiveDeadlineAtMs,
     );
-    if (resolvedSnapshotWork.status === 'PENDING_AT_DEADLINE') {
-      return notVerifiable('DEADLINE_DURING_TARGET_FACT_COLLECTION', emptyEvidence(before));
+    if (resolvedSnapshotWork.status === 'PENDING_AT_DEADLINE' || remaining() === 0) {
+      return deadlineBeforeClick(emptyEvidence(before));
     }
     const resolvedSnapshot = resolvedSnapshotWork.value;
-    if (debitDomWork(resolvedSnapshot.domWorkUsed)) {
-      return domWorkExhausted(before);
-    }
-    if (remaining() === 0) {
-      return notVerifiable('DEADLINE_DURING_TARGET_FACT_COLLECTION', emptyEvidence(before));
-    }
-    if (resolvedSnapshot.status === 'DOM_WORK_BUDGET_REACHED') {
-      return notVerifiable(
-        'TARGET_INSPECTION_DOM_WORK_EXHAUSTED',
-        emptyEvidence(before, 'UNESTABLISHED'),
-      );
-    }
-    if (resolvedSnapshot.status === 'CANDIDATE_LIMIT_REACHED') {
-      return notVerifiable(
-        'TARGET_INSPECTION_CANDIDATE_LIMIT_REACHED',
-        emptyEvidence(before, 'UNESTABLISHED'),
-      );
-    }
-    if (resolvedSnapshot.status === 'TEXT_NODE_LIMIT_REACHED') {
-      return notVerifiable(
-        'TARGET_INSPECTION_TEXT_NODE_LIMIT_REACHED',
-        emptyEvidence(before, 'UNESTABLISHED'),
-      );
-    }
-    if (resolvedSnapshot.status === 'DISCONNECTED') {
-      return notVerifiable(
-        'TARGET_DISCONNECTED_BEFORE_ADMISSION',
-        emptyEvidence(before, 'MISSING'),
-      );
+    if (resolvedSnapshot.status !== 'CONNECTED') {
+      return notVerifiable('TARGET_DISCONNECTED_BEFORE_ADMISSION', emptyEvidence(before, 'MISSING'));
     }
     const resolvedCandidate = resolvedSnapshot.candidate;
-    // click の前のスクロール位置。click の後の観測の記録と比べ、スクロールが起きたかを判定する（設計書 2026-09-23 4.4 の追記）。
-    const scrollBeforeClick = resolvedSnapshot.scroll;
-    // click の前の、対象の状態（候補の事実、対象自身の属性、親の details の開閉）。click の後の観測と比べる（設計書 2026-09-23 4.4.1）。
-    // 下準備で hover と focus をし、安定性の確認をした後に取るので、hover と focus による変化は、前後の差に出ない。
+    // click の前の、対象の状態（候補の事実、対象自身の属性、親の details の開閉）。click の後の 1 回の観測と比べる（設計書 2026-09-23 4.4.1、SPEC-5）。
+    // 下準備で hover をした後に取るので、hover による変化は、前後の差に出ない。
     const observationBeforeClick: TargetObservation = Object.freeze({
       candidate: resolvedCandidate,
       attributes: resolvedSnapshot.attributes,
@@ -1388,9 +1070,6 @@ async function executeInteraction(
       return notVerifiable('TARGET_CHANGED_DURING_EXACT_NODE_RESOLUTION', emptyEvidence(before));
     }
     const exactAdmission = classifyInteractionCandidate(resolvedCandidate);
-    if (remaining() === 0) {
-      return notVerifiable('DEADLINE_DURING_EXACT_NODE_ADMISSION', emptyEvidence(before));
-    }
     if (exactAdmission.action === 'REJECT') {
       const ledgerRecord = interactionRejectionLedgerRecord(exactAdmission.reason);
       // `isBlockedExternalActionReason` は、記録先の判断（`interactionRejectionLedgerRecord`）と一致する（テストで確かめる）。
@@ -1409,174 +1088,97 @@ async function executeInteraction(
       }
       return outcome('REJECTED_UNSAFE', exactAdmission.reason, null, matchedPreInteractionEvidence(resolvedCandidate));
     }
-    if (scrollPreparation.status !== 'SCROLLED') {
+    // 凍結の前に下準備をしていない対象（凍結の後に現れた要素など）は、押さない。
+    if (preparation.status !== 'PREPARED') {
       return notVerifiable('TARGET_NOT_SCROLL_PREPARED', emptyEvidence(resolvedCandidate));
     }
-    // 安定性の確認の終わりから、凍結の後の click の前の観測までに変わった項目も、不安定とする。
-    scrollPreparation.recorder.record(scrollPreparation.observation, observationBeforeClick);
-    const instability = scrollPreparation.recorder.snapshot();
+    // REV-SD の I-1: 押す直前に、main frame の URL を見直す（範囲の外へ移った page では押さない）。
+    if (movedOutsideAuditScope(session, input)) {
+      return notVerifiable('INITIAL_LOAD_AFTER_LOAD', emptyEvidence(resolvedCandidate), OUTSIDE_AUDIT_SCOPE_DETAIL);
+    }
 
     const clickBudgetMs = remaining();
     if (clickBudgetMs === 0) {
-      return notVerifiable('DEADLINE_BEFORE_EXACT_NODE_CLICK', emptyEvidence(resolvedCandidate));
+      return deadlineBeforeClick(emptyEvidence(resolvedCandidate));
     }
-    let clickFailed = false;
-    let clickError: unknown;
+    let clickFailure: { readonly error: unknown } | null = null;
+    // SPEC-5（設計書 2026-11-14 5.1）: 押した後は、ページの落ち着き（落ち着きの待ちの唯一の部品 `waitForPageSettled` と口ごとの静まり）を待ってから、
+    // 1 回だけ観測する。見張りの口がないとき（利用者が期限を指定したとき）も同じく待つ（期限で終わる）。押した後の要求の口ごとの事実は、落ち着きの待ちの
+    // ためだけに数える（要求は増やさない。要求ごとの記録は持たない。設計者の判断 2026-11-11）。落ち着かないまま見張りが終えたら、session が閉じられて、
+    // この後の観測が失敗する（見張りの理由の NOT_VERIFIABLE になる）。
+    const network = DataActivityCollector.attach(session.page);
     try {
-      await targetReference.handle.click({ timeout: clickBudgetMs });
-    } catch (error) {
-      clickFailed = true;
-      clickError = error;
+      try {
+        await targetReference.handle.click({ timeout: clickBudgetMs });
+      } catch (error) {
+        clickFailure = Object.freeze({ error });
+      }
+      if (clickFailure === null) {
+        await waitForPageSettled(session.page, {
+          deadlineAtMs: effectiveDeadlineAtMs,
+          ...PAGE_SETTLING_PACING,
+          ...(input.progress === undefined ? {} : { progress: input.progress }),
+          dataActivity: () => network.dataRequestActivity(),
+        });
+      }
+    } finally {
+      network.detach();
+    }
+    if (hasFreezeEvent(session.ledger.snapshot())) {
+      return outcome('BLOCKED_BY_SAFETY', 'SAFETY_FREEZE_BLOCKED', null, emptyEvidence(resolvedCandidate));
     }
 
-    let lastEvidence = emptyEvidence(resolvedCandidate);
-    // 最後の観測で、変化が `boundingBox` だけだった場合の区別。
-    let geometryOnlyChange: GeometryOnlyChange | null = null;
-    // 持続の確認の途中の状態（設計書 2026-09-23 4.4.1、R5 の N-3）。根拠となる変化を見つけた観測の Evidence と、
-    // その変化が続いているかを確かめる時刻。
-    let persistence: { readonly evidence: InteractionChangeEvidence; readonly checkAtMs: number } | null = null;
-    // 期限までに変化を確かめられなかった場合の結果（I15a で、区分が期限の切れる時点によらないようにした）。
-    // - 最後の観測で、変化が `boundingBox` だけだった（根拠にしなかった）場合は、それが分かる理由にする。
-    // - click の後の観測を終えて、根拠となる変化が見えないまま期限が切れた場合は、持続の確認の途中でなければ、観測の前・途中・描画の
-    //   待ちのどこで期限が切れても `NO_OBSERVABLE_CHANGE` にする。確かめる手順を終えて、変化が見えなかった場合だからである。
-    // - それ以外（click の後の観測を1回も終えていない、持続の確認の途中）は、渡された code にする。
-    const unverifiedAtDeadline = (code: InteractionNotVerifiableReasonCode): ClassifiedWorkOutcome => {
-      if (geometryOnlyChange !== null) {
-        return notVerifiable(GEOMETRY_ONLY_CHANGE_REASONS[geometryOnlyChange], lastEvidence);
-      }
-      const observedNoChange = persistence === null
-        && lastEvidence.identityStatus === 'MATCHED'
-        && lastEvidence.changedFields.length === 0;
-      return notVerifiable(observedNoChange ? 'NO_OBSERVABLE_CHANGE' : code, lastEvidence);
-    };
-    while (true) {
-      // 保持した対象が切断された場合の詳細（切断の後の identityStatus の値）。
-      let identityLossDetail: string | undefined;
-      let observationDeadlineExpired = false;
-      const safety = session.ledger.snapshot();
-      if (hasFreezeEvent(safety)) {
-        return outcome('BLOCKED_BY_SAFETY', 'SAFETY_FREEZE_BLOCKED', null, lastEvidence);
-      }
-      if (clickFailed && remaining() === 0) {
-        return clickFailureOutcome(clickError, lastEvidence);
-      }
-      if (remaining() === 0) {
-        return unverifiedAtDeadline('DEADLINE_BEFORE_POST_CONDITION_OBSERVATION');
-      }
-      try {
-        const retainedSnapshotWork = await awaitBrowserWork(
-          () => inspectInteractionCandidateHandle(targetReference, resolvedCandidate.ordinal, domWorkRemaining),
-          effectiveDeadlineAtMs,
-        );
-        if (retainedSnapshotWork.status === 'PENDING_AT_DEADLINE') {
-          return unverifiedAtDeadline('DEADLINE_DURING_POST_CONDITION_OBSERVATION');
-        }
+    // 押した後の 1 回の観測。保持した要素が切断されていれば、探し直して、置き換えか削除かを記録する（同じ要素とは確かめられない）。
+    // 期限までに観測を終えられなければ、観測の結果を持たない（null）。
+    let observed: InteractionChangeEvidence | null = null;
+    // 保持した対象が切断された場合の詳細（切断の後の identityStatus の値）。
+    let identityLossDetail: string | null = null;
+    try {
+      const retainedSnapshotWork = await awaitBrowserWork(
+        () => inspectInteractionCandidateHandle(targetReference, resolvedCandidate.ordinal),
+        effectiveDeadlineAtMs,
+      );
+      if (retainedSnapshotWork.status === 'SETTLED') {
         const retainedSnapshot = retainedSnapshotWork.value;
-        if (debitDomWork(retainedSnapshot.domWorkUsed)) {
-          return domWorkExhausted(resolvedCandidate);
-        }
-        observationDeadlineExpired = remaining() === 0;
         if (retainedSnapshot.status === 'CONNECTED') {
-          // 対象の位置と大きさの変化は、根拠にしない（`collectInteractionChangeEvidence` は `boundingBox` を数えない）。
-          // 対象自身の属性は、前後の記録を比べられて、1つでも変わった場合だけ根拠にする。安定性の確認で不安定になった項目と
-          // 属性は、根拠にしない。スクロールの比較は、位置と大きさだけが変わった場合の NOT_VERIFIABLE の理由を区別するために使う。
-          // `role="tab"` を明示した要素は、下準備で focus をしないので、focus や mousedown で変わる属性が前後の差に出る。
-          // そのため、属性の変化は ARIA の状態だけを根拠にする（設計書 2026-09-23 4.4.1、R9 の Important-1）。判定は、下準備で
-          // focus を飛ばす判定と同じ `hasExplicitTabRole` を使う。
-          lastEvidence = collectInteractionChangeEvidence(resolvedCandidate, retainedSnapshot.candidate, {
-            difference: targetStateDifference(observationBeforeClick, {
-              candidate: retainedSnapshot.candidate,
-              attributes: retainedSnapshot.attributes,
-              detailsOpen: retainedSnapshot.detailsOpen,
-            }),
-            instability,
-            ariaStateAttributesOnly: hasExplicitTabRole(resolvedCandidate.role),
+          // 対象の位置と大きさの変化は、根拠にしない（`collectInteractionChangeEvidence` は `boundingBox` を数えない）。属性は、ARIA の状態と
+          // `open` と class の名前だけを根拠にする（SPEC-5。前はタブだけに当てた決まりを、全部の候補に当てる）。
+          observed = collectInteractionChangeEvidence(resolvedCandidate, retainedSnapshot.candidate, {
+            difference: targetStateDifference(observationBeforeClick, retainedSnapshot),
           });
-          const scrollComparison = compareInteractionScrollRecords(scrollBeforeClick, retainedSnapshot.scroll);
-          geometryOnlyChange = lastEvidence.changedFields.length === 0
-            && interactionGeometryChanged(resolvedCandidate, retainedSnapshot.candidate)
-            ? (scrollComparison === 'UNCHANGED' ? 'GEOMETRY' : scrollComparison)
-            : null;
-        } else if (retainedSnapshot.status === 'DOM_WORK_BUDGET_REACHED') {
-          return notVerifiable(
-            'RETAINED_INSPECTION_DOM_WORK_EXHAUSTED',
-            emptyEvidence(resolvedCandidate, 'UNESTABLISHED'),
-          );
-        } else if (retainedSnapshot.status === 'CANDIDATE_LIMIT_REACHED') {
-          return notVerifiable(
-            'RETAINED_INSPECTION_CANDIDATE_LIMIT_REACHED',
-            emptyEvidence(resolvedCandidate, 'UNESTABLISHED'),
-          );
-        } else if (retainedSnapshot.status === 'TEXT_NODE_LIMIT_REACHED') {
-          return notVerifiable(
-            'RETAINED_INSPECTION_TEXT_NODE_LIMIT_REACHED',
-            emptyEvidence(resolvedCandidate, 'UNESTABLISHED'),
-          );
-        } else if (!observationDeadlineExpired) {
+        } else {
           const liveCandidatesWork = await awaitBrowserWork(
-            () => discoverInteractionCandidates(session.page, domWorkRemaining),
+            () => discoverInteractionCandidates(session.page),
             effectiveDeadlineAtMs,
           );
-          if (liveCandidatesWork.status === 'PENDING_AT_DEADLINE') {
-            return unverifiedAtDeadline('DEADLINE_DURING_POST_CONDITION_OBSERVATION');
+          if (liveCandidatesWork.status === 'SETTLED') {
+            observed = collectDisconnectedInteractionEvidence(resolvedCandidate, liveCandidatesWork.value.candidates);
+            identityLossDetail = observed.identityStatus;
           }
-          const liveCandidatesResult = liveCandidatesWork.value;
-          if (debitDomWork(liveCandidatesResult.domWorkUsed)) {
-            return domWorkExhausted(resolvedCandidate);
-          }
-          if (liveCandidatesResult.completeness !== 'COMPLETE'
-            && !liveCandidatesResult.candidates.some((item) => item.candidateId === resolvedCandidate.candidateId)) {
-            return incompleteRediscovery(
-              liveCandidatesResult.completeness,
-              emptyEvidence(resolvedCandidate, 'UNESTABLISHED'),
-            );
-          }
-          observationDeadlineExpired = remaining() === 0;
-          lastEvidence = collectDisconnectedInteractionEvidence(resolvedCandidate, liveCandidatesResult.candidates);
-          geometryOnlyChange = null;
-          identityLossDetail = lastEvidence.identityStatus;
         }
-      } catch (error) {
-        if (hasFreezeEvent(session.ledger.snapshot())) {
-          return outcome('BLOCKED_BY_SAFETY', 'SAFETY_FREEZE_BLOCKED', null, lastEvidence);
-        }
-        throw error;
       }
-      const afterObservationSafety = session.ledger.snapshot();
-      if (hasFreezeEvent(afterObservationSafety)) {
-        return outcome('BLOCKED_BY_SAFETY', 'SAFETY_FREEZE_BLOCKED', null, lastEvidence);
+    } catch (error) {
+      if (hasFreezeEvent(session.ledger.snapshot())) {
+        return outcome('BLOCKED_BY_SAFETY', 'SAFETY_FREEZE_BLOCKED', null, emptyEvidence(resolvedCandidate));
       }
-      if (clickFailed) {
-        return clickFailureOutcome(clickError, lastEvidence);
-      }
-      if (identityLossDetail !== undefined) {
-        return notVerifiable('RETAINED_IDENTITY_LOST', lastEvidence, identityLossDetail);
-      }
-      if (observationDeadlineExpired || remaining() === 0) {
-        return unverifiedAtDeadline('DEADLINE_DURING_POST_CONDITION_OBSERVATION');
-      }
-      if (lastEvidence.identityStatus === 'MATCHED' && lastEvidence.changedFields.length > 0) {
-        // 持続の確認: 根拠となる変化を見つけたら、`INTERACTION_PERSISTENCE_WINDOW_MS` の後にもう一度観測し、その時にも続いている
-        // 項目だけを根拠にする。元に戻った変化は根拠にせず、新しい変化があれば、そこから持続の確認をやり直す。
-        if (persistence !== null && Date.now() >= persistence.checkAtMs) {
-          const persistent = retainPersistentInteractionChanges(lastEvidence, persistence.evidence);
-          if (persistent.changedFields.length > 0) {
-            return outcome('VERIFIED', 'OBSERVABLE_STATE_CHANGED', null, persistent);
-          }
-          persistence = null;
-        }
-        persistence ??= Object.freeze({ evidence: lastEvidence, checkAtMs: Date.now() + INTERACTION_PERSISTENCE_WINDOW_MS });
-        if (persistence.checkAtMs >= effectiveDeadlineAtMs) {
-          return unverifiedAtDeadline('PERSISTENCE_CHECK_DEADLINE');
-        }
-        await wait(Math.max(0, persistence.checkAtMs - Date.now()));
-        continue;
-      }
-      persistence = null;
-      if (!await awaitInitialRender(session.page, effectiveDeadlineAtMs)) {
-        return unverifiedAtDeadline('NO_OBSERVABLE_CHANGE');
-      }
+      throw error;
     }
+    const observedEvidence = observed ?? emptyEvidence(resolvedCandidate);
+    if (hasFreezeEvent(session.ledger.snapshot())) {
+      return outcome('BLOCKED_BY_SAFETY', 'SAFETY_FREEZE_BLOCKED', null, observedEvidence);
+    }
+    if (clickFailure !== null) {
+      return clickFailureOutcome(clickFailure.error, observedEvidence);
+    }
+    if (observed === null) {
+      return notVerifiable('DEADLINE_DURING_POST_CONDITION_OBSERVATION', observedEvidence);
+    }
+    if (identityLossDetail !== null) {
+      return notVerifiable('RETAINED_IDENTITY_LOST', observed, identityLossDetail);
+    }
+    return observed.changedFields.length > 0
+      ? outcome('VERIFIED', 'OBSERVABLE_STATE_CHANGED', null, observed)
+      : notVerifiable('NO_OBSERVABLE_CHANGE', observed);
   } finally {
     await disposeRetainedHandleUntil(session, targetReference.handle, effectiveDeadlineAtMs);
   }
@@ -1591,6 +1193,7 @@ export async function auditInteraction(input: InteractionAuditInput): Promise<In
   const sessionOpenTimeoutMs = input.sessionOpenTimeoutMs ?? SESSION_OPEN_TIMEOUT_MS;
   positiveFiniteInteger(sessionOpenTimeoutMs, 'Interaction session open timeout');
   positiveFiniteInteger(input.freezeActivationTimeoutMs ?? CONTEXT_CLOSE_TIMEOUT_MS, 'Interaction freeze activation timeout');
+  positiveFiniteInteger(input.cleanupTimeoutMs ?? input.timeoutMs, 'Interaction cleanup timeout');
   const { releaseLateSessionFailure } = input;
   if (releaseLateSessionFailure !== undefined && typeof releaseLateSessionFailure !== 'function') {
     throw new Error('The receiver of late interaction session failures must be a function');
@@ -1632,11 +1235,51 @@ export async function auditInteraction(input: InteractionAuditInput): Promise<In
     return sessionOpenDeadlineResult(candidate);
   }
   const session = opened.value;
+  // L5: 進みの見張りの口があれば、隔離した page の変化に印を付け、見張りが終えたら session を閉じて待ちを終わらせる（閉じる処理の失敗は、後片付けが記録する）。
+  const { progress } = input;
+  const detachProgress = progress === undefined ? (): void => undefined : attachPageProgressSignals(session.page, progress);
+  const closeOnWatchEnd = (): void => {
+    void session.close().catch(() => undefined);
+  };
+  if (progress !== undefined) {
+    if (progress.signal.aborted) {
+      closeOnWatchEnd();
+    } else {
+      progress.signal.addEventListener('abort', closeOnWatchEnd, { once: true });
+    }
+  }
   let classifiedWork: ClassifiedWorkOutcome;
   try {
-    classifiedWork = await executeInteraction(session, input, candidate, navigationDeadlineAtMs, sessionOpenTimeoutMs);
+    classifiedWork = await executeInteraction(session, input, candidate, navigationDeadlineAtMs);
   } catch (error) {
     classifiedWork = outcome('EXECUTION_FAILED', 'EXECUTION_FAILED', interactionFailureDetail(error), emptyEvidence(candidate));
+  } finally {
+    progress?.signal.removeEventListener('abort', closeOnWatchEnd);
+    detachProgress();
+  }
+  // L5: 見張りが終えて、確かめを終えられなかった（NOT_VERIFIABLE・EXECUTION_FAILED。閉じた session で失敗した）操作は、見張りの理由にする。確かめ終えた結果
+  // （VERIFIED）・安全の判定（REJECTED_UNSAFE・BLOCKED_BY_SAFETY）は変えない（凍結の失敗の fail-closed は、閉じた session のまま変わらない）。
+  const stageEnd = interactionStageEndReasonOf(progress?.signal);
+  if (stageEnd !== null && (classifiedWork.work.status === NOT_VERIFIABLE_STATUS || classifiedWork.work.status === 'EXECUTION_FAILED')) {
+    classifiedWork = notVerifiable(stageEnd, classifiedWork.work.evidence);
+  }
+  // COV-4 の区切り 3: 操作の後の文書の URL（文書が替わらずに URL が変わったら、巡回の辺にする）。閉じた session からは読まない。
+  let postInteractionUrl: string | undefined;
+  if (!session.isClosed()) {
+    try {
+      postInteractionUrl = session.page.url();
+    } catch {
+      postInteractionUrl = undefined;
+    }
+  }
+  // COV-4 の区切り 3（設計者の判断 2026-11-10）: 確かめ終えた（VERIFIED）操作で開いた状態に、呼び出し側が今の段を当てる（凍結したままの page。読み込み直さない）。
+  // 当てる処理の失敗は、操作の結果を変えない（呼び出し側が自分の記録に残す）。
+  if (classifiedWork.work.status === 'VERIFIED' && input.afterVerified !== undefined && !session.isClosed() && progress?.signal.aborted !== true) {
+    try {
+      await input.afterVerified(session.page);
+    } catch {
+      // 開いた状態の監査の失敗で、後片付けを止めない。
+    }
   }
 
   let cleanupAnomaly = false;
@@ -1648,8 +1291,10 @@ export async function auditInteraction(input: InteractionAuditInput): Promise<In
   let latestCleanupAnomaly: InteractionCleanupFailure['anomaly'] = 'FULFILLED_NON_TERMINAL';
   let attemptsStarted = 0;
   const cleanupStartedAtMs = Date.now();
-  const cleanupDeadlineAtMs = cleanupStartedAtMs + input.timeoutMs;
-  const firstAttemptDeadlineAtMs = cleanupStartedAtMs + Math.floor(input.timeoutMs / 2);
+  // L5: 後片付けの期限は、操作の期限から切り離せる（`cleanupTimeoutMs`。省略は操作の期限）。
+  const cleanupTimeoutMs = input.cleanupTimeoutMs ?? input.timeoutMs;
+  const cleanupDeadlineAtMs = cleanupStartedAtMs + cleanupTimeoutMs;
+  const firstAttemptDeadlineAtMs = cleanupStartedAtMs + Math.floor(cleanupTimeoutMs / 2);
   const finishClosed = (): InteractionAuditResult => {
     const lifecycle = closedLifecycle(latestCleanupAnomalyReason?.reason ?? null, latestCleanupAnomalyReason?.reasonDetail ?? null);
     const finalSafety = session.ledger.snapshot();
@@ -1664,6 +1309,7 @@ export async function auditInteraction(input: InteractionAuditInput): Promise<In
       lifecycle,
       notVerifiableKind: finalOutcome.notVerifiableKind,
       safety: finalSafety,
+      ...(postInteractionUrl === undefined ? {} : { postInteractionUrl }),
     });
   };
   const throwCleanupFailure = (

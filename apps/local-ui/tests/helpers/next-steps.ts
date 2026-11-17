@@ -1,7 +1,7 @@
 /**
  * 画面のテストの補助（T43a fix round 1 で作り、PL-1 で置き換えた）: サイトの画面の要点のパネルの段を読む。前の「次にすること」の表（手順ごとの状態）は、
  * PL-1（設計書 `doc/design/2026-10-26-beaksight-plain-ui-design.md` 3 章の 1）で、要点＋主のボタン 1 つに置き換えた。段の値は `display/next-steps.ts` の
- * `PROFILE_STAGES`。`onboarding-ui-flows.test.ts`・`credential-ui-flows.test.ts`・`entry-check-ui.test.ts` が共用する（同じ読み方を 2 か所に書かない）。
+ * `PROFILE_STAGES`。`site-screens-ui.test.ts`・`credential-ui-flows.test.ts`・`entry-check-ui.test.ts` が共用する（同じ読み方を 2 か所に書かない）。
  */
 import type { Page } from 'playwright';
 

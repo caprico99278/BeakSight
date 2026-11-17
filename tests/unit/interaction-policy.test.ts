@@ -5,21 +5,14 @@ import { INTERACTION_HREF_KINDS, INTERACTION_REJECTION_REASONS } from '../../src
 import {
   classifyInteractionCandidate,
   freezeInteractionCandidate,
-  INTERACTION_CANDIDATE_LIMITS,
   interactionRejectionLedgerRecord,
   type InteractionCandidate,
   type InteractionRejectionReason,
 } from '../../src/safety/interaction-policy.js';
 
-// F20b（設計書 2026-09-23 4.4.1「長い class」）: class の値だけは、ほかの属性より長い、class 専用の上限まで記録する。
-describe('INTERACTION_CANDIDATE_LIMITS (F20b)', () => {
-  it('keeps a dedicated class limit of 4096 that is longer than the limit of the other attributes', () => {
-    expect(INTERACTION_CANDIDATE_LIMITS.maxClassAttributeLength).toBe(4_096);
-    expect(INTERACTION_CANDIDATE_LIMITS.maxAttributeLength).toBe(512);
-    expect(INTERACTION_CANDIDATE_LIMITS.maxClassAttributeLength).toBeGreaterThan(INTERACTION_CANDIDATE_LIMITS.maxAttributeLength);
-    expect(Object.isFrozen(INTERACTION_CANDIDATE_LIMITS)).toBe(true);
-  });
-});
+// F20b（設計書 2026-09-23 4.4.1「長い class」）: 前は、class の値だけをほかの属性（512）より長い 4,096 まで記録した。L10（設計書
+// `2026-11-09-beaksight-remove-limits-design.md` 4。INV-LIMITS の N3・N4）: 数と長さの上限は撤廃した（前の値の定数は LZ-1 で消した。下の L10 のテストで、
+// 前の値を超える候補を受け入れることを確かめる）。
 
 function candidate(overrides: Partial<InteractionCandidate> = {}): InteractionCandidate {
   return {
@@ -43,6 +36,7 @@ function candidate(overrides: Partial<InteractionCandidate> = {}): InteractionCa
     type: 'button',
     disabled: false,
     visible: true,
+    destructiveAction: false,
     boundingBox: {
       x: 10,
       y: 20,
@@ -110,6 +104,8 @@ describe('classifyInteractionCandidate', () => {
       hrefKind: 'SAME_ORIGIN_HTTP',
       download: true,
     }, 'DOWNLOAD'],
+    // SD-1（設計書 `2026-11-16-beaksight-action-based-delete-guard-design.md` 2.3）: 削除に関する操作は押さない（記録は除外した候補）。
+    ['destructive actions', { destructiveAction: true }, 'DESTRUCTIVE_ACTION_SKIPPED'],
     ['disabled controls', { disabled: true }, 'DISABLED'],
     ['non-visible controls', { visible: false }, 'NOT_VISIBLE'],
   ] as const)('rejects %s', (_label, overrides, reason) => {
@@ -119,11 +115,9 @@ describe('classifyInteractionCandidate', () => {
     });
   });
 
-  it('fails closed on unbounded or internally inconsistent candidate data', () => {
-    expect(classifyInteractionCandidate(candidate({ accessibleName: 'x'.repeat(300) }))).toEqual({
-      action: 'REJECT',
-      reason: 'MALFORMED_CANDIDATE',
-    });
+  // L10（INV-LIMITS の N3・N4）: 前は、長さの上限を超える名前（300 文字）も契約違反として拒んだ。長さの上限は撤廃したので、ここでは中身が食い違う候補だけを確かめる
+  // （長い名前は、下の L10 のテストで受け入れることを確かめる）。
+  it('fails closed on internally inconsistent candidate data', () => {
     expect(classifyInteractionCandidate(candidate({ visible: true, boundingBox: { ...candidate().boundingBox, width: 0 } })))
       .toEqual({ action: 'REJECT', reason: 'MALFORMED_CANDIDATE' });
   });
@@ -148,6 +142,36 @@ describe('classifyInteractionCandidate', () => {
       .toEqual({ action: 'REJECT', reason: 'MALFORMED_CANDIDATE' });
     expect(classifyInteractionCandidate(throwingCandidate))
       .toEqual({ action: 'REJECT', reason: 'MALFORMED_CANDIDATE' });
+  });
+
+  // L10（設計書 `2026-11-09-beaksight-remove-limits-design.md` 4。INV-LIMITS の N3・N4）: 安全の側の受け入れの検査は、前は数と長さの上限（`maxOrdinal` 99、
+  // `maxAttributeLength` 512、`maxTextLength` 256、`maxUrlLength`）で候補を拒んだ（`MALFORMED_CANDIDATE`）。上限は撤廃したので、前の上限を超える数の候補
+  // （101 個。順番 0〜100）と、前の上限を超える長さの値も受け入れる。形の検査（種類・印の形・矩形など）は今どおり。
+  it('accepts 101 candidates with ordinals up to 100 beyond the former maxOrdinal of 99 (L10)', () => {
+    const candidates = Array.from({ length: 101 }, (_unused, ordinal) => candidate({ ordinal }));
+    for (const each of candidates) {
+      expect(classifyInteractionCandidate(each), `ordinal ${String(each.ordinal)}`).toEqual({ action: 'ALLOW', reason: 'MECHANICALLY_SAFE' });
+      expect(() => freezeInteractionCandidate(each)).not.toThrow();
+    }
+    expect(classifyInteractionCandidate(candidate({ ordinal: 1_000_000 }))).toEqual({ action: 'ALLOW', reason: 'MECHANICALLY_SAFE' });
+  });
+
+  it('accepts values longer than the former length limits (L10)', () => {
+    const long = candidate({
+      accessibleName: 'n'.repeat(1_000),
+      role: 'r'.repeat(1_000),
+      ariaControls: 'c'.repeat(1_000),
+      type: 't'.repeat(1_000),
+      tagName: 'button',
+    });
+    expect(classifyInteractionCandidate(long)).not.toEqual({ action: 'REJECT', reason: 'MALFORMED_CANDIDATE' });
+    expect(() => freezeInteractionCandidate(long)).not.toThrow();
+    const longHref = candidate({ tagName: 'a', href: `https://example.test/${'p'.repeat(3_000)}`, hrefKind: 'SAME_ORIGIN_HTTP', type: null, ariaExpanded: null, ariaControls: null, controlledVisible: null, controlledHidden: null });
+    expect(() => freezeInteractionCandidate(longHref)).not.toThrow();
+    // 形の検査は今どおり（順番が負・整数でないもの、空の要素の名前は拒む）。
+    expect(classifyInteractionCandidate(candidate({ ordinal: -1 }))).toEqual({ action: 'REJECT', reason: 'MALFORMED_CANDIDATE' });
+    expect(classifyInteractionCandidate(candidate({ ordinal: 1.5 }))).toEqual({ action: 'REJECT', reason: 'MALFORMED_CANDIDATE' });
+    expect(classifyInteractionCandidate(candidate({ tagName: '' }))).toEqual({ action: 'REJECT', reason: 'MALFORMED_CANDIDATE' });
   });
 
   it.each(INTERACTION_HREF_KINDS)('accepts the closed href kind %s as a well-formed candidate', (hrefKind) => {
@@ -197,6 +221,7 @@ describe('interactionRejectionLedgerRecord (M2)', () => {
     ['RESET_CONTROL', 'EXCLUDED_CANDIDATE'],
     ['FORM_ASSOCIATED', 'EXCLUDED_CANDIDATE'],
     ['NAVIGATION_HREF', 'EXCLUDED_CANDIDATE'],
+    ['DESTRUCTIVE_ACTION_SKIPPED', 'EXCLUDED_CANDIDATE'],
     ['DISABLED', 'NONE'],
     ['NOT_VISIBLE', 'NONE'],
     ['MALFORMED_CANDIDATE', 'NONE'],

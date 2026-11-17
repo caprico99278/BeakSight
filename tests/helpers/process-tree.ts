@@ -1,13 +1,13 @@
 /**
  * テストが起動したプロセスの子孫（Chromium など）を見つけ、終わったことを確かめる補助（T24d。`tests/integration/audit-worker.test.ts`）。
- * - プロセスの一覧は、Windows では `Get-CimInstance Win32_Process`（PowerShell）、ほかの OS では `ps` で、非同期に読む（fixture のサーバが
- *   同じプロセスで応答するので、同期の起動で止めない）。
+ * - プロセスの一覧は、Windows では `Get-CimInstance Win32_Process`（続けて使う PowerShell。SLIM-2（X8））、ほかの OS では `ps` で、非同期に読む
+ *   （fixture のサーバが同じプロセスで応答するので、同期の起動で止めない）。
  * - プロセスは、ID と起動の時刻の組で見分ける（Windows はプロセスの ID を使い回すので、ID だけでは別のプロセスを同じとみなす恐れがある）。
  * - 子孫は、親の PID だけでなく、起動の時刻（親より前に起動していない）と名前（監査で起動する node と Chromium）でも確かめる（DEF-059。
  *   使い回された PID の子として、無関係なプロセスを数えないため）。
  * - 何も止めない（読むだけ）。
  */
-import { execFile } from 'node:child_process';
+import { execFile, spawn, type ChildProcessWithoutNullStreams } from 'node:child_process';
 import { setTimeout as sleep } from 'node:timers/promises';
 
 /** プロセスの見分け（ID と起動の時刻）。 */
@@ -24,11 +24,109 @@ const PROCESS_POLL_INTERVAL_MS = 250;
 /** 一覧を読むコマンドの上限（ms）。 */
 const PROCESS_LIST_LIMIT_MS = 30_000;
 
+/**
+ * 監査で起動するプロセスの実行ファイルの名前（拡張子 `.exe` と、大文字・小文字を除いたもの）。ワーカーと CLI の `node`、Chromium の
+ * `chrome`（`channel: 'chromium'`）、`chrome-headless-shell` と `headless_shell`（テストの既定の headless）、Chromium が起動する
+ * `chrome_crashpad_handler`（DEF-059）。
+ */
+export const AUDIT_PROCESS_NAMES: readonly string[] = Object.freeze([
+  'node',
+  'chrome',
+  'chrome-headless-shell',
+  'headless_shell',
+  'chrome_crashpad_handler',
+]);
+
+/**
+ * SLIM-2（X8）: Windows の一覧は、監査で起動する名前（`AUDIT_PROCESS_NAMES`）のプロセスだけを読む（子孫として数えるのも、たどるのも、その名前だけ。
+ * `descendantsOf`）。根（ワーカー・CLI・画面のサーバ）も `node`。
+ */
 const WINDOWS_PROCESS_LIST_SCRIPT = [
-  'Get-CimInstance Win32_Process',
+  `Get-CimInstance Win32_Process -Filter "${AUDIT_PROCESS_NAMES.map((name) => `Name='${name}.exe'`).join(' OR ')}"`,
   "| Select-Object ProcessId,ParentProcessId,Name,@{ Name = 'StartedAt'; Expression = { $_.CreationDate.ToString('o') } }",
   '| ConvertTo-Json -Compress',
 ].join(' ');
+
+/** SLIM-2（X8）: 続けて使う PowerShell の、1 回の読み取りの終わりの印（標準出力の行）。 */
+const SESSION_END_MARK = '__BEAKSIGHT_PROCESS_LIST_END__';
+
+/**
+ * SLIM-2（X8）: 一覧を読むたびに PowerShell を起こす（1 回 0.4〜2 秒）代わりに、テストの process の中で 1 つの PowerShell を続けて使う（読み取りは 1 回
+ * 数十 ms）。標準入力に 1 行ずつ書き、終わりの印までの標準出力を受ける。読み取りは順に 1 つずつ。失敗・上限超えでは閉じて、呼び出し側は 1 回ごとの起動に戻る。
+ * テストの process を残さないよう、参照を外し（`unref`）、テストの process の終わりに閉じる。
+ */
+interface PowerShellSession {
+  query(script: string): Promise<string>;
+}
+
+let windowsSession: PowerShellSession | null | undefined;
+
+const startPowerShellSession = (): PowerShellSession | null => {
+  let child: ChildProcessWithoutNullStreams;
+  try {
+    child = spawn('powershell.exe', ['-NoProfile', '-NonInteractive', '-Command', '-'], { windowsHide: true });
+  } catch {
+    return null;
+  }
+  let output = '';
+  let pending: { readonly resolve: (text: string) => void; readonly reject: (error: Error) => void } | undefined;
+  let queue: Promise<unknown> = Promise.resolve();
+  const fail = (error: Error): void => {
+    windowsSession = null;
+    pending?.reject(error);
+    pending = undefined;
+    child.kill();
+  };
+  child.stdout.setEncoding('utf8');
+  child.stdout.on('data', (chunk: string) => {
+    output += chunk;
+    const end = output.indexOf(SESSION_END_MARK);
+    if (end >= 0 && pending !== undefined) {
+      const text = output.slice(0, end);
+      output = output.slice(end + SESSION_END_MARK.length).replace(/^\r?\n/u, '');
+      pending.resolve(text);
+      pending = undefined;
+    }
+  });
+  child.stderr.on('data', () => undefined);
+  child.once('error', (error) => fail(error));
+  child.once('exit', () => fail(new Error('the PowerShell session ended')));
+  child.stdin.on('error', () => undefined);
+  child.unref();
+  for (const stream of [child.stdin, child.stdout, child.stderr] as const) {
+    (stream as unknown as { unref?: () => void }).unref?.();
+  }
+  process.once('exit', () => child.kill());
+  return {
+    query: (script) => {
+      const result = queue.then(() => new Promise<string>((resolvePromise, rejectPromise) => {
+        const timer = setTimeout(() => fail(new Error('the PowerShell session did not answer in time')), PROCESS_LIST_LIMIT_MS);
+        pending = {
+          resolve: (text) => { clearTimeout(timer); resolvePromise(text); },
+          reject: (error) => { clearTimeout(timer); rejectPromise(error); },
+        };
+        child.stdin.write(`${script}; Write-Output '${SESSION_END_MARK}'\n`);
+      }));
+      queue = result.catch(() => undefined);
+      return result;
+    },
+  };
+};
+
+/** Windows の一覧の JSON（続けて使う PowerShell。使えなければ 1 回ごとに起動する）。 */
+const windowsProcessListOutput = async (): Promise<string> => {
+  if (windowsSession === undefined) {
+    windowsSession = startPowerShellSession();
+  }
+  if (windowsSession !== null) {
+    try {
+      return await windowsSession.query(WINDOWS_PROCESS_LIST_SCRIPT);
+    } catch {
+      windowsSession = null;
+    }
+  }
+  return run('powershell.exe', ['-NoProfile', '-NonInteractive', '-Command', WINDOWS_PROCESS_LIST_SCRIPT]);
+};
 
 const run = (file: string, arguments_: readonly string[]): Promise<string> =>
   new Promise((resolvePromise, rejectPromise) => {
@@ -44,7 +142,10 @@ const run = (file: string, arguments_: readonly string[]): Promise<string> =>
 /** 今のプロセスの一覧。 */
 export async function listProcesses(): Promise<readonly ProcessIdentity[]> {
   if (process.platform === 'win32') {
-    const output = await run('powershell.exe', ['-NoProfile', '-NonInteractive', '-Command', WINDOWS_PROCESS_LIST_SCRIPT]);
+    const output = (await windowsProcessListOutput()).trim();
+    if (output === '') {
+      return [];
+    }
     const parsed = JSON.parse(output) as unknown;
     const rows = (Array.isArray(parsed) ? parsed : [parsed]) as readonly Record<string, unknown>[];
     return rows.map((row) => ({
@@ -62,19 +163,6 @@ export async function listProcesses(): Promise<readonly ProcessIdentity[]> {
       : [{ processId: Number(match[1]), parentProcessId: Number(match[2]), startedAt: match[3] ?? '', name: (match[4] ?? '').trim() }];
   });
 }
-
-/**
- * 監査で起動するプロセスの実行ファイルの名前（拡張子 `.exe` と、大文字・小文字を除いたもの）。ワーカーと CLI の `node`、Chromium の
- * `chrome`（`channel: 'chromium'`）、`chrome-headless-shell` と `headless_shell`（テストの既定の headless）、Chromium が起動する
- * `chrome_crashpad_handler`（DEF-059）。
- */
-export const AUDIT_PROCESS_NAMES: readonly string[] = Object.freeze([
-  'node',
-  'chrome',
-  'chrome-headless-shell',
-  'headless_shell',
-  'chrome_crashpad_handler',
-]);
 
 const AUDIT_PROCESS_NAME_SET: ReadonlySet<string> = new Set(AUDIT_PROCESS_NAMES);
 

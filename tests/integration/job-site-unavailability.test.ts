@@ -30,7 +30,7 @@ import { executeDiscoveryRun } from '../../src/worker/discovery-run.js';
 import type { JobRunNotice as JobSiteNotice } from '../../src/worker/job-site-availability.js';
 import { executeReadCheckRun } from '../../src/worker/read-check-run.js';
 import { overrideBrowser } from '../helpers/browser-proxies.js';
-import { isCliChromiumSelected, launchCliChromium, launchHeadlessChromium } from '../helpers/chromium.js';
+import { BOTH_CHROMIUM_LAUNCHERS, CLI_CHROMIUM_RUN_LABEL } from '../helpers/chromium.js';
 import {
   DISCOVERY_SITE_FAULT_LINK,
   DISCOVERY_SITE_LOCAL_STORAGE_ITEM,
@@ -57,11 +57,10 @@ const P = DISCOVERY_SITE_PATHS;
 const STATUS_503: DiscoverySitePageFault = { kind: 'STATUS', status: 503 };
 const STATUS_503_ONCE: DiscoverySitePageFault = { kind: 'STATUS', status: 503, times: 1 };
 
-// 4 つ目は、その回の Chromium が CLI の起動の設定か（DEF-166。テストの既定の Chromium は、`BEAKSIGHT_TEST_DEFAULT_CHROMIUM=cli` のとき CLI の設定）。
-describe.each([
-  ['the default test Chromium', () => launchHeadlessChromium(), true, isCliChromiumSelected()],
-  ['the CLI Chromium', () => launchCliChromium(), false, true],
-] as const)('DEF-136: the site unavailability of the discovery and READ check jobs (%s)', (_label, launch, everyCase, cliChromium) => {
+// TEST-SLIM: 2 つの Chromium の組（`BOTH_CHROMIUM_LAUNCHERS`）。3 つ目は、全部の場面を流すか（組の先頭の回だけ。SLIM-B0）。CLI の Chromium は、止めた後に
+// サーバへ届く要求（ネットワークの層の送り直しを含む。記録されない要求）の確かめの場面だけを流す。4 つ目は、その回の Chromium が CLI の起動の設定か（DEF-166）。
+describe.each(BOTH_CHROMIUM_LAUNCHERS.map(([label, launch], index) => [label, launch, index === 0, label === CLI_CHROMIUM_RUN_LABEL] as const))(
+  'DEF-136: the site unavailability of the discovery and READ check jobs (%s)', (_label, launch, everyCase, cliChromium) => {
   let site: DiscoverySite;
   let outputDirectory: string;
 

@@ -10,8 +10,8 @@ import {
   type AutoLoginWorkerEntryOptions,
   type ManualLoginStageOfEntry,
 } from '../helpers/auto-login-worker-entry.js';
-import { CHROMIUM_SHARED_WORKERS_DISABLED_ARGS, CHROMIUM_WEBRTC_NON_PROXIED_UDP_DISABLED_ARGS } from '../../src/browser/chromium-launch.js';
-import { TEST_DEFAULT_CHROMIUM_LAUNCH_SOURCE } from '../helpers/test-chromium-args.js';
+import { CHROMIUM_SHARED_WORKERS_DISABLED_ARGS } from '../../src/browser/chromium-launch.js';
+import { TEST_CLI_CHROMIUM_LAUNCH_SOURCE, TEST_DEFAULT_CHROMIUM_LAUNCH_SOURCE } from '../helpers/test-chromium-args.js';
 
 const KEY = 'ab'.repeat(32);
 const RECORD = 'C:\\work\\manual-login-stage.log';
@@ -59,17 +59,19 @@ describe('the test entry of a worker that uses the automated login (CC-091)', ()
     expect(source).not.toContain('the manual login stage must not run');
   });
 
-  it('replaces the automated login Browser only for the test default launch, and the credential store only when it is portable', () => {
-    expect(sourceOf({ launch: 'test-default' })).toContain('automatedLoginStage: { launchAutomatedLoginBrowser: launchLoginBrowser },');
-    // CC-098: テストの既定の起動は 1 か所の式（`TEST_DEFAULT_CHROMIUM_LAUNCH_SOURCE`）で、WebRTC と Shared Worker の引数を含む。
+  it('replaces the automated login Browser with the login launch, and the credential store only when it is portable', () => {
+    // RB-4 fix（M-1）: どちらの起動でも、自動ログインの段の Browser を、テストだけの外へ出ない引数の付いた起動に替える（Run の Browser は Gate が確かめる）。
+    for (const launch of ['test-default', 'cli'] as const) {
+      expect(sourceOf({ launch })).toContain('automatedLoginStage: { launchAutomatedLoginBrowser: launchLoginBrowser },');
+    }
+    // CC-098: テストの既定の起動は 1 か所の式（`TEST_DEFAULT_CHROMIUM_LAUNCH_SOURCE`）で、Shared Worker の引数を含む。
     expect(sourceOf({ launch: 'test-default' })).toContain(TEST_DEFAULT_CHROMIUM_LAUNCH_SOURCE);
-    for (const arg of [...CHROMIUM_WEBRTC_NON_PROXIED_UDP_DISABLED_ARGS, ...CHROMIUM_SHARED_WORKERS_DISABLED_ARGS]) {
+    for (const arg of CHROMIUM_SHARED_WORKERS_DISABLED_ARGS) {
       expect(TEST_DEFAULT_CHROMIUM_LAUNCH_SOURCE).toContain(JSON.stringify(arg));
     }
-    expect(sourceOf({ launch: 'cli' })).not.toContain('automatedLoginStage');
-    // EL-12: CLI の起動は、本番と同じ起動の部品（`launchChromium`）で行う。
-    expect(sourceOf({ launch: 'cli' })).toContain('launchChromium({ headless: true })');
-    expect(sourceOf({ launch: 'cli' })).toContain("import { launchChromium } from './dist/browser/chromium-launch.js';");
+    // EL-12: CLI の起動は、本番と同じ起動の部品（`launchChromiumWith`）で行う。RB-4b: テストだけの外へ出ない引数を足す。
+    expect(sourceOf({ launch: 'cli' })).toContain(TEST_CLI_CHROMIUM_LAUNCH_SOURCE);
+    expect(sourceOf({ launch: 'cli' })).toContain("import { chromiumLaunchOptions, launchChromiumWith } from './dist/browser/chromium-launch.js';");
     expect(sourceOf({ portableCredentialStore: true })).toContain('protector: portableProtector,');
     expect(sourceOf({ portableCredentialStore: false })).not.toContain('openCredentialStore');
   });

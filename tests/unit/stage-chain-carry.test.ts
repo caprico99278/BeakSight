@@ -22,7 +22,6 @@ const AUDIT_STAGE: AuditStageServiceRequests = Object.freeze({
   approvedServiceOrigins: [SERVICE_ORIGIN],
   auditReadRequests: [],
   scriptLogin: { origin: SERVICE_ORIGIN, path: '/token', requiredQuery: [] },
-  serviceRequestLimits: { perMinute: 2, perRun: 2 },
 });
 
 const AUTHENTICATION: RunAuthentication = Object.freeze({
@@ -42,20 +41,24 @@ class FakeClock {
 describe('FM2d: the per minute window carried over by the audit stage state', () => {
   it('starts the state with the carried window, and counts the run limit from zero', () => {
     const clock = new FakeClock();
-    const first = createAuditStageRunState(AUDIT_STAGE, clock.now, undefined);
+    const first = createAuditStageRunState(clock.now, undefined);
     expect([first.budget.tryConsume(), first.budget.tryConsume()]).toEqual([true, true]);
     const carried = serviceRequestWindowOf(first);
     expect(carried).toEqual([2_000_000, 2_000_000]);
     clock.nowMs += 1_000;
-    const second = createAuditStageRunState(AUDIT_STAGE, clock.now, undefined, carried);
-    expect(second.budget.waitBeforeNextLoadMs()).toBe(LOAD_PEAK_WINDOW_MS - 1_000);
-    expect(second.budget.isLimitReached()).toBe(false);
+    const second = createAuditStageRunState(clock.now, undefined, carried);
+    // L11 で直した: 1 分あたりの上限で待つことは撤廃した（窓は記録として持ち越すが、待たない）。
+    expect(second.budget.waitBeforeNextLoadMs()).toBe(0);
+    expect(serviceRequestWindowOf(second)).toEqual([2_000_000, 2_000_000]);
+    expect(second.budget.snapshot().limitReached).toBe(false);
   });
 
   it('gives the carried window to the job flows (discovery and READ check)', () => {
     const clock = new FakeClock();
     const { state } = jobContextFactoryOptions(AUTHENTICATION, clock.now, 'REGISTERED', [1_999_000, 1_999_500]);
-    expect(state?.budget.waitBeforeNextLoadMs()).toBe(1_999_000 + LOAD_PEAK_WINDOW_MS - 2_000_000);
+    // L11 で直した: 窓は持ち越すが、待たない。
+    expect(state === null ? null : serviceRequestWindowOf(state)).toEqual([1_999_000, 1_999_500]);
+    expect(state?.budget.waitBeforeNextLoadMs()).toBe(0);
     // 持ち越しを渡さなければ、今のまま（窓は空から）。
     expect(jobContextFactoryOptions(AUTHENTICATION, clock.now, 'REGISTERED').state?.budget.waitBeforeNextLoadMs()).toBe(0);
   });

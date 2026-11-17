@@ -86,29 +86,15 @@ export const READ_CHECK_RESULTS = Object.freeze([
 ] as const);
 export type ReadCheckResult = (typeof READ_CHECK_RESULTS)[number];
 
-/** 1 回のジョブ（`READ_CHECK`）で読む READ の数の上限（設計書 4.5、10 章の 2。ユーザー承認の値）。 */
-export const MAX_READ_CHECKS_PER_JOB = 20;
+// L4（COV-7）: 1 回のジョブで読む READ の数と、1 つのプロファイルの定義の数の上限（前は 20）は撤廃した（定数は LZ-1 で消した）。
 
-/** 1 つのプロファイルの、取り消していない定義の数の上限（1 回のジョブで、すべての定義を読めるように、1 回のジョブの上限と同じ定数）。 */
-export const MAX_READ_CHECK_DEFINITIONS_PER_PROFILE = MAX_READ_CHECKS_PER_JOB;
+// LZ-3a: 1 つの定義の、送る値の数（前は `MAX_READ_CHECK_PARAMETERS` 50）・期待の数（前は `MAX_READ_CHECK_EXPECTATIONS` 10）・期待の行の数（前は
+// `MAX_READ_CHECK_ROW_COUNT` 100,000）の上限は撤廃した（スキーマにも置かない。期待は 1 件以上、行の数は 0 以上の決まりは残す）。
 
-/** 1 つの定義の、送る値の数の上限（1 つの候補の欄の数の上限 `MAX_CANDIDATE_FIELDS` より大きくしない。テストで確かめる）。 */
-export const MAX_READ_CHECK_PARAMETERS = 50;
+// LZ-2: 送る値の名前と値の長さの上限（前は `MAX_FIELD_NAME_LENGTH`・`MAX_READ_CHECK_PARAMETER_VALUE_LENGTH` 256）は撤廃した。
 
-/** 送る値 1 つの最大長（UTF-16 のコード単位）。 */
-export const MAX_READ_CHECK_PARAMETER_VALUE_LENGTH = 256;
-
-/** 1 つの定義の、期待の数の上限（1 つ以上）。 */
-export const MAX_READ_CHECK_EXPECTATIONS = 10;
-
-/** 期待の行の数の上限（`ROW_COUNT_*` の `count`。0 以上）。 */
-export const MAX_READ_CHECK_ROW_COUNT = 100_000;
-
-/** 期待の文（`TEXT_CONTAINS` の `text`、`DETAIL_FIELD_EQUALS` の `value`）の最大長（UTF-16 のコード単位。1 文字以上）。 */
-export const MAX_READ_CHECK_EXPECTED_TEXT_LENGTH = 256;
-
-/** 詳細の項目の名前（`DETAIL_FIELD_EQUALS` の `field`）の最大長（UTF-16 のコード単位。1 文字以上）。 */
-export const MAX_READ_CHECK_DETAIL_FIELD_LENGTH = 256;
+// LZ-2: 期待の文（`TEXT_CONTAINS` の `text`、`DETAIL_FIELD_EQUALS` の `value`）と詳細の項目の名前（`field`）の長さの上限（前は
+// `MAX_READ_CHECK_EXPECTED_TEXT_LENGTH`・`MAX_READ_CHECK_DETAIL_FIELD_LENGTH` 256）は撤廃した（1 文字以上の決まりは残す）。
 
 /**
  * 定義の対象の種類（T37d。Task 37 の設計書 3.5。閉じた一覧）。
@@ -118,8 +104,7 @@ export const MAX_READ_CHECK_DETAIL_FIELD_LENGTH = 256;
 export const READ_CHECK_TARGET_KINDS = Object.freeze(['CANDIDATE', 'PAGE'] as const);
 export type ReadCheckTargetKind = (typeof READ_CHECK_TARGET_KINDS)[number];
 
-/** 画面の path（`targetPagePath`）の最大長（UTF-16 のコード単位。`/` を含む。T37d）。 */
-export const MAX_READ_CHECK_PAGE_PATH_LENGTH = 1_024;
+// URL-LEN: 画面の path（`targetPagePath`）の長さの上限（前は 1,024）は撤廃した（管理データの版 20 で列の上限も外した）。
 
 /** 送る値（欄の名前 → 値。テスト環境のテスト用の値だけ）。 */
 export type ReadCheckParameters = Readonly<Record<string, string>>;
@@ -137,7 +122,7 @@ export interface ReadCheckCandidateDefinition {
   readonly targetIdentityDigest: string;
   readonly targetPagePath?: never;
   readonly parameters: ReadCheckParameters;
-  /** 期待（1 件以上、`MAX_READ_CHECK_EXPECTATIONS` 件まで）。 */
+  /** 期待（1 件以上）。 */
   readonly expectations: readonly ReadCheckExpectation[];
 }
 
@@ -165,13 +150,13 @@ const PAGE_URL_PROTOCOLS: ReadonlySet<string> = new Set(['http:', 'https:']);
 
 /**
  * 画面の path の定義の、読む URL（T37d。純粋。保存の確かめ `src/control/read-check-policy.ts` と、ワーカーの実行 `src/worker/read-check-run.ts` が
- * 使う唯一の組み立て）。`origin` は http(s) の Origin の正規の直列化だけ、`path` は `/` で始まり（`//` で始まらない）、長さが
- * `MAX_READ_CHECK_PAGE_PATH_LENGTH` 以下で、URL の解析で形が変わらない（正規の形）ものだけ受ける。組み立てた URL の Origin が `origin` で、path が
+ * 使う唯一の組み立て）。`origin` は http(s) の Origin の正規の直列化だけ、`path` は `/` で始まり（`//` で始まらない）、URL の解析で形が変わらない
+ * （正規の形）ものだけ受ける（URL-LEN: 長さでは拒まない）。組み立てた URL の Origin が `origin` で、path が
  * `path` のまま、query と fragment がないこと。どれかに外れたら null（fail-closed。`..` の区切り、URL の解析が取り除く・符号化する文字（タブ、
  * 空白、日本語の文字など）、`\`（区切りとして読まれる）、`?`、`#` を含む path は受けない）。
  */
 export const readCheckPageUrlOf = (origin: string, path: string): string | null => {
-  if (path.length === 0 || path.length > MAX_READ_CHECK_PAGE_PATH_LENGTH || !path.startsWith('/') || path.startsWith('//')
+  if (path.length === 0 || !path.startsWith('/') || path.startsWith('//')
     || path.includes('\\') || path.includes('?') || path.includes('#')) {
     return null;
   }
@@ -198,8 +183,8 @@ export const readCheckPageUrlOf = (origin: string, path: string): string | null 
 // API のシナリオの照合の READ に使う、画面の path の定義の型。path の区切りのちょうど 1 つの全体が `{id}`（`PATH_TEMPLATE_ID_SEGMENT`。型の owner
 // `fingerprint.ts` と同じ印）で、ほかに `{`・`}` を持たない。読む URL は、`{id}` に台帳の ID（安全な形だけ。判定は呼び出し側の唯一の判定
 // `isUsableRecordId` を受ける）を入れて、`readCheckPageUrlOf` で組み立てる。保存の確かめは、代わりの値（`READ_CHECK_PAGE_TEMPLATE_SAMPLE_ID`）を
-// 入れた path で、今の画面の READ の確かめを通す。READ の確かめのジョブが型の定義を単独で読むことはない（`readCheckPageUrlOf` が型を組み立てないので、
-// ワーカーは読まずに `URL_NOT_BUILT`。fail-closed）。実際の照合（ID を入れて読む）は Task 40。
+// 入れた path で、今の画面の READ の確かめを通す。`readCheckPageUrlOf` は型を組み立てない（fail-closed）。実際の照合（ID を入れて読む）は Task 40。
+// DEF-235: READ の確かめのジョブも、型の定義を、番号を埋めて読む（番号の元と一覧の画面は `read-check-record-ids.ts`。読む URL は照合と同じ確かめ直し）。
 
 /** path の区切り。 */
 const PAGE_PATH_SEPARATOR = '/';

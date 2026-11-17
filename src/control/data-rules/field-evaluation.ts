@@ -65,6 +65,7 @@ import {
 } from '../approval/scenario-contracts.js';
 import type { ApiJsonValueType } from '../../core/api-request-shape.js';
 import { deepFreeze } from '../../core/immutable.js';
+import { apiKeyFieldValueTypeOf } from '../../core/json-value.js';
 import { compareCodeUnits } from '../../core/text.js';
 import {
   CHOICE_FIELD_TYPES,
@@ -486,7 +487,8 @@ const apiTargetOf = (candidate: DiscoveryCandidate, api: ScenarioApiSpec, key: s
     omittedOptionCount: formField?.omittedOptionCount ?? 0,
     hasValue: false,
   };
-  return { field, sendable: !isMethodOverrideFieldName(key) && !isUnsendableFieldType(type), jsonType: keyField.type, formField };
+  // ARR-2（設計書 `2026-11-08-beaksight-api-array-keys-design.md` 3.3 の 1）: 一覧の鍵（array）の値は、要素の文字（`apiKeyFieldValueTypeOf`）として判定し、作る。
+  return { field, sendable: !isMethodOverrideFieldName(key) && !isUnsendableFieldType(type), jsonType: apiKeyFieldValueTypeOf(keyField.type), formField };
 };
 
 /**

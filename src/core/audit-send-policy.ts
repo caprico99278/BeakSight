@@ -1,5 +1,5 @@
 // 監査の段の送信の扱いの値の一覧の唯一の owner（AS-b。設計書 `doc/design/2026-10-19-beaksight-audit-send-policy-design.md` 2.1、5 章の AS-b の Blocker の行）。
-// - `READ_ONLY`（設定ファイルの既定。項目のない設定・記録の読み方）: 今のまま、Passive Context では GET と HEAD のほかを送らない。
+// - `READ_ONLY`（項目のない設定・記録の読み方。L14 から設定ファイルの既定ではない）:今のまま、Passive Context では GET と HEAD のほかを送らない。
 // - `PASS_EXCEPT_DELETE`: 監査・発見・READ の確かめの Passive Context で、ページが自分で出す副資源の要求のうち、削除と危険な語の path のほかを通す
 //   （判定は `src/safety/request-policy.ts` の `auditSendDecisionOf`。口は Guard の `auditSend`）。
 // - 項目を持たない設定（AS-b の前の保存・`run.json`、項目を書かない設定の値）は `READ_ONLY` と読む（その Run は読み取りだけで動いたため）。読み替えは
@@ -18,8 +18,17 @@ export const AUDIT_SEND_PASS_EXCEPT_DELETE = 'PASS_EXCEPT_DELETE';
 export const AUDIT_SEND_POLICIES = Object.freeze([AUDIT_SEND_READ_ONLY, AUDIT_SEND_PASS_EXCEPT_DELETE] as const);
 export type AuditSendPolicyName = (typeof AUDIT_SEND_POLICIES)[number];
 
-/** 設定ファイルの既定の扱いと、項目のない設定・記録の読み方（読み取りだけ）。 */
+/**
+ * 項目のない設定・記録の読み方（読み取りだけ。AS-b の前の保存・`run.json` は、読み取りだけで動いたため）。管理の DB の列の既定も同じ値。
+ * L14（設計書 `2026-11-09-beaksight-remove-limits-design.md` 5 の 2）: 設定ファイル（CLI）の既定は、この値ではなく `DEFAULT_CONFIG_AUDIT_SEND_POLICY`。
+ */
 export const DEFAULT_AUDIT_SEND_POLICY: AuditSendPolicyName = AUDIT_SEND_READ_ONLY;
+
+/**
+ * L14（設計書 `2026-11-09-beaksight-remove-limits-design.md` 5 の 2）: 設定ファイル（CLI）の既定の扱い（削除のほかを通す。サイトの既定と同じ）。
+ * `src/config/defaults.ts` の `DEFAULT_CONFIG.audit.sendPolicy` が使う。`READ_ONLY` は、設定ファイルに書いたときだけ。
+ */
+export const DEFAULT_CONFIG_AUDIT_SEND_POLICY: AuditSendPolicyName = AUDIT_SEND_PASS_EXCEPT_DELETE;
 
 /** OP-I（I1）: サイト（プロファイルの表示の設定）の既定の扱い（削除と危険な語のほかを通す）。 */
 export const DEFAULT_SITE_AUDIT_SEND_POLICY: AuditSendPolicyName = AUDIT_SEND_PASS_EXCEPT_DELETE;

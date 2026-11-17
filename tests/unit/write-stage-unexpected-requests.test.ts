@@ -1,11 +1,10 @@
 // OP-M: 書き込みの段で止めた、承認した送信のほかの要求の一覧（`src/safety/write-stage-unexpected-requests.ts`）の単体テスト。
 // - 行は、送り方・送り先の区分・path の形・種類・時点・理由・目印の真偽・本文の種類・回数だけ（Origin・query・本文・値を持たない）。
 // - 目印（入れた値）は、本文に含まれるかの真偽だけを残し、path に入っても区切りを伏せる（OP-N: JSON の入れ子の値と form の符号化も照らす）。
-// - 同じ形は回数を足し、上限（`MAX_WRITE_STAGE_UNEXPECTED_REQUESTS`）を超えた新しい行は数だけ（`unlisted`）。
+// - 同じ形は回数を足し、新しい形は上限なしに行にする（L12a。前は 20 行を超えた新しい行は数だけ）。
 import { describe, expect, it } from 'vitest';
 import { REDACTED } from '../../src/core/redaction.js';
 import {
-  MAX_WRITE_STAGE_UNEXPECTED_REQUESTS,
   requestCarriesMarker,
   WriteStageUnexpectedRequestList,
   type WriteStageUnexpectedRequestFacts,
@@ -74,17 +73,20 @@ describe('OP-M: the list of the requests other than the approved send in the wri
     ]);
   });
 
-  it('adds up the same shape, and counts the new shapes over the limit only as a number', () => {
+  // L12a（設計書 `2026-11-09-beaksight-remove-limits-design.md` 4 の S12）: 行の数の上限を撤廃した（前は 20 行を超えた新しい形を数だけにした）。
+  it('adds up the same shape, and keeps every new shape as a row without a limit (L12a)', () => {
     const list = new WriteStageUnexpectedRequestList([MARKER]);
     list.record(facts());
     list.record(facts());
-    for (let index = 0; index < MAX_WRITE_STAGE_UNEXPECTED_REQUESTS + 2; index += 1) {
+    /** 前の行の上限（20）を超える数。 */
+    const shapes = 22;
+    for (let index = 0; index < shapes; index += 1) {
       list.record(facts({ url: `https://backend.example.invalid/p${String(index)}`, body: () => ({ kind: 'NONE' }) }));
     }
     const snapshot = list.snapshot();
-    expect(snapshot.requests).toHaveLength(MAX_WRITE_STAGE_UNEXPECTED_REQUESTS);
+    expect(snapshot.requests).toHaveLength(shapes + 1);
     expect(snapshot.requests[0]?.count).toBe(2);
-    expect(snapshot.unlisted).toBe(3);
+    expect(snapshot.unlisted).toBe(0);
   });
 
   it('keeps a row apart by the timing and the destination', () => {
@@ -124,6 +126,11 @@ describe('OP-N: whether a request carries a typed value (the marker)', () => {
     expect(list.carriesMarker({ url, body: text(escaped) })).toBe(true);
     expect(list.carriesMarker({ url, body: text(`--b\r\nContent-Disposition: form-data; name="v"\r\n\r\n${MULTIBYTE}\r\n--b--`) })).toBe(true);
     expect(list.carriesMarker({ url, body: text(JSON.stringify({ event: 'open' })) })).toBe(false);
+    // L13 fix round 1: 64KiB を超える本文も全部読む（前は大きい本文の入れ子を照らさず「分からない」で、目印ありとみなした）。
+    const padding = 'x'.repeat(70_000);
+    expect(list.carriesMarker({ url, body: text(JSON.stringify({ pad: padding, a: { b: [MULTIBYTE] } }).replace(/[^\x20-\x7e]/gu,
+      (character) => `\\u${character.charCodeAt(0).toString(16).padStart(4, '0')}`)) })).toBe(true);
+    expect(list.carriesMarker({ url, body: text(JSON.stringify({ pad: padding, event: 'open' })) })).toBe(false);
   });
 
   it('treats an unreadable body and a body that cannot be read as carrying the value (the safe side), and says false without markers', () => {

@@ -1,11 +1,11 @@
-// T30f・T30h-1（Task 30 の設計書 6 章、8 章の G30）: 書き込みのジョブ（`WRITE_CREATE`）を、ジョブの管理（`createAuditJobManager`）から本物のワーカー
+// T30f・T30h-1（Task 30 の設計書 6 章、8 章の G30）: 点検（まとめて実行）の書き込みの段を、ジョブの管理（`createAuditJobManager`）から本物のワーカー
 // （`child_process.fork`。一時のビルド）と本物の Chromium（headless だけ）で動かす結合テストの共通の準備（テストの補助。テストのファイルではない）。
-// `write-job-fork.test.ts` と `write-job-g30.test.ts` が使う。
+// `navigation-pacing.test.ts` が使う（SLIM W-1: 単独で書き込みを始める口は外した。RB-6: 書き込みの連鎖の fork のテストは消した）。
 // - 子 process の入口は、テストだけの入口（一時のビルドの root に書く `.mjs`）。本番の process の組み立て（`runAuditWorkerProcess`）を、テストだけの
 //   口で呼ぶ: 手動のログインの段の Browser を CLI の起動の設定の headless に替え、人の操作の代わりに、テストが標準入力で渡した仮の資格情報を入れる。
 //   書き込みの流れの Browser は本番の依存のまま（CLI の起動の設定の headless）。
-// - 準備は、本番の部品の公開の口だけで行う: 書き込みのモードのプロファイルと認証の設定 → 発見のジョブ（本物のワーカー）→ 発見の成果物の候補から
-//   照合の READ の定義 → シナリオ（作成 → 入力の規則 → 本物の事実で承認）→ 実行の許可の発行。承認に縛る digest を手で書かない。
+// - 準備は、本番の部品の公開の口だけで行う: 書き込みのモードのプロファイルと認証の設定 → 発見（本物のワーカー）→ 発見の成果物の候補から
+//   照合の READ の定義 → シナリオ（作成 → 入力の規則 → 本物の事実で承認）。許可は点検の書き込みの段が発行する。承認に縛る digest を手で書かない。
 // - ジョブの管理の時計は、テストが進め・戻せる（`clockOffsetMs`）。ワーカーの時計は本物の時計なので、ワーカーが書く時刻（送った時刻など）が管理の
 //   時計より前にならないように、テストは管理の時計を本物の時計より前（負の値）に置いて進める。
 // - 秘密の目印（セッションの値、資格情報、CSRF、readonly の値）を探す場所: 管理データのファイルと WAL、IPC、ワーカーの出力、ジョブの値、出力先の
@@ -20,38 +20,22 @@ import { expect } from 'vitest';
 import { wait as sleep } from '../../src/core/deadline.js';
 import { loadConfig } from '../../src/config/load-config.js';
 import { approvalExternalFactsOf } from '../../src/control/approval-external-facts.js';
-import {
-  approveScenario,
-  createScenario,
-  issueExecutionGrant,
-  readPlannedUpdateTarget,
-  readScenario,
-  readScenarioApprovalStatus,
-  type ApprovalExternalFacts,
-  type ExecutionGrantResult,
-} from '../../src/control/approval/scenario-store.js';
-import type { ScenarioLimits, ScenarioVerification } from '../../src/control/approval/scenario-contracts.js';
+import { createScenario, type ApprovalExternalFacts } from '../../src/control/approval/scenario-store.js';
+import type { ScenarioLimits } from '../../src/control/approval/scenario-contracts.js';
 import type { ScenarioDraftInput } from '../../src/control/approval/scenario-policy.js';
-import { FORM_NAVIGATION_SETUP_ITEMS } from './auth-setup-samples.js';
-import {type AuthSetup } from '../../src/control/auth/auth-setup-contracts.js';
 import { MIN_PROFILE_REVISION, SITE_PROFILE_SCHEMA_VERSION } from '../../src/control/contracts.js';
-import type { RuleSetContent } from '../../src/control/data-rules/rule-contracts.js';
-import { saveRuleSetAndAttach } from '../../src/control/data-rules/rule-store.js';
 import {
   createAuditJobManager,
   type AuditJobManager,
-  type AuditJobStartResult,
   type AuditWorkerForker,
 } from '../../src/control/job/audit-job-manager.js';
 import type { AuditJobView } from '../../src/control/job/job-store.js';
-import { createReadCheck } from '../../src/control/job/read-check-store.js';
 import type { ProfileValidationContext } from '../../src/control/profile-policy.js';
-import { validateReadCheckDefinition } from '../../src/control/read-check-policy.js';
 import { saveAuthSetup } from '../../src/control/store/auth-setup-store.js';
 import { closeControlDatabase, openControlDatabase, type ControlDatabase } from '../../src/control/store/control-database.js';
 import { resolveControlDatabasePath } from '../../src/control/store/database-path.js';
 import { createProfile, getProfile, saveProfileDisplaySettings } from '../../src/control/store/profile-store.js';
-import { AUDIT_SEND_READ_ONLY } from '../../src/core/audit-send-policy.js';
+import { AUDIT_SEND_READ_ONLY, type AuditSendPolicyName } from '../../src/core/audit-send-policy.js';
 import { createCredentialStore, type CredentialStore } from '../../src/control/credentials/credential-store.js';
 import { validateWorkerToParentMessage, type WorkerToParentMessage } from '../../src/control/worker-protocol.js';
 import { DISCOVERY_ARTIFACT_FILE_NAME, artifactFilePath } from '../../src/core/artifact-layout.js';
@@ -61,13 +45,25 @@ import { discoveryCandidatesOf, type DiscoveryDocument } from '../../src/discove
 import { PATH_TEMPLATE_ID_SEGMENT } from '../../src/discovery/fingerprint.js';
 import { ALL_CONFIRMED } from '../unit/approval-samples.js';
 import { databaseFilePlaces, filesUnder, placesWithMarkers } from './leak-places.js';
+import { settleLateDeliveries } from './loopback-server.js';
 import { descendantsOf, listProcesses } from './process-tree.js';
 import { cliTargetConfig } from './run-harness.js';
-import { buildIntoTemporaryDirectory, type TemporaryBuild } from './temporary-build.js';
+import { useSharedTemporaryBuild } from './shared-temporary-build.js';
+import { buildEntryPath, type TemporaryBuild } from './temporary-build.js';
 import { TEST_DEFAULT_CHROMIUM_LAUNCH_SOURCE } from './test-chromium-args.js';
 import { testLoginWorkerEntrySource } from './test-login-worker-entry.js';
+import { TEST_WAITS_HOOK_SOURCE } from './test-waits.js';
 import { STDIN_CREDENTIALS_EXPRESSION, STDIN_CREDENTIALS_PRELUDE, createRecordingFork } from './worker-fork-support.js';
-import { WRITE_SITE_LOGIN_FIELDS, WRITE_SITE_PATHS, startWriteSite, writeSiteEditPathOf, writeSiteRecordPathOf, type WriteSite } from './write-site-fixture.js';
+import { attachNameRulesAndApprove, createWriteSiteReadCheck, writeSiteAuthSetupOf, writeSiteCreateDraftOf } from './write-site-candidates.js';
+import {
+  WRITE_JOB_VERIFICATION,
+  WRITE_SITE_LOGIN_FIELDS,
+  WRITE_SITE_PATHS,
+  startWriteSite,
+  writeSiteEditPathOf,
+  writeSiteRecordPathOf,
+  type WriteSite,
+} from './write-site-fixture.js';
 
 const WAIT_LIMIT_MS = 180_000;
 const WAIT_POLL_MS = 100;
@@ -80,31 +76,22 @@ const ENOUGH_PAGES = 10;
 /** 読み込みの最小の間隔（ms。ループバックの fixture なので短くする）。 */
 export const WRITE_JOB_NAVIGATION_INTERVAL_MS = 400;
 /**
- * サーバに届いた時刻の長さで許す不足（ms。`discovery-job-fork.test.ts` の同じ名前の値と同じ根拠）。DEF-100 fix から 0（pacer は、前の読み込みの
+ * サーバに届いた時刻の長さで許す不足（ms。`navigation-pacing.test.ts` の同じ根拠）。DEF-100 fix から 0（pacer は、前の読み込みの
  * 文書の要求の応答を受けた時刻からも間隔を数えるので、届く間隔は設定以上。前は 250）。
  */
 export const SERVER_ARRIVAL_DELAY_TOLERANCE_MS = 0;
 /** 全部の回の後に、遅れて届く要求を見逃さないために待つ時間（ms）。 */
 export const LATE_DELIVERY_SETTLE_MS = 2_000;
-/** 照合の READ の定義の id。 */
-export const WRITE_JOB_READ_CHECK_ID = 'rc-fork';
+/**
+ * SLIM-2（X1）: 全部のジョブが終わった後（ワーカーが Browser を閉じて終えた後）に、遅れて届く要求を数え直す前の待ち。サイトが静まるまで
+ * （`LATE_DELIVERY_SETTLE_MS` まで。`settleLateDeliveries`）。ジョブの途中では使わない。
+ */
+export const settleWriteJobSite = (harness: { readonly site: WriteSite }): Promise<void> => settleLateDeliveries(LATE_DELIVERY_SETTLE_MS, harness.site);
 /** GET と HEAD（読み込みの要求の method。CC-091: 定義は `leak-places.ts` の 1 か所）。 */
 export { READ_METHODS } from './leak-places.js';
 /** 1 分（ms。管理の時計を進めるときの単位）。 */
 export const MINUTE_MS = 60_000;
 
-/** 検証の指定（PL-6a: 結果は構造の判定、ID は URL のパスの型から、照合は一覧の検索）。 */
-export const WRITE_JOB_VERIFICATION: ScenarioVerification = Object.freeze<ScenarioVerification>({
-  // PL-6a: 成否の条件の代わりに、結果の判定のしかたの印（form の構造の判定）。ID の取り方は ID の型の一覧。
-  resultJudgement: 'FORM_STRUCTURE',
-  recordId: { source: 'URL_PATH_PATTERNS', pathPatterns: [`${WRITE_SITE_PATHS.create}/{id}`] },
-  readVerification: {
-    readCheckId: WRITE_JOB_READ_CHECK_ID,
-    revision: 1,
-    bindings: [{ parameterName: 'q', fieldName: 'name' }],
-    expectations: [{ kind: 'ROW_COUNT_EQUALS', count: 1 }],
-  },
-});
 
 /**
  * テストだけの入口（一時のビルドの root に書く）。CC-061 の後半（PRE42-CC の組 6a）: 本文は、共用の `testLoginWorkerEntrySource`（CLI の起動の
@@ -116,11 +103,15 @@ const ENTRY_SOURCE = testLoginWorkerEntrySource({
   loginTimeoutMs: LOGIN_TIMEOUT_MS,
   prelude: STDIN_CREDENTIALS_PRELUDE,
   credentialsExpression: STDIN_CREDENTIALS_EXPRESSION,
+  loginLaunch: 'CLI',
+  // TEST-TIME-B: 押した後の静まりの窓と probe の観察を短くする（テストだけの口）。
+  additionalHooks: TEST_WAITS_HOOK_SOURCE,
 });
 
 /**
- * OP-2: Run の Browser（とログイン用の Browser）の起動の設定。`CLI` は CLI の起動の設定（既定。上の入口のまま）、`TEST_DEFAULT` はテストの既定の headless shell
- * （書き込みの安全を 2 つの Chromium で確かめるため）。
+ * OP-2: Run の Browser（とログイン用の Browser）の起動の設定。`CLI` は CLI の起動の設定（上の入口のまま）、`TEST_DEFAULT` はテストの既定の headless shell。
+ * SLIM-2（X6）: 既定は `TEST_DEFAULT`（CLI の Chromium の重い起動を、制御の場面で払わない）。書き込みの安全を 2 つの Chromium で確かめる場面だけが、`CLI` を
+ * 明示して選ぶ（NL-2・OP-2 の `describe.each(['CLI', 'TEST_DEFAULT'])`）。
  */
 export type WriteJobRunBrowser = 'CLI' | 'TEST_DEFAULT';
 
@@ -131,7 +122,7 @@ const TEST_DEFAULT_ENTRY_SOURCE = testLoginWorkerEntrySource({
   prelude: STDIN_CREDENTIALS_PRELUDE,
   credentialsExpression: STDIN_CREDENTIALS_EXPRESSION,
   loginLaunch: 'TEST_DEFAULT',
-  additionalHooks: `\n  launchRunBrowser: () => ${TEST_DEFAULT_CHROMIUM_LAUNCH_SOURCE},`,
+  additionalHooks: `\n  launchRunBrowser: () => ${TEST_DEFAULT_CHROMIUM_LAUNCH_SOURCE},${TEST_WAITS_HOOK_SOURCE}`,
 });
 
 /** シナリオの準備の選択肢。 */
@@ -176,15 +167,6 @@ export const updateScenarioDraftOf = (profileId: string, document: DiscoveryDocu
   };
 };
 
-/** 許可を発行して、書き込みのジョブを始めた結果。 */
-export interface StartedWrite {
-  readonly grantId: string;
-  readonly jobId: string;
-  /** 始める前の、サーバの記録の位置。 */
-  readonly since: number;
-  readonly started: AuditJobStartResult;
-}
-
 export interface WriteJobHarness {
   readonly site: WriteSite;
   readonly database: ControlDatabase;
@@ -215,16 +197,8 @@ export interface WriteJobHarness {
    * `/members/{id}`、変える欄は `name`）、入力の規則を付け、本物の事実で承認する。
    */
   approvedUpdateScenario(document: DiscoveryDocument, options: WriteJobUpdateScenarioOptions): Promise<void>;
-  /** 本物の事実（承認と発行に渡す）。 */
+  /** 本物の事実（承認に渡す）。 */
   externalFacts(): Promise<ApprovalExternalFacts>;
-  /** 管理の時計の今の時刻で、許可を発行する（ジョブの id は `job-<grantId>`。件数の既定は 1）。 */
-  issue(scenarioId: string, grantId: string, count?: number): Promise<ExecutionGrantResult>;
-  /** 書き込みのジョブを始める（許可は発行済み）。 */
-  start(scenarioId: string, grantId: string): Promise<AuditJobStartResult>;
-  /** 許可を発行してジョブを始める（発行・開始のどちらかが拒まれたら誤り）。 */
-  issueAndStart(scenarioId: string, grantId: string): Promise<StartedWrite>;
-  /** T31g-2: 許可を発行して（対象のレコードは発行の中で選ばれる）、更新の書き込みのジョブを始める。 */
-  issueAndStartUpdate(scenarioId: string, grantId: string): Promise<StartedWrite>;
   /** ジョブが終わるまで待つ（ワーカーが止まるまで）。 */
   waitForEnd(jobId: string): Promise<AuditJobView>;
   /** 届いた登録の POST（`since` 番目の記録から）。 */
@@ -254,15 +228,24 @@ export interface WriteJobHarness {
 export async function startWriteJobHarness(options: {
   readonly profileId: string;
   readonly clockOffsetMs?: number;
-  /** OP-2: Run の Browser の起動の設定（省略は `CLI`）。 */
+  /** OP-2: Run の Browser の起動の設定（SLIM-2（X6）: 省略は `TEST_DEFAULT`）。 */
   readonly runBrowser?: WriteJobRunBrowser;
+  /**
+   * NL-2（設計書 `2026-11-06-beaksight-no-login-test-site-design.md` 7 章）: ログインのないサイト（`startWriteSite` の `noLogin`）と、環境 `TEST` × 認証の方式
+   * `NONE` のプロファイル（認証の設定を保存しない）。省略は今のまま（ログインのあるサイトと手動のログインのプロファイル）。
+   */
+  readonly noLogin?: boolean;
+  /** NL fix round 1（SREV-NL の M-3）: 監査の段の送信の扱い（省略は今のまま `READ_ONLY`）。 */
+  readonly auditSendPolicy?: AuditSendPolicyName;
 }): Promise<WriteJobHarness> {
   const { profileId } = options;
+  const noLogin = options.noLogin === true;
   const targetConfigPath = `local/targets/${profileId}.json`;
-  const build: TemporaryBuild = await buildIntoTemporaryDirectory();
+  // TEST-TIME-A: 一時ビルドは、1 回の vitest で共有する（harness を起こすたびにビルドしない）。入口は名前を分けて書く（`buildEntryPath`）。
+  const build: TemporaryBuild = await useSharedTemporaryBuild();
   const directory = await mkdtemp(join(tmpdir(), 'beaksight-write-job-'));
   const database = openControlDatabase(resolveControlDatabasePath(directory));
-  const site = await startWriteSite();
+  const site = await startWriteSite({ noLogin });
   const children: ChildProcess[] = [];
   const workerPids: number[] = [];
   const received: unknown[] = [];
@@ -285,30 +268,19 @@ export async function startWriteJobHarness(options: {
     targetConfigPath,
     environment: 'TEST',
     mode: 'TEST_APPROVED_WRITE',
-    auth: 'MANUAL_SESSION',
+    auth: noLogin ? 'NONE' : 'MANUAL_SESSION',
     approvedTestOrigins: [site.origin],
     environmentEvidenceRef: `evidence/${profileId}/isolation-check-1`,
   }, { resolveContext }).ok).toBe(true);
   // FM-2: テストのジョブのブラウザは今どおり headless（プロファイルの表示の設定を切る。既定は表示）。
   // OP-I（I1）: 送信の扱いは今までどおり読み取りだけ（サイトの既定は `PASS_EXCEPT_DELETE` になった。人が詳しい内容で選んだ形）。
-  expect(saveProfileDisplaySettings(database, profileId, { showJobBrowser: false, auditSendPolicy: AUDIT_SEND_READ_ONLY }).ok).toBe(true);
-  const setup: AuthSetup = {
-    ...FORM_NAVIGATION_SETUP_ITEMS,
-    profileId,
-    profileRevision: MIN_PROFILE_REVISION,
-    loginStartUrl: `${site.origin}${WRITE_SITE_PATHS.login}`,
-    loginPostEndpoints: [{ origin: site.origin, path: WRITE_SITE_PATHS.login }],
-    successCondition: { pathPrefix: WRITE_SITE_PATHS.list, selector: '#search' },
-    sessionLostCondition: { pathPrefix: WRITE_SITE_PATHS.login },
-    excludedPaths: ['/logout'],
-    auditPathPrefixes: [WRITE_SITE_PATHS.list],
-    maxLoginAttempts: 2,
-    allowedIdpOrigins: [],
-    automatedLogin: null,
-  };
-  expect(saveAuthSetup(database, setup, { resolveContext }).ok).toBe(true);
-  const entry = join(build.rootDirectory, `${Date.now()}-${ENTRY_FILE_NAME}`);
-  await writeFile(entry, options.runBrowser === 'TEST_DEFAULT' ? TEST_DEFAULT_ENTRY_SOURCE : ENTRY_SOURCE, 'utf8');
+  expect(saveProfileDisplaySettings(database, profileId, { showJobBrowser: false, auditSendPolicy: options.auditSendPolicy ?? AUDIT_SEND_READ_ONLY }).ok).toBe(true);
+  // NL-2: ログインのないサイトのプロファイルは、認証の設定を保存しない。
+  if (!noLogin) {
+    expect(saveAuthSetup(database, writeSiteAuthSetupOf(profileId, site.origin), { resolveContext }).ok).toBe(true);
+  }
+  const entry = buildEntryPath(build, ENTRY_FILE_NAME);
+  await writeFile(entry, options.runBrowser === 'CLI' ? ENTRY_SOURCE : TEST_DEFAULT_ENTRY_SOURCE, 'utf8');
   const fields: [string, string][] = [];
   await site.fillCredentials(async (selector, value) => {
     fields.push([selector, value]);
@@ -339,7 +311,8 @@ export async function startWriteJobHarness(options: {
     database,
     repositoryRoot: directory,
     credentials: { root: directory, store: credentialStore },
-    workerPath: join(build.distDirectory, 'worker', 'audit-worker.js'),
+    // DEF-277: fork するのはテストだけの入口（`recordingFork` の `entry`）。製品の入口の名前を書かない。
+    workerPath: entry,
     resolveContext: async (path) => (path === targetConfigPath ? { targetConfig: await loadConfig(join(directory, path)) } : undefined),
     forkWorker: recordingFork,
     now: () => new Date(Date.now() + clockOffsetMs),
@@ -382,61 +355,12 @@ export async function startWriteJobHarness(options: {
   /** OP-2: 今のプロファイルの改訂（点検の中のログインの直後の登録で進む）。 */
   const currentProfileRevision = (): number => getProfile(database, profileId)?.profile.revision ?? MIN_PROFILE_REVISION;
 
-  // T31g-2: UPDATE のシナリオは、画面と同じく、更新の予定のレコード（`readPlannedUpdateTarget`）を発行に渡す（発行の中で選び直して照らす）。
-  const issue = async (scenarioId: string, grantId: string, count = 1): Promise<ExecutionGrantResult> => issueExecutionGrant(database, {
-    scenarioId, expectedRevision: readScenario(database, scenarioId)?.revision ?? 0, grantId, jobId: `job-${grantId}`, count,
-    external: await externalFacts(), at: nowText(), expectedTargetRecordId: readPlannedUpdateTarget(database, scenarioId),
-  });
-
-  const start = (scenarioId: string, grantId: string): Promise<AuditJobStartResult> =>
-    manager.startWriteCreate({ profileId, expectedRevision: currentProfileRevision(), scenarioId, grantId });
-
-  const startUpdate = (scenarioId: string, grantId: string): Promise<AuditJobStartResult> =>
-    manager.startWriteUpdate({ profileId, expectedRevision: currentProfileRevision(), scenarioId, grantId });
-
-  const issueAndStartWith = async (
-    scenarioId: string,
-    grantId: string,
-    begin: (scenarioId: string, grantId: string) => Promise<AuditJobStartResult>,
-  ): Promise<StartedWrite> => {
-    const issued = await issue(scenarioId, grantId);
-    if (!issued.ok) {
-      throw new Error(`the grant was not issued: ${issued.reason}`);
-    }
-    const since = site.requests.length;
-    const started = await begin(scenarioId, grantId);
-    if (!started.ok) {
-      throw new Error(`the write job did not start: ${JSON.stringify(started)}`);
-    }
-    return { grantId, jobId: issued.grant.jobId, since, started };
-  };
-
   /** 作ったシナリオに、変える欄 `name` の人の固定の値の規則を付け、本物の事実で承認する。 */
   const attachRulesAndApprove = async (created: ReturnType<typeof createScenario>, scenario: WriteJobScenarioOptions): Promise<void> => {
-    if (!created.ok) {
-      throw new Error(`the scenario was not created: ${created.reason}`);
-    }
-    const content: RuleSetContent = {
-      fieldRules: [{ fieldName: 'name', semanticKind: 'FIXED_LIST', method: 'FROM_FIXED_LIST', range: null, fixedValues: [...scenario.names] }],
-      relations: [],
-      uniqueKeyFieldNames: ['name'],
-    };
-    const saved = saveRuleSetAndAttach(database, {
-      ruleSetId: `rules-${scenario.scenarioId}`, scenarioId: scenario.scenarioId, expectedRevision: null, content,
-      expectedScenarioRevision: created.scenario.revision, at: nowText(),
-    });
-    if (saved.attachment === null || !saved.attachment.ok) {
-      throw new Error(`the input rules were not attached: ${JSON.stringify(saved)}`);
-    }
     const facts = await externalFacts();
-    const status = readScenarioApprovalStatus(database, scenario.scenarioId, facts, new Date(Date.now() + clockOffsetMs));
-    const approved = approveScenario(database, {
-      scenarioId: scenario.scenarioId, expectedRevision: saved.attachment.scenario.revision, expectedApprovalDigest: status?.approvalDigest ?? '',
-      receiptId: `receipt-${scenario.scenarioId}`, external: facts, at: nowText(),
+    attachNameRulesAndApprove(database, created, {
+      scenarioId: scenario.scenarioId, names: scenario.names, facts, now: new Date(Date.now() + clockOffsetMs), at: nowText(),
     });
-    if (!approved.ok) {
-      throw new Error(`the scenario was not approved: ${approved.reason} ${JSON.stringify(status)}`);
-    }
   };
 
   const dataPlaces = (): (readonly [string, Buffer])[] => {
@@ -488,13 +412,7 @@ export async function startWriteJobHarness(options: {
       if (search === undefined) {
         throw new Error('the search candidate was not discovered');
       }
-      const checked = validateReadCheckDefinition({
-        targetIdentityDigest: search.identityDigest, parameters: { q: 'x' }, expectations: [{ kind: 'ROW_COUNT_EQUALS', count: 1 }],
-      }, search);
-      if (!checked.ok) {
-        throw new Error(`the READ check was rejected: ${JSON.stringify(checked.errors)}`);
-      }
-      expect(createReadCheck(database, { readCheckId: WRITE_JOB_READ_CHECK_ID, profileId, definition: checked.definition, at: nowText() }).ok).toBe(true);
+      createWriteSiteReadCheck(database, profileId, search, nowText());
     },
     async approvedScenario(document, scenario) {
       const form = discoveryCandidatesOf(document).find((candidate) => candidate.kind === 'FORM' && candidate.page.path === WRITE_SITE_PATHS.form);
@@ -504,16 +422,7 @@ export async function startWriteJobHarness(options: {
       }
       await attachRulesAndApprove(createScenario(database, {
         scenarioId: scenario.scenarioId,
-        draft: {
-          profileId,
-          candidateIdentityDigest: form.identityDigest,
-          fieldNames: ['name', 'email', 'newsletter'],
-          readChecks: [],
-          sideEffectConfirmations: ALL_CONFIRMED,
-          limits: scenario.limits ?? { maxCreatesPerRun: 1, maxCumulativeCreates: 20 },
-          approvalTtlDays: 30,
-          verification: WRITE_JOB_VERIFICATION,
-        },
+        draft: writeSiteCreateDraftOf(profileId, form, scenario.limits),
         discovery: document,
         at: nowText(),
       }), scenario);
@@ -527,14 +436,6 @@ export async function startWriteJobHarness(options: {
       }), scenario);
     },
     externalFacts,
-    issue,
-    start,
-    async issueAndStart(scenarioId, grantId) {
-      return issueAndStartWith(scenarioId, grantId, start);
-    },
-    async issueAndStartUpdate(scenarioId, grantId) {
-      return issueAndStartWith(scenarioId, grantId, startUpdate);
-    },
     waitForEnd,
     createPosts: (since = 0) => site.requests.slice(since)
       .filter(({ method, path }) => method === 'POST' && path.split('?')[0] === WRITE_SITE_PATHS.create).map(({ path }) => path),

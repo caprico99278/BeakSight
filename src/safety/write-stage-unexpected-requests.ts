@@ -4,8 +4,8 @@
 // - 1 行は、送り方（method）、送り先の区分（`WRITE_STAGE_REQUEST_DESTINATIONS`。許可の外の Origin は名前を残さない）、path の形、要求の種類、いつ出たか
 //   （`WRITE_STAGE_REQUEST_TIMINGS`）、止めた理由のコード、入れた値（目印）が本文に入っていたかの真偽と本文の種類、回数。Origin・query・本文・値は持たない。
 // - path の形・method の形は、型の作り手（`src/core/api-request-shape.ts` の `apiRequestShapeOf`）に任せる（値に見える区切りと目印を含む区切りを伏せる）。
-// - 同じ形の行は重ねず、回数を足す（飽和）。一覧は `MAX_WRITE_STAGE_UNEXPECTED_REQUESTS` まで。上限を超えた新しい行と、型を作れなかった要求は数だけ
-//   （`unlisted`）。
+// - 同じ形の行は重ねず、回数を足す（飽和）。L12a: 行の数の上限（前は 20）は置かない。型を作れなかった
+//   要求は数だけ（`unlisted`）。
 // - OP-N（設計書 `2026-10-27-beaksight-one-pass-flow-design.md` 4.1.7 の N1・N2）: 目印の照らし（`requestCarriesMarker`）の唯一の owner。行の
 //   `markerInBody` と、Guard の判断（値を入れた後に止めた読み取りと WebSocket を、取りやめに数えるか）が、同じ照らしを使う。照らす形は、そのままの文字列、
 //   `%XX` を寛容に戻した形、さらに `+` を空白に直した形（form の符号化）、JSON の入れ子の値と鍵（`\u` の符号化を戻す）で、大文字と小文字を区別しない。読めない
@@ -18,16 +18,11 @@
 // - OP-N（N2）: 同じ形の一覧を、送信の扱い `PASS_EXCEPT_DELETE` で通した、サイトが自動で送る通信の記録にも使う（理由は `WRITE_STAGE_AUDIT_SEND_PASSED`）。
 import {
   apiRequestShapeOf,
-  MAX_API_REQUEST_BODY_BYTES,
-  MAX_API_SHAPE_MARKERS,
   type ApiRequestBody,
   type ApiRequestBodyKind,
 } from '../core/api-request-shape.js';
 import { saturatingIncrement } from '../core/saturating-count.js';
 import type { RequestResourceType } from './request-policy.js';
-
-/** 一覧の行の上限（OP-M の指示書の「名前つきの数」）。 */
-export const MAX_WRITE_STAGE_UNEXPECTED_REQUESTS = 20;
 
 /** OP-N（N2）: 送信の扱い `PASS_EXCEPT_DELETE` で通した要求の行の理由（止めた理由ではない。通した一覧の行だけが持つ）。 */
 export const WRITE_STAGE_AUDIT_SEND_PASSED = 'AUDIT_SEND_PASSED';
@@ -116,24 +111,21 @@ const textsCarryMarker = (texts: readonly string[], loweredMarkers: readonly str
   return loweredMarkers.some((marker) => expanded.some((text) => text.includes(marker)));
 };
 
-/** 本文の目印の有無（`UNKNOWN` は、読めない・大きすぎて入れ子を照らせない本文）。 */
+/** 本文の目印の有無（`UNKNOWN` は、読めない本文。L13 fix round 1: 大きさでは `UNKNOWN` にしない）。 */
 type BodyMarkerPresence = 'ABSENT' | 'PRESENT' | 'UNKNOWN';
 
 const bodyMarkerPresenceOf = (body: ApiRequestBody, loweredMarkers: readonly string[]): BodyMarkerPresence => {
   if (body.kind === 'NONE' || loweredMarkers.length === 0) return 'ABSENT';
   if (body.kind !== 'TEXT' || typeof body.text !== 'string') return 'UNKNOWN';
   const texts = [body.text];
-  // 入れ子の値は、型の作り手と同じ大きさの上限の中だけ照らす（超えた本文は、そのままの形で見つからなければ分からないとする）。
-  const parseable = body.text.length <= MAX_API_REQUEST_BODY_BYTES;
-  if (parseable) {
-    try {
-      nestedJsonTextsOf(JSON.parse(body.text) as unknown, texts);
-    } catch {
-      // JSON でない本文は、そのままの形と、form の符号化を戻した形で照らす。
-    }
+  // L13 fix round 1: 入れ子の値は、本文の大きさによらず全部照らす（前は 64KiB（`MAX_API_REQUEST_BODY_BYTES`）を超えた本文の入れ子を照らさず、そのままの形で
+  // 見つからなければ「分からない」とした）。読めない本文（`TEXT` でない）は、上で今どおり「分からない」。
+  try {
+    nestedJsonTextsOf(JSON.parse(body.text) as unknown, texts);
+  } catch {
+    // JSON でない本文は、そのままの形と、form の符号化を戻した形で照らす。
   }
-  if (textsCarryMarker(texts, loweredMarkers)) return 'PRESENT';
-  return parseable ? 'ABSENT' : 'UNKNOWN';
+  return textsCarryMarker(texts, loweredMarkers) ? 'PRESENT' : 'ABSENT';
 };
 
 /** 空でない目印を、小文字にした写し。 */
@@ -191,8 +183,9 @@ export class WriteStageUnexpectedRequestList {
   constructor(markers: readonly string[]) {
     const kept = markers.filter((marker) => typeof marker === 'string' && marker.length > 0);
     this.#loweredMarkers = Object.freeze(loweredMarkersOf(kept));
-    // 型の作り手の目印の上限まで（空の値は比べない）。
-    this.#markers = Object.freeze(kept.slice(0, MAX_API_SHAPE_MARKERS));
+    // 空の値は比べない。L13（N25）: 型の作り手の目印の数の上限（前は `MAX_API_SHAPE_MARKERS` まで）は撤廃したので、全部の目印を渡す（記録の行の
+    // `markerInBody` だけに効く。止める判定は変えない）。
+    this.#markers = Object.freeze(kept);
   }
 
   /** OP-N: 要求の URL か本文に、この段の目印のどれかが入っているか（`requestCarriesMarker` と同じ照らし。読めない本文は入っているとみなす）。 */
@@ -234,10 +227,8 @@ export class WriteStageUnexpectedRequestList {
       entry.count = saturatingIncrement(entry.count);
       return;
     }
-    if (this.#entries.size >= MAX_WRITE_STAGE_UNEXPECTED_REQUESTS) {
-      this.#unlisted = saturatingIncrement(this.#unlisted);
-      return;
-    }
+    // L12a（設計書 `2026-11-09-beaksight-remove-limits-design.md` 4 の S12）: 行の数の上限（`MAX_WRITE_STAGE_UNEXPECTED_REQUESTS`）は使わない（形の数だけ行を持つ。
+    // 同じ形は回数を足すので、行の数はページの送信の形の数まで）。`unlisted` は、型を作れなかった要求だけを数える。
     this.#entries.set(key, { row, count: 1 });
   }
 

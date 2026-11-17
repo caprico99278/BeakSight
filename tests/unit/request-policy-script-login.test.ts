@@ -26,7 +26,6 @@ import {
   type PassiveRequestDecision,
   type RequestResourceType,
   type ScriptLoginBlockReason,
-  type WriteStagePolicy,
 } from '../../src/safety/request-policy.js';
 
 const APP_ORIGIN = 'https://example.com';
@@ -293,13 +292,6 @@ describe('T34b: the other requests of the script login stage', () => {
     expect(decide(facts('GET', `${OTHER_ORIGIN}/pixel`, 'image'), open))
       .toEqual({ action: 'BLOCK', category: 'LOGIN_STAGE', reason: 'SUBMISSION_WINDOW' });
     expect(decide(facts('POST', `${APP_ORIGIN}/cdn-cgi/rum`, 'fetch'), open)).toEqual(blocked('UNREGISTERED_NON_READ'));
-  });
-
-  it('does not allow any script POST when the login stage and the write stage are combined (fail closed)', () => {
-    const writeStage: WriteStagePolicy = { writeEndpoint: { origin: APP_ORIGIN, path: '/items' }, remainingPosts: ONE };
-    const combined = classifyPassiveRequest(facts('POST', TOKEN_URL, 'fetch'), ALLOWED_ORIGINS, { authSetup: SCRIPT, writeStage });
-    expect(combined.action).toBe('BLOCK');
-    expect(classifyPassiveRequest(facts('POST', SIDE_URL, 'fetch'), ALLOWED_ORIGINS, { authSetup: SCRIPT, writeStage }).action).toBe('BLOCK');
   });
 });
 

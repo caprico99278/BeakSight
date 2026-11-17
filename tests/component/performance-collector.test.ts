@@ -1,6 +1,6 @@
 import type { BrowserContext, Page } from 'playwright';
 import { afterEach, describe, expect, it, vi } from 'vitest';
-import { MAX_ERROR_MESSAGE_LENGTH, MAX_RESOURCE_TIMING_ENTRIES } from '../../src/core/limits.js';
+import { MAX_RESOURCE_TIMING_ENTRIES } from '../../src/core/limits.js';
 import type {
   HeaderEvidence,
   NetworkEvidence,
@@ -370,6 +370,14 @@ function fakePage(result: unknown): Page {
   return { evaluate: vi.fn(async () => result) } as unknown as Page;
 }
 
+/**
+ * L2: 期限を渡さないときの偽のページ（進みの見張りのページの自発の変化の受け口 `on`・`off`・`isClosed` を持つ。事象は出さず、画面の変化の読み取りも
+ * できないので、ページの自発の変化の印は付かない）。
+ */
+function watchablePage(evaluate: () => Promise<unknown>): Page {
+  return { evaluate: vi.fn(evaluate), on: () => undefined, off: () => undefined, isClosed: () => false } as unknown as Page;
+}
+
 function requireWebVitals(result: PerformanceEvidence): Readonly<WebVitalsEvidence> {
   expect(result.webVitals).not.toBeNull();
   if (result.webVitals === null) throw new Error('Expected available Web Vital evidence');
@@ -669,36 +677,6 @@ describe('PerformanceCollector', () => {
     expect(result.telemetryCandidates).toHaveLength(2);
   });
 
-  it('adjudicates late completion and rejection as deadline without mutating returned evidence', async () => {
-    vi.useFakeTimers();
-    vi.setSystemTime(10_000);
-    let resolveLate: ((value: unknown) => void) | undefined;
-    const lateResolution = new Promise((resolve) => { resolveLate = resolve; });
-    const resolvingPage = { evaluate: vi.fn(() => lateResolution) } as unknown as Page;
-    const resolvingPromise = new PerformanceCollector().collect(resolvingPage, EMPTY_NETWORK, {
-      deadlineAtMs: 10_020,
-    });
-    await vi.advanceTimersByTimeAsync(20);
-    const resolvingResult = await resolvingPromise;
-    expect(resolvingResult).toMatchObject({ status: 'PARTIAL', reason: 'DEADLINE_EXCEEDED' });
-    resolveLate?.(rawBrowserEvidence());
-    await Promise.resolve();
-    expect(resolvingResult.resources).toEqual([]);
-
-    vi.setSystemTime(20_000);
-    let rejectLate: ((reason: unknown) => void) | undefined;
-    const lateRejection = new Promise((_resolve, reject) => { rejectLate = reject; });
-    const rejectingPage = { evaluate: vi.fn(() => lateRejection) } as unknown as Page;
-    const rejectingPromise = new PerformanceCollector().collect(rejectingPage, EMPTY_NETWORK, {
-      deadlineAtMs: 20_020,
-    });
-    await vi.advanceTimersByTimeAsync(20);
-    const rejectingResult = await rejectingPromise;
-    expect(rejectingResult).toMatchObject({ status: 'PARTIAL', reason: 'DEADLINE_EXCEEDED' });
-    rejectLate?.(new Error('late rejection'));
-    await Promise.resolve();
-  });
-
   it('rejects invalid browser numbers without retaining synthetic or non-finite values', async () => {
     const raw = rawBrowserEvidence();
     raw.webVitals.LCP.value = Number.NaN;
@@ -739,270 +717,23 @@ describe('PerformanceCollector', () => {
     expect(Object.isFrozen(requireWebVitals(result).CLS.attribution)).toBe(true);
   });
 
-  it('checks an expired deadline before reading any NetworkEvidence field', async () => {
-    const network = new Proxy({} as NetworkEvidence, {
-      get() {
-        throw new Error('NetworkEvidence must not be traversed after entry expiry');
-      },
-    });
-    const page = { evaluate: vi.fn() } as unknown as Page;
-
-    const result = await new PerformanceCollector().collect(page, network, {
-      deadlineAtMs: Date.now() - 1,
-    });
-
-    expect(result).toMatchObject({
-      status: 'PARTIAL',
-      reason: 'DEADLINE_EXCEEDED',
-      webVitals: null,
-      telemetryHeaders: [],
-      telemetryCandidates: [],
-    });
-    expect(page.evaluate).not.toHaveBeenCalled();
-  });
-
-  it('does not read responses after the requests getter reaches the deadline', async () => {
-    vi.useFakeTimers();
-    vi.setSystemTime(35_000);
-    const deadlineAtMs = 35_050;
-    let responseReads = 0;
-    const network = Object.defineProperties({}, {
-      requests: {
-        get() {
-          vi.setSystemTime(deadlineAtMs);
-          return [];
-        },
-      },
-      responses: {
-        get() {
-          responseReads += 1;
-          return [];
-        },
-      },
-      failures: { value: [] },
-    }) as NetworkEvidence;
-    const page = { evaluate: vi.fn() } as unknown as Page;
-
-    const result = await new PerformanceCollector().collect(page, network, { deadlineAtMs });
-
-    expect(result).toMatchObject({ status: 'PARTIAL', reason: 'DEADLINE_EXCEEDED' });
-    expect(responseReads).toBe(0);
-    expect(page.evaluate).not.toHaveBeenCalled();
-  });
-
-  it('caches caller-owned request and response array lengths during projection', async () => {
-    let requestLengthReads = 0;
-    let responseLengthReads = 0;
-    const requests = new Proxy([
-      requestEvidence('REQ-LENGTH', 'https://fixture.test/app.js', 'script'),
-    ], {
-      get(target, property, receiver) {
-        if (property === 'length') requestLengthReads += 1;
-        return Reflect.get(target, property, receiver);
-      },
-    });
-    const responses = new Proxy([] as NetworkEvidence['responses'][number][], {
-      get(target, property, receiver) {
-        if (property === 'length') responseLengthReads += 1;
-        return Reflect.get(target, property, receiver);
-      },
-    });
-
-    const result = await new PerformanceCollector().collect(
-      fakePage(rawBrowserEvidence()),
-      networkOf(requests, responses),
-      { deadlineAtMs: Date.now() + 1_000 },
-    );
-
-    expect(result.status).toBe('COMPLETE');
-    expect(requestLengthReads).toBe(1);
-    expect(responseLengthReads).toBe(1);
-  });
-
-  it.each(['REQUEST', 'RESPONSE'] as const)(
-    'does not read %s scalars after its indexed getter reaches the deadline',
-    async (direction) => {
-      vi.useFakeTimers();
-      vi.setSystemTime(36_000);
-      const deadlineAtMs = 36_050;
-      const lateReads: string[] = [];
-      const baseRequest = requestEvidence('REQ-INDEXED', 'https://fixture.test/app.js', 'script');
-      const request = new Proxy(baseRequest, {
-        get(target, property, receiver) {
-          if (Date.now() >= deadlineAtMs) lateReads.push(String(property));
-          return Reflect.get(target, property, receiver);
-        },
-      });
-      const baseResponse = networkEvidence().responses[0]!;
-      const response = new Proxy(baseResponse, {
-        get(target, property, receiver) {
-          if (Date.now() >= deadlineAtMs) lateReads.push(String(property));
-          return Reflect.get(target, property, receiver);
-        },
-      });
-      const requests = direction === 'REQUEST'
-        ? new Proxy([request], {
-          get(target, property, receiver) {
-            const value = Reflect.get(target, property, receiver);
-            if (property === '0') vi.setSystemTime(deadlineAtMs);
-            return value;
-          },
-        })
-        : [];
-      const responses = direction === 'RESPONSE'
-        ? new Proxy([response], {
-          get(target, property, receiver) {
-            const value = Reflect.get(target, property, receiver);
-            if (property === '0') vi.setSystemTime(deadlineAtMs);
-            return value;
-          },
-        })
-        : [];
-      const page = { evaluate: vi.fn() } as unknown as Page;
-
-      const result = await new PerformanceCollector().collect(
-        page,
-        networkOf(requests, responses),
-        { deadlineAtMs },
-      );
-
-      expect(result).toMatchObject({ status: 'PARTIAL', reason: 'DEADLINE_EXCEEDED' });
-      expect(lateReads).toEqual([]);
-      expect(page.evaluate).not.toHaveBeenCalled();
-    },
-  );
-
-  it('does not read FAILED header errorText after status reaches the deadline', async () => {
-    vi.useFakeTimers();
-    vi.setSystemTime(37_000);
-    const deadlineAtMs = 37_050;
-    const lateReads: string[] = [];
-    const headers = Object.defineProperties({}, {
-      status: {
-        get() {
-          vi.setSystemTime(deadlineAtMs);
-          return 'FAILED';
-        },
-      },
-      errorText: {
-        get() {
-          if (Date.now() >= deadlineAtMs) lateReads.push('errorText');
-          return 'unavailable';
-        },
-      },
-    }) as HeaderEvidence;
-    const request = { ...requestEvidence('REQ-FAILED', 'https://fixture.test/app.js', 'script'), headers };
-
-    const result = await new PerformanceCollector().collect(
-      { evaluate: vi.fn() } as unknown as Page,
-      networkWithRequests([request]),
-      { deadlineAtMs },
-    );
-
-    expect(result).toMatchObject({ status: 'PARTIAL', reason: 'DEADLINE_EXCEEDED' });
-    expect(lateReads).toEqual([]);
-  });
-
-  it('caches OBSERVED header values and stops after a value getter reaches the deadline', async () => {
-    vi.useFakeTimers();
-    vi.setSystemTime(38_000);
-    const deadlineAtMs = 38_050;
-    let valuesReads = 0;
-    const lateReads: string[] = [];
-    const values = Object.defineProperties({}, {
-      traceparent: {
-        enumerable: true,
-        get() {
-          vi.setSystemTime(deadlineAtMs);
-          return '00-trace';
-        },
-      },
-      'x-request-id': {
-        enumerable: true,
-        get() {
-          if (Date.now() >= deadlineAtMs) lateReads.push('x-request-id');
-          return 'late-id';
-        },
-      },
-    });
-    const headers = Object.defineProperties({}, {
-      status: { get: () => 'OBSERVED' },
-      values: {
-        get() {
-          valuesReads += 1;
-          if (Date.now() >= deadlineAtMs) lateReads.push('values');
-          return values;
-        },
-      },
-    }) as HeaderEvidence;
-    const request = { ...requestEvidence('REQ-VALUES', 'https://fixture.test/app.js', 'script'), headers };
-
-    const result = await new PerformanceCollector().collect(
-      { evaluate: vi.fn() } as unknown as Page,
-      networkWithRequests([request]),
-      { deadlineAtMs },
-    );
-
-    expect(result).toMatchObject({ status: 'PARTIAL', reason: 'DEADLINE_EXCEEDED' });
-    expect(valuesReads).toBe(1);
-    expect(lateReads).toEqual([]);
-  });
-
-  it('gates the ownKeys and own-property descriptor header boundaries separately', async () => {
-    vi.useFakeTimers();
-    vi.setSystemTime(39_000);
-    const deadlineAtMs = 39_050;
-    const lateReads: string[] = [];
-    const valuesTarget = { traceparent: '00-trace' };
-    const values = new Proxy(valuesTarget, {
-      ownKeys(target) {
-        vi.setSystemTime(deadlineAtMs);
-        return Reflect.ownKeys(target);
-      },
-      getOwnPropertyDescriptor(target, property) {
-        if (Date.now() >= deadlineAtMs) lateReads.push(`descriptor:${String(property)}`);
-        return Reflect.getOwnPropertyDescriptor(target, property);
-      },
-    });
-    const request = {
-      ...requestEvidence('REQ-OWN-KEYS', 'https://fixture.test/app.js', 'script'),
-      headers: { status: 'OBSERVED' as const, values },
-    };
-
-    const result = await new PerformanceCollector().collect(
-      { evaluate: vi.fn() } as unknown as Page,
-      networkWithRequests([request]),
-      { deadlineAtMs },
-    );
-
-    expect(result).toMatchObject({ status: 'PARTIAL', reason: 'DEADLINE_EXCEEDED' });
-    expect(lateReads).toEqual([]);
-  });
-
-  it('bounds request and response projection before evaluation', async () => {
-    const request = requestEvidence('REQ-BOUNDED', 'https://fixture.test/app.js', 'script');
-    const response = {
+  it('L2: projects every request and response beyond the former limits (500 and 200)', async () => {
+    const requests = Array.from({ length: 1_200 }, (_value, index) => requestEvidence(
+      `REQ-${index}`,
+      `https://fixture.test/analytics/${index}`,
+      'fetch',
+      { status: 'OBSERVED', values: { traceparent: `00-${index}` } },
+    ));
+    const responses = requests.map((request) => ({
       requestId: request.requestId,
       url: request.url,
       status: 200,
       statusText: 'OK',
-      headers: { status: 'OBSERVED' as const, values: {} },
+      headers: { status: 'OBSERVED' as const, values: { 'x-request-id': request.requestId } },
       contentLengthHeader: null,
       timing: timing(),
       ...RESPONSE_FLAGS,
-    };
-    const requests = new Proxy(Array.from({ length: 501 }, () => request), {
-      get(target, property, receiver) {
-        if (property === '500') throw new Error('unbounded request traversal');
-        return Reflect.get(target, property, receiver);
-      },
-    });
-    const responses = new Proxy(Array.from({ length: 501 }, () => response), {
-      get(target, property, receiver) {
-        if (property === '500') throw new Error('unbounded response traversal');
-        return Reflect.get(target, property, receiver);
-      },
-    });
+    }));
 
     const result = await new PerformanceCollector().collect(
       fakePage(rawBrowserEvidence()),
@@ -1011,40 +742,31 @@ describe('PerformanceCollector', () => {
     );
 
     expect(result.status).toBe('COMPLETE');
+    expect(result.telemetryHeaders).toHaveLength(2_400);
+    expect(result.telemetryCandidates).toHaveLength(1_200);
+    expect(result.truncation).toMatchObject({
+      omittedNetworkRequestCount: 0,
+      omittedNetworkResponseCount: 0,
+      omittedTelemetryHeaderCount: 0,
+      omittedTelemetryCandidateCount: 0,
+    });
   });
 
-  it('stops projection when its deadline is reached and returns no speculative telemetry', async () => {
-    vi.useFakeTimers();
-    vi.setSystemTime(30_000);
-    const deadlineAtMs = 30_050;
-    const traced = requestEvidence(
-      'REQ-TRACE',
-      'https://fixture.test/analytics/collect',
-      'fetch',
-      { status: 'OBSERVED', values: { traceparent: '00-before-deadline' } },
-    );
-    const requests = new Proxy([traced, traced], {
-      get(target, property, receiver) {
-        if (property === '1') vi.setSystemTime(deadlineAtMs);
-        return Reflect.get(target, property, receiver);
-      },
-    });
-    const page = { evaluate: vi.fn() } as unknown as Page;
+  it('L2: keeps every telemetry header field of one record (no 32 field limit)', async () => {
+    const values: Record<string, string> = {};
+    for (let index = 0; index < 40; index += 1) {
+      values[`x-filler-${index}`] = 'v';
+    }
+    values['x-request-id'] = 'late-field';
+    const request = requestEvidence('REQ-WIDE', 'https://fixture.test/api', 'fetch', { status: 'OBSERVED', values });
 
     const result = await new PerformanceCollector().collect(
-      page,
-      networkOf(requests),
-      { deadlineAtMs },
+      fakePage(rawBrowserEvidence()),
+      networkWithRequests([request]),
+      { deadlineAtMs: Date.now() + 1_000 },
     );
 
-    expect(result).toMatchObject({
-      status: 'PARTIAL',
-      reason: 'DEADLINE_EXCEEDED',
-      webVitals: null,
-      telemetryHeaders: [],
-      telemetryCandidates: [],
-    });
-    expect(page.evaluate).not.toHaveBeenCalled();
+    expect(result.telemetryHeaders).toEqual([expect.objectContaining({ requestId: 'REQ-WIDE', values: { 'x-request-id': 'late-field' } })]);
   });
 
   it.each([
@@ -1230,36 +952,6 @@ describe('PerformanceCollector', () => {
     });
   });
 
-  it('bounds projected scalar retention and excludes overlong URLs from exact correlation', async () => {
-    const overlongUrl = `https://fixture.test/analytics/${'a'.repeat(2_100)}`;
-    const raw = rawBrowserEvidence();
-    raw.resourceEntries.splice(0, raw.resourceEntries.length, rawResource(overlongUrl, 'link'));
-    const request = {
-      ...requestEvidence(
-        'R'.repeat(300),
-        overlongUrl,
-        'resource-type-'.repeat(60),
-        { status: 'OBSERVED', values: { traceparent: 'v'.repeat(700) } },
-      ),
-      method: 'M'.repeat(700),
-    };
-
-    const result = await new PerformanceCollector().collect(
-      fakePage(raw),
-      networkWithRequests([request]),
-      { deadlineAtMs: Date.now() + 1_000 },
-    );
-
-    expect(result.resources[0]).toMatchObject({ requestId: null, networkResourceType: null });
-    expect(result.telemetryCandidates[0]?.requestId.length).toBeLessThanOrEqual(256);
-    expect(result.telemetryCandidates[0]?.url.length).toBeLessThanOrEqual(2_048);
-    expect(result.telemetryCandidates[0]?.method.length).toBeLessThanOrEqual(512);
-    expect(result.telemetryCandidates[0]?.resourceType.length).toBeLessThanOrEqual(512);
-    const observedHeader = result.telemetryHeaders.find((header) => header.status === 'OBSERVED');
-    expect(observedHeader?.status === 'OBSERVED' ? observedHeader.values.traceparent?.length : 0)
-      .toBeLessThanOrEqual(512);
-  });
-
   it('does not claim a css-initiated resource is a stylesheet without Task 7 type evidence', async () => {
     const raw = rawBrowserEvidence();
     raw.resourceEntries.splice(0, raw.resourceEntries.length,
@@ -1442,23 +1134,39 @@ describe('PerformanceCollector', () => {
     expect(reported).toMatchObject({ status: 'PARTIAL', reason: 'RESOURCE_LIMIT_REACHED' });
     expect(reported.resourceCoverage).toMatchObject({ bufferFull: false, retainedEntryCount: 5, omittedEntryCount: 7 });
 
+  });
+
+  it('L2: records every resource entry the browser returned beyond the former limit (500)', async () => {
     const oversized = rawBrowserEvidence();
     oversized.resourceEntries.splice(0, oversized.resourceEntries.length, ...Array.from(
       { length: MAX_RESOURCE_TIMING_ENTRIES + 3 },
       (_value, index) => rawResource(`https://fixture.test/item-${index}.js`, 'script'),
     ));
-    const bounded = await new PerformanceCollector().collect(
+    const all = await new PerformanceCollector().collect(
       fakePage(oversized),
       EMPTY_NETWORK,
       { deadlineAtMs: Date.now() + 1_000 },
     );
 
-    expect(bounded).toMatchObject({ status: 'PARTIAL', reason: 'RESOURCE_LIMIT_REACHED' });
-    expect(bounded.resources).toHaveLength(MAX_RESOURCE_TIMING_ENTRIES);
-    expect(bounded.resourceCoverage).toMatchObject({
-      retainedEntryCount: MAX_RESOURCE_TIMING_ENTRIES,
-      omittedEntryCount: 3,
+    expect(all.status).toBe('COMPLETE');
+    expect(all.resources).toHaveLength(MAX_RESOURCE_TIMING_ENTRIES + 3);
+    expect(all.resourceCoverage).toMatchObject({
+      retainedEntryCount: MAX_RESOURCE_TIMING_ENTRIES + 3,
+      omittedEntryCount: 0,
     });
+  });
+
+  it('L2: does not report a full browser buffer as a loss when the entries were observed by the performance observer', async () => {
+    const raw = { ...rawBrowserEvidence(), resourceSource: 'OBSERVER', resourceBuffer: { size: MAX_RESOURCE_TIMING_ENTRIES, full: true } };
+
+    const result = await new PerformanceCollector().collect(
+      fakePage(raw),
+      EMPTY_NETWORK,
+      { deadlineAtMs: Date.now() + 1_000 },
+    );
+
+    expect(result.status).toBe('COMPLETE');
+    expect(result.resourceCoverage).toMatchObject({ bufferFull: true, omittedEntryCount: 0 });
   });
 
   it.each([
@@ -1554,7 +1262,32 @@ describe('PerformanceCollector', () => {
     expect(requireResourceSummaries(result).script).toMatchObject({ count: 1, sizeUnknownCount: 1, transferSize: 0 });
   });
 
-  it('records Server-Timing entries omitted by the per-entry and total limits', async () => {
+  it('L2: records every Server-Timing entry beyond the former per-entry (20) and total (500) limits', async () => {
+    const raw = rawBrowserEvidence();
+    const serverTiming = Array.from({ length: 25 }, (_value, index) => ({
+      name: `metric-${index}`,
+      description: '',
+      duration: 1,
+    }));
+    raw.navigationEntries[0]!.serverTiming = [];
+    raw.resourceEntries.splice(0, raw.resourceEntries.length, ...Array.from({ length: 26 }, (_value, index) => ({
+      ...rawResource(`https://fixture.test/timed-${index}.js`, 'script'),
+      serverTiming,
+      omittedServerTimingCount: 0,
+    })));
+
+    const result = await new PerformanceCollector().collect(
+      fakePage(raw),
+      EMPTY_NETWORK,
+      { deadlineAtMs: Date.now() + 1_000 },
+    );
+
+    expect(result.status).toBe('COMPLETE');
+    expect(result.serverTiming).toHaveLength(26 * 25);
+    expect(result.truncation?.omittedServerTimingCount).toBe(0);
+  });
+
+  it('still counts Server-Timing entries that a browser snapshot reported as omitted', async () => {
     const raw = rawBrowserEvidence();
     const serverTiming = Array.from({ length: 20 }, (_value, index) => ({
       name: `metric-${index}`,
@@ -1574,42 +1307,49 @@ describe('PerformanceCollector', () => {
       { deadlineAtMs: Date.now() + 1_000 },
     );
 
-    expect(result.serverTiming).toHaveLength(500);
-    expect(result.truncation?.omittedServerTimingCount).toBe(26 + 20);
+    // L2: 上限で捨てないので、記録は全部（26 × 20）。数は、ブラウザが省いたと報告した数（1 件ずつ）だけ。
+    expect(result.serverTiming).toHaveLength(26 * 20);
+    expect(result.truncation?.omittedServerTimingCount).toBe(26);
   });
 
-  it('records telemetry headers, telemetry candidates, and projected network records omitted by limits', async () => {
-    const requests = Array.from({ length: 505 }, (_value, index) => requestEvidence(
-      `REQ-${index}`,
-      `https://fixture.test/analytics/${index}`,
-      'fetch',
-      { status: 'OBSERVED', values: { traceparent: `00-${index}` } },
-    ));
-    const responses = Array.from({ length: 205 }, (_value, index) => ({
-      requestId: `REQ-${index}`,
-      url: `https://fixture.test/analytics/${index}`,
-      status: 204,
-      statusText: 'No Content',
-      headers: { status: 'OBSERVED' as const, values: {} },
-      contentLengthHeader: null,
-      timing: timing(),
-      ...RESPONSE_FLAGS,
+  it('L2: without a deadline, waits for a browser snapshot longer than the former deadline', async () => {
+    vi.useFakeTimers();
+    vi.setSystemTime(40_000);
+    const page = watchablePage(() => new Promise((resolve) => {
+      setTimeout(() => resolve(rawBrowserEvidence()), 120_000);
     }));
 
-    const result = await new PerformanceCollector().collect(
-      fakePage(rawBrowserEvidence()),
-      networkOf(requests, responses),
-      { deadlineAtMs: Date.now() + 1_000 },
-    );
-
-    expect(result.telemetryHeaders).toHaveLength(200);
-    expect(result.telemetryCandidates).toHaveLength(100);
-    expect(result.truncation).toMatchObject({
-      omittedNetworkRequestCount: 5,
-      omittedNetworkResponseCount: 5,
-      omittedTelemetryHeaderCount: 300,
-      omittedTelemetryCandidateCount: 400,
+    let settled = false;
+    const pending = new PerformanceCollector().collect(page, networkEvidence()).finally(() => {
+      settled = true;
     });
+    await vi.advanceTimersByTimeAsync(60_000);
+    expect(settled).toBe(false);
+    await vi.advanceTimersByTimeAsync(60_000);
+
+    const result = await pending;
+    expect(result.status).toBe('COMPLETE');
+    expect(result.resources).toHaveLength(5);
+  });
+
+  it('L2: without a deadline, ends as unresponsive only after the quiet limit and keeps the network facts', async () => {
+    vi.useFakeTimers();
+    vi.setSystemTime(40_000);
+    const page = watchablePage(() => new Promise(() => undefined));
+    const quietLimitMs = 5_000;
+
+    let settled = false;
+    const pending = new PerformanceCollector().collect(page, networkEvidence(), { watch: { quietLimitMs } }).finally(() => {
+      settled = true;
+    });
+    await vi.advanceTimersByTimeAsync(quietLimitMs - 1);
+    expect(settled).toBe(false);
+    await vi.advanceTimersByTimeAsync(1);
+
+    const result = await pending;
+    expect(result).toMatchObject({ status: 'PARTIAL', reason: 'STAGE_UNRESPONSIVE' });
+    expect(result.telemetryCandidates).toHaveLength(2);
+    expect(result.resources).toEqual([]);
   });
 
   it('reports no truncation for small evidence', async () => {
@@ -1630,14 +1370,73 @@ describe('PerformanceCollector', () => {
     expect(Object.isFrozen(result.truncation)).toBe(true);
   });
 
-  it('marks truncated text from projected network scalars and from browser web-vitals state', async () => {
-    const request = { ...requestEvidence('REQ-LONG-METHOD', 'https://fixture.test/app.js', 'script'), method: 'M'.repeat(700) };
+  // 設計者の判断 2026-11-11: 同じ口の成功した読み取りのくり返しは、network の記録で 1 件の記録とまとめた記録（`repeatedReads`）になる。Resource Timing の項目は、
+  // 1 件の記録と照らし合わせられなかったら、同じ口（Origin と path）のまとめた記録の資源の種類で分ける（要求の ID は、1 件の記録がないので持たない）。
+  it('categorizes the Resource Timing entries of the repeated reads by the resource type of their group', async () => {
+    const first = requestEvidence('REQ-CSS-0', 'https://fixture.test/item.css?i=0', 'stylesheet');
+    const network: NetworkEvidence = {
+      ...networkWithRequests([first]),
+      repeatedReads: [{
+        method: 'GET', origin: 'https://fixture.test', path: '/item.css', resourceType: 'stylesheet', status: 200, isMainFrame: true, count: 3,
+        firstRequestId: 'REQ-CSS-0', first: { url: first.url, timing: timing() }, slowest: { url: first.url, timing: timing() },
+        firstStartTime: 0, lastStartTime: 2, transfer: { observedCount: 3, totalBytes: 30 }, distinctQueryCount: 3,
+      }],
+    };
+    const raw = rawBrowserEvidence();
+    raw.resourceEntries = [0, 1, 2].map((index) => rawResource(`https://fixture.test/item.css?i=${String(index)}`, 'link'));
+    // 種類の違う資源（script として始めた）は、まとめた記録の種類（stylesheet）と合わないので、まとめた記録で分けない。
+    raw.resourceEntries.push(rawResource('https://fixture.test/item.css?i=9', 'script'));
+
+    const result = await new PerformanceCollector().collect(fakePage(raw), network, { deadlineAtMs: Date.now() + 1_000 });
+
+    expect(result.resources.map(({ requestId, networkResourceType, categoryBasis }) => [requestId, networkResourceType, categoryBasis])).toEqual([
+      ['REQ-CSS-0', 'stylesheet', 'NETWORK_EVIDENCE'],
+      [null, 'stylesheet', 'NETWORK_EVIDENCE'],
+      [null, 'stylesheet', 'NETWORK_EVIDENCE'],
+      [null, null, 'INITIATOR_TYPE'],
+    ]);
+    expect(result.resourceSummaries?.stylesheet.count).toBe(3);
+  });
+
+  // 設計者の判断 2026-11-11: URL は切り詰めない（network の記録の URL・Resource Timing・navigation・LCP の URL の全部を残す）。前の上限（2,048 文字）より長い
+  // URL も、Resource Timing と network の要求を照らし合わせる。
+  it('keeps whole long URLs and correlates a long Resource Timing URL with its network request', async () => {
+    const longUrl = `https://fixture.test/${'a'.repeat(5_000)}.js`;
+    const longPageUrl = `https://fixture.test/?q=${'p'.repeat(5_000)}`;
+    const longImageUrl = `https://fixture.test/${'i'.repeat(5_000)}.png`;
+    const request = requestEvidence('REQ-LONG-URL', longUrl, 'script', Object.freeze({
+      status: 'OBSERVED',
+      values: Object.freeze({ traceparent: '00-trace-long' }),
+    }));
+    const raw = rawBrowserEvidence();
+    raw.resourceEntries = [rawResource(longUrl, 'script')];
+    raw.navigationEntries = [{ ...raw.navigationEntries[0], name: longPageUrl }];
+    const lcp = raw.webVitals.LCP as { attribution: Record<string, unknown> };
+    lcp.attribution = { ...lcp.attribution, url: longImageUrl };
+
+    const result = await new PerformanceCollector().collect(fakePage(raw), networkWithRequests([request]), { deadlineAtMs: Date.now() + 1_000 });
+
+    expect(result.status).toBe('COMPLETE');
+    expect(result.resources[0]).toMatchObject({ url: longUrl, requestId: 'REQ-LONG-URL', categoryBasis: 'NETWORK_EVIDENCE' });
+    expect(result.telemetryHeaders[0]).toMatchObject({ url: longUrl });
+    expect(result.telemetryCandidates[0]).toMatchObject({ url: longUrl });
+    expect(result.navigationTiming).toMatchObject({ url: longPageUrl });
+    expect(requireWebVitals(result).LCP.attribution).toMatchObject({ url: longImageUrl });
+    expect(result.truncation?.textTruncated).toBe(false);
+  });
+
+  it('LZ-2: keeps long ids, texts and header error text whole, and still reports the browser web-vitals truncation of an older state', async () => {
+    const longMethod = 'M'.repeat(513);
+    const longId = `REQ-${'i'.repeat(257)}`;
+    const longErrorText = 'e'.repeat(2_049);
+    const request = { ...requestEvidence(longId, 'https://fixture.test/app.js', 'script', { status: 'FAILED', errorText: longErrorText }), method: longMethod };
     const fromNetwork = await new PerformanceCollector().collect(
       fakePage(rawBrowserEvidence()),
       networkWithRequests([request]),
       { deadlineAtMs: Date.now() + 1_000 },
     );
-    expect(fromNetwork.truncation?.textTruncated).toBe(true);
+    expect(fromNetwork.truncation?.textTruncated).toBe(false);
+    expect(fromNetwork.telemetryHeaders[0]).toMatchObject({ requestId: longId, status: 'FAILED', errorText: longErrorText });
 
     const raw = rawBrowserEvidence();
     raw.webVitalsTextTruncated = true;
@@ -1648,29 +1447,5 @@ describe('PerformanceCollector', () => {
     );
     expect(fromBrowser.status).toBe('COMPLETE');
     expect(fromBrowser.truncation?.textTruncated).toBe(true);
-  });
-
-  it('bounds FAILED telemetry header error text by the shared error message limit', async () => {
-    const request = requestEvidence(
-      'REQ-HEADER-FAILURE',
-      'https://fixture.test/app.js',
-      'script',
-      { status: 'FAILED', errorText: 'e'.repeat(MAX_ERROR_MESSAGE_LENGTH + 10) },
-    );
-
-    const result = await new PerformanceCollector().collect(
-      fakePage(rawBrowserEvidence()),
-      networkWithRequests([request]),
-      { deadlineAtMs: Date.now() + 1_000 },
-    );
-
-    expect(result.telemetryHeaders[0]).toEqual({
-      direction: 'REQUEST',
-      requestId: 'REQ-HEADER-FAILURE',
-      url: 'https://fixture.test/app.js',
-      status: 'FAILED',
-      errorText: 'e'.repeat(MAX_ERROR_MESSAGE_LENGTH),
-    });
-    expect(result.truncation?.textTruncated).toBe(true);
   });
 });

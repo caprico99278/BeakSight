@@ -8,8 +8,19 @@
 //   `AUTH_RESULT_UNKNOWN`（送信は分からない `UNKNOWN` か `YES`。どちらでも自動ログインを止める）。資格情報を含む要求はサーバに届かない。
 // - 結果は、スクリプトで送るログインの数（`scriptLogin`。止めた資格情報の数を含む）を持つ。
 // 届いたかは fixture の記録で数える。各場面の終わりに、名前つきの時間（`LATE_REQUEST_WAIT_MS`）だけ待ってから数え直す。値は出力しない。
-import type { Browser } from 'playwright';
+// SFIX-1104（SREV-1104 の C-1・I-2。設計書 `doc/design/2026-11-04-beaksight-login-session-design.md` 3.2。SLIM L-3 で前の automated-login-probe を
+// まとめた）: 自動ログインの段の通し方（DEF-193）を崩す要求を、本物の factory・Guard・出口の中継・資格情報の守りで確かめる（fixture は
+// `tests/helpers/login-probe-site.ts`。レビューの 30 種の場面と、読まないパスへの自動の POST）。
+// - 資格情報を含んで届くのは、承認した token の送信だけ（そのまま・base64 の本文・`Authorization: Basic`・必須の query を保って query を足した 2 回目の
+//   ログインの送信は届かない）。token の更新（必須の query の値が違う）は今のとおり通り、ログインの送信の回数に数えない。
+// - 読まないパスへの、サイトの自動の POST は届かない（決まりで止めた行 `AUTOMATED_LOGIN_RULE_BLOCKED`）。
+// SFIX-1104-2（SREV-1104-2 の C1・C2）: base64 に `+`・`/` が出る記号つきのパスワード（`symbol`）でも、16 進だけのパスワード（`hex`）でも同じ。
+// - `encodeURIComponent` した base64 の query の値（GET・POST）も、「ID:パスワード」の同じ形も届かない。
+// - 読み取りでない要求の、ID だけの base64（`X-` のヘッダ）も届かない。読み取りの要求の ID は比べない決まり（SREV-1104-2 の M1）なので、ID だけの
+//   `Basic` の GET は届く（その 1 件だけ）。
 import { afterAll, afterEach, beforeAll, describe, expect, it } from 'vitest';
+import type { Browser } from 'playwright';
+import { BrowserContextFactory } from '../../src/browser/context-factory.js';
 import { wait } from '../../src/core/deadline.js';
 import type { AuditConfig } from '../../src/config/types.js';
 import {
@@ -17,30 +28,32 @@ import {
   AUTOMATED_LOGIN_MAX_LOGIN_ATTEMPTS,
   type AuthSetupV3,
 } from '../../src/control/auth/auth-setup-contracts.js';
-import { launchCliChromium, launchHeadlessChromium } from '../helpers/chromium.js';
+import { createLoginCredentialGuard } from '../../src/safety/login-credential-guard.js';
+import { LoginStageMonitor } from '../../src/safety/passive-request-guard.js';
+import { SafetyLedger } from '../../src/safety/safety-ledger.js';
+import { BOTH_CHROMIUM_LAUNCHERS } from '../helpers/chromium.js';
 import { READ_METHODS } from '../helpers/leak-places.js';
+import {
+  LOGIN_PROBE_EXCLUDED_PATH,
+  startLoginProbeSite,
+  type LoginProbePasswordKind,
+  type LoginProbeSite,
+} from '../helpers/login-probe-site.js';
 import { fastRunConfig } from '../helpers/run-harness.js';
 import {
   SPA_APP_PATHS,
-  SPA_AUTH_STORAGE_KEY,
   SPA_BACKEND_PATHS,
   SPA_GRANT_TYPES,
   SPA_LOGIN_FIELDS,
-  SPA_SHARED_HEADER_LINK,
   SPA_STATE_ELEMENTS,
-  SPA_TOKEN_RETRY_AFTER,
   startSpaAuthSite,
   type SpaAuthSite,
   type SpaAuthSiteOptions,
   type SpaLoginLayout,
 } from '../helpers/spa-auth-site-fixture.js';
+import { createTestConfig, TEST_FACTORY_OPTIONS } from '../helpers/test-config.js';
 import { runAutomatedLoginStage, type AutomatedLoginStageResult } from '../../src/worker/automated-login.js';
-import { DISCOVERY_LOGOUT_WORDS } from '../../src/discovery/classification-words.js';
 
-const LAUNCHERS: readonly (readonly [string, () => Promise<Browser>])[] = [
-  ['the default test Chromium', () => launchHeadlessChromium()],
-  ['the CLI Chromium', () => launchCliChromium()],
-];
 const TEST_TIMEOUT_MS = 120_000;
 /** 送信の後に結果を待つ時間（ms。テストを速くする）。 */
 const RESULT_TIMEOUT_MS = 10_000;
@@ -50,12 +63,32 @@ const CREDENTIAL_REVISION = 1;
 const EXISTING_NAME = '既存花子';
 const WRONG_PASSWORD_SUFFIX = '-wrong';
 const ONE_SIDE_POST = 1;
-/** `Retry-After` の秒数（fixture の値）を ms にする係数。 */
-const MS_PER_SECOND = 1_000;
 /** fixture の鍵の名前（`fixture-auth-token`）に当たる、成功の鍵の形。 */
 const FIXTURE_KEY = Object.freeze({ prefix: 'fixture', suffix: '-auth-token' });
 
-describe.each(LAUNCHERS)('T36c: the automated script login stage with %s', (_label, launch) => {
+/** SFIX-1104: パスワードの 2 つの形。 */
+const PROBE_PASSWORD_KINDS = ['hex', 'symbol'] as const satisfies readonly LoginProbePasswordKind[];
+/** 読み取りの要求の ID は比べない決まり（SREV-1104-2 の M1）で届く、ID だけの `Basic` の GET。 */
+const READ_WITH_USERNAME_ONLY = '/probe/x_basicIdOnlyGet';
+const PROBE_RESULT_TIMEOUT_MS = 60_000;
+const PROBE_LATE_REQUEST_WAIT_MS = 1_500;
+const PROBE_TEST_TIMEOUT_MS = 180_000;
+
+/** ページの結果（応答の状態。届かなければ 0）の期待。`credBeaconQueued` は送信の予約の結果（届いたかはサーバの記録で見る）。 */
+const PROBE_EXPECTED_RESULTS: Readonly<Record<string, number>> = Object.freeze({
+  ok: 200, credPath: 0, credCookie: 0, credB64Body: 0, credBasic: 0, credBasicGet: 0, credThird: 0, thirdNoCred: 200, credBeaconQueued: 1,
+  credBlob: 0, credForm: 0, credBig: 0, credWorker: 0, refreshCred: 0, secondLoginQ: 0, secondLoginBasic: 0,
+  // SD-2（設計書 `2026-11-16-beaksight-action-based-delete-guard-design.md` 2.4）: 資格情報を含まないページの送信は、削除の上書き・危険な語・読まないパスでも届く。
+  overrideForm: 200, overrideMultipart: 200, overrideJson: 200, overrideQuery: 200, overrideXHM: 200, overrideXMO: 200, putMethod: 200, patchMethod: 200,
+  dangerQueryEnc: 200, dangerFullwidth: 200, dangerPathEnc: 200, dangerLogout: 200, excludedPath: 200, refresh1: 200, refresh2: 200,
+  // SFIX-1104-2: レビュー（SREV-1104-2）の x_ の場面。届くのは、読み取りの要求の ID だけの Basic（M1）だけ。
+  x_basicLower: 0, x_basicUpper: 0, x_basicTwoSpaces: 0, x_basicLowerGet: 0, x_basicUpperTwoGet: 0, x_basicUrlSafeGet: 0, x_basicIdOnlyPost: 0,
+  x_basicIdColonPost: 0, x_basicIdOnlyGet: 200, x_basicPwOnlyPost: 0, x_basicPwOnlyGet: 0, x_basicColonPwGet: 0, x_b64JsonNested: 0, x_b64JsonUrlSafe: 0,
+  x_b64JsonBasic: 0, x_b64QueryGetEnc: 0, x_b64QueryGetRaw: 0, x_b64QueryGetUrlSafe: 0, x_b64QueryGetBasicEnc: 0, x_b64QueryGetSimple: 0,
+  x_b64QueryPostEnc: 0, x_xHeaderPw: 0, x_xHeaderPwGet: 0, x_xHeaderBasic: 0, x_xHeaderBasicGet: 0, x_xHeaderId: 0,
+});
+
+describe.each(BOTH_CHROMIUM_LAUNCHERS)('T36c: the automated script login stage with %s', (_label, launch) => {
   let spa: SpaAuthSite | undefined;
 
   beforeAll(() => undefined);
@@ -151,22 +184,8 @@ describe.each(LAUNCHERS)('T36c: the automated script login stage with %s', (_lab
     expect(result.scriptLogin?.blockedByReason.LOGIN_CREDENTIAL_IN_REQUEST).toBe(0);
   }, TEST_TIMEOUT_MS);
 
-  // T43d fix round 1（Task 43 の設計書 4.4）: 自動ログインの段も、結果を待った後に観察する。新しく出た鍵の名前（成功の鍵の名前の案。値は持たない）と、
-  // 凍結した成功の画面のセレクタの案（ログアウトのリンク。ログインの画面にもある見出しのリンクは案にならない）が出る。秘密の目印は観察に出ない。
-  it('proposes the new key name and the success screen selector after the automated login', async () => {
-    const site = await startSite({ sharedHeaderLink: true });
-    const result = await runStage(site);
-    expect(result.kind).toBe('AUTHENTICATED');
-    // T43R-fix の C-1 (a)（意図して直した期待）: 鍵の名前は、最初と最後の部分の接頭辞と接尾辞の案だけ。
-    expect(SPA_AUTH_STORAGE_KEY).toBe('fixture-auth-token');
-    expect(result.loginObservation?.storageKeys).toEqual({ origin: site.appOrigin, shapes: [{ prefix: '', suffix: '-token' }], omitted: 0 });
-    expect(result.loginObservation?.successSelector).toMatchObject({ selector: '#logout', kind: 'LOGOUT_CONTROL' });
-    expect(DISCOVERY_LOGOUT_WORDS as readonly (string | null | undefined)[]).toContain(result.loginObservation?.successSelector?.logoutWord);
-    const text = JSON.stringify(result.loginObservation);
-    expect(text).not.toContain(SPA_SHARED_HEADER_LINK.id);
-    expect(text).not.toContain(SPA_SHARED_HEADER_LINK.href);
-    expect(site.secretValues().filter((marker) => text.includes(marker))).toEqual([]);
-  }, TEST_TIMEOUT_MS);
+  // SLIM L-3: 結果の後の観察の案（T43d fix round 1）は、単体 `login-observation.test.ts`（鍵の名前の形・ログインの画面の CSS を除く成功のセレクタ）と、
+  // 自動ログインの段の観察のつながりの結合 `login-observation-hostile.test.ts`（'keeps no user name after the automated login'）へ任せた。
 
   // T36R-fix（ユーザーの判断「ログインの画面に form の要素がなければ止めるのでは監査が開始できない」）: form の要素のないログインの画面でも、値を入れて
   // 押し、token の送信 1 回で成功する（送信の要素は `button type="button"` と `role="button"`）。
@@ -180,47 +199,24 @@ describe.each(LAUNCHERS)('T36c: the automated script login stage with %s', (_lab
     expect(result.scriptLogin?.blockedByReason.LOGIN_CREDENTIAL_IN_REQUEST).toBe(0);
   }, TEST_TIMEOUT_MS);
 
-  // T36R-fix: form の要素のない画面でも、送信の要素が `href` のある `a` なら、値を入れずに止める（送信なし）。
-  it('stops before filling on the form-less login page whose submit element is a link', async () => {
-    const site = await startSite({ loginLayout: 'linkSubmit' });
-    const result = await runStage(site);
-    expect(result).toMatchObject({ kind: 'LOGIN_FORM_INVALID', submitted: 'NO', formInvalidReason: 'SUBMIT_BUTTON_INVALID' });
-    expect(backendNonReads(site)).toEqual([]);
-    expect(site.successfulLogins).toBe(0);
-  }, TEST_TIMEOUT_MS);
+  // SLIM L-3: 送信の要素が `href` のある `a` の form のない画面で値を入れずに止める場面は、検査の結合 `login-form-submitter.test.ts`
+  // （'inspects the %s layout of a script login by reading only' の `linkSubmit`）と、検査の失敗を `LOGIN_FORM_INVALID` にする `automated-login.test.ts` へ任せた。
+  // 429 の `RATE_LIMITED` と `Retry-After` の期限は、偽のワーカーの `control-audit-jobs-auto-login.test.ts`（429 の期限を待つ場面）と単体
+  // `login-http-status-results.test.ts`・`auto-login-limits.test.ts`（`retryAfterUntilOf`）へ任せた。
 
-  it.each<readonly [string, SpaAuthSiteOptions, string | undefined, string]>([
-    ['a wrong password (400)', {}, WRONG_PASSWORD_SUFFIX, 'INVALID_CREDENTIALS'],
-    ['a locked account (423)', { tokenResponse: 'locked' }, undefined, 'ACCOUNT_LOCKED'],
-    ['a server error (503)', { tokenResponse: 'serverError' }, undefined, 'AUTH_RESULT_UNKNOWN'],
-    ['no response', { tokenResponse: 'noResponse' }, undefined, 'AUTH_RESULT_UNKNOWN'],
-  ])('classifies %s from the token response, with the token request sent once', async (_name, options, passwordSuffix, expected) => {
+  // T36R-fix（T36R の M-4。DEF-099 の印。SLIM L-3 で前の別の場面をここへ畳んだ）: token を送って応答がなかった回は、送った後に応答がなかった印
+  // （`responseAfterSubmission: false`。親が試しを 2 回と数える）。応答のあった回（503 など）は付けない。
+  // RB-12: 423・503 などの表の行は、単体 `automated-login-result-steps.test.ts`（結果の輪）と `login-http-status-results.test.ts`（表）へ任せた。
+  it.each<readonly [string, SpaAuthSiteOptions, string | undefined, string, boolean]>([
+    ['a wrong password (400)', {}, WRONG_PASSWORD_SUFFIX, 'INVALID_CREDENTIALS', false],
+    ['no response', { tokenResponse: 'noResponse' }, undefined, 'AUTH_RESULT_UNKNOWN', true],
+  ])('classifies %s from the token response, with the token request sent once', async (_name, options, passwordSuffix, expected, unanswered) => {
     const site = await startSite(options);
     const result = await runStage(site, passwordSuffix === undefined ? {} : { passwordSuffix });
     expect(result).toMatchObject({ kind: expected, submitted: 'YES', retryAfterUntil: null });
+    expect((result as { readonly responseAfterSubmission?: false }).responseAfterSubmission).toBe(unanswered ? false : undefined);
     expect(backendNonReads(site)).toEqual([SPA_BACKEND_PATHS.token]);
     expect(result.scriptLogin?.tokenRequestsAllowed).toBe(1);
-  }, TEST_TIMEOUT_MS);
-
-  // T36R-fix（T36R の M-4。DEF-099 の印）: token を送って応答がなかった回は、送った後に応答がなかった印（親が試しを 2 回と数える）。応答のあった回は付けない。
-  it('marks no response to the token request with responseAfterSubmission false, and not a response', async () => {
-    const unanswered = await runStage(await startSite({ tokenResponse: 'noResponse' }));
-    expect(unanswered).toMatchObject({ kind: 'AUTH_RESULT_UNKNOWN', submitted: 'YES', responseAfterSubmission: false });
-    await spa?.close();
-    spa = undefined;
-    const answered = await runStage(await startSite({ tokenResponse: 'serverError' }));
-    expect(answered).toMatchObject({ kind: 'AUTH_RESULT_UNKNOWN', submitted: 'YES' });
-    expect('responseAfterSubmission' in answered).toBe(false);
-  }, TEST_TIMEOUT_MS);
-
-  it('classifies a rate limit (429) with the time to try again from Retry-After', async () => {
-    const site = await startSite({ tokenResponse: 'rateLimited' });
-    const before = Date.now();
-    const result = await runStage(site);
-    expect(result).toMatchObject({ kind: 'RATE_LIMITED', submitted: 'YES' });
-    const until = result.kind === 'RATE_LIMITED' ? result.retryAfterUntil?.getTime() ?? 0 : 0;
-    expect(until).toBeGreaterThanOrEqual(before + Number(SPA_TOKEN_RETRY_AFTER) * MS_PER_SECOND - MS_PER_SECOND);
-    expect(backendNonReads(site)).toEqual([SPA_BACKEND_PATHS.token]);
   }, TEST_TIMEOUT_MS);
 
   it('stops with an unknown result when the default GET form submission carries the credentials, and nothing carrying them arrives', async () => {
@@ -240,4 +236,65 @@ describe.each(LAUNCHERS)('T36c: the automated script login stage with %s', (_lab
     expect(result.scriptLogin?.blockedByReason.LOGIN_CREDENTIAL_IN_REQUEST).toBe(1);
     expect(backendNonReads(site)).toEqual([SPA_BACKEND_PATHS.token]);
   }, TEST_TIMEOUT_MS);
+
+  // SFIX-1104（前の automated-login-probe）: 2 つのパスワードの形で、自動ログインの段の通し方を崩す要求を確かめる。
+  it.each(PROBE_PASSWORD_KINDS)('SFIX-1104: delivers only the approved token request with the credentials, and the excluded path send without them (SD-2) (the %s password)', async (kind) => {
+    const site: LoginProbeSite = await startLoginProbeSite({ passwordKind: kind });
+    let browser: Browser | undefined;
+    let factory: BrowserContextFactory | undefined;
+    try {
+      browser = await launch();
+      const config = createTestConfig(site.appOrigin, '/auth', { audit: { sendPolicy: 'PASS_EXCEPT_DELETE' } });
+      factory = new BrowserContextFactory(browser, config, () => new SafetyLedger(), TEST_FACTORY_OPTIONS);
+      const monitor = new LoginStageMonitor();
+      const context = await factory.createLoginStageContext(config.viewports.primaryDesktop, {
+        loginPostEndpoints: [],
+        maxLoginPosts: 1,
+        monitor,
+        scriptRequest: {
+          scriptLogin: { origin: site.svcOrigin, path: '/auth/v1/token', requiredQuery: [{ name: 'grant_type', value: 'password' }] },
+          loginSideRequests: [],
+          approvedServiceOrigins: [site.svcOrigin],
+        },
+        credentialGuard: createLoginCredentialGuard({ username: site.username, password: site.password }),
+      });
+      const page = await factory.createPassivePage(context);
+      await page.goto(`${site.appOrigin}/auth`);
+      await page.locator('#email').fill(site.username);
+      await page.locator('#password').fill(site.password);
+      await page.locator('#submit').click();
+      await page.locator('#state[data-state="done"], #state[data-state="login-failed"]').waitFor({ state: 'attached', timeout: PROBE_RESULT_TIMEOUT_MS });
+      const results = JSON.parse((await page.locator('#state').getAttribute('data-results')) ?? '{}') as Record<string, number>;
+      const arrivals = (): string => JSON.stringify(site.records.filter(({ preflight }) => !preflight));
+      const counted = arrivals();
+      // 名前つきの時間だけ待って、遅れて届く要求（beacon など）を数え直す。
+      await wait(PROBE_LATE_REQUEST_WAIT_MS);
+      expect(arrivals()).toBe(counted);
+      const delivered = site.records.filter(({ preflight }) => !preflight);
+
+      expect(results).toEqual(PROBE_EXPECTED_RESULTS);
+      // 資格情報を含んで届いたのは、承認した token の送信 1 回だけ。
+      expect(delivered.filter(({ carriesCredential }) => carriesCredential).map(({ path, search }) => `${path}${search}`))
+        .toEqual(['/auth/v1/token?grant_type=password']);
+      // SFIX-1104-2 の C2: 読み取りでない要求で ID を含んで届いたのも、承認した token の送信だけ。読み取りの要求では、ID だけの Basic の GET の 1 件（M1）。
+      const isRead = (method: string): boolean => READ_METHODS.has(method);
+      expect(delivered.filter(({ carriesUsername, method }) => carriesUsername && !isRead(method)).map(({ path, search }) => `${path}${search}`))
+        .toEqual(['/auth/v1/token?grant_type=password']);
+      expect(delivered.filter(({ carriesUsername, method }) => carriesUsername && isRead(method)).map(({ path }) => path)).toEqual([READ_WITH_USERNAME_ONLY]);
+      // SD-2: 読まないパスへの送信（資格情報を含まない）も届き、止めた行には載らない。
+      expect(delivered.filter(({ path }) => path.startsWith(LOGIN_PROBE_EXCLUDED_PATH)).map(({ method }) => method)).toEqual(['POST']);
+      const snapshot = monitor.snapshot();
+      expect(snapshot.scriptRequest.tokenRequestsAllowed).toBe(1);
+      expect(snapshot.blockedRequests.requests.filter(({ path }) => path.startsWith(LOGIN_PROBE_EXCLUDED_PATH))).toEqual([]);
+      // 必須の query を保って query を足した 2 回目のログインの送信は、token の更新として通さない（通した一覧に token の送信先は、更新の 1 行だけ）。
+      expect(snapshot.passedRequests.requests.filter(({ path }) => path === '/auth/v1/token').map(({ query }) => query?.values))
+        .toEqual([[{ name: 'grant_type', value: 'refresh_token' }]]);
+      expect(factory.getSafetyLedger(context).snapshot().invariantViolationCount).toBe(0);
+      await factory.closePassiveContext(context);
+    } finally {
+      await factory?.close().catch(() => undefined);
+      await browser?.close().catch(() => undefined);
+      await site.close();
+    }
+  }, PROBE_TEST_TIMEOUT_MS);
 });

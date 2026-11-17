@@ -33,6 +33,7 @@ import {
   type DisplayValue,
 } from '../display/labels';
 import type { WriteReportView, WriteResultSummaryView, WriteUpdateResultView } from '../server/write-results';
+import { FieldNameText } from './FieldNameText';
 import { Notice } from './Notice';
 
 const text = LOCAL_UI_WRITE_TEXT;
@@ -78,7 +79,7 @@ function UpdateDiff({ update }: Readonly<{ update: WriteUpdateResultView }>) {
             <tbody>
               {update.changed.map((field) => (
                 <tr key={field.fieldName} data-testid="write-result-diff-changed" data-field-name={field.fieldName} data-matched={matchedAttribute(field.matched)}>
-                  <th scope="row"><code>{field.fieldName}</code></th>
+                  <th scope="row"><FieldNameText fieldName={field.fieldName} /></th>
                   <td><code data-testid="write-result-diff-previous">{field.previousValue}</code></td>
                   <td><code data-testid="write-result-diff-new">{field.newValue}</code></td>
                   <td><Matched matched={field.matched} /></td>
@@ -101,7 +102,7 @@ function UpdateDiff({ update }: Readonly<{ update: WriteUpdateResultView }>) {
             <tbody>
               {update.kept.map((field) => (
                 <tr key={field.fieldName} data-testid="write-result-diff-kept" data-field-name={field.fieldName} data-matched={matchedAttribute(field.matched)}>
-                  <th scope="row"><code>{field.fieldName}</code></th>
+                  <th scope="row"><FieldNameText fieldName={field.fieldName} /></th>
                   <td><Matched matched={field.matched} /></td>
                 </tr>
               ))}

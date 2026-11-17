@@ -15,10 +15,11 @@ import {
   LOCAL_UI_SCENARIO_TEXT,
   LOCAL_UI_TEXT,
 } from '../../../../src/presentation/messages.js';
+import { useSiteNameOf } from '../display/site-name';
 
 /**
  * 今どこにいるかの 1 行の、今の画面より上の 1 項目（行き先の画面の種類）。名前はこの部品が決める: 一覧と種類の画面は、その画面の題と同じ語。
- * サイトはサイトの名前（プロファイルの ID。一覧の画面と同じ）。シナリオは ID を画面に出さない（設計書 3 章の 2）ので、詳細の画面の題の語。
+ * サイトはサイトの名前（DN-1: 画面に出す名前。なければプロファイルの ID。一覧の画面と同じ）。シナリオは ID を画面に出さない（設計書 3 章の 2）ので、詳細の画面の題の語。
  */
 export type PageTrailStep =
   | { readonly kind: 'sites' }
@@ -57,13 +58,19 @@ export const arrivalSearchOf = (search: Readonly<Record<string, unknown>>): { re
  */
 const TRAIL_ACTIVE_OPTIONS = Object.freeze({ exact: true });
 
+/** 1 行のサイトの項目（DN-1: 名前は画面に出す名前。決め方は `siteNameOf` の 1 か所）。 */
+function SiteTrailLink({ profileId }: Readonly<{ profileId: string }>) {
+  const siteNameOf = useSiteNameOf();
+  return <Link to="/profiles/$profileId" params={{ profileId }} activeOptions={TRAIL_ACTIVE_OPTIONS}>{siteNameOf(profileId)}</Link>;
+}
+
 /** 1 行の 1 項目のリンク（名前と行き先）。 */
 function TrailStepLink({ step }: Readonly<{ step: PageTrailStep }>) {
   switch (step.kind) {
     case 'sites':
       return <Link to="/" activeOptions={TRAIL_ACTIVE_OPTIONS}>{LOCAL_UI_TEXT.pages.profiles}</Link>;
     case 'site':
-      return <Link to="/profiles/$profileId" params={{ profileId: step.profileId }} activeOptions={TRAIL_ACTIVE_OPTIONS}>{step.profileId}</Link>;
+      return <SiteTrailLink profileId={step.profileId} />;
     case 'readChecks':
       return <Link to="/read-checks/$profileId" params={{ profileId: step.profileId }} activeOptions={TRAIL_ACTIVE_OPTIONS}>{LOCAL_UI_READ_CHECK_TEXT.pages.readChecks}</Link>;
     case 'scenarios':

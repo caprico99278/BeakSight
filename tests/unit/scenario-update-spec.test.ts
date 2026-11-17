@@ -9,7 +9,7 @@
 // - 中身には、候補から求めた型にした識別の digest（`fingerprint.ts`）を持つ（承認の有効性は、これで判定する）。
 // 例の値は、匿名の値（`127.0.0.1`）だけを使う。
 import { describe, expect, it } from 'vitest';
-import { MAX_SCENARIO_KEEP_FIELD_NAMES, type ScenarioKindFact } from '../../src/control/approval/scenario-contracts.js';
+import type { ScenarioKindFact } from '../../src/control/approval/scenario-contracts.js';
 import {
   NO_SCENARIO_DRAFT_CONTEXT,
   SCENARIO_DRAFT_REJECTION_REASONS,
@@ -19,7 +19,6 @@ import {
   type ScenarioDraftValidationResult,
 } from '../../src/control/approval/scenario-policy.js';
 import type { DiscoveredCandidate, DiscoveryCandidate } from '../../src/discovery/candidate-contracts.js';
-import { MAX_CANDIDATE_FIELDS } from '../../src/discovery/candidate-contracts.js';
 import { recordIdSegmentPairOfTemplates, templatedIdentityDigestOf } from '../../src/discovery/fingerprint.js';
 import { isSecretLikeStateField } from '../../src/discovery/read-check-contracts.js';
 import { CREATE_CANDIDATE, OTHER_PROFILE_ID, PROFILE_ID, READ_CHECK_FACTS, candidateOf, sampleDraft } from './approval-samples.js';
@@ -106,7 +105,6 @@ describe('UPDATE spec contracts (T31b)', () => {
       'SCENARIO_UPDATE_PATH_NOT_BOUND_TO_LEDGER_ID',
     ]));
     expect(SCENARIO_DRAFT_REJECTION_REASONS.every((reason) => reason.startsWith('SCENARIO_'))).toBe(true);
-    expect(MAX_SCENARIO_KEEP_FIELD_NAMES).toBe(MAX_CANDIDATE_FIELDS);
     expect(NO_SCENARIO_DRAFT_CONTEXT).toEqual({ scenarioId: null, scenarios: [] });
     expect(Object.isFrozen(NO_SCENARIO_DRAFT_CONTEXT)).toBe(true);
   });
@@ -157,7 +155,6 @@ describe('UPDATE spec in the draft validation (T31b)', () => {
     ['a placeholder inside a segment', { formPathTemplate: '/members/x{id}/edit' }],
     ['a query in the template', { actionPathTemplate: '/members/{id}?back=1' }],
     ['a template without a leading slash', { formPathTemplate: 'members/{id}/edit' }],
-    ['a template above the length limit', { formPathTemplate: `/${'a'.repeat(2048)}/{id}` }],
     ['a target id of another form', { targetCreateScenarioId: 'Scenario Create' }],
     ['a duplicate keep field', { keepFieldNames: ['email', 'email', 'note', 'status'] }],
     ['an empty keep field name', { keepFieldNames: ['email', '', 'note', 'status'] }],
@@ -183,11 +180,17 @@ describe('UPDATE spec in the draft validation (T31b)', () => {
     expect(codesOf(validate(updateDraft({}, change)))).toEqual(['SCENARIO_UPDATE_PATH_MISMATCH']);
   });
 
+  // L12b（設計書 `2026-11-09-beaksight-remove-limits-design.md` 6.2。設計者の判断 2）: 登録の ID の長さの上限（前は 256）は撤廃した。形（英数字・`_`・`-`）
+  // だけで決める。前は 300 桁の ID を、長さで拒んでいた。
   it('rejects a record id outside the record id form', () => {
-    const longId = '1'.repeat(300);
-    const candidate = editCandidate(longId);
+    const candidate = editCandidate('a.b');
     expect(codesOf(validate(updateDraft({ candidateIdentityDigest: candidate.identityDigest }), candidate)))
       .toEqual(['SCENARIO_UPDATE_RECORD_ID_UNSAFE']);
+  });
+
+  it('accepts a record id of the record id form longer than the former length limit', () => {
+    const candidate = editCandidate('1'.repeat(300));
+    expect(codesOf(validate(updateDraft({ candidateIdentityDigest: candidate.identityDigest }), candidate))).toEqual([]);
   });
 
   it('requires a role for every visible editable field, at most one role per field, and at least one field to change', () => {

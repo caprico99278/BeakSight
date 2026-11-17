@@ -1,0 +1,177 @@
+{
+  "$id": "urn:beaksight:schema:discovery-checkpoint:1.0",
+  "description": "DEF-200 (doc/design/2026-11-04-beaksight-login-session-design.md 3.4): the state of a discovery job written after each page (checkpoint/discovery-state.json in the Run directory), so that the job signed in again after a lost sign-in continues the same Run without reading the read pages again. COV-2 (doc/design/2026-11-09-beaksight-coverage-by-state-design.md 3.2): version 2.0 holds the recursive coverage queue (CoverageQueue.snapshot in src/discovery/coverage-queue.ts; redacted URLs only, the pressed pairs and the closed chains); version 1.0 is no longer read (the continuation stops). The writer passes it through the URL secret redaction of the artifacts. It holds the facts of discovery.json only (no credential, token, cookie, input value or option label); the pages are the page entries of the discovery schema, referenced and not copied. A file of another Run, another job, another auth setup or another target configuration is not used.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schemaVersion",
+    "runId",
+    "jobId",
+    "authenticationSha256",
+    "targetConfigSha256",
+    "startedAt",
+    "coverage",
+    "allocator",
+    "readPages",
+    "unreadReasons",
+    "excluded",
+    "uncountedStateIds",
+    "crawledPages"
+  ],
+  "properties": {
+    "schemaVersion": { "const": "discovery-checkpoint-schema/2.0" },
+    "runId": { "$ref": "urn:beaksight:schema:run:1.0#/properties/runId" },
+    "jobId": { "type": "string", "pattern": "^[a-z0-9][a-z0-9-]{0,63}$" },
+    "authenticationSha256": { "type": "string", "pattern": "^[0-9a-f]{64}$" },
+    "targetConfigSha256": { "type": "string", "pattern": "^[0-9a-f]{64}$" },
+    "startedAt": { "$ref": "urn:beaksight:schema:discovery:1.0#/$defs/compactUtcTimestamp" },
+    "coverage": {
+      "description": "The coverage queue snapshot (format beaksight-coverage-queue/2). CoverageQueue.restore checks the location keys against the redacted URLs, the IDs, the pending list and the trails.",
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["format", "states", "pending", "pressed", "closedChains"],
+      "properties": {
+        "format": { "const": "beaksight-coverage-queue/2" },
+        "states": { "type": "array", "items": { "$ref": "#/$defs/state" } },
+        "pending": { "type": "array", "items": { "$ref": "#/$defs/digest" } },
+        "pressed": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["structureKey", "candidateIdentityDigest", "ordinal"],
+            "properties": {
+              "structureKey": { "$ref": "#/$defs/digest" },
+              "candidateIdentityDigest": { "$ref": "#/$defs/digest" },
+              "ordinal": { "$ref": "#/$defs/count" }
+            }
+          }
+        },
+        "closedChains": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["stateId", "kind", "reason", "droppedEdgeCount"],
+            "properties": {
+              "stateId": { "$ref": "#/$defs/digest" },
+              "kind": { "$ref": "#/$defs/edgeKind" },
+              "reason": { "enum": ["NO_NEW_LOCATION_OR_STRUCTURE"] },
+              "droppedEdgeCount": { "$ref": "#/$defs/count" }
+            }
+          }
+        }
+      }
+    },
+    "allocator": { "$ref": "urn:beaksight:schema:checkpoint:1.0#/properties/allocator" },
+    "readPages": { "type": "array", "items": { "$ref": "urn:beaksight:schema:discovery:1.0#/$defs/page" } },
+    "unreadReasons": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["stateId", "reason"],
+        "properties": {
+          "stateId": { "$ref": "#/$defs/digest" },
+          "reason": { "$ref": "urn:beaksight:schema:discovery:1.0#/$defs/page/oneOf/1/properties/reason" }
+        }
+      }
+    },
+    "excluded": { "type": "array", "items": { "$ref": "urn:beaksight:schema:discovery:1.0#/$defs/url" } },
+    "uncountedStateIds": {
+      "description": "COV-2: the states not counted against the page limit (the create pages read first in the chained run and the opened edit pages).",
+      "type": "array",
+      "uniqueItems": true,
+      "items": { "$ref": "#/$defs/digest" }
+    },
+    "crawledPages": { "type": "integer", "minimum": 0 },
+    "sharedLayoutDigests": {
+      "description": "Optional (DEF-208-4; discovery coverage design 3.7 A): the identity digests of the shared layout buttons pressed so far (digests only; no values and no paths). The continuation does not press them again. Absent when there are none.",
+      "type": "array",
+      "minItems": 1,
+      "uniqueItems": true,
+      "items": { "type": "string", "pattern": "^sha256:[0-9a-f]{64}$" }
+    }
+  },
+  "$defs": {
+    "digest": { "type": "string", "pattern": "^sha256:[0-9a-f]{64}$" },
+    "count": { "type": "integer", "minimum": 0, "maximum": 9007199254740991 },
+    "edgeKind": { "enum": ["LINK", "SPA_ROUTE", "QUERY_CHANGE", "PRESS_RESULT", "OPENED_REGION", "FRAME", "OPTION_SELECT"] },
+    "nullableText": { "anyOf": [{ "type": "string" }, { "type": "null" }] },
+    "state": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "stateId", "locationKey", "kind", "url", "redacted", "frame", "openedRegion", "depth", "chainLength", "preferred", "status", "structureKey",
+        "observedStructureKey", "parentStateId", "trail"
+      ],
+      "properties": {
+        "stateId": { "$ref": "#/$defs/digest" },
+        "locationKey": { "$ref": "#/$defs/digest" },
+        "kind": { "$ref": "#/$defs/edgeKind" },
+        "url": { "$ref": "urn:beaksight:schema:discovery:1.0#/$defs/url" },
+        "redacted": { "type": "boolean" },
+        "frame": { "$ref": "#/$defs/nullableText" },
+        "openedRegion": { "$ref": "#/$defs/nullableText" },
+        "depth": { "$ref": "#/$defs/count" },
+        "chainLength": { "$ref": "#/$defs/count" },
+        "preferred": { "type": "boolean" },
+        "status": { "enum": ["QUEUED", "READING", "READ"] },
+        "structureKey": { "anyOf": [{ "$ref": "#/$defs/digest" }, { "type": "null" }] },
+        "observedStructureKey": { "anyOf": [{ "$ref": "#/$defs/digest" }, { "type": "null" }] },
+        "parentStateId": { "anyOf": [{ "$ref": "#/$defs/digest" }, { "type": "null" }] },
+        "redactedQueryNames": {
+          "description": "Optional (COV-2c; SREV-COV I-4): the query names whose values the location key and the record redact besides the secret-looking names (the names whose values carry a probe marker on a page moved to by a press). Names only, never a value. Absent when none.",
+          "type": "array",
+          "uniqueItems": true,
+          "items": { "type": "string", "minLength": 1 }
+        },
+        "frozenRead": {
+          "description": "Optional (COV-2c fix round 4; SREV-COV 3rd review C-1): the state is read only inside the freeze, because it was found from a state made by a press (the mark is inherited along the edges). The discovery loads the nearest ancestor not made by a press, freezes it and loads the ancestors and this state frozen. Absent when false.",
+          "const": true
+        },
+        "pressTrail": {
+          "description": "Optional (COV-2c; SREV-COV I-4): the presses on the parent state that lead to this state (a page moved to by a press, or a URL changed in the same document by a press). After the resume, the discovery reads the parent again and replays these presses (frozen; nothing is delivered) to rebuild the redacted URL. Each press is the candidate position, its match key (the identity digest and a structure hint; no value) and the order among the same key. Absent for the states not made by a press.",
+          "type": "array",
+          "minItems": 1,
+          "items": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["index", "matchKey", "ordinal"],
+            "properties": {
+              "index": { "$ref": "#/$defs/count" },
+              "matchKey": { "type": "string", "minLength": 1 },
+              "ordinal": { "$ref": "#/$defs/count" }
+            }
+          }
+        },
+        "trail": {
+          "anyOf": [
+            { "type": "null" },
+            {
+              "type": "object",
+              "additionalProperties": false,
+              "required": ["baseStateId", "presses"],
+              "properties": {
+                "baseStateId": { "$ref": "#/$defs/digest" },
+                "presses": {
+                  "type": "array",
+                  "minItems": 1,
+                  "items": {
+                    "type": "object",
+                    "additionalProperties": false,
+                    "required": ["candidateIdentityDigest", "ordinal"],
+                    "properties": {
+                      "candidateIdentityDigest": { "$ref": "#/$defs/digest" },
+                      "ordinal": { "$ref": "#/$defs/count" }
+                    }
+                  }
+                }
+              }
+            }
+          ]
+        }
+      }
+    }
+  }
+}

@@ -76,6 +76,9 @@
  *    - 見えない checkbox・radio・select（select-one）は、チェック・選択の状態と値を読み、チェック・選択があればその値を照らし
  *      （`checkedPassthroughFields`）、なければ「送られない」にする（`absentFieldNames`）。同じ名前で 2 つ以上チェックしていれば
  *      `VALUE_NOT_SUPPORTED`。見えない select-multiple と、hidden・readonly・見えない password は、期待を作れない（`SPEC_INVALID`）。
+ * LU-SFIX2-A（LU-SREV2 の Minor-1 と同じ形）: 確かめ（`inspectWriteForm`・`inspectUpdateForm`）と確かめ直し（`reinspect`）は、form を決めた読み取りと同じ 1 回の
+ * 読み取りで、決めた form・送信ボタン・送る欄の要素そのものの番号（backendNodeId）を受ける（`readDecideAndTrack`。要素の橋渡しの部品
+ * `readElementsInIsolatedWorld` の `choose`）。決めた後に位置で引き直さない（決めた読み取りと番号の読み取りの間に、ページの JS が要素を入れ替える窓がない）。
  * 要素は、isolated world で読んだ位置（文書の根からの要素の番号）の XPath で Playwright に渡す。最初の確かめで、form・送信ボタン・送る欄の要素を
  * Playwright の要素の参照で持ち、確かめ直しのたびに、同じ位置の要素が同じものか（`===`。ページの JS は偽れない）を比べる（同じ形の写しに
  * 差し替えた form も `FORM_CHANGED` で止める）。読んだ後に DOM が変わっても、入れた後と押す直前の確かめ直し（位置・要素・値）と、Guard の
@@ -83,10 +86,19 @@
  * 例外を投げない。
  */
 import type { Locator, Page } from 'playwright';
+import { wait } from '../core/deadline.js';
 import { isRecord } from '../core/guards.js';
+import type { ObservationWindows } from '../core/observation-windows.js';
 import { isSecretUrlQueryParameterName } from '../core/secret-query-names.js';
 import { fieldNameHasRemovalWord, fieldNameHasStateWord } from '../discovery/classify.js';
-import { backendNodeIdsAtPaths, readInIsolatedWorld, withSignaledElements } from '../discovery/isolated-read.js';
+import {
+  pressWithPressTimeGuard,
+  readElementsInIsolatedWorld,
+  readInIsolatedWorld,
+  withSignaledElements,
+  type InPageElementsResult,
+  type PressTimeFacts,
+} from '../discovery/isolated-read.js';
 import { composeInPage, type StandardReaders } from './in-page-readers.js';
 import {
   CANDIDATE_FIELD_TYPES,
@@ -106,6 +118,7 @@ import {
   WRITE_FORM_ENCTYPES,
   WRITE_METHOD_OVERRIDES,
   type WriteCheckboxPair,
+  type WriteDeferredPriorValues,
   type WriteFormEnctype,
   type WriteMethodOverride,
   type WritePayloadExpectation,
@@ -116,15 +129,19 @@ import { elementPathSelectorOf } from './element-path-engine.js';
 import {
   FORM_POST_METHOD,
   FORM_SELF_TARGETS,
-  FORM_STEP_TIMEOUT_MS,
   lineFeedForm,
   sameValue,
   valueChangeKindOf,
+  waitForPageQuietAfterPress,
+  WRITE_STEP_TIMEOUT_MS,
   type WriteInputValueChange,
 } from './form-submission-common.js';
 
-/** フォームを読む・値を入れる・送る、それぞれの時間の上限（ms。ログインの入力の部品と同じ値）。 */
-export const WRITE_FORM_STEP_TIMEOUT_MS = FORM_STEP_TIMEOUT_MS;
+/**
+ * フォームを読む・値を入れる・送る、それぞれを待つ長さ（ms）。L12b（T23）: 前の上限（ログインと同じ 10 秒）を撤廃し、書き込みの入力の部品の共通の値
+ * （`WRITE_STEP_TIMEOUT_MS`。L0 の反応なしの長さ）にした。
+ */
+export const WRITE_FORM_STEP_TIMEOUT_MS = WRITE_STEP_TIMEOUT_MS;
 
 /**
  * 止めた理由（閉じた一覧。確かめの理由、入力と送信の理由の順）。
@@ -193,6 +210,17 @@ export interface WriteFormSpec {
   readonly candidateFields: readonly WriteFormFieldSpec[];
   readonly submittedFieldNames: readonly string[];
   readonly methodOverride: WriteMethodOverride | null;
+  /**
+   * LU-12b（設計書 `2026-11-02-beaksight-list-row-update-design.md` 5.5 の 6）: 一覧の行の更新で、送る form を、この位置の見えている form だけに限る（ワーカーが
+   * `locateRowWriteForms` の結果と行の決まりで 1 つに決めた位置）。省けば今のまま（送る欄の名前で決める）。位置の form がない・見えていなければ `FORM_NOT_FOUND`。
+   */
+  readonly formPath?: readonly number[] | undefined;
+  /**
+   * LU-SFIX4（LU-REV の I-2）: 押す時点の確かめに足す、送信ボタンの事実の確かめ（一覧の行の更新で、ワーカーが form の識別を承認の候補と照らした後に渡す。承認の
+   * 候補の送信ボタンの語と同じで、削除の語を含まないか。比べ方は API の送り手と共有する部品で、ワーカーが組む。この部品は API の送り手を参照しない）。偽なら押さない。
+   * 省けば今のまま。
+   */
+  readonly submitterFactsAccepted?: ((facts: PressTimeFacts) => boolean) | undefined;
 }
 
 /** 送る中身の照合（Guard の `WritePayloadExpectation`）に渡す、名前の一覧と、値を照らす欄の期待（承認した候補から求める）。 */
@@ -282,9 +310,8 @@ const SUBMIT_INPUT_TYPES: readonly string[] = Object.freeze(['submit', 'image'])
 const UNREAD_VALUE_TYPES: readonly string[] = Object.freeze(['hidden', 'password', 'file']);
 /** T31g-1: 名前で読むと決めた欄でも、値を読まない型（`candidate-contracts.ts` の値を送れない型。password・file）。 */
 const NEVER_READ_VALUE_TYPES: readonly string[] = Object.freeze([...UNSENDABLE_FIELD_TYPES]);
-/** 読み取りの上限（文書の form の数、1 つの form の要素の数）。超えたら読めなかったとする（fail-closed）。 */
-const MAX_READ_FORMS = 256;
-const MAX_READ_FORM_CONTROLS = 512;
+// L12b（N20）: 読み取りの数の上限（前は form 256・要素 512）を置かない。LZ-3b: ページの中に渡していた番兵（前の `NO_WRITE_FORM_READ_LIMIT` =
+// `Number.MAX_SAFE_INTEGER`）と、上限の印（`limitReached`。立てば `FORM_UNREADABLE`）も消した。ページの中では数を比べない。
 /** `accept-charset` で受ける文字コードの名前（小文字。ほかの名前は止める）。 */
 const UTF8_ACCEPT_CHARSET = 'utf-8';
 /** checkbox・radio の `value` の属性がないときの値（HTML の既定）。 */
@@ -305,8 +332,12 @@ interface WriteFormReadInput {
   readonly unreadValueTypes: readonly string[];
   readonly neverReadTypes: readonly string[];
   readonly defaultCheckableValue: string;
-  readonly maxForms: number;
-  readonly maxControls: number;
+  /**
+   * LU-SFIX2-A: 位置のある要素（form・送信ボタン・欄）そのものも返すか。真なら、結果を `InPageElementsResult` の形にし、`elements` に要素を、`value` の
+   * `elementPathKeys` に、同じ順で、その位置の鍵（`pathKeySeparator` でつないだ位置）を入れる。
+   */
+  readonly withElements: boolean;
+  readonly pathKeySeparator: string;
 }
 
 /** 読んだ欄（値を読む欄だけ、値と選択の状態を持つ）。 */
@@ -343,12 +374,13 @@ interface ReadForm {
   readonly submitters: readonly ReadSubmitter[];
   /** form の中の要素のうち、候補の名前を持ち、別の form に結び付いた欄の名前。 */
   readonly foreignNames: readonly string[];
+  /** LU-12b: form が描かれているか（`getClientRects` の数が 1 以上。`hidden` の form と、隠れた行の中の form は偽）。 */
+  readonly visible: boolean;
 }
 
 interface ReadDocument {
   readonly forms: readonly ReadForm[];
   readonly baseTarget: string;
-  readonly limitReached: boolean;
 }
 
 /**
@@ -356,7 +388,7 @@ interface ReadDocument {
  * 欄（`valueNames` の、hidden・password・file でない型の欄と、`hiddenValueNames` の、password・file でない型の欄）だけを読む。
  * 部品（`R`）は `composeInPage` で組み込む（`src/browser/in-page-readers.ts`。CC-068）。
  */
-function readWriteFormsReader(R: StandardReaders, input: WriteFormReadInput): ReadDocument {
+function readWriteFormsReader(R: StandardReaders, input: WriteFormReadInput): ReadDocument | InPageElementsResult {
   // 標準の prototype の getter（部品の `standardGetter`。`src/browser/in-page-readers.ts`。CC-068）。
   const { standardGetter: getterOf } = R;
   const text = (value: unknown): string => (typeof value === 'string' ? value : '');
@@ -391,30 +423,32 @@ function readWriteFormsReader(R: StandardReaders, input: WriteFormReadInput): Re
   const querySelectorAll = (root: Element, selectors: string): unknown => Element.prototype.querySelectorAll.call(root, selectors);
 
   // 要素の位置（文書の根からの、要素の子の中の番号）。shadow root の中なら null（部品の `elementPathOf`。要素の橋渡しと同じ数え方。T32j-4）。
-  const pathOf = R.elementPathOf;
+  // LU-SFIX2-A: 位置のある要素そのものと、その位置の鍵も集める（`withElements` のときだけ返す）。
+  const trackedElements: Element[] = [];
+  const trackedKeys: string[] = [];
+  const pathOf = (element: Element): number[] | null => {
+    const path = R.elementPathOf(element);
+    if (input.withElements && path !== null) {
+      trackedElements.push(element);
+      trackedKeys.push(path.join(input.pathKeySeparator));
+    }
+    return path;
+  };
   const valueRead = (name: string, type: string): boolean => (input.valueNames.includes(name) && !input.unreadValueTypes.includes(type))
     || (input.hiddenValueNames.includes(name) && !input.neverReadTypes.includes(type));
   const overrideOf = (element: Element, prototype: object, attribute: string, property: string): string | null =>
     hasAttribute(element, attribute) ? text(getterOf(prototype, property)(element)) : null;
 
-  let limitReached = false;
   const forms: ReadForm[] = [];
   const formCollection = formsOf(document);
   const formCount = Number(collectionLengthOf(formCollection));
-  if (formCount > input.maxForms) {
-    limitReached = true;
-  }
-  for (let formIndex = 0; formIndex < Math.min(formCount, input.maxForms); formIndex += 1) {
+  for (let formIndex = 0; formIndex < formCount; formIndex += 1) {
     const form = itemOf(formCollection, formIndex);
     if (form === null) {
       continue;
     }
     const elements = formElementsOf(form);
     const count = Number(collectionLengthOf(elements));
-    if (count > input.maxControls) {
-      limitReached = true;
-      continue;
-    }
     const controls: ReadControl[] = [];
     const submitters: ReadSubmitter[] = [];
     for (let index = 0; index < count; index += 1) {
@@ -504,11 +538,13 @@ function readWriteFormsReader(R: StandardReaders, input: WriteFormReadInput): Re
       controls,
       submitters,
       foreignNames,
+      visible: Number(Element.prototype.getClientRects.call(form).length) > 0,
     });
   }
   // `document` の名前つきの要素（`<img name="querySelector">` など）に隠されないように、標準のメソッドで読む。
   const base = Document.prototype.querySelector.call(document, 'base[target]');
-  return { forms, baseTarget: base === null ? '' : text(getAttribute(base, 'target')), limitReached };
+  const read: ReadDocument = { forms, baseTarget: base === null ? '' : text(getAttribute(base, 'target')) };
+  return input.withElements ? { value: { ...read, elementPathKeys: trackedKeys }, elements: trackedElements } : read;
 }
 const readWriteFormsInPage = composeInPage(readWriteFormsReader);
 
@@ -535,11 +571,12 @@ const isReadForm = (value: unknown): value is ReadForm => isRecord(value)
   && isNullableString(value['target'])
   && Array.isArray(value['controls']) && value['controls'].every(isReadControl)
   && Array.isArray(value['submitters']) && value['submitters'].every(isReadSubmitter)
-  && Array.isArray(value['foreignNames']) && value['foreignNames'].every(isString);
+  && Array.isArray(value['foreignNames']) && value['foreignNames'].every(isString)
+  && typeof value['visible'] === 'boolean';
 
 const isReadDocument = (value: unknown): value is ReadDocument => isRecord(value)
   && Array.isArray(value['forms']) && value['forms'].every(isReadForm)
-  && isString(value['baseTarget']) && typeof value['limitReached'] === 'boolean';
+  && isString(value['baseTarget']);
 
 // ---------------------------------------------------------------------------------------------------------------
 // 判定（Node の側）
@@ -558,9 +595,9 @@ interface InspectedState {
   readonly signature: string;
   /**
    * form・送信ボタン・送る欄の位置と、最初の確かめの時の要素の backendNodeId（isolated world で読む。同じ要素かを、ページの JS に偽られずに
-   * 確かめる。DEF-114。T32j-4）。
+   * 確かめる。DEF-114。T32j-4）。DEF-237: 位置は、確かめ直しが通るたびに今読んだ位置に更新する（番号は変えない）。
    */
-  readonly elements: TrackedElements;
+  elements: TrackedElements;
   /** T31g-1: UPDATE の確かめ（欄の役割と前の値）。CREATE はない。 */
   readonly update?: { readonly roles: UpdateRoles; readonly prior: UpdateFormValues } | undefined;
 }
@@ -910,12 +947,61 @@ function submitterProblemOf(spec: WriteFormSpec, form: ReadForm, submitter: Read
   return acceptsOnlyUtf8(form.acceptCharset) ? null : 'ACCEPT_CHARSET_NOT_UTF8';
 }
 
+/** 2 つの要素の位置が同じか（どちらかが null なら偽）。 */
+const samePath = (left: readonly number[] | null, right: readonly number[] | null): boolean =>
+  left !== null && right !== null && left.length === right.length && left.every((step, index) => right[index] === step);
+
+/** LU-12b: 送信先へ送る form の、位置と見え方（値は持たない）。 */
+export interface RowWriteFormPlace {
+  readonly path: readonly number[];
+  readonly visible: boolean;
+}
+
+/** LU-12b: 送信先へ送る form の読み取りの結果（読めない・上限で読み切れない・位置のない form があれば `FAILED`）。 */
+export type RowWriteFormsOutcome =
+  | { readonly status: 'READ'; readonly forms: readonly RowWriteFormPlace[] }
+  | { readonly status: 'FAILED' };
+
+/**
+ * LU-12b（設計書 5.5 の 6。LU-12-brief の 3.4）: 一覧の画面で、承認の送信先（`endpoint`。台帳の番号を入れた具体的な path）へ送る form（form の action か、
+ * 送信ボタンの formaction を解決した URL が送信先。比べ方は送信ボタンの確かめと同じ `isWriteEndpointUrl`）の位置と見え方を、1 回の読み取りで返す（読むだけ。
+ * 例外を投げない）。行の決まりで 1 つに決めるのは呼ぶ側（ワーカー）。
+ */
+export async function locateRowWriteForms(
+  page: Page,
+  spec: Pick<WriteFormSpec, 'endpoint' | 'candidateFields'>,
+  timeoutMs = WRITE_FORM_STEP_TIMEOUT_MS,
+): Promise<RowWriteFormsOutcome> {
+  const failed: RowWriteFormsOutcome = { status: 'FAILED' };
+  try {
+    const read = { ...spec, enctype: 'application/x-www-form-urlencoded', submittedFieldNames: [], methodOverride: null } as WriteFormSpec;
+    const outcome = await readInIsolatedWorld(page, readWriteFormsInPage, readInputOf(read, { valueNames: [], hiddenValueNames: [] }, false), Date.now() + timeoutMs);
+    if (outcome.status !== 'READ' || !isReadDocument(outcome.value)) {
+      return failed;
+    }
+    const forms: RowWriteFormPlace[] = [];
+    for (const form of outcome.value.forms) {
+      const sends = isWriteEndpointUrl(form.action, spec.endpoint)
+        || form.submitters.some((submitter) => submitter.action !== null && isWriteEndpointUrl(submitter.action, spec.endpoint));
+      if (!sends) {
+        continue;
+      }
+      if (form.path === null) {
+        return failed;
+      }
+      forms.push(Object.freeze({ path: Object.freeze([...form.path]), visible: form.visible }));
+    }
+    return Object.freeze({ status: 'READ', forms: Object.freeze(forms) });
+  } catch {
+    return failed;
+  }
+}
+
 /** 読んだ文書から、送る form と送信ボタンを決めて確かめる（ファイルの先頭の説明の順）。 */
 function decideWriteForm(spec: WriteFormSpec, read: ReadDocument): Decision {
-  if (read.limitReached) {
-    return { ok: false, reason: 'FORM_UNREADABLE' };
-  }
-  const forms = read.forms.filter((form) => spec.submittedFieldNames.every((name) =>
+  // LU-12b: 一覧の行の更新は、ワーカーが決めた位置の見えている form だけ（位置で 1 つに決める。ほかの行の form を数えない）。
+  const located = spec.formPath === undefined ? read.forms : read.forms.filter((form) => form.visible && samePath(form.path, spec.formPath ?? null));
+  const forms = located.filter((form) => spec.submittedFieldNames.every((name) =>
     form.controls.some((control) => control.name === name) || form.foreignNames.includes(name)));
   const [form, ...others] = forms;
   if (form === undefined) {
@@ -978,28 +1064,96 @@ async function readAndDecide(
   page: Page,
   spec: WriteFormSpec,
   timeoutMs: number,
-  names: ValueReadNames = { valueNames: spec.submittedFieldNames, hiddenValueNames: [] },
+  names: ValueReadNames = defaultValueReadNamesOf(spec),
 ): Promise<Decision> {
-  const input: WriteFormReadInput = {
-    candidateNames: [...new Set(spec.candidateFields.map((candidate) => candidate.name))],
-    valueNames: [...names.valueNames],
-    hiddenValueNames: [...names.hiddenValueNames],
-    buttonInputTypes: BUTTON_INPUT_TYPES,
-    submitInputTypes: SUBMIT_INPUT_TYPES,
-    unreadValueTypes: UNREAD_VALUE_TYPES,
-    neverReadTypes: NEVER_READ_VALUE_TYPES,
-    defaultCheckableValue: DEFAULT_CHECKABLE_VALUE,
-    maxForms: MAX_READ_FORMS,
-    maxControls: MAX_READ_FORM_CONTROLS,
-  };
-  const outcome = await readInIsolatedWorld(page, readWriteFormsInPage, input, Date.now() + timeoutMs);
+  const outcome = await readInIsolatedWorld(page, readWriteFormsInPage, readInputOf(spec, names, false), Date.now() + timeoutMs);
   if (outcome.status !== 'READ' || !isReadDocument(outcome.value)) {
     return { ok: false, reason: 'FORM_UNREADABLE' };
   }
   return decideWriteForm(spec, outcome.value);
 }
 
-const signatureOf = (layout: WriteFormLayout): string => JSON.stringify(layout);
+/** 値を読む欄の名前の既定（送る欄だけ。CREATE）。 */
+const defaultValueReadNamesOf = (spec: WriteFormSpec): ValueReadNames => ({ valueNames: spec.submittedFieldNames, hiddenValueNames: [] });
+
+/** ページの中の読み取りの入力。 */
+const readInputOf = (spec: WriteFormSpec, names: ValueReadNames, withElements: boolean): WriteFormReadInput => ({
+  candidateNames: [...new Set(spec.candidateFields.map((candidate) => candidate.name))],
+  valueNames: [...names.valueNames],
+  hiddenValueNames: [...names.hiddenValueNames],
+  buttonInputTypes: BUTTON_INPUT_TYPES,
+  submitInputTypes: SUBMIT_INPUT_TYPES,
+  unreadValueTypes: UNREAD_VALUE_TYPES,
+  neverReadTypes: NEVER_READ_VALUE_TYPES,
+  defaultCheckableValue: DEFAULT_CHECKABLE_VALUE,
+  withElements,
+  pathKeySeparator: PATH_KEY_SEPARATOR,
+});
+
+/** 決めて、要素の番号も受けた結果（番号は、決めた form が通り、`pathsOf` が位置を返したときだけ）。 */
+interface TrackedDecision {
+  readonly decision: Decision;
+  readonly elements: TrackedElements | null;
+}
+
+/**
+ * LU-SFIX2-A（LU-SREV2 の Minor-1 と同じ形）: form を読んで決め（`readAndDecide` と同じ読み取りと判定）、決めた form の位置（`pathsOf`。null なら番号を受けない）の
+ * 要素の番号（backendNodeId）を、同じ 1 回の読み取りの要素そのものから受ける（`readElementsInIsolatedWorld` の `choose`。位置で引き直さない）。読めない・位置の
+ * 要素がない・数が合わないときは `FORM_UNREADABLE`。
+ */
+async function readDecideAndTrack(
+  page: Page,
+  spec: WriteFormSpec,
+  timeoutMs: number,
+  names: ValueReadNames,
+  pathsOf: (layout: WriteFormLayout) => readonly (readonly number[])[] | null,
+): Promise<TrackedDecision> {
+  const unreadable: TrackedDecision = { decision: { ok: false, reason: 'FORM_UNREADABLE' }, elements: null };
+  const state: { decision: Decision | null; paths: readonly (readonly number[])[] | null } = { decision: null, paths: null };
+  const outcome = await readElementsInIsolatedWorld(
+    page,
+    readWriteFormsInPage as (input: WriteFormReadInput) => InPageElementsResult,
+    readInputOf(spec, names, true),
+    Date.now() + timeoutMs,
+    {
+      choose: (value) => {
+        if (!isReadDocument(value) || !isRecord(value) || !Array.isArray(value['elementPathKeys'])) {
+          return null;
+        }
+        const decision = decideWriteForm(spec, value);
+        state.decision = decision;
+        const paths = decision.ok ? pathsOf(decision.layout) : null;
+        if (paths === null) {
+          return [];
+        }
+        const keys = value['elementPathKeys'] as readonly unknown[];
+        const indexes = paths.map((path) => keys.indexOf(path.join(PATH_KEY_SEPARATOR)));
+        if (indexes.some((index) => index < 0)) {
+          return null;
+        }
+        state.paths = paths;
+        return indexes;
+      },
+    },
+  );
+  const { decision, paths } = state;
+  if (outcome.status !== 'READ' || decision === null) {
+    return unreadable;
+  }
+  if (paths === null) {
+    return { decision, elements: null };
+  }
+  if (outcome.elements.length !== paths.length) {
+    return unreadable;
+  }
+  return { decision, elements: { paths, backendNodeIds: outcome.elements.map(({ backendNodeId }) => backendNodeId) } };
+}
+
+/**
+ * form の形（確かめ直しで比べる）。DEF-237: 位置の道は除く（欄の名前と型の並びだけ）。同じ要素かは backendNodeId で決める（`sameElements`）。名前のない
+ * 欄が足されるなど、欄の並びが変われば形が違う（今のとおり止める）。
+ */
+const signatureOf = (layout: WriteFormLayout): string => JSON.stringify(layout.controls.map(({ name, type }) => [name, type]));
 
 /** 要素の参照を持つ位置（form、送信ボタン、送る欄）。 */
 const trackedPathsOf = (spec: WriteFormSpec, layout: WriteFormLayout): readonly (readonly number[])[] => [
@@ -1015,26 +1169,13 @@ interface TrackedElements {
 }
 
 /**
- * 位置の要素の backendNodeId を、isolated world で読む（要素の橋渡しの部品 `backendNodeIdsAtPaths`。DEF-114。T32j-4）。読めなければ投げる
- * （呼ぶ側が `FORM_UNREADABLE` か `FORM_CHANGED` にする）。
+ * 確かめ直しの読み取りの要素が、最初の確かめの時の要素と同じものか（isolated world で読んだ backendNodeId を比べる。ページの JS は読む間に走らず、
+ * 偽れない。DEF-114 の前は main world の `===` で、`Object.prototype` の getter で偽れた）。LU-SFIX2-A: 今の要素の番号は、確かめ直しで form を決めた読み取りと
+ * 同じ読み取りの要素から受けたもの（`readDecideAndTrack`）。
  */
-async function trackedElementsOf(page: Page, paths: readonly (readonly number[])[], timeoutMs: number): Promise<TrackedElements> {
-  const backendNodeIds = await backendNodeIdsAtPaths(page, paths, Date.now() + timeoutMs);
-  if (backendNodeIds === null) {
-    throw new Error('Write form elements unreadable');
-  }
-  return { paths, backendNodeIds };
-}
-
-/**
- * 今の位置の要素が、最初の確かめの時の要素と同じものか（isolated world で読んだ backendNodeId を比べる。ページの JS は読む間に走らず、
- * 偽れない。DEF-114 の前は main world の `===` で、`Object.prototype` の getter で偽れた）。
- */
-async function sameElements(page: Page, state: InspectedState, timeoutMs: number): Promise<boolean> {
-  const current = await trackedElementsOf(page, state.elements.paths, timeoutMs);
-  return current.backendNodeIds.length === state.elements.backendNodeIds.length
-    && current.backendNodeIds.every((backendNodeId, index) => backendNodeId === state.elements.backendNodeIds[index]);
-}
+const sameElements = (state: InspectedState, current: TrackedElements): boolean =>
+  current.backendNodeIds.length === state.elements.backendNodeIds.length
+  && current.backendNodeIds.every((backendNodeId, index) => backendNodeId === state.elements.backendNodeIds[index]);
 
 /**
  * 送る前の確かめ（ファイルの先頭の説明の 1）。値を受けない。通れば、照合に渡す名前の一覧を返す（位置は、この部品の中だけに持つ）。例外を投げない。
@@ -1045,14 +1186,11 @@ export async function inspectWriteForm(page: Page, spec: WriteFormSpec, timeoutM
     if (problem !== null) {
       return { ok: false, reason: problem };
     }
-    const decision = await readAndDecide(page, spec, timeoutMs);
+    const { decision, elements } = await readDecideAndTrack(page, spec, timeoutMs, defaultValueReadNamesOf(spec), (layout) => trackedPathsOf(spec, layout));
     if (!decision.ok) {
       return decision;
     }
-    let elements: InspectedState['elements'];
-    try {
-      elements = await trackedElementsOf(page, trackedPathsOf(spec, decision.layout), timeoutMs);
-    } catch {
+    if (elements === null) {
       return { ok: false, reason: 'FORM_UNREADABLE' };
     }
     const form: InspectedWriteForm = writeFormFieldListsOf(spec);
@@ -1064,22 +1202,29 @@ export async function inspectWriteForm(page: Page, spec: WriteFormSpec, timeoutM
 }
 
 /**
- * 確かめ直し: 最初の確かめと同じ位置で、同じ要素なら、読んだ form と位置を返す。違えば・通らなければ・要素の参照を取れなければ null
- * （`FORM_CHANGED`）。
+ * 確かめ直し: 最初の確かめと同じ形で、同じ要素（backendNodeId）なら、読んだ form と位置を返す。違えば・通らなければ・要素の参照を取れなければ null
+ * （`FORM_CHANGED`）。DEF-237: 位置の道は比べない（今読んだ位置の要素の番号を、確かめの時の番号と比べる）。通れば、道を今読んだ位置に更新する（道は
+ * 探すための手がかり）。
  */
 async function reinspect(page: Page, state: InspectedState, timeoutMs: number): Promise<{ readonly form: ReadForm; readonly layout: WriteFormLayout } | null> {
-  const decision = await readAndDecide(page, state.spec, timeoutMs, state.update === undefined ? undefined : valueReadNamesOf(state.update.roles));
-  if (!decision.ok || signatureOf(decision.layout) !== state.signature) {
+  const { decision, elements } = await readDecideAndTrack(
+    page,
+    state.spec,
+    timeoutMs,
+    state.update === undefined ? defaultValueReadNamesOf(state.spec) : valueReadNamesOf(state.update.roles),
+    (layout) => (signatureOf(layout) === state.signature ? trackedPathsOf(state.spec, layout) : null),
+  );
+  if (!decision.ok || signatureOf(decision.layout) !== state.signature || elements === null) {
     return null;
   }
   if (state.update !== undefined && !pairsAdjacent(decision.form, state.update.roles)) {
     return null;
   }
-  try {
-    return await sameElements(page, state, timeoutMs) ? { form: decision.form, layout: decision.layout } : null;
-  } catch {
+  if (!sameElements(state, elements)) {
     return null;
   }
+  state.elements = elements;
+  return { form: decision.form, layout: decision.layout };
 }
 
 /**
@@ -1129,8 +1274,30 @@ async function runOnTrackedElements<T>(
   return outcome.error === undefined || outcome.error instanceof SignaledElementMissing ? { status: 'CHANGED' } : { status: 'FAILED' };
 }
 
+/** LU-SFIX3-A: 位置が同じか。 */
+const samePathOf = (left: readonly number[], right: readonly number[]): boolean =>
+  left.length === right.length && left.every((step, index) => right[index] === step);
+
 /** 位置を表の鍵にするときの区切り。 */
 const PATH_KEY_SEPARATOR = '/';
+
+/** FIX-237 fix round 1: 要素の参照の並び（`trackedPathsOf`）の中の、form の位置。 */
+const TRACKED_FORM_INDEX = 0;
+/**
+ * 押した後、書き込みの段の送信が始まったか（送信の報告が `NOT_SENT` でなくなったか）。部品がなければ偽。L12b（設計書 `2026-11-09-beaksight-remove-limits-design.md`
+ * 6.2。T24）: 時間の上限（前は 1.5 秒）で切らず、送信が始まるか、ページが静まる（`waitForPageQuietAfterPress`。
+ * 全く反応がないときは L0 の見張り）まで待つ（遅い SPA が押した後に送る形を「送れなかった」にしない）。
+ */
+async function submissionStarted(page: Page, monitor: WriteStageMonitor | undefined, observationWindows: ObservationWindows | undefined): Promise<boolean> {
+  if (monitor === undefined) {
+    return false;
+  }
+  const started = (): boolean => monitor.submissionReport().submission !== 'NOT_SENT';
+  if (!started()) {
+    await waitForPageQuietAfterPress(page, { until: started, observationWindows });
+  }
+  return started();
+}
 
 
 /**
@@ -1305,12 +1472,14 @@ export async function fillWriteForm(
 
 /**
  * 押す直前に確かめ直し、値を読み直してから、決めた送信ボタンを押す（ファイルの先頭の説明の 3）。押した後のナビゲーションは待たない。例外を投げない。
+ * TEST-TIME-B: `observationWindows` は、押した後の静まりの待ちの観察の窓の一式（テストだけ。省略すると本番の値。`waitForPageQuietAfterPress`）。
  */
 export async function submitWriteForm(
   page: Page,
   form: InspectedWriteForm,
   values: Readonly<Record<string, string | null>>,
   timeoutMs = WRITE_FORM_STEP_TIMEOUT_MS,
+  observationWindows?: ObservationWindows,
 ): Promise<WriteFormSubmission> {
   const state = inspectedStates.get(form);
   if (state === undefined || !isRecord(values)) {
@@ -1333,22 +1502,66 @@ export async function submitWriteForm(
   }
   try {
     // T32R-fix-I1: 合図つきの Locator で、送信ボタンの位置の要素が確かめの時の要素かを照らしてから押す（入れ替わっていれば押さずに
-    // `FORM_CHANGED`）。押す操作も、同じ合図つきのセレクタで要素を解き直す。
+    // `FORM_CHANGED`）。押す操作も、同じ合図つきのセレクタで要素を解き直す。DEF-237: 位置は、確かめ直し（`checked`）で今読んだ位置（`state.elements` も
+    // 同じ位置に更新済み）。道がずれても、合図の受け手の要素（確かめの時の要素）を押す。
     const submitterPath = checked.layout.submitterPath;
+    const submitterIndex = state.elements.paths.findIndex((path) => samePathOf(path, submitterPath));
+    const submitterId = state.elements.backendNodeIds[submitterIndex];
     let clickAttempted = false;
+    let stoppedAtPress = false;
     const clicked = await runOnTrackedElements(page, state, timeoutMs, async (locate) => {
       const submitter = await locate(submitterPath);
-      // T40R-fix-A（Task 40 の設計書 7 章の T40R の I-1）: 押す直前に、値を入れたときの部品で送信の窓の送信の段を開く（Guard が承認の形の POST を照合に
-      // かけて 1 回だけ通すのは、この後だけ）。開けなければ（窓が開いていない、値を入れていない）押さない。
-      const monitor = windowMonitors.get(form);
-      if (monitor === undefined || !monitor.openSubmissionPhase()) {
+      // FIX-237 fix round 1（SREV-237 の Critical-1）: 確かめの時の form の要素。押す時点の受け手が、送信ボタンの form owner がこの要素と同一かを確かめる
+      // （押す瞬間に別の form へ移す・form 属性で付け替えると止める）。
+      const formBackendNodeId = state.elements.backendNodeIds[TRACKED_FORM_INDEX];
+      if (submitterId === undefined || formBackendNodeId === undefined) {
         throw new SignaledElementMissing();
       }
-      clickAttempted = true;
-      await submitter.click({ timeout: timeoutMs, noWaitAfter: true });
+      // LU-SFIX3-A（LU-SREV3 の Critical-1）: 押す時点の確かめ（ただ 1 つの部品 `pressWithPressTimeGuard`）。受け手を先に付け、確かめ直し（`reinspect`）で同じ
+      // form・同じ送信ボタンで、受け手を付けた時点の送信ボタンが文書につながり、上書きの属性の有無が確かめ直しの送信ボタンと同じときだけ押す。押した後、事象が
+      // 届いた時点の事実が付けた時点と違えば、受け手が止める。
+      const pressed = await pressWithPressTimeGuard(page, submitterId, Date.now() + timeoutMs, async (armedFacts) => {
+        // DEF-237: 同じ送信ボタンかは、確かめ直しの番号（backendNodeId）の比べで決める。送信ボタンの事実は、確かめ直しで今読んだ位置で引く。
+        const again = await reinspect(page, state, timeoutMs).catch(() => null);
+        const currentPath = again?.layout.submitterPath;
+        const read = currentPath === undefined
+          ? undefined
+          : again?.form.submitters.find((candidate) => candidate.path !== null && samePathOf(candidate.path, currentPath));
+        if (again === null || read === undefined) {
+          return false;
+        }
+        const expected = [read.action, read.method, read.enctype, read.target].map((value) => value !== null);
+        // LU-SFIX4（LU-REV の I-2）: 送信ボタンの事実の確かめがあれば、押す時点の事実（語）がそれに通ること。
+        const { submitterFactsAccepted } = state.spec;
+        return armedFacts.connected && expected.length === armedFacts.overrides.length && expected.every((flag, index) => flag === armedFacts.overrides[index])
+          && (submitterFactsAccepted === undefined || submitterFactsAccepted(armedFacts));
+      }, async () => {
+        // T40R-fix-A（Task 40 の設計書 7 章の T40R の I-1）: 押す直前に、値を入れたときの部品で送信の窓の送信の段を開く（Guard が承認の形の POST を照合に
+        // かけて 1 回だけ通すのは、この後だけ）。開けなければ（窓が開いていない、値を入れていない）押さない。
+        const monitor = windowMonitors.get(form);
+        if (monitor === undefined || !monitor.openSubmissionPhase()) {
+          throw new SignaledElementMissing();
+        }
+        clickAttempted = true;
+        await submitter.click({ timeout: timeoutMs, noWaitAfter: true });
+      }, { formBackendNodeId });
+      if (pressed === 'STOPPED') {
+        stoppedAtPress = true;
+      }
+      if (pressed !== 'PRESSED') {
+        throw new SignaledElementMissing();
+      }
     });
     if (clicked.status === 'DONE') {
-      return { ok: true, outcome: 'SUBMITTED' };
+      // FIX-237 fix round 1（SREV-237 の Minor-1）: 押した後、名前つきの時間の中で送信が始まらなければ（Guard の送信の報告が `NOT_SENT` のまま。押す事象が
+      // 途中で止まった・Guard が止めた）、`SUBMITTED` と言わない。
+      return await submissionStarted(page, windowMonitors.get(form), observationWindows)
+        ? { ok: true, outcome: 'SUBMITTED' }
+        : { ok: false, reason: 'SUBMIT_FAILED', clickAttempted: true };
+    }
+    // LU-SFIX3-A: 押す時点の確かめの受け手が事象を止めた（ページの要素の受け手に届いていない）。押さなかった扱い。
+    if (stoppedAtPress) {
+      return { ok: false, reason: 'FORM_CHANGED', clickAttempted: false };
     }
     if (!clickAttempted) {
       return { ok: false, reason: 'FORM_CHANGED', clickAttempted: false };
@@ -1378,6 +1591,10 @@ export interface WriteUpdateFormSpec {
   readonly methodOverride: WriteMethodOverride | null;
   readonly changedFieldNames: readonly string[];
   readonly keptFieldNames: readonly string[];
+  /** LU-12b: 送る form の位置（`WriteFormSpec.formPath` と同じ。一覧の行の更新だけ）。 */
+  readonly formPath?: readonly number[] | undefined;
+  /** LU-SFIX4: 押す時点の送信ボタンの事実の確かめ（`WriteFormSpec.submitterFactsAccepted` と同じ。一覧の行の更新だけ）。 */
+  readonly submitterFactsAccepted?: ((facts: PressTimeFacts) => boolean) | undefined;
 }
 
 /**
@@ -1579,6 +1796,8 @@ const formSpecOf = (spec: WriteUpdateFormSpec): WriteFormSpec => ({
   candidateFields: spec.candidateFields,
   submittedFieldNames: spec.changedFieldNames,
   methodOverride: spec.methodOverride,
+  ...(spec.formPath === undefined ? {} : { formPath: spec.formPath }),
+  ...(spec.submitterFactsAccepted === undefined ? {} : { submitterFactsAccepted: spec.submitterFactsAccepted }),
 });
 
 /** 値を読む欄の名前（変える欄と保つ欄、状態の hidden と組の hidden）。 */
@@ -1711,8 +1930,70 @@ export async function readUpdateFormValues(page: Page, spec: WriteUpdateFormSpec
 }
 
 /**
+ * LU-12b（設計書 `2026-11-02-beaksight-list-row-update-design.md` 5.5。LU-12a の実装者の提案）: 更新の期待の、前の値に頼らない部分の部品（今の更新と、一覧の行の
+ * 更新の両方が使う唯一の置き場所）。欄の役割（`updateRolesOf`）と、変える欄の新しい値の確かめ・置き方（組でない変える欄は送る欄か、null なら送られない欄）。
+ * 変える組は前の値（`offValue`）が要るので置かない（呼ぶ側が置く）。作れなければ `updatePayloadFieldsOf` と同じ理由。
+ */
+function updateBasePartsOf(
+  spec: WriteUpdateFormSpec,
+  values: Readonly<Record<string, string | null>>,
+):
+  | { readonly ok: true; readonly roles: UpdateRoles; readonly submitted: readonly WriteSubmittedField[]; readonly absent: readonly string[] }
+  | { readonly ok: false; readonly reason: UpdateSpecReason } {
+  const invalid = { ok: false, reason: 'SPEC_INVALID' } as const;
+  const roles = updateRolesOf(spec);
+  if (typeof roles === 'string') {
+    return { ok: false, reason: roles };
+  }
+  if (!isRecord(values)) {
+    return invalid;
+  }
+  const valueNames = Object.keys(values);
+  if (valueNames.length !== roles.changed.length || !roles.changed.every((name) => Object.hasOwn(values, name) && isNullableString(values[name]))) {
+    return invalid;
+  }
+  const submitted: WriteSubmittedField[] = [];
+  const absent: string[] = [];
+  for (const name of roles.changed) {
+    const value = values[name] ?? null;
+    const type = roles.typeOf.get(name);
+    // 変える select・text 系は、新しい値が要る（null は checkbox・radio だけ）。
+    if (value === null && (type === undefined || !CHECKABLE_TYPES.has(type))) {
+      return invalid;
+    }
+    if (roles.pairNames.includes(name)) {
+      continue;
+    }
+    if (value === null) {
+      // ブラウザが送らない欄だけ（チェックしていない checkbox、選んでいない radio）。LU-12a fix round 1: 判定は印の作り手と同じ `isChoiceType`。
+      if (!isChoiceType(type)) {
+        return invalid;
+      }
+      absent.push(name);
+    } else {
+      submitted.push(Object.freeze({ name, value }));
+    }
+  }
+  return { ok: true, roles, submitted: Object.freeze(submitted), absent: Object.freeze(absent) };
+}
+
+/** 期待の欄の部分の名前の重なりと、method の上書きの欄の名前がないことの確かめ（今の更新と一覧の行の更新で共通）。 */
+const payloadFieldNamesValid = (fields: Omit<UpdatePayloadFields, 'methodOverride'>): boolean => {
+  const lists = [
+    fields.submittedFields.map(({ name }) => name),
+    fields.passthroughFieldNames,
+    fields.emptyFileFieldNames,
+    (fields.checkedPassthroughFields ?? []).map(({ name }) => name),
+    (fields.checkboxPairs ?? []).map(({ name }) => name),
+    fields.absentFieldNames ?? [],
+  ].flat();
+  return new Set(lists).size === lists.length && !lists.some(isMethodOverrideFieldName);
+};
+
+/**
  * UPDATE の送る中身の照合の期待のうち欄の部分（ファイルの先頭の説明の 4。純粋。凍結）。`prior` は前の値（`readUpdateFormValues`）、`values` は
  * 変える欄の新しい値（変える欄の名前をちょうど持つ。null は checkbox を外す・radio を選ばない）。作れなければ `SPEC_INVALID`。
+ * LU-12b: 前の値に頼らない部分は `updateBasePartsOf`（一覧の行の更新の基本の期待 `updateBasePayloadFieldsOf` と共通）。並びは前のまま。
  */
 export function updatePayloadFieldsOf(
   spec: WriteUpdateFormSpec,
@@ -1720,33 +2001,33 @@ export function updatePayloadFieldsOf(
   values: Readonly<Record<string, string | null>>,
 ): UpdatePayloadFieldsResult {
   const invalid: UpdatePayloadFieldsResult = { ok: false, reason: 'SPEC_INVALID' };
-  const roles = updateRolesOf(spec);
-  if (typeof roles === 'string') {
-    return { ok: false, reason: roles };
+  const base = updateBasePartsOf(spec, values);
+  if (!base.ok) {
+    return base;
   }
-  if (!isPriorOf(prior, roles) || !isRecord(values)) {
+  const { roles } = base;
+  if (!isPriorOf(prior, roles)) {
     return invalid;
   }
-  const valueNames = Object.keys(values);
-  if (valueNames.length !== roles.changed.length || !roles.changed.every((name) => Object.hasOwn(values, name) && isNullableString(values[name]))) {
-    return invalid;
-  }
-  const submittedFields: WriteSubmittedField[] = [];
-  const absentFieldNames: string[] = [];
+  const submittedFields: WriteSubmittedField[] = [...base.submitted];
+  const absentFieldNames: string[] = [...base.absent];
   const checkboxPairs: WriteCheckboxPair[] = [];
-  const place = (name: string, value: string | null): boolean => {
-    const type = roles.typeOf.get(name);
+  const placePair = (name: string, value: string | null): boolean => {
+    const offValue = prior.pairOffValues[name];
+    if (offValue === undefined) {
+      return false;
+    }
+    checkboxPairs.push(Object.freeze({ name, offValue, checkedValue: value }));
+    return true;
+  };
+  const placeKept = (name: string, value: string | null): boolean => {
     if (roles.pairNames.includes(name)) {
-      const offValue = prior.pairOffValues[name];
-      if (offValue === undefined) {
-        return false;
-      }
-      checkboxPairs.push(Object.freeze({ name, offValue, checkedValue: value }));
-      return true;
+      return placePair(name, value);
     }
     if (value === null) {
       // ブラウザが送らない欄だけ（チェックしていない checkbox、選んでいない radio、選んでいない select）。text 系は空の値で送られる。
-      if (type === undefined || !(CHECKABLE_TYPES.has(type) || SELECT_TYPES.has(type))) {
+      // LU-12a fix round 1: 判定は、前の値を後から入れる印の作り手（`updateDeferredPriorValuesOf`）と同じ `isChoiceType`。
+      if (!isChoiceType(roles.typeOf.get(name))) {
         return false;
       }
       absentFieldNames.push(name);
@@ -1755,13 +2036,8 @@ export function updatePayloadFieldsOf(
     submittedFields.push(Object.freeze({ name, value }));
     return true;
   };
-  const changedPlaced = roles.changed.every((name) => {
-    const value = values[name] ?? null;
-    // 変える select・text 系は、新しい値が要る（null は checkbox・radio だけ）。
-    const type = roles.typeOf.get(name);
-    return (value !== null || (type !== undefined && CHECKABLE_TYPES.has(type))) && place(name, value);
-  });
-  if (!changedPlaced || !roles.kept.every((name) => place(name, prior.fields[name] ?? null))) {
+  const changedPairsPlaced = roles.changed.filter((name) => roles.pairNames.includes(name)).every((name) => placePair(name, values[name] ?? null));
+  if (!changedPairsPlaced || !roles.kept.every((name) => placeKept(name, prior.fields[name] ?? null))) {
     return invalid;
   }
   // T31R-fix-1（C-1）: 値を照らすほかの hidden・readonly・見えない欄も、前の値で照らす。T31R2-fix-1: 前の値が null の choice は「送られない」
@@ -1772,27 +2048,79 @@ export function updatePayloadFieldsOf(
   ];
   const checkedPassthroughFields = concealedPrior.flatMap(([name, value]) => (value === null ? [] : [Object.freeze({ name, value })]));
   absentFieldNames.push(...roles.absentNames, ...concealedPrior.flatMap(([name, value]) => (value === null ? [name] : [])));
-  const lists = [
-    submittedFields.map(({ name }) => name),
-    roles.passthroughNames,
-    roles.emptyFileNames,
-    checkedPassthroughFields.map(({ name }) => name),
-    checkboxPairs.map(({ name }) => name),
-    absentFieldNames,
-  ].flat();
-  if (new Set(lists).size !== lists.length || lists.some(isMethodOverrideFieldName)) {
-    return invalid;
+  const fields = {
+    submittedFields: Object.freeze(submittedFields),
+    passthroughFieldNames: roles.passthroughNames,
+    emptyFileFieldNames: roles.emptyFileNames,
+    methodOverride: spec.methodOverride,
+    absentFieldNames: Object.freeze(absentFieldNames),
+    checkedPassthroughFields: Object.freeze(checkedPassthroughFields),
+    checkboxPairs: Object.freeze(checkboxPairs),
+  };
+  return payloadFieldNamesValid(fields) ? { ok: true, fields: Object.freeze(fields) } : invalid;
+}
+
+/**
+ * LU-12b（設計書 5.5、4.0.1 の K1。LU-12a の実装者の提案）: 一覧の行の更新の、前の値を後から入れる印の期待の基本の部分（純粋。凍結）。前の値に頼らない部分
+ * （変える欄の送る欄と送られない欄、disabled の欄、名前だけを照らす欄、file の欄、method の上書き）だけで、前の値に頼る一覧（値を照らす hidden・組）は空。
+ * 前の値は、Guard の口（`WriteStageMonitor.supplyFormPriorValues`）で後から入れる。部品は今の更新の期待と同じ `updateBasePartsOf`（複製しない）。
+ */
+export function updateBasePayloadFieldsOf(spec: WriteUpdateFormSpec, values: Readonly<Record<string, string | null>>): UpdatePayloadFieldsResult {
+  const base = updateBasePartsOf(spec, values);
+  if (!base.ok) {
+    return base;
   }
+  const fields = {
+    submittedFields: base.submitted,
+    passthroughFieldNames: base.roles.passthroughNames,
+    emptyFileFieldNames: base.roles.emptyFileNames,
+    methodOverride: spec.methodOverride,
+    absentFieldNames: Object.freeze([...base.absent, ...base.roles.absentNames]),
+    checkedPassthroughFields: Object.freeze([]),
+    checkboxPairs: Object.freeze([]),
+  };
+  return payloadFieldNamesValid(fields) ? { ok: true, fields: Object.freeze(fields) } : { ok: false, reason: 'SPEC_INVALID' };
+}
+
+/** LU-12a fix round 1: 前の値を後から入れる印の作り手の結果。 */
+export type UpdateDeferredPriorValuesResult =
+  | { readonly ok: true; readonly mark: WriteDeferredPriorValues }
+  | { readonly ok: false; readonly reason: UpdateSpecReason };
+
+/**
+ * LU-12a fix round 1（設計書 `2026-11-02-beaksight-list-row-update-design.md` 5.3 の 2・5.5、設計者の判断 (b)）: 前の値を後から入れる印（純粋。凍結）。
+ * 名前の集合は、承認の時の欄の役割（`updateRolesOf`）から作り、ページの値から作らない。`values` は変える欄の新しい値（変える欄の名前をちょうど持つ）。
+ * - 保つ見える欄（組でない保つ欄）、値を照らす欄（状態の hidden とほかの値を照らす欄）、保つ組、変える組と新しい `checkedValue`。
+ * - null を入れてよい欄（`nullableFieldNames`）: 保つ見える欄と値を照らす欄のうち、型が checkbox・radio・select の欄（`isChoiceType`。前の値の期待の作り手
+ *   `updatePayloadFieldsOf` と前の値の確かめ `isPriorOf` と同じ判定）。
+ * 作れなければ、`updatePayloadFieldsOf` と同じ理由（`SPEC_INVALID` など）。
+ */
+export function updateDeferredPriorValuesOf(
+  spec: WriteUpdateFormSpec,
+  values: Readonly<Record<string, string | null>>,
+): UpdateDeferredPriorValuesResult {
+  const roles = updateRolesOf(spec);
+  if (typeof roles === 'string') {
+    return { ok: false, reason: roles };
+  }
+  if (!isRecord(values) || Object.keys(values).length !== roles.changed.length
+    || !roles.changed.every((name) => Object.hasOwn(values, name) && isNullableString(values[name]))) {
+    return { ok: false, reason: 'SPEC_INVALID' };
+  }
+  const keptFieldNames = roles.kept.filter((name) => !roles.pairNames.includes(name));
+  const checkedPassthroughNames = [...roles.stateHiddenNames, ...roles.checkedPassthroughNames];
   return {
     ok: true,
-    fields: Object.freeze({
-      submittedFields: Object.freeze(submittedFields),
-      passthroughFieldNames: roles.passthroughNames,
-      emptyFileFieldNames: roles.emptyFileNames,
-      methodOverride: spec.methodOverride,
-      absentFieldNames: Object.freeze(absentFieldNames),
-      checkedPassthroughFields: Object.freeze(checkedPassthroughFields),
-      checkboxPairs: Object.freeze(checkboxPairs),
+    mark: Object.freeze({
+      keptFieldNames: Object.freeze(keptFieldNames),
+      checkedPassthroughNames: Object.freeze(checkedPassthroughNames),
+      keptCheckboxPairNames: Object.freeze(roles.kept.filter((name) => roles.pairNames.includes(name))),
+      changedCheckboxPairs: Object.freeze(roles.changed.filter((name) => roles.pairNames.includes(name))
+        .map((name) => Object.freeze({ name, checkedValue: values[name] ?? null }))),
+      nullableFieldNames: Object.freeze([
+        ...keptFieldNames.filter((name) => isChoiceType(roles.typeOf.get(name))),
+        ...checkedPassthroughNames.filter((name) => isChoiceType(roles.concealedTypeOf.get(name))),
+      ]),
     }),
   };
 }
@@ -1817,7 +2145,7 @@ export async function inspectUpdateForm(
       return { ok: false, reason: 'SPEC_INVALID' };
     }
     const formSpec = formSpecOf(spec);
-    const decision = await readAndDecide(page, formSpec, timeoutMs, valueReadNamesOf(roles));
+    const { decision, elements } = await readDecideAndTrack(page, formSpec, timeoutMs, valueReadNamesOf(roles), (layout) => trackedPathsOf(formSpec, layout));
     if (!decision.ok) {
       return decision;
     }
@@ -1831,10 +2159,7 @@ export async function inspectUpdateForm(
     if (!matchesPrior(decision.form, roles, prior, true)) {
       return { ok: false, reason: 'PRIOR_VALUE_CHANGED' };
     }
-    let elements: InspectedState['elements'];
-    try {
-      elements = await trackedElementsOf(page, trackedPathsOf(formSpec, decision.layout), timeoutMs);
-    } catch {
+    if (elements === null) {
       return { ok: false, reason: 'FORM_UNREADABLE' };
     }
     const form: InspectedWriteForm = Object.freeze({

@@ -27,8 +27,8 @@ interface PageSchemaFacts {
 }
 const pageSchema = JSON.parse(readFileSync(new URL('../../schemas/page.schema.json', import.meta.url), 'utf8')) as PageSchemaFacts;
 
-/** Ledger の事象の上限（`src/safety/safety-ledger.ts` の `MAX_LEDGER_EVENTS`。超えた分を確かめる）。 */
-const LEDGER_EVENT_LIMIT = 256;
+/** 撤廃した Ledger の事象の上限（前の `MAX_LEDGER_EVENTS`）の写し。 */
+const FORMER_LEDGER_EVENT_LIMIT = 256;
 const TIMING = Object.freeze({
   startTime: 0, domainLookupStart: -1, domainLookupEnd: -1, connectStart: -1, secureConnectionStart: -1, connectEnd: -1, requestStart: -1, responseStart: -1, responseEnd: -1,
 });
@@ -70,30 +70,22 @@ describe('BN-a: the Safety Ledger records the phase and the resource type of the
     expect(Object.hasOwn(snapshot.blockedAuditExclusions?.events[1] ?? {}, 'speculative')).toBe(false);
   });
 
-  it('counts the requests stopped while closing apart from the blocked request counts, and does not truncate the record at the event limit', () => {
+  // LZ-3a: Ledger の事象の数の上限（前は 256）は撤廃した。前の上限を超える分も残らず記録する。
+  it('counts the requests stopped while closing apart from the blocked request counts, and keeps every one beyond the former limit', () => {
     const ledger = new SafetyLedger();
-    for (let index = 0; index < LEDGER_EVENT_LIMIT + 2; index += 1) {
+    for (let index = 0; index < FORMER_LEDGER_EVENT_LIMIT + 2; index += 1) {
       ledger.recordBlockedClosingRequest({ method: 'get', url: `https://example.com/poll?i=${String(index)}`, resourceType: 'fetch' });
     }
     ledger.recordBlockedClosingRequest(null);
     const snapshot = ledger.snapshot();
-    expect(snapshot.blockedClosingRequests?.count).toBe(LEDGER_EVENT_LIMIT + 3);
-    expect(snapshot.blockedClosingRequests?.events).toHaveLength(LEDGER_EVENT_LIMIT);
+    expect(snapshot.blockedClosingRequests?.count).toBe(FORMER_LEDGER_EVENT_LIMIT + 3);
+    expect(snapshot.blockedClosingRequests?.events).toHaveLength(FORMER_LEDGER_EVENT_LIMIT + 2);
     expect(snapshot.blockedClosingRequests?.events[0]).toEqual({ method: 'GET', url: 'https://example.com/poll?i=0', resourceType: 'fetch', phase: 'CLOSING' });
     expect(snapshot.blockedRequests).toEqual([]);
     expect(snapshot.blockedRequestsByMethod).toEqual({});
-    expect(snapshot.recordLimits).toMatchObject({ truncated: false, droppedEventCount: 2, reachedCategories: ['blockedClosingRequests'] });
+    expect(snapshot.recordLimits).toMatchObject({ truncated: false, droppedEventCount: 0, reachedCategories: [] });
     expect(Object.isFrozen(snapshot.blockedClosingRequests)).toBe(true);
     expect(Object.isFrozen(snapshot.blockedClosingRequests?.events[0])).toBe(true);
-  });
-
-  it('still truncates the record when another record reached its limit next to the closing record', () => {
-    const ledger = new SafetyLedger();
-    for (let index = 0; index < LEDGER_EVENT_LIMIT + 1; index += 1) {
-      ledger.recordBlockedClosingRequest({ method: 'GET', url: `https://example.com/poll?i=${String(index)}`, resourceType: 'fetch' });
-      ledger.recordBlockedWebSocket({ url: `wss://example.com/s${String(index)}`, reason: 'PASSIVE_WEBSOCKET', phase: 'LOAD' });
-    }
-    expect(ledger.snapshot().recordLimits.truncated).toBe(true);
   });
 });
 

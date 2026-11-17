@@ -6,14 +6,13 @@
  *   確かめ（下書きの確かめ、承認の境界）は変えない。サイトには接続しない（読むのは管理データと成果物だけ）。
  * - 作るもの: 登録の型の行ごとに、登録のシナリオの下書き（`DRAFT`。副作用の確認の 4 項目は偽。承認・実行の許可は作らない）、推した入力の規則の集まり
  *   （`inferRuleSetContent`）、照合の READ の `{id}` の型の定義（推せたときだけ。仮の期待つき）と、規則の後に推した期待（推せたときだけ、シナリオの版を
- *   上げて照合の READ に結ぶ）。更新は保存しない（変える欄は人が必ず選ぶ）。作成の画面へのリンク（候補・型・前もって選ぶ台帳と画面の型）を返す。
+ *   上げて照合の READ に結ぶ）。更新は保存しない（一覧のチェックが規則 F で作る）。
  * - 押せるのは、最後の発見の時のプロファイルの改訂が今の改訂と同じときだけ（`autoDraftBlockerOf`）。作る時は、確認のダイアログに出した改訂と発見の
  *   ジョブと照らし直し、違えば何も作らない（`PREVIEW_OUTDATED`）。
- * - 更新の導線: 作成の画面で人が変える欄を選んで保存すると、保存の口（`scenario-functions.ts`）が推した規則を付ける（PL-6b・PL-5 の 9 の (1)。
- *   すべての保存）。PL-5 の修正の 1 回目: 前の規則を付ける口 `attachAutoDraftRulesFn` とスキーマ `ui-scenario-auto-rules` は、使い先がなくなったので捨てた。
+ * - SPEC-4: 手で作る道（作成・変更・規則の画面）は外した。人が保存した規則は、一覧のチェックの前に推した規則に替える（`replaceHumanRules`）。
  * - PL-6b（設計書 `2026-10-26-beaksight-plain-ui-design.md` 8 章、8.1）: 下書きの入口は 1 つ。最後の発見の候補が API の形でもフォームの形でも、同じ口で作る
  *   （フォームの形の決まりは `form-scenario-autodraft.ts`）。フォームの形の登録は、ID の型と照合の専用の答え合わせの定義を付ける（決められない理由は
- *   `gaps`）。書き換えの案内（作成の画面へのリンクと前もって選ぶ値）は、確認の一覧（`scenarioAutoDraftPreviewFn`）でも、今の管理データから求め直して返す
+ *   `gaps`）。書き換えの案内（前もって選ぶ値）は、確認の一覧（`scenarioAutoDraftPreviewFn`）でも、今の管理データから求め直して返す
  *   （画面を移っても消えない。管理データの版を上げない）。
  */
 import { randomUUID } from 'node:crypto';
@@ -34,6 +33,7 @@ import {
   autoDraftReadCheckChoiceOf,
   autoDraftReadVerificationOf,
   isAutoDraftListPageChoice,
+  isUnnamedOpenerUpdateOf,
   autoDraftScenarioIdOf,
   writeScreenMayNotifyOf,
   attachInferredRules,
@@ -48,6 +48,7 @@ import {
   listScenarios,
   readScenario,
   readScenarioDraftContext,
+  replaceHumanRules,
   revokeScenarioApproval,
   updateScenario,
   validateScenarioDraft,
@@ -88,7 +89,6 @@ import {
   type RuleSetStoreRejectionReason,
 } from '../../../../src/control/data-rules-view.js';
 import {
-  MAX_READ_CHECK_DEFINITIONS_PER_PROFILE,
   discoveryPageScreenNameOf,
   type DiscoveryCandidate,
   type DiscoveryDocument,
@@ -125,7 +125,7 @@ export interface AutoDraftRowView {
   /** PL-6b: 送り方（API の形かフォームの形か）。 */
   readonly transport: ScenarioTransport;
   readonly identityDigest: string;
-  /** API の形の型の digest（PL-6b: フォームの形の行は空の文字。作成の画面のリンクでは省かれる）。 */
+  /** API の形の型の digest（PL-6b: フォームの形の行は空の文字）。 */
   readonly shapeDigest: string;
   readonly method: string;
   readonly pathShape: string;
@@ -147,18 +147,7 @@ export interface AutoDraftCreatePreviewView extends AutoDraftRowView {
   readonly gaps: readonly FormAutoDraftGap[];
 }
 
-/** 作成の画面へのリンクの引数（ID と型だけ。値と秘密は載せない）。PL-6b: フォームの形は `shape` が空の文字。 */
-export interface AutoDraftUpdateLinkView {
-  readonly candidate: string;
-  readonly shape: string;
-  readonly ledger: string | null;
-  readonly template: string | null;
-}
-
-/**
- * 確認のダイアログの、更新の行 1 つ。PL-6b（設計書 8 章の「更新の案内」）: 作成の画面へのリンクと前もって選ぶ値も、今の管理データから求め直して返す（画面を
- * 移っても案内が消えない。保存しない）。
- */
+/** 確認のダイアログの、更新の行 1 つ（前もって選ぶ値は、今の管理データから求め直して返す。保存しない）。 */
 export interface AutoDraftUpdatePreviewView extends AutoDraftRowView {
   /** OP-2（D10）: 計画の状態（`NEW` は規則 F で変える欄を決めた）。作った結果は `CREATED`（保存した）か `NOT_SAVED`（台帳か型を決められない・保存で拒まれた）。 */
   readonly status: AutoDraftUpdateResultStatus;
@@ -166,8 +155,6 @@ export interface AutoDraftUpdatePreviewView extends AutoDraftRowView {
   readonly reason: ScenarioDraftRejectionReason | null;
   /** OP-2: 規則 F で決めた変える欄（`NEW`・`CREATED` のとき。ほかは空）。 */
   readonly changedFieldNames: readonly string[];
-  /** 作成の画面へのリンク（OP-2: もう使わない。いつも null。形は前のまま）。 */
-  readonly link: AutoDraftUpdateLinkView | null;
   readonly ledgerOptionCount: number;
   readonly presetLedger: AutoDraftValueView | null;
   readonly presetTemplate: AutoDraftValueView | null;
@@ -325,7 +312,7 @@ const formAnswerChoiceOf = (
     answerRead: item.answerRead.value,
     definitions,
     verificationOnlyReadCheckIds: readVerificationOnlyReadCheckIds(localUiStore(), facts.stored.profile.profileId),
-    maxDefinitions: MAX_READ_CHECK_DEFINITIONS_PER_PROFILE,
+    // L4（COV-7）: 定義の数で止めない（上限を渡さない）。
   }));
 
 /** 確認のダイアログの一覧（保存しない。照合の READ の定義の予定は、作る順に数えて上限を見る）。 */
@@ -346,7 +333,8 @@ const previewOf = (facts: AutoDraftFacts): AutoDraftPreviewView => {
         };
       }
       const choice = autoDraftReadCheckChoiceOf({
-        createPagePath: item.row.candidate.page.path, readPagePaths, definitions, maxDefinitions: MAX_READ_CHECK_DEFINITIONS_PER_PROFILE,
+        // L4（COV-7）: 定義の数で止めない（上限を渡さない）。
+        createPagePath: item.row.candidate.page.path, readPagePaths, definitions,
         withoutData: item.recordIdKey?.ground === 'API_RECORD_ID_KEY_COMMON_NAME',
         // OP-R（R1）: 点検の段のリンクにある、登録の画面の 1 つ上の一覧の画面も選べる。
         auditLinkPaths: facts.auditLinkPaths,
@@ -381,15 +369,12 @@ const previewOf = (facts: AutoDraftFacts): AutoDraftPreviewView => {
   return {
     ...base,
     creates: [...apiCreates, ...formCreates],
-    // PL-6b（設計書 8 章の「更新の案内」）: 書き換えの案内（作成の画面へのリンクと前もって選ぶ値）は、今の管理データ（作った登録）から求め直す。
+    // PL-6b（設計書 8 章の「更新の案内」）: 書き換えの案内（前もって選ぶ値）は、今の管理データ（作った登録）から求め直す。
     updates: [...plan.updates.map((item) => updateOne(facts, item, facts.context, false)), ...formPlan.updates.map((item) => formUpdateOne(facts, item, false))],
   };
 };
 
-/**
- * 推した規則の集まりを作り、シナリオに付ける（今の 2 段の保存の口。承認の前だけ）。PL-6b（設計書 8 章の「入れる値の決まり」）: 書き込みの手順の保存の口
- * （`scenario-functions.ts` の作成と変更）も、規則がまだない下書きに、これで付ける（付け方の 1 か所）。
- */
+/** 推した規則の集まりを作り、シナリオに付ける（今の 2 段の保存の口。承認の前だけ）。 */
 const attachInferredRulesOf = (scenario: ScenarioView): {
   readonly view: AutoDraftRulesView;
   readonly scenario: ScenarioView | null;
@@ -400,9 +385,6 @@ const attachInferredRulesOf = (scenario: ScenarioView): {
   const attached = attachInferredRules(localUiStore(), scenario, nowCompactTimestamp);
   return { view: attached.summary, scenario: attached.scenario, ruleSet: attached.ruleSet, rejection: attached.rejection };
 };
-
-/** PL-6b: 保存の口（`scenario-functions.ts`）が使う、推した規則の付け方（サーバだけの関数。DEF-066 の決まり）。 */
-export const attachInferredRulesOnSave = createServerOnlyFn((scenario: ScenarioView) => attachInferredRulesOf(scenario));
 
 /**
  * 照合の READ の定義の参照（既にある定義を使うか、確かめてから作る）。FM2R の Minor 10: 期待を結べるときだけ呼ぶ（結べない定義を作らない）。
@@ -494,7 +476,7 @@ interface AttachedRulesFacts {
 /**
  * API の形の登録の照合の READ の計画（保存しない。登録を作るときと、OP-S の作り直しの共通の 1 か所）: 照合の READ の画面の選び方と、期待の段。
  * 期待の欄は、規則を付けた後に、実行のたびに値が変わる欄から推す（許可の発行と同じ値の作り方と判定）。MI-C（MI-6 の報告の片付け）: 下書きは副作用の確認が
- * まだなので、承認の前の画面（`data-rule-facts.ts`）と同じ前提（承認のダイアログで確認する `PRE_APPROVAL_EVALUATION_PREMISE`）で判定する（メールの欄も
+ * まだなので、承認の前の画面（`data-rule-facts.ts`）と同じ前提（一覧のチェックで確認する `PRE_APPROVAL_EVALUATION_PREMISE`）で判定する（メールの欄も
  * 変わる欄に数える。承認の後の許可の発行は、確認を入れた版で同じ判定になる）。
  */
 const apiVerificationPlanOf = (
@@ -510,7 +492,7 @@ const apiVerificationPlanOf = (
     createPagePath: item.row.candidate.page.path,
     readPagePaths: readCheckPagePathsOf(facts.latest, facts.reading),
     definitions: readCheckFactsOf(facts.stored.profile.profileId),
-    maxDefinitions: MAX_READ_CHECK_DEFINITIONS_PER_PROFILE,
+    // L4（COV-7）: 定義の数で止めない（上限を渡さない）。
     // OP-G（設計書 4.1.4 の E2）: データのないサイトの登録は、答え合わせの画面の型も、よくある形を推す。
     withoutData: item.recordIdKey?.ground === 'API_RECORD_ID_KEY_COMMON_NAME',
     // OP-R（設計書 4.1.9 の R1）: 点検の段のリンクにある、登録の画面の 1 つ上の一覧の画面を、よくある形より先に選ぶ。
@@ -608,7 +590,6 @@ const updateViewOf = (row: AutoDraftRowView, outcome: UpdateAutoDraftOutcome): A
   scenarioId: outcome.scenarioId,
   reason: outcome.reason,
   changedFieldNames: outcome.changedFieldNames,
-  link: null,
   ledgerOptionCount: outcome.ledgerOptionCount,
   presetLedger: valueViewOf(outcome.presetLedger),
   presetTemplate: valueViewOf(outcome.presetTemplate),
@@ -664,9 +645,6 @@ const createFormOne = (facts: AutoDraftFacts, item: FormAutoDraftCreatePlan): Au
   // 結べない定義は作らない（変わる欄がなければ、定義を作らずに理由を返す）。
   if (verificationOf({ readCheckId: '', revision: 0 }) === null) {
     return { ...base, readCheck: notLinked, expectationOutcome: 'NO_VARYING_FIELD' };
-  }
-  if (choice.kind === 'LIMIT_REACHED') {
-    return { ...base, readCheck: 'LIMIT_REACHED', expectationOutcome: 'NO_READ_CHECK' };
   }
   const linked = linkFormVerificationOf(facts, item, attached.scenario, choice, answerCandidate, verificationOf);
   if (linked.kind === 'REJECTED') {
@@ -748,7 +726,7 @@ const formUpdateOne = (facts: AutoDraftFacts, item: FormAutoDraftUpdatePlan, sav
 // - その画面の登録の手順が既にあれば、最後の操作さがしと今の自動の下書きの決まりで作り直した中身（送る欄・ID の取り方などの下書き、照合の READ の定義と期待）
 //   を、今の版と比べる。違えば、今の保存の口（`updateScenario`）で新しい版にする（承認は、チェックの保存がその版に行う）。同じなら、何もしない（承認だけ）。
 // - 作り方は、登録を作るときと同じ部品（`apiVerificationPlanOf`・`linkApiVerificationOf`・`linkFormVerificationOf`）。入れる値の決まりは、今の版に付いた
-//   規則を使う（人が直したかもしれないので、推し直さない）。今の決まりで完全な手順を作れないとき（照合の READ を推せない・上限・期待を推せない）は、
+//   規則を使う（SPEC-4: 人が保存した規則は、チェックの保存が作り直しの前に推した規則に替える）。今の決まりで完全な手順を作れないとき（照合の READ を推せない・上限・期待を推せない）は、
 //   今の版のまま（承認だけ）にする（チェックできていた画面を、チェックできない形にしない）。
 // - 承認している版は、今の撤回の口（`revokeScenarioApproval`）で取り消してから、新しい版にする（承認を引き継がない）。
 // - 前の照合の定義: 照合の専用の印で参照していた定義は、どのシナリオの今の版も参照しなくなれば取り消す（印がなくなると、単独の READ の確かめのジョブが読む
@@ -916,7 +894,7 @@ const redraftFormCreate = (
   const content = validateScenarioDraft(item.draft, item.row.candidate, [], context);
   const planned = content.ok ? plannedRulesOf(attachedRulesOfExisting(existing, content.content, item.row.candidate)) : null;
   const choice = formAnswerChoiceOf(facts, item, readCheckFactsOf(facts.stored.profile.profileId));
-  if (!content.ok || planned === null || choice === null || choice.kind === 'LIMIT_REACHED') {
+  if (!content.ok || planned === null || choice === null) {
     return 'NOT_REDRAFTED';
   }
   const answerCandidate = item.answerRead.value.candidate;
@@ -992,6 +970,11 @@ export const draftScreenForCheck = createServerOnlyFn(async (profileId: string, 
     return { ok: false, createScenarioId: null, updateScenarioId: null, blocker: facts.blocker ?? 'DISCOVERY_MISSING' };
   }
   const { apiCreate, formCreate } = screenCreatesOf(facts, facts.context, createDigest);
+  // SPEC-4: 既にある登録の手順に人が保存した規則が付いていれば、作り直しの前に推した規則に替える（作り直しの計画を、推した規則で立てるため）。
+  const existing = apiCreate !== undefined ? apiCreate : formCreate;
+  if (existing?.status === 'EXISTING') {
+    replaceHumanRules(localUiStore(), existing.scenarioId, nowCompactTimestamp);
+  }
   // OP-S: 既にある登録の手順は、今の決まりで作り直す（違うときだけ新しい版。承認は、チェックの保存がその版に行う）。
   redraftExistingOf(facts, facts.context, apiCreate, formCreate);
   const created = apiCreate !== undefined ? createOne(facts, apiCreate) : formCreate !== undefined ? createFormOne(facts, formCreate) : null;
@@ -1020,6 +1003,9 @@ export const draftScreenForCheck = createServerOnlyFn(async (profileId: string, 
  *   （候補が分かっているときだけ）のどちらかが当たれば真。
  * - `updateFound`（OP-2 の修正の 2 回目、R1）: 同じ表の更新の画面（候補）が操作さがしにある（下書きを作れるかによらない。`updatePossible` が偽で、これが真なら、
  *   更新する欄を決められない）。
+ * - `updateOpenerUnnamedOnly`（LU-13 fix round 1。設計書 `2026-11-02-beaksight-list-row-update-design.md` 4.0 の D3、5.6）: 同じ表の更新の候補があり、どれも
+ *   名前のない開き手（アイコンだけ）から開くもの（判定の 1 か所 `isUnnamedOpenerUpdateOf`）。名前のない開き手の更新は扱わない（チェックしても更新の手順は
+ *   承認されない）ので、そのときは `updatePossible` を偽にする（行の更新の 1 行は `NOT_DECIDABLE` で、文は「この画面の更新は自動で扱えません。」）。
  */
 export interface AutoDraftScreenView {
   readonly rowKey: string;
@@ -1030,6 +1016,7 @@ export interface AutoDraftScreenView {
   readonly notCheckableReason: ScenarioDraftRejectionReason | null;
   readonly updatePossible: boolean;
   readonly updateFound: boolean;
+  readonly updateOpenerUnnamedOnly: boolean;
   /**
    * OP-T fix round 2（I-2）: 最後の操作さがしで既にある更新の手順（同じ形の計画の `EXISTING`。計画の順）。行が対象にする更新は、このうち登録の台帳に結ぶ最初の
    * もの（チェックの保存の `draftUpdateForCreate` が既にある更新を選ぶ順と同じ）。
@@ -1069,18 +1056,22 @@ export const scenarioAutoDraftScreensOf = createServerOnlyFn(async (profileId: s
     updateFound: boolean,
     updateCandidates: readonly DiscoveryCandidate[],
     existingUpdateScenarioIds: readonly string[],
-  ): AutoDraftScreenView => ({
-    rowKey: item.row.candidate.identityDigest,
-    pagePath: item.row.candidate.page.path,
-    screenName: discoveryPageScreenNameOf(latest, item.row.candidate.page.path),
-    // OP-F（M-3）: 登録の画面か、分かっている更新の画面のどちらかが当たれば出す（判定は 1 か所 `writeScreenMayNotifyOf`）。
-    mayNotify: writeScreenMayNotifyOf(item.row.candidate, updateCandidates),
-    scenarioId: item.status === 'EXISTING' ? item.scenarioId : null,
-    notCheckableReason: item.status === 'REJECTED' ? item.reason : null,
-    updatePossible,
-    updateFound: updatePossible || updateFound,
-    existingUpdateScenarioIds,
-  });
+  ): AutoDraftScreenView => {
+    const updateOpenerUnnamedOnly = updateCandidates.length > 0 && updateCandidates.every(isUnnamedOpenerUpdateOf);
+    return {
+      rowKey: item.row.candidate.identityDigest,
+      pagePath: item.row.candidate.page.path,
+      screenName: discoveryPageScreenNameOf(latest, item.row.candidate.page.path),
+      // OP-F（M-3）: 登録の画面か、分かっている更新の画面のどちらかが当たれば出す（判定は 1 か所 `writeScreenMayNotifyOf`）。
+      mayNotify: writeScreenMayNotifyOf(item.row.candidate, updateCandidates),
+      scenarioId: item.status === 'EXISTING' ? item.scenarioId : null,
+      notCheckableReason: item.status === 'REJECTED' ? item.reason : null,
+      updatePossible: updatePossible && !updateOpenerUnnamedOnly,
+      updateFound: updatePossible || updateFound,
+      updateOpenerUnnamedOnly,
+      existingUpdateScenarioIds,
+    };
+  };
   return [
     ...plan.creates.map((item) => screenOf(item, apiUpdatePossible, plan.updates.length > 0, apiUpdateCandidates, apiExistingUpdateIds)),
     ...formPlan.creates.map((item) => screenOf(

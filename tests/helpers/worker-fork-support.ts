@@ -1,5 +1,4 @@
-// CC-095（T36c）: ワーカーの fork のテスト（スクリプトで送るログインの手動のログイン `script-login-worker-fork`、SPA の監査 `spa-audit-worker-fork`、
-// スクリプトで送るログインの自動ログイン `automated-script-login-fork`）の共通の補助（テストのファイルではない）。テストのファイルに書き写さない。
+// CC-095（T36c）: ワーカーの fork のテスト（本物のワーカーを子の process で起こす結合と、`write-job-harness.ts`）の共通の補助（テストのファイルではない）。テストのファイルに書き写さない。
 // - 標準入力の資格情報の準備（テストだけの入口の `prelude` と `credentialsExpression`）。
 // - process とその子孫（Chromium）の一覧（`processTreeOf`）と、状態を待つ（`waitForValue`）。
 // - fork のテストのプロファイル（版の決まった欄を埋める `createForkTestProfile`）。

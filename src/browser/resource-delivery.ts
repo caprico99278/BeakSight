@@ -258,11 +258,32 @@ function validatedLimits(limits: ResourceCacheLimits): ResourceCacheLimits {
  * Run 全体のリソースのキャッシュ。Run Coordinator が Run の初めに1つだけ作り、Run の終わりに捨てる（ファイルには書かない）。
  * 大きさは本文で数え、合計の上限を超えたら、最も前に使われたものから捨てる（LRU）。
  */
+/**
+ * 項目が合計の上限の中で占める大きさ（バイト）: 本文の大きさに、付属分（URL の鍵と、持つ応答の header の名前と値。UTF-8 の長さ）を足したもの。要求を出し続ける
+ * 画面（本文が小さく、URL ごとに別の資源）で、本文だけを数えると付属分が上限に入らず、増え続けたため。合計の上限（256 MiB）はキャッシュの容量で、網羅を削る上限ではない
+ * （入りきらない分は、キャッシュせずに読むだけ）。
+ */
+function accountedBytesOf(resource: CachedResource): number {
+  return resource.body.byteLength + resourceCacheEntryOverheadBytes(resource.url, resource.headers);
+}
+
+/** 項目の付属分（URL の鍵と、持つ応答の header の名前と値。UTF-8 の長さ）のバイト数（数え方の唯一の場所。テストが上限を組み立てるのにも使う）。 */
+export function resourceCacheEntryOverheadBytes(url: string, headers: Readonly<Record<string, string>>): number {
+  let bytes = Buffer.byteLength(url, 'utf8');
+  for (const [name, value] of Object.entries(headers)) {
+    bytes += Buffer.byteLength(name, 'utf8') + Buffer.byteLength(value, 'utf8');
+  }
+  return bytes;
+}
+
 export class ResourceCache {
   readonly #limits: ResourceCacheLimits;
   /** URL を鍵にした項目。Map の順を LRU の順（先頭が、最も前に使われたもの）として使う。 */
   readonly #entries = new Map<string, CachedResource>();
+  /** 本文の大きさの合計（`stats` の `totalBytes`）。 */
   #totalBytes = 0;
+  /** 合計の上限と比べる大きさ（本文と付属分。`accountedBytesOf` の合計）。 */
+  #accountedBytes = 0;
 
   constructor(options: ResourceCacheOptions = {}) {
     this.#limits = validatedLimits(options.limits ?? RESOURCE_CACHE_LIMITS);
@@ -283,8 +304,7 @@ export class ResourceCache {
     ) {
       return false;
     }
-    this.#remove(fact.url);
-    this.#entries.set(fact.url, Object.freeze({
+    const resource: CachedResource = Object.freeze({
       url: fact.url,
       status: RESOURCE_CACHE_STORABLE_STATUS,
       headers: storedResponseHeaders(
@@ -292,8 +312,15 @@ export class ResourceCache {
         content.kind === 'FULL_RANGE' ? EXCLUDED_FULL_RANGE_RESPONSE_HEADER_NAMES : EXCLUDED_RESPONSE_HEADER_NAMES,
       ),
       body: fact.body,
-    }));
+    });
+    // 付属分（URL の鍵と、持つ header）を含めて合計の上限に入らない項目は、入れない（キャッシュせずに読むだけ。すでにある項目は変えない）。
+    if (accountedBytesOf(resource) > this.#limits.maxTotalBytes) {
+      return false;
+    }
+    this.#remove(fact.url);
+    this.#entries.set(fact.url, resource);
     this.#totalBytes += fact.body.byteLength;
+    this.#accountedBytes += accountedBytesOf(resource);
     this.#evictLeastRecentlyUsed();
     return true;
   }
@@ -356,13 +383,17 @@ export class ResourceCache {
     if (existing !== undefined) {
       this.#entries.delete(url);
       this.#totalBytes -= existing.body.byteLength;
+      this.#accountedBytes -= accountedBytesOf(existing);
     }
   }
 
-  /** 合計の上限に収まるまで、前に使われたものから捨てる（最後に入れた項目は、1件の上限があるので捨てられない）。 */
+  /**
+   * 合計の上限に収まるまで、前に使われたものから捨てる（最後に入れた項目は、`store` が付属分を含めて合計の上限に入ると確かめたので捨てられない）。
+   * 合計は、本文に付属分（URL の鍵と、持つ header）を足した大きさで数える（`accountedBytesOf`）。
+   */
   #evictLeastRecentlyUsed(): void {
     for (const url of this.#entries.keys()) {
-      if (this.#totalBytes <= this.#limits.maxTotalBytes) {
+      if (this.#accountedBytes <= this.#limits.maxTotalBytes) {
         return;
       }
       this.#remove(url);

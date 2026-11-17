@@ -217,7 +217,8 @@ describe('T41a: the keys decided by the page of an API UPDATE (the user decision
   const body = { ...MEMBER_BODY, tenant_id: 'tenant-1' };
 
   it('has the two reasons of T41a at the end of the closed list', () => {
-    expect(SCENARIO_DRAFT_REJECTION_REASONS.slice(-2)).toEqual(['SCENARIO_API_PAGE_KEY_NOT_IDENTIFIABLE', 'SCENARIO_API_FILTER_NOT_BOUND_TO_LEDGER_ID']);
+    // ARR-2: その後ろに、一覧の鍵の 4 つを足した（`def-226-array-key-approval.test.ts`）。ARR-3: さらに 1 つ（`arr-3-array-rows.test.ts`）。ARR-5: さらに 2 つ。ARR-5 fix round 1: さらに 2 つ。
+    expect(SCENARIO_DRAFT_REJECTION_REASONS.slice(-11, -9)).toEqual(['SCENARIO_API_PAGE_KEY_NOT_IDENTIFIABLE', 'SCENARIO_API_FILTER_NOT_BOUND_TO_LEDGER_ID']);
   });
 
   it('accepts a page key that is a field of the update page (a selected field of the same name), with its field identity', () => {
@@ -423,7 +424,7 @@ describe('T41a: the approval digest v4 of an API UPDATE', () => {
 
 const KEY_FIELDS_DIGEST = apiKeyFieldsDigestOf(SHAPE_A, [NAME_FIELD, EMAIL_FIELD, NOTE_FIELD]);
 const TEMPLATED_FACT = Object.freeze({
-  templatedIdentityDigests: [TEMPLATED], ruleDigest: RULE, classification: 'NEEDS_BINDING' as const, drift: 'NEW' as const,
+  templatedIdentityDigests: [TEMPLATED], ruleDigest: RULE, classification: 'NEEDS_BINDING' as const, drift: 'SEEN' as const,
   shapeDigests: [SHAPE_A], keyFieldDigests: [KEY_FIELDS_DIGEST],
 });
 
@@ -435,7 +436,7 @@ const UPDATE_FACTS: ApprovalCurrentFacts = Object.freeze<ApprovalCurrentFacts>({
   candidate: null,
   candidateShapeDigests: null,
   candidateKeyFieldDigests: null,
-  apiShapeOriginIndex: 0,
+  apiShapeOrigin: { kind: 'APPROVED_API', index: 0 },
   latestDiscoveryProfileRevision: 4,
   templatedCandidates: [TEMPLATED_FACT],
   inputRuleReference: INPUT_RULES,

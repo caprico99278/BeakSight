@@ -1,0 +1,48 @@
+<!doctype html>
+<html lang="ja">
+  <head>
+    <meta charset="utf-8">
+    <title>Notification region fixture</title>
+    <style>
+      * { box-sizing: border-box; }
+      body { margin: 0; font-family: sans-serif; font-size: 16px; line-height: 1.25; }
+      main { width: 800px; padding: 8px; }
+      button { font: inherit; }
+      /* 全面の透明な入れ物（背景なし・押下を受けない）。 */
+      #notice-layer { position: fixed; inset: 0; z-index: 40; pointer-events: none; }
+      /* 入れ物の中の、固定の region の枠（背景・枠線・影あり）。role="dialog" ではない。 */
+      #notice {
+        position: fixed; right: 16px; bottom: 16px; width: 320px; height: 200px; pointer-events: auto;
+        background: #fff; border: 1px solid #333; box-shadow: 0 2px 6px rgba(0, 0, 0, 0.3);
+      }
+      #notice header { display: flex; gap: 8px; }
+      /* 隠したダイアログ（どれも閉じるボタンを持つ）。hidden は見えない。inert と aria-hidden は見えるが、利用者から隠されている。 */
+      .concealed { position: fixed; left: 16px; width: 200px; height: 80px; background: #eee; }
+      #inert-dialog { top: 16px; }
+      #aria-hidden-dialog { top: 120px; }
+    </style>
+  </head>
+  <body>
+    <main>
+      <h1>Sample page</h1>
+      <p>This paragraph explains the page in plain words for the test.</p>
+    </main>
+    <div id="notice-layer">
+      <section id="notice" role="region" aria-labelledby="notice-title" aria-live="polite">
+        <header>
+          <h2 id="notice-title">お知らせ</h2>
+          <button type="button" id="notice-minimize" aria-expanded="true" aria-controls="notice-body" aria-label="お知らせを最小化">−</button>
+          <button type="button" id="notice-close" aria-label="お知らせを閉じる"><svg aria-hidden="true" width="12" height="12" viewBox="0 0 12 12"><path d="M1 1L11 11M11 1L1 11" stroke="#000" stroke-width="2"/></svg></button>
+        </header>
+        <div id="notice-body"><p>一般のお知らせの文です。</p></div>
+      </section>
+    </div>
+    <div id="hidden-dialog" class="concealed" role="dialog" hidden><button type="button">閉じる</button></div>
+    <div id="inert-dialog" class="concealed" role="dialog" inert><button type="button">閉じる</button></div>
+    <div id="aria-hidden-dialog" class="concealed" role="dialog" aria-hidden="true"><button type="button">閉じる</button></div>
+    <script>
+      document.getElementById('notice-minimize').addEventListener('click', () => { document.getElementById('notice-body').hidden = true; });
+      document.getElementById('notice-close').addEventListener('click', () => { document.getElementById('notice').remove(); });
+    </script>
+  </body>
+</html>

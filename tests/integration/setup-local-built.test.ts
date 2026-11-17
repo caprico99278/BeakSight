@@ -28,6 +28,7 @@ const REPOSITORY_ROOT = new URL('../../', import.meta.url);
 let build: TemporaryBuild | undefined;
 
 beforeAll(async () => {
+  // TEST-TIME-A: ビルドの root の下に管理データを作る（中身を書き換える）ので、共有のビルドを使わず、自分のビルドを使う。
   build = await buildIntoTemporaryDirectory();
 }, BUILD_TIMEOUT_MS);
 

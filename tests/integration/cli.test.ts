@@ -18,7 +18,6 @@ import {
   checkpointArtifactRelativePath,
   isBundleFileName,
 } from '../../src/core/artifact-layout.js';
-import { findingsOfAuditArtifact, type AuditArtifactFindingsPart } from '../../src/core/audit-artifact-findings.js';
 import type { Finding, PageAuditResult, RunSummary } from '../../src/core/contracts.js';
 import { validateArtifact } from '../../src/core/schema-validator.js';
 import { RUN_STATUS_CATALOG, SEVERITY_CATALOG } from '../../src/presentation/catalog.js';
@@ -31,7 +30,9 @@ import {
   STACK_TRACE_LINE,
   type CliProcessResult,
 } from '../helpers/cli-process.js';
-import { buildIntoTemporaryDirectory, type TemporaryBuild } from '../helpers/temporary-build.js';
+import { readRunAudit } from '../helpers/run-harness.js';
+import { useSharedTemporaryBuild } from '../helpers/shared-temporary-build.js';
+import type { TemporaryBuild } from '../helpers/temporary-build.js';
 
 const SUITE_TIMEOUT_MS = 300_000;
 const JAPANESE_CHARACTER = /[\p{Script=Hiragana}\p{Script=Katakana}\p{Script=Han}]/u;
@@ -42,7 +43,7 @@ let workDirectory: string;
 
 beforeAll(async () => {
   server = await startFixtureServer();
-  build = await buildIntoTemporaryDirectory();
+  build = await useSharedTemporaryBuild();
   workDirectory = await mkdtemp(join(tmpdir(), 'beaksight-cli-integration-'));
 }, SUITE_TIMEOUT_MS);
 
@@ -101,8 +102,8 @@ describe('CLI run: a COMPLETE Run with site ERROR Findings (Task 17 Step 1)', ()
     result = await runCli('run', '--config', config, '--output', outputDirectory, '--headless');
     runDirectory = await onlyRunDirectory(outputDirectory);
     run = (await readJson(join(runDirectory, RUN_ARTIFACT_FILE_NAMES.run))) as RunSummary;
-    // T44f: audit.json の最上位の findings はページに入っていない Finding だけなので、読む側の決まりで Run のすべての Finding にする。
-    findings = findingsOfAuditArtifact((await readJson(join(runDirectory, RUN_ARTIFACT_FILE_NAMES.audit))) as AuditArtifactFindingsPart);
+    // REC-2: audit.json は目録なので、Run のすべての Finding は、目録と page.json から読む（`readRunAudit`）。
+    findings = (await readRunAudit(runDirectory)).findings;
   }, SUITE_TIMEOUT_MS);
 
   it('exits with 0 for COMPLETE even though the site has ERROR Findings', () => {
@@ -124,10 +125,10 @@ describe('CLI run: a COMPLETE Run with site ERROR Findings (Task 17 Step 1)', ()
   it('writes run.json, audit.json, report.html, the bundle and every page.json, and they match their schemas', async () => {
     await expect(validateArtifact('run', run)).resolves.toEqual({ ok: true });
     await expect(validateArtifact('audit', await readJson(join(runDirectory, RUN_ARTIFACT_FILE_NAMES.audit)))).resolves.toEqual({ ok: true });
-    const pages = ((await readJson(join(runDirectory, RUN_ARTIFACT_FILE_NAMES.audit))) as { readonly pages: readonly PageAuditResult[] }).pages;
+    const pages = ((await readJson(join(runDirectory, RUN_ARTIFACT_FILE_NAMES.audit))) as { readonly pages: readonly string[] }).pages;
     expect(pages.length).toBeGreaterThan(0);
-    for (const page of pages) {
-      await expect(validateArtifact('page', await readJson(join(runDirectory, 'pages', page.pageId, 'page.json')))).resolves.toEqual({ ok: true });
+    for (const path of pages) {
+      await expect(validateArtifact('page', await readJson(join(runDirectory, path)))).resolves.toEqual({ ok: true });
     }
     const html = await readFile(join(runDirectory, RUN_ARTIFACT_FILE_NAMES.report), 'utf8');
     expect(html).toContain('<html lang="ja">');
@@ -181,49 +182,5 @@ describe('CLI run: a COMPLETE Run with site ERROR Findings (Task 17 Step 1)', ()
   });
 });
 
-describe('CLI run: a PARTIAL Run (page limit)', () => {
-  let result: CliProcessResult;
-  let outputDirectory: string;
-  let runDirectory: string;
-  let run: RunSummary;
-
-  beforeAll(async () => {
-    const config = await writeTargetConfig('partial.json', '/crawl/index.html', {
-      crawl: { maxPages: 1, minNavigationIntervalMs: 0 },
-      audit: { screenshots: false },
-      output: { directory: 'partial-output' },
-    });
-    // 設定の既定値に頼らず、headless に固定する（RC18 の M5）。
-    result = await runCli('run', '--config', config, '--headless');
-    outputDirectory = join(workDirectory, 'partial-output');
-    runDirectory = await onlyRunDirectory(outputDirectory);
-    run = (await readJson(join(runDirectory, RUN_ARTIFACT_FILE_NAMES.run))) as RunSummary;
-  }, SUITE_TIMEOUT_MS);
-
-  it('exits with 2 for PARTIAL, within the limit', () => {
-    expect(run.runStatus).toBe('PARTIAL');
-    expect(run.crawlLimits.maxPagesReached).toBe(true);
-    expect(result.status, result.stderr).toBe(EXIT_CODES.PARTIAL);
-    expectFinishedInTime(result);
-  });
-
-  it('writes into the configured output directory (relative to the working directory) when --output is not given', async () => {
-    const bundleName = bundleFileName(run.executions[run.executions.length - 1]?.finishedAt ?? '');
-    for (const file of [...Object.values(RUN_ARTIFACT_FILE_NAMES), bundleName]) {
-      await expect(readFile(join(runDirectory, file))).resolves.toBeInstanceOf(Buffer);
-    }
-    expect((await readdir(runDirectory)).filter(isBundleFileName)).toEqual([bundleName]);
-  });
-
-  // R5a（中断した Run の再開の設計書 3.2、4.7.1）: ページ数の上限による PARTIAL は、再開の対象にしない（保存の状態は FINISHED）。
-  it('leaves only state.json (FINISHED) in checkpoint/, because a Run stopped by the page limit is not resumed', async () => {
-    await expectOnlyFinishedState(runDirectory);
-  });
-
-  it('prints the PARTIAL label and the number of incomplete reasons', () => {
-    expect(result.stdout).toContain(RUN_STATUS_CATALOG.PARTIAL.label);
-    expect(result.stdout).toContain(runDirectory);
-    expect(result.stdout).toContain(`${RUN_SUMMARY_TEXT.reasonsHeading}: ${formatCount(run.incompleteReasons.length)}`);
-    expect(result.stderr).not.toMatch(STACK_TRACE_LINE);
-  });
-});
+// SLIM-GROUP: 前の「PARTIAL の Run（ページの上限）」の describe は外した。終了コードの表は `tests/unit/cli.test.ts`、ページの上限の PARTIAL は
+// `auditor-gates.test.ts` の GATE-A09、ページの上限の Run を再開しない（保存の状態が FINISHED）は単体の Run Coordinator と保存。

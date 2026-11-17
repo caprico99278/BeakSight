@@ -1,17 +1,14 @@
 // ジョブの表の、ジョブの記録の口が書くまとめの列の結合テスト（T32g・T34e・T36R-fix・T43d・DEF-138）。LG-2 で、版ごとのテスト
 // （`control-store-v10`・`v11`・`v16`）の今の形と、今の版の管理データでの部品の振る舞いをまとめた（前の版からの上げの確かめは捨てた）。
 // - 書き込みのジョブの報告の確かめ（`write_report_check`）: 記録の口（`recordWriteReportCheck`）は書き込みのジョブだけに 1 回だけ書く。
-// - ログインの段のまとめ（`login_stage_summary`）: JSON の object と大きさの上限の CHECK。最も大きいまとめが上限に収まる。記録の口
+// - ログインの段のまとめ（`login_stage_summary`）: JSON の object の CHECK（URL-LEN の版 20 で大きさの上限は外した）。記録の口
 //   （`recordAuthState`）は 1 回だけ書き、読む口（`readJob`）は閉じた形に合わなければデータベースの誤りとして止める。
-// - セッションの切れの証拠（`session_loss`）: JSON の object と大きさの上限の CHECK。`SESSION_LOST` のときに 1 回だけ書く。
+// - セッションの切れの証拠（`session_loss`）: JSON の object の CHECK（大きさの上限は版 20 で外した）。`SESSION_LOST` のときに 1 回だけ書く。
 // 一時のフォルダだけを使い、終わったら消す。
 import type { DatabaseSync } from 'node:sqlite';
 import { describe, expect, it } from 'vitest';
-import { MAX_LOGIN_SIDE_REQUESTS, MAX_SUCCESS_SELECTOR_LENGTH } from '../../src/control/auth/auth-setup-contracts.js';
 import { MIN_PROFILE_REVISION } from '../../src/control/contracts.js';
-import { MAX_LOGIN_STAGE_SUMMARY_LENGTH, MAX_SESSION_LOSS_RECORD_LENGTH } from '../../src/control/job/job-records.js';
 import {
-  fittedLoginStageSummary,
   readJob,
   recordAuthState,
   recordEnded,
@@ -19,40 +16,13 @@ import {
   type AuditJobLoginStageSummary,
 } from '../../src/control/job/job-store.js';
 import { closeControlDatabase, openControlDatabase, type ControlDatabase } from '../../src/control/store/control-database.js';
-import {
-  MAX_WORKER_LOGIN_STAGE_BLOCKED_PATH_LENGTH,
-  MAX_WORKER_LOGIN_STAGE_BLOCKED_REQUESTS,
-  MAX_WORKER_NOTICE_URL_LENGTH,
-  WORKER_LOGIN_STAGE_BLOCK_REASONS,
-  WORKER_REQUEST_RESOURCE_TYPES,
-  WORKER_SCRIPT_LOGIN_BLOCK_REASONS,
-  type WorkerScriptLoginBlockReason,
-} from '../../src/control/worker-protocol.js';
-import {
-  MAX_SESSION_LOSS_BLOCKED_REQUESTS,
-  MAX_SESSION_LOSS_KEY_SHAPES,
-  MAX_SESSION_LOSS_PATH_LENGTH,
-  MAX_SESSION_LOSS_REDIRECT_PATHS,
-  MAX_SESSION_LOSS_STORAGE_KEY_CHANGES,
-  SESSION_LOSS_BLOCKED_REQUEST_REASONS,
-  type SessionLossEvidence,
-} from '../../src/core/evidence-types.js';
-import { DISCOVERY_LOGOUT_WORDS } from '../../src/discovery/classification-words.js';
-import {
-  LOGIN_OBSERVED_QUERY_VALUE_NAMES,
-  MAX_LOGIN_OBSERVED_KEY_PART_LENGTH,
-  MAX_LOGIN_OBSERVED_QUERY_NAMES,
-  MAX_LOGIN_OBSERVED_QUERY_NAME_LENGTH,
-  MAX_LOGIN_OBSERVED_QUERY_VALUE_LENGTH,
-  MAX_LOGIN_OBSERVED_STORAGE_KEY_NAMES,
-} from '../../src/discovery/login-observation.js';
+import { WORKER_SCRIPT_LOGIN_BLOCK_REASONS, type WorkerScriptLoginBlockReason } from '../../src/control/worker-protocol.js';
+import type { SessionLossEvidence } from '../../src/core/evidence-types.js';
 import { insertRow, useControlStoreWorkspace, type SqlValue } from '../helpers/control-store-schema.js';
 
 const PROFILE_ID = 'example-job-summaries';
 const CREATED_AT = '20261016000000';
 const LATER_AT = '20261016000100';
-/** 安全な整数の最大（回数の最悪の桁数）。 */
-const MAX_COUNT = Number.MAX_SAFE_INTEGER;
 
 const workspace = useControlStoreWorkspace('beaksight-control-job-summaries-');
 
@@ -110,40 +80,17 @@ const SUMMARY: AuditJobLoginStageSummary = {
   },
 };
 
-/** 最も大きいまとめ（上限の長さの Origin と path、上限の件数、安全な整数の最大の回数、最も長い理由と種類の名前）。 */
-const largestSummaryText = (): string => {
-  const longest = (values: readonly string[]): string => values.reduce((a, b) => (b.length > a.length ? b : a), '');
-  const origin = `http://${'a'.repeat(MAX_WORKER_NOTICE_URL_LENGTH - 'http://'.length)}`;
-  return JSON.stringify({
-    scriptLogin: {
-      tokenRequestsAllowed: MAX_COUNT,
-      sideRequestsAllowed: Array.from({ length: MAX_LOGIN_SIDE_REQUESTS }, () => MAX_COUNT),
-      serviceOriginReads: MAX_COUNT,
-      blockedByReason: Object.fromEntries(WORKER_SCRIPT_LOGIN_BLOCK_REASONS.map((reason) => [reason, MAX_COUNT])),
-    },
-    blockedRequests: {
-      requests: Array.from({ length: MAX_WORKER_LOGIN_STAGE_BLOCKED_REQUESTS }, () => ({
-        origin,
-        path: `/${'p'.repeat(MAX_WORKER_LOGIN_STAGE_BLOCKED_PATH_LENGTH - 1)}`,
-        resourceType: longest(WORKER_REQUEST_RESOURCE_TYPES),
-        reason: longest(WORKER_LOGIN_STAGE_BLOCK_REASONS),
-        count: MAX_COUNT,
-      })),
-      unlisted: MAX_COUNT,
-    },
-  });
-};
+/** URL-LEN（版 20）: 前の JSON の全体の上限（まとめ 32,768・証拠 65,536）を超える長さ。 */
+const LONGER_THAN_FORMER_RECORD_LIMIT = 70_000;
 
 describe('Control store: the login stage summary of a job', () => {
-  it('fits the largest summary in the size limit', () => {
-    expect(largestSummaryText().length).toBeLessThanOrEqual(MAX_LOGIN_STAGE_SUMMARY_LENGTH);
-  });
-
-  it('accepts a JSON object within the size limit, and rejects a broken JSON, a JSON that is not an object and a too long one', () => {
+  // URL-LEN（版 20）: 大きさの上限（前は 32,768）はない。JSON の object の形だけを確かめる。
+  it('accepts a JSON object of any size, and rejects a broken JSON and a JSON that is not an object', () => {
     const connection = workspace.latestConnection([PROFILE_ID]);
     insertJob(connection, { job_id: 'job-ok', login_stage_summary: JSON.stringify(SUMMARY) });
     insertJob(connection, { job_id: 'job-null', login_stage_summary: null });
-    for (const [index, value] of ['{', '[]', '"text"', JSON.stringify({ padding: 'x'.repeat(MAX_LOGIN_STAGE_SUMMARY_LENGTH) })].entries()) {
+    insertJob(connection, { job_id: 'job-long', login_stage_summary: JSON.stringify({ padding: 'x'.repeat(LONGER_THAN_FORMER_RECORD_LIMIT) }) });
+    for (const [index, value] of ['{', '[]', '"text"'].entries()) {
       expect(() => insertJob(connection, { job_id: `job-bad-${index}`, login_stage_summary: value }), value.slice(0, 10)).toThrow();
     }
   });
@@ -187,40 +134,8 @@ describe('Control store: the login stage summary of a job', () => {
 });
 
 // T43d（Task 43 の設計書 4.4）: ログインの段のまとめに、止めた要求の行の query（名前と `grant_type` の値）と、観察（成功の鍵の名前の案と成功の画面の
-// セレクタの案。任意の項目 `observation`）を足した。最も大きいまとめも、大きさの上限の中に収まる。`observation` のない行は今どおり読める。
+// セレクタの案。任意の項目 `observation`）を足した。`observation` のない行は今どおり読める。
 describe('Control store: the login observation in the login stage summary', () => {
-  /** 最も大きい観察（上限の長さの Origin、上限の数と長さの鍵の名前、最も長い CSS と語）。 */
-  const largestObservation = () => {
-    const longest = (values: readonly string[]): string => values.reduce((a, b) => (b.length > a.length ? b : a), '');
-    return {
-      // T43R-fix の C-1（意図して直した期待）: 鍵の名前は接頭辞と接尾辞の組だけ。
-      storageKeys: {
-        origin: `http://${'a'.repeat(MAX_WORKER_NOTICE_URL_LENGTH - 'http://'.length)}`,
-        shapes: Array.from({ length: MAX_LOGIN_OBSERVED_STORAGE_KEY_NAMES }, (_, index) => ({
-          prefix: `${index}${'k'.repeat(MAX_LOGIN_OBSERVED_KEY_PART_LENGTH - 1)}.`, suffix: `.${index}${'k'.repeat(MAX_LOGIN_OBSERVED_KEY_PART_LENGTH - 1)}`,
-        })),
-        omitted: MAX_COUNT,
-      },
-      successSelector: { selector: `#${'s'.repeat(MAX_SUCCESS_SELECTOR_LENGTH - 1)}`, kind: 'LOGOUT_CONTROL', logoutWord: longest(DISCOVERY_LOGOUT_WORDS) },
-      credentialDiscarded: MAX_COUNT,
-    };
-  };
-
-  it('fits the largest summary with the query of every row and the observation in the size limit', () => {
-    const largest = JSON.parse(largestSummaryText()) as { blockedRequests: { requests: Record<string, unknown>[] } } & Record<string, unknown>;
-    const query = {
-      names: Array.from({ length: MAX_LOGIN_OBSERVED_QUERY_NAMES }, (_, index) => `${index}${'q'.repeat(MAX_LOGIN_OBSERVED_QUERY_NAME_LENGTH - 1)}`),
-      omitted: MAX_COUNT,
-      values: LOGIN_OBSERVED_QUERY_VALUE_NAMES.map((name) => ({ name, value: 'v'.repeat(MAX_LOGIN_OBSERVED_QUERY_VALUE_LENGTH) })),
-    };
-    const text = JSON.stringify({
-      ...largest,
-      blockedRequests: { ...largest.blockedRequests, requests: largest.blockedRequests.requests.map((request) => ({ ...request, query })) },
-      observation: largestObservation(),
-    });
-    expect(text.length).toBeLessThanOrEqual(MAX_LOGIN_STAGE_SUMMARY_LENGTH);
-  });
-
   it('records the observation and the query with the summary, reads them back, and reads a summary without the observation', () => {
     withJobs([
       { job_id: 'job-o', state: 'RUNNING', finished_at: null },
@@ -258,72 +173,28 @@ describe('Control store: the login observation in the login stage summary', () =
     });
   });
 
-  // T43R-fix の M-5: まとめの大きさは JSON の escape を含めた全体の長さで確かめ、上限を超えるときは観察と行の query の名前を落として「省いた」印を付ける
-  // （RangeError で落とさない）。数のまとめと、行の Origin・path・種類・理由・回数は残る。
-  it('drops the observation and the query names of a summary over the limit with the escapes, and marks it omitted', () => {
-    withJobs([{ job_id: 'job-big', state: 'RUNNING', finished_at: null }], (database) => {
-      const largest = JSON.parse(largestSummaryText()) as AuditJobLoginStageSummary;
-      // 引用符は JSON の escape で 2 文字になる（IPC の検証は 1 文字で数える）。
-      const quoted = (index: number): string => `${index}${'"'.repeat(MAX_LOGIN_OBSERVED_QUERY_NAME_LENGTH - 1)}`;
+  // URL-LEN（版 20）: 前の大きさの上限（32,768）を超えるまとめも、観察と行の query の名前を落とさずに、そのまま書いて読む（前は落として「省いた」印を付けた）。
+  // 前に書いた「省いた」印のまとめも読める。
+  it('records a summary longer than the former limit as it is, with the observation and the query names, and reads an omitted summary written before', () => {
+    withJobs([{ job_id: 'job-big', state: 'RUNNING', finished_at: null }, { job_id: 'job-omitted', state: 'FINISHED' }], (database) => {
+      const longPath = `/${'p'.repeat(LONGER_THAN_FORMER_RECORD_LIMIT)}`;
       const big: AuditJobLoginStageSummary = {
-        ...largest,
+        scriptLogin: null,
         blockedRequests: {
-          requests: (largest.blockedRequests?.requests ?? []).map((request) => ({
-            ...request,
-            query: { names: [quoted(0), quoted(1), quoted(2), 'grant_type'].sort(), omitted: MAX_COUNT, values: [{ name: 'grant_type', value: 'password' }] },
-          })),
-          unlisted: largest.blockedRequests?.unlisted ?? 0,
+          requests: [{
+            origin: 'http://127.0.0.1:5173', path: longPath, resourceType: 'fetch', reason: 'NON_READ_METHOD', count: 1,
+            query: { names: ['grant_type'], omitted: 0, values: [{ name: 'grant_type', value: 'password' }] },
+          }],
+          unlisted: 0,
         },
-        observation: {
-          ...largestObservation(),
-          storageKeys: {
-            origin: largestObservation().storageKeys.origin,
-            shapes: Array.from({ length: MAX_LOGIN_OBSERVED_STORAGE_KEY_NAMES }, (_, index) => ({
-              prefix: `${index}${'"'.repeat(MAX_LOGIN_OBSERVED_KEY_PART_LENGTH - 1)}.`, suffix: `.${index}${'"'.repeat(MAX_LOGIN_OBSERVED_KEY_PART_LENGTH - 1)}`,
-            })),
-            omitted: MAX_COUNT,
-          },
-        } as NonNullable<AuditJobLoginStageSummary['observation']>,
+        observation: { successSelector: { selector: '#logout', kind: 'LOGOUT_CONTROL', logoutWord: 'logout' } },
       };
-      // 上限を超えるまとめは、観察と query の名前を落とし、省いた印を付ける（行と数は残る）。
-      expect(JSON.stringify(big).length).toBeGreaterThan(MAX_LOGIN_STAGE_SUMMARY_LENGTH);
-      const fitted = fittedLoginStageSummary(big);
-      expect(fitted.observationOmitted).toBe(true);
-      expect(fitted.observation).toBeUndefined();
-      expect(fitted.blockedRequests?.requests.every((request) => request.query === undefined)).toBe(true);
-      expect(fitted.blockedRequests?.requests).toHaveLength(largest.blockedRequests?.requests.length ?? 0);
-      expect(fitted.scriptLogin).toEqual(largest.scriptLogin);
-      expect(JSON.stringify(fitted).length).toBeLessThanOrEqual(MAX_LOGIN_STAGE_SUMMARY_LENGTH);
-      expect(fittedLoginStageSummary(SUMMARY)).toBe(SUMMARY);
-      // IPC の検証を通る最も大きいまとめ（正規の Origin の最大の長さ、escape で 2 文字になる引用符の path・query の名前・鍵の部分）は、上限に収まり、
-      // 書く口は RangeError で落とさずに、そのまま書く。省いた印のまとめも書けて読める。
-      const origin = `https://${'a'.repeat(63)}.${'b'.repeat(63)}.${'c'.repeat(63)}.${'d'.repeat(57)}:65535`;
-      const valid: AuditJobLoginStageSummary = {
-        ...big,
-        blockedRequests: {
-          requests: (big.blockedRequests?.requests ?? []).map((request, index) => ({
-            ...request, origin, path: `/${String(index)}${'"'.repeat(MAX_WORKER_LOGIN_STAGE_BLOCKED_PATH_LENGTH - 2)}`,
-          })),
-          unlisted: MAX_COUNT,
-        },
-        observation: {
-          ...big.observation,
-          // T43R2-fix: 鍵の案の端の部分は一般の語だけ（引用符の部分は持てない）。最も長い一般の語の組を上限の数まで。
-          storageKeys: {
-            origin,
-            shapes: ['refreshtoken', 'accesstoken', 'credentials', 'authtoken'].map((word) => ({ prefix: `${word}.`, suffix: `.${word}` })),
-            omitted: MAX_COUNT,
-          },
-          // ログアウトの属性の CSS の最も長い形（`href` は上限の長さまで）。
-          successSelector: { selector: `a[href="/${'menu/'.repeat(24)}logout"]`, kind: 'LOGOUT_CONTROL', logoutWord: 'ログアウト' },
-        },
-      };
-      expect(recordAuthState(database, 'job-big', 'LOGIN_TIMEOUT', null, valid)).toBe(true);
-      expect(readJob(database, 'job-big')?.loginStage).toEqual(valid);
-      expect(recordEnded(database, 'job-big', { state: 'FAILED', reason: 'LOGIN_TIMEOUT', exitCode: null, at: LATER_AT })).toBe(true);
-      addJob({ job_id: 'job-omitted', state: 'RUNNING', finished_at: null });
+      expect(recordAuthState(database, 'job-big', 'LOGIN_TIMEOUT', null, big)).toBe(true);
+      expect(readJob(database, 'job-big')?.loginStage).toEqual(big);
       const omitted: AuditJobLoginStageSummary = { scriptLogin: null, blockedRequests: SUMMARY.blockedRequests, observationOmitted: true };
-      expect(recordAuthState(database, 'job-omitted', 'LOGIN_TIMEOUT', null, omitted)).toBe(true);
+      const connection = workspace.rawConnection();
+      connection.prepare('UPDATE jobs SET login_stage_summary = ? WHERE job_id = ?').run(JSON.stringify(omitted), 'job-omitted');
+      connection.close();
       expect(readJob(database, 'job-omitted')?.loginStage).toEqual(omitted);
     });
   });
@@ -342,38 +213,13 @@ const EVIDENCE: SessionLossEvidence = {
   storageKeyChange: [{ storage: 'LOCAL_STORAGE', originKind: 'ALLOWED', change: 'REMOVED', count: 1, shapes: [{ prefix: '', suffix: '-token' }] }],
 };
 
-/** 最も大きい証拠（上限の件数と最大の長さの path の表記、安全な整数の最大の回数）。 */
-const largestEvidenceText = (): string => {
-  const longest = (values: readonly string[]): string => values.reduce((a, b) => (b.length > a.length ? b : a), '');
-  const path = `/${'p'.repeat(MAX_SESSION_LOSS_PATH_LENGTH - 1)}`;
-  const part = 't'.repeat(MAX_LOGIN_OBSERVED_KEY_PART_LENGTH);
-  return JSON.stringify({
-    stage: path,
-    requestedPath: path,
-    landedPath: path,
-    landedBy: 'BLOCKED_REDIRECT',
-    redirectPaths: Array.from({ length: MAX_SESSION_LOSS_REDIRECT_PATHS }, () => ({ originKind: 'SERVICE', path })),
-    redirectPathsOmitted: MAX_COUNT,
-    blockedRequests: Array.from({ length: MAX_SESSION_LOSS_BLOCKED_REQUESTS }, () => ({
-      method: 'M'.repeat(32), originKind: 'SERVICE', path, reason: longest(SESSION_LOSS_BLOCKED_REQUEST_REASONS), count: MAX_COUNT,
-    })),
-    blockedRequestsUnlisted: MAX_COUNT,
-    storageKeyChange: Array.from({ length: MAX_SESSION_LOSS_STORAGE_KEY_CHANGES }, () => ({
-      storage: 'LOCAL_STORAGE', originKind: 'SERVICE', change: 'REMOVED', count: MAX_COUNT,
-      shapes: Array.from({ length: MAX_SESSION_LOSS_KEY_SHAPES }, () => ({ prefix: `${part}.`, suffix: `.${part}` })),
-    })),
-  });
-};
-
 describe('Control store: the session loss evidence of a job', () => {
-  it('fits the largest evidence in the size limit', () => {
-    expect(largestEvidenceText().length).toBeLessThanOrEqual(MAX_SESSION_LOSS_RECORD_LENGTH);
-  });
-
-  it('rejects a broken JSON, a JSON that is not an object and a too long one', () => {
+  // URL-LEN（版 20）: 大きさの上限（前は 65,536）はない。JSON の object の形だけを確かめる。
+  it('accepts an evidence of any size, and rejects a broken JSON and a JSON that is not an object', () => {
     const connection = workspace.latestConnection([PROFILE_ID]);
     insertJob(connection, { job_id: 'job-ok', session_loss: JSON.stringify(EVIDENCE) });
-    for (const [index, value] of ['{', '[]', '"text"', JSON.stringify({ padding: 'x'.repeat(MAX_SESSION_LOSS_RECORD_LENGTH) })].entries()) {
+    insertJob(connection, { job_id: 'job-long', session_loss: JSON.stringify({ padding: 'x'.repeat(LONGER_THAN_FORMER_RECORD_LIMIT) }) });
+    for (const [index, value] of ['{', '[]', '"text"'].entries()) {
       expect(() => insertJob(connection, { job_id: `job-bad-${index}`, session_loss: value }), value.slice(0, 10)).toThrow();
     }
   });
@@ -394,6 +240,12 @@ describe('Control store: the session loss evidence of a job', () => {
       expect(readJob(database, 'job-s')?.sessionLoss).toEqual(EVIDENCE);
       // 閉じた形でない（query の値を持つ）証拠は、データベースの誤り。
       expect(() => readJob(database, 'job-x')).toThrow(/session_loss/u);
+      // URL-LEN: 前の大きさの上限（65,536）と path の上限（2,048）を超える証拠も、そのまま書いて読む。
+      expect(recordEnded(database, 'job-s', { state: 'FAILED', reason: 'LOGIN_TIMEOUT', exitCode: null, at: LATER_AT })).toBe(true);
+      addJob({ job_id: 'job-long', state: 'RUNNING', finished_at: null });
+      const long: SessionLossEvidence = { ...EVIDENCE, requestedPath: `/${'p'.repeat(LONGER_THAN_FORMER_RECORD_LIMIT)}` };
+      expect(recordAuthState(database, 'job-long', 'SESSION_LOST', `http://127.0.0.1/${'p'.repeat(2_049)}`, null, long)).toBe(true);
+      expect(readJob(database, 'job-long')).toMatchObject({ sessionLoss: long, sessionLostUrl: `http://127.0.0.1/${'p'.repeat(2_049)}` });
     });
   });
 });

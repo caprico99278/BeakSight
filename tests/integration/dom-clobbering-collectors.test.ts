@@ -3,7 +3,7 @@
 // スクロールの位置と controlled scroll（内側のスクロール領域の探索を含む）、ログインのフォームの確かめ）が、上書きのない同じ構造のページ
 // （名前だけを無害なものに変えた対照）と同じ結果を返すことを確かめる。link の抽出（`discoverLinks` の `document.baseURI`）も確かめる。
 // fixture は `fixtures/site/dom-clobbered-collectors.html` と、その対照の `dom-clobbered-collectors-control.html`。
-// Chromium は headless だけ（テストの既定と、CLI の起動の設定の両方）。サーバは 127.0.0.1 の fixture のサーバだけ。
+// Chromium は headless のテストの既定だけ。サーバは 127.0.0.1 の fixture のサーバだけ。
 import type { Browser, Page } from 'playwright';
 import { afterAll, beforeAll, describe, expect, it } from 'vitest';
 import { startFixtureServer, type FixtureServer } from '../../fixtures/server.js';
@@ -13,16 +13,10 @@ import { waitForPageSettled } from '../../src/browser/page-settling.js';
 import type { DomEvidence, ScrollEvidence } from '../../src/core/evidence-types.js';
 import { createPageId } from '../../src/core/ids.js';
 import { discoverLinks } from '../../src/crawl/discover-links.js';
-import { collectColorEvidence } from '../../src/evidence/color-collector.js';
 import { collectDomEvidence } from '../../src/evidence/dom-collector.js';
 import { collectLayoutEvidence } from '../../src/evidence/layout-collector.js';
 import { discoverInteractionCandidates } from '../../src/interaction/discover-candidates.js';
-import { launchCliChromium, launchHeadlessChromium } from '../helpers/chromium.js';
-
-const LAUNCHERS = [
-  ['the default test Chromium', () => launchHeadlessChromium()],
-  ['the CLI launch settings', () => launchCliChromium()],
-] as const;
+import { DEFAULT_CHROMIUM_LAUNCHERS } from '../helpers/chromium.js';
 
 const CLOBBERED_PATH = '/dom-clobbered-collectors.html';
 const CONTROL_PATH = '/dom-clobbered-collectors-control.html';
@@ -104,7 +98,7 @@ function comparableScroll(result: ScrollEvidence): unknown {
   };
 }
 
-describe.each(LAUNCHERS)('DEF-072 and DEF-073: collectors on clobbered forms and documents (%s)', (_name, launch) => {
+describe.each(DEFAULT_CHROMIUM_LAUNCHERS)('DEF-072 and DEF-073: collectors on clobbered forms and documents (%s)', (_name, launch) => {
   let browser: Browser;
 
   beforeAll(async () => {
@@ -163,12 +157,6 @@ describe.each(LAUNCHERS)('DEF-072 and DEF-073: collectors on clobbered forms and
   it('discovers the same interaction candidates as on the control page', async () => {
     const { control, clobbered } = await collectOnBoth((page) => discoverInteractionCandidates(page));
     expect(control.candidates.map(({ accessibleName }) => accessibleName)).toContain('Zero size form');
-    expect(clobbered).toEqual(control);
-  });
-
-  it('collects the same color Evidence as on the control page', async () => {
-    const { control, clobbered } = await collectOnBoth((page) => collectColorEvidence(page));
-    expect(control.textSamples.length).toBeGreaterThan(0);
     expect(clobbered).toEqual(control);
   });
 

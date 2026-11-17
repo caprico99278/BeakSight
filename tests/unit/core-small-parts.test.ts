@@ -12,7 +12,7 @@ import type { AuthSetup } from '../../src/control/auth/auth-setup-contracts.js';
 import { dateOfCompactUtcTimestamp as dateOfCompactUtcTimestampForAutoLogin } from '../../src/control/job/auto-login-limits.js';
 import { targetConfigDigestOf, workerAuthenticationDigestOf } from '../../src/control/worker-protocol.js';
 import { errorCodeOf } from '../../src/core/errors.js';
-import { createSha256Fingerprint, createSha256FingerprintOfBytes, sha256HexOfBytes, sha256HexOfText } from '../../src/core/ids.js';
+import { sha256HexOfBytes, sha256HexOfText } from '../../src/core/ids.js';
 import { RENAME_MAX_ATTEMPTS, RENAME_RETRY_DELAY_MS, RENAME_RETRY_ERROR_CODES, renameWithRetry } from '../../src/core/rename-retry.js';
 import { dateOfCompactUtcTimestamp, formatCompactUtcTimestamp, parseCompactUtcTimestamp } from '../../src/core/utc-timestamp.js';
 import { WORKER_CONFIG_OVERRIDES } from '../../src/worker/audit-worker-session.js';
@@ -92,13 +92,6 @@ describe('CC-059: SHA-256 of the target JSON and of the authentication settings'
     expect(workerAuthenticationDigestOf(setup, ['https://a.test'], { jobKind: 'AUDIT', automatedLogin: null }))
       .toBe('59efec58872371dda12add4f2113c04de10d97cf76a7025ee6d7831bd49f67d4');
     expect(sha256HexOfText('ü')).toBe(sha256HexOfBytes(new TextEncoder().encode('ü')));
-  });
-
-  it('keeps the sha256: fingerprints', () => {
-    expect(createSha256Fingerprint('')).toBe('sha256:e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855');
-    expect(createSha256Fingerprint('ü')).toBe(createSha256FingerprintOfBytes(new TextEncoder().encode('ü')));
-    expect(createSha256FingerprintOfBytes(new TextEncoder().encode('abc')))
-      .toBe('sha256:ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad');
   });
 });
 

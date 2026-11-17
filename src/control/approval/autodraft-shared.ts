@@ -5,12 +5,19 @@
 // - ID の型の選び方（`autoDraftRecordIdTemplatesOf`）: 書き換えの候補（form）の画面の path と送信先の path の、同じ ID の区切りの組を `{id}` にした型（最後の組。
 //   型の組の列挙は発見の部品 `pathTemplateOptionsOf`）。フォームの登録の ID の型（送信先の型と画面の型）と、フォームの書き換えの path の型に使う。
 // - 下書きを作るフォームの形の行（`formAutoDraftRowsOf`）: 分類が登録・書き換えで、送信先を持つ候補（画面を通さない送信の行は API の部品）。
+//   LU-11（設計書 `2026-11-02-beaksight-list-row-update-design.md` 5.4 の 4、D5）: 画面の path に番号がなく、送信先の最後が番号の書き換え（行の下に広がる
+//   フォーム。形 B）は、送信先を型にした識別の digest（`listRowFormTemplatedIdentityDigestOf`）で 1 行にまとめる（最初の候補を行にする）。
 // - 答え合わせの見るだけの確かめの定義の選び方（`autoDraftDefinitionChoiceOf`）: 同じ定義が既にあれば使う、上限なら作らない、ほかは作る。
 // - OP-2 の修正の 1 回目（判断 1）: 画面の一覧の行の「メールなどを送ることがある」の印（`autoDraftScreenMayNotifyOf`）。送る欄にメール・電話の欄があるか
 //   （外部到達の語の owner `externalDeliveryKindsOf`・`externalDeliveryKindsOfName` の判定。副作用の確認 `NO_EXTERNAL_NOTIFICATION` に当たる欄）。
 import { isRecordIdLikePathSegment } from '../../core/api-request-shape.js';
 import type { DiscoveryCandidate } from '../../discovery/candidate-contracts.js';
-import { pathTemplateOptionsOf, type PathTemplateOption } from '../../discovery/fingerprint.js';
+import {
+  actionPathRecordIdTemplateOf,
+  listRowFormTemplatedIdentityDigestOf,
+  pathTemplateOptionsOf,
+  type PathTemplateOption,
+} from '../../discovery/fingerprint.js';
 import { submissionProbeWriteOf } from '../../discovery/submission-probe-contracts.js';
 import { externalDeliveryKindsOf, externalDeliveryKindsOfName } from '../data-rules/external-delivery-words.js';
 import { CREATE_SCENARIO_KIND, UPDATE_SCENARIO_KIND, type ReadCheckReference, type ScenarioKind } from './scenario-contracts.js';
@@ -24,6 +31,26 @@ export const isAutoDraftRecordIdSegment = (segment: string): boolean => isRecord
  */
 export const autoDraftRecordIdTemplatesOf = (update: DiscoveryCandidate): PathTemplateOption | null =>
   pathTemplateOptionsOf(update, isAutoDraftRecordIdSegment).at(-1) ?? null;
+
+/**
+ * LU-11（設計書 `2026-11-02-beaksight-list-row-update-design.md` 5.4 の 4、D5。LU-11 fix round 1）: 行の下に広がるフォーム（形 B）の書き換えの型の組（作れなければ
+ * null）。同じ行の名前のある開き手（`rowOpener`）があり、まとめる digest（`listRowFormTemplatedIdentityDigestOf`）を持つ候補だけ。画面の型は一覧の path
+ * そのもの（`{id}` なし）、送信先の型は最後の番号の区切りを `{id}` にした形（`actionPathRecordIdTemplateOf`）、ID は送信先の最後の区切り。
+ */
+export const listRowFormTemplatesOf = (update: DiscoveryCandidate): PathTemplateOption | null => {
+  const actionPathTemplate = actionPathRecordIdTemplateOf(update);
+  const recordId = update.action?.path.split('/').at(-1);
+  return update.rowOpener?.hasName !== true || listRowFormTemplatedIdentityDigestOf(update) === null || actionPathTemplate === null || recordId === undefined
+    ? null
+    : Object.freeze({ formPathTemplate: update.page.path, actionPathTemplate, recordId });
+};
+
+/**
+ * LU-11: 書き換えの候補の型の組の推し（判定の 1 か所）。行の下に広がるフォーム（`listRowFormTemplatesOf`）なら、その組。ほかは今の推し
+ * （`autoDraftRecordIdTemplatesOf`。形 C は変えない）。
+ */
+export const formUpdateTemplatesOf = (update: DiscoveryCandidate): PathTemplateOption | null =>
+  listRowFormTemplatesOf(update) ?? autoDraftRecordIdTemplatesOf(update);
 
 /** フォームの形の、下書きを作る行 1 つ（登録か書き換えの候補）。 */
 export interface FormAutoDraftRow {
@@ -39,9 +66,14 @@ const scenarioKindOf = (candidate: DiscoveryCandidate): ScenarioKind | null => {
   return candidate.classification === UPDATE_SCENARIO_KIND ? UPDATE_SCENARIO_KIND : null;
 };
 
+/** LU-11: 書き換えの、まとめる鍵（行の下に広がるフォームの digest。判定は発見の部品 `listRowFormTemplatedIdentityDigestOf`）。ほかは null。 */
+const listRowFormGroupKeyOf = (kind: ScenarioKind, candidate: DiscoveryCandidate): string | null =>
+  (kind === UPDATE_SCENARIO_KIND ? listRowFormTemplatedIdentityDigestOf(candidate) : null);
+
 /**
  * フォームの形の、下書きを作る行（作る順: 登録が先、書き換えが後。それぞれ候補の順。同じ識別の行は 1 つ。凍結）。分類が登録・書き換えで、送信先を持ち、
- * 画面を通さない送信の記録（書き込みの probe）を持たない候補。
+ * 画面を通さない送信の記録（書き込みの probe）を持たない候補。LU-11: 行の下に広がるフォームの書き換えは、送信先を型にした識別の digest ごとに 1 つ
+ * （最初の候補。`listRowFormGroupKeyOf`）。
  */
 export const formAutoDraftRowsOf = (candidates: readonly DiscoveryCandidate[]): readonly FormAutoDraftRow[] => {
   const seen = new Set<string>();
@@ -49,10 +81,15 @@ export const formAutoDraftRowsOf = (candidates: readonly DiscoveryCandidate[]): 
     const kind = scenarioKindOf(candidate);
     const probe = candidate.submissionProbe;
     const apiWrite = probe === undefined ? null : submissionProbeWriteOf(probe.result);
-    if (kind === null || candidate.action === null || apiWrite !== null || seen.has(candidate.identityDigest)) {
+    if (kind === null || candidate.action === null || apiWrite !== null) {
       return [];
     }
-    seen.add(candidate.identityDigest);
+    // 識別の digest と、まとめる鍵の digest は印が違うので、同じ集まりで比べても当たらない。
+    const key = listRowFormGroupKeyOf(kind, candidate) ?? candidate.identityDigest;
+    if (seen.has(key)) {
+      return [];
+    }
+    seen.add(key);
     return [Object.freeze({ kind, candidate })];
   });
   return Object.freeze([...rows.filter(({ kind }) => kind === CREATE_SCENARIO_KIND), ...rows.filter(({ kind }) => kind === UPDATE_SCENARIO_KIND)]);
@@ -68,27 +105,25 @@ export interface AutoDraftDefinitionFact extends ReadCheckReference {
   readonly parameterNames?: readonly string[];
 }
 
-/** 答え合わせの定義の選び方の結果（既にある定義を使う・作る・上限で作らない）。 */
+/** 答え合わせの定義の選び方の結果（既にある定義を使う・作る）。 */
 export type AutoDraftDefinitionChoice<Definition> =
   | { readonly kind: 'EXISTING'; readonly reference: ReadCheckReference }
-  | { readonly kind: 'CREATE'; readonly definition: Definition }
-  | { readonly kind: 'LIMIT_REACHED' };
+  | { readonly kind: 'CREATE'; readonly definition: Definition };
 
 /**
  * 答え合わせの定義の選び方（API の `{id}` の型の定義とフォームの照合の専用の定義の共通）: 同じ定義（`isSame`）が既にあれば使う（同じ定義を 2 つ作らない）。
- * 定義の数が上限（`maxDefinitions`）に達していれば作らない。ほかは `definition` を作る。
+ * ほかは `definition` を作る。L4（設計書 `2026-11-09-beaksight-remove-limits-design.md`。COV-7）: 定義の数で止めない（LZ-3c: 前の `maxDefinitions` と
+ * `LIMIT_REACHED` は捨てた。どちらも管理データ・成果物に残らない）。
  */
 export const autoDraftDefinitionChoiceOf = <Definition>(input: {
   readonly definitions: readonly AutoDraftDefinitionFact[];
   readonly isSame: (fact: AutoDraftDefinitionFact) => boolean;
-  readonly maxDefinitions: number;
   readonly definition: Definition;
 }): AutoDraftDefinitionChoice<Definition> => {
   const existing = input.definitions.find(input.isSame);
-  if (existing !== undefined) {
-    return { kind: 'EXISTING', reference: { readCheckId: existing.readCheckId, revision: existing.revision } };
-  }
-  return input.definitions.length >= input.maxDefinitions ? { kind: 'LIMIT_REACHED' } : { kind: 'CREATE', definition: input.definition };
+  return existing === undefined
+    ? { kind: 'CREATE', definition: input.definition }
+    : { kind: 'EXISTING', reference: { readCheckId: existing.readCheckId, revision: existing.revision } };
 };
 
 /**

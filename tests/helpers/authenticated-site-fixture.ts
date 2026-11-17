@@ -32,11 +32,6 @@ export const AUTH_SITE_OTHER_ORIGIN_COOKIE = 'idp';
 /** localStorage の項目の名前（値は秘密の目印）。 */
 export const AUTH_SITE_LOCAL_STORAGE_ITEM = 'ls_token';
 
-/**
- * 1 つのページで、除外に当たる iframe の数（除外の記録の上限 256 件を超える数）。BN-0（設計書 `2026-10-23-beaksight-bundle-beaksight-block-noise-design.md`
- * 3.0）から、監査の段の除外はページの文書でない GET（画像など）に当てず、文書の読み込み（iframe を含む）に当てるので、iframe の文書で数を作る。
- */
-export const AUTH_SITE_MANY_EXCLUDED_IMAGES = 300;
 /** `adminPinging` の画面が `adminPing` を GET する間隔（ms）。 */
 const ADMIN_PING_INTERVAL_MS = 100;
 
@@ -48,7 +43,6 @@ export const AUTH_SITE_PATHS = Object.freeze({
   adminFrames: '/admin/frames',
   adminLogout: '/admin/logout',
   adminDelete: '/admin/items/1/delete',
-  adminManyExcluded: '/admin/many-excluded',
   /** 読み込んだ後も、管理画面の下の JSON を一定の間隔で GET し続ける画面（回転で古い値になった Context が、古い値を送り続ける）。 */
   adminPinging: '/admin/pinging',
   adminPing: '/admin/ping.json',
@@ -101,6 +95,8 @@ export interface AuthenticatedSiteRequest {
 
 export interface AuthenticatedSiteOptions {
   readonly rotate?: boolean;
+  /** LU-SFIX3-B: `rotate` の回転の `Set-Cookie` を、HttpOnly でない cookie にする（ページのスクリプトが読める形）。 */
+  readonly rotateReadable?: boolean;
   readonly theftDetection?: boolean;
   readonly maxAdminPages?: number;
   /**
@@ -263,11 +259,6 @@ export async function startAuthenticatedSite(options: AuthenticatedSiteOptions =
 
   const adminHtml = (path: string): string => {
     const p = AUTH_SITE_PATHS;
-    if (path === p.adminManyExcluded) {
-      return '<h1 id="admin-ok">MANY</h1>'
-        + Array.from({ length: AUTH_SITE_MANY_EXCLUDED_IMAGES }, (_, index) =>
-          `<iframe title="f${String(index)}" src="${p.adminLogout}?frame=${String(index)}" style="width:1px;height:1px"></iframe>`).join('');
-    }
     if (path === p.adminFrames) {
       return '<h1 id="admin-ok">FRAMES</h1>'
         + `<img src="${originB()}${p.otherPixel}" alt="">`
@@ -452,7 +443,7 @@ export async function startAuthenticatedSite(options: AuthenticatedSiteOptions =
       if (nextSession !== undefined) nextSession.adminPages = session.adminPages;
       sessions.delete(presented);
       rotatedAway.set(presented, session.family);
-      headers['set-cookie'] = `${AUTH_SITE_SESSION_COOKIE}=${next}; HttpOnly; SameSite=Lax; Path=/`;
+      headers['set-cookie'] = `${AUTH_SITE_SESSION_COOKIE}=${next}; ${options.rotateReadable === true ? '' : 'HttpOnly; '}SameSite=Lax; Path=/`;
     }
     const storageScript = options.loginForm === true
       ? `<script>localStorage.setItem('${AUTH_SITE_LOCAL_STORAGE_ITEM}', '${localStorageMarker}');</script>`

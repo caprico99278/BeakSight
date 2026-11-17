@@ -79,7 +79,8 @@ export const SAFETY_RULES: readonly AuditRule[] = Object.freeze([
   safetyRule({
     ruleId: 'SAFETY_NON_READ_REQUEST_BLOCKED',
     plainMessage: 'サイトの中身を変えるかもしれない送信を、安全のために止めました。',
-    facts: (payload) => [...payload.blockedRequests, ...payload.blockedInteractionRequests]
+    // DEF-215: 中継が拒んだ要求の前の接続（`preRequestConnection`。拒んだトンネルには何も流れていない）は、送信の遮断ではないので数えない。
+    facts: (payload) => [...payload.blockedRequests, ...payload.blockedInteractionRequests.filter((event) => event.preRequestConnection !== true)]
       .filter((event) => !isReadMethod(event.method))
       .map((event) => ({ sample: `${event.method} ${event.url}`, kind: event.method })),
     describe: (count, kinds, sample) =>

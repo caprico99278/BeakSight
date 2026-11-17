@@ -1,8 +1,8 @@
 // T34e（Task 34 の設計書 3.5 と 8 章の T34e の行）: ログインの段で止めた読み取りでない要求の一覧（`src/safety/login-stage-blocked-requests.ts`）。
 // - 一覧の 1 行は、Origin と path（query・fragment・本文・値なし）、要求の種類、止めた理由、回数。同じ Origin・path・種類・理由は重ねず、回数を足す。
-// - 上限（`MAX_LOGIN_STAGE_BLOCKED_REQUESTS`）を超えた新しい行は、一覧に入れずに数だけ（`unlisted`）。一覧に入っている行は、上限の後も回数を足す。
+// - LZ-3a: 一覧の行の数の上限（前は 8）はない。新しい行は残らず一覧に入れる。
 // - T34e fix round 1: path は、値に見える区切り（`src/core/url-path-redaction.ts`）を `[REDACTED]` にする。送信先の path（`/auth/v1/token` など）は
-//   伏せない。長い path は上限で切り、切った後にも値に見える区切りが残らない。
+//   伏せない。URL-LEN: 長い path も切り詰めない。
 // - HTTP(S) でない URL や読めない URL は、一覧に入れずに数だけ。
 // - ワーカーが IPC に載せる値（`loginStageBlockedRequestsOf`）は、止めた要求がなければ `undefined`。
 // 例の値は、匿名の値（`127.0.0.1`、`example`）だけを使う。
@@ -12,8 +12,6 @@ import {
   LOGIN_STAGE_BLOCKED_REQUEST_REASONS,
   isLoginStageBlockedRequestReason,
   LoginStageBlockedRequestList,
-  MAX_LOGIN_STAGE_BLOCKED_PATH_LENGTH,
-  MAX_LOGIN_STAGE_BLOCKED_REQUESTS,
 } from '../../src/safety/login-stage-blocked-requests.js';
 import { LOGIN_CREDENTIAL_BLOCK_REASON } from '../../src/safety/login-credential-guard.js';
 import { LoginStageMonitor } from '../../src/safety/passive-request-guard.js';
@@ -22,11 +20,10 @@ import { loginStageBlockedRequestsOf } from '../../src/worker/login-stage-checks
 
 const APP = 'http://127.0.0.1:4173';
 const SERVICE = 'http://127.0.0.1:5173';
+/** LZ-3a: 撤廃した一覧の行の数の上限（前の `MAX_LOGIN_STAGE_BLOCKED_REQUESTS`）の写し。 */
+const FORMER_MAX_LOGIN_STAGE_BLOCKED_REQUESTS = 8;
 /** path の中の値（JWT の形）の目印（一覧に出ない）。 */
 const VALUE_MARKER = 'eyJtYXJrZXIiOiJ0MzRlIn0.eyJzdWIiOiJleGFtcGxlIn0.bWFya2VyLXNpZ25hdHVyZQ';
-/** 切る位置にかかる区切りの、上限の中に入る長さ（値に見える長さ）と、区切りを作る繰り返しの数。 */
-const CUT_SEGMENT_HEAD_LENGTH = 32;
-const CUT_SEGMENT_REPEAT = 10;
 /** query の値の目印（一覧に出ない）。 */
 const QUERY_MARKER = 'marker-query-value-t34e';
 
@@ -36,11 +33,13 @@ describe('T34e: the list of the non-read requests blocked in the login stage', (
     expect(LOGIN_STAGE_BLOCKED_REQUEST_REASONS).toEqual([
       ...SCRIPT_LOGIN_BLOCK_REASONS.filter((reason) => reason !== LOGIN_CREDENTIAL_BLOCK_REASON),
       'NON_READ_METHOD',
+      // DEF-194: 行だけの理由（自動ログインの段で通した行と、その通し方の決まりで止めた行）。
+      'AUTOMATED_LOGIN_PASSED',
+      'AUTOMATED_LOGIN_RULE_BLOCKED',
     ]);
     expect(isLoginStageBlockedRequestReason(LOGIN_CREDENTIAL_BLOCK_REASON)).toBe(false);
     expect(LOGIN_STAGE_BLOCKED_REQUEST_REASONS.every(isLoginStageBlockedRequestReason)).toBe(true);
     expect(Object.isFrozen(LOGIN_STAGE_BLOCKED_REQUEST_REASONS)).toBe(true);
-    expect(MAX_LOGIN_STAGE_BLOCKED_REQUESTS).toBe(8);
   });
 
   it('keeps the origin and the path only, and adds up the same origin, path, type and reason', () => {
@@ -70,34 +69,34 @@ describe('T34e: the list of the non-read requests blocked in the login stage', (
     expect(snapshot.requests.every((request) => Object.isFrozen(request))).toBe(true);
   });
 
-  it('lists up to the limit, counts the new requests over it as unlisted, and still adds up the listed ones', () => {
+  // LZ-3a: 一覧の行の数の上限（前は 8）は撤廃した。前の上限を超える行も残らず一覧に入れ、回数を足す（token の形の行も、ほかの行を外さずに入る）。
+  it('lists every row beyond the former limit, and still adds up the listed ones', () => {
     const list = new LoginStageBlockedRequestList();
-    for (let index = 0; index < MAX_LOGIN_STAGE_BLOCKED_REQUESTS + 2; index += 1) {
+    for (let index = 0; index < FORMER_MAX_LOGIN_STAGE_BLOCKED_REQUESTS + 2; index += 1) {
       list.record(`${SERVICE}/rest/v1/rpc/call_${index}`, 'fetch', 'UNREGISTERED_NON_READ');
     }
     list.record(`${SERVICE}/rest/v1/rpc/call_0`, 'fetch', 'UNREGISTERED_NON_READ');
+    list.record(`${SERVICE}/auth/v1/token?grant_type=password`, 'fetch', 'NON_READ_METHOD');
     const snapshot = list.snapshot();
-    expect(snapshot.requests).toHaveLength(MAX_LOGIN_STAGE_BLOCKED_REQUESTS);
+    expect(snapshot.requests).toHaveLength(FORMER_MAX_LOGIN_STAGE_BLOCKED_REQUESTS + 3);
     expect(snapshot.requests[0]).toMatchObject({ path: '/rest/v1/rpc/call_0', count: 2 });
-    expect(snapshot.unlisted).toBe(2);
+    expect(snapshot.requests.at(-1)).toMatchObject({ path: '/auth/v1/token', query: { values: [{ name: 'grant_type', value: 'password' }] } });
+    expect(snapshot.unlisted).toBe(0);
   });
 
-  it('keeps the endpoint path, hides the value-like segments, and cuts a long path at the limit without leaving a value-like segment', () => {
+  // URL-LEN: 長い path も切り詰めない（前は 1,024 で切った）。値に見える区切りは今どおり伏せる。
+  it('keeps the endpoint path, hides the value-like segments, and keeps a long path whole', () => {
     const list = new LoginStageBlockedRequestList();
     // T43d（意図して直した期待）: `grant_type` の決まった形の値は残すようになったので、値を残さない名前（`code`）で、query の値が出ないことを確かめる。
     list.record(`${SERVICE}/auth/v1/token?code=${QUERY_MARKER}`, 'fetch', 'TOKEN_REQUEST_QUERY_MISMATCH');
     list.record(`${APP}/session/${VALUE_MARKER}/end`, 'document', 'NON_READ_METHOD');
-    const long = `/${'p'.repeat(MAX_LOGIN_STAGE_BLOCKED_PATH_LENGTH + 10)}`;
+    const long = `/${'p'.repeat(2_049)}`;
     list.record(`${APP}${long}`, 'fetch', 'NON_READ_METHOD');
-    // 上限の位置で切ると値に見える区切りになる区切り（全体は `.` を含むので値に見えない）。切った後にも伏せる。
-    const head = `/${'p'.repeat(MAX_LOGIN_STAGE_BLOCKED_PATH_LENGTH - CUT_SEGMENT_HEAD_LENGTH - 2)}`;
-    list.record(`${APP}${head}/${'Ab12'.repeat(CUT_SEGMENT_REPEAT)}.x`, 'fetch', 'NON_READ_METHOD');
     const { requests } = list.snapshot();
     expect(requests.map(({ path }) => path)).toEqual([
       '/auth/v1/token',
       `/session/${REDACTED_PATH_SEGMENT}/end`,
-      long.slice(0, MAX_LOGIN_STAGE_BLOCKED_PATH_LENGTH),
-      `${head}/${REDACTED_PATH_SEGMENT}`,
+      long,
     ]);
     expect(requests.some(({ path }) => hasValueLikePathSegment(path))).toBe(false);
     const text = JSON.stringify(requests);
@@ -114,23 +113,6 @@ describe('T34e: the list of the non-read requests blocked in the login stage', (
 
   // T43d（Task 43 の設計書 4.4）: 行に query の名前の一覧（値なし。上限つき）と、閉じた一覧の名前（`grant_type`）の決まった形の値を足す。値の違う
   // `grant_type` は別の行にし、名前は同じ行の間で足し合わせる。query のない行は項目を持たない。
-  // ML-a-fix（ML-R の M-1）: token の形の行（閉じた一覧の `grant_type` の値を記録した行）は、上限の外で必ず残す（上限で一覧が埋まっていたら、token の形でない
-  // 最後の行を一覧から外し、その回数を数だけにする。一覧の行の数は上限のまま）。
-  it('keeps a token shaped row over the limit by moving the last other row to the unlisted count (ML-a-fix M-1)', () => {
-    const list = new LoginStageBlockedRequestList();
-    for (let index = 0; index < MAX_LOGIN_STAGE_BLOCKED_REQUESTS; index += 1) {
-      list.record(`${APP}/collect/beacon_${index}`, 'ping', 'NON_READ_METHOD');
-    }
-    list.record(`${APP}/collect/beacon_7`, 'ping', 'NON_READ_METHOD');
-    list.record(`${SERVICE}/auth/v1/token?grant_type=password`, 'fetch', 'NON_READ_METHOD');
-    list.record(`${SERVICE}/auth/v1/token?grant_type=password`, 'fetch', 'NON_READ_METHOD');
-    const { requests, unlisted } = list.snapshot();
-    expect(requests).toHaveLength(MAX_LOGIN_STAGE_BLOCKED_REQUESTS);
-    expect(requests.at(-1)).toMatchObject({ path: '/auth/v1/token', count: 2, query: { values: [{ name: 'grant_type', value: 'password' }] } });
-    expect(requests.map(({ path }) => path)).not.toContain('/collect/beacon_7');
-    expect(unlisted).toBe(2);
-  });
-
   // ML-a-fix（ML-R の I-1）: 行に「token の送信より前に最初に見た」印（`beforeToken: true`。値を持たない）を残せる。同じ行の後の回は、最初の回の印のまま。
   it('keeps the mark of the first observation before the token request (ML-a-fix I-1)', () => {
     const list = new LoginStageBlockedRequestList();

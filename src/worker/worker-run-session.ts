@@ -4,13 +4,13 @@
  * 変えない）。
  *
  * 1. Run の始め（`startWorkerRun`。監査と同じ。CLI の監査から、動いている Run として見える）:
- *    - 出力先の開始のロックを、CLI の監査と同じ部品（`src/orchestration/output-start-lock.ts` の `holdOutputStartLock`。CCX-6）で取る。
- *      動いている持ち主のものなら `RUN_ACTIVE`。
- *    - 出力先に動いている Run（Run のロックが `ACTIVE`。`findActiveRunInOutputDirectory`）があれば `RUN_ACTIVE`。
- *    - Run の ID は今の決まり（`createRunIdFromTime`）。Run のディレクトリを排他的に作り（`createRunArtifactDirectory`）、作れなければ
- *      `RUN_DIRECTORY_UNAVAILABLE`。Run のロックは保存のセッション（`RunCheckpointSession` の `NEW_RUN`。ロックとハートビートだけを使い、保存の
- *      状態は書かない。再開の対象にしない）で取る。開始のロックは、Run のロックを取った後に離す。
- * 2. Run の終わり（`endWorkerRun`）: ハートビートを止めてから、Run のロックを消す。
+ *    - 出力先の監査中の印を、CLI の監査と同じ部品（`src/core/run-exclusion.ts` の `acquireRunExclusion`。SPEC-2）で取る。
+ *      ほかの起動が持っていれば `RUN_ACTIVE`。印の持ち主は、このワーカーの process（終われば OS が放す）。
+ *    - Run の ID は今の決まり（`createRunIdFromTime`。DEF-281: 同じ秒の名前がすでにあれば 2 桁の連番を足す）。Run のディレクトリを排他的に作り
+ *      （`createRunArtifactDirectoryForStart`）、作れなければ
+ *      `RUN_DIRECTORY_UNAVAILABLE`。印を持てたかを決められなかったときは、Run のディレクトリを作れても、その失敗で reject する（止まる側）。
+ *      保存の状態は書かない（再開の対象にしない）。
+ * 2. Run の終わり（`endWorkerRun`）: 出力先のロックを離す。
  * 3. 1 画面の読み込み（`visitGuardedPage`。凍結は戻せないので、画面ごとに新しい Context）: Guard の付いた新しい Passive の Context と page
  *    （`openPassiveSessionBeforeDeadline`。認証の状態は factory が世代つきで受け継ぐ）→ 進行中の要求の数え方（`InFlightRequestCounter`）を
  *    `goto` の前に作る → 読み込みの間隔を待つ（読み込みの直前）→ 読み込み（`navigatePage`）→ セッションの切れの確かめ（Task 25 の設計書 4.3。
@@ -37,21 +37,27 @@ import type { BrowserContext, Page } from 'playwright';
 import type { BrowserContextFactory } from '../browser/context-factory.js';
 import { EXIT_CODES, RUN_UNAVAILABLE_EXIT_CODE } from '../cli/exit-codes.js';
 import type { AuditConfig } from '../config/types.js';
-import { createRunArtifactDirectory } from '../core/artifact-layout.js';
-import type { RunId, RunStatus, SessionKeyLostDetail } from '../core/contracts.js';
+import { createRunArtifactDirectoryForStart } from '../core/artifact-layout.js';
+import { acquireRunExclusion } from '../core/run-exclusion.js';
+import type { RunId, RunStatus, SessionLostDetail } from '../core/contracts.js';
 import type { SessionLossEvidence } from '../core/evidence-types.js';
 import { CONTEXT_CLOSE_TIMEOUT_MS } from '../core/limits.js';
+import type { ObservationWindows } from '../core/observation-windows.js';
 import type { NavigationPacer } from '../crawl/navigation-pacer.js';
 import { InFlightRequestCounter } from '../discovery/settle.js';
 import type { ReadCheckAuditStageObservation } from '../discovery/read-check-evaluation.js';
 import {
   auditStageReadCountsOf,
   auditStageReadObservationBetween,
+  isAuditStageReadObstructed,
+  serviceUnauthorizedCountOf,
+  serviceUnauthorizedSessionLostDetailOf,
   sessionKeyLostDetailOf,
   type AuditStageRunState,
 } from '../orchestration/audit-stage-run.js';
 import {
   SESSION_LOSS_CHECK_POINTS,
+  isOutsideRunAuditScope,
   observeSessionLossNavigation,
   sessionLossEvidenceOf,
   sessionLostUrlAt,
@@ -59,24 +65,18 @@ import {
   type SessionLossCheckPoint,
   type SessionLossNavigationRecord,
 } from '../orchestration/authenticated-run.js';
-import { findActiveRunInOutputDirectory, holdOutputStartLock, type OutputLockGraceOptions } from '../orchestration/output-start-lock.js';
 import { navigatePage, type PageNavigationResult } from '../orchestration/page-navigation.js';
+import { watchAuditScope } from '../orchestration/audit-scope-watch.js';
 import { closePassiveContextBeforeDeadline } from '../orchestration/passive-session-close.js';
 import { openPassiveSessionBeforeDeadline, passiveSessionOpenDeadlineAtMs } from '../orchestration/passive-session-open.js';
-import { RunCheckpointSession } from '../orchestration/run-checkpoint-session.js';
+import { blockedRequestsDuringPacingWait, waitWithPageShown } from '../orchestration/visible-pacing-wait.js';
 import { createRunIdFromTime } from '../orchestration/run-id.js';
-import type { ArtifactWriter } from '../report/artifact-writer.js';
 import { jobSafetyViolationOf, type JobSafetyViolation, type JobSafetyViolationPress } from '../safety/job-safety-violation.js';
 import { pageLoadFactsOf, type PageLoadFacts } from '../safety/passive-request-guard.js';
 import type { SafetyLedger } from '../safety/safety-ledger.js';
 
 /** DEF-129: main frame の文書の要求を受けなかった画面の事実。 */
-const NO_PAGE_LOAD: PageLoadFacts = Object.freeze({
-  documentRequests: 0, childFrameDocumentRequests: 0, subresourceRequests: 0, limitReached: false, subresourceLimitReached: false,
-});
-
-/** 開始のロックを持たなかった（`UNAVAILABLE`）ときの、離す処理（何もしない。ロックなしで進める）。 */
-const releaseNothing = async (): Promise<void> => undefined;
+const NO_PAGE_LOAD: PageLoadFacts = Object.freeze({ limitReached: false });
 
 /** Run を始めた結果（Run のディレクトリは絶対パス）。 */
 export type WorkerRunStart =
@@ -85,9 +85,10 @@ export type WorkerRunStart =
     readonly runId: RunId;
     readonly runDirectory: string;
     readonly startedAt: Date;
-    readonly session: RunCheckpointSession;
+    /** 出力先のロックを離す（`endWorkerRun` が呼ぶ。何回呼んでもよい。reject しない）。 */
+    readonly releaseLock: () => Promise<void>;
   }
-  | { readonly kind: 'RUN_ACTIVE'; readonly activeRunId: RunId | null; readonly exitCode: number }
+  | { readonly kind: 'RUN_ACTIVE'; readonly exitCode: number }
   | {
     readonly kind: 'RUN_DIRECTORY_UNAVAILABLE';
     readonly runId: RunId;
@@ -96,55 +97,41 @@ export type WorkerRunStart =
     readonly exitCode: number;
   };
 
-/** Run を始める（ファイルの先頭の 1）。Run の外の失敗は reject する。 */
+/** Run を始める（ファイルの先頭の 1）。Run の外の失敗は reject する。始めなかったとき（reject を含む）は、取ったロックを離す。 */
 export async function startWorkerRun(
-  writer: ArtifactWriter,
   outputDirectory: string,
   clock: () => Date,
-  now: () => number,
-  lockGrace: OutputLockGraceOptions = {},
 ): Promise<WorkerRunStart> {
-  // DEF-172: 動いている持ち主のロックが古く見えるときは、取り直す前・動いている Run と決める前に、猶予の後に読み直す（`lockGrace` の待ちは、
-  // 省略すると本番の待ち。テストは注入した待ち）。
-  const startLock = await holdOutputStartLock(writer, outputDirectory, now(), lockGrace);
-  if (startLock.kind === 'HELD_BY_ANOTHER_START') {
-    return {
-      kind: 'RUN_ACTIVE',
-      activeRunId: await findActiveRunInOutputDirectory(writer, outputDirectory, now()),
-      exitCode: RUN_UNAVAILABLE_EXIT_CODE,
-    };
+  const runLock = await acquireRunExclusion(outputDirectory);
+  if (runLock.kind === 'HELD') {
+    return { kind: 'RUN_ACTIVE', exitCode: RUN_UNAVAILABLE_EXIT_CODE };
   }
-  const releaseStartLock = startLock.kind === 'ACQUIRED' ? startLock.release : releaseNothing;
-  const startedAt = clock();
+  const releaseLock = runLock.kind === 'ACQUIRED' ? runLock.release : async (): Promise<void> => undefined;
+  let started = false;
   try {
-    const activeRunId = await findActiveRunInOutputDirectory(writer, outputDirectory, now(), lockGrace);
-    if (activeRunId !== null) {
-      return { kind: 'RUN_ACTIVE', activeRunId, exitCode: RUN_UNAVAILABLE_EXIT_CODE };
-    }
-    // DEF-170: Run のディレクトリと Run のロックを作る前に、開始のロックが今も自分のものかを読み直す（違えば、別の起動が開始の段にいるときと同じ）。
-    if (startLock.kind === 'ACQUIRED' && !(await startLock.confirm())) {
-      return { kind: 'RUN_ACTIVE', activeRunId: await findActiveRunInOutputDirectory(writer, outputDirectory, now()), exitCode: RUN_UNAVAILABLE_EXIT_CODE };
-    }
-    const runId = createRunIdFromTime(startedAt);
-    const created = await createRunArtifactDirectory(outputDirectory, runId);
+    const startedAt = clock();
+    // DEF-281: 同じ出力先で同じ秒に始めた Run があれば、2 桁の連番を足した Run の ID で作る。
+    const created = await createRunArtifactDirectoryForStart(outputDirectory, createRunIdFromTime(startedAt));
+    const { runId } = created;
     if (!created.ok) {
       return { kind: 'RUN_DIRECTORY_UNAVAILABLE', runId, runDirectory: created.runDirectory, runStatus: 'FAILED', exitCode: EXIT_CODES.FAILED };
     }
-    const session = new RunCheckpointSession({ store: writer, now });
-    const started = await session.start(created.runDirectory, { mode: 'NEW_RUN' });
-    if (!started.ok) {
-      return { kind: 'RUN_DIRECTORY_UNAVAILABLE', runId, runDirectory: created.runDirectory, runStatus: 'FAILED', exitCode: EXIT_CODES.FAILED };
+    if (runLock.kind === 'UNAVAILABLE') {
+      // ロックなしで Run を進めない（止まる側）。
+      throw runLock.cause;
     }
-    return { kind: 'STARTED', runId, runDirectory: created.runDirectory, startedAt, session };
+    started = true;
+    return { kind: 'STARTED', runId, runDirectory: created.runDirectory, startedAt, releaseLock };
   } finally {
-    await releaseStartLock();
+    if (!started) {
+      await releaseLock();
+    }
   }
 }
 
-/** Run を終える（ファイルの先頭の 2）。保存の状態は書かない（再開の対象にしない）。ハートビートを止めてから、Run のロックを消す。 */
-export async function endWorkerRun(writer: ArtifactWriter, run: Extract<WorkerRunStart, { readonly kind: 'STARTED' }>): Promise<void> {
-  await run.session.abandon();
-  await writer.releaseRunLock(run.runDirectory).catch(() => undefined);
+/** Run を終える（ファイルの先頭の 2）。保存の状態は書かない（再開の対象にしない）。出力先のロックを離す。 */
+export async function endWorkerRun(run: Extract<WorkerRunStart, { readonly kind: 'STARTED' }>): Promise<void> {
+  await run.releaseLock();
 }
 
 /** Safety Ledger の、止めた要求の数（ページ自身が出した送信。method ごとの数の合計）。 */
@@ -175,6 +162,34 @@ export interface GuardedPageLoadOptions {
    * 見た段）。発見と READ の確かめが、成果物と IPC の要約に残すために渡す。省略すると呼ばない。
    */
   readonly onSafetyViolation?: ((violation: JobSafetyViolation) => void) | undefined;
+  /**
+   * DEF-233（設計書 `2026-11-09-beaksight-discovery-token-refresh-design.md` 2.3）: 承認したサービスの Origin の 401 で描けなかった画面を、セッションの切れ
+   * （詳しい理由 `SERVICE_UNAUTHORIZED`）にするか（判定は `serviceUnauthorizedSessionLostDetailOf`）。操作さがしと READ の確かめのジョブだけが真を渡す
+   * （書き込みのジョブは渡さない。今のとおり）。監査の段の状態がなければ使わない。
+   */
+  readonly serviceUnauthorizedSessionLoss?: boolean | undefined;
+  /**
+   * DEF-236（設計書 `2026-11-09-beaksight-visible-pacing-wait-design.md` 3.2）: 読み取りを終えた後、閉じる前に、この画面を見せたまま次の読み込みの間隔を待つか。
+   * 省略と真は待つ（次の読み込みがあるとみなす）。呼ぶ側が、この画面の後に読み込みがないと分かっているときは偽を渡す（待たずに閉じる）。セッションの切れと
+   * 違反の後は、この指定によらず待たない。
+   */
+  readonly pacingWaitBeforeClose?: boolean | undefined;
+  /**
+   * COV-2c の M-1（SAFE-2 の 1 の口の後。設計者の判断）: 最初から凍結した Context で読み込むか。真なら、`openFrozenObservationContext` で Context を開き
+   * （読み込む前の page を凍結する）、`loadFrozenDocument` で読み込む（読み込みのときの自動の書き込みを届けない）。操作さがしが、2 回目からの祖先の画面に使う。
+   * 省略すると今どおり（凍結せずに読み込む）。
+   */
+  readonly frozenFromStart?: true | undefined;
+  /**
+   * RB-8 の残り（RB-12 で行った）: 観察の窓の一式（進行中の要求の数え方の、応答の後の本文の猶予 `discoverySettle.responseBodyGraceMs` を読む）。省略すると本番の値。
+   * テストだけが渡す（本番の入口は渡さない。`worker-login-hooks` の (n)・(p)）。
+   */
+  readonly observationWindows?: ObservationWindows | undefined;
+  /**
+   * REV-SD の I-1: 読み込みの後、押す前に点検の範囲の外へ移った画面を、呼ぶ側が自分で扱うか（入口の確かめ。移った先を伝えるため）。省略すると、その画面は
+   * 読めなかった（`FAILED`）とする。
+   */
+  readonly outsideAuditScopeHandledByCaller?: true | undefined;
 }
 
 /** 認証つきのジョブの 1 画面の読み込みの指定（認証の指定を必ず持つ。今の形）。 */
@@ -199,6 +214,20 @@ export interface GuardedPageView {
    * 切れ `SESSION_LOST` になる）。認証の指定がなければ何もしない。呼ばなくても、読み取りの後（時機 `pageEnd`）に確かめる。
    */
   readonly stopIfSessionLostAfterSettling: () => void;
+  /**
+   * REV-SD の I-1: 読み込みから probe の段に入るまでに、main frame が点検の範囲の外へ移った最初の URL（移っていなければ `null`。判定は
+   * `audit-scope-watch.ts` の 1 か所）。probe の段に入る時（`enterSubmissionProbe` の最初）と、落ち着いた後（`stopIfSessionLostAfterSettling`）にも見直し、
+   * 移っていれば読み取りを止める（その画面は `FAILED`）。
+   */
+  readonly outsideAuditScope: () => string | null;
+}
+
+/** REV-SD の I-1: 押す前に点検の範囲の外へ移ったので、読み取りを止めたことを伝える（`visitGuardedPage` の中だけで使う。その画面は `FAILED`）。 */
+class OutsideAuditScopeDuringReadError extends Error {
+  constructor() {
+    super('the page moved out of the audit scope before BeakSight operated on it; the read was stopped');
+    this.name = 'OutsideAuditScopeDuringReadError';
+  }
 }
 
 /** DF-3: 落ち着きを待った後にセッションの切れを見つけたので、読み取りを止めたことを伝える（`visitGuardedPage` の中だけで使う）。 */
@@ -235,7 +264,8 @@ export type GuardedPageVisit<T> =
   | {
     readonly kind: 'SESSION_LOST';
     readonly url: string;
-    readonly detail: SessionKeyLostDetail | null;
+    /** DEF-233: サービスの 401 で描けなかった画面は `SERVICE_UNAUTHORIZED`。 */
+    readonly detail: SessionLostDetail | null;
     readonly blockedRequests: number;
     readonly violation: boolean;
     /** DEF-138: セッションの切れの証拠（Page Auditor と同じ部品で組み立てる。値を持たない。組み立てられなければ `null`）。 */
@@ -277,6 +307,25 @@ class SafetyViolationStages {
   }
 }
 
+/**
+ * COV-2c の M-1: 最初から凍結した Context を開く（`openFrozenObservationContext`。開けなければ factory が Context を閉じて投げるので、`FAILED` で返す。
+ * 閉じる Context はない）。形は `openPassiveSessionBeforeDeadline` の結果に合わせる。
+ */
+const openFrozenFromStart = async (
+  factory: BrowserContextFactory,
+  viewport: Parameters<BrowserContextFactory['openFrozenObservationContext']>[0],
+): Promise<
+  | Readonly<{ status: 'OPENED'; context: BrowserContext; page: Page; ledger: SafetyLedger }>
+  | Readonly<{ status: 'FAILED'; context: undefined; ledger: null }>
+> => {
+  try {
+    const { context, page } = await factory.openFrozenObservationContext(viewport);
+    return Object.freeze({ status: 'OPENED', context, page, ledger: factory.getSafetyLedger(context) });
+  } catch {
+    return Object.freeze({ status: 'FAILED', context: undefined, ledger: null });
+  }
+};
+
 /** DEF-144: 違反の中身を組み立てて、呼ぶ側に渡す（閉じた後の Ledger）。 */
 const reportSafetyViolation = (options: GuardedPageLoadOptions, url: string, ledger: SafetyLedger, place: SafetyViolationPlace): void => {
   options.onSafetyViolation?.(jobSafetyViolationOf({ url, snapshot: ledger.snapshot(), stage: place.stage, press: place.press }));
@@ -293,7 +342,13 @@ export async function visitGuardedPage<T>(
   options: GuardedPageLoadOptions,
   use: (view: GuardedPageView) => Promise<T>,
 ): Promise<GuardedPageVisit<T>> {
-  const opened = await openPassiveSessionBeforeDeadline(factory, options.config.viewports.primaryDesktop, passiveSessionOpenDeadlineAtMs());
+  // DEF-236（設計書 `2026-11-09-beaksight-visible-pacing-wait-design.md` 3.2）: 読み込みの間隔は、セッションを作る前に待つ（新しい空の page を見せたまま待たない。
+  // 監査と同じ順）。前の画面は、閉じる前に見せたまま待ったので、ふつうは待たない。
+  await pacer.beforeNavigation();
+  // COV-2c の M-1: 最初から凍結した Context（`frozenFromStart`）は、factory の口で開く（失敗したら、factory が Context を閉じて投げる）。
+  const opened = options.frozenFromStart === true
+    ? await openFrozenFromStart(factory, options.config.viewports.primaryDesktop)
+    : await openPassiveSessionBeforeDeadline(factory, options.config.viewports.primaryDesktop, passiveSessionOpenDeadlineAtMs());
   if (opened.status !== 'OPENED') {
     if (opened.status === 'FAILED' && opened.context !== undefined) {
       await closePassiveContextBeforeDeadline(factory, opened.context, { timeoutMs: CONTEXT_CLOSE_TIMEOUT_MS });
@@ -310,6 +365,8 @@ export async function visitGuardedPage<T>(
   const stages = new SafetyViolationStages(ledger);
   const auditStage = options.auditStage ?? null;
   const countsBefore = auditStage === null ? null : auditStageReadCountsOf(auditStage);
+  // DEF-233: 読み込みの前の 401 の数（後と比べて、この画面の 401 を見分ける）。
+  const unauthorizedBefore = serviceUnauthorizedCountOf(auditStage);
   let visit: { readonly kind: 'VISITED'; readonly value: T } | { readonly kind: 'FAILED' } | { readonly kind: 'SESSION_LOST'; readonly url: string };
   // DEF-138: 認証つきのジョブでは、main frame の文書の要求の経路を、セッションの切れの確かめまで記録する（要求を足さない。証拠だけに使う）。DF-3:
   // 確かめは読み取りの後まで続くので、記録は Context を閉じる前に外す。
@@ -330,17 +387,31 @@ export async function visitGuardedPage<T>(
     }
     return lost?.url ?? null;
   };
+  // SD-2（設計書 `2026-11-16-beaksight-action-based-delete-guard-design.md` 2.4）: 点検の範囲（Page Auditor と同じ Run の範囲 `isOutsideRunAuditScope`）。
+  const allowedOrigins = new Set(options.config.site.allowedOrigins);
+  const isOutsideAuditScope = (target: string): boolean => isOutsideRunAuditScope(target, allowedOrigins, options.authentication ?? null);
+  // REV-SD の I-1: 読み込みから probe の段に入るまで、main frame の移動を見張る（probe の段の後の移動は、BeakSight の押下の結果として probe の部品が扱う）。
+  const scope = watchAuditScope(page, isOutsideAuditScope);
+  let probeEntered = false;
+  /** 範囲の外へ移っていれば、読み取りを止める（その画面は `FAILED`）。 */
+  const stopIfOutsideAuditScope = (): void => {
+    if (scope.outsideUrl() !== null) {
+      throw new OutsideAuditScopeDuringReadError();
+    }
+  };
   try {
     // 進行中の要求の数え方は、読み込みの前に作る（それより前に始まった要求は数えられない）。
-    const counter = new InFlightRequestCounter(page);
+    const counter = new InFlightRequestCounter(page, { responseBodyGraceMs: options.observationWindows?.discoverySettle.responseBodyGraceMs });
     try {
-      // 読み込みの間隔は、読み込みの直前で待つ（Context の作成の時間に左右されず、読み込みの開始どうしの間隔を設定の値以上にする）。
-      await pacer.beforeNavigation();
-      const navigation = await navigatePage(page, url, {
+      const load = (): ReturnType<typeof navigatePage> => navigatePage(page, url, {
         timeoutMs: options.config.crawl.navigationTimeoutMs,
         ledger,
         allowedQueryParameters: options.allowedQueryParameters,
+        // SD-2: 点検の範囲の外へ移った画面は読まない（読み込みの失敗の扱い）。
+        isOutsideAuditScope,
       });
+      // COV-2c の M-1: 最初から凍結した Context では、凍結を解かずに読み込む（`loadFrozenDocument`）。
+      const navigation = options.frozenFromStart === true ? await factory.loadFrozenDocument(page, url, load) : await load();
       // 経路の記録は、読み込みの直後の写しを証拠に使う（鍵の消失の証拠も、この写し）。後の時機で path の切れを見つけたら、その時点の写しにする。
       routeRecord = route?.snapshot() ?? null;
       const lostUrl = lostUrlAt(SESSION_LOSS_CHECK_POINTS.navigation);
@@ -352,16 +423,28 @@ export async function visitGuardedPage<T>(
           ledger,
           counter,
           navigation,
-          enterSubmissionProbe: (press) => stages.enter(press),
+          enterSubmissionProbe: (press) => {
+            // REV-SD の I-1: probe の段に入る前に見直し、範囲の外へ移っていれば押さない。入った後は見張らない。
+            if (!probeEntered) {
+              stopIfOutsideAuditScope();
+              probeEntered = true;
+              scope.dispose();
+            }
+            stages.enter(press);
+          },
           stopIfSessionLostAfterSettling: () => {
             const lostAfterSettling = lostUrlAt(SESSION_LOSS_CHECK_POINTS.settled);
             if (lostAfterSettling !== null) {
               throw new SessionLostDuringReadError(lostAfterSettling);
             }
+            if (!probeEntered) stopIfOutsideAuditScope();
           },
+          outsideAuditScope: () => scope.outsideUrl(),
         });
         // DF-3: 読み取りの後（成果物に書く前）にも確かめる。当たれば、読み取った値を使わない。
         const lostAtEnd = lostUrlAt(SESSION_LOSS_CHECK_POINTS.pageEnd);
+        // REV-SD の I-1: probe の段に入るまでに範囲の外へ移った画面は、読めなかったとする（呼ぶ側が自分で扱う入口の確かめを除く）。
+        if (lostAtEnd === null && options.outsideAuditScopeHandledByCaller !== true) stopIfOutsideAuditScope();
         visit = lostAtEnd === null ? { kind: 'VISITED', value } : { kind: 'SESSION_LOST', url: lostAtEnd };
       }
     } finally {
@@ -371,10 +454,16 @@ export async function visitGuardedPage<T>(
     visit = error instanceof SessionLostDuringReadError ? { kind: 'SESSION_LOST', url: error.url } : { kind: 'FAILED' };
   } finally {
     route?.dispose();
+    scope.dispose();
     // DEF-144: 閉じる前に、それまでの違反を今の段に結びつける（閉じた後に初めて見た違反は、閉じる段）。
     stages.settle();
-    await closePassiveContextBeforeDeadline(factory, context, { timeoutMs: CONTEXT_CLOSE_TIMEOUT_MS });
   }
+  // DEF-236（設計書 3.2）: 読み取りを終えた後、閉じる前に、この画面を見せたまま次の読み込みの間隔を待つ（監査と同じ部品）。セッションの切れ・違反の後と、呼ぶ側が
+  // 次の読み込みがないと伝えた時（`pacingWaitBeforeClose` が偽）は、待たずに閉じる。
+  const pacingWait = visit.kind !== 'SESSION_LOST' && !hasViolation(ledger) && options.pacingWaitBeforeClose !== false
+    ? await waitWithPageShown({ page, ledger, pacer })
+    : null;
+  await closePassiveContextBeforeDeadline(factory, context, { timeoutMs: CONTEXT_CLOSE_TIMEOUT_MS });
   // DF-3: Context を閉じた後にも、もう一度確かめる（閉じる間に Guard が止めた main frame の移動を含める。時機はページの終わり）。
   if (visit.kind !== 'SESSION_LOST') {
     const lostAfterClose = lostUrlAt(SESSION_LOSS_CHECK_POINTS.pageEnd);
@@ -382,13 +471,16 @@ export async function visitGuardedPage<T>(
       visit = { kind: 'SESSION_LOST', url: lostAfterClose };
     }
   }
-  // 閉じた後の Ledger で数える（閉じる間に Guard が止めた送信と、記録された違反も含める）。
-  const counts = { blockedRequests: blockedRequestCountOf(ledger), violation: hasViolation(ledger) };
+  // 閉じた後の Ledger で数える（閉じる間に Guard が止めた送信と、記録された違反も含める）。DEF-236: 見せたままの待ちの間に止めた送信は、数えない（記録には残る）。
+  const counts = {
+    blockedRequests: blockedRequestCountOf(ledger) - (pacingWait === null ? 0 : blockedRequestsDuringPacingWait(pacingWait)),
+    violation: hasViolation(ledger),
+  };
   if (counts.violation) {
     reportSafetyViolation(options, url, ledger, stages.first() ?? { stage: 'CONTEXT_CLOSE', press: null });
   }
   // DEF-138: 証拠は、閉じた後に組み立てる（閉じるときに factory が読んだ状態の名前と、閉じる間に止めた要求を含める）。
-  const evidenceOf = (stage: SessionKeyLostDetail | null): SessionLossEvidence | null =>
+  const evidenceOf = (stage: SessionLostDetail | null): SessionLossEvidence | null =>
     sessionLossEvidenceOfVisit(factory, { url, page, context, ledger, route: routeRecord, stage, options });
   if (visit.kind === 'SESSION_LOST') {
     return { ...visit, detail: null, ...counts, sessionLoss: evidenceOf(null) };
@@ -404,6 +496,16 @@ export async function visitGuardedPage<T>(
   const auditStageObservation = auditStage === null || countsBefore === null
     ? null
     : auditStageReadObservationBetween(countsBefore, auditStageReadCountsOf(auditStage));
+  // DEF-233（設計書 2.3）: 承認したサービスの Origin の 401 を受け、描けなかった画面（`SERVICE_READ_REFUSED` の判定）は、セッションの切れにする（その画面の
+  // 結果は採らない。DEF-200 のログインし直しの後に読み直す）。指定のあるジョブだけ。
+  const unauthorizedDetail = options.serviceUnauthorizedSessionLoss === true
+    ? serviceUnauthorizedSessionLostDetailOf(
+      auditStage, unauthorizedBefore, isAuditStageReadObstructed(auditStageObservation), options.authentication?.automatedRelogin === true,
+    )
+    : null;
+  if (unauthorizedDetail !== null) {
+    return { kind: 'SESSION_LOST', url, detail: unauthorizedDetail, ...counts, sessionLoss: evidenceOf(unauthorizedDetail) };
+  }
   // DEF-129: Context を閉じた後に、文書の読み込みの事実を読む（Guard の 1 か所が数えた値）。
   const pageLoad = pageLoadFactsOf(page) ?? NO_PAGE_LOAD;
   return { ...visit, auditStageObservation, pageLoad, ...counts };
@@ -421,7 +523,7 @@ function sessionLossEvidenceOfVisit(
     readonly context: BrowserContext;
     readonly ledger: SafetyLedger;
     readonly route: SessionLossNavigationRecord | null;
-    readonly stage: SessionKeyLostDetail | null;
+    readonly stage: SessionLostDetail | null;
     readonly options: GuardedPageLoadOptions;
   },
 ): SessionLossEvidence | null {

@@ -11,12 +11,12 @@ import {
   type GuardRequestInput,
 } from '../../src/safety/passive-request-guard.js';
 import {
-  MAX_OBSERVED_SUBMISSION_SHAPES,
   SubmissionObservation,
   attachSubmissionObservation,
   observationAdmitsFrozenPreflight,
   recordObservedFrozenPreflight,
   recordObservedFrozenRequest,
+  frozenRequestCarriesObservedMarker,
 } from '../../src/safety/submission-observation.js';
 
 const APP = 'https://app.example.test';
@@ -24,7 +24,7 @@ const API = 'https://api.example.test';
 const MARKER = 'bsmarkerObservationQ1';
 const SECRET = 'kSecretApiKeyValue0123456789abcdef';
 
-const observationOf = (): SubmissionObservation => new SubmissionObservation({ approvedApiOrigins: [API], allowedOrigins: [APP] });
+const observationOf = (): SubmissionObservation => new SubmissionObservation({ approvedApiOrigins: [API], approvedTestOrigins: [], allowedOrigins: [APP] });
 
 const requestFacts = (method: string, url = `${API}/rest/v1/members`) => ({
   method,
@@ -74,7 +74,7 @@ describe('SubmissionObservation (T37b)', () => {
   });
 
   it('classifies the Origin by the Origin owner: the index of the approved API Origin, the allowed Origin, or another', () => {
-    const observation = new SubmissionObservation({ approvedApiOrigins: ['https://first-api.example.test', API], allowedOrigins: [APP] });
+    const observation = new SubmissionObservation({ approvedApiOrigins: ['https://first-api.example.test', API], approvedTestOrigins: [], allowedOrigins: [APP] });
     observation.begin({ pagePath: '/admin/members/new', markers: [] });
     for (const url of [`${API}/rest/v1/members`, 'https://first-api.example.test/x', `${APP}/api/members`, 'https://elsewhere.example.test/x', 'not a url']) {
       recordObservedFrozenRequest(observation, requestFacts('POST', url));
@@ -88,10 +88,33 @@ describe('SubmissionObservation (T37b)', () => {
     ]);
   });
 
+  it('DEF-220: classifies an approved test Origin given explicitly as APPROVED_TEST with its index, and another allowed Origin as ALLOWED', () => {
+    const other = 'https://other-app.example.test';
+    const observation = new SubmissionObservation({
+      approvedApiOrigins: [API], approvedTestOrigins: ['https://first-app.example.test', APP], allowedOrigins: [APP, other, 'https://first-app.example.test'],
+    });
+    observation.begin({ pagePath: '/admin/members/new', markers: [] });
+    for (const url of [`${APP}/api/members`, 'https://first-app.example.test/api/notes', `${other}/api/members`, `${API}/rest/v1/members`]) {
+      recordObservedFrozenRequest(observation, requestFacts('POST', url));
+    }
+    expect(observation.end().shapes.map(({ origin }) => origin)).toEqual([
+      { kind: 'APPROVED_TEST', index: 1 },
+      { kind: 'APPROVED_TEST', index: 0 },
+      { kind: 'ALLOWED' },
+      { kind: 'APPROVED_API', index: 0 },
+    ]);
+    // 事前確認を満たすのは、承認した API の Origin だけ（今のまま。テストの Origin は同じ Origin なので事前確認がない）。
+    const active = new SubmissionObservation({ approvedApiOrigins: [], approvedTestOrigins: [APP], allowedOrigins: [APP] });
+    active.begin({ pagePath: '/admin', markers: [] });
+    expect(observationAdmitsFrozenPreflight(active, `${APP}/api/members`)).toBe(false);
+    active.end();
+  });
+
   it('judges the state key with the name before hiding (T37R-fix-A I-3), keeping only the truth value', () => {
     const observation = observationOf();
     observation.begin({ pagePath: '/admin/members/new', markers: [] });
-    const longStateName = `deleted_${'x'.repeat(70)}`;
+    // L13: 長さでは伏せないので、値に見えて伏せる名前で確かめる。
+    const longStateName = 'deleted_AbCdEfGhIjKlMnOpQrStUv12';
     recordObservedFrozenRequest(observation, { ...requestFacts('POST'), body: () => ({ kind: 'TEXT' as const, text: JSON.stringify({ [longStateName]: true }) }) });
     recordObservedFrozenRequest(observation, requestFacts('POST'));
     const { shapes } = observation.end();
@@ -111,13 +134,14 @@ describe('SubmissionObservation (T37b)', () => {
     expect(bodyReads).toBe(0);
   });
 
-  it('keeps the limit of the shapes of one observation and counts the rest as unrecorded', () => {
+  it('L7（N38）: records every shape of one observation without a count limit', () => {
     const observation = observationOf();
     observation.begin({ pagePath: '/admin/members/new', markers: [] });
-    for (let index = 0; index < MAX_OBSERVED_SUBMISSION_SHAPES + 2; index += 1) recordObservedFrozenRequest(observation, requestFacts('POST'));
+    const count = 10;
+    for (let index = 0; index < count; index += 1) recordObservedFrozenRequest(observation, requestFacts('POST'));
     const result = observation.end();
-    expect(result.shapes).toHaveLength(MAX_OBSERVED_SUBMISSION_SHAPES);
-    expect(result).toMatchObject({ nonReadRequestCount: MAX_OBSERVED_SUBMISSION_SHAPES + 2, unrecordedShapeCount: 2 });
+    expect(result.shapes).toHaveLength(count);
+    expect(result).toMatchObject({ nonReadRequestCount: count, unrecordedShapeCount: 0 });
   });
 
   it('counts a request whose shape could not be made as unrecorded, without throwing', () => {
@@ -149,7 +173,10 @@ describe('SubmissionObservation (T37b)', () => {
     observation.end();
     attachSubmissionObservation(observation);
     expect(() => attachSubmissionObservation(observation)).toThrow(TypeError);
-    expect(() => new SubmissionObservation({ approvedApiOrigins: [1 as unknown as string], allowedOrigins: [] })).toThrow(TypeError);
+    expect(() => new SubmissionObservation({ approvedApiOrigins: [1 as unknown as string], approvedTestOrigins: [], allowedOrigins: [] })).toThrow(TypeError);
+    // DEF-220: 承認したテストの Origin は明示して渡す（ないか、文字列の配列でなければ作らない）。
+    expect(() => new SubmissionObservation({ approvedApiOrigins: [], allowedOrigins: [] } as never)).toThrow(TypeError);
+    expect(() => new SubmissionObservation({ approvedApiOrigins: [], approvedTestOrigins: [1 as unknown as string], allowedOrigins: [] })).toThrow(TypeError);
   });
 });
 
@@ -210,5 +237,37 @@ describe('decideGuardRequest with the frozen preflight of the observation (T37b)
     const unread = inputOf({ request: null });
     expect(decideGuardRequest(unread.input)).toEqual({ kind: 'BLOCK_FROZEN', request: null, navigation: false });
     expect(unread.asked()).toBe(0);
+  });
+});
+
+// DEF-233（設計書 `2026-11-09-beaksight-discovery-token-refresh-design.md` 2.1 の 1）: 凍結の段で通す token の更新は、押すときに欄へ入れた目印を含まない。
+// 目印は、観察を終えた後も（凍結はページを閉じるまで続き、欄に値が残りうる）、その口が始めた観察のすべての目印で照らす（URL と本文）。
+describe('DEF-233: frozenRequestCarriesObservedMarker', () => {
+  const refreshUrl = `${API}/auth/v1/token?grant_type=refresh_token`;
+  const bodyOf = (text: string) => (): { readonly kind: 'TEXT'; readonly text: string } => ({ kind: 'TEXT', text });
+
+  it('is false before any observation began (no marker was entered)', () => {
+    const observation = observationOf();
+    expect(frozenRequestCarriesObservedMarker(observation, refreshUrl, bodyOf(JSON.stringify({ refresh_token: 'r1' })))).toBe(false);
+  });
+
+  it('finds the marker in the body or the URL during the observation and after it ended', () => {
+    const observation = observationOf();
+    observation.begin({ pagePath: '/admin/p1', markers: [MARKER] });
+    expect(frozenRequestCarriesObservedMarker(observation, refreshUrl, bodyOf(JSON.stringify({ draft: MARKER })))).toBe(true);
+    expect(frozenRequestCarriesObservedMarker(observation, `${refreshUrl}&d=${MARKER}`, bodyOf(''))).toBe(true);
+    expect(frozenRequestCarriesObservedMarker(observation, refreshUrl, bodyOf(JSON.stringify({ refresh_token: 'r1' })))).toBe(false);
+    observation.end();
+    expect(frozenRequestCarriesObservedMarker(observation, refreshUrl, bodyOf(JSON.stringify({ draft: MARKER })))).toBe(true);
+    observation.begin({ pagePath: '/admin/p1', markers: ['bsmarkerSecondPress'] });
+    observation.end();
+    expect(frozenRequestCarriesObservedMarker(observation, refreshUrl, bodyOf(JSON.stringify({ draft: MARKER })))).toBe(true);
+    expect(frozenRequestCarriesObservedMarker(observation, refreshUrl, bodyOf('bsmarkerSecondPress'))).toBe(true);
+  });
+
+  it('takes an unreadable body as carrying the marker (the safe side)', () => {
+    const observation = observationOf();
+    observation.begin({ pagePath: '/admin/p1', markers: [MARKER] });
+    expect(frozenRequestCarriesObservedMarker(observation, refreshUrl, () => { throw new Error('unreadable'); })).toBe(true);
   });
 });

@@ -1,12 +1,11 @@
 // T38b（Task 38 の設計書 3.2、4 章、5 章の 1）: form のない登録と更新の画面（fixture の `memberScreenLayout: 'formless'`）の発見の成果物から、API の
 // シナリオの下書きを作って保存し、承認や入力の規則がないうちは実行の許可が出ないことを確かめる。
-// - 発見は本物の流れ（`executeDiscoveryRun`。認証つきの factory と Guard、送らずに観察する probe）。Chromium はテストの既定の headless と、CLI の起動の
-//   設定の両方。
+// - 発見は本物の流れ（`executeDiscoveryRun`。認証つきの factory と Guard、送らずに観察する probe）。Chromium はテストの既定の headless。
 // - 保存の口（`createScenario`）は、候補を型の digest で選び（`candidateOfDiscoveryDocumentByShape`）、`evidence` に `submissionProbe` を含む候補を書く。
 //   型・鍵と欄の対応・許すヘッダの名前は値を持たない（目印と fixture の秘密がシナリオと管理データのファイルに出ない）。
 // - 登録（CREATE）と更新（UPDATE。台帳は登録のシナリオ）の API のシナリオが保存できる。発行の口（`issueExecutionGrant`）は、API のシナリオを送り方では
-//   拒まず（T40a で登録、T41b で更新）、FORM と同じ確かめ（承認、入力の規則など）で拒む。許可を出す通しは、登録が `write-job-api-start.test.ts`、更新が
-//   `api-update-grant-start.test.ts`（許可から `START` まで）と `write-job-api-update.test.ts`（本物のワーカーの更新の流れと親の締めまで）。
+//   拒まず（T40a で登録、T41b で更新）、FORM と同じ確かめ（承認、入力の規則など）で拒む。許可を出す通しは、登録が `control-write-api-jobs.test.ts`、更新が
+//   `api-update-grant-start.test.ts`（点検の登録の段から更新の段の書き込みの指定まで）。
 // - 発見と保存の間に、サーバに届いた読み取りでない要求は 0（fixture の記録で数え、待って数え直す）。
 // - T38c: 発見のジョブの行（プロファイルの改訂）を書く。API の登録と更新のシナリオを承認でき（許可は出ない）、プロファイルを直すと再承認（前の発見の
 //   候補では下書きを保存できない）、同じ画面の保存の本文の鍵が変わる（fixture の `setHostileMemberSave`）と再承認（`CANDIDATE_SHAPE_CHANGED`）。
@@ -14,7 +13,6 @@ import { existsSync, readFileSync, readdirSync, statSync } from 'node:fs';
 import { mkdtemp, rm } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import type { Browser } from 'playwright';
 import { afterAll, afterEach, beforeAll, describe, expect, it } from 'vitest';
 import { wait } from '../../src/core/deadline.js';
 import type { AuditConfig } from '../../src/config/types.js';
@@ -33,7 +31,6 @@ import { discoveryIndexEntryOf, recordDiscoveryCandidates } from '../../src/cont
 import { createStartingJob, recordLoginCheckFinished } from '../../src/control/job/job-store.js';
 import { createReadCheck } from '../../src/control/job/read-check-store.js';
 import { saveRuleSetAndAttach } from '../../src/control/data-rules/rule-store.js';
-import { recordIdPatternMatchesPagePath } from '../../src/core/record-id-path-pattern.js';
 import { closeControlDatabase, openControlDatabase, type ControlDatabase } from '../../src/control/store/control-database.js';
 import { resolveControlDatabasePath } from '../../src/control/store/database-path.js';
 import { createProfile, updateProfile } from '../../src/control/store/profile-store.js';
@@ -44,7 +41,7 @@ import { submissionProbeKeyFieldsOf } from '../../src/discovery/submission-probe
 import type { RunAuthentication } from '../../src/orchestration/authenticated-run.js';
 import { executeDiscoveryRun } from '../../src/worker/discovery-run.js';
 import { hasSuccessStorageKey } from '../../src/worker/login-stage-checks.js';
-import { launchCliChromium, launchHeadlessChromium } from '../helpers/chromium.js';
+import { DEFAULT_CHROMIUM_LAUNCHERS, useSharedRunBrowser } from '../helpers/chromium.js';
 import { READ_METHODS } from '../helpers/leak-places.js';
 import { fastRunConfig } from '../helpers/run-harness.js';
 import {
@@ -59,19 +56,15 @@ import {
   type SpaHostileMemberSave,
 } from '../helpers/spa-auth-site-fixture.js';
 import { createTestConfig } from '../helpers/test-config.js';
+import { probeQuietWindowsOf } from '../helpers/test-waits.js';
 import { TEST_TARGET_PATH, testWriteProfile } from './control-profile-fixtures.js';
 
-const LAUNCHERS: readonly (readonly [string, () => Promise<Browser>])[] = [
-  ['the default test Chromium', () => launchHeadlessChromium()],
-  ['the CLI Chromium', () => launchCliChromium()],
-];
 const TEST_TIMEOUT_MS = 240_000;
 /** 遅れて届く要求を待つ時間（ms）。 */
 const LATE_REQUEST_WAIT_MS = 1_000;
 /** 押した後に静まるまで待つ時間（ms。テストの値。fixture はすぐに送る）。 */
 const SHORT_QUIET_WAIT_MS = 500;
 const MAX_PAGES = 6;
-const DEFAULT_LIMITS = Object.freeze({ perMinute: 120, perRun: 600 });
 const FIXTURE_KEY = Object.freeze({ prefix: 'fixture', suffix: '-auth-token' });
 const PROFILE_ID = 'example-t38b';
 const MARKER_PREFIX = 'bsprobe';
@@ -87,56 +80,91 @@ const REDISCOVERY_AT = '20261017100230';
 const EXTERNAL = Object.freeze({ authSetupDigest: `sha256:${'2'.repeat(64)}`, targetConfigDigest: '3'.repeat(64) });
 const noObserver = { onRunStarted: (): void => undefined, onSessionLost: (): void => undefined };
 
-describe.each(LAUNCHERS)('T38b: API scenarios from the discovery of the formless member screens with %s', (_label, launch) => {
-  let spa: SpaAuthSite | undefined;
+/**
+ * W-FIX（SLIM の組 4）: 発見のやり直しが要る保存の送り方（型の digest の変化と、敵対的な保存）。各 1 回だけ、`beforeAll` で発見する。再承認の理由の判定そのものは
+ * 単体（`approval-validity`・`approval-scenario-policy`・`scenario-api-review-fixes`・`scenario-api-draft`）が確かめる。
+ */
+const REDISCOVERED_SAVES = Object.freeze([
+  'softDeleteKey', 'extraPageHeader', 'doubleSend', 'methodOverrideHeader', 'bodyMethodOverride', 'unapprovedOrigin',
+] as const satisfies readonly SpaHostileMemberSave[]);
+type RediscoveredSave = (typeof REDISCOVERED_SAVES)[number];
+
+describe.each(DEFAULT_CHROMIUM_LAUNCHERS)('T38b: API scenarios from the discovery of the formless member screens with %s', (_label, launchChromium) => {
+  // SLIM-2（X7）: 発見の流れごとに Chromium を起こさず、1 つの Browser を共有する（Context は流れごと）。
+  const launch = useSharedRunBrowser(launchChromium);
+  let site: SpaAuthSite;
   let workDirectory = '';
   let database: ControlDatabase | undefined;
+  /** 共有のサイトと別の作りの画面の場面（R2-I-1）のサイト。場面の後に閉じる。 */
+  let otherSite: SpaAuthSite | undefined;
+  /**
+   * W-FIX（SLIM の組 4）: 場面が共有する発見の文書。`first` と `again` は同じ状態の画面の 2 回の発見（ジョブの ID だけが違う）、ほかは保存の送り方を
+   * 替えた画面の発見。場面ごとに発見し直さない（前は 1 場面で 1〜5 回発見していた）。
+   */
+  const documents = new Map<'first' | 'again' | RediscoveredSave, DiscoveryDocument>();
+  const documentOf = (name: 'first' | 'again' | RediscoveredSave): DiscoveryDocument => {
+    const document = documents.get(name);
+    if (document === undefined) throw new Error(`the discovery ${name} was not run`);
+    return document;
+  };
 
   beforeAll(async () => {
     workDirectory = await mkdtemp(join(tmpdir(), 'beaksight-scenario-api-store-'));
-  });
+    site = await startSpaAuthSite({ memberScreenLayout: 'formless' });
+    site.addMember('既存花子');
+    documents.set('first', await discover('job-discovery-1'));
+    documents.set('again', await discover('job-discovery-2'));
+    for (const [index, save] of REDISCOVERED_SAVES.entries()) {
+      site.setHostileMemberSave(save);
+      documents.set(save, await discover(`job-discovery-save-${String(index)}`));
+    }
+    site.setHostileMemberSave(null);
+  }, TEST_TIMEOUT_MS * 3);
 
   afterEach(async () => {
     if (database !== undefined) closeControlDatabase(database);
     database = undefined;
-    await spa?.close();
-    spa = undefined;
+    await otherSite?.close();
+    otherSite = undefined;
   });
 
   afterAll(async () => {
+    // 発見の probe を含めて、サーバに届いた読み取りでない要求は 0（遅れて届く要求を待って数える）。
+    await wait(LATE_REQUEST_WAIT_MS);
+    expect(site.requests.filter((request) => request.preflight || !READ_METHODS.has(request.method))).toEqual([]);
+    await site.close();
     await rm(workDirectory, { recursive: true, force: true });
   });
 
   /** 発見のジョブ（`/admin` から。form のない会員の画面）を動かし、成果物の文書を返す。 */
-  const discover = async (site: SpaAuthSite, jobId = 'job-discovery-1'): Promise<DiscoveryDocument> => {
+  async function discover(jobId: string, target: SpaAuthSite = site): Promise<DiscoveryDocument> {
     const authentication: RunAuthentication = {
-      initialState: { cookies: [], origins: [{ origin: site.appOrigin, localStorage: [{ name: SPA_AUTH_STORAGE_KEY, value: site.issueStoredSession() }] }] },
-      approvedTestOrigins: [site.appOrigin],
+      initialState: { cookies: [], origins: [{ origin: target.appOrigin, localStorage: [{ name: SPA_AUTH_STORAGE_KEY, value: target.issueStoredSession() }] }] },
+      approvedTestOrigins: [target.appOrigin],
       auditExclusions: { excludedPathPrefixes: [SPA_APP_PATHS.logout], auditPathPrefixes: [], dangerousTerms: DEFAULT_EXCLUDED_URL_WORDS },
       sessionLostPathPrefix: SPA_APP_PATHS.auth,
       filterState: filterAuthenticatedState,
       auditStage: {
-        approvedServiceOrigins: [site.backendOrigin],
+        approvedServiceOrigins: [target.backendOrigin],
         auditReadRequests: [],
-        scriptLogin: { origin: site.tokenOrigin, path: SPA_BACKEND_PATHS.token, requiredQuery: [{ name: 'grant_type', value: SPA_GRANT_TYPES.password }] },
-        serviceRequestLimits: DEFAULT_LIMITS,
-      },
-      sessionKeyPresent: (state) => hasSuccessStorageKey(state, { origin: site.appOrigin, ...FIXTURE_KEY }),
+        scriptLogin: { origin: target.tokenOrigin, path: SPA_BACKEND_PATHS.token, requiredQuery: [{ name: 'grant_type', value: SPA_GRANT_TYPES.password }] },      },
+      sessionKeyPresent: (state) => hasSuccessStorageKey(state, { origin: target.appOrigin, ...FIXTURE_KEY }),
     };
-    const base = fastRunConfig(site.appOrigin, SPA_APP_PATHS.admin, {
-      target: { id: 'spa-api-scenario' }, output: { directory: join(workDirectory, 'discovery') }, crawl: { maxPages: MAX_PAGES },
+    // DEF-281: 出力先はジョブごとに分ける（同じ秒に始まった Run の名前が重ならないように。write-create-run と同じ形）。
+    const base = fastRunConfig(target.appOrigin, SPA_APP_PATHS.admin, {
+      target: { id: 'spa-api-scenario' }, output: { directory: join(workDirectory, 'discovery', jobId) }, crawl: { maxPages: MAX_PAGES },
     });
-    const config: AuditConfig = { ...base, site: { startUrl: `${site.appOrigin}${SPA_APP_PATHS.admin}`, allowedOrigins: [site.appOrigin] } };
+    const config: AuditConfig = { ...base, site: { startUrl: `${target.appOrigin}${SPA_APP_PATHS.admin}`, allowedOrigins: [target.appOrigin] } };
     const outcome = await executeDiscoveryRun({
       config, jobId, authentication, launchBrowser: launch, clock: () => new Date(), now: () => Date.now(),
-      stopSignal: new AbortController().signal, submissionProbeQuietWaitMs: SHORT_QUIET_WAIT_MS,
+      stopSignal: new AbortController().signal, observationWindows: probeQuietWindowsOf(SHORT_QUIET_WAIT_MS),
     }, noObserver);
     if (outcome.kind !== 'RAN') {
       throw new Error(`the discovery did not run: ${outcome.kind}`);
     }
     runDirectories.push(outcome.runDirectory);
     return JSON.parse(readFileSync(join(outcome.runDirectory, 'discovery.json'), 'utf8')) as DiscoveryDocument;
-  };
+  }
   /** T38f: 発見の Run のディレクトリ（成果物に目印と値が出ないことを確かめる）。 */
   const runDirectories: string[] = [];
 
@@ -204,10 +232,7 @@ describe.each(LAUNCHERS)('T38b: API scenarios from the discovery of the formless
   };
 
   it('saves the CREATE and UPDATE API scenarios, writes the candidate with its probe as the evidence, and issues no grant', async () => {
-    const site = await startSpaAuthSite({ memberScreenLayout: 'formless' });
-    spa = site;
-    site.addMember('既存花子');
-    const document = await discover(site);
+    const document = documentOf('first');
     const create = saveButtonOf(document, SPA_APP_PATHS.memberNew);
     const update = saveButtonOf(document, spaMemberEditPathOf(1));
     expect([create.submissionProbe?.result, update.submissionProbe?.result]).toEqual(['API_CREATE', 'API_UPDATE']);
@@ -264,17 +289,12 @@ describe.each(LAUNCHERS)('T38b: API scenarios from the discovery of the formless
         expect(text.includes(secret)).toBe(false);
       }
     }
-    await wait(LATE_REQUEST_WAIT_MS);
-    expect(site.requests.filter((request) => request.preflight || !READ_METHODS.has(request.method))).toEqual([]);
   }, TEST_TIMEOUT_MS);
 
   // T38c（Task 38 の設計書 3.3、5 章の 1・2）: API のシナリオを承認でき（許可は出ない）、プロファイルを直すと再承認、型が変わる（同じ画面の保存の本文の
   // 鍵を変える）と再承認。プロファイルを直した後は、前の発見の候補で下書きを保存できない（発見のジョブの改訂が今の改訂と違う）。
   it('approves an API scenario without a grant, and needs a new approval after a profile edit and after the shape of the request changed', async () => {
-    const site = await startSpaAuthSite({ memberScreenLayout: 'formless' });
-    spa = site;
-    site.addMember('既存花子');
-    const first = await discover(site, 'job-discovery-1');
+    const first = documentOf('first');
     const create = saveButtonOf(first, SPA_APP_PATHS.memberNew);
     const { opened } = await openWithProfile(site);
     recordDiscovery(opened, first, CREATED_AT, MIN_PROFILE_REVISION);
@@ -322,14 +342,13 @@ describe.each(LAUNCHERS)('T38b: API scenarios from the discovery of the formless
     expect(stale.ok ? [] : [stale.reason, ...(stale.draftErrors ?? []).map(({ code }) => code)])
       .toEqual(['SCENARIO_DRAFT_INVALID', 'SCENARIO_API_DISCOVERY_PROFILE_STALE']);
     expect(approveAt(CHECK_AT, 'receipt-api-2')).toMatchObject({ ok: false, reason: 'SCENARIO_NOT_APPROVABLE', invalidityReasons: ['API_DISCOVERY_PROFILE_STALE'] });
-    const again = await discover(site, 'job-discovery-1b');
-    recordDiscovery(opened, again, REDISCOVERY_AT, MIN_PROFILE_REVISION + 1);
+    // 発見し直した（同じ状態の画面の 2 回目の発見を、今の改訂で記録する）。
+    recordDiscovery(opened, documentOf('again'), REDISCOVERY_AT, MIN_PROFILE_REVISION + 1);
     expect(approveAt(REDISCOVERY_AT, 'receipt-api-2')).toMatchObject({ ok: true });
     expect(statusAt(REDISCOVERY_AT)?.validity).toMatchObject({ approved: true, receiptId: 'receipt-api-2' });
 
     // 同じ画面の保存の本文の鍵が変わる（論理削除の鍵を足す）と、次の発見の索引に、シナリオの型の digest がない → 再承認。
-    site.setHostileMemberSave('softDeleteKey');
-    const second = await discover(site, 'job-discovery-2');
+    const second = documentOf('softDeleteKey');
     const changed = saveButtonOf(second, SPA_APP_PATHS.memberNew);
     expect(changed.identityDigest).toBe(create.identityDigest);
     expect(changed.submissionProbe?.shapeDigest).not.toBe(create.submissionProbe?.shapeDigest);
@@ -341,10 +360,7 @@ describe.each(LAUNCHERS)('T38b: API scenarios from the discovery of the formless
   // 同じ画面を発見し直しただけ（ブラウザが付けるヘッダを含めて同じ送り方）なら、型の digest は同じで、承認は有効のまま。
   it('needs a new approval when the page supplies another header name (shape digest v2), and keeps it when nothing changed', async () => {
     const third = '20261017100400';
-    const site = await startSpaAuthSite({ memberScreenLayout: 'formless' });
-    spa = site;
-    site.addMember('既存花子');
-    const first = await discover(site, 'job-discovery-1');
+    const first = documentOf('first');
     const create = saveButtonOf(first, SPA_APP_PATHS.memberNew);
     const { opened } = await openWithProfile(site);
     recordDiscovery(opened, first, CREATED_AT, MIN_PROFILE_REVISION);
@@ -356,14 +372,13 @@ describe.each(LAUNCHERS)('T38b: API scenarios from the discovery of the formless
     })).toMatchObject({ ok: true });
 
     // 同じ送り方で発見し直す: 型の digest は同じ（ブラウザが付けるヘッダの名前は digest に入らない）。承認は有効のまま。
-    const again = await discover(site, 'job-discovery-2');
+    const again = documentOf('again');
     expect(saveButtonOf(again, SPA_APP_PATHS.memberNew).submissionProbe?.shapeDigest).toBe(create.submissionProbe?.shapeDigest);
     recordDiscovery(opened, again, SECOND_DISCOVERY_AT, MIN_PROFILE_REVISION);
     expect(statusAt(SECOND_DISCOVERY_AT)?.validity).toMatchObject({ approved: true, receiptId: 'receipt-api-1' });
 
     // ページが付けるヘッダを 1 つ足す: 分類は同じ `API_CREATE` のまま、型の digest が変わり、承認は `CANDIDATE_SHAPE_CHANGED`。
-    site.setHostileMemberSave('extraPageHeader');
-    const changed = await discover(site, 'job-discovery-3');
+    const changed = documentOf('extraPageHeader');
     const changedCreate = saveButtonOf(changed, SPA_APP_PATHS.memberNew);
     expect(changedCreate.identityDigest).toBe(create.identityDigest);
     expect(changedCreate.submissionProbe?.result).toBe('API_CREATE');
@@ -371,17 +386,12 @@ describe.each(LAUNCHERS)('T38b: API scenarios from the discovery of the formless
     expect(changedCreate.submissionProbe?.shapeDigest).not.toBe(create.submissionProbe?.shapeDigest);
     recordDiscovery(opened, changed, third, MIN_PROFILE_REVISION);
     expect(statusAt(third)?.validity).toEqual({ approved: false, reasons: ['CANDIDATE_SHAPE_CHANGED'] });
-    await wait(LATE_REQUEST_WAIT_MS);
-    expect(site.requests.filter((request) => request.preflight || !READ_METHODS.has(request.method))).toEqual([]);
   }, TEST_TIMEOUT_MS);
 
   // T38R-fix（C-1）: 承認の後に、保存が 2 つの要求を送る形（`doubleSend`）で発見し直すと、probe は `NOT_EXECUTABLE` になり、索引の型の digest に
   // シナリオの型がないので再承認（`CANDIDATE_SHAPE_CHANGED`）。
   it('T38R-fix C-1: needs a new approval after the save sends two requests (doubleSend)', async () => {
-    const site = await startSpaAuthSite({ memberScreenLayout: 'formless' });
-    spa = site;
-    site.addMember('既存花子');
-    const first = await discover(site, 'job-c1-1');
+    const first = documentOf('first');
     const create = saveButtonOf(first, SPA_APP_PATHS.memberNew);
     const { opened } = await openWithProfile(site);
     recordDiscovery(opened, first, CREATED_AT, MIN_PROFILE_REVISION);
@@ -391,8 +401,7 @@ describe.each(LAUNCHERS)('T38b: API scenarios from the discovery of the formless
       scenarioId: 'scenario-c1', expectedRevision: 1, expectedApprovalDigest: statusAt(APPROVE_AT)?.approvalDigest ?? '', receiptId: 'receipt-c1',
       external: EXTERNAL, at: APPROVE_AT,
     })).toMatchObject({ ok: true });
-    site.setHostileMemberSave('doubleSend');
-    const second = await discover(site, 'job-c1-2');
+    const second = documentOf('doubleSend');
     expect(saveButtonOf(second, SPA_APP_PATHS.memberNew).submissionProbe?.result).toBe('NOT_EXECUTABLE');
     recordDiscovery(opened, second, SECOND_DISCOVERY_AT, MIN_PROFILE_REVISION);
     expect(statusAt(SECOND_DISCOVERY_AT)?.validity).toEqual({ approved: false, reasons: ['CANDIDATE_SHAPE_CHANGED'] });
@@ -402,20 +411,21 @@ describe.each(LAUNCHERS)('T38b: API scenarios from the discovery of the formless
   // 2 回目はもう 1 つのボタンだけが 2 つの要求を送る（最初の型はシナリオの型と同じ）。まとめた後の行は書き込みでない行になり、再承認
   // （`CANDIDATE_SHAPE_CHANGED`）。その行では下書きも保存できない。
   it('T38R2-fix R2-I-1: needs a new approval when another button of the same identity sends two requests of the same first shape', async () => {
-    const site = await startSpaAuthSite({ hostileMemberInput: 'duplicateSubmit' });
-    spa = site;
-    site.addMember('既存花子');
+    // 別の作りの画面なので、この場面だけ別のサイトで 2 回発見する。
+    const duplicate = await startSpaAuthSite({ hostileMemberInput: 'duplicateSubmit' });
+    otherSite = duplicate;
+    duplicate.addMember('既存花子');
     const saveRowsOf = (document: DiscoveryDocument): readonly DiscoveryCandidate[] => discoveryCandidatesOf(document).filter((candidate) =>
       candidate.page.path === SPA_APP_PATHS.memberNew && candidate.kind === 'BUTTON' && candidate.submitterWords.includes(SAVE_WORD)
       && candidate.submissionProbe !== undefined);
-    const first = await discover(site, 'job-r2i1-1');
+    const first = await discover('job-r2i1-1', duplicate);
     const create = saveButtonOf(first, SPA_APP_PATHS.memberNew);
     // 同じ識別の 2 つのボタンを、どちらも押した（どちらも 1 つの要求で、同じ型）。
     expect(saveRowsOf(first).map(({ identityDigest, submissionProbe }) => [identityDigest, submissionProbe?.result, submissionProbe?.shapeDigest])).toEqual([
       [create.identityDigest, 'API_CREATE', create.submissionProbe?.shapeDigest],
       [create.identityDigest, 'API_CREATE', create.submissionProbe?.shapeDigest],
     ]);
-    const { opened } = await openWithProfile(site);
+    const { opened } = await openWithProfile(duplicate);
     recordDiscovery(opened, first, CREATED_AT, MIN_PROFILE_REVISION);
     expect(createScenario(opened, { scenarioId: 'scenario-r2i1', draft: draftOf(create, {}), discovery: first, at: CREATED_AT })).toMatchObject({ ok: true });
     const statusAt = (at: string) => readScenarioApprovalStatus(opened, 'scenario-r2i1', EXTERNAL, dateOfCompactUtcTimestamp(at));
@@ -425,8 +435,8 @@ describe.each(LAUNCHERS)('T38b: API scenarios from the discovery of the formless
     })).toMatchObject({ ok: true });
     expect(statusAt(CHECK_AT)?.validity).toMatchObject({ approved: true });
 
-    site.setDuplicateSaveSendsTwice(true);
-    const second = await discover(site, 'job-r2i1-2');
+    duplicate.setDuplicateSaveSendsTwice(true);
+    const second = await discover('job-r2i1-2', duplicate);
     // 保存のボタン（先）は 1 つの要求、もう 1 つのボタン（後）は 2 つの要求。最初の型は同じ。
     expect(saveRowsOf(second).map(({ submissionProbe }) => [submissionProbe?.result, submissionProbe?.reason, submissionProbe?.shapeDigest])).toEqual([
       ['API_CREATE', null, create.submissionProbe?.shapeDigest],
@@ -438,15 +448,12 @@ describe.each(LAUNCHERS)('T38b: API scenarios from the discovery of the formless
     const rejected = createScenario(opened, { scenarioId: 'scenario-r2i1-again', draft: draftOf(create, {}), discovery: second, at: SECOND_DISCOVERY_AT });
     expect(rejected.ok ? [] : [rejected.reason, ...(rejected.draftErrors ?? []).map(({ code }) => code)]).toEqual(['SCENARIO_DRAFT_INVALID', 'SCENARIO_API_CANDIDATE_NOT_API']);
     await wait(LATE_REQUEST_WAIT_MS);
-    expect(site.requests.filter((request) => request.preflight || !READ_METHODS.has(request.method))).toEqual([]);
+    expect(duplicate.requests.filter((request) => request.preflight || !READ_METHODS.has(request.method))).toEqual([]);
   }, TEST_TIMEOUT_MS);
 
   // T38R-fix（C-2）: 下書きの後に、承認したサービスの Origin を外すと、承認できない（Origin が型の番号の位置にない。最新の発見の改訂も違う）。
   it('T38R-fix C-2: does not approve a draft whose API origin was removed from the approved service origins after the draft', async () => {
-    const site = await startSpaAuthSite({ memberScreenLayout: 'formless' });
-    spa = site;
-    site.addMember('既存花子');
-    const first = await discover(site, 'job-c2-1');
+    const first = documentOf('first');
     const create = saveButtonOf(first, SPA_APP_PATHS.memberNew);
     const { opened } = await openWithProfile(site);
     recordDiscovery(opened, first, CREATED_AT, MIN_PROFILE_REVISION);
@@ -466,11 +473,7 @@ describe.each(LAUNCHERS)('T38b: API scenarios from the discovery of the formless
   // 送り方は、発見し直した候補の下書きで拒む。目印と値は、管理データ（WAL を含む）と発見の成果物に出ない。発見の probe を含めて、サーバに届いた
   // 読み取りでない要求は 0。
   it('G38: needs a new approval after the approved service origins changed, rejects the hostile shapes in the draft, and keeps no value', async () => {
-    const site = await startSpaAuthSite({ memberScreenLayout: 'formless' });
-    spa = site;
-    site.addMember('既存花子');
-    runDirectories.splice(0);
-    const first = await discover(site, 'job-g38-1');
+    const first = documentOf('first');
     const create = saveButtonOf(first, SPA_APP_PATHS.memberNew);
     const { opened, path } = await openWithProfile(site);
     recordDiscovery(opened, first, CREATED_AT, MIN_PROFILE_REVISION);
@@ -491,15 +494,14 @@ describe.each(LAUNCHERS)('T38b: API scenarios from the discovery of the formless
     expect(statusAt(CHECK_AT)?.validity).toEqual({ approved: false, reasons: ['PROFILE_REVISION_CHANGED', 'API_DISCOVERY_PROFILE_STALE'] });
 
     // 敵対的な保存の送り方で発見し直すと、その候補の下書きは拒まれる（理由は候補の確かめ。probe の分類と、下書きの I21 の照らし直し）。
-    const hostile: readonly (readonly [SpaHostileMemberSave, string])[] = [
+    const hostile: readonly (readonly [RediscoveredSave, string])[] = [
       ['softDeleteKey', 'SCENARIO_API_CANDIDATE_NOT_API'],
       ['methodOverrideHeader', 'SCENARIO_API_CANDIDATE_NOT_API'],
       ['bodyMethodOverride', 'SCENARIO_API_CANDIDATE_NOT_API'],
       ['unapprovedOrigin', 'SCENARIO_API_CANDIDATE_NOT_API'],
     ];
     for (const [index, [save, code]] of hostile.entries()) {
-      site.setHostileMemberSave(save);
-      const document = await discover(site, `job-g38-hostile-${String(index)}`);
+      const document = documentOf(save);
       const at = `2026101711${String(index).padStart(2, '0')}00`;
       recordDiscovery(opened, document, at, MIN_PROFILE_REVISION + 1);
       const candidate = saveButtonOf(document, SPA_APP_PATHS.memberNew);
@@ -509,7 +511,7 @@ describe.each(LAUNCHERS)('T38b: API scenarios from the discovery of the formless
         .toEqual(['SCENARIO_DRAFT_INVALID', code]);
     }
 
-    // 目印と値（fixture の秘密）は、管理データのファイル（WAL を含む）と発見の成果物に出ない。
+    // 目印と値（fixture の秘密）は、管理データのファイル（WAL を含む）と発見の成果物（この組のすべての発見）に出ない。
     closeControlDatabase(opened);
     database = undefined;
     const artifacts = runDirectories.flatMap((directory) => readdirSync(directory, { recursive: true, encoding: 'utf8' })
@@ -524,19 +526,15 @@ describe.each(LAUNCHERS)('T38b: API scenarios from the discovery of the formless
         expect(text.includes(secret)).toBe(false);
       }
     }
-    // 発見の probe を含めて、サーバに届いた読み取りでない要求は 0。
-    await wait(LATE_REQUEST_WAIT_MS);
-    expect(site.requests.filter((request) => request.preflight || !READ_METHODS.has(request.method))).toEqual([]);
-  }, TEST_TIMEOUT_MS * 3);
+    // 発見の probe を含めて、サーバに届いた読み取りでない要求は 0（組の終わりの `afterAll` で、待って数える）。
+  }, TEST_TIMEOUT_MS);
 
   // T40R-fix-B（Task 40 の設計書 7 章の「T40R」の行の I-2 (a)・(b)）: form のない登録の画面の API のシナリオで、`{id}` の照合の READ の期待が行の数
   // だけの下書きと、画面から ID を取る型に登録の画面（`/admin/members/new`）が当たる下書きを、保存で拒む（何も書かない）。生成した値と比べる期待を持ち、
   // 型が登録の画面に当たらない下書きは保存できる。
   // T40R2-fix: (b) の ID の型は保存できて注意の判定が真（意図した変化）。M-1 の毎回同じ値の欄だけの照合は、許可の発行で拒む。
   it('T40R-fix-B / T40R2-fix: rejects a row-count-only template READ, saves a record id pattern the new page matches with a caution, and issues no grant for a constant expectation', async () => {
-    const site = await startSpaAuthSite({ memberScreenLayout: 'formless' });
-    spa = site;
-    const document = await discover(site);
+    const document = documentOf('first');
     const create = saveButtonOf(document, SPA_APP_PATHS.memberNew);
     const { opened } = await openWithProfile(site);
     recordDiscovery(opened, document, CREATED_AT, MIN_PROFILE_REVISION);
@@ -557,15 +555,12 @@ describe.each(LAUNCHERS)('T38b: API scenarios from the discovery of the formless
     expect(codesOf(saveWith('scenario-row-count', verificationOf([{ kind: 'ROW_COUNT_EQUALS', count: 1 }], null))))
       .toEqual(['SCENARIO_DRAFT_INVALID', 'SCENARIO_API_READ_VERIFICATION_NOT_BOUND']);
     expect(readScenario(opened, 'scenario-row-count')).toBeNull();
-    // T40R2-fix（使える度合い）: 登録の画面に当たる ID の型は保存でき（意図した変化）、注意の判定が真になる（画面が注意を出す）。
+    // T40R2-fix（使える度合い）: 登録の画面に当たる ID の型は保存できる（意図した変化）。SPEC-4: 画面の注意は、詳細の画面の値ごと捨てた。
     const newPageId = { source: 'URL_PATH_PATTERN', pathPattern: '/admin/members/{id}' };
     expect(saveWith('scenario-new-page-id', verificationOf([{ kind: 'TEXT_CONTAINS', fieldName: 'email' }], newPageId))).toMatchObject({ ok: true });
-    const savedNewPageId = readScenario(opened, 'scenario-new-page-id');
-    expect(savedNewPageId?.current.verification.recordId).toEqual(newPageId);
-    expect(recordIdPatternMatchesPagePath(savedNewPageId?.current.verification.recordId ?? null, savedNewPageId?.evidence.page.path ?? '')).toBe(true);
+    expect(readScenario(opened, 'scenario-new-page-id')?.current.verification.recordId).toEqual(newPageId);
     expect(saveWith('scenario-fixed', verificationOf([{ kind: 'ROW_COUNT_EQUALS', count: 1 }, { kind: 'TEXT_CONTAINS', fieldName: 'email' }],
       { source: 'URL_PATH_PATTERN', pathPattern: '/admin/members/{id}/edit' }))).toMatchObject({ ok: true });
-    expect(recordIdPatternMatchesPagePath(readScenario(opened, 'scenario-fixed')?.current.verification.recordId ?? null, SPA_APP_PATHS.memberNew)).toBe(false);
 
     // T40R2-fix（M-1）: 照合の READ の期待の欄（email）が、毎回同じ値になる規則（1 つの値だけの固定の一覧）なら、承認しても許可を出さない。生成した値の
     // 規則（テンプレートの合成のメール）に替えると、許可が出る。
@@ -592,8 +587,6 @@ describe.each(LAUNCHERS)('T38b: API scenarios from the discovery of the formless
     expect(issueAt('grant-fixed-1', APPROVE_AT)).toMatchObject({ ok: false, reason: 'READ_VERIFICATION_NOT_VARYING' });
     approveWithRules([], 1, CHECK_AT);
     expect(issueAt('grant-fixed-2', CHECK_AT)).toMatchObject({ ok: true, grant: { reservation: { state: 'RESERVED' } } });
-    await wait(LATE_REQUEST_WAIT_MS);
-    expect(site.requests.filter((request) => request.preflight || !READ_METHODS.has(request.method))).toEqual([]);
   }, TEST_TIMEOUT_MS);
 
   // T41a（Task 41 の設計書 3.1、3.3 のページが決める鍵）: form のない会員の更新の画面の API の UPDATE を、変える鍵（名前）と保つ鍵（メールアドレス・備考）で
@@ -601,10 +594,7 @@ describe.each(LAUNCHERS)('T38b: API scenarios from the discovery of the formless
   // 鍵から ID を取るときは、その鍵が filter の名前と同じであること（違う台帳では保存できない）。許可は、入力の規則がないので出ない（T41b から送り方では
   // 拒まない）。
   it('T41a: saves and approves an API UPDATE with the changed key and the kept keys, bound to the ledger id, and issues no grant yet', async () => {
-    const site = await startSpaAuthSite({ memberScreenLayout: 'formless' });
-    spa = site;
-    site.addMember('既存花子');
-    const document = await discover(site);
+    const document = documentOf('first');
     const create = saveButtonOf(document, SPA_APP_PATHS.memberNew);
     const update = saveButtonOf(document, spaMemberEditPathOf(1));
     const { opened } = await openWithProfile(site);
@@ -658,7 +648,5 @@ describe.each(LAUNCHERS)('T38b: API scenarios from the discovery of the formless
     for (const secret of site.secretValues()) {
       expect(stored.includes(secret)).toBe(false);
     }
-    await wait(LATE_REQUEST_WAIT_MS);
-    expect(site.requests.filter((request) => request.preflight || !READ_METHODS.has(request.method))).toEqual([]);
   }, TEST_TIMEOUT_MS);
 });

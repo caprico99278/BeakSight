@@ -16,21 +16,15 @@
  *   - 再試行の前の試行のスクリーンショット: `pages/<pageId>/retry-<n>/<ビューポート>/`（DEF-007）
  * - Run のディレクトリからの相対パスが安全かどうかの検証（`isPortableRelativeArtifactPath`、`isPortableArtifactPathSegment`）も、
  *   ここだけで行う（CC-027）。スクリーンショットの収集、`ArtifactWriter`、ChatGPT 用バンドルは、どれもここを使う。
- * - 中断した Run の再開のための保存（チェックポイント）とロックの配置（中断した Run の再開の設計書 4.1、4.4）:
- *   - `checkpoint/`: `state.json`、`state.prev.json`、`run.lock`
+ * - 中断した Run の再開のための保存（チェックポイント）の配置（中断した Run の再開の設計書 4.1）:
+ *   - `checkpoint/`: `state.json`、`state.prev.json`
  *   - `checkpoint/pages/<pageId>.json`: ページの保存
  *   保存のファイルを読み書きし、消すのは `ArtifactWriter` である。ここは、名前とパスだけを持つ。
- * - サイトの不調で止めたときの診断の記録の配置（サイトの不調で止めたときの診断の記録の設計書 2.3）:
- *   - `diagnostics/site-unavailable-<pageId>-<実行の番号>-<試行の番号>.json`: そのページのその試行の監査の結果と、ページ本体の要求の観察の
- *     結果（試行の番号は、捨てた後に段階的に最大 4 回確かめ直す決まり（サイトが応答しないときに Run を止める設計書 3.5.2、3.6.2）による。1 回目が 1、確かめ直しが 2〜5）
- *   `checkpoint/` の外に置く（Run の終わりの片付けで消さない）。書くのは `ArtifactWriter` である。
  * - PREFLIGHT が Run のディレクトリの直下に作る一時ファイルの名前（接頭辞と接尾辞）も、ここに置く（PREFLIGHT が作り、再開のときの
  *   後始末で `ArtifactWriter` が消す。report の層は orchestration を import しないため）。
  * - Run のディレクトリを排他的に作る処理（`createRunArtifactDirectory`。DEF-009）と、Run のディレクトリの一覧の読み取り
  *   （`listRunDirectories` と、それから保存のあるものを選ぶ `listCheckpointRunDirectories`。読むだけ）も、ここに置く。このファイルで
  *   入出力を行うのは、これらだけである。
- * - 出力先の直下の開始のロック（`OUTPUT_START_LOCK_FILE_NAME`。DEF-057。Task 24 の設計書 4.6）の名前とパスも、ここに置く。Run のディレクトリの
- *   一覧には入らない（Run の ID の形のディレクトリだけを数えるため）。
  */
 import { mkdir, readdir, stat } from 'node:fs/promises';
 import { join, posix, win32 } from 'node:path';
@@ -75,6 +69,12 @@ export const REPORT_SUMMARY_ARTIFACT_FILE_NAME = 'report-summary.json';
  * （監査の Run には書かないので、監査の Run のファイルの一覧に入れない）。
  */
 export const DISCOVERY_ARTIFACT_FILE_NAME = 'discovery.json';
+
+/**
+ * DEF-200（設計書 `2026-11-04-beaksight-login-session-design.md` 3.4 の 9）: 操作さがしの続きのための状態の保存の、Run のディレクトリからの相対パス（区切りは `/`）。
+ * 監査の保存と同じ `checkpoint/` に置く（監査の状態の保存とは別のファイル）。
+ */
+export const DISCOVERY_CHECKPOINT_RELATIVE_PATH = 'checkpoint/discovery-state.json';
 
 /**
  * READ の確かめのジョブ（Task 27。T27e）の Run のディレクトリの直下の成果物の名前。発見のジョブと同じく、監査の Run の成果物とは別に置く。
@@ -189,24 +189,92 @@ export function bundleFileNameLabelOf(profileName: string): string {
  * - `profileName` があり、名前の部分（`bundleFileNameLabelOf`）が空でなければ、`beaksight-audit-bundle_<名前の部分>_YYYYMMDDHHmmss.zip`
  *   （画面のジョブ。プロファイルの名前は、ファイル名だけに使う）。
  * - `profileName` がない（CLI の実行）か、名前の部分が空なら、`beaksight-audit-bundle_YYYYMMDDHHmmss.zip`（今の形）。
+ * - AUD-1d: `part` の部の数が 2 以上なら、日時の後に `_part<番号>` を付ける（例: `beaksight-audit-bundle_YYYYMMDDHHmmss_part1.zip`）。1 部のときと省略は
+ *   今の名前。番号が 1 から部の数までの整数でなければ `RangeError`。
  * `finishedAt` は、その Run の最後の実行の終わりの時刻（`RunSummary.executions` の最後の `finishedAt`。ISO 8601）。
  * 日時は UTC で、Run の ID と同じ書式（`formatCompactUtcTimestamp`）にする。同じ Run の結果とプロファイルの名前からは、同じ名前になる
  * （書き出しの時刻は使わない）。文字列でない値、時刻として読めない文字列、UTC の年が4桁でない時刻、文字列でないプロファイルの名前は、
  * `RangeError` を投げる。
  */
-export function bundleFileName(finishedAt: string, profileName?: string): string {
+export function bundleFileName(finishedAt: string, profileName?: string, part?: BundleFilePart): string {
   const given: unknown = finishedAt;
   if (typeof given !== 'string') {
     throw new RangeError(`${BUNDLE_TIME_SUBJECT} must be an ISO 8601 string`);
   }
+  if (part !== undefined && !(isPositiveSafeInteger(part.partNumber) && isPositiveSafeInteger(part.partCount) && part.partNumber <= part.partCount)) {
+    throw new RangeError(`bundle part must be 1 to the part count: ${String(part.partNumber)} of ${String(part.partCount)}`);
+  }
   const label = profileName === undefined ? '' : bundleFileNameLabelOf(profileName);
   const prefix = label.length === 0 ? BUNDLE_FILE_NAME_PREFIX : `${BUNDLE_FILE_NAME_PREFIX}${label}${BUNDLE_FILE_NAME_TIME_SEPARATOR}`;
-  return timestampedBundleFileName(prefix, formatCompactUtcTimestamp(new Date(given), BUNDLE_TIME_SUBJECT));
+  const name = timestampedBundleFileName(prefix, formatCompactUtcTimestamp(new Date(given), BUNDLE_TIME_SUBJECT));
+  // AUD-1d: 2 部以上のときだけ、日時の後に `_part<番号>` を付ける（1 部のときは今の名前）。
+  return part === undefined || part.partCount === 1
+    ? name
+    : `${name.slice(0, -BUNDLE_FILE_NAME_EXTENSION.length)}${BUNDLE_FILE_NAME_PART_SEPARATOR}${part.partNumber}${BUNDLE_FILE_NAME_EXTENSION}`;
+}
+
+/** AUD-1d: バンドルの部の番号と数（`bundleFileName` の第 3 引数。1 から）。 */
+export interface BundleFilePart {
+  readonly partNumber: number;
+  readonly partCount: number;
+}
+
+/** AUD-1d: 部の名前の、日時の後の印（`_part<番号>`）。 */
+const BUNDLE_FILE_NAME_PART_SEPARATOR = '_part';
+/** 部の名前の末尾（`_part` と、0 で始まらない数字）。 */
+const BUNDLE_FILE_NAME_PART_SUFFIX = /_part([1-9][0-9]*)$/u;
+
+/** バンドルの名前の、接頭辞と拡張子を除いた中身から、部の印を分ける（部の印がなければ番号は `null`）。 */
+const splitBundlePart = (body: string): { readonly body: string; readonly partNumber: number | null } => {
+  const match = BUNDLE_FILE_NAME_PART_SUFFIX.exec(body);
+  const partNumber = match === null ? null : Number(match[1]);
+  return match === null || partNumber === null || !isPositiveSafeInteger(partNumber)
+    ? { body, partNumber: null }
+    : { body: body.slice(0, match.index), partNumber };
+};
+
+/**
+ * AUD-1d: ChatGPT 用バンドルの名前の、部の番号（`_part<番号>` の形。1 部だけの名前は `null`）と、部の印を除いた名前（同じ組の部に共通。組の鍵に使う）。
+ * バンドルの名前でなければ `null`。
+ */
+export function bundleFilePartOf(name: string): { readonly setName: string; readonly partNumber: number | null } | null {
+  if (!isBundleFileName(name)) {
+    return null;
+  }
+  const body = name.slice(BUNDLE_FILE_NAME_PREFIX.length, name.length - BUNDLE_FILE_NAME_EXTENSION.length);
+  const { body: setBody, partNumber } = splitBundlePart(body);
+  return { setName: `${BUNDLE_FILE_NAME_PREFIX}${setBody}${BUNDLE_FILE_NAME_EXTENSION}`, partNumber };
+}
+
+/**
+ * AUD-1d: 名前の一覧のうち、いちばん新しいバンドルの組（日時の新しい組。日時が同じなら、部の印を除いた名前のコード単位の大きい組）の、全部の部の名前（部の番号の順。
+ * 1 部だけの名前は、その 1 つ）。バンドルの名前でないものは見ない。なければ空。画面が配るバンドルを選ぶのに使う。
+ */
+export function newestBundleFileSetOf(names: readonly string[]): readonly string[] {
+  const parts = names.flatMap((name) => {
+    const part = bundleFilePartOf(name);
+    const timestamp = bundleFileNameTimestampOf(name);
+    return part === null || timestamp === null ? [] : [{ name, timestamp, ...part }];
+  });
+  const newest = parts.reduce<(typeof parts)[number] | null>((best, candidate) => {
+    if (best === null) {
+      return candidate;
+    }
+    // 日時は同じ長さの ASCII の数字なので、コード単位の比べがそのまま新しさの比べになる。
+    return candidate.timestamp > best.timestamp || (candidate.timestamp === best.timestamp && candidate.setName > best.setName) ? candidate : best;
+  }, null);
+  return newest === null
+    ? []
+    : parts
+        .filter(({ setName }) => setName === newest.setName)
+        .sort((left, right) => (left.partNumber ?? 0) - (right.partNumber ?? 0))
+        .map(({ name }) => name);
 }
 
 /**
  * ChatGPT 用バンドルの名前の日時（ASCII の数字14桁）。名前の部分つきの形（`beaksight-audit-bundle_<名前の部分>_<14桁>.zip`）と、名前の部分のない形
  * （`beaksight-audit-bundle_<14桁>.zip`）の、末尾の 14 桁を返す。日時は末尾の固定の長さで読むので、名前の部分に `_` や数字があっても取り違えない。
+ * AUD-1d: 部の名前（日時の後に `_part<番号>`）も受ける。
  * 名前の部分は、`bundleFileNameLabelOf` が同じ値を返すもの（作り直しても変わらないもの）だけを受ける。日時のない名前と、バンドルの名前でない
  * ものは `null`。
  */
@@ -214,7 +282,7 @@ export function bundleFileNameTimestampOf(name: string): string | null {
   if (!name.startsWith(BUNDLE_FILE_NAME_PREFIX) || !name.endsWith(BUNDLE_FILE_NAME_EXTENSION)) {
     return null;
   }
-  const body = name.slice(BUNDLE_FILE_NAME_PREFIX.length, name.length - BUNDLE_FILE_NAME_EXTENSION.length);
+  const { body } = splitBundlePart(name.slice(BUNDLE_FILE_NAME_PREFIX.length, name.length - BUNDLE_FILE_NAME_EXTENSION.length));
   if (isCompactUtcTimestamp(body)) {
     return body;
   }
@@ -276,20 +344,60 @@ export const PAGES_ARTIFACT_DIRECTORY = 'pages';
 /** 再試行の前の試行のスクリーンショットを置くディレクトリの名前の接頭辞（`retry-<試行の番号>`。DEF-007）。 */
 export const RETRY_ARTIFACT_DIRECTORY_PREFIX = 'retry-';
 
+/**
+ * EV-5（設計者の判断 2026-11-16）: 時間切れの後の再開で読み直したページのスクリーンショットを置くディレクトリの名前の接頭辞（`pages/<pageId>/revisit-<番号>/`。
+ * 番号は、そのページの読み直しの順。前の結果の画像を上書きしないため。読み直しを採ったときだけ、そのページの結果がここを指す）。
+ */
+export const REVISIT_ARTIFACT_DIRECTORY_PREFIX = 'revisit-';
+
+/** EV-5: 番号つきのディレクトリの名前（`<接頭辞><正の整数>`）の番号（違えば `null`）。 */
+const numberedDirectoryIndexOf = (name: string, prefix: string): number | null => {
+  if (!name.startsWith(prefix)) {
+    return null;
+  }
+  const digits = name.slice(prefix.length);
+  return /^[1-9][0-9]*$/u.test(digits) && isPositiveSafeInteger(Number(digits)) ? Number(digits) : null;
+};
+
+/** EV-5: 画像の相対パス（`screenshotRelativePath`）の、読み直しの番号（`pages/<pageId>/revisit-<番号>/…`。読み直しでない画像は `null`）。 */
+export const revisitIndexOfScreenshotPath = (relativePath: string): number | null => {
+  const [directory, , segment] = relativePath.split('/');
+  return directory === PAGES_ARTIFACT_DIRECTORY && segment !== undefined ? numberedDirectoryIndexOf(segment, REVISIT_ARTIFACT_DIRECTORY_PREFIX) : null;
+};
+
+/**
+ * AUD-3d: 幅の走査の幅ごとの viewport の画像を置くディレクトリの名前の接頭辞（`<ビューポート>/stress-<幅>/viewport.png`）。
+ */
+export const STRESS_WIDTH_SCREENSHOT_DIRECTORY_PREFIX = 'stress-';
+
+/** AUD-3d の続き: 落ち着いた後の確かめ直しの段の viewport の画像を置くディレクトリの名前（`<ビューポート>/recheck/viewport.png`）。 */
+export const RECHECK_SCREENSHOT_DIRECTORY = 'recheck';
+
+/**
+ * AUD-4d: フォーカスしても隠れたままの要素で撮った、フォーカスを当てたままの viewport の画像のディレクトリの名前の接頭辞（`focus-<その時点の確かめの中の番号>`。
+ * 幅の走査の幅では `stress-<幅>/focus-<番号>`）。
+ */
+export const FOCUS_CHECK_SCREENSHOT_DIRECTORY_PREFIX = 'focus-';
+/**
+ * EV-2: 対象まで動かして撮った viewport の画像のディレクトリの名前の接頭辞（`reveal-<その時点の中の番号>`。幅の走査の幅では `stress-<幅>/reveal-<番号>`）。
+ */
+export const REVEAL_SCREENSHOT_DIRECTORY_PREFIX = 'reveal-';
+/** COV-4 の区切り 3: 見るだけの点検の操作で開いた状態の画像のディレクトリの名前の頭（`state-<番号>`。番号は 1 から）。 */
+export const OPENED_STATE_SCREENSHOT_DIRECTORY_PREFIX = 'state-';
+
 /** スクリーンショットのファイルの名前（撮り方ごと）。 */
 export const SCREENSHOT_FILE_NAMES = Object.freeze({
   VIEWPORT: 'viewport.png',
   FULL_PAGE: 'full-page.png',
 } as const satisfies Record<ScreenshotCaptureType, string>);
 
-/** 再開のための保存（チェックポイント）とロックを置く、Run のディレクトリの直下のディレクトリの名前（中断した Run の再開の設計書 4.1）。 */
+/** 再開のための保存（チェックポイント）を置く、Run のディレクトリの直下のディレクトリの名前（中断した Run の再開の設計書 4.1）。 */
 export const CHECKPOINT_ARTIFACT_DIRECTORY = 'checkpoint';
 
-/** `checkpoint/` の中のファイルの名前（状態の保存、1つ前の状態の保存、ロック。設計書 4.1、4.3、4.4）。 */
+/** `checkpoint/` の中のファイルの名前（状態の保存、1つ前の状態の保存。設計書 4.1、4.3）。 */
 export const CHECKPOINT_ARTIFACT_FILE_NAMES = Object.freeze({
   state: 'state.json',
   previousState: 'state.prev.json',
-  lock: 'run.lock',
 } as const);
 export type CheckpointArtifactFile = keyof typeof CHECKPOINT_ARTIFACT_FILE_NAMES;
 
@@ -299,40 +407,10 @@ export const CHECKPOINT_PAGES_ARTIFACT_DIRECTORY = `${CHECKPOINT_ARTIFACT_DIRECT
 /** ページの保存のファイルの名前の接尾辞（`<pageId>.json`）。 */
 const CHECKPOINT_PAGE_FILE_SUFFIX = '.json';
 
-/**
- * サイトの不調で止めたときの診断の記録を置く、Run のディレクトリの直下のディレクトリの名前（サイトの不調で止めたときの診断の記録の
- * 設計書 2.3）。`checkpoint/` の外なので、Run の終わりの片付け（`checkpoint/` の中だけを消す）で消えない。
- */
-export const DIAGNOSTICS_ARTIFACT_DIRECTORY = 'diagnostics';
-
-/**
- * 診断の記録のファイルの名前の接頭辞（`<接頭辞><pageId><区切り><実行の番号><区切り><試行の番号><接尾辞>`。
- * `site-unavailable-<pageId>-<実行の番号>-<試行の番号>.json`）。
- */
-const SITE_UNAVAILABLE_DIAGNOSTIC_FILE_PREFIX = 'site-unavailable-';
-/** 診断の記録のファイルの名前の、ページの ID と実行の番号と試行の番号の区切り。 */
-const SITE_UNAVAILABLE_DIAGNOSTIC_FILE_SEPARATOR = '-';
-/** 診断の記録のファイルの名前の接尾辞。 */
-const SITE_UNAVAILABLE_DIAGNOSTIC_FILE_SUFFIX = '.json';
-
 /** PREFLIGHT が出力先を確かめるために、Run のディレクトリの直下に作って消す一時ファイルの名前の接頭辞（`<接頭辞><UUID><接尾辞>`）。 */
 export const PREFLIGHT_TEMPORARY_FILE_PREFIX = '.beaksight-preflight-';
 /** PREFLIGHT の一時ファイルの名前の接尾辞。 */
 export const PREFLIGHT_TEMPORARY_FILE_SUFFIX = '.tmp';
-
-/**
- * 出力先ごとの開始のロックのファイルの名前（DEF-057。Task 24 の設計書 4.6）。出力先の直下に置き、Run の開始の段（実行中の Run の確かめ →
- * 再開する Run の選択 → Run のディレクトリとロックの作成）の間だけ、監査の中核（`src/cli/audit-run.ts`）が持つ。中身は Run のロックと同じ形
- * （`RunLock`）。作る・読む・消すのは `ArtifactWriter` である。
- * 名前は `.` で始まるファイルで、Run の ID の形（`isRunId`）でもディレクトリでもないので、Run のディレクトリの一覧（`listRunDirectories`、
- * `listCheckpointRunDirectories`）に入らない。
- */
-export const OUTPUT_START_LOCK_FILE_NAME = '.beaksight-run-start.lock';
-
-/** 出力先の開始のロックのファイルのパス（`<出力先>/<OUTPUT_START_LOCK_FILE_NAME>`。区切りは実行している環境のもの）。 */
-export function outputStartLockPath(outputDirectory: string): string {
-  return join(outputDirectory, OUTPUT_START_LOCK_FILE_NAME);
-}
 
 /** Run の artifact を置くディレクトリ（`<出力先の根>/<runId>`。区切りは実行している環境のもの）。 */
 export function runArtifactDirectory(outputDirectory: string, runId: RunId): string {
@@ -350,26 +428,6 @@ export const checkpointArtifactRelativePath = (file: CheckpointArtifactFile): st
 /** ページの保存の、Run のディレクトリからの相対パス（区切りは `/`。例: `checkpoint/pages/PAGE-000001.json`）。 */
 export const checkpointPageArtifactRelativePath = (pageId: PageId): string =>
   `${CHECKPOINT_PAGES_ARTIFACT_DIRECTORY}/${pageId}${CHECKPOINT_PAGE_FILE_SUFFIX}`;
-
-/**
- * サイトの不調で止めたときの診断の記録の、Run のディレクトリからの相対パス（区切りは `/`。例:
- * `diagnostics/site-unavailable-PAGE-000003-1-1.json`。サイトの不調で止めたときの診断の記録の設計書 2.3）。`executionNumber` は、その記録を
- * 書いた実行の番号（1から。再開した実行は、前の回の実行の数 + 1）。`attemptNumber` は、その実行の中でそのページを監査した試行の番号
- * （1から。捨てた後の確かめ直しの試行は 2〜5。サイトが応答しないときに Run を止める設計書 3.5.2、3.6.2）。ページと実行と試行ごとに1つで、
- * 同じページが別の実行や試行でまた止まっても、前の記録を置き換えない。
- * `executionNumber` か `attemptNumber` が正の安全な整数でない場合は、`RangeError` を投げる。
- */
-export function siteUnavailableDiagnosticRelativePath(pageId: PageId, executionNumber: number, attemptNumber: number): string {
-  if (!isPositiveSafeInteger(executionNumber)) {
-    throw new RangeError(`execution number must be a positive safe integer: ${String(executionNumber)}`);
-  }
-  if (!isPositiveSafeInteger(attemptNumber)) {
-    throw new RangeError(`attempt number must be a positive safe integer: ${String(attemptNumber)}`);
-  }
-  const fileName = [SITE_UNAVAILABLE_DIAGNOSTIC_FILE_PREFIX + pageId, executionNumber, attemptNumber]
-    .join(SITE_UNAVAILABLE_DIAGNOSTIC_FILE_SEPARATOR) + SITE_UNAVAILABLE_DIAGNOSTIC_FILE_SUFFIX;
-  return `${DIAGNOSTICS_ARTIFACT_DIRECTORY}/${fileName}`;
-}
 
 /**
  * `checkpoint/pages/` の中のファイルの名前が、ページの保存の名前（`<pageId>.json`。ページの ID は `isPageId` の形）なら、その
@@ -394,18 +452,58 @@ export const isPreflightTemporaryFileName = (fileName: string): boolean =>
  * 最終の試行（`retryAttempt` が `null`）は `pages/<pageId>/<ビューポート>/<ファイル名>`、再試行の前の試行は
  * `pages/<pageId>/retry-<retryAttempt>/<ビューポート>/<ファイル名>`（DEF-007）。
  * `retryAttempt` が正の安全な整数でも `null` でもない場合は、`RangeError` を投げる。
+ * AUD-3d: 幅の走査の幅の viewport の画像（`stressWidth` が正の安全な整数）は、ビューポートの下の `stress-<幅>/` に置く。落ち着いた後の確かめ直しの段の
+ * viewport の画像（`recheck` が真）は、ビューポートの下の `recheck/` に置く。どちらも `VIEWPORT` だけで、両方は指定できない。
+ * EV-2: 対象まで動かして撮った画像（`revealIndex`）は、`reveal-<番号>/` に置く（`VIEWPORT` だけ。確かめ直しとフォーカスの画像とは重ねない）。
+ * EV-5: 時間切れの後の再開で読み直したページの画像（`revisitIndex`）は、ページの下の `revisit-<番号>/` に置く（前の結果の画像を上書きしない）。
  */
 export function screenshotRelativePath(
   pageId: PageId,
   viewport: ViewportProfile,
   captureType: ScreenshotCaptureType,
   retryAttempt: number | null,
+  stressWidth: number | null = null,
+  recheck = false,
+  focusIndex: number | null = null,
+  openedStateIndex: number | null = null,
+  revealIndex: number | null = null,
+  revisitIndex: number | null = null,
 ): string {
+  if (revisitIndex !== null && !isPositiveSafeInteger(revisitIndex)) {
+    throw new RangeError(`revisit index must be a positive safe integer: ${String(revisitIndex)}`);
+  }
+  if (revealIndex !== null && (!isPositiveSafeInteger(revealIndex) || captureType !== 'VIEWPORT' || recheck || focusIndex !== null)) {
+    throw new RangeError(`a reveal screenshot must be a VIEWPORT capture of a positive safe integer index: ${String(revealIndex)}`);
+  }
+  if (openedStateIndex !== null && (!isPositiveSafeInteger(openedStateIndex) || captureType !== 'VIEWPORT' || stressWidth !== null)) {
+    throw new RangeError(`an opened state screenshot must be a VIEWPORT capture of a positive safe integer index: ${String(openedStateIndex)}`);
+  }
   if (retryAttempt !== null && !isPositiveSafeInteger(retryAttempt)) {
     throw new RangeError(`retry attempt must be a positive safe integer: ${String(retryAttempt)}`);
   }
+  if (stressWidth !== null && (!isPositiveSafeInteger(stressWidth) || captureType !== 'VIEWPORT' || recheck)) {
+    throw new RangeError(`a stress width screenshot must be a VIEWPORT capture of a positive safe integer width: ${String(stressWidth)}`);
+  }
+  if (recheck && (captureType !== 'VIEWPORT' || focusIndex !== null)) {
+    throw new RangeError('a recheck screenshot must be a VIEWPORT capture');
+  }
+  if (focusIndex !== null && (!isPositiveSafeInteger(focusIndex) || captureType !== 'VIEWPORT')) {
+    throw new RangeError(`a focus check screenshot must be a VIEWPORT capture of a positive safe integer index: ${String(focusIndex)}`);
+  }
   const retryDirectory = retryAttempt === null ? [] : [`${RETRY_ARTIFACT_DIRECTORY_PREFIX}${retryAttempt}`];
-  return [PAGES_ARTIFACT_DIRECTORY, pageId, ...retryDirectory, viewport, SCREENSHOT_FILE_NAMES[captureType]].join('/');
+  const stressDirectory = stressWidth === null ? [] : [`${STRESS_WIDTH_SCREENSHOT_DIRECTORY_PREFIX}${stressWidth}`];
+  const stageDirectory = recheck
+    ? [RECHECK_SCREENSHOT_DIRECTORY]
+    : focusIndex !== null
+      ? [`${FOCUS_CHECK_SCREENSHOT_DIRECTORY_PREFIX}${focusIndex}`]
+      : revealIndex === null ? [] : [`${REVEAL_SCREENSHOT_DIRECTORY_PREFIX}${revealIndex}`];
+  // COV-4 の区切り 3: 見るだけの点検の操作で開いた状態の画像（`state-<番号>`。その状態の確かめ直し・フォーカスの確かめの画像は、その下の `recheck`・`focus-<番号>`）。
+  const openedStateDirectory = openedStateIndex === null ? [] : [`${OPENED_STATE_SCREENSHOT_DIRECTORY_PREFIX}${openedStateIndex}`];
+  // EV-5: 読み直しの画像は、ページの下の `revisit-<番号>/`（その下は、ふだんと同じ並び）。
+  const revisitDirectory = revisitIndex === null ? [] : [`${REVISIT_ARTIFACT_DIRECTORY_PREFIX}${revisitIndex}`];
+  return [
+    PAGES_ARTIFACT_DIRECTORY, pageId, ...revisitDirectory, ...retryDirectory, viewport, ...stressDirectory, ...openedStateDirectory, ...stageDirectory, SCREENSHOT_FILE_NAMES[captureType],
+  ].join('/');
 }
 
 /**
@@ -442,6 +540,30 @@ export async function createRunArtifactDirectory(outputDirectory: string, runId:
     return Object.freeze({ ok: false, runDirectory, alreadyExists: errorCodeOf(error) === 'EEXIST', error });
   }
   return Object.freeze({ ok: true, runDirectory });
+}
+
+/** DEF-281: 同じ秒の Run の ID に足す連番の数（01〜99。2 桁）。 */
+const SAME_SECOND_RUN_ID_SUFFIXES = 99;
+/** DEF-281: 連番の桁の数。 */
+const SAME_SECOND_RUN_ID_SUFFIX_WIDTH = 2;
+
+/** `createRunArtifactDirectoryForStart` の結果（作った、または最後に試した Run の ID つき）。 */
+export type RunArtifactDirectoryStart = RunArtifactDirectoryCreation & { readonly runId: RunId };
+
+/**
+ * 新しい Run のディレクトリを、排他的に作る（DEF-009）。DEF-281: 開始の秒から作った `baseRunId` の名前がすでにあれば（同じ出力先で同じ秒に
+ * 始めた Run）、その後ろに 2 桁の連番（01〜99）を足した名前を順に試す（`RUN-` と数字だけなので `isRunId` とスキーマの pattern に合い、名前の順は
+ * 時刻の順のまま）。すでにある名前のほかの失敗は、そこで返す。99 まですべてあれば、最後に試した名前の失敗（`alreadyExists`）を返す。
+ * 作る処理そのものは `createRunArtifactDirectory`（排他。何も消さず、書き換えない）。
+ */
+export async function createRunArtifactDirectoryForStart(outputDirectory: string, baseRunId: RunId): Promise<RunArtifactDirectoryStart> {
+  let runId = baseRunId;
+  let created = await createRunArtifactDirectory(outputDirectory, runId);
+  for (let suffix = 1; !created.ok && created.alreadyExists && suffix <= SAME_SECOND_RUN_ID_SUFFIXES; suffix += 1) {
+    runId = `${baseRunId}${String(suffix).padStart(SAME_SECOND_RUN_ID_SUFFIX_WIDTH, '0')}` as RunId;
+    created = await createRunArtifactDirectory(outputDirectory, runId);
+  }
+  return Object.freeze({ ...created, runId });
 }
 
 /** `listRunDirectories` の1件（Run の ID と、Run のディレクトリ）。 */

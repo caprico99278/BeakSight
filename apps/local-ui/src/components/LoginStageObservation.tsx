@@ -65,7 +65,12 @@ export function LoginStageRegisterCell({ profileId, request, target, automatedLo
   const registration = loginStageRegistrationOf(request);
   const draft = observedDraftOfRegistration(registration);
   if (registration.kind === 'MANUAL' || draft === null) {
-    const guidance = registration.kind === 'MANUAL' && registration.reason === 'REDACTED_PATH' ? text.manualRedactedPath : text.manualAlreadyRegistered;
+    // DEF-194: 自動ログインの段で通した行と、削除・危ないことばで止めた行は、登録が要らないことだけを出す。
+    const guidance = registration.kind !== 'MANUAL'
+      ? text.manualAlreadyRegistered
+      : registration.reason === 'REDACTED_PATH'
+        ? text.manualRedactedPath
+        : registration.reason === 'NOT_NEEDED' ? text.manualNotNeeded : text.manualAlreadyRegistered;
     return <span className="muted" data-testid="job-login-stage-manual">{guidance}</span>;
   }
   return (

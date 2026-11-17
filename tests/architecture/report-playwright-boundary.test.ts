@@ -29,16 +29,16 @@ const playwrightChainsFrom = (files: ReadonlyMap<string, ScannedSource>, starts:
   findTransitiveForbiddenReferences(files, starts, () => false, (specifier) => PLAYWRIGHT_PACKAGE_PATTERN.test(specifier));
 
 describe('report Playwright boundary detector (BN-c fix)', () => {
-  it('reports a report file that reaches Playwright directly or through another module, and ignores type-only imports', () => {
+  // 型だけの import を飛ばすことは、`module-references.test.ts` の共通の補助（`findTransitiveForbiddenReferences`）の自己検査が確かめる。
+  it('reports a report file that reaches Playwright directly or through another module', () => {
     const files = new Map<string, ScannedSource>([
       ['src/report/direct.ts', scanSource("import { chromium } from 'playwright';")],
       ['src/report/indirect.ts', scanSource("import { isBlocked } from '../browser/errors.js';")],
       ['src/browser/errors.ts', scanSource("import { errors } from 'playwright-core';\nexport const isBlocked = () => errors;")],
-      ['src/report/types-only.ts', scanSource("import type { Page } from 'playwright';\nimport type { X } from '../browser/errors.js';")],
       ['src/report/clean.ts', scanSource("import { isBlockedByClientFailure } from '../core/blocked-by-client-failures.js';")],
       ['src/core/blocked-by-client-failures.ts', scanSource('export const isBlockedByClientFailure = () => true;')],
     ]);
-    expect(playwrightChainsFrom(files, ['src/report/direct.ts', 'src/report/indirect.ts', 'src/report/types-only.ts', 'src/report/clean.ts'])).toEqual([
+    expect(playwrightChainsFrom(files, ['src/report/direct.ts', 'src/report/indirect.ts', 'src/report/clean.ts'])).toEqual([
       'src/report/direct.ts -> playwright',
       'src/report/indirect.ts -> src/browser/errors.ts -> playwright-core',
     ]);

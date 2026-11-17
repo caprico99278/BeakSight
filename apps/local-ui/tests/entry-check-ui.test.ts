@@ -45,6 +45,7 @@ import { READ_METHODS } from '../../../tests/helpers/leak-places.js';
 import { writeAuthTargetConfig } from './helpers/auth-worker.ts';
 import { openAuthSetupAdvancedSettings } from './helpers/auth-setup-page.ts';
 import {
+  BUILT_SERVER_ENTRY,
   createTemporaryUiRoot,
   findFreePort,
   parseSetCookie,
@@ -204,7 +205,7 @@ beforeAll(async () => {
   root = createTemporaryUiRoot('built');
   site = await startEntryCheckSite();
   spaSite = await startSpaAuthSite();
-  ids = readServerFunctionIds(`${root.root}/apps/local-ui/dist/server/server.js`);
+  ids = readServerFunctionIds(BUILT_SERVER_ENTRY);
   browser = await launchHeadlessChromium();
   server = await startLauncher(root, await findFreePort());
   context = await browser.newContext();

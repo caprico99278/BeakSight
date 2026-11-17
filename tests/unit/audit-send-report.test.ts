@@ -33,7 +33,7 @@ const passingLedger = (): SafetyLedger => {
 };
 
 /** 知らせの文の、件数の前まで（出ていないことを確かめる）。 */
-const NOTICE_PREFIX = 'この監査では、ページが出す送信のうち削除のほかを通した';
+const NOTICE_PREFIX = AUDIT_SEND_TEXT.passedNotice('').split('（')[0]!;
 
 /** AS-c: ほかの Origin へ通した数と、通した WebSocket の接続の数も持つ。AS-c fix round 1: Guard の判定を通らずに開いた接続と危険な語の接続の数も持つ。 */
 const READ_ONLY_SUMMARY = {
@@ -105,7 +105,9 @@ describe('AS-b: the view model and the three surfaces', () => {
   it('marks PASS_EXCEPT_DELETE only as prominent in the display catalog', () => {
     expect(AUDIT_SEND_POLICY_CATALOG.PASS_EXCEPT_DELETE.prominent).toBe(true);
     expect(AUDIT_SEND_POLICY_CATALOG.READ_ONLY.prominent).toBe(false);
-    expect(notice).toBe('この点検では、ページが出す送信のうち削除のほかを通した（3件）');
+    // SD-3: 意味の確かめだけ（サイトの通信を止めなかったことと、件数）。
+    expect(notice).toContain('止めませんでした');
+    expect(notice).toContain('3件');
   });
 
   it('builds summary.auditSend once from run.json, reading a run without the item as READ_ONLY', () => {

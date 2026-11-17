@@ -3,7 +3,7 @@
  * - 形の作り方: 生の path から、`%XX` を変わらなくなるまで戻す（上限の回数まで）、連続した `/` をまとめる、各 segment の `;` から後を外す、
  *   `.` と `..` を解決する、を新しい形が出なくなるまで重ねる（読む範囲の形）。除外の比べの形は、さらに NFKC と大文字・小文字の畳み込みを重ね、
  *   小文字にする。戻せない `%`、形の数が上限を超えるときは `null`（fail-closed）。
- * - 表: Guard（`request-policy.ts` の `classifyPassiveRequest`）、認証の設定の保存の検証（`auth-setup-policy.ts` の登録した読み取りの手続きの
+ * - 表: 移る前の判定（SD-2 から。もと Guard。`request-policy.ts` の `isAuditExcludedUrl`）、認証の設定の保存の検証（`auth-setup-policy.ts` の登録した読み取りの手続きの
  *   呼び出しの path）、READ の確かめの画面の path の保存の検証（`read-check-policy.ts`）が、同じ入力で同じ判定をする（保存の検証を Guard と
  *   同じ形にそろえた。保存の検証は前より厳しくなりうる）。
  * 例の値は匿名の値（`example.invalid`）だけ。
@@ -24,7 +24,7 @@ import { validateAuthSetup } from '../../src/control/auth/auth-setup-policy.js';
 import { SITE_PROFILE_SCHEMA_VERSION, type SiteProfile, type ValidatedSiteProfile } from '../../src/control/contracts.js';
 import { validateSiteProfile, type ProfileValidationContext } from '../../src/control/profile-policy.js';
 import { validateReadCheckDefinition, type ReadCheckPageContext } from '../../src/control/read-check-policy.js';
-import { classifyPassiveRequest } from '../../src/safety/request-policy.js';
+import { isAuditExcludedUrl } from '../../src/safety/request-policy.js';
 import { createTestConfig } from '../helpers/test-config.js';
 
 const TEST_ORIGIN = 'https://app.example.invalid';
@@ -108,17 +108,11 @@ const setupWithRead = (path: string): AuthSetupV3 => ({
 });
 
 /**
- * Guard: 許可 Origin への読み取りが、監査の除外に当たるか。BN-0（設計書 `2026-10-23-beaksight-bundle-beaksight-block-noise-design.md` 3.0）から、監査の段の
- * Passive の Context の除外は文書の読み込みに当たる（ページが出す文書でない GET には当てない）ので、path の比べ方は main frame の文書の読み込みで確かめる。
+ * 移る前の判定（もと Guard）: 許可 Origin への URL が、監査の除外に当たるか。SD-2（設計書 `2026-11-16-beaksight-action-based-delete-guard-design.md` 2.4）から、
+ * 除外は要求の判定（Guard）では当てず、BeakSight 自身の移動の前の判定（`isAuditExcludedUrl`）が当てるので、path の比べ方はその判定で確かめる。
  */
-const guardExcludes = (path: string, auditPathPrefixes: readonly string[] = []): boolean => {
-  const decision = classifyPassiveRequest(
-    { kind: 'HTTP', method: 'GET', url: `${TEST_ORIGIN}${path}`, isNavigationRequest: true, isMainFrame: true, resourceType: 'document' },
-    new Set([TEST_ORIGIN]),
-    { auditExclusions: { excludedPathPrefixes: [EXCLUDED], auditPathPrefixes, dangerousTerms: DEFAULT_EXCLUDED_URL_WORDS } },
-  );
-  return decision.action === 'BLOCK' && decision.reason === 'AUDIT_EXCLUDED_URL';
-};
+const guardExcludes = (path: string, auditPathPrefixes: readonly string[] = []): boolean =>
+  isAuditExcludedUrl(`${TEST_ORIGIN}${path}`, new Set([TEST_ORIGIN]), { excludedPathPrefixes: [EXCLUDED], auditPathPrefixes, dangerousTerms: DEFAULT_EXCLUDED_URL_WORDS });
 
 /** 認証の設定の保存の検証: 登録した読み取りの手続きの呼び出しの path を、読まないパスか危険な語として拒むか。 */
 const authSetupExcludes = (path: string): boolean => {

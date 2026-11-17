@@ -1,0 +1,59 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8">
+    <title>Intended clipping fixture</title>
+    <style>
+      * { box-sizing: border-box; }
+      body { margin: 0; font-family: Arial, sans-serif; font-size: 16px; line-height: 20px; }
+      main { width: 380px; }
+      section { margin: 0 0 16px; }
+      /* AUD-4a: 2 行に絞る行数の省略。箱の高さは 2 行（40px）で、見える行は 2。 */
+      #clamp-two { width: 200px; margin: 0; display: -webkit-box; -webkit-box-orient: vertical; -webkit-line-clamp: 2; overflow: hidden; }
+      /* 2 行に絞るのに、箱の高さが 1.5 行（30px）。行の途中で切れる。 */
+      #clamp-half { width: 200px; margin: 0; display: -webkit-box; -webkit-box-orient: vertical; -webkit-line-clamp: 2; overflow: hidden; max-height: 30px; }
+      /* 折り返さない 1 行を、ellipsis で横に省略する。 */
+      #ellipsis-line { width: 120px; margin: 0; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+      /* 折り返さない 1 行を、ellipsis なしで横に切る。 */
+      #nowrap-cut { width: 120px; margin: 0; white-space: nowrap; overflow: hidden; }
+      /* 閉じた折りたたみ。1.5 行だけ見せる（ボタンの aria-controls がこの要素を指す）。 */
+      #collapsed-panel { width: 200px; height: 30px; margin: 0; overflow: hidden; }
+      /* 閉じた折りたたみの中の要素（ボタンの aria-controls が祖先を指す）。 */
+      #collapsed-inner { width: 200px; height: 30px; margin: 0; overflow: hidden; }
+      /* 開いた折りたたみの中で切れる箱（aria-expanded="true" は閉じた折りたたみではない）。 */
+      #open-panel-cut { width: 200px; height: 30px; margin: 0; overflow: hidden; }
+    </style>
+  </head>
+  <body>
+    <main>
+      <section>
+        <p id="clamp-two">First line of the clamped text goes on. Second line of the clamped text goes on. Third line is hidden by the clamp. Fourth line is hidden too.</p>
+      </section>
+      <section>
+        <p id="clamp-half">First line of the clamped text goes on. Second line of the clamped text goes on. Third line is hidden by the clamp. Fourth line is hidden too.</p>
+      </section>
+      <section>
+        <p id="ellipsis-line">A single line that is shortened with an ellipsis</p>
+      </section>
+      <section>
+        <p id="nowrap-cut">A single line that is cut without an ellipsis</p>
+      </section>
+      <section>
+        <button type="button" aria-expanded="false" aria-controls="collapsed-panel">More</button>
+        <p id="collapsed-panel">First line of the collapsed panel goes on. Second line of the collapsed panel goes on. Third line of the collapsed panel.</p>
+      </section>
+      <section>
+        <button type="button" aria-expanded="false" aria-controls="unrelated collapsed-outer">More</button>
+        <div id="collapsed-outer">
+          <p id="collapsed-inner">First line of the collapsed inner text goes on. Second line of the collapsed inner text goes on. Third line.</p>
+        </div>
+      </section>
+      <section>
+        <button type="button" aria-expanded="true" aria-controls="open-panel">Less</button>
+        <div id="open-panel">
+          <p id="open-panel-cut">First line of the open panel text goes on. Second line of the open panel text goes on. Third line.</p>
+        </div>
+      </section>
+    </main>
+  </body>
+</html>

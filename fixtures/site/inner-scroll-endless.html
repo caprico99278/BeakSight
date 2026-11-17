@@ -1,0 +1,42 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <title>Inner scroll endless fixture</title>
+  <style>
+    /* DEF-207: 文書は動かず、本文の入れ物だけが縦に動く。入れ物の下の方まで動かすたびに中身を足し続ける（止まらない）。 */
+    html { height: 100%; overflow: hidden; }
+    body { height: 100%; margin: 0; overflow: hidden; font-family: sans-serif; }
+    #app-shell { box-sizing: border-box; height: 100%; overflow-y: auto; }
+    #app-shell > section { box-sizing: border-box; min-height: 700px; padding: 24px; }
+  </style>
+</head>
+<body>
+  <div id="app-shell">
+    <section><h1>Inner scroll endless fixture</h1></section>
+    <section><p>Content that keeps growing while the container scrolls.</p></section>
+  </div>
+  <script>
+    (() => {
+      const shell = document.querySelector('#app-shell');
+      let batches = 0;
+      let pending = false;
+      const appendNearBottom = () => {
+        if (pending) return;
+        const remaining = shell.scrollHeight - (shell.scrollTop + shell.clientHeight);
+        if (remaining > 180) return;
+        pending = true;
+        setTimeout(() => {
+          batches += 1;
+          const batch = document.createElement('section');
+          batch.dataset.endlessBatch = String(batches);
+          batch.textContent = `Endless batch ${batches}`;
+          shell.append(batch);
+          pending = false;
+        }, 10);
+      };
+      shell.addEventListener('scroll', appendNearBottom, { passive: true });
+    })();
+  </script>
+</body>
+</html>

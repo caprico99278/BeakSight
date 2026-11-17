@@ -4,11 +4,15 @@
 // - 危険な語の一覧（`DEFAULT_EXCLUDED_URL_WORDS`）の定義は `src/core/`（値は変えない。LG-4F で認証の設定の契約からの公開し直しを捨てた）。
 // - factory へ渡す口の組み立て（`auditSendOptionsOf`）は `src/orchestration/` の 1 か所。`PASS_EXCEPT_DELETE` のときだけ口を作る。
 // - 再開の比べは、読み替えずに行う（LG-4: 項目を持たない古い途中の Run は `CONFIG_DIFFERS`）。
+import { readFileSync } from 'node:fs';
 import { mkdtemp, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
-import { join } from 'node:path';
+import { join, resolve } from 'node:path';
 import { afterEach, describe, expect, it } from 'vitest';
 import { DEFAULT_CONFIG } from '../../src/config/defaults.js';
+import { WRITE_AUDIT_MODE } from '../../src/control/contracts.js';
+import { profileOperationRejectionOf } from '../../src/control/execution-policy.js';
+import { WORKER_JOB_KINDS_ACCEPTING_AUDIT_SEND_POLICY } from '../../src/control/worker-protocol.js';
 import { loadConfig } from '../../src/config/load-config.js';
 import { validateConfig } from '../../src/config/validate-config.js';
 import {
@@ -64,7 +68,7 @@ describe('AS-b: the values of the audit send policy', () => {
     expect(AUDIT_SEND_READ_ONLY).toBe('READ_ONLY');
     expect(AUDIT_SEND_PASS_EXCEPT_DELETE).toBe('PASS_EXCEPT_DELETE');
     expect(DEFAULT_AUDIT_SEND_POLICY).toBe(AUDIT_SEND_READ_ONLY);
-    // OP-I（I1。設計書 `2026-10-27-beaksight-one-pass-flow-design.md` 4.1.5）: サイト（プロファイル）の既定は、削除のほかを通す。項目のない設定・記録の
+    // OP-I（I1。設計書 `2026-10-27-beaksight-one-pass-flow-design.md` 4.1.5）: サイト（プロファイル）の既定は、サイトの通信を止めない。項目のない設定・記録の
     // 読み方と、設定ファイルの既定（上の `DEFAULT_AUDIT_SEND_POLICY`）は、読み取りだけのまま。
     expect(DEFAULT_SITE_AUDIT_SEND_POLICY).toBe(AUDIT_SEND_PASS_EXCEPT_DELETE);
     expect(GUARD_PASS_EXCEPT_DELETE).toBe(AUDIT_SEND_PASS_EXCEPT_DELETE);
@@ -84,8 +88,9 @@ describe('AS-b: the values of the audit send policy', () => {
 });
 
 describe('AS-b: audit.sendPolicy in the configuration file', () => {
-  it('defaults to READ_ONLY', () => {
-    expect(DEFAULT_CONFIG.audit.sendPolicy).toBe('READ_ONLY');
+  // L14（設計書 `2026-11-09-beaksight-remove-limits-design.md` 5 の 2）: 設定ファイルの既定は、サイトの通信を止めない（項目のない記録の読み方は READ_ONLY のまま）。
+  it('defaults to PASS_EXCEPT_DELETE', () => {
+    expect(DEFAULT_CONFIG.audit.sendPolicy).toBe('PASS_EXCEPT_DELETE');
   });
 
   it('accepts the listed values and rejects any other value', () => {
@@ -100,7 +105,8 @@ describe('AS-b: audit.sendPolicy in the configuration file', () => {
     }
   });
 
-  it('reads the value of the file, READ_ONLY when the file does not have it, and applies an override', async () => {
+  // L14: 項目のないファイルは、設定ファイルの既定（PASS_EXCEPT_DELETE）で読む。
+  it('reads the value of the file, PASS_EXCEPT_DELETE when the file does not have it, and applies an override', async () => {
     const directory = await mkdtemp(join(tmpdir(), 'beaksight-audit-send-config-'));
     temporaryDirectories.push(directory);
     const write = async (name: string, audit: Record<string, unknown> | null): Promise<string> => {
@@ -112,10 +118,10 @@ describe('AS-b: audit.sendPolicy in the configuration file', () => {
       }), 'utf8');
       return path;
     };
-    expect((await loadConfig(await write('plain', null))).audit.sendPolicy).toBe('READ_ONLY');
-    expect((await loadConfig(await write('passing', { sendPolicy: 'PASS_EXCEPT_DELETE' }))).audit.sendPolicy).toBe('PASS_EXCEPT_DELETE');
-    const overridden = await loadConfig(await write('overridden', null), { audit: { sendPolicy: 'PASS_EXCEPT_DELETE' } });
-    expect(overridden.audit).toEqual({ ...DEFAULT_CONFIG.audit, sendPolicy: 'PASS_EXCEPT_DELETE' });
+    expect((await loadConfig(await write('plain', null))).audit.sendPolicy).toBe('PASS_EXCEPT_DELETE');
+    expect((await loadConfig(await write('reading', { sendPolicy: 'READ_ONLY' }))).audit.sendPolicy).toBe('READ_ONLY');
+    const overridden = await loadConfig(await write('overridden', null), { audit: { sendPolicy: 'READ_ONLY' } });
+    expect(overridden.audit).toEqual({ ...DEFAULT_CONFIG.audit, sendPolicy: 'READ_ONLY' });
     await expect(loadConfig(await write('broken', { sendPolicy: 'PASS_ALL' }))).rejects.toMatchObject({ kind: 'CONFIG_INVALID' });
   });
 
@@ -190,5 +196,22 @@ describe('AS-b: the resume comparison compares audit.sendPolicy, and does not re
     const saved = withEffectiveConfig(checkpoint, passing);
     expect(selectRunToResume([candidateOf(saved)], passing)).toMatchObject({ kind: 'RESUME' });
     expect(selectRunToResume([candidateOf(saved)], readOnly)).toMatchObject({ kind: 'CONFIG_DIFFERS', differences: ['audit.sendPolicy'] });
+  });
+});
+
+// MI-5（設計書 `2026-10-26-beaksight-minimal-input-ux-design.md` 4.5）: 書き込みのモードのプロファイルでも監査を始められ、監査の段の送信の扱いはジョブの種類と保存した
+// 設定で決まり、モードを見ない。SLIM W-3: 本物のワーカーで書き込みのモードの監査を流す結合（`write-mode-audit-read-only.test.ts`）から置き換えた（READ_ONLY の
+// 止め方は安全の一覧の `guard-audit-stage.test.ts`、監査の段でサイトの通信を止めないことは、ずれの確かめ
+// `pass-through-paths.test.ts` のサーバの記録が確かめる）。
+describe('MI-5: the send policy of the audit stage does not look at the profile mode', () => {
+  const START_PROPERTIES = Object.keys((JSON.parse(readFileSync(resolve(process.cwd(), 'schemas', 'control', 'worker-message.schema.json'), 'utf8')) as {
+    readonly $defs: { readonly start: { readonly properties: Record<string, unknown> } };
+  }).$defs.start.properties);
+
+  it('starts an audit in the write mode, and gives the worker the send policy by the job kind without the mode', () => {
+    expect(profileOperationRejectionOf('AUDIT', WRITE_AUDIT_MODE, 'MANUAL_SESSION')).toBeNull();
+    expect(WORKER_JOB_KINDS_ACCEPTING_AUDIT_SEND_POLICY).toContain('AUDIT');
+    expect(START_PROPERTIES).toContain('auditSendPolicy');
+    expect(START_PROPERTIES.filter((name) => /mode/iu.test(name))).toEqual([]);
   });
 });

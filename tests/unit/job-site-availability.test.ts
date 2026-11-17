@@ -83,6 +83,7 @@ const recordingPacer = () => {
   const raised: number[] = [];
   const pacer: NavigationPacer = {
     beforeNavigation: () => Promise.resolve(0),
+    waitUntilNextNavigationDue: () => Promise.resolve(0),
     snapshot: () => { throw new Error('not used'); },
     raiseMinimumInterval: (ms) => { raised.push(ms); },
     recordDocumentRequestSent: () => undefined,

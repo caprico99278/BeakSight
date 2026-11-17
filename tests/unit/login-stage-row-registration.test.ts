@@ -8,7 +8,6 @@
 import { describe, expect, it } from 'vitest';
 import {
   AUTH_SETUP_SCHEMA_VERSION_3,
-  MAX_LOGIN_SIDE_REQUESTS,
   MAX_LOGIN_SIDE_REQUESTS_PER_LOGIN_STAGE,
   type AuthSetupV3,
 } from '../../src/control/auth/auth-setup-contracts.js';
@@ -126,9 +125,10 @@ describe('FM-1: registering one row of the login stage table on the spot', () =>
     expect(of(formSetup, tokenRow(), outside)).toEqual({ ok: false, reason: 'NO_STORAGE_KEY' });
     const full: AuthSetupV3 = {
       ...scriptSetup,
-      loginSideRequests: Array.from({ length: MAX_LOGIN_SIDE_REQUESTS }, (_, index) => ({ origin: SERVICE_ORIGIN, path: `/v1/side${String(index)}`, method: 'POST' as const, maxPerLoginStage: 1 })),
+      loginSideRequests: Array.from({ length: 8 }, (_, index) => ({ origin: SERVICE_ORIGIN, path: `/v1/side${String(index)}`, method: 'POST' as const, maxPerLoginStage: 1 })),
     };
-    expect(of(full, row('/v1/after'))).toEqual({ ok: false, reason: 'SIDE_REQUEST_LIMIT' });
+    // L11（設計書 `2026-11-09-beaksight-remove-limits-design.md` 4）で直した: ログインに伴う送信の件数の上限は撤廃した（前は `SIDE_REQUEST_LIMIT` で断った）。
+    expect(of(full, row('/v1/after')).ok).toBe(true);
     expect(of(full, row('/v1/side0'))).toEqual({ ok: false, reason: 'ALREADY_REGISTERED' });
   });
 });

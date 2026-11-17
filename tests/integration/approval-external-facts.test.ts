@@ -152,4 +152,23 @@ describe('approval external facts (T28R-fix-1, I-1)', () => {
     rmSync(join(repositoryRoot, TEST_TARGET_PATH));
     expect(await approvalExternalFactsOf(storedProfile(), deps())).toBeNull();
   });
+
+  // NL-1（設計書 `2026-11-06-beaksight-no-login-test-site-design.md` 3.1 の 5）: ログインのない方式（`auth: NONE`）のプロファイルは、残っている認証の設定
+  // （ログインを使う方式から変えた後の残り）があっても、認証の設定の digest を null にする（残りを承認に混ぜない）。ターゲットの設定の digest は今までどおり。
+  it('gives a null auth setup digest for a profile without login, even when an auth setup remains', async () => {
+    recordEvent('CREATED', '20261012000100', 1);
+    credentialRevision = 1;
+    const withLogin = await approvalExternalFactsOf(storedProfile(), deps());
+    expect(withLogin?.authSetupDigest).toEqual(expect.any(String));
+    const stored = storedProfile();
+    const noLogin: StoredProfile = { ...stored, profile: { ...stored.profile, auth: 'NONE' } };
+    const facts = await approvalExternalFactsOf(noLogin, deps());
+    expect(facts).toEqual({ authSetupDigest: null, targetConfigDigest: withLogin?.targetConfigDigest });
+    // 資格情報のメタデータを読めなくても、ログインのない方式は資格情報を縛らない。
+    metadataReadable = false;
+    expect(await approvalExternalFactsOf(noLogin, deps())).toEqual({ authSetupDigest: null, targetConfigDigest: withLogin?.targetConfigDigest });
+    // ターゲットの設定を読めなければ、今までどおり null（fail-closed）。
+    rmSync(join(repositoryRoot, TEST_TARGET_PATH));
+    expect(await approvalExternalFactsOf(noLogin, deps())).toBeNull();
+  });
 });

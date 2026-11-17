@@ -25,7 +25,6 @@ import {
   type AutomatedLoginSubmission,
 } from '../auth/automated-login-results.js';
 import { canonicalHttpOriginOf } from '../../crawl/normalize-url.js';
-import { MAX_LOGIN_SIDE_REQUESTS } from '../auth/auth-setup-contracts.js';
 import { MIN_PROFILE_REVISION } from '../contracts.js';
 import { MANUAL_LOGIN_REGISTRATION_SKIP_REASONS } from '../manual-login-registration.js';
 import type { ControlDatabase } from '../store/control-database.js';
@@ -58,8 +57,6 @@ import {
   AUDIT_JOB_FAILURE_REASONS,
   AUDIT_JOB_KINDS,
   AUDIT_JOB_STATES,
-  MAX_LOGIN_STAGE_SUMMARY_LENGTH,
-  MAX_SESSION_LOSS_RECORD_LENGTH,
   WRITE_REPORT_CHECKS,
   type AuditJobFailureReason,
   type AuditJobKind,
@@ -234,9 +231,6 @@ export const AUDIT_JOB_AUTOMATED_LOGIN_UNAVAILABLE_REASONS = Object.freeze([
 ] as const);
 export type AuditJobAutomatedLoginUnavailableReason = (typeof AUDIT_JOB_AUTOMATED_LOGIN_UNAVAILABLE_REASONS)[number];
 
-/** 足した Origin の数の上限（token の送信先と、ログインに伴う送信の上限の和）。 */
-const MAX_AUTO_REGISTRATION_ADDED_ORIGINS = 1 + MAX_LOGIN_SIDE_REQUESTS;
-
 /** 自動の登録の結果として書ける・読める値か（閉じた形）。 */
 const isAutoRegistration = (value: unknown): value is AuditJobLoginAutoRegistration => {
   if (!isRecord(value)) {
@@ -264,32 +258,10 @@ const isAutoRegistration = (value: unknown): value is AuditJobLoginAutoRegistrat
   const { profileRevision, addedServiceOrigins } = value;
   return value['result'] === 'SAVED' && keys.length === 3 + switchKey
     && typeof profileRevision === 'number' && Number.isSafeInteger(profileRevision) && profileRevision > MIN_PROFILE_REVISION
-    && Array.isArray(addedServiceOrigins) && addedServiceOrigins.length <= MAX_AUTO_REGISTRATION_ADDED_ORIGINS
+    // L11（設計書 `2026-11-09-beaksight-remove-limits-design.md` 4）: 足した Origin の数の上限は撤廃した（ログインに伴う送信の件数の上限をなくしたため）。
+    && Array.isArray(addedServiceOrigins)
     && new Set(addedServiceOrigins).size === addedServiceOrigins.length
     && addedServiceOrigins.every((origin) => typeof origin === 'string' && canonicalHttpOriginOf(origin) === origin);
-};
-
-/**
- * T43R-fix の M-5: まとめを、管理データの大きさの上限に収める。JSON（escape を含めた全体）の長さが上限を超えるときは、観察（鍵の名前の案、セレクタの案）と
- * 行の query の名前を落とし、省いた印を付ける（数のまとめと、行の Origin・path・種類・理由・回数は残す）。それでも超えるときは、そのまま返す（書く口が誤りにする）。
- */
-export const fittedLoginStageSummary = (summary: AuditJobLoginStageSummary): AuditJobLoginStageSummary => {
-  if (JSON.stringify(summary).length <= MAX_LOGIN_STAGE_SUMMARY_LENGTH) {
-    return summary;
-  }
-  // DEF-139: 状態の名前の記録も、観察と一緒に落とす（省いた印は同じ）。
-  const { observation: _observation, stateNames: _stateNames, ...rest } = summary;
-  return {
-    ...rest,
-    blockedRequests: summary.blockedRequests === null
-      ? null
-      : { ...summary.blockedRequests, requests: summary.blockedRequests.requests.map(({ query: _query, ...row }) => row) },
-    // ML-a: 通した送信の一覧も、行の query の名前を落とす。
-    ...(summary.passedRequests === undefined
-      ? {}
-      : { passedRequests: { ...summary.passedRequests, requests: summary.passedRequests.requests.map(({ query: _query, ...row }) => row) } }),
-    observationOmitted: true,
-  };
 };
 
 /** 作るジョブ（`STARTING`）。 */
@@ -754,26 +726,25 @@ export const recordNotice = (database: ControlDatabase, jobId: string, notice: W
  * 最後の認証の状態を記録する（T25d）。止まったページの URL は、`SESSION_LOST` のときだけ渡す（`null` なら、前の値を残す）。終わっていない
  * 行だけ。値と秘密は受けない（契約の `AUTH_STATE` を検証してから呼ぶ）。
  * T34e: ログインの段のまとめ（`loginStage`）があれば、同じトランザクションの中で、まだ記録のない行にだけ書く（1 回だけ。後の状態は書き換えない）。
- * 閉じた形でない値と、大きさの上限を超える値は、呼び出し側の誤り（`RangeError`）。
+ * 閉じた形でない値は、呼び出し側の誤り（`RangeError`）。URL-LEN（管理データの版 20）: 大きさの上限（前はまとめ 32,768・証拠 65,536。超えるまとめは観察と
+ * query の名前を落とした）はない。まとめと証拠は、そのまま書く。
  */
 export const recordAuthState = (
   database: ControlDatabase,
   jobId: string,
   state: WorkerAuthState,
   sessionLostUrl: string | null,
-  received: AuditJobLoginStageSummary | null = null,
+  loginStage: AuditJobLoginStageSummary | null = null,
   sessionLoss: SessionLossEvidence | null = null,
 ): boolean => {
-  // T43R-fix の M-5: 上限を超えるまとめは、観察と query の名前を落として収める（RangeError で落とさない）。
-  const loginStage = received === null ? null : fittedLoginStageSummary(received);
   const summary = loginStage === null ? null : JSON.stringify(loginStage);
-  if (loginStage !== null && (!isLoginStageSummary(loginStage) || (summary ?? '').length > MAX_LOGIN_STAGE_SUMMARY_LENGTH)) {
-    throw new RangeError('the login stage summary must be a closed login stage summary within the size limit');
+  if (loginStage !== null && !isLoginStageSummary(loginStage)) {
+    throw new RangeError('the login stage summary must be a closed login stage summary');
   }
-  // DEF-138: セッションの切れの証拠は、`SESSION_LOST` の閉じた形で、大きさの上限までのものだけ（呼び出し側が契約を確かめてから渡す）。
+  // DEF-138: セッションの切れの証拠は、`SESSION_LOST` の閉じた形のものだけ（呼び出し側が契約を確かめてから渡す）。
   const loss = sessionLoss === null ? null : JSON.stringify(sessionLoss);
-  if (sessionLoss !== null && (state !== WORKER_SESSION_LOST_STATE || !isSessionLossRecord(sessionLoss) || (loss ?? '').length > MAX_SESSION_LOSS_RECORD_LENGTH)) {
-    throw new RangeError('the session loss evidence must be a closed session loss evidence of SESSION_LOST within the size limit');
+  if (sessionLoss !== null && (state !== WORKER_SESSION_LOST_STATE || !isSessionLossRecord(sessionLoss))) {
+    throw new RangeError('the session loss evidence must be a closed session loss evidence of SESSION_LOST');
   }
   return withWriteTransaction(database, (connection) => {
     const changed = changedOne(connection.prepare(UPDATE_AUTH_STATE_SQL).run(state, sessionLostUrl, jobId, ACTIVE_STATES_JSON).changes);
@@ -806,11 +777,10 @@ export const recordLoginStageAutoRegistration = (
     return false;
   }
   const next: AuditJobLoginStageSummary = { ...current, autoRegistration: registration };
-  const text = JSON.stringify(next);
-  if (!isLoginStageSummary(next) || text.length > MAX_LOGIN_STAGE_SUMMARY_LENGTH) {
+  if (!isLoginStageSummary(next)) {
     return false;
   }
-  return changedOne(connection.prepare(UPDATE_LOGIN_STAGE_REGISTRATION_SQL).run(text, jobId, row.login_stage_summary).changes);
+  return changedOne(connection.prepare(UPDATE_LOGIN_STAGE_REGISTRATION_SQL).run(JSON.stringify(next), jobId, row.login_stage_summary).changes);
 });
 
 /** 生きている合図の時刻を記録する。終わっていない行だけ。 */

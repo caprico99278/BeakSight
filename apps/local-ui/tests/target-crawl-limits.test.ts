@@ -14,7 +14,6 @@ import { afterEach, describe, expect, it } from 'vitest';
 import { DEFAULT_CONFIG } from '../../../src/config/defaults.js';
 import { loadConfig, targetConfigWithDefaultsOf } from '../../../src/config/load-config.js';
 import { validateConfig } from '../../../src/config/validate-config.js';
-import { MAX_CRAWL_MAX_PAGES } from '../../../src/core/limits.js';
 import {
   isEditableTargetConfigPath,
   prepareTargetCrawlLimitsChange,
@@ -43,7 +42,8 @@ afterEach(() => {
 const PATH = 'local/targets/limits-test.json';
 const PUBLIC_ORIGIN = 'https://example.test';
 const LOOPBACK_ORIGIN = 'http://127.0.0.1:9';
-const LIMITS = Object.freeze({ maxPages: 3, maxRuntimeMs: 3_600_000, minNavigationIntervalMs: 10_000 });
+// L14: ページの上限 3・時間の上限 1 時間は前の既定（読むときに「選んでいない」とみなす）なので、利用者が選んだ値として別の値を使う。
+const LIMITS = Object.freeze({ maxPages: 4, maxRuntimeMs: 1_200_000, minNavigationIntervalMs: 10_000 });
 
 /** 設定のファイルの中身（ほかの項目も持つ。変えないことを確かめる）。 */
 const contentOf = (origin: string, crawl: Readonly<Record<string, unknown>> = LIMITS): string => `${JSON.stringify({
@@ -63,16 +63,10 @@ describe('T44d: reading the limits of the target configuration', () => {
     expect(readTargetCrawlLimits(contentOf(LOOPBACK_ORIGIN))).toMatchObject({ ok: true, limits: LIMITS, minNavigationIntervalFloorMs: 0 });
   });
 
-  it('reads the default values for a file without the crawl values (the same merge as loadConfig)', () => {
+  it('reads a file without the crawl values as no page limit and no time limit (the same merge as loadConfig)', () => {
     const content = `${JSON.stringify({ target: { id: 'limits-test' }, site: { startUrl: `${PUBLIC_ORIGIN}/`, allowedOrigins: [PUBLIC_ORIGIN] } })}\n`;
-    expect(readTargetCrawlLimits(content)).toMatchObject({
-      ok: true,
-      limits: {
-        maxPages: DEFAULT_CONFIG.crawl.maxPages,
-        maxRuntimeMs: DEFAULT_CONFIG.crawl.maxRuntimeMs,
-        minNavigationIntervalMs: DEFAULT_CONFIG.crawl.minNavigationIntervalMs,
-      },
-    });
+    const reading = readTargetCrawlLimits(content);
+    expect(reading.ok && reading.limits).toEqual({ minNavigationIntervalMs: DEFAULT_CONFIG.crawl.minNavigationIntervalMs });
   });
 
   it('does not read a file that is not valid JSON or does not pass validateConfig', () => {
@@ -101,6 +95,21 @@ describe('T44d: preparing the change of the limits', () => {
     expect((await loadConfig(join(root, PATH))).crawl).toMatchObject(after);
   });
 
+  it('removes the page limit and the time limit from the file when the user leaves them empty (no limit)', async () => {
+    const prepared = prepareTargetCrawlLimitsChange(contentOf(PUBLIC_ORIGIN), { minNavigationIntervalMs: 10_000 });
+    expect(prepared).toMatchObject({ ok: true, before: LIMITS, after: { minNavigationIntervalMs: 10_000 } });
+    if (!prepared.ok) {
+      return;
+    }
+    const crawl = (JSON.parse(prepared.content) as Record<string, Record<string, unknown>>)['crawl'];
+    expect(Object.hasOwn(crawl ?? {}, 'maxPages') || Object.hasOwn(crawl ?? {}, 'maxRuntimeMs')).toBe(false);
+    const root = temporaryRoot();
+    mkdirSync(join(root, 'local/targets'), { recursive: true });
+    writeFileSync(join(root, PATH), prepared.content, 'utf8');
+    const loaded = await loadConfig(join(root, PATH));
+    expect([loaded.crawl.maxPages, loaded.crawl.maxRuntimeMs]).toEqual([undefined, undefined]);
+  });
+
   it('rejects the values outside the range of validateConfig, by field', () => {
     const content = contentOf(PUBLIC_ORIGIN);
     expect(prepareTargetCrawlLimitsChange(content, { maxPages: 0, maxRuntimeMs: 1.5, minNavigationIntervalMs: -1 })).toEqual({
@@ -116,13 +125,8 @@ describe('T44d: preparing the change of the limits', () => {
       ok: false,
       problems: [{ field: 'maxPages', code: 'NOT_POSITIVE_INTEGER' }],
     });
-    // T44R（Task 44 のレビューの M-3）: ページの上限は、`validateConfig` と同じ上限（`MAX_CRAWL_MAX_PAGES`）を超えられない。上限そのものは受ける。
-    expect(prepareTargetCrawlLimitsChange(content, { ...LIMITS, maxPages: MAX_CRAWL_MAX_PAGES + 1 })).toEqual({
-      ok: false,
-      reason: 'CRAWL_LIMITS_INVALID',
-      problems: [{ field: 'maxPages', code: 'ABOVE_MAX_PAGES' }],
-    });
-    expect(prepareTargetCrawlLimitsChange(content, { ...LIMITS, maxPages: MAX_CRAWL_MAX_PAGES }).ok).toBe(true);
+    // LZ-3a: ページの上限の上限（前は 100,000）は撤廃した（`validateConfig` と同じく、正の整数をそのまま受ける）。
+    expect(prepareTargetCrawlLimitsChange(content, { ...LIMITS, maxPages: 100_001 }).ok).toBe(true);
   });
 
   it('does not make the navigation interval shorter than the current floor (1 s for a non-loopback origin)', () => {

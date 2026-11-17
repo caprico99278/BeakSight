@@ -17,6 +17,8 @@
 import { DEFAULT_SITE_AUDIT_SEND_POLICY, isAuditSendPolicyName, type AuditSendPolicyName } from '../../core/audit-send-policy.js';
 import { isRecord } from '../../core/guards.js';
 import { deepFreeze } from '../../core/immutable.js';
+import { MAX_PROFILE_DISPLAY_NAME_LENGTH } from '../../core/limits.js';
+import { hasControlOrLineSeparator } from '../../core/text.js';
 import { formatCompactUtcTimestamp } from '../../core/utc-timestamp.js';
 import {
   MIN_PROFILE_REVISION,
@@ -586,5 +588,76 @@ export const saveProfileDisplaySettings = (
     }
     const row = connection.prepare(SELECT_DISPLAY_SETTINGS_SQL).get(profileId) as { readonly show_job_browser: number; readonly audit_send_policy: unknown };
     return Object.freeze({ ok: true, settings: displaySettingsOfRow(row) } as const);
+  });
+};
+
+// ---------------------------------------------------------------------------------------------------------------
+// DN-1（設計書 `2026-11-16-beaksight-profile-display-name-design.md` 2 章）: サイトの画面に出す名前（管理データの版 22 の `profile_display_settings.display_name`）。
+// 見分けの印（プロファイルの ID）とは別に持ち、書いても、プロファイルの文書・改訂・承認・ログインの設定と、表示の設定のほかの値を変えない。
+// 名前がないときに何を出すかは、画面の 1 か所（`apps/local-ui/src/display/site-name.ts` の `siteNameOf`）が決める。
+// ---------------------------------------------------------------------------------------------------------------
+
+/** 画面に出す名前の保存が拒む理由（閉じた一覧）。 */
+export const PROFILE_DISPLAY_NAME_REJECTION_REASONS = Object.freeze([
+  'PROFILE_NOT_FOUND',
+  'DISPLAY_NAME_EMPTY',
+  'DISPLAY_NAME_TOO_LONG',
+  'DISPLAY_NAME_CONTROL_CHARACTER',
+] as const);
+export type ProfileDisplayNameRejectionReason = (typeof PROFILE_DISPLAY_NAME_REJECTION_REASONS)[number];
+
+/** 画面に出す名前の保存の結果（保存できたら、保存した名前）。 */
+export type ProfileDisplayNameSaveResult =
+  | { readonly ok: true; readonly displayName: string }
+  | { readonly ok: false; readonly reason: ProfileDisplayNameRejectionReason };
+
+const SELECT_DISPLAY_NAMES_SQL = 'SELECT profile_id, display_name FROM profile_display_settings WHERE display_name IS NOT NULL';
+/** 行がなければ、表示の設定はサイトの既定で作る（読むときの既定と同じ値）。行があれば、名前だけを替える。 */
+const UPSERT_DISPLAY_NAME_SQL = `INSERT INTO profile_display_settings (profile_id, show_job_browser, audit_send_policy, updated_at, display_name)
+  VALUES (?, ?, ?, ?, ?)
+  ON CONFLICT (profile_id) DO UPDATE SET display_name = excluded.display_name, updated_at = excluded.updated_at`;
+
+/** 名前の値を確かめて、前後の空白を除いた値にする。 */
+const displayNameOf = (value: unknown): { readonly ok: true; readonly displayName: string } | { readonly ok: false; readonly reason: ProfileDisplayNameRejectionReason } => {
+  const displayName = typeof value === 'string' ? value.trim() : '';
+  if (displayName === '') {
+    return { ok: false, reason: 'DISPLAY_NAME_EMPTY' };
+  }
+  // 改行と制御文字（行の区切りの文字も）。
+  if (hasControlOrLineSeparator(displayName)) {
+    return { ok: false, reason: 'DISPLAY_NAME_CONTROL_CHARACTER' };
+  }
+  // 文字の数は、SQLite の `length` と同じく、コードポイントで数える。
+  return [...displayName].length > MAX_PROFILE_DISPLAY_NAME_LENGTH ? { ok: false, reason: 'DISPLAY_NAME_TOO_LONG' } : { ok: true, displayName };
+};
+
+/** 画面に出す名前のあるプロファイルの、ID と名前の組（名前のないプロファイルは入れない）。 */
+export const readProfileDisplayNames = (database: ControlDatabase): Readonly<Record<string, string>> => {
+  const rows = database.connection.prepare(SELECT_DISPLAY_NAMES_SQL).all() as unknown as readonly { readonly profile_id: string; readonly display_name: string }[];
+  return Object.freeze(Object.fromEntries(rows.map((row) => [row.profile_id, row.display_name])));
+};
+
+/**
+ * 画面に出す名前を保存する（前後の空白を除く）。空・長すぎ・改行や制御文字を含む名前と、ないプロファイルは拒む（書かない）。データベースそのものの誤りは
+ * `ControlStoreError` で投げる。
+ */
+export const saveProfileDisplayName = (
+  database: ControlDatabase,
+  profileId: string,
+  value: string,
+  options: { readonly now?: () => Date } = {},
+): ProfileDisplayNameSaveResult => {
+  const checked = displayNameOf(value);
+  return withWriteTransaction(database, (connection): ProfileDisplayNameSaveResult => {
+    if (typeof profileId !== 'string' || readRow(connection, profileId) === undefined) {
+      return Object.freeze({ ok: false, reason: 'PROFILE_NOT_FOUND' });
+    }
+    if (!checked.ok) {
+      return Object.freeze(checked);
+    }
+    const defaults = DEFAULT_PROFILE_DISPLAY_SETTINGS;
+    connection.prepare(UPSERT_DISPLAY_NAME_SQL)
+      .run(profileId, defaults.showJobBrowser ? 1 : 0, defaults.auditSendPolicy, timestampOf(options.now), checked.displayName);
+    return Object.freeze({ ok: true, displayName: checked.displayName });
   });
 };

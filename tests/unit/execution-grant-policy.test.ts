@@ -17,15 +17,10 @@ import {
   targetSelectionRejectionOf,
   usedCumulativeWrites,
   writeLimitRejectionOf,
-  writeRateRejectionOf,
 } from '../../src/control/approval/execution-grant.js';
 import {
-  DEFAULT_MAX_CUMULATIVE_CREATES,
   EXECUTION_GRANT_TTL_MS,
-  MAX_WRITES_PER_DAY,
-  MIN_WRITE_INTERVAL_MS,
   WRITE_JOB_CONCURRENCY,
-  WRITE_RATE_WINDOW_MS,
   WRITE_RESERVATION_STATES,
 } from '../../src/control/approval/scenario-contracts.js';
 import { dateOfCompactUtcTimestamp } from '../../src/core/utc-timestamp.js';
@@ -42,14 +37,11 @@ describe('execution grant policy (T28d)', () => {
       'NEEDS_RULE_INPUT',
       // T30a: 検証の指定のどれかが未指定（発行の確かめに足すのは T30d）。
       'VERIFICATION_SPEC_MISSING',
-      // T30d: 環境の証跡の参照が空、連続の上限（間隔と 24 時間の件数）。
+      // T30d: 環境の証跡の参照が空。LZ-3c: 連続の上限（間隔と 24 時間の件数）と累積の上限の理由は、出さないので捨てた（管理データ・成果物に残らない）。
       'GRANT_ENVIRONMENT_EVIDENCE_MISSING',
-      'GRANT_WRITE_INTERVAL_NOT_ELAPSED',
-      'GRANT_DAILY_WRITE_LIMIT_REACHED',
       'GRANT_ALREADY_OPEN',
       'GRANT_WRITE_CONCURRENCY_EXCEEDED',
       'GRANT_RUN_LIMIT_EXCEEDED',
-      'GRANT_CUMULATIVE_LIMIT_REACHED',
       'GRANT_FACTS_CHANGED',
       'GRANT_NOT_FOUND',
       'GRANT_MISMATCH',
@@ -133,70 +125,31 @@ describe('execution grant policy (T28d)', () => {
     expect(usedCumulativeWrites([])).toBe(0);
   });
 
+  // L12b（設計書 `2026-11-09-beaksight-remove-limits-design.md` 6.2。S14）: 累積の件数の上限を撤廃した（前は `GRANT_CUMULATIVE_LIMIT_REACHED`）。1 回の Run の件数
+  // （1 つのジョブの承認した 1 回）は今のまま。
+  // LZ-3c: 判定は使った件数を受けない（前の累積の上限に届いた場面は、受けるものがないので捨てた）。
   it.each([
-    ['a count within the limits', 1, [], null],
-    ['a count above the per-run limit', 2, [], 'GRANT_RUN_LIMIT_EXCEEDED'],
-    ['a zero count', 0, [], 'GRANT_RUN_LIMIT_EXCEEDED'],
-    ['the last write of the cumulative limit', 1, [{ state: 'COMMITTED', count: 1 }, { state: 'UNKNOWN', count: 1 }], null],
-    ['the cumulative limit reached', 1, [{ state: 'COMMITTED', count: 1 }, { state: 'UNKNOWN', count: 1 }, { state: 'RESERVED', count: 1 }],
-      'GRANT_CUMULATIVE_LIMIT_REACHED'],
-    ['released writes that are not counted', 1,
-      [{ state: 'COMMITTED', count: 1 }, { state: 'RELEASED', count: 1 }, { state: 'RELEASED', count: 1 }, { state: 'UNKNOWN', count: 1 }], null],
-  ] as const)('judges %s', (_label, count, reservations, expected) => {
-    expect(writeLimitRejectionOf(count, LIMITS, reservations)).toBe(expected);
+    ['a count within the limits', 1, null],
+    ['a count above the per-run limit', 2, 'GRANT_RUN_LIMIT_EXCEEDED'],
+    ['a zero count', 0, 'GRANT_RUN_LIMIT_EXCEEDED'],
+    ['a fractional count', 1.5, 'GRANT_RUN_LIMIT_EXCEEDED'],
+  ] as const)('judges %s', (_label, count, expected) => {
+    expect(writeLimitRejectionOf(count, LIMITS)).toBe(expected);
   });
 
-  it('rejects at the default cumulative limit', () => {
-    const used = Array.from({ length: DEFAULT_MAX_CUMULATIVE_CREATES }, () => ({ state: 'COMMITTED' as const, count: 1 }));
-    const limits = { maxCreatesPerRun: 1, maxCumulativeCreates: DEFAULT_MAX_CUMULATIVE_CREATES };
-    expect(writeLimitRejectionOf(1, limits, used.slice(1))).toBeNull();
-    expect(writeLimitRejectionOf(1, limits, used)).toBe('GRANT_CUMULATIVE_LIMIT_REACHED');
+  it('does not take a grant of a running job as stale by the former expiry (L12b)', () => {
+    expect(expiredOpenGrantIdsOf([
+      { grantId: 'grant-1', expiresAt: '20261012030500', consumedAt: null, invalidatedAt: null, jobExists: true },
+      { grantId: 'grant-2', expiresAt: '20261012030500', consumedAt: null, invalidatedAt: null, jobExists: false },
+    ], new Date(Date.parse('2026-10-12T09:00:00Z')))).toEqual(new Set(['grant-2']));
   });
 
-  // T30d（Task 30 の設計書 2 章のユーザーの判断 3、3 章の「連続の上限」）: 同じシナリオの最後の書き込み（`COMMITTED`・`UNKNOWN` の予約を締めた
-  // 時刻）から 5 分以上、24 時間の窓の中の書き込みが 5 件未満。`RELEASED` と `RESERVED` は数えない。
-  describe('write rate limits (T30d)', () => {
-    const NOW = Date.parse('2026-10-13T12:00:00Z');
-    const at = (offsetMs: number): string => {
-      const date = new Date(NOW + offsetMs);
-      return date.toISOString().replace(/[-:T]/gu, '').slice(0, 14);
-    };
-    const MINUTE_MS = 60_000;
-
-    it('has the user-approved values as named constants', () => {
-      expect(MIN_WRITE_INTERVAL_MS).toBe(5 * MINUTE_MS);
-      expect(MAX_WRITES_PER_DAY).toBe(5);
-      expect(WRITE_RATE_WINDOW_MS).toBe(24 * 60 * MINUTE_MS);
-    });
-
-    it.each<readonly [string, readonly { readonly state: 'COMMITTED' | 'UNKNOWN' | 'RELEASED' | 'RESERVED'; readonly settledAt: string | null }[],
-      string | null]>([
-      ['no write', [], null],
-      ['a write exactly 5 minutes ago', [{ state: 'COMMITTED', settledAt: at(-MIN_WRITE_INTERVAL_MS) }], null],
-      ['a write 4 minutes 59 seconds ago', [{ state: 'COMMITTED', settledAt: at(-MIN_WRITE_INTERVAL_MS + 1_000) }], 'GRANT_WRITE_INTERVAL_NOT_ELAPSED'],
-      ['an UNKNOWN write 1 minute ago (counted)', [{ state: 'UNKNOWN', settledAt: at(-MINUTE_MS) }], 'GRANT_WRITE_INTERVAL_NOT_ELAPSED'],
-      ['a RELEASED reservation 1 minute ago (not counted)', [{ state: 'RELEASED', settledAt: at(-MINUTE_MS) }], null],
-      ['4 writes in the window', [1, 2, 3, 4].map((hour) => ({ state: 'COMMITTED' as const, settledAt: at(-hour * 60 * MINUTE_MS) })), null],
-      ['5 writes in the window', [1, 2, 3, 4, 5].map((hour) => ({ state: 'COMMITTED' as const, settledAt: at(-hour * 60 * MINUTE_MS) })),
-        'GRANT_DAILY_WRITE_LIMIT_REACHED'],
-      ['5 writes with UNKNOWN in the window', [1, 2, 3, 4, 5].map((hour) => ({ state: hour % 2 === 0 ? 'UNKNOWN' as const : 'COMMITTED' as const,
-        settledAt: at(-hour * 60 * MINUTE_MS) })), 'GRANT_DAILY_WRITE_LIMIT_REACHED'],
-      ['5 writes with a RELEASED one in the window', [1, 2, 3, 4, 5].map((hour) => ({ state: hour === 3 ? 'RELEASED' as const : 'COMMITTED' as const,
-        settledAt: at(-hour * 60 * MINUTE_MS) })), null],
-      ['5 writes, the oldest exactly 24 hours ago (outside the window)', [1, 2, 3, 4].map((hour) => ({ state: 'COMMITTED' as const,
-        settledAt: at(-hour * 60 * MINUTE_MS) })).concat([{ state: 'COMMITTED', settledAt: at(-WRITE_RATE_WINDOW_MS) }]), null],
-      ['5 writes, the oldest 1 second inside the window', [1, 2, 3, 4].map((hour) => ({ state: 'COMMITTED' as const,
-        settledAt: at(-hour * 60 * MINUTE_MS) })).concat([{ state: 'COMMITTED', settledAt: at(-WRITE_RATE_WINDOW_MS + 1_000) }]),
-      'GRANT_DAILY_WRITE_LIMIT_REACHED'],
-      ['a RESERVED reservation (not settled)', [{ state: 'RESERVED', settledAt: null }], null],
-    ])('judges %s', (_label, writes, expected) => {
-      expect(writeRateRejectionOf(writes, new Date(NOW))).toBe(expected);
-    });
-
-    it('reports the interval before the daily limit', () => {
-      const writes = [0, 1, 2, 3, 4].map((hour) => ({ state: 'COMMITTED' as const, settledAt: at(-hour * 60 * MINUTE_MS - MINUTE_MS) }));
-      expect(writeRateRejectionOf(writes, new Date(NOW))).toBe('GRANT_WRITE_INTERVAL_NOT_ELAPSED');
-    });
+  // T30d の連続の上限（5 分の間隔・24 時間に 5 件）は L12b で撤廃した。LZ-3c: 判定と予定の部品も捨てた。
+  it('has no write rate parts any more (LZ-3c)', async () => {
+    const grant: Record<string, unknown> = await import('../../src/control/approval/execution-grant.js');
+    const contracts: Record<string, unknown> = await import('../../src/control/approval/scenario-contracts.js');
+    expect(['writeRateRejectionOf', 'writeScheduleOf', 'RATE_COUNTED_WRITE_RESERVATION_STATES'].filter((name) => name in grant)).toEqual([]);
+    expect(['MIN_WRITE_INTERVAL_MS', 'MAX_WRITES_PER_DAY', 'WRITE_RATE_WINDOW_MS'].filter((name) => name in contracts)).toEqual([]);
   });
 
   it('rejects a profile without an environment evidence reference (null, empty or blank) (T30d)', () => {

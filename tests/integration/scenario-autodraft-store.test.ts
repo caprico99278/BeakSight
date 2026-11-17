@@ -27,6 +27,7 @@ import {
   approveScenario,
   createScenario,
   listScenarios,
+  readScenario,
   readScenarioApprovalStatus,
   readScenarioDraftContext,
   updateScenario,
@@ -35,7 +36,9 @@ import {
 import { FORM_NAVIGATION_SETUP_ITEMS } from '../helpers/auth-setup-samples.js';
 import {type AuthSetup } from '../../src/control/auth/auth-setup-contracts.js';
 import { MIN_PROFILE_REVISION, type SiteProfile } from '../../src/control/contracts.js';
+import { approveForCheck, attachInferredRules, draftUpdateForCreate } from '../../src/control/approval/update-autodraft.js';
 import { discoveryIndexEntryOf, recordDiscoveryCandidates } from '../../src/control/job/discovery-index-store.js';
+import { createReadCheck } from '../../src/control/job/read-check-store.js';
 import { createStartingJob, recordLoginCheckFinished } from '../../src/control/job/job-store.js';
 import { saveAuthSetup } from '../../src/control/store/auth-setup-store.js';
 import { closeControlDatabase, openControlDatabase, type ControlDatabase } from '../../src/control/store/control-database.js';
@@ -47,7 +50,12 @@ import { apiRequestShapeOf } from '../../src/core/api-request-shape.js';
 import { dateOfCompactUtcTimestamp } from '../../src/core/utc-timestamp.js';
 import type { DiscoveryCandidate } from '../../src/discovery/candidate-contracts.js';
 import { DISCOVERY_ARTIFACT_SCHEMA_VERSION, discoveryReadPagePaths, mergeDiscoveryCandidates, type DiscoveryDocument } from '../../src/discovery/discovery-result.js';
-import { observedSubmissionProbeOf, type SubmissionProbeInputField, type SubmissionProbeRecord } from '../../src/discovery/submission-probe-contracts.js';
+import {
+  observedSubmissionProbeOf,
+  submissionProbeOpenerOf,
+  type SubmissionProbeInputField,
+  type SubmissionProbeRecord,
+} from '../../src/discovery/submission-probe-contracts.js';
 import { ALL_CONFIRMED, candidateOf } from '../unit/approval-samples.js';
 import { NO_JS_BINDING, sampleButton } from '../unit/discovery-candidate-samples.js';
 import { TEST_ORIGIN, TEST_TARGET_PATH, resolveTestContext, testAuthProfile, testWriteProfile } from './control-profile-fixtures.js';
@@ -429,5 +437,124 @@ describe('PL-U: the discovery result stays usable after the write mode switch on
     expect(status?.validity).toMatchObject({ approved: false });
     expect(status?.validity.approved === false ? status.validity.reasons : [])
       .toEqual(expect.arrayContaining(['PROFILE_REVISION_CHANGED', 'API_DISCOVERY_PROFILE_STALE']));
+  });
+});
+
+// LU-7（設計書 `2026-11-02-beaksight-list-row-update-design.md` 5.4 の 4、`2026-10-27-beaksight-one-pass-flow-design.md` 4.1 の R1）: 一覧の行の「編集」から開いた
+// 窓の保存（probe の記録に名前のある開き手）の更新を、登録を保存した後に、チェックの保存と同じ部品（`draftUpdateForCreate`）で自動の下書きにし、今の保存の口で
+// 保存して、チェックの範囲の承認（`approveForCheck`）まで通す。A_FILTER（`?id=eq.N`）と A_PATH（`/members/N`）の両方。
+describe('LU-7: the automatic draft of a list row update saved and approved through the current store', () => {
+  const LIST_PROFILE = 'example-list-autodraft';
+  const LIST_JOB = 'job-list-auto-d1';
+  const LIST_PATH = '/admin/members';
+  const LIST_CREATE_ID = 'scenario-list-auto-create';
+  const READ_CHECK_ID = 'rc-list-auto';
+  const OPENER_DIGEST = `sha256:${'1'.repeat(64)}`;
+  const clock = (): string => CREATED_AT;
+
+  /** 一覧の画面の、行の開き手を押した後の窓の保存（probe の記録に開き手）。 */
+  const listUpdateOf = (url: string, hasName = true): DiscoveryCandidate => ({
+    ...candidateOf(sampleButton({ page: { origin: TEST_ORIGIN, path: LIST_PATH }, submitterText: '保存', jsBinding: { ...NO_JS_BINDING, submitter: ['click'] } })),
+    submissionProbe: observedSubmissionProbeOf({
+      shapes: [apiRequestShapeOf({
+        method: 'PATCH', resourceType: 'fetch', url, origin: { kind: 'APPROVED_API', index: 0 },
+        headers: { 'content-type': 'application/json', prefer: 'return=representation' },
+        body: { kind: 'TEXT', text: JSON.stringify({ name: MARKERS[0], email: MARKERS[1] }) },
+      }, { pagePath: LIST_PATH, markers: MARKERS })],
+      nonReadRequestCount: 1, readRequestCount: 0, unrecordedShapeCount: 0,
+    }, { filledFieldCount: 2, skippedFieldCount: 0 }, INPUT_FIELDS, ['保存'], submissionProbeOpenerOf(OPENER_DIGEST, hasName, ['編集'])),
+  });
+
+  /** 一覧の行の更新のあるサイトで、操作さがしを 1 回した状態。登録の下書きを保存し、照合の READ（`{id}` の画面）を結び、推した入れる値の決まりを付ける。 */
+  /** 台帳の照合の READ の定義の画面（`{id}` の型の画面か、LU-7 fix round 2: 一覧の画面だけ）。 */
+  const TEMPLATE_READ_PATH = '/admin/members/{id}';
+  const setUpListSite = async (update: DiscoveryCandidate, readPagePath = TEMPLATE_READ_PATH): Promise<{ readonly discovery: DiscoveryDocument; readonly external: ApprovalExternalFacts }> => {
+    const candidates = mergeDiscoveryCandidates([CREATE_CANDIDATE, update]);
+    const discovery = { ...DISCOVERY, jobId: LIST_JOB, pages: [pageOf(CREATE_CANDIDATE), pageOf(update)] } as DiscoveryDocument;
+    expect(createProfile(database, { ...testWriteProfile(LIST_PROFILE, MIN_PROFILE_REVISION), approvedServiceOrigins: [API_ORIGIN] },
+      { resolveContext: resolveTestContext }).ok).toBe(true);
+    expect(saveAuthSetup(database, { ...SETUP, profileId: LIST_PROFILE }, { resolveContext: resolveTestContext })).toMatchObject({ ok: true });
+    expect(createStartingJob(database, {
+      jobId: LIST_JOB, jobKind: 'DISCOVERY', profileId: LIST_PROFILE, profileRevision: MIN_PROFILE_REVISION, startNew: true, createdAt: DISCOVERED_AT,
+    }, () => null)).toEqual({ ok: true });
+    expect(recordLoginCheckFinished(database, LIST_JOB, 0, DISCOVERED_AT)).toBe(true);
+    recordDiscoveryCandidates(database, {
+      profileId: LIST_PROFILE, jobId: LIST_JOB, at: DISCOVERED_AT, entries: candidates.map(discoveryIndexEntryOf), readPagePaths: discoveryReadPagePaths(discovery),
+    });
+    expect(createReadCheck(database, {
+      readCheckId: READ_CHECK_ID, profileId: LIST_PROFILE,
+      definition: { targetPagePath: readPagePath, parameters: {}, expectations: [{ kind: 'ROW_COUNT_AT_LEAST', count: 1 }] }, at: DISCOVERED_AT,
+    })).toMatchObject({ ok: true });
+    const context = readScenarioDraftContext(database, LIST_PROFILE, LIST_JOB, null);
+    if (context === null) {
+      throw new Error('the draft context is not available');
+    }
+    const [create] = apiAutoDraftPlanOf({ profileId: LIST_PROFILE, candidates, context, scenarios: [] }).creates;
+    if (create?.status !== 'NEW') {
+      throw new Error(`the create is ${create?.status ?? 'missing'}`);
+    }
+    const created = createScenario(database, {
+      scenarioId: LIST_CREATE_ID, discovery, at: CREATED_AT, draft: {
+        ...create.draft,
+        verification: {
+          resultJudgement: null, recordId: null,
+          readVerification: { readCheckId: READ_CHECK_ID, revision: 1, bindings: [], expectations: [{ kind: 'TEXT_CONTAINS', fieldName: 'email' }] },
+        },
+      },
+    });
+    if (!created.ok) {
+      throw new Error(`the create draft was not saved: ${created.reason} ${JSON.stringify(created.draftErrors)}`);
+    }
+    expect(attachInferredRules(database, created.scenario, clock).rejection).toBeNull();
+    const stored = getProfile(database, LIST_PROFILE);
+    const external = stored === null ? null : await approvalExternalFactsOf(stored, {
+      database, repositoryRoot: workDirectory, credentialStore: { readMetadata: () => Promise.resolve(null) },
+    });
+    if (external === null) {
+      throw new Error('the external facts are not available');
+    }
+    return { discovery, external };
+  };
+
+  for (const [form, url, filterName, readPagePath] of [
+    ['A_FILTER', `${API_ORIGIN}/rest/v1/members?id=eq.4&select=*`, 'id', TEMPLATE_READ_PATH],
+    ['A_PATH', `${API_ORIGIN}/rest/v1/members/4`, null, TEMPLATE_READ_PATH],
+    // LU-7 fix round 2: 台帳の照合の READ が一覧の画面の定義だけ（一覧しかないサイト）。
+    ['A_FILTER, the list page READ only', `${API_ORIGIN}/rest/v1/members?id=eq.4&select=*`, 'id', LIST_PATH],
+    ['A_PATH, the list page READ only', `${API_ORIGIN}/rest/v1/members/4`, null, LIST_PATH],
+  ] as const) {
+    it(`drafts the list row update for the saved create, saves it and approves it within the check (${form})`, async () => {
+      const update = listUpdateOf(url);
+      const { discovery, external } = await setUpListSite(update, readPagePath);
+      // 点検の連鎖と同じ順: チェックの保存が登録を承認した（副作用の確認を兼ねる）後に、その台帳に結ぶ更新を作る。
+      expect(approveForCheck(database, [LIST_CREATE_ID], external, clock)).toEqual({ ok: true });
+      const updateId = draftUpdateForCreate({ database, profileId: LIST_PROFILE, discovery, clock }, LIST_CREATE_ID);
+      if (updateId === null) {
+        throw new Error('the list row update was not drafted');
+      }
+      const saved = readScenario(database, updateId);
+      expect(saved?.current).toMatchObject({ kind: 'UPDATE', fieldNames: ['name'] });
+      expect(saved?.current.api).toMatchObject({
+        filterName,
+        ledger: { targetCreateScenarioId: LIST_CREATE_ID, formPathTemplate: LIST_PATH, listRow: { listPagePath: LIST_PATH, openerIdentityDigest: OPENER_DIGEST, rowKeyField: 'email' } },
+      });
+      expect(saved?.current.api?.keptKeys?.map(({ key }) => key)).toEqual(['email']);
+      expect(saved?.current.api?.templatedIdentityDigest).toBeUndefined();
+      // 照合の READ は台帳の定義の写し（一覧の画面なら照合の専用の印つき）。期待は変える欄の「本文が含む」。
+      expect(saved?.current.verification.readVerification).toEqual({
+        readCheckId: READ_CHECK_ID, revision: 1, bindings: [], expectations: [{ kind: 'TEXT_CONTAINS', fieldName: 'name' }],
+        ...(readPagePath === LIST_PATH ? { verificationOnly: true } : {}),
+      });
+      expect(approveForCheck(database, [LIST_CREATE_ID, updateId], external, clock)).toEqual({ ok: true });
+      expect(readScenario(database, LIST_CREATE_ID)?.state).toBe('APPROVED');
+      expect(readScenario(database, updateId)?.state).toBe('APPROVED');
+    });
+  }
+
+  it('does not draft the update from an opener without a name (D3)', async () => {
+    const { discovery, external } = await setUpListSite(listUpdateOf(`${API_ORIGIN}/rest/v1/members?id=eq.4&select=*`, false));
+    expect(approveForCheck(database, [LIST_CREATE_ID], external, clock)).toEqual({ ok: true });
+    expect(draftUpdateForCreate({ database, profileId: LIST_PROFILE, discovery, clock }, LIST_CREATE_ID)).toBeNull();
+    expect(listScenarios(database, LIST_PROFILE).map(({ scenarioId }) => scenarioId)).toEqual([LIST_CREATE_ID]);
   });
 });

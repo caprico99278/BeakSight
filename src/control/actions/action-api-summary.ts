@@ -1,8 +1,8 @@
 // 書き込みの記録と報告（版 1.1）の API の要約の、組み立てと照らし合わせの唯一の owner（T40c。Task 40 の設計書 3.4、4 章、7 章の履歴）。純粋な関数。
 // - 組み立て（`actionApiSummaryOf`）: 承認した API の指定（`ScenarioApiSpec`）と、Guard の照合が返したページが決める鍵の値から、要約を作る。ワーカーの
 //   API の書き込みの流れ（T40b）は、この関数で `action-run.json` と `action-evidence.json` の `api` を 1 回だけ作る。ヘッダの値・応答の本文・欄に入れた
-//   値は受けない（I22。受け取る口がない）。ページが決める鍵の値（Task 38 の判断 (1)）だけを、JSON の scalar を JSON の文字列にした形で残し、長さが
-//   `MAX_SUBMITTED_VALUE_LENGTH` を超えたら値を残さずに null の印にする。
+//   値は受けない（I22。受け取る口がない）。ページが決める鍵の値（Task 38 の判断 (1)）だけを、JSON の scalar を JSON の文字列にした形で残す（L12b:
+//   長さの上限は撤廃した）。
 // - 手書きの確かめ（`actionRunRuleErrors`）: スキーマで書けない組の決まり（項目の有無、送り方と API の要約と成否の条件の組、名前の順と重なり、送った
 //   値とページが決める鍵の値の鍵の集まり、送らなかった回の値なし）。送り方と要約と成否の条件の組は、スキーマでも縛る（両方で縛る）。誤りの文に値と
 //   名前を入れない。
@@ -22,14 +22,18 @@ import {
 } from '../approval/scenario-contracts.js';
 import {
   ACTION_RUN_SCHEMA_VERSION,
-  MAX_SUBMITTED_VALUE_LENGTH,
   NOT_SENT_SUBMISSION_STATE,
   type ActionApiSummary,
   type ActionRunDocument,
 } from './action-contracts.js';
 
-/** ページが決める鍵の値（Guard の照合が返す JSON の scalar。`src/core/json-value.ts` の変えた値と同じ型）。 */
-export type ActionApiPageKeyValue = Extract<JsonValueConversion, { readonly ok: true }>['value'];
+/** JSON の scalar（`src/core/json-value.ts` の変えた値と同じ型）。 */
+type ActionApiScalarValue = Extract<JsonValueConversion, { readonly ok: true }>['value'];
+/**
+ * ページが決める鍵の値（Guard の照合が返す JSON の scalar。ARR-2（設計書 `2026-11-08-beaksight-api-array-keys-design.md` 3.4 の 4）: ページが決める一覧の鍵は
+ * scalar の一覧）。
+ */
+export type ActionApiPageKeyValue = ActionApiScalarValue | readonly ActionApiScalarValue[];
 
 /** 1.1 で足した項目の名前（項目の有無の確かめ）。 */
 const TRANSPORT_PROPERTY = 'transport';
@@ -46,13 +50,21 @@ const isStrictlySorted = (names: readonly string[]): boolean =>
 const sameNames = (left: readonly string[], right: readonly string[]): boolean =>
   left.length === right.length && left.every((name, index) => name === right[index]);
 
-/** ページが決める鍵の値を、残す文字列にする（JSON の文字列。長さが上限を超える値と、scalar でない値は null の印）。 */
+/**
+ * ページが決める鍵の値を、残す文字列にする（JSON の文字列。長さが上限を超える値と、scalar でも scalar の一覧でもない値は null の印）。ARR-2: 一覧の値は、
+ * 人が見るために JSON の文字の形で残す（例 `["u-1"]`。上限は同じ。値を照らさない鍵の中身を隠さない）。
+ */
 const pageKeyValueTextOf = (value: ActionApiPageKeyValue): string | null => {
-  if (typeof value === 'object' && value !== null) {
+  if (Array.isArray(value)) {
+    if (!value.every((element) => element === null || typeof element !== 'object')) {
+      return null;
+    }
+  } else if (typeof value === 'object' && value !== null) {
     return null;
   }
   const text = JSON.stringify(value);
-  return typeof text === 'string' && text.length <= MAX_SUBMITTED_VALUE_LENGTH ? text : null;
+  // L12b（設計書 `2026-11-09-beaksight-remove-limits-design.md` 6.2。S18）: 長さの上限（前は `MAX_SUBMITTED_VALUE_LENGTH` を超えたら null の印）は置かない。
+  return typeof text === 'string' ? text : null;
 };
 
 /**
@@ -107,8 +119,9 @@ const apiSummaryRuleErrors = (api: ActionApiSummary, document: ActionRunDocument
     if (!sameNames(sortedNamesOf(Object.keys(values)), expectedNames)) {
       errors.push('/api/pageKeyValues must have a value for each key of the page only, and none for an update');
     }
-    if (Object.values(values).some((value) => value !== null && (typeof value !== 'string' || value.length > MAX_SUBMITTED_VALUE_LENGTH))) {
-      errors.push('/api/pageKeyValues must have strings within the limit or the cut mark');
+    // L12b（S18）: 長さの上限は置かない（文字列か、読めなかった印の null）。
+    if (Object.values(values).some((value) => value !== null && typeof value !== 'string')) {
+      errors.push('/api/pageKeyValues must have strings or the cut mark');
     }
   }
   return errors;

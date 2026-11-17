@@ -9,7 +9,6 @@ import { RUN_STATUSES } from '../../src/core/contracts.js';
 import {
   countIdentifier,
   findCallSites,
-  findImportSpecifiers,
   findModuleReferences,
   findModuleSpecifiers,
   loadSourceFiles,
@@ -341,11 +340,6 @@ describe('source scanner', () => {
     expect(splitTopLevelArguments('a, { b: f(1, 2) }, [c, d]')).toEqual(['a', '{ b: f(1, 2) }', '[c, d]']);
     expect(countIdentifier(bare, 'loadConfig')).toBe(3);
   });
-
-  it('finds import specifiers in the code without comments', () => {
-    const code = scanSource("import { a } from './a.js';\n// import { b } from './b.js';\nconst c = await import('./c.js');").code;
-    expect(findImportSpecifiers(code)).toEqual(['./a.js', './c.js']);
-  });
 });
 
 describe('GATE-ARCH02〜08 detectors', () => {
@@ -668,6 +662,14 @@ const EXCLUSIONS: Readonly<Record<ExclusionScope, ReadonlyMap<string, string>>> 
       'Interaction の候補の Evidence（hrefKind の判定の入力）として読む。クロールのリンクの抽出ではない',
     ],
     [
+      'src/interaction/submission-probe.ts: a[href',
+      'REV-SD の M-4: 共通の枠の部分の構造の鍵に、枠の中のリンクの path の型の集合を入れるために読む。クロールのリンクの抽出ではない',
+    ],
+    [
+      'src/browser/in-page-readers.ts: a[href',
+      'SD-1: 押す要素の祖先のリンクの移る先を、操作の前の判定（削除の語）の入力として読む。クロールのリンクの抽出ではない',
+    ],
+    [
       'src/evidence/layout-collector.ts: a[href',
       'レイアウトの要素の種類（link）の分類と、大きさ0の操作できる要素の判定のセレクタ。href の値を読まない',
     ],
@@ -679,6 +681,12 @@ const EXCLUSIONS: Readonly<Record<ExclusionScope, ReadonlyMap<string, string>>> 
     [
       'src/worker/discovery-run.ts',
       '発見のジョブの巡回（Task 27 の設計書 3 章、4.2）が、リンクの抽出の唯一の入口 `discoverLinks` を、発見と同じページで 1 回だけ呼ぶ',
+    ],
+    // DEF-235（設計書 `2026-11-09-beaksight-read-check-record-id-fill-design.md` 3.2）: READ の確かめの段は、番号の入る画面の型の番号を探すため、一覧の画面を
+    // 1 回だけ読み、凍結の後にリンクの抽出の唯一の入口 `discoverLinks` を呼ぶ（巡回はしない。Link の Evidence は作らない）。
+    [
+      'src/worker/read-check-run.ts',
+      'READ の確かめの段（DEF-235 の設計書 3.2）が、番号を探す一覧の画面で、リンクの抽出の唯一の入口 `discoverLinks` を 1 回だけ呼ぶ',
     ],
   ]),
   ARCH04: new Map([
@@ -697,6 +705,11 @@ const EXCLUSIONS: Readonly<Record<ExclusionScope, ReadonlyMap<string, string>>> 
     [
       'src/evidence/performance-collector.ts: .origin ===',
       'Resource Timing の大きさが、別 Origin のために隠されたかの判定（ブラウザの same-origin の規則）。URL の受け入れではない',
+    ],
+    // AUD-7: 誤りの応答の文脈の印（承認したサービスの Origin への要求の応答か）。記録の事実で、URL の受け入れではない（要求を通すかは Guard が決める）。
+    [
+      'src/evidence/network-collector.ts: .has(new URL(url).origin)',
+      '誤りの応答の文脈の Evidence（承認したサービスの Origin の応答か）。URL の受け入れではない',
     ],
     [
       'src/interaction/discover-candidates.ts: .origin ===',
@@ -833,6 +846,10 @@ const EXCLUSIONS: Readonly<Record<ExclusionScope, ReadonlyMap<string, string>>> 
     [
       'src/evidence/screenshot-collector.ts: .screenshot({ path:',
       'スクリーンショットの PNG は、collector が Evidence の取得として直接書く（最終の JSON・HTML・バンドルの書き出しではない。設計書 4.4）',
+    ],
+    [
+      'src/browser/playwright/playwright-browser-port.ts: .screenshot({ path:',
+      'RB-1: ブラウザに頼む口の本物が、呼ぶ側の指定の先に Evidence の PNG を書く（collector の撮り方を口へ移す先。最終の書き出しではない）',
     ],
     [
       'src/orchestration/preflight.ts: writeFile(',

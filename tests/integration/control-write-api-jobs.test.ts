@@ -1,5 +1,6 @@
-// T40c（Task 40 の設計書 3.4、4 章、5 章の 4）: 送り方 API の書き込みのジョブの、親の読み取りと締め（ジョブの管理 `createAuditJobManager`、偽のワーカー
-// `tests/helpers/fake-audit-worker.ts` の `write` の動きを本物の `fork` で起動。ワーカーの API の書き込みの流れは T40b）。
+// T40c（Task 40 の設計書 3.4、4 章、5 章の 4）: 送り方 API の書き込みの段の、親の読み取りと締め（ジョブの管理 `createAuditJobManager` の点検の書き込みの段、
+// 偽のワーカー `tests/helpers/fake-audit-worker.ts` の `chain` を本物の `fork` で起動。ワーカーの API の書き込みの流れは T40b。SLIM W-1: 点検を通す
+// （`tests/helpers/chain-write-support.ts`））。
 // - 手で作った `action-run.json`（版 1.1。送り方 `API`、API の要約は `actionApiSummaryOf` で、承認した API の指定とページが決める鍵の値から作る）を、親が
 //   受けて締める: 書き込みの結果の行は送り方 `API` と API の型の要約（型の digest、method、Origin、path の型）を持ち、`VERIFIED`・`COMMITTED`。報告の
 //   確かめは `VALID`。
@@ -21,11 +22,9 @@ import type { ScenarioApiSpec } from '../../src/control/approval/scenario-contra
 import {
   approveScenario,
   createScenario,
-  issueExecutionGrant,
   readExecutionGrant,
   readScenario,
   readScenarioApprovalStatus,
-  type ApprovalExternalFacts,
 } from '../../src/control/approval/scenario-store.js';
 import { FORM_NAVIGATION_SETUP_ITEMS } from '../helpers/auth-setup-samples.js';
 import {type AuthSetup } from '../../src/control/auth/auth-setup-contracts.js';
@@ -34,6 +33,7 @@ import { saveRuleSetAndAttach } from '../../src/control/data-rules/rule-store.js
 import type { AuditJobManager } from '../../src/control/job/audit-job-manager.js';
 import { discoveryIndexEntryOf, recordDiscoveryCandidates } from '../../src/control/job/discovery-index-store.js';
 import { createStartingJob, recordLoginCheckFinished, type AuditJobView } from '../../src/control/job/job-store.js';
+import { chainWriteWorkerValues, runWriteChain } from '../helpers/chain-write-support.js';
 import { createReadCheck } from '../../src/control/job/read-check-store.js';
 import { saveAuthSetup } from '../../src/control/store/auth-setup-store.js';
 import { closeControlDatabase, openControlDatabase, type ControlDatabase } from '../../src/control/store/control-database.js';
@@ -54,22 +54,13 @@ import { verifiedApiCreateDocuments } from '../helpers/action-report-samples.js'
 import { writeFakeWorker, type FakeWorker, type FakeWorkerValues } from '../helpers/fake-audit-worker.js';
 import { databaseFilePlaces, filesUnder, placesWithMarkers } from '../helpers/leak-places.js';
 import { createCountingFork } from '../helpers/worker-fork.js';
-import {
-  awaitWorkersExit,
-  createFakeWorkerJobManager,
-  fakeWorkerValuesOf,
-  isJobEnded,
-  waitForJob,
-  withOutputDirectory,
-  type JobViewSource,
-} from '../helpers/job-test-support.js';
+import { awaitWorkersExit, createFakeWorkerJobManager, withOutputDirectory } from '../helpers/job-test-support.js';
 import { ALL_CONFIRMED, candidateOf } from '../unit/approval-samples.js';
 import { NO_JS_BINDING, sampleButton } from '../unit/discovery-candidate-samples.js';
 import { TEST_ORIGIN, TEST_TARGET_PATH, resolveTestContext, testWriteProfile } from './control-profile-fixtures.js';
 
 const TEST_TIMEOUT_MS = 60_000;
 const FAKE_RUN_ID = 'RUN-20261017000000';
-const OTHER_RUN_ID = 'RUN-20261017000999';
 const OUTPUT_DIRECTORY = 'write-api-jobs-output';
 const TARGET_CONFIG_TEXT = JSON.stringify({ target: { id: 'example-api-write' } });
 const PROFILE_ID = 'example-api-write';
@@ -83,7 +74,6 @@ const TEMPLATE_PATH = '/admin/members/{id}/edit';
 const DISCOVERED_AT = '20261017000000';
 const CREATED_AT = '20261017001000';
 const APPROVED_AT = '20261017002000';
-const ISSUE_AT = '20261017003000';
 const MANAGER_NOW = '20261017003100';
 const FFLATE_URL = pathToFileURL(createRequire(import.meta.url).resolve('fflate')).href;
 const HTML = '<!DOCTYPE html>\n<p>report</p>\n';
@@ -162,13 +152,14 @@ const HANDOFF = Object.freeze({
 let workDirectory = '';
 let database: ControlDatabase;
 let manager: AuditJobManager | undefined;
-let facts: ApprovalExternalFacts;
 const forks = createCountingFork();
 
 const fakeWorker = (name: string, write: NonNullable<FakeWorkerValues['write']>): FakeWorker => {
   const directory = join(workDirectory, 'workers', name);
   mkdirSync(directory, { recursive: true });
-  return writeFakeWorker(directory, 'write', fakeWorkerValuesOf({ runId: FAKE_RUN_ID, otherRunId: OTHER_RUN_ID }, { write }));
+  return writeFakeWorker(directory, 'chain', chainWriteWorkerValues({
+    outputDirectory: resolve(workDirectory, OUTPUT_DIRECTORY), discovery: DISCOVERY, writeRunId: FAKE_RUN_ID, write,
+  }));
 };
 
 async function managerWith(worker: FakeWorker): Promise<AuditJobManager> {
@@ -184,9 +175,6 @@ async function managerWith(worker: FakeWorker): Promise<AuditJobManager> {
   return manager;
 }
 
-const currentManager: JobViewSource = { getAuditJob: (jobId) => manager?.getAuditJob(jobId) ?? null };
-const isEndedWithoutWorker = (job: AuditJobView): boolean => isJobEnded(job) && (manager?.runningWorkerCount() ?? 0) === 0;
-
 /** 承認した API の指定（保存したシナリオの今の版）。 */
 const scenarioApi = (): ScenarioApiSpec => {
   const api = readScenario(database, SCENARIO_ID)?.current.api;
@@ -198,15 +186,15 @@ const scenarioApi = (): ScenarioApiSpec => {
 
 const revision = (): number => readScenario(database, SCENARIO_ID)?.revision ?? 0;
 
-/** 照合まで済んだ API の `action-run.json`（版 1.1。seed の記録は、偽のワーカーが START の値に置き換える印）。 */
-const apiActionRunOf = (jobId: string, grantId: string, overrides: Partial<ActionRunDocument> = {}): ActionRunDocument => ({
+/** 照合まで済んだ API の `action-run.json`（版 1.1。seed の記録・段のジョブの id・許可の id は、偽のワーカーが書き込みの指定の値に置き換える印）。 */
+const apiActionRunOf = (overrides: Partial<ActionRunDocument> = {}): ActionRunDocument => ({
   ...verifiedApiCreateDocuments().actionRun,
-  jobId,
+  jobId: '__START_JOB_ID__',
   runId: FAKE_RUN_ID,
   profileId: PROFILE_ID,
   scenarioId: SCENARIO_ID,
   scenarioRevision: revision(),
-  grantId,
+  grantId: '__START_GRANT_ID__',
   seedRecord: '__START_SEED_RECORD__' as never,
   // T40R2-fix（M-1）: 照合の READ の期待の欄（email）は実行のたびに変わる規則（値が 2 つの固定の一覧）なので、送った値は偽のワーカーが START の値を書き写す印。
   submittedValues: '__START_VALUES__' as never,
@@ -248,25 +236,15 @@ const writeOf = (run: ActionRunDocument | string): NonNullable<FakeWorkerValues[
   },
 });
 
-/** API の書き込みのジョブを 1 回、偽のワーカーで行う。 */
-async function runApiWriteJob(name: string, grantId: string, write: NonNullable<FakeWorkerValues['write']>): Promise<AuditJobView> {
-  const jobs = await managerWith(fakeWorker(name, write));
-  const started = await jobs.startWriteCreate({ profileId: PROFILE_ID, expectedRevision: MIN_PROFILE_REVISION, scenarioId: SCENARIO_ID, grantId });
-  if (!started.ok) {
-    throw new Error(`the API write job did not start: ${started.reason}`);
+/** API の登録の画面をチェックした点検を 1 回、偽のワーカーで行い、書き込みの段のジョブの見え方と許可の id を返す。 */
+async function runApiWriteStage(name: string, write: NonNullable<FakeWorkerValues['write']>): Promise<AuditJobView & { readonly grantId: string }> {
+  const { chain, writeJobs } = await runWriteChain(await managerWith(fakeWorker(name, write)), PROFILE_ID, MIN_PROFILE_REVISION);
+  const [job] = writeJobs;
+  if (job === undefined) {
+    throw new Error(`no write stage: ${JSON.stringify(chain)}`);
   }
-  return waitForJob(currentManager, started.job.jobId, isEndedWithoutWorker);
+  return { ...job, grantId: readWriteResult(database, job.jobId)?.grantId ?? '' };
 }
-
-const issue = (slot: number): { readonly grantId: string; readonly jobId: string } => {
-  const issued = issueExecutionGrant(database, {
-    scenarioId: SCENARIO_ID, expectedRevision: revision(), grantId: `grant-a${slot}`, jobId: `job-a${slot}`, count: 1, external: facts, at: ISSUE_AT,
-  });
-  if (!issued.ok) {
-    throw new Error(`not issued: ${issued.reason}`);
-  }
-  return { grantId: issued.grant.grantId, jobId: issued.grant.jobId };
-};
 
 /** API の登録のシナリオを、索引・照合の READ（`{id}` の型の画面）・入力の規則とともに作り、本物の事実で承認する。 */
 const prepareApprovedApiScenario = async (): Promise<void> => {
@@ -343,11 +321,10 @@ const prepareApprovedApiScenario = async (): Promise<void> => {
   if (external === null) {
     throw new Error('the external facts are not available');
   }
-  facts = external;
-  const status = readScenarioApprovalStatus(database, SCENARIO_ID, facts, dateOfCompactUtcTimestamp(APPROVED_AT));
+  const status = readScenarioApprovalStatus(database, SCENARIO_ID, external, dateOfCompactUtcTimestamp(APPROVED_AT));
   expect(approveScenario(database, {
     scenarioId: SCENARIO_ID, expectedRevision: saved.attachment.scenario.revision, expectedApprovalDigest: status?.approvalDigest ?? '',
-    receiptId: 'receipt-api', external: facts, at: APPROVED_AT,
+    receiptId: 'receipt-api', external, at: APPROVED_AT,
   })).toMatchObject({ ok: true });
 };
 
@@ -366,11 +343,11 @@ afterEach(async () => {
   rmSync(workDirectory, { recursive: true, force: true });
 });
 
-describe('T40c: the parent reads and settles the action-run.json of an API write job', () => {
+describe('T40c: the parent reads and settles the action-run.json of an API write stage', () => {
   it('settles a matching API record (VERIFIED, COMMITTED), writes the transport and the shape summary to the ledger, and checks the report VALID', async () => {
-    const { grantId, jobId } = issue(1);
-    const run = apiActionRunOf(jobId, grantId);
-    const ended = await runApiWriteJob('api-verified', grantId, writeOf(run));
+    const run = apiActionRunOf();
+    const ended = await runApiWriteStage('api-verified', writeOf(run));
+    const { grantId, jobId } = ended;
     expect(ended).toMatchObject({ jobKind: 'WRITE_CREATE', state: 'FINISHED', failureReason: null, endKind: 'RAN', writeReportCheck: 'VALID' });
     const api = scenarioApi();
     expect(readWriteResult(database, jobId)).toMatchObject({
@@ -386,35 +363,34 @@ describe('T40c: the parent reads and settles the action-run.json of an API write
     expect(placesWithMarkers(places, [HEADER_VALUE_MARKER, RESPONSE_BODY_MARKER, ...PROBE_MARKERS])).toEqual([]);
   }, TEST_TIMEOUT_MS);
 
-  it.each<readonly [string, (jobId: string, grantId: string) => unknown]>([
-    ['another shape digest', (jobId, grantId) => apiActionRunOf(jobId, grantId, {
+  it.each<readonly [string, () => unknown]>([
+    ['another shape digest', () => apiActionRunOf({
       api: { ...actionApiSummaryOf(scenarioApi(), HANDOFF.pageKeyValues), shapeDigest: `sha256:${'c'.repeat(64)}` },
     })],
-    ['another origin', (jobId, grantId) => apiActionRunOf(jobId, grantId, {
+    ['another origin', () => apiActionRunOf({
       api: { ...actionApiSummaryOf(scenarioApi(), HANDOFF.pageKeyValues), origin: 'http://127.0.0.3:4174' },
     })],
-    ['another path shape', (jobId, grantId) => apiActionRunOf(jobId, grantId, {
+    ['another path shape', () => apiActionRunOf({
       api: { ...actionApiSummaryOf(scenarioApi(), HANDOFF.pageKeyValues), pathShape: '/rest/v1/other' },
     })],
-    ['other keys', (jobId, grantId) => apiActionRunOf(jobId, grantId, {
+    ['other keys', () => apiActionRunOf({
       api: { ...actionApiSummaryOf(scenarioApi(), HANDOFF.pageKeyValues), keyNames: ['email', 'name'] },
     })],
-    ['the FORM transport', (jobId, grantId) => apiActionRunOf(jobId, grantId, {
+    ['the FORM transport', () => apiActionRunOf({
       transport: 'FORM', api: null, resultJudgement: 'FORM_STRUCTURE',
     })],
-    ['the version 1.0 (no transport)', (jobId, grantId) => {
-      const { transport: _transport, api: _api, ...run } = apiActionRunOf(jobId, grantId, {
+    ['the version 1.0 (no transport)', () => {
+      const { transport: _transport, api: _api, ...run } = apiActionRunOf({
         resultJudgement: 'FORM_STRUCTURE',
       });
       return { ...run, schemaVersion: 'action-run-schema/1.0' };
     }],
   ])('does not use a record with %s: WRITE_RESULT_INVALID, settled from the submission report (not as a success)', async (name, runOf) => {
-    const { grantId, jobId } = issue(1);
-    const ended = await runApiWriteJob(name.split(' ').join('-'), grantId, writeOf(JSON.stringify(runOf(jobId, grantId))));
+    const ended = await runApiWriteStage(name.split(' ').join('-'), writeOf(JSON.stringify(runOf())));
     expect(ended).toMatchObject({ jobKind: 'WRITE_CREATE', state: 'FAILED', failureReason: 'WRITE_RESULT_INVALID', writeReportCheck: 'RESULT_INVALID' });
-    expect(readWriteResult(database, jobId)).toMatchObject({
+    expect(readWriteResult(database, ended.jobId)).toMatchObject({
       submission: 'UNKNOWN', result: 'UNKNOWN', reason: 'NO_RESPONSE', reservationState: 'UNKNOWN', recordId: null, transport: 'API',
     });
-    expect(readExecutionGrant(database, grantId)).toMatchObject({ reservation: { state: 'UNKNOWN' } });
+    expect(readExecutionGrant(database, ended.grantId)).toMatchObject({ reservation: { state: 'UNKNOWN' } });
   }, TEST_TIMEOUT_MS);
 });

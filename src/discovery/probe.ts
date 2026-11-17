@@ -18,14 +18,14 @@
 //   ボタン、form、`<base target>` の順（実際の送信の先）。
 // - 範囲: 文書と、open な shadow root の中（`Element.prototype.shadowRoot` の getter が返すもの）。closed な shadow root はページの中からは
 //   見えない（`listeners.ts` が CDP で見つける）。iframe などの別の文書の要素（`FRAME_ELEMENT_NAMES`）があれば `frameFound`。
-// - 上限: 走査する要素の数（`MAX_DISCOVERY_ELEMENTS`）、画面の候補の数（`MAX_PAGE_CANDIDATES`）、候補の欄の数（`MAX_CANDIDATE_FIELDS`）、
-//   選択肢の数（`MAX_SELECT_OPTION_VALUES`。超えた分は件数）、文字列の長さ（契約の名前つきの定数）。上限で読み切れなかったら `limitReached`
-//   （呼ぶ側が `INCOMPLETE_LIMIT_REACHED` にする）。
+// - COV-6b-1（INV-LIMITS の N26・N27）: 走査する要素の数と画面の候補の数の上限は外した（全部の要素を読み、候補は `PAGE_CANDIDATE_PART_SIZE` ずつ
+//   `readInParts` で分けて読む。送信の要素も返す読み取りは、同じ読み取りの要素を返すため、分けずに 1 回で全部読む）。
+// - 上限: 文字列の長さ（選択肢の値・制約・送信ボタンの文言。契約の名前つきの定数）。L13（N28〜N30）: 欄と選択肢の数、欄と送信先の query の名前の
+//   数と長さでは切らない（前は `limitReached` を立て、呼ぶ側が `INCOMPLETE_LIMIT_REACHED` にした）。
 // - 要素の位置（`path`）: 文書の根からの、要素の子の中の番号の並び。open な shadow root に入る所は `SHADOW_ROOT_STEP`。JS の結び付きを CDP で
 //   読むときに、同じ要素を探すために使う（`listeners.ts`）。
 import type { Page } from 'playwright';
 import { isNonNegativeSafeInteger, isRecord } from '../core/guards.js';
-import { MAX_URL_LENGTH } from '../core/limits.js';
 import { normalizeWhitespace } from '../core/text.js';
 import { VISIBILITY_CHECK_OPTIONS } from '../core/visibility.js';
 import { isHttpProtocol } from '../crawl/normalize-url.js';
@@ -35,15 +35,6 @@ import {
   FIELD_CONSTRAINT_NAMES,
   FORM_ENCTYPES,
   FORM_METHODS,
-  MAX_ACTION_QUERY_NAMES,
-  MAX_CANDIDATE_FIELDS,
-  MAX_CANDIDATE_URL_PART_LENGTH,
-  MAX_CONSTRAINT_VALUE_LENGTH,
-  MAX_FIELD_NAME_LENGTH,
-  MAX_FORM_TARGET_LENGTH,
-  MAX_OPTION_VALUE_LENGTH,
-  MAX_SELECT_OPTION_VALUES,
-  MAX_SUBMITTER_TEXT_LENGTH,
   METHOD_OVERRIDE_FIELD_NAME,
   METHOD_OVERRIDE_VALUES,
   type CandidateAction,
@@ -58,17 +49,12 @@ import {
   type MethodOverride,
 } from './candidate-contracts.js';
 import { submitterTextHasSubmitWord, submitterWordsOf } from './classify.js';
-import { readInIsolatedWorld } from './isolated-read.js';
+import { readElementsInIsolatedWorld, readInIsolatedWorld, type InPageElementsResult, type IsolatedElementReference } from './isolated-read.js';
+import { readInParts } from '../core/read-in-parts.js';
 import { composeInPage, type StandardReaders } from '../browser/in-page-readers.js';
 
-/** 1 つの画面で走査する要素の数の上限（文書と open な shadow root の要素の合計）。 */
-export const MAX_DISCOVERY_ELEMENTS = 100_000;
-/** 1 つの画面の候補の数の上限。 */
-export const MAX_PAGE_CANDIDATES = 500;
-/** 送信先の URL を、ページの中で読む長さの倍率（Origin と path の上限に対して。解析の前に、上限より長く読んでおく）。 */
-export const ACTION_URL_READ_FACTOR = 4;
-/** 送信ボタンの文字を、空白をまとめる前に読む長さの倍率（文言の上限に対して）。 */
-export const SUBMITTER_TEXT_READ_FACTOR = 4;
+// COV-6b-1（N26・N27）: 1 つの画面で走査する要素の数（前は 100,000）と候補の数（前は 500）の上限は撤廃した（全部の要素を、分けて全部読む）。
+// 定数は LZ-1 で消した。
 /** 要素の位置の、open な shadow root に入る所の印（要素の番号は 0 以上なので、負の数にする）。 */
 export const SHADOW_ROOT_STEP = -1;
 /** 別の文書を持ちうる要素の名前（あれば、その画面を `INCOMPLETE_FRAME_OR_CLOSED_SHADOW` にする）。 */
@@ -85,24 +71,16 @@ const NODE_FILTER_SHOW_ELEMENT = 1;
 const OPAQUE_ORIGIN = 'null';
 const ROOT_PATH = '/';
 
-/** probe の上限（ページの中に渡す）。 */
-interface DiscoveryProbeLimits {
-  readonly maxElements: number;
-  readonly maxCandidates: number;
-  readonly maxFields: number;
-  readonly maxOptions: number;
-  readonly maxOptionLength: number;
-  readonly maxFieldNameLength: number;
-  readonly maxConstraintLength: number;
-  readonly maxSubmitterTextLength: number;
-  readonly submitterTextReadLength: number;
-  readonly maxTargetLength: number;
-  readonly maxActionUrlLength: number;
-}
+/**
+ * COV-6b-1（網羅の設計書 3.3、INV-LIMITS の N27）: 候補を分けて読む 1 回の読み取りの候補の数（自分の処理の大きさ。網羅の上限ではない。候補は全部読む）。
+ */
+export const PAGE_CANDIDATE_PART_SIZE = 500;
+
+// probe の上限（前はページの中に渡した）: COV-6b-1 で要素の数と候補の数、L13 で欄・選択肢の数と欄の名前の長さ、LZ-2 で選択肢の値と制約の属性の値の長さ、
+// LZ-3c で送信ボタンの文言の長さ（前は `MAX_SUBMITTER_TEXT_LENGTH` 256 と読む倍率 4）を外した。上限はもう渡さない。
 
 /** probe の入力（ページの中の関数は外を参照できないので、値はすべてここで渡す）。 */
 interface DiscoveryProbeInput {
-  readonly limits: DiscoveryProbeLimits;
   readonly visibilityOptions: CheckVisibilityOptions;
   readonly showElement: number;
   readonly shadowRootStep: number;
@@ -113,6 +91,16 @@ interface DiscoveryProbeInput {
   readonly defaultCheckableValue: string;
   readonly methodOverrideFieldName: string;
   readonly methodOverrideValues: readonly string[];
+  /**
+   * LU-SFIX2-A（LU-SREV2 の Critical-1）: 送信の要素そのもの（要素の参照）も返すか。真なら、結果を `InPageElementsResult` の形にし、`elements` に送信の
+   * 要素を候補の順で入れ、`value` の `submitterElementIndexes` に候補ごとの `elements` の中の位置（送信の要素のない候補は null）を入れる。
+   */
+  readonly withSubmitterElements: boolean;
+  /**
+   * COV-6b-1: 返す候補の範囲（候補の順の位置 `start` から `size` 個。`null` は全部）。範囲の後ろに候補が残れば、結果の `more` を真にする（呼ぶ側が
+   * `readInParts` で次の範囲を読む）。
+   */
+  readonly part: { readonly start: number; readonly size: number } | null;
 }
 
 /** ページの中で読んだ欄（検査の前）。 */
@@ -142,7 +130,6 @@ interface RawProbeCandidate {
   readonly formMethod: string | null;
   readonly methodOverride: string | null;
   readonly action: string | null;
-  readonly actionTruncated: boolean;
   readonly enctype: string | null;
   readonly target: string | null;
   readonly fields: readonly RawProbeField[];
@@ -156,15 +143,21 @@ interface RawProbeCandidate {
 interface RawProbeResult {
   readonly candidates: readonly RawProbeCandidate[];
   readonly frameFound: boolean;
-  readonly limitReached: boolean;
+  /** COV-6b-1: 読んだ範囲の後ろに、まだ候補があるか。 */
+  readonly more: boolean;
+}
+
+/** LU-SFIX2-A: 送信の要素も返すときの、ページの中の結果（`readElementsInIsolatedWorld` が受ける形）。 */
+interface RawProbeElementsResult {
+  readonly value: RawProbeResult & { readonly submitterElementIndexes: readonly (number | null)[] };
+  readonly elements: readonly Element[];
 }
 
 /**
  * ページの中で、form と、ボタンの候補（form の外のボタン、form の中の送信ボタンでないボタン）を読む（ページに何も書かない。操作しない）。この関数はページの中で動く（外の値を参照しない）。
  * 部品（`R`）は `composeInPage` で組み込む（`src/browser/in-page-readers.ts`。CC-068）。
  */
-function discoveryProbeReader(R: StandardReaders, input: DiscoveryProbeInput): RawProbeResult {
-  const { limits } = input;
+function discoveryProbeReader(R: StandardReaders, input: DiscoveryProbeInput): RawProbeResult | RawProbeElementsResult {
   // 標準の prototype の getter（部品の `standardGetter`。`src/browser/in-page-readers.ts`。CC-068）。
   const { standardGetter: getterOf } = R;
   const text = (value: unknown): string => (typeof value === 'string' ? value : '');
@@ -218,16 +211,12 @@ function discoveryProbeReader(R: StandardReaders, input: DiscoveryProbeInput): R
 
   // 文書と open な shadow root の要素を集める（shadow root の中は、文書の後に、見つけた順に読む）。
   const elements: Element[] = [];
-  let limitReached = false;
   const shadowRoots: Node[] = [];
   const collect = (root: Node, includeRoot: boolean): void => {
     const walker = createElementWalker(root);
     let node: Node | null = includeRoot ? root : walker.nextNode();
+    // COV-6b-1（N26）: 走査する要素の数の上限はない（全部の要素を読む）。
     while (node !== null) {
-      if (elements.length >= limits.maxElements) {
-        limitReached = true;
-        return;
-      }
       const element = node as Element;
       elements.push(element);
       const shadowRoot = shadowRootOf(element);
@@ -241,7 +230,7 @@ function discoveryProbeReader(R: StandardReaders, input: DiscoveryProbeInput): R
   if (documentElement !== null && documentElement !== undefined) {
     collect(documentElement as Node, true);
   }
-  for (let index = 0; index < shadowRoots.length && !limitReached; index += 1) {
+  for (let index = 0; index < shadowRoots.length; index += 1) {
     const shadowRoot = shadowRoots[index];
     if (shadowRoot !== undefined) {
       collect(shadowRoot, false);
@@ -324,16 +313,16 @@ function discoveryProbeReader(R: StandardReaders, input: DiscoveryProbeInput): R
     : HTMLInputElement.prototype);
   const overrideOf = (submitter: Element | null, attribute: string, property: string): string | null =>
     submitter !== null && hasAttribute(submitter, attribute) ? text(getterOf(submitterPrototypeOf(submitter), property)(submitter)) : null;
-  const bounded = (value: string | null, maxLength: number): string | null => (value === null ? null : value.slice(0, maxLength));
   const submitterTextOf = (element: Element): string => {
     const name = text(localNameOf(element));
     const own = name === 'input'
       ? text(getAttribute(element, text(inputTypeOf(element)) === 'image' ? 'alt' : 'value'))
       : text(textContentOf(element));
+    // LZ-3c: 文言は切らずに全部を読む（前は 1 つを 1,024・全体を 256 で切った）。押す時点の確かめ（`pressTimeFactsInPage`）と同じ決まり。
     const parts = [own, text(getAttribute(element, 'aria-label')), text(getAttribute(element, 'title'))]
-      .map((part) => part.slice(0, limits.submitterTextReadLength).replace(/\s+/gu, ' ').trim())
+      .map((part) => part.replace(/\s+/gu, ' ').trim())
       .filter((part, index, all) => part.length > 0 && all.indexOf(part) === index);
-    return parts.join(' ').slice(0, limits.maxSubmitterTextLength);
+    return parts.join(' ');
   };
 
   // form の欄（form に属する入力の欄。送信ボタンとリセット・普通のボタンは含めない）と `_method` の値。
@@ -365,27 +354,24 @@ function discoveryProbeReader(R: StandardReaders, input: DiscoveryProbeInput): R
       if (tag === 'input' && type === 'hidden' && name.toLowerCase() === input.methodOverrideFieldName) {
         overrideValues.add(text(inputValueOf(element)).trim().toUpperCase());
       }
-      if (fields.length >= limits.maxFields) {
-        limitReached = true;
-        continue;
-      }
+      // L13（N28・N29）: 欄と選択肢は数で打ち切らない（前は 200 個目・50 個目の後を読まなかった。省いた選択肢の数の項目は 0 のまま。候補の識別に入るので残す）。
       let options: string[] | null = null;
-      let omittedOptionCount = 0;
+      const omittedOptionCount = 0;
       let hasValue: boolean;
       if (tag === 'select') {
         const optionElements = selectOptionsOf(element);
         const optionCount = lengthOf(optionElements);
         options = [];
-        for (let optionIndex = 0; optionIndex < Math.min(optionCount, limits.maxOptions); optionIndex += 1) {
+        for (let optionIndex = 0; optionIndex < optionCount; optionIndex += 1) {
           const option = itemOf(optionElements, optionIndex);
-          options.push(option === null ? '' : text(getAttribute(option, 'value')).slice(0, limits.maxOptionLength));
+          // LZ-2: 選択肢の値は切り詰めない（前は 256 文字まで）。
+          options.push(option === null ? '' : text(getAttribute(option, 'value')));
         }
-        omittedOptionCount = Math.max(0, optionCount - limits.maxOptions);
         hasValue = text(selectValueOf(element)).length > 0;
       } else if (tag === 'textarea') {
         hasValue = text(textAreaValueOf(element)).length > 0;
       } else if (type === 'checkbox' || type === 'radio') {
-        options = [(getAttribute(element, 'value') ?? input.defaultCheckableValue).slice(0, limits.maxOptionLength)];
+        options = [getAttribute(element, 'value') ?? input.defaultCheckableValue];
         hasValue = inputCheckedOf(element) === true;
       } else if (type === 'file') {
         const files = inputFilesOf(element);
@@ -394,14 +380,16 @@ function discoveryProbeReader(R: StandardReaders, input: DiscoveryProbeInput): R
         hasValue = text(inputValueOf(element)).length > 0;
       }
       fields.push({
-        name: name.slice(0, limits.maxFieldNameLength),
+        // L13（N30）: 欄の名前は切り詰めない（前は 256 文字まで）。
+        name,
         tag,
         type,
         required: hasAttribute(element, 'required'),
         readonly: hasAttribute(element, 'readonly'),
         disabled: matches(element, ':disabled'),
         hidden: type === 'hidden' || !isVisible(element),
-        constraints: input.constraintNames.map((constraint) => bounded(getAttribute(element, constraint), limits.maxConstraintLength)),
+        // LZ-2: 制約の属性の値は切り詰めない（前は 512 文字まで）。
+        constraints: input.constraintNames.map((constraint) => getAttribute(element, constraint)),
         options,
         omittedOptionCount,
         hasValue,
@@ -415,12 +403,29 @@ function discoveryProbeReader(R: StandardReaders, input: DiscoveryProbeInput): R
   };
 
   const candidates: RawProbeCandidate[] = [];
-  const pushCandidate = (candidate: RawProbeCandidate): boolean => {
-    if (candidates.length >= limits.maxCandidates) {
-      limitReached = true;
-      return false;
+  // LU-SFIX2-A: 送信の要素そのもの（候補の順）と、候補ごとの位置（`withSubmitterElements` のときだけ返す）。
+  const submitterElements: Element[] = [];
+  const submitterElementIndexes: (number | null)[] = [];
+  // COV-6b-1（N27）: 候補の数の上限はない。返す範囲（`input.part`）の外の候補は数えるだけで、組み立てない（次の範囲の読み取りで組み立てる）。
+  const part = input.part;
+  let seen = 0;
+  const inPart = (): boolean => {
+    const position = seen;
+    seen += 1;
+    return part === null || (position >= part.start && position < part.start + part.size);
+  };
+  const pushCandidate = (build: () => RawProbeCandidate, submitterElement: Element | null): boolean => {
+    if (!inPart()) {
+      return true;
     }
+    const candidate = build();
     candidates.push(candidate);
+    if (submitterElement === null) {
+      submitterElementIndexes.push(null);
+    } else {
+      submitterElementIndexes.push(submitterElements.length);
+      submitterElements.push(submitterElement);
+    }
     return true;
   };
   for (const form of forms) {
@@ -430,32 +435,31 @@ function discoveryProbeReader(R: StandardReaders, input: DiscoveryProbeInput): R
       const action = overrideOf(submitter, 'formaction', 'formAction') ?? text(formActionOf(form));
       const target = overrideOf(submitter, 'formtarget', 'formTarget')
         ?? (hasAttribute(form, 'target') ? text(formTargetOf(form)) : baseTarget());
-      const pushed = pushCandidate({
+      const pushed = pushCandidate(() => ({
         kind: 'FORM',
         formMethod: (overrideOf(submitter, 'formmethod', 'formMethod') ?? text(formMethodOf(form))).toUpperCase(),
         methodOverride,
-        action: action.slice(0, limits.maxActionUrlLength),
-        actionTruncated: action.length > limits.maxActionUrlLength,
+        // URL-LEN: 送信先の URL と target は、ページの中でも切り詰めない。
+        action,
         enctype: overrideOf(submitter, 'formenctype', 'formEnctype') ?? text(formEnctypeOf(form)),
-        target: target.slice(0, limits.maxTargetLength),
+        target,
         fields,
         submitterText: submitter === null ? null : submitterTextOf(submitter),
         inlineHandler: hasAttribute(form, 'onsubmit') || (submitter !== null && hasAttribute(submitter, 'onclick')),
         form: describe(form),
         submitter: submitter === null ? null : describe(submitter),
-      });
+      }), submitter);
       if (!pushed) {
         break;
       }
     }
   }
   for (const button of buttonCandidates) {
-    const pushed = pushCandidate({
+    const pushed = pushCandidate(() => ({
       kind: 'BUTTON',
       formMethod: null,
       methodOverride: null,
       action: null,
-      actionTruncated: false,
       enctype: null,
       target: null,
       fields: [],
@@ -463,30 +467,21 @@ function discoveryProbeReader(R: StandardReaders, input: DiscoveryProbeInput): R
       inlineHandler: hasAttribute(button, 'onclick'),
       form: null,
       submitter: describe(button),
-    });
+    }), button);
     if (!pushed) {
       break;
     }
   }
-  return { candidates, frameFound, limitReached };
+  const more = part !== null && seen > part.start + part.size;
+  if (input.withSubmitterElements) {
+    return { value: { candidates, frameFound, more, submitterElementIndexes }, elements: submitterElements };
+  }
+  return { candidates, frameFound, more };
 }
 const discoveryProbeInPage = composeInPage(discoveryProbeReader);
 
 /** probe の入力（本番の値）。 */
 const DISCOVERY_PROBE_INPUT: DiscoveryProbeInput = Object.freeze({
-  limits: Object.freeze({
-    maxElements: MAX_DISCOVERY_ELEMENTS,
-    maxCandidates: MAX_PAGE_CANDIDATES,
-    maxFields: MAX_CANDIDATE_FIELDS,
-    maxOptions: MAX_SELECT_OPTION_VALUES,
-    maxOptionLength: MAX_OPTION_VALUE_LENGTH,
-    maxFieldNameLength: MAX_FIELD_NAME_LENGTH,
-    maxConstraintLength: MAX_CONSTRAINT_VALUE_LENGTH,
-    maxSubmitterTextLength: MAX_SUBMITTER_TEXT_LENGTH,
-    submitterTextReadLength: MAX_SUBMITTER_TEXT_LENGTH * SUBMITTER_TEXT_READ_FACTOR,
-    maxTargetLength: MAX_FORM_TARGET_LENGTH,
-    maxActionUrlLength: MAX_CANDIDATE_URL_PART_LENGTH * ACTION_URL_READ_FACTOR,
-  }),
   visibilityOptions: VISIBILITY_CHECK_OPTIONS,
   showElement: NODE_FILTER_SHOW_ELEMENT,
   shadowRootStep: SHADOW_ROOT_STEP,
@@ -497,6 +492,8 @@ const DISCOVERY_PROBE_INPUT: DiscoveryProbeInput = Object.freeze({
   defaultCheckableValue: DEFAULT_CHECKABLE_VALUE,
   methodOverrideFieldName: METHOD_OVERRIDE_FIELD_NAME,
   methodOverrideValues: METHOD_OVERRIDE_VALUES,
+  withSubmitterElements: false,
+  part: null,
 });
 
 // ---------------------------------------------------------------------------------------------------------------
@@ -545,8 +542,6 @@ export type PageProbeOutcome =
     readonly candidates: readonly ProbedCandidate[];
     /** iframe などの別の文書の要素があった。 */
     readonly frameFound: boolean;
-    /** 上限で読み切れなかった。 */
-    readonly limitReached: boolean;
   }
   | { readonly status: 'FAILED' };
 
@@ -578,30 +573,21 @@ const requireRecord = (value: unknown): Record<string, unknown> => {
   return value;
 };
 
-/** URL の Origin と path（http(s) でない、解析できない URL は、決まらない Origin）。上限を超えたら切り詰め、`truncated` を立てる。 */
-export const locationOfUrl = (raw: string): { readonly location: CandidateLocation; readonly url: URL | null; readonly truncated: boolean } => {
+/**
+ * URL の Origin と path（http(s) でない、解析できない URL は、決まらない Origin）。URL-LEN: 長さでは切り詰めない（前は 2,048 で切り詰め、`truncated` を立てた）。
+ */
+export const locationOfUrl = (raw: string): { readonly location: CandidateLocation; readonly url: URL | null } => {
   const url = URL.canParse(raw) ? new URL(raw) : null;
   if (url === null || !isHttpProtocol(url.protocol)) {
-    return { location: { origin: OPAQUE_ORIGIN, path: ROOT_PATH }, url: null, truncated: false };
+    return { location: { origin: OPAQUE_ORIGIN, path: ROOT_PATH }, url: null };
   }
-  const { origin, pathname } = url;
-  return {
-    location: { origin: origin.slice(0, MAX_CANDIDATE_URL_PART_LENGTH), path: pathname.slice(0, MAX_CANDIDATE_URL_PART_LENGTH) },
-    url,
-    truncated: origin.length > MAX_CANDIDATE_URL_PART_LENGTH || pathname.length > MAX_CANDIDATE_URL_PART_LENGTH,
-  };
+  return { location: { origin: url.origin, path: url.pathname }, url };
 };
 
-/** 送信先（query は名前だけ。値は持たない）。 */
-const actionOf = (raw: string, readTruncated: boolean): { readonly action: CandidateAction; readonly truncated: boolean } => {
-  const { location, url, truncated } = locationOfUrl(raw);
-  const allNames = url === null ? [] : [...url.searchParams.keys()];
-  const queryNames = allNames.slice(0, MAX_ACTION_QUERY_NAMES).map((name) => name.slice(0, MAX_FIELD_NAME_LENGTH));
-  return {
-    action: { ...location, queryNames },
-    truncated: readTruncated || truncated || allNames.length > MAX_ACTION_QUERY_NAMES
-      || allNames.some((name) => name.length > MAX_FIELD_NAME_LENGTH),
-  };
+/** 送信先（query は名前だけ。値は持たない）。URL-LEN・L13（N30）: URL も query の名前の数と長さも切り詰めない。 */
+const actionOf = (raw: string): CandidateAction => {
+  const { location, url } = locationOfUrl(raw);
+  return { ...location, queryNames: url === null ? [] : [...url.searchParams.keys()] };
 };
 
 const fieldOf = (value: unknown): CandidateField => {
@@ -610,15 +596,16 @@ const fieldOf = (value: unknown): CandidateField => {
   if (constraintValues.length !== FIELD_CONSTRAINT_NAMES.length) throw new ProbeShapeError();
   const constraints = Object.fromEntries(FIELD_CONSTRAINT_NAMES.map((name, index) => [
     name,
-    requireNullableString(constraintValues[index])?.slice(0, MAX_CONSTRAINT_VALUE_LENGTH) ?? null,
+    requireNullableString(constraintValues[index]),
   ])) as CandidateFieldConstraints;
+  // L13（N29・N30）: 選択肢の数と欄の名前の長さで切らない。
   const options = raw['options'] === null
     ? null
-    : requireArray(raw['options']).slice(0, MAX_SELECT_OPTION_VALUES).map((option) => requireString(option).slice(0, MAX_OPTION_VALUE_LENGTH));
+    : requireArray(raw['options']).map((option) => requireString(option));
   const omittedOptionCount = raw['omittedOptionCount'];
   if (!isNonNegativeSafeInteger(omittedOptionCount)) throw new ProbeShapeError();
   return {
-    name: requireString(raw['name']).slice(0, MAX_FIELD_NAME_LENGTH),
+    name: requireString(raw['name']),
     tag: requireOneOf<CandidateFieldTag>(CANDIDATE_FIELD_TAGS, raw['tag']),
     type: requireOneOf<CandidateFieldType>(CANDIDATE_FIELD_TYPES, raw['type']),
     required: requireBoolean(raw['required']),
@@ -644,43 +631,35 @@ const elementOf = (value: unknown): ProbedElement | null => {
   return { path, localName: requireString(raw['localName']) };
 };
 
-const candidateOf = (value: unknown): { readonly candidate: ProbedCandidate; readonly truncated: boolean } => {
+const candidateOf = (value: unknown): ProbedCandidate => {
   const raw = requireRecord(value);
   const kind = requireOneOf<CandidateKind>(['FORM', 'BUTTON'], raw['kind']);
   const submitterText = requireNullableString(raw['submitterText']);
   const common = {
-    // T27R-fix-1（DEF-086）: 文言は、分類の語を求めるためだけに使い、持たない。
-    submitterWords: submitterText === null ? Object.freeze([]) : submitterWordsOf(normalizeWhitespace(submitterText).slice(0, MAX_SUBMITTER_TEXT_LENGTH)),
+    // T27R-fix-1（DEF-086）: 文言は、分類の語を求めるためだけに使い、持たない。LZ-3c: 文言は切らずに全部から求める（押す時点の確かめと同じ）。
+    submitterWords: submitterText === null ? Object.freeze([]) : submitterWordsOf(normalizeWhitespace(submitterText)),
     hasSubmitterText: submitterText !== null && normalizeWhitespace(submitterText).length > 0,
     // T44c: 押す順だけの送信の語の印（文言は持たない）。
-    hasSubmitWord: submitterText !== null && submitterTextHasSubmitWord(normalizeWhitespace(submitterText).slice(0, MAX_SUBMITTER_TEXT_LENGTH)),
+    hasSubmitWord: submitterText !== null && submitterTextHasSubmitWord(normalizeWhitespace(submitterText)),
     inlineHandler: requireBoolean(raw['inlineHandler']),
     submitter: elementOf(raw['submitter']),
   };
   if (kind === 'BUTTON') {
-    return {
-      candidate: {
-        kind, formMethod: null, methodOverride: null, action: null, enctype: null, target: null, fields: [], ...common, form: null,
-      },
-      truncated: false,
-    };
+    return { kind, formMethod: null, methodOverride: null, action: null, enctype: null, target: null, fields: [], ...common, form: null };
   }
-  const allFields = requireArray(raw['fields']);
-  const { action, truncated } = actionOf(requireString(raw['action']), requireBoolean(raw['actionTruncated']));
   const methodOverride = raw['methodOverride'] === null ? null : requireOneOf<MethodOverride>(METHOD_OVERRIDE_VALUES, raw['methodOverride']);
   return {
-    candidate: {
-      kind,
-      formMethod: requireOneOf<FormMethod>(FORM_METHODS, raw['formMethod']),
-      methodOverride,
-      action,
-      enctype: requireOneOf<FormEnctype>(FORM_ENCTYPES, raw['enctype']),
-      target: requireString(raw['target']).slice(0, MAX_FORM_TARGET_LENGTH),
-      fields: allFields.slice(0, MAX_CANDIDATE_FIELDS).map(fieldOf),
-      ...common,
-      form: elementOf(raw['form']),
-    },
-    truncated: truncated || allFields.length > MAX_CANDIDATE_FIELDS,
+    kind,
+    formMethod: requireOneOf<FormMethod>(FORM_METHODS, raw['formMethod']),
+    methodOverride,
+    action: actionOf(requireString(raw['action'])),
+    enctype: requireOneOf<FormEnctype>(FORM_ENCTYPES, raw['enctype']),
+    // URL-LEN: form の target は切り詰めない（前は 256）。
+    target: requireString(raw['target']),
+    // L13（N28）: 欄は数で切らない（前は 200 個まで）。
+    fields: requireArray(raw['fields']).map(fieldOf),
+    ...common,
+    form: elementOf(raw['form']),
   };
 };
 
@@ -689,20 +668,92 @@ const candidateOf = (value: unknown): { readonly candidate: ProbedCandidate; rea
  * world、例外の詳細などを含む）`FAILED`。
  */
 export async function probePageCandidates(page: Page, deadlineAtMs: number): Promise<PageProbeOutcome> {
-  const outcome = await readInIsolatedWorld(page, discoveryProbeInPage, DISCOVERY_PROBE_INPUT, deadlineAtMs);
-  if (outcome.status !== 'READ') {
-    return PROBE_FAILED;
-  }
+  // COV-6b-1（N27）: 候補を `PAGE_CANDIDATE_PART_SIZE` ずつ分けて読み（`readInParts`）、全部を記録する。どれかの部分を読めなければ、読めなかった結果。
   try {
-    const raw = requireRecord(outcome.value);
-    const read = requireArray(raw['candidates']).map(candidateOf);
+    const parts = await readInParts(0, async (start) => {
+      const outcome = await readInIsolatedWorld(page, discoveryProbeInPage, {
+        ...DISCOVERY_PROBE_INPUT, part: { start, size: PAGE_CANDIDATE_PART_SIZE },
+      }, deadlineAtMs);
+      if (outcome.status !== 'READ') {
+        throw new ProbeShapeError();
+      }
+      const read = probeOutcomeOf(outcome.value);
+      return { part: read, next: requireBoolean(requireRecord(outcome.value)['more']) ? start + PAGE_CANDIDATE_PART_SIZE : null };
+    });
     return Object.freeze({
       status: 'READ',
-      candidates: read.map(({ candidate }) => candidate),
-      frameFound: requireBoolean(raw['frameFound']),
-      limitReached: requireBoolean(raw['limitReached']) || read.some(({ truncated }) => truncated),
+      candidates: Object.freeze(parts.flatMap(({ candidates }) => candidates)),
+      frameFound: parts.some(({ frameFound }) => frameFound),
     });
   } catch {
     return PROBE_FAILED;
   }
+}
+
+/** ページの中の結果を、probe の結果にする（形が違えば `ProbeShapeError`）。 */
+const probeOutcomeOf = (value: unknown): Extract<PageProbeOutcome, { readonly status: 'READ' }> => {
+  const raw = requireRecord(value);
+  return Object.freeze({
+    status: 'READ',
+    candidates: requireArray(raw['candidates']).map(candidateOf),
+    frameFound: requireBoolean(raw['frameFound']),
+  });
+};
+
+/** LU-SFIX2-A: 選んだ候補の送信の要素の参照（候補の位置と、同じ読み取りの要素の backendNodeId・文書の根からの位置）。 */
+export interface ProbedSubmitterElement {
+  readonly candidateIndex: number;
+  readonly element: IsolatedElementReference;
+}
+
+/** LU-SFIX2-A: 送信の要素の参照も返す probe の結果。 */
+export type PageProbeWithSubmittersOutcome =
+  | (Extract<PageProbeOutcome, { readonly status: 'READ' }> & { readonly chosen: readonly ProbedSubmitterElement[] })
+  | { readonly status: 'FAILED' };
+
+/**
+ * LU-SFIX2-A（LU-SREV2 の Critical-1・Minor-1）: 画面の候補を、isolated world の 1 回の読み取りで読み（`probePageCandidates` と同じ読み方と同じ候補）、
+ * `choose` が選んだ候補（候補の位置。送信の要素のある候補だけ）の送信の要素の参照を、同じ読み取りの要素そのものから返す（例外を投げない）。確かめた候補の
+ * 要素と、参照の要素の間に、ページの JS が要素を入れ替える窓がない（位置で引き直さない）。読めない・形の誤り・`choose` が null か、送信の要素のない候補を
+ * 選んだときは `FAILED`。
+ */
+export async function probePageCandidatesWithSubmitters(
+  page: Page,
+  deadlineAtMs: number,
+  choose: (candidates: readonly ProbedCandidate[]) => readonly number[] | null,
+): Promise<PageProbeWithSubmittersOutcome> {
+  const state: { probe: Extract<PageProbeOutcome, { readonly status: 'READ' }> | null; candidateIndexes: readonly number[] } = { probe: null, candidateIndexes: [] };
+  const outcome = await readElementsInIsolatedWorld(page, discoveryProbeInPage as (input: DiscoveryProbeInput) => InPageElementsResult, {
+    ...DISCOVERY_PROBE_INPUT,
+    withSubmitterElements: true,
+  }, deadlineAtMs, {
+    choose: (value) => {
+      try {
+        const probe = probeOutcomeOf(value);
+        const indexes = requireArray(requireRecord(value)['submitterElementIndexes']);
+        if (indexes.length !== probe.candidates.length) {
+          return null;
+        }
+        const candidateIndexes = choose(probe.candidates);
+        if (candidateIndexes === null) {
+          return null;
+        }
+        const elementIndexes = candidateIndexes.map((candidateIndex) => indexes[candidateIndex]);
+        if (!elementIndexes.every(isNonNegativeSafeInteger)) {
+          return null;
+        }
+        state.probe = probe;
+        state.candidateIndexes = candidateIndexes;
+        return elementIndexes;
+      } catch {
+        return null;
+      }
+    },
+  });
+  const { probe, candidateIndexes } = state;
+  if (outcome.status !== 'READ' || probe === null || outcome.elements.length !== candidateIndexes.length) {
+    return Object.freeze({ status: 'FAILED' });
+  }
+  const chosen = candidateIndexes.map((candidateIndex, index) => Object.freeze({ candidateIndex, element: outcome.elements[index] as IsolatedElementReference }));
+  return Object.freeze({ ...probe, chosen: Object.freeze(chosen) });
 }

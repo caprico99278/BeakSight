@@ -19,7 +19,7 @@ import { classifyApiShapeObservation } from '../../src/discovery/api-shape-class
 import { AuditStageMonitor, activateInteractionFreeze } from '../../src/safety/passive-request-guard.js';
 import { SafetyLedger } from '../../src/safety/safety-ledger.js';
 import type { SubmissionObservation, SubmissionObservationResult } from '../../src/safety/submission-observation.js';
-import { closeTestContexts, launchCliChromium, launchHeadlessChromium } from '../helpers/chromium.js';
+import { BOTH_CHROMIUM_LAUNCHERS, closeTestContexts } from '../helpers/chromium.js';
 import { fastRunConfig } from '../helpers/run-harness.js';
 import {
   SPA_APP_PATHS,
@@ -36,25 +36,20 @@ import {
   type SpaAuthSiteOptions,
   type SpaHostileMemberSave,
 } from '../helpers/spa-auth-site-fixture.js';
-import { TEST_FACTORY_OPTIONS } from '../helpers/test-config.js';
+import { PROBE_FACTORY_OPTIONS } from '../helpers/test-config.js';
 
-const LAUNCHERS: readonly (readonly [string, () => Promise<Browser>])[] = [
-  ['the default test Chromium', () => launchHeadlessChromium()],
-  ['the CLI Chromium', () => launchCliChromium()],
-];
 const TEST_TIMEOUT_MS = 120_000;
 const UI_TIMEOUT_MS = 15_000;
 /** 押した後、ページの要求が静まるまで待つ時間（ms。設計書 3.2 の既定 2 秒より短い、テストの値）。 */
 const QUIET_WAIT_MS = 500;
 /** 全部の後に、遅れて届く要求を待つ時間（ms）。 */
 const LATE_REQUEST_WAIT_MS = 1_000;
-const DEFAULT_LIMITS = Object.freeze({ perMinute: 120, perRun: 600 });
 const EXISTING_NAME = '既存花子';
 /** 欄に入れる目印（probe の合成の値と同じ形。秘密ではないが、型・記録・例外に値が出ないことを確かめる）。 */
 const MARKERS = Object.freeze({ name: 'bsprobeNameK4q', email: 'bsprobeMailR8w@example.invalid', note: 'bsprobeNoteT2z' });
 const MARKER_LIST = Object.freeze([MARKERS.name, MARKERS.email, MARKERS.note]);
 
-describe.each(LAUNCHERS)('T37b: the submission observation of the frozen Guard with %s', (_label, launch) => {
+describe.each(BOTH_CHROMIUM_LAUNCHERS)('T37b: the submission observation of the frozen Guard with %s', (_label, launch) => {
   let browser: Browser;
   let spa: SpaAuthSite | undefined;
   const factories: BrowserContextFactory[] = [];
@@ -82,23 +77,21 @@ describe.each(LAUNCHERS)('T37b: the submission observation of the frozen Guard w
   const auditStageOf = (site: SpaAuthSite): AuditStageServiceRequests => ({
     approvedServiceOrigins: [site.backendOrigin],
     auditReadRequests: [],
-    scriptLogin: { origin: site.tokenOrigin, path: SPA_BACKEND_PATHS.token, requiredQuery: [{ name: 'grant_type', value: SPA_GRANT_TYPES.password }] },
-    serviceRequestLimits: DEFAULT_LIMITS,
-  });
+    scriptLogin: { origin: site.tokenOrigin, path: SPA_BACKEND_PATHS.token, requiredQuery: [{ name: 'grant_type', value: SPA_GRANT_TYPES.password }] },  });
 
   /** 認証つきの factory の PRIMARY の Context で、form のない会員の画面を開き、準備を待って凍結する。 */
   const openFrozenScreen = async (site: SpaAuthSite, pagePath: string) => {
     const base = fastRunConfig(site.appOrigin, pagePath);
     const config: AuditConfig = { ...base, site: { startUrl: `${site.appOrigin}${pagePath}`, allowedOrigins: [site.appOrigin] } };
     const factory = new BrowserContextFactory(browser, config, () => new SafetyLedger(), {
-      ...TEST_FACTORY_OPTIONS,
+      ...PROBE_FACTORY_OPTIONS,
       authentication: {
         initialState: { cookies: [], origins: [{ origin: site.appOrigin, localStorage: [{ name: SPA_AUTH_STORAGE_KEY, value: site.issueStoredSession() }] }] },
         filterState: (state) => filterAuthenticatedState(state, [site.appOrigin]),
         auditExclusions: { excludedPathPrefixes: [SPA_APP_PATHS.logout], auditPathPrefixes: [], dangerousTerms: DEFAULT_EXCLUDED_URL_WORDS },
         auditStage: auditStageOf(site),
       },
-      serviceRequestBudget: createServiceRequestBudget({ ...DEFAULT_LIMITS, now: () => Date.now() }),
+      serviceRequestBudget: createServiceRequestBudget({ now: () => Date.now() }),
       auditStageMonitor: new AuditStageMonitor(),
     });
     factories.push(factory);
@@ -230,22 +223,14 @@ describe.each(LAUNCHERS)('T37b: the submission observation of the frozen Guard w
     expect(snapshot.invariantViolations).toEqual([]);
   }, TEST_TIMEOUT_MS);
 
-  /** 敵対的な保存の、分類の結果と理由（更新の画面で押す）。 */
+  /**
+   * 敵対的な保存の、分類の結果と理由（更新の画面で押す）。SLIM: 代表 2（削除と 2 回送る）。ほかの理由（UPSERT・ARRAY_BODY・FILTER_MISSING・
+   * PROCEDURE_CALL_PATH・SOFT_DELETE_KEY・METHOD_OVERRIDE）は単体 `tests/unit/api-shape-classification.test.ts` の NOT_EXECUTABLE の表に任せる。
+   * 承認していない Origin と画面を移る保存（NO_REQUEST）は、下の専用の場面で分類も確かめる。
+   */
   const HOSTILE_CASES: readonly (readonly [SpaHostileMemberSave, string, string | null])[] = [
     ['deleteOnSave', 'NOT_EXECUTABLE', 'DELETE_METHOD'],
-    ['upsert', 'NOT_EXECUTABLE', 'UPSERT'],
-    ['arrayBody', 'NOT_EXECUTABLE', 'ARRAY_BODY'],
-    ['unfilteredPatch', 'NOT_EXECUTABLE', 'FILTER_MISSING'],
-    ['rpcCall', 'NOT_EXECUTABLE', 'PROCEDURE_CALL_PATH'],
     ['doubleSend', 'NOT_EXECUTABLE', 'MULTIPLE_REQUESTS'],
-    ['softDeleteKey', 'NOT_EXECUTABLE', 'SOFT_DELETE_KEY'],
-    ['unapprovedOrigin', 'NOT_EXECUTABLE', 'UNAPPROVED_ORIGIN'],
-    ['navigateOnSave', 'NO_REQUEST', null],
-    // T37R2-fix-A（Task 37 の設計書 8 章の最後の行の M-1・M-2）。
-    ['methodOverrideHeader', 'NOT_EXECUTABLE', 'METHOD_OVERRIDE'],
-    ['bodyMethodOverride', 'NOT_EXECUTABLE', 'METHOD_OVERRIDE'],
-    ['encodedRpcPath', 'NOT_EXECUTABLE', 'PROCEDURE_CALL_PATH'],
-    ['paramRpcPath', 'NOT_EXECUTABLE', 'PROCEDURE_CALL_PATH'],
   ];
 
   it.each(HOSTILE_CASES)('classifies the hostile save %s as %s (%s); nothing reaches any server', async (hostile, classification, reason) => {
@@ -273,6 +258,10 @@ describe.each(LAUNCHERS)('T37b: the submission observation of the frozen Guard w
     expect(result.preflightsFulfilled).toBe(0);
     expect(result.shapes.map(({ method, origin }) => `${method} ${origin.kind}`)).toEqual(['OPTIONS OTHER']);
     expect(frozenBlocked(ledger())).toContain(`OPTIONS ${site.otherOrigin}${SPA_BACKEND_PATHS.members}?id=eq.${memberId} INTERACTION_FROZEN`);
+    expect(classifyApiShapeObservation(result)).toMatchObject({ classification: 'NOT_EXECUTABLE', reason: 'UNAPPROVED_ORIGIN' });
+    expect(ledger().invariantViolations).toEqual([]);
+    expectNoValues(site, result);
+    expect(site.memberOf(memberId)?.name).toBe(EXISTING_NAME);
   }, TEST_TIMEOUT_MS);
 
   it('records what the probe-aware page really sent (another table, no marker in the body), not what it would send to a user', async () => {
@@ -295,6 +284,9 @@ describe.each(LAUNCHERS)('T37b: the submission observation of the frozen Guard w
     expect(result).toMatchObject({ shapes: [], nonReadRequestCount: 0 });
     expect(result.readRequestCount).toBeGreaterThanOrEqual(1);
     expect(frozenBlocked(ledger())).toContain(`GET ${site.appOrigin}${SPA_APP_PATHS.admin} INTERACTION_FROZEN`);
+    expect(classifyApiShapeObservation(result)).toMatchObject({ classification: 'NO_REQUEST', reason: null });
+    expect(ledger().invariantViolations).toEqual([]);
+    expect(site.memberOf(memberId)?.name).toBe(EXISTING_NAME);
     // 止めた移動は一覧の画面を読まない（main frame の URL が変わったかの見分けと `PAGE_CHANGED` は、押す部品の T37c が決める）。
     expect(page.url()).not.toBe(`${site.appOrigin}${SPA_APP_PATHS.admin}`);
   }, TEST_TIMEOUT_MS);

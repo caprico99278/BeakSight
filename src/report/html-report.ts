@@ -63,16 +63,19 @@ import {
 } from '../presentation/format.js';
 import {
   AUDIT_SEND_TEXT,
+  FINDING_HOLD_REASON_TEXT,
   HTML_REPORT_TEXT,
   PAGE_COVERAGE_ITEMS,
   REPORT_COMPONENT_TEXT,
   RUN_SUMMARY_TEXT,
   describeBlockedRequestReason,
   earlierAttemptRecordText,
+  evidenceSufficiencyEntries,
   ordinalText,
   retryAttemptText,
   ruleVersionText,
   severityGroupTotalText,
+  specifiedLimitText,
   userAgentLabelText,
 } from '../presentation/messages.js';
 import {
@@ -80,7 +83,7 @@ import {
   joinHtml,
   renderBadge,
   renderCode,
-  renderDocument,
+  renderDocumentChunks,
   renderEvidenceRef,
   renderFileLink,
   renderFindingRow,
@@ -102,8 +105,10 @@ import {
   renderUrl,
   renderUrlAsText,
   toAnchorId,
+  type FindingImageRegionInput,
   type SafeHtml,
   type SectionHeadingLevel,
+  type StreamedSectionInput,
 } from './html-components.js';
 import type {
   EvidenceLocationView,
@@ -274,7 +279,30 @@ const findingRow = (context: RenderContext, view: FindingView, technical: boolea
     technical,
     // OP-R2: やさしい語の行の内容は、Rule のやさしい文（表示用モデルの値のまま）。Rule の文は、記録の段に出す。
     ...(technical ? {} : { plainMessage: view.plainMessage }),
+    // AUD-3d: 問題の場所の画像と、画像の上の場所（表示用モデルの値のまま。覆われた要素の矩形は本文に出さない）。
+    imageRegion: imageRegionInputOf(view),
   });
+
+/** AUD-3d: 表示用モデルの画像の参照から、Finding の行の入力（参照のない指摘は `null`）。 */
+const imageRegionInputOf = (view: FindingView): FindingImageRegionInput | null => {
+  const region = view.imageRegion;
+  if (region === null) {
+    return null;
+  }
+  // EV-2: 保留の理由は、利用者向けの 1 文だけ出す（画像の参照がない指摘も）。
+  const holdText = region.holdReason === null ? null : FINDING_HOLD_REASON_TEXT[region.holdReason];
+  if (region.relativePath === null || region.screenshotEvidenceId === null) {
+    return holdText === null ? null : { relativePath: null, stressWidth: null, missing: false, rects: [], holdText };
+  }
+  const screenshot = view.screenshots.find(({ evidenceId }) => evidenceId === region.screenshotEvidenceId);
+  return {
+    relativePath: region.relativePath,
+    stressWidth: region.stressWidth,
+    missing: screenshot?.missing ?? false,
+    rects: region.regions.filter(({ role }) => role !== 'COVERED').map(({ rect }) => rect),
+    holdText,
+  };
+};
 
 const findingTableOrNone = (context: RenderContext, findings: readonly FindingView[]): Fragment =>
   findings.length === 0
@@ -331,7 +359,7 @@ const loadEntries = (load: RunLoad): readonly { readonly label: string; readonly
   const labels = HTML_REPORT_TEXT.summary.load;
   return [
     { label: labels.minNavigationInterval, value: formatDuration(load.minNavigationIntervalMs) },
-    { label: labels.maxInteractionsPerPage, value: formatCount(load.maxInteractionsPerPage) },
+    { label: labels.maxInteractionsPerPage, value: specifiedLimitText(load.maxInteractionsPerPage, formatCount) },
     { label: labels.navigationCount, value: formatTimes(load.navigationCount) },
     { label: labels.pacingWait, value: formatElapsedTime(load.pacingWaitMs) },
     { label: RUN_SUMMARY_TEXT.allowedOriginRequests, value: formatRequestsWithPeak(load.requests.allowedOrigins) },
@@ -451,6 +479,12 @@ function renderSummary(summary: RunSummaryView, level: SectionHeadingLevel): rea
           value: formatCount(summary.beaksightBlockRelation.byRelation[relation]),
         })),
         { label: text.bundleMainFindings, value: formatCount(summary.beaksightBlockRelation.mainFindingCounts.total) },
+        // AUD-2d: 初めの表示だけの問題（易しい数だけ。印のコードは出さない）。
+        { label: text.initialOnlyFindings, value: formatCount(summary.recheck.initialOnlyFindingCounts.total) },
+        // AUD-2d の直し: 確かめ直しで新しく出た問題（本体に含める。易しい数だけ）。
+        { label: text.lateFindings, value: formatCount(summary.recheck.byMark.LATE) },
+        // EV-5: 証拠の足り方（表示用モデルの数のまま。2 行）。
+        ...evidenceSufficiencyEntries(summary.evidenceSufficiency, formatCount),
       ]),
     ]),
     subsection(level, text.limitsHeading, SUMMARY_ANCHORS.limits, [
@@ -458,15 +492,19 @@ function renderSummary(summary: RunSummaryView, level: SectionHeadingLevel): rea
         caption: null,
         columns: text.limitColumns,
         rows: [
-          renderTableRow([text.limits.maxPages, formatCount(summary.limits.maxPages), reachedText(summary.limits.reached.maxPagesReached)]),
+          renderTableRow([
+            text.limits.maxPages,
+            specifiedLimitText(summary.limits.maxPages, formatCount),
+            reachedText(summary.limits.reached.maxPagesReached),
+          ]),
           renderTableRow([
             text.limits.maxDepth,
-            formatInteger(summary.limits.maxDepth),
+            specifiedLimitText(summary.limits.maxDepth, formatInteger),
             reachedText(summary.limits.reached.maxDepthReached),
           ]),
           renderTableRow([
             text.limits.maxRuntime,
-            formatDuration(summary.limits.maxRuntimeMs),
+            specifiedLimitText(summary.limits.maxRuntimeMs, formatDuration),
             reachedText(summary.limits.reached.maxRuntimeReached),
           ]),
         ],
@@ -562,6 +600,8 @@ function renderOverview(context: RenderContext, viewModel: ReportViewModel, leve
     ...auditSendNotice(summary.auditSend),
     // OP-H: チェックした画面がある点検は、この後に登録・更新することを言う（表示用モデルの `overview.plannedWriteScreenCount` のまま。報告で判定しない）。
     ...(overview.plannedWriteScreenCount > 0 ? [renderParagraph(text.plannedWrites)] : []),
+    // WSO: 「チェックした画面だけ」の点検は、点検した範囲を言う（表示用モデルの `overview.pageScope` のまま）。
+    ...(overview.pageScope === null ? [] : [renderParagraph(text.checkedScreensOnly(formatInteger(overview.pageScope.pageCount)))]),
     subsection(level, text.scopeHeading, OVERVIEW_ANCHORS.scope, [
       renderKeyValueList([
         { label: text.site, value: renderUrl(summary.startUrl, context.allowedOrigins) },
@@ -572,6 +612,8 @@ function renderOverview(context: RenderContext, viewModel: ReportViewModel, leve
     ]),
     subsection(level, text.countsHeading, OVERVIEW_ANCHORS.counts, [
       renderParagraph(overview.problemCount === 0 ? text.noProblems : text.problemsFound(formatCount(overview.problemCount))),
+      // AUD-9c: 問題を同じ作りの所でまとめた数（表示用モデルの値のまま。問題があるときだけ）。
+      ...(overview.problemCount === 0 ? [] : [renderParagraph(text.problemGroups(formatInteger(overview.problemGroupCount)))]),
       renderParagraph(renderMutedText(text.countsNote)),
       renderKeyValueList(
         sortByDisplayOrder(SEVERITIES, SEVERITY_CATALOG).map((severity) => ({
@@ -748,6 +790,10 @@ function renderSafety(context: RenderContext, viewModel: ReportViewModel, level:
         { label: text.blockedActions.popups, value: formatCount(blocked.popups) },
         { label: text.blockedActions.downloads, value: formatCount(blocked.downloads) },
         { label: text.blockedActions.webSockets, value: formatCount(blocked.webSockets) },
+        // SAFE-2 の 4: 違反にしない止めた記録と、外部スキームへの移動の試みの数（持たない古い run.json は 0）。
+        { label: text.blockedActions.frameChecks, value: formatCount(safety.frameClassificationFailureCount ?? 0) },
+        { label: text.blockedActions.readNavigations, value: formatCount(safety.readNavigationFailureCount ?? 0) },
+        { label: text.blockedActions.externalApps, value: formatCount(safety.externalSchemeNavigationCount ?? 0) },
       ]),
     ]),
   ];
@@ -870,7 +916,10 @@ function renderPage(context: RenderContext, view: PageView, index: number, level
 function renderPagesRecord(context: RenderContext, viewModel: ReportViewModel, level: SectionHeadingLevel): Fragment {
   const text = HTML_REPORT_TEXT.record;
   const subLevel = (level + 1) as SectionHeadingLevel;
+  // AUD-1c: 発表の前の確かめで見つからなかったファイルの数（表示用モデルの値のまま。バンドルの `missingArtifactCount` と同じ値。1 以上のときだけ）。
+  const missingCount = viewModel.missingArtifactCount ?? 0;
   return subsection(level, text.pagesHeading, SUMMARY_ANCHORS.pages, [
+    ...(missingCount > 0 ? [renderParagraph(text.missingArtifacts(formatInteger(missingCount)))] : []),
     tableOrNone(null, text.pageColumns, viewModel.pages.map((view) => renderTableRow([
       joinWithSpace([renderUrl(view.pageUrl, context.allowedOrigins), pageLink(context, view.pageId)]),
       renderCode(view.pageId),
@@ -913,8 +962,11 @@ function renderFindingsRecord(context: RenderContext, viewModel: ReportViewModel
 const SECTION_LEVEL: SectionHeadingLevel = 2;
 const SUBSECTION_LEVEL: SectionHeadingLevel = 3;
 
-/** 節ごとの中身（`Record` なので、節を1つ加えると、ここの書き漏れが型のエラーになる）。 */
-const SECTION_RENDERERS: Readonly<Record<ReportSection, (context: RenderContext, viewModel: ReportViewModel) => readonly Fragment[]>> =
+/**
+ * 節ごとの中身（`Record` なので、節を1つ加えると、ここの書き漏れが型のエラーになる）。MEM-4: 中身は、小さな節（またはページ 1 つ分）ずつ順に返す
+ * （ページの節と分類ごとの節は、描きながら返す）。
+ */
+const SECTION_RENDERERS: Readonly<Record<ReportSection, (context: RenderContext, viewModel: ReportViewModel) => Iterable<Fragment>>> =
   Object.freeze({
     // PL-R: 冒頭のまとめの段と、末尾の記録の段（前の要約の節。中身は変えずに移した）。
     OVERVIEW: (context, viewModel) => renderOverview(context, viewModel, SUBSECTION_LEVEL),
@@ -928,14 +980,21 @@ const SECTION_RENDERERS: Readonly<Record<ReportSection, (context: RenderContext,
     // T44f（Task 44 の設計書 P3-1 の D）: 行を出し直さず、分類ごとの節の行へのリンクの一覧にする。
     CRITICAL_FINDINGS: (_context, viewModel) => [findingLinksOrNone(viewModel.criticalFindings)],
     CATEGORY_FINDINGS: (context, viewModel) =>
-      viewModel.categorySections.map((section) => renderCategorySection(context, section, SUBSECTION_LEVEL)),
+      lazyMap(viewModel.categorySections, (section) => renderCategorySection(context, section, SUBSECTION_LEVEL)),
     INTERACTIONS: (context, viewModel) => renderInteractions(context, viewModel, SUBSECTION_LEVEL),
     SAFETY: (context, viewModel) => renderSafety(context, viewModel, SUBSECTION_LEVEL),
     PAGES: (context, viewModel) =>
       viewModel.pages.length === 0
         ? [renderParagraph(HTML_REPORT_TEXT.pages.noPages)]
-        : viewModel.pages.map((view, index) => renderPage(context, view, index, SUBSECTION_LEVEL)),
+        : lazyMap(viewModel.pages, (view, index) => renderPage(context, view, index, SUBSECTION_LEVEL)),
   });
+
+/** 並びの値を、順に描きながら返す（全部を描いてから返さない）。 */
+function* lazyMap<TValue>(values: readonly TValue[], render: (value: TValue, index: number) => Fragment): Generator<Fragment, void, undefined> {
+  for (const [index, value] of values.entries()) {
+    yield render(value, index);
+  }
+}
 
 function createContext(viewModel: ReportViewModel): RenderContext {
   const pageAnchors = new Map<PageId, string>();
@@ -949,18 +1008,41 @@ function createContext(viewModel: ReportViewModel): RenderContext {
 
 /**
  * 表示用モデルから、日本語の静的な HTML レポート（`report.html` の中身）を描く。改行は LF。ファイルは書かない。
- * 節は、設計書 6.1.4 の順（`REPORT_SECTION_CATALOG` の表示の順）に並べる。
+ * 節は、設計書 6.1.4 の順（`REPORT_SECTION_CATALOG` の表示の順）に並べる。`renderHtmlReportChunks` の断片をつないだもの。
  */
 export function renderHtmlReport(viewModel: ReportViewModel): string {
+  return [...renderHtmlReportChunks(viewModel)].join('');
+}
+
+/**
+ * MEM-4（DEF-266）: `renderHtmlReport` と同じ HTML レポートを、断片を順に返す形で描く（全部を 1 つの文字列にしない。書き手は、断片を受け取るたびに書く）。
+ * 1 つの断片は、文書・節の始まりか終わり、節の説明、小さな節（またはページ 1 つ分）より大きくならない。
+ */
+export function renderHtmlReportChunks(viewModel: ReportViewModel): Iterable<string> {
   const context = createContext(viewModel);
-  const sections = sortByDisplayOrder(REPORT_SECTIONS, REPORT_SECTION_CATALOG).map((section) => {
+  return renderDocumentChunks({
+    title: HTML_REPORT_TEXT.title,
+    sections: lazySections(context, viewModel),
+  });
+}
+
+/** 節（設計書 6.1.4 の順）を、順に返す。 */
+function* lazySections(context: RenderContext, viewModel: ReportViewModel): Generator<StreamedSectionInput, void, undefined> {
+  for (const section of sortByDisplayOrder(REPORT_SECTIONS, REPORT_SECTION_CATALOG)) {
     const spec = REPORT_SECTION_CATALOG[section];
-    return renderSection({
+    yield {
       level: SECTION_LEVEL,
       label: spec.label,
       anchorId: spec.anchor,
-      content: [...(spec.description === null ? [] : [renderParagraph(spec.description)]), ...SECTION_RENDERERS[section](context, viewModel)],
-    });
-  });
-  return renderDocument({ title: HTML_REPORT_TEXT.title, content: sections });
+      content: sectionContent(spec.description, SECTION_RENDERERS[section](context, viewModel)),
+    };
+  }
+}
+
+/** 節の説明（あれば）と、節の中身を、順に返す。 */
+function* sectionContent(description: string | null, content: Iterable<Fragment>): Generator<Fragment, void, undefined> {
+  if (description !== null) {
+    yield renderParagraph(description);
+  }
+  yield* content;
 }

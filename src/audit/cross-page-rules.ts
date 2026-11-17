@@ -52,6 +52,82 @@ export type CrossPagePageResult = Pick<PageAuditResult, 'pageId' | 'pageUrl' | '
   readonly viewports: Readonly<Record<ViewportProfile, CrossPageViewportResult>>;
 };
 
+/** MEM-3b: ビューポートのある DOM の Evidence の、Cross-page rule が読む項目（title と canonical と、その切り詰めの印）。 */
+export interface CrossPageDocumentFact {
+  readonly evidenceId: EvidenceId;
+  readonly viewport: ViewportProfile;
+  readonly title: string | null;
+  readonly titleTruncated: boolean;
+  readonly canonicalUrl: string | null;
+  readonly canonicalUrlTruncated: boolean;
+}
+
+/** MEM-3b: link の Evidence の、巡回の候補と同じ取り出しの URL（`internalNavigableUrlsOf`。文書の順）。 */
+export interface CrossPageLinkFact {
+  readonly evidenceId: EvidenceId;
+  readonly urls: readonly NormalizedHttpUrlEvidence[];
+}
+
+/** MEM-3b: ビューポートのある network の Evidence（参照だけに使う）。 */
+export interface CrossPageNetworkFact {
+  readonly evidenceId: EvidenceId;
+  readonly viewport: ViewportProfile;
+}
+
+/**
+ * MEM-3b（DEF-266）: Cross-page rule が読む、1 ページの材料（`CrossPagePageResult` から、Rule が読む項目だけを Evidence の順のまま取り出したもの）。
+ * ページの結果の本体を Run の終わりまで生で持たずに済むよう、ページを終えたときに `crossPagePageFactsOf` で作って要約に持つ。Rule の判定は、
+ * `CrossPagePageResult` を渡したときと同じ。
+ */
+export interface CrossPagePageFacts {
+  readonly pageId: PageAuditResult['pageId'];
+  readonly pageUrl: PageAuditResult['pageUrl'];
+  readonly viewports: Readonly<Record<ViewportProfile, CrossPageViewportResult>>;
+  /** ページのすべての Evidence の ID（Evidence の順。Finding の参照の確かめに使う）。 */
+  readonly evidenceIds: readonly EvidenceId[];
+  readonly documents: readonly CrossPageDocumentFact[];
+  readonly links: readonly CrossPageLinkFact[];
+  readonly networks: readonly CrossPageNetworkFact[];
+}
+
+/** MEM-3b: 1 ページの、Cross-page rule の材料（Evidence の順。入力を変えない）。 */
+export const crossPagePageFactsOf = (page: CrossPagePageResult): CrossPagePageFacts => {
+  const documents: CrossPageDocumentFact[] = [];
+  const links: CrossPageLinkFact[] = [];
+  const networks: CrossPageNetworkFact[] = [];
+  for (const record of page.evidence) {
+    if (record.type === 'dom' && record.viewport !== null) {
+      const { title, canonicalUrl, truncation } = record.payload;
+      documents.push({
+        evidenceId: record.evidenceId,
+        viewport: record.viewport,
+        title,
+        titleTruncated: truncation.documentFields.title,
+        canonicalUrl,
+        canonicalUrlTruncated: truncation.documentFields.canonicalUrl,
+      });
+    } else if (record.type === 'link') {
+      // 巡回の候補と同じ取り出し（`INTERNAL_NAVIGABLE` で正規化が `ok` のもの。文書の順。CC-070 (b)）。
+      links.push({ evidenceId: record.evidenceId, urls: internalNavigableUrlsOf(record.payload.links) });
+    } else if (record.type === 'network' && record.viewport !== null) {
+      networks.push({ evidenceId: record.evidenceId, viewport: record.viewport });
+    }
+  }
+  return {
+    pageId: page.pageId,
+    pageUrl: page.pageUrl,
+    viewports: page.viewports,
+    evidenceIds: page.evidence.map(({ evidenceId }) => evidenceId),
+    documents,
+    links,
+    networks,
+  };
+};
+
+/** 入力のページ（結果か材料）の、材料。 */
+const factsOf = (page: CrossPagePageResult | CrossPagePageFacts): CrossPagePageFacts =>
+  ('evidence' in page ? crossPagePageFactsOf(page) : page);
+
 export interface CrossPageRuleInput {
   /** `AuditConfig.target.id`。fingerprint の対象になる。 */
   readonly targetId: string;
@@ -61,10 +137,18 @@ export interface CrossPageRuleInput {
   readonly allowedOrigins: readonly string[];
   /** `AuditConfig.crawl.allowedQueryParameters`。canonical・最終URL・sitemap のURLを、クロールと同じ規則で正規化するために使う。 */
   readonly allowedQueryParameters: readonly string[];
-  /** 監査したページ（スキップ・失敗したページを含む）。同じ `pageUrl` のページを2つ含めてはならない。 */
-  readonly pages: readonly CrossPagePageResult[];
+  /**
+   * 監査したページ（スキップ・失敗したページを含む）。同じ `pageUrl` のページを2つ含めてはならない。MEM-3b: ページの結果か、その材料
+   * （`crossPagePageFactsOf`。判定は同じ）。
+   */
+  readonly pages: readonly (CrossPagePageResult | CrossPagePageFacts)[];
   /** sitemap の Evidence。sitemap がない場合は省略するか `null`。 */
   readonly sitemap?: SitemapEvidence | null;
+  /**
+   * WSO（REV-WSO の I-2）: クロールがサイトの全部を巡回したか（省略は真）。偽（「チェックした画面だけ」の点検）なら、全部を巡回した前提の判定
+   * （sitemap の URL が発見されなかった、canonical の先が発見されなかった）をしない。
+   */
+  readonly crawlCoversSite?: boolean;
 }
 
 export interface CrossPageEvaluationResult extends MaterializeFindingDraftsResult {
@@ -107,7 +191,7 @@ export interface IndexedFinalUrl {
 }
 
 export interface IndexedPage {
-  readonly page: CrossPagePageResult;
+  readonly page: CrossPagePageFacts;
   /** 正規化した title と、それを記録した DOM の Evidence の ID。2xx の文書の、切り詰めていない title だけ。 */
   readonly titles: ReadonlyMap<string, readonly EvidenceId[]>;
   /** 正規化した canonical と、それを記録した DOM の Evidence の ID。2xx の文書の、切り詰めていない canonical だけ。 */
@@ -150,6 +234,8 @@ export interface CrossPageIndex {
     readonly urls: readonly NormalizedHttpUrlEvidence[];
     readonly truncated: boolean;
   } | null;
+  /** WSO: クロールがサイトの全部を巡回したか（`CrossPageRuleInput.crawlCoversSite`。省略は真）。 */
+  readonly crawlCoversSite: boolean;
 }
 
 export interface ViewportHttpStatus {
@@ -208,10 +294,8 @@ const pushToMapList = <K, V>(map: Map<K, V[]>, key: K, value: V): void => {
  * ページの、指定したビューポートの network の Evidence の ID。ナビゲーションや最終URLの Finding は、これを参照する。
  * 参照できる Evidence がなければ、その Finding は作らない（`evidenceRefs` は1件以上が必要なため）。
  */
-const networkRefsOf = (page: CrossPagePageResult, viewports: readonly ViewportProfile[]): EvidenceId[] =>
-  page.evidence
-    .filter((record) => record.type === 'network' && record.viewport !== null && viewports.includes(record.viewport))
-    .map((record) => record.evidenceId);
+const networkRefsOf = (page: CrossPagePageFacts, viewports: readonly ViewportProfile[]): EvidenceId[] =>
+  page.networks.filter((record) => viewports.includes(record.viewport)).map((record) => record.evidenceId);
 
 /**
  * 正規化した URL が許可Originの外なら、文言に示すための、その URL の Origin を返す。中なら `null`。
@@ -221,7 +305,7 @@ const outsideOriginOf = (url: NormalizedHttpUrlEvidence, allowedOrigins: Readonl
   admissionOf(url, allowedOrigins).kind === 'EXTERNAL_RECORD_ONLY' ? new URL(url).origin : null;
 
 /** ページの Finding の文脈。いまの Cross-page rule の Finding は、どれもビューポートを持たない（`viewport` は null）。 */
-const pageContext = (page: CrossPagePageResult): FindingDraftContext => ({
+const pageContext = (page: CrossPagePageFacts): FindingDraftContext => ({
   pageId: page.pageId,
   pageUrl: page.pageUrl,
   viewport: null,
@@ -274,25 +358,22 @@ const normalizeWithRules = (
   return normalized.ok ? normalized.url : null;
 };
 
-const indexPage = (page: CrossPagePageResult, allowedQueryParameters: ReadonlySet<string>): IndexedPage => {
+const indexPage = (page: CrossPagePageFacts, allowedQueryParameters: ReadonlySet<string>): IndexedPage => {
   const titles = new Map<string, EvidenceId[]>();
   const canonicals = new Map<NormalizedHttpUrlEvidence, EvidenceId[]>();
-  for (const record of page.evidence) {
-    if (record.type !== 'dom' || record.viewport === null) {
-      continue;
-    }
+  for (const record of page.documents) {
     const identity = page.viewports[record.viewport];
     if (!isSuccessStatus(identity.httpStatus)) {
       continue;
     }
-    const { title, canonicalUrl, truncation } = record.payload;
-    if (title !== null && !truncation.documentFields.title) {
+    const { title, canonicalUrl } = record;
+    if (title !== null && !record.titleTruncated) {
       const normalizedTitle = normalizeWhitespace(title);
       if (normalizedTitle.length > 0) {
         pushToMapList(titles, normalizedTitle, record.evidenceId);
       }
     }
-    if (canonicalUrl !== null && !truncation.documentFields.canonicalUrl) {
+    if (canonicalUrl !== null && !record.canonicalUrlTruncated) {
       const canonical = normalizeWithRules(canonicalUrl, identity.finalUrl ?? page.pageUrl, allowedQueryParameters);
       if (canonical !== null) {
         pushToMapList(canonicals, canonical, record.evidenceId);
@@ -326,13 +407,13 @@ const buildIndex = (input: CrossPageRuleInput): { readonly index: CrossPageIndex
   const evidenceIds = new Set<string>();
 
   const pagesByUrl = new Map<string, IndexedPage>();
-  for (const page of input.pages) {
+  for (const page of input.pages.map(factsOf)) {
     if (pagesByUrl.has(page.pageUrl)) {
       throw new TypeError(`cross-page input contains the same page url more than once: ${page.pageUrl}`);
     }
     pagesByUrl.set(page.pageUrl, indexPage(page, allowedQueryParameters));
-    for (const record of page.evidence) {
-      evidenceIds.add(record.evidenceId);
+    for (const evidenceId of page.evidenceIds) {
+      evidenceIds.add(evidenceId);
     }
   }
   const pages = [...pagesByUrl.values()].sort((left, right) => compareCodeUnits(left.page.pageUrl, right.page.pageUrl));
@@ -363,12 +444,8 @@ const buildIndex = (input: CrossPageRuleInput): { readonly index: CrossPageIndex
     }
 
     const targets = new Map<NormalizedHttpUrlEvidence, Set<EvidenceId>>();
-    for (const record of page.evidence) {
-      if (record.type !== 'link') {
-        continue;
-      }
-      // 巡回の候補と同じ取り出し（`INTERNAL_NAVIGABLE` で正規化が `ok` のもの。文書の順。CC-070 (b)）。
-      for (const targetUrl of internalNavigableUrlsOf(record.payload.links)) {
+    for (const record of page.links) {
+      for (const targetUrl of record.urls) {
         discoveredUrls.add(targetUrl);
         const refs = targets.get(targetUrl) ?? new Set<EvidenceId>();
         refs.add(record.evidenceId);
@@ -410,7 +487,7 @@ const buildIndex = (input: CrossPageRuleInput): { readonly index: CrossPageIndex
   }
 
   return {
-    index: { pages, pagesByUrl, allowedOrigins, internalLinks, discoveredUrls, statusesByUrl, sitemap },
+    index: { pages, pagesByUrl, allowedOrigins, internalLinks, discoveredUrls, statusesByUrl, sitemap, crawlCoversSite: input.crawlCoversSite !== false },
     evidenceIds,
   };
 };
@@ -634,7 +711,8 @@ const CANONICAL_TARGET_NOT_FOUND = defineRule(
         if (errorStatuses.length > 0) {
           message = `canonical の遷移先 ${canonical} の応答が HTTP のエラーでした（${formatStatuses(errorStatuses)}）。`
             + `宣言したページ: ${indexed.page.pageUrl}`;
-        } else if (!index.discoveredUrls.has(canonical)) {
+        } else if (index.crawlCoversSite && !index.discoveredUrls.has(canonical)) {
+          // WSO: 全部を巡回していない点検では、発見されなかったとは言えない（判定しない）。
           message = `canonical の遷移先 ${canonical} は、クロールで発見されませんでした。宣言したページ: ${indexed.page.pageUrl}`;
         } else {
           // 発見したが、応答が成功だったか、監査していない（上限など）。監査していないものを問題とはみなさない。
@@ -686,7 +764,8 @@ const SITEMAP_URL_NOT_DISCOVERED = defineRule(
   },
   (rule, index) => {
     const { sitemap } = index;
-    if (sitemap === null) {
+    // WSO: 全部を巡回していない点検では、発見されなかったとは言えない（判定しない）。
+    if (sitemap === null || !index.crawlCoversSite) {
       return [];
     }
     return sitemap.urls
@@ -794,9 +873,13 @@ const UNEXPECTED_ORIGIN_REDIRECT = defineRule(
       const viewports: ViewportProfile[] = [];
       const details: string[] = [];
       for (const viewport of VIEWPORT_PROFILES) {
-        if (page.viewports[viewport].navigationOutcome === 'BLOCKED_EXTERNAL_REDIRECT') {
+        // SD-2（設計書 `2026-11-16-beaksight-action-based-delete-guard-design.md` 2.4）: `BLOCKED_EXTERNAL_REDIRECT` は「点検の範囲の外へ移ったので点検しなかった」の
+        // 意味になった。同じ Origin の範囲の外（読まないパスなど）へ移った画面（最終 URL が許可 Origin の中）は、サイトの外へ移されたのではないので数えない。
+        const finalUrlInside = indexed.finalUrls.some((finalUrl) =>
+          finalUrl.viewport === viewport && outsideOriginOf(finalUrl.url, index.allowedOrigins) === null);
+        if (page.viewports[viewport].navigationOutcome === 'BLOCKED_EXTERNAL_REDIRECT' && !finalUrlInside) {
           viewports.push(viewport);
-          details.push(`${viewport}: 許可Originの外へのリダイレクトを遮断`);
+          details.push(`${viewport}: 点検の範囲の外へ移ったので点検しませんでした`);
           continue;
         }
         const outside = indexed.finalUrls.find((finalUrl) =>

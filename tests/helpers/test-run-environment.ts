@@ -22,6 +22,24 @@ export const CLI_CHROMIUM_RUN_ENVIRONMENT: Readonly<Record<string, string>> = Ob
 });
 
 /**
+ * SLIM-B0: 2 つの Chromium の組（`tests/helpers/chromium.ts` の `chromiumRunsOf`・`BOTH_CHROMIUM_LAUNCHERS`）を、両方の Chromium に広げる環境変数
+ * （値が `BOTH_CHROMIUM_SELECTION` のときだけ）。省略とほかの値は、CLI の起動の設定（本番）の 1 つだけ。広げるのは、安全の不具合を直す束、Guard・中継・
+ * 起動の部品を変えた束、Chromium の版を上げるときだけ（`tests/run-suite.mjs` の `safety`、`related --with-safety`・`--both-chromium`）。
+ */
+export const BOTH_CHROMIUM_ENVIRONMENT_VARIABLE = 'BEAKSIGHT_TEST_BOTH_CHROMIUM';
+/** `BOTH_CHROMIUM_ENVIRONMENT_VARIABLE` の、両方の Chromium に広げる値。 */
+export const BOTH_CHROMIUM_SELECTION = 'both';
+/** 両方の Chromium に広げる回で、起動の部品が子のプロセスに渡す環境変数。 */
+export const BOTH_CHROMIUM_RUN_ENVIRONMENT: Readonly<Record<string, string>> = Object.freeze({
+  [BOTH_CHROMIUM_ENVIRONMENT_VARIABLE]: BOTH_CHROMIUM_SELECTION,
+});
+
+/** この回が 2 つの Chromium の組を両方に広げるか（`BOTH_CHROMIUM_ENVIRONMENT_VARIABLE` が `BOTH_CHROMIUM_SELECTION`。唯一の判定）。 */
+export function isBothChromiumSelected(environment: Readonly<Record<string, string | undefined>> = process.env): boolean {
+  return environment[BOTH_CHROMIUM_ENVIRONMENT_VARIABLE] === BOTH_CHROMIUM_SELECTION;
+}
+
+/**
  * TS-b: 回数を重ねるテストの回数（`tests/helpers/test-rounds.ts`）を、全部の組の値にする環境変数（値が `FULL_TEST_TIER` のときだけ）。
  * 省略とほかの値は、ふだんの組の値。
  */

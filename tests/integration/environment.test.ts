@@ -157,7 +157,6 @@ describe('collectRunEnvironment (R15c)', () => {
       incompleteReasons: [{ code: 'PREFLIGHT_FAILED', detail: 'BROWSER_LAUNCH' }],
       load: {
         minNavigationIntervalMs: config.crawl.minNavigationIntervalMs,
-        maxInteractionsPerPage: config.crawl.maxInteractionsPerPage,
         navigationCount: 0,
         pacingWaitMs: 0,
         requests: {

@@ -562,18 +562,74 @@ export interface RecordedRequestUrlRedactionOptions {
  * 判定は、この前（伏せる前の値）で終わっている（呼び出し側は書き手だけ）。
  */
 export function redactRecordedRequestUrlsInValue<T>(value: T, options: RecordedRequestUrlRedactionOptions = {}): T {
-  const redactions: RecordedUrlRedactions = {
-    pairs: new Map(),
-    blocked: new Set(),
-    pageIdentities: new Set(options.keptUrls ?? []),
-    loadedDocuments: new Set(),
-  };
+  const redactions = recordedUrlRedactionsOf(options);
   const structural = redactStructurally(value, redactions);
-  if (options.matchValues === false) {
-    return structural as T;
+  return (options.matchValues === false ? structural : replaceMatchedValuesByTable(structural, matchTableOf(redactions))) as T;
+}
+
+/** 伏せる前と後の値の組を覚える段の、空の入れ物（`keptUrls` を、ページの identity に入れておく）。 */
+const recordedUrlRedactionsOf = (options: RecordedRequestUrlRedactionOptions): RecordedUrlRedactions => ({
+  pairs: new Map(),
+  blocked: new Set(),
+  pageIdentities: new Set(options.keptUrls ?? []),
+  loadedDocuments: new Set(),
+});
+
+/** (b) の段（表が空なら、名前で伏せた写しのまま）。 */
+const replaceMatchedValuesByTable = (structural: unknown, table: MatchTable): unknown =>
+  (table.tokens.size === 0 ? structural : replaceMatchedValues(structural, table));
+
+/**
+ * MEM-1（DEF-266）: 2 つの段に分けた伏せ字の表（`recordedRequestUrlRedactionTableOf` が作る。中身は呼び出し側に見せない）。`null` は、値で照らす段を
+ * 行わない（`matchValues` が偽）。
+ */
+export interface RecordedRequestUrlRedactionTable {
+  readonly match: MatchTable | null;
+}
+
+/**
+ * MEM-1（DEF-266）の 1 回目: 値の木を部分（`parts`。たとえば、ページの一覧を空にした Run と、各ページ）に分けて順に見て、木の全体の照らす表を作る
+ * （`redactRecordedRequestUrlsInValue` が木の全体から作る表と同じ中身）。名前で伏せた写しは、部分ごとに捨てる（同時に持つのは 1 つの部分と表だけ）。
+ * 部分に分けるときは、木の中の位置が名前で伏せる段に効かない所（名前の一覧にない欄の配列の項目など）で分ける（呼び出し側の責務）。
+ */
+export function recordedRequestUrlRedactionTableOf(
+  parts: Iterable<unknown>,
+  options: RecordedRequestUrlRedactionOptions = {},
+): RecordedRequestUrlRedactionTable {
+  const builder = createRecordedRequestUrlRedactionTableBuilder(options);
+  for (const part of parts) {
+    builder.add(part);
   }
-  const table = matchTableOf(redactions);
-  return (table.tokens.size === 0 ? structural : replaceMatchedValues(structural, table)) as T;
+  return builder.table();
+}
+
+/**
+ * MEM-3d（DEF-266）: `recordedRequestUrlRedactionTableOf` と同じ表を、部分を 1 つずつ足して作るもの（部分を非同期に 1 つずつ取り出す呼び出し側のため）。
+ * 足した部分の写しは持たない。`table` は、足し終えた後に 1 回だけ呼ぶ。
+ */
+export function createRecordedRequestUrlRedactionTableBuilder(options: RecordedRequestUrlRedactionOptions = {}): {
+  readonly add: (part: unknown) => void;
+  readonly table: () => RecordedRequestUrlRedactionTable;
+} {
+  if (options.matchValues === false) {
+    return { add: () => undefined, table: () => Object.freeze({ match: null }) };
+  }
+  const redactions = recordedUrlRedactionsOf(options);
+  return {
+    add: (part) => {
+      redactStructurally(part, redactions);
+    },
+    table: () => Object.freeze({ match: matchTableOf(redactions) }),
+  };
+}
+
+/**
+ * MEM-1（DEF-266）の 2 回目: 部分（`value`）の写しを作り、1 回目の表（`table`）で、記録した要求の URL を伏せる。部分ごとの結果を元の位置に戻すと、木の全体を
+ * `redactRecordedRequestUrlsInValue` で伏せた結果と同じ（名前で伏せる段は部分の中だけで決まり、値で照らす段は表だけで決まる）。入力は変えない。
+ */
+export function redactRecordedRequestUrlsByTable<T>(value: T, table: RecordedRequestUrlRedactionTable): T {
+  const structural = redactStructurally(value, recordedUrlRedactionsOf({}));
+  return (table.match === null ? structural : replaceMatchedValuesByTable(structural, table.match)) as T;
 }
 
 /** JSON の値として扱うオブジェクト（prototype が `Object.prototype` か `null`）か。 */

@@ -1,6 +1,6 @@
 // T27e（Task 27 の設計書 4.5、4.6）: READ の確かめのジョブ（`READ_CHECK`）の、ジョブの管理（`createAuditJobManager` の `startReadCheck` と、ジョブの
 // 終わりの結果の記録）を、偽のワーカー（`tests/helpers/fake-audit-worker.ts` の `read-check` の動き）を本物の `fork` で起動して確かめる（本物の
-// ワーカーと Chromium での端から端は `discovery-job-fork.test.ts` の「T27e」の describe）。
+// Chromium での READ の確かめの流れは `read-check-run.test.ts`、画面からの端から端は `full-flow.test.ts`）。
 // - 開始の確かめは発見と同じ（プロファイルが `TEST_AUTH_PASSIVE`、認証の設定が `CURRENT`）。取り消していない定義が 0 件なら
 //   `READ_CHECK_DEFINITIONS_MISSING`（ワーカーを起動しない）。公開の監査のプロファイルは拒む。
 // - `START` は、`READ_CHECK` の種類と、認証の指定（種類を含む SHA-256）と、定義の一覧（定義の ID・今の版・対象の候補の画面・定義の中身）を持つ。
@@ -32,7 +32,7 @@ import { saveAuthSetup } from '../../src/control/store/auth-setup-store.js';
 import { closeControlDatabase, openControlDatabase, type ControlDatabase } from '../../src/control/store/control-database.js';
 import { resolveControlDatabasePath } from '../../src/control/store/database-path.js';
 import { createProfile } from '../../src/control/store/profile-store.js';
-import { MAX_WORKER_READ_CHECKS, workerAuthenticationDigestOf } from '../../src/control/worker-protocol.js';
+import { workerAuthenticationDigestOf } from '../../src/control/worker-protocol.js';
 import type { DiscoveredCandidate, DiscoveryCandidate } from '../../src/discovery/candidate-contracts.js';
 import { classifyCandidate } from '../../src/discovery/classify.js';
 import {
@@ -121,7 +121,8 @@ const definitionFor = (targetIdentityDigest: string, q = 'x'): ReadCheckDefiniti
   expectations: [{ kind: 'ROW_COUNT_AT_LEAST', count: 1 }],
 });
 
-const discoveryDocument = (jobId: string): DiscoveryDocument => ({
+/** DEF-235: 読み切れた画面に足す path（候補なし。番号の元 1 の確かめに使う）。 */
+const discoveryDocument = (jobId: string, readPaths: readonly string[] = []): DiscoveryDocument => ({
   schemaVersion: DISCOVERY_ARTIFACT_SCHEMA_VERSION,
   jobId,
   runId: FAKE_RUN_ID,
@@ -133,6 +134,9 @@ const discoveryDocument = (jobId: string): DiscoveryDocument => ({
   pages: [
     { url: `${TEST_ORIGIN}/admin/items`, state: 'READ', record: { location: location('/admin/items'), incompleteReasons: [], candidates: [SEARCH] }, blockedRequests: 0 },
     { url: `${TEST_ORIGIN}/admin/lookup`, state: 'READ', record: { location: location('/admin/lookup'), incompleteReasons: [], candidates: [LOOKUP] }, blockedRequests: 0 },
+    ...readPaths.map((path) => ({
+      url: `${TEST_ORIGIN}${path}`, state: 'READ' as const, record: { location: location(path), incompleteReasons: [], candidates: [] }, blockedRequests: 0,
+    })),
   ],
   omittedUnreadPages: 0,
 });
@@ -168,8 +172,8 @@ async function managerWith(worker: FakeWorker, forkWorker: AuditWorkerForker = c
 const currentManager: JobViewSource = { getAuditJob: (jobId) => manager?.getAuditJob(jobId) ?? null };
 
 /** 発見のジョブを 1 回、偽のワーカーで行い、索引と `discovery.json` を作る。 */
-async function discover(profileId = PROFILE_ID): Promise<void> {
-  const document = discoveryDocument('__JOB_ID__');
+async function discover(profileId = PROFILE_ID, readPaths: readonly string[] = []): Promise<void> {
+  const document = discoveryDocument('__JOB_ID__', readPaths);
   const worker = fakeWorker('discovery', {
     discovery: {
       outputDirectory: resolve(workDirectory, OUTPUT_DIRECTORY),
@@ -275,14 +279,12 @@ describe('READ check jobs (T27e): the start', () => {
         [ended.jobId, 'read-2', 2, 'NOT_MATCHED'],
         [ended.jobId, 'read-3', 1, 'READ_CANDIDATE_DRIFTED'],
       ]);
-    // IPC: 結果を載せず、件数の要約だけ。
-    expect(MAX_WORKER_READ_CHECKS).toBe(20);
   }, TEST_TIMEOUT_MS);
 
   // T28b（Task 28 の設計書 2 章のユーザーの判断 1、4.5）: 書き込みのモード（`TEST_APPROVED_WRITE`）のプロファイルでも、認証の設定・発見・READ の
   // 確かめの定義の保存・READ の確かめのジョブができる（確かめは認証つきの読み取りの監査と同じ）。MI-5（設計書
   // `2026-10-26-beaksight-minimal-input-ux-design.md` 4.5）: 認証つきの監査（`AUDIT`）は、書き込みのモードでも始められるようになったので、ここで拒むことは
-  // 確かめない（書き込みのモードの監査の開始の確かめは `control-audit-jobs.test.ts`、読み取りだけであることは `write-mode-audit-read-only.test.ts`）。
+  // 確かめない（書き込みのモードの監査の開始の確かめは `control-audit-jobs.test.ts`、送信の扱いがモードを見ないことは `tests/unit/audit-send-settings.test.ts`）。
   it('runs the READ check of a write mode profile after its discovery (T28b)', async () => {
     expect(createProfile(database, testWriteProfile(WRITE_PROFILE_ID, MIN_PROFILE_REVISION), { resolveContext: resolveTestContext }).ok).toBe(true);
     expect(saveAuthSetup(database, { ...SETUP, profileId: WRITE_PROFILE_ID }, { resolveContext: resolveTestContext })).toMatchObject({ ok: true });
@@ -324,6 +326,35 @@ describe('READ check jobs (T27e): the start', () => {
     ]);
     expect(readRecentReadCheckResults(database, PROFILE_ID).map(({ readCheckId, result }) => [readCheckId, result]).sort())
       .toEqual([['read-1', 'MATCHED'], ['read-2', 'UNDETERMINED']]);
+  }, TEST_TIMEOUT_MS);
+
+  // L4（COV-7）: 定義の数で切らない。前の上限 20 を超える 25 件を、全部 START に入れ、全部の結果を記録する。
+  it('sends every definition to the job, more than the former limit of 20, and records every result (L4)', async () => {
+    await discover();
+    const count = 25;
+    for (let index = 0; index < count; index += 1) {
+      createDefinition(`read-${index}`, definitionFor(SEARCH.identityDigest, `q${index}`));
+    }
+    const ended = await runReadCheckJob('many', { results: Array.from({ length: count }, () => 'MATCHED' as const) });
+    expect(ended).toMatchObject({ jobKind: 'READ_CHECK', state: 'FINISHED', failureReason: null });
+    expect((ended.received.find((message) => message['type'] === 'START')?.['readChecks'] as readonly unknown[])).toHaveLength(count);
+    expect(readRecentReadCheckResults(database, PROFILE_ID)).toHaveLength(count);
+  }, TEST_TIMEOUT_MS);
+
+  // DEF-235（設計書 3.1。FIX-235 の読み替え）: 画面の path の型の定義には、番号の元（最新の操作さがしで読み切れた同じ型の画面）の番号を全部付ける。番号のない
+  // 型の定義は付けない（ワーカーが一覧の画面を読む）。型でない定義は今のまま。
+  it('sends a page path template with every record id of the pages read by the last discovery (DEF-235)', async () => {
+    await discover(PROFILE_ID, ['/admin/items/12', '/admin/items/7', '/admin/items/new', '/admin/other/3']);
+    const template: ReadCheckDefinition = { targetPagePath: '/admin/items/{id}', parameters: {}, expectations: [{ kind: 'ROW_COUNT_AT_LEAST', count: 1 }] };
+    const unlisted: ReadCheckDefinition = { ...template, targetPagePath: '/admin/members/{id}' };
+    createDefinition('read-1', template);
+    createDefinition('read-2', unlisted);
+    const ended = await runReadCheckJob('record-ids', { results: ['MATCHED', 'UNDETERMINED'] });
+    expect(ended).toMatchObject({ jobKind: 'READ_CHECK', state: 'FINISHED', failureReason: null });
+    expect(ended.received.find((message) => message['type'] === 'START')?.['readChecks']).toEqual([
+      { readCheckId: 'read-1', readCheckRevision: 1, targetPage: location('/admin/items/{id}'), definition: template, recordIds: ['12', '7'] },
+      { readCheckId: 'read-2', readCheckRevision: 1, targetPage: location('/admin/members/{id}'), definition: unlisted },
+    ]);
   }, TEST_TIMEOUT_MS);
 });
 

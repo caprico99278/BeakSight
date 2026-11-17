@@ -11,11 +11,11 @@
  *   最初の自動ログインで兼ねる）。ログインの確かめのジョブは、開始の Server Function（`startLoginCheckFn`）で始めて確かめる。始められない理由は、開始の
  *   画面の要点に出る。
  * - 監査の開始の画面の自動ログインの案内と上限の状態、環境の状態の画面の暗号化の状態。
- * - 手動のログインのプロファイルでは、資格情報の画面を出さず、直接の要求を拒む。CSRF（cross-site の POST は 403）、スキーマに合わない入力は 400。
+ * - 手動のログインのプロファイルでは、資格情報の画面を出さず、直接の要求を拒む。CSRF（403）とスキーマに合わない入力（400）、その応答と画面のサーバの
+ *   出力に目印の値がないことは、`server-guards.test.ts` の Server Function の表で確かめる。
  * - 値を出さない: 目印の値（ユーザー名とパスワード）が、ページの HTML（すべての画面）、Server Function の応答（成功と誤り）、画面のサーバの標準出力と
  *   標準エラー、管理データのファイルと WAL、資格情報のファイル（暗号文）のどこにもない。
- * - Windows でないとき（画面のサーバの `process.platform` をテストだけの前処理で差し替える）は「この環境では使えない」を出し、保存を拒む。起動のときに
- *   資格情報のフォルダの書きかけの一時のファイルを消す。
+ * - Windows でないときの拒否と、起動のときの一時のファイルの片付けは、速い組（ファイルの終わりの注）で確かめる。
  * - すべての画面で、CSP の違反と console の誤りが 0 件、外部への要求が 0 件。ワーカーと Chromium の process が残らない。
  * 資格情報は、本物の DPAPI（Windows だけ。一時の root の中の資格情報のフォルダ。資格情報マネージャーは使わない）で暗号化する。Windows でなければ、
  * その場面を理由を出して飛ばす。監査のワーカーは、一時の root の入口をテストだけの入口に替えて動かす（自動ログインの段は本番のまま。headless）。
@@ -24,7 +24,6 @@
  */
 import { randomUUID } from 'node:crypto';
 import { existsSync, mkdirSync, writeFileSync } from 'node:fs';
-import { pathToFileURL } from 'node:url';
 import type { Browser, BrowserContext, Locator, Page } from 'playwright';
 import { afterAll, afterEach, beforeAll, describe, expect, it } from 'vitest';
 import {  AUTOMATED_LOGIN_MAX_LOGIN_ATTEMPTS,
@@ -37,7 +36,6 @@ import {
   resolveCredentialDirectory,
 } from '../../../src/control/credentials/credential-store.js';
 import { CONTROL_DATA_DIRECTORY_NAME } from '../../../src/control/store/database-path.js';
-import { temporaryPathFor } from '../../../src/core/temporary-file-name.js';
 import { AUTOMATED_LOGIN_RESULT_CATALOG, CREDENTIAL_ENVIRONMENT_CATALOG } from '../../../src/presentation/catalog.js';
 import { formatCount, formatElapsedTime, formatInteger, formatTimes } from '../../../src/presentation/format.js';
 import { AUTO_LOGIN_DAILY_MAX_ATTEMPTS, AUTO_LOGIN_DAILY_WINDOW_MS, AUTO_LOGIN_MIN_INTERVAL_MS } from '../../../src/control/job/auto-login-limits.js';
@@ -68,17 +66,17 @@ import { openAuthSetupAdvancedSettings } from './helpers/auth-setup-page.ts';
 import { MANUAL_LOGIN_STAGE_RECORD, WORKER_RECORD_FILES, installTestAutomatedLoginWorkerEntry } from './helpers/auth-worker.ts';
 import { profileStageOf } from './helpers/next-steps.ts';
 import {
+  BUILT_SERVER_ENTRY,
   createTemporaryUiRoot,
   findFreePort,
   parseSetCookie,
   rawRequest,
   startLauncher,
-  startLauncherWithNodeArguments,
   stopServer,
   type StartedServer,
   type TemporaryUiRoot,
 } from './helpers/local-server.ts';
-import { callServerFunction, encodeServerFunctionPayload, readServerFunctionIds } from './helpers/server-functions.ts';
+import { callServerFunction, readServerFunctionIds } from './helpers/server-functions.ts';
 import { waitForJobViaServerFunctions } from './helpers/server-function-job-wait.ts';
 import { filesUnder, leakedPlaces } from './helpers/secret-markers.ts';
 import { createProfileInStore, saveProfileAndAuthSetupInStore, saveAuthSetupRequestInStore } from './helpers/profile-store-setup.ts';
@@ -101,7 +99,7 @@ const POLL_MS = 250;
 /** フォーカスを Tab で動かす回数の上限。 */
 const MAX_TAB_PRESSES = 80;
 /** HTTP の状態。 */
-const STATUS = Object.freeze({ OK: 200, BAD_REQUEST: 400, FORBIDDEN: 403 });
+const STATUS = Object.freeze({ OK: 200 });
 const FIRST_REVISION = 1;
 
 /** テストの値（匿名）。 */
@@ -109,7 +107,6 @@ const MAIN_PROFILE = 't26e-main';
 const INVALID_PROFILE = 't26e-invalid';
 const SLOW_PROFILE = 't26e-slow';
 const MANUAL_PROFILE = 't26e-manual';
-const LINUX_PROFILE = 't26e-linux';
 /** T26g-2: 取り消しで資格情報を消す（ジョブなし・ジョブあり）、自動ログインでなくなったプロファイルに残った資格情報を消す。 */
 const RETIRE_PROFILE = 't26g2-retire';
 const RETIRE_RUNNING_PROFILE = 't26g2-retire-running';
@@ -322,7 +319,7 @@ describe.skipIf(!IS_WINDOWS)(`T26e: the automated login screens${IS_WINDOWS ? ''
     recordDirectory = `${root.root}/t26e-worker-records`;
     installTestAutomatedLoginWorkerEntry(root.root, recordDirectory);
     fixture = await startAutomatedLoginFixture({ username: USER_OK, password: PASS_OK, onSlowPost: () => { slowPosts += 1; } });
-    ids = readServerFunctionIds(`${root.root}/apps/local-ui/dist/server/server.js`);
+    ids = readServerFunctionIds(BUILT_SERVER_ENTRY);
     browser = await launchHeadlessChromium();
     server = await startLauncher(root, await findFreePort());
     context = await browser.newContext();
@@ -962,42 +959,6 @@ describe.skipIf(!IS_WINDOWS)(`T26e: the automated login screens${IS_WINDOWS ? ''
     await snapshot(page);
   }, SCENARIO_TIMEOUT_MS);
 
-  it('keeps the CSRF protection (a cross-site POST is 403) and rejects inputs that do not match the schemas with 400', async () => {
-    const before = await valueOf<{ credential: unknown }>('getCredentialPageFn', 'GET', { profileId: INVALID_PROFILE });
-    const posts: readonly (readonly [string, unknown])[] = [
-      ['registerCredentialFn', { profileId: MAIN_PROFILE, username: USER_OK, password: PASS_OK, passwordConfirmation: PASS_OK }],
-      ['changeCredentialFn', { profileId: INVALID_PROFILE, username: USER_OTHER, password: null, passwordConfirmation: null, clearHold: false }],
-      ['replaceCredentialFn', { profileId: INVALID_PROFILE, username: USER_OTHER, password: PASS_OK, passwordConfirmation: PASS_OK, clearHold: true }],
-      ['removeCredentialFn', { profileId: INVALID_PROFILE }],
-      ['clearAutoLoginHoldFn', { profileId: INVALID_PROFILE }],
-      ['startLoginCheckFn', { profileId: INVALID_PROFILE, expectedRevision: FIRST_REVISION }],
-    ];
-    for (const [name, data] of posts) {
-      const response = await rawRequest(started().port, `/_serverFn/${ids.get(name) ?? ''}`, {
-        method: 'POST',
-        headers: { cookie, 'content-type': 'application/json', 'x-tsr-serverfn': 'true', 'sec-fetch-site': 'cross-site', origin: started().origin },
-        body: encodeServerFunctionPayload(data),
-      });
-      responseBodies.push(response.body);
-      expect(response.status, name).toBe(STATUS.FORBIDDEN);
-    }
-    const tooLong = 'a'.repeat(MAX_CREDENTIAL_VALUE_LENGTH + 1);
-    const invalid: readonly (readonly [string, unknown])[] = [
-      ['registerCredentialFn', { profileId: MAIN_PROFILE, username: tooLong, password: PASS_OK, passwordConfirmation: PASS_OK }],
-      ['registerCredentialFn', { profileId: MAIN_PROFILE, username: USER_OK, password: PASS_OK }],
-      ['registerCredentialFn', { profileId: MAIN_PROFILE, username: USER_OK, password: PASS_OK, passwordConfirmation: PASS_OK, extra: 1 }],
-      ['changeCredentialFn', { profileId: INVALID_PROFILE, username: USER_OTHER, password: null, passwordConfirmation: null }],
-      ['replaceCredentialFn', { profileId: INVALID_PROFILE, username: 1, password: PASS_OK, passwordConfirmation: PASS_OK, clearHold: false }],
-      ['startLoginCheckFn', { profileId: INVALID_PROFILE, expectedRevision: 0 }],
-    ];
-    for (const [name, data] of invalid) {
-      const result = await callFunction(name, 'POST', data);
-      expect(result.response.status, name).toBe(STATUS.BAD_REQUEST);
-    }
-    expect(await valueOf('getCredentialPageFn', 'GET', { profileId: INVALID_PROFILE })).toEqual(before);
-    expect(await valueOf('getCredentialPageFn', 'GET', { profileId: MAIN_PROFILE })).toMatchObject({ credential: null });
-  }, SCENARIO_TIMEOUT_MS);
-
   it('never shows the values: the pages, the responses, the server output, the control data and the credential files', () => {
     expect(htmlSnapshots.length).toBeGreaterThan(10);
     expect(responseBodies.length).toBeGreaterThan(10);
@@ -1018,134 +979,6 @@ describe.skipIf(!IS_WINDOWS)(`T26e: the automated login screens${IS_WINDOWS ? ''
   });
 });
 
-// ---------------------------------------------------------------------------------------------------------------
-// Windows でないとき（画面のサーバの `process.platform` を、テストだけの前処理で差し替える）と、起動のときの一時のファイルの片付け
-// ---------------------------------------------------------------------------------------------------------------
-
-/** 画面のサーバの process の中で、`process.platform` を Windows でない値にするテストだけの前処理（`node --import`）。 */
-const PLATFORM_OVERRIDE_SOURCE = "Object.defineProperty(process, 'platform', { value: 'linux', configurable: true, enumerable: true });\n";
-
-describe('T26e: on a platform that is not Windows (the server judges it), and the startup cleanup', () => {
-  let linuxRoot: TemporaryUiRoot | undefined;
-  let linuxServer: StartedServer | undefined;
-  let linuxBrowser: Browser | undefined;
-  let linuxCookie = '';
-  let linuxIds: ReadonlyMap<string, string> = new Map();
-  const leftovers: string[] = [];
-  let keptFile = '';
-
-  const linuxCall = async (name: string, method: 'GET' | 'POST', data?: unknown): Promise<unknown> => {
-    if (linuxServer === undefined) {
-      throw new Error('サーバが起動していない');
-    }
-    const result = await callServerFunction({ port: linuxServer.port, origin: linuxServer.origin, cookie: linuxCookie, ids: linuxIds }, name, method, data);
-    expect(result.response.status, name).toBe(STATUS.OK);
-    expect(leaks(result.response.body)).toBe(false);
-    return result.value;
-  };
-
-  beforeAll(async () => {
-    linuxRoot = createTemporaryUiRoot('built');
-    // 前の画面のサーバが残した、書きかけの一時のファイル（起動のときに消える）と、ほかのファイル（残る）。
-    const secrets = `${linuxRoot.root}/local/secrets`;
-    mkdirSync(secrets, { recursive: true });
-    leftovers.push(temporaryPathFor(`${secrets}/${LINUX_PROFILE}.credential.json`), temporaryPathFor(`${secrets}/other.credential.json`));
-    for (const path of leftovers) {
-      writeFileSync(path, '{}');
-    }
-    keptFile = `${secrets}/notes.txt`;
-    writeFileSync(keptFile, 'kept');
-    const preload = `${linuxRoot.root}/t26e-platform-override.mjs`;
-    writeFileSync(preload, PLATFORM_OVERRIDE_SOURCE, 'utf8');
-    linuxIds = readServerFunctionIds(`${linuxRoot.root}/apps/local-ui/dist/server/server.js`);
-    linuxServer = await startLauncherWithNodeArguments(linuxRoot, await findFreePort(), ['--import', pathToFileURL(preload).href]);
-    const exchange = await rawRequest(linuxServer.port, `${linuxServer.tokenUrl.pathname}${linuxServer.tokenUrl.search}`);
-    linuxCookie = parseSetCookie(exchange.headers['set-cookie'])?.pair ?? '';
-    linuxBrowser = await launchHeadlessChromium();
-  }, SCENARIO_TIMEOUT_MS);
-
-  afterAll(async () => {
-    await linuxBrowser?.close();
-    await stopServer(linuxServer);
-    linuxRoot?.remove();
-  });
-
-  it('removes the temporary files left in the credential folder at startup, and keeps the other files', () => {
-    expect(leftovers.filter((path) => existsSync(path))).toEqual([]);
-    expect(existsSync(keptFile)).toBe(true);
-  });
-
-  it('shows "not available in this environment" judged on the server, and rejects saving', async () => {
-    if (linuxRoot === undefined || linuxServer === undefined || linuxBrowser === undefined) {
-      throw new Error('準備ができていない');
-    }
-    const config = `config/targets/${LINUX_PROFILE}.json`;
-    writeFileSync(`${linuxRoot.root}/${config}`, `${JSON.stringify({
-      target: { id: LINUX_PROFILE },
-      site: { startUrl: 'http://127.0.0.1:9/home', allowedOrigins: ['http://127.0.0.1:9'] },
-      crawl: { minNavigationIntervalMs: 0, maxPages: 1 },
-      output: { directory: 't26e-output-linux' },
-    }, null, 2)}\n`, 'utf8');
-    // MI-F1（設計書 4.7.1 の 2）: 自動ログインのプロファイルは、画面の作成の口では作れない（切り替えだけで入る）。テストの準備は、保存の部品で直接作る。
-    expect(await createProfileInStore(linuxRoot.root, {
-      schemaVersion: 'beaksight-profile/1',
-      profileId: LINUX_PROFILE,
-      revision: FIRST_REVISION,
-      targetConfigPath: config,
-      environment: 'TEST',
-      mode: 'TEST_AUTH_PASSIVE',
-      auth: 'AUTOMATED_LOGIN',
-      approvedTestOrigins: ['http://127.0.0.1:9'],
-      environmentEvidenceRef: 't26e-evidence',
-    })).toMatchObject({ ok: true });
-    expect(await saveAuthSetupRequestInStore(linuxRoot, {
-      setup: {
-        ...FORM_NAVIGATION_SETUP_ITEMS,
-        profileId: LINUX_PROFILE,
-        profileRevision: FIRST_REVISION,
-        loginStartUrl: 'http://127.0.0.1:9/login',
-        loginPostEndpoints: [{ origin: 'http://127.0.0.1:9', path: '/login' }],
-        successCondition: { pathPrefix: '/home', selector: '#home' },
-        sessionLostCondition: { pathPrefix: null },
-        excludedPaths: ['/logout'],
-        auditPathPrefixes: ['/home'],
-        maxLoginAttempts: AUTOMATED_LOGIN_MAX_LOGIN_ATTEMPTS,
-        allowedIdpOrigins: [],
-        automatedLogin: {
-          usernameSelector: '#user',
-          passwordSelector: '#pass',
-          submitSelector: '#go',
-          failureConditions: { invalidCredentials: null, accountLocked: null, mfaRequired: null, credentialExpired: null },
-        },
-      },
-    })).toMatchObject({ ok: true });
-    expect(await linuxCall('environmentStatusFn', 'GET')).toMatchObject({ credentialEnvironment: 'NOT_WINDOWS' });
-    expect(await linuxCall('registerCredentialFn', 'POST', {
-      profileId: LINUX_PROFILE, username: USER_OK, password: PASS_OK, passwordConfirmation: PASS_OK,
-    })).toEqual({ ok: false, reason: 'CREDENTIAL_PLATFORM_UNSUPPORTED', field: null });
-    expect(existsSync(`${linuxRoot.root}/local/secrets/${LINUX_PROFILE}.credential.json`)).toBe(false);
-    expect(await linuxCall('startLoginCheckFn', 'POST', { profileId: LINUX_PROFILE, expectedRevision: FIRST_REVISION }))
-      .toMatchObject({ ok: false, reason: 'CREDENTIAL_MISSING' });
-
-    const linuxContext = await linuxBrowser.newContext();
-    try {
-      const page = await linuxContext.newPage();
-      await page.goto(linuxServer.tokenUrl.href, { waitUntil: 'networkidle' });
-      await page.goto(`${linuxServer.origin}/credentials/${LINUX_PROFILE}`, { waitUntil: 'networkidle' });
-      expect(await page.getByTestId('credential-unavailable').getAttribute('data-state')).toBe('NOT_WINDOWS');
-      expect(await page.getByTestId('credential-unavailable').textContent()).toBe(CREDENTIAL_ENVIRONMENT_CATALOG.NOT_WINDOWS.description);
-      // PL-4（設計書 3 章の 2）: 暗号化の行は出さない（上の知らせだけ）。
-      expect(await page.getByTestId('credential-protection').count()).toBe(0);
-      expect(await page.getByTestId('credential-register-form').count()).toBe(0);
-      expect(await page.locator('input[type="password"]').count()).toBe(0);
-      expect(leaks(await page.content())).toBe(false);
-      await screenshot(page, '20-credentials-not-windows');
-      await page.goto(`${linuxServer.origin}/environment`, { waitUntil: 'networkidle' });
-      expect(await page.getByTestId('environment-credential-protection').getAttribute('data-state')).toBe('NOT_WINDOWS');
-      await screenshot(page, '21-environment-not-windows');
-    } finally {
-      await linuxContext.close();
-    }
-    expect(leaks(linuxServer.output())).toBe(false);
-  }, SCENARIO_TIMEOUT_MS);
-});
+// SLIM-GROUP UI-7: 前の「Windows でないとき（2 つ目の画面のサーバで `process.platform` を差し替える）と、起動のときの一時のファイルの片付け」の場面は、
+// サーバの判定と保存の拒否を `credential-service.test.ts`（NOT_WINDOWS・CREDENTIAL_PLATFORM_UNSUPPORTED）、一時のファイルの片付けを
+// `tests/unit/credential-store.test.ts`（速い組）で確かめる。

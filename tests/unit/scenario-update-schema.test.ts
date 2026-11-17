@@ -6,13 +6,8 @@
 import { readFileSync } from 'node:fs';
 import { resolve } from 'node:path';
 import { describe, expect, it } from 'vitest';
-import {
-  MAX_SCENARIO_KEEP_FIELD_NAMES,
-  MAX_UPDATE_PATH_TEMPLATE_LENGTH,
-  SCENARIO_ID_PATTERN,
-} from '../../src/control/approval/scenario-contracts.js';
+import { SCENARIO_ID_PATTERN } from '../../src/control/approval/scenario-contracts.js';
 import { assertStorableScenarioRevision, storedScenarioRevisionOf } from '../../src/control/approval/scenario-policy.js';
-import { MAX_FIELD_NAME_LENGTH } from '../../src/discovery/candidate-contracts.js';
 import { UPDATE_SPEC, sampleScenario, sampleUpdateScenario } from './approval-samples.js';
 
 type JsonSchema = Record<string, unknown> & {
@@ -38,16 +33,21 @@ describe('UPDATE spec in the scenario schema (T31b)', () => {
     expect(updateDef?.required).toEqual(['targetCreateScenarioId', 'formPathTemplate', 'actionPathTemplate', 'keepFieldNames', 'templatedIdentityDigest']);
     expect(updateDef?.additionalProperties).toBe(false);
     expect(prop(updateDef, 'targetCreateScenarioId').pattern).toBe(SCENARIO_ID_PATTERN.source);
-    expect(prop(updateDef, 'formPathTemplate').maxLength).toBe(MAX_UPDATE_PATH_TEMPLATE_LENGTH);
-    expect(prop(updateDef, 'actionPathTemplate').maxLength).toBe(MAX_UPDATE_PATH_TEMPLATE_LENGTH);
-    expect(prop(updateDef, 'keepFieldNames').maxItems).toBe(MAX_SCENARIO_KEEP_FIELD_NAMES);
-    expect(prop(updateDef, 'keepFieldNames').items?.maxLength).toBe(MAX_FIELD_NAME_LENGTH);
+    // URL-LEN: path の型の長さの上限（前は 2,048）はない。
+    expect(prop(updateDef, 'formPathTemplate').maxLength).toBeUndefined();
+    expect(prop(updateDef, 'actionPathTemplate').maxLength).toBeUndefined();
+    // L13（N28・N30）: 保つ欄の数と名前の長さの上限（前は 200・256）はない。
+    expect(prop(updateDef, 'keepFieldNames').maxItems).toBeUndefined();
+    expect(prop(updateDef, 'keepFieldNames').items?.maxLength).toBeUndefined();
   });
 
   it('accepts a CREATE revision only with a null spec, and a form UPDATE revision only with a spec (LG-3)', () => {
     expect(assertStorableScenarioRevision(sampleScenario()).update).toBeNull();
     expect(() => assertStorableScenarioRevision(sampleScenario({ update: UPDATE_SPEC }))).toThrow(RangeError);
     expect(assertStorableScenarioRevision(sampleUpdateScenario()).update).toEqual(UPDATE_SPEC);
+    // URL-LEN: 前の上限（2,048）より長い path の型も受ける。
+    const longSpec = { ...UPDATE_SPEC, formPathTemplate: `/${'f'.repeat(2_049)}/{id}`, actionPathTemplate: `/${'a'.repeat(2_049)}/{id}` };
+    expect(assertStorableScenarioRevision(sampleUpdateScenario({ update: longSpec })).update).toEqual(longSpec);
     expect(() => assertStorableScenarioRevision(sampleUpdateScenario({ update: null }))).toThrow(RangeError);
     expect(() => assertStorableScenarioRevision(withoutUpdate(sampleScenario()) as never)).toThrow(RangeError);
   });

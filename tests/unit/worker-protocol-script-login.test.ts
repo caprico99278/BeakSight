@@ -14,7 +14,7 @@ import { readFileSync } from 'node:fs';
 import { resolve } from 'node:path';
 import { describe, expect, it } from 'vitest';
 import { FORM_NAVIGATION_SETUP_ITEMS } from '../helpers/auth-setup-samples.js';
-import {MAX_LOGIN_SIDE_REQUESTS, type AuthSetup } from '../../src/control/auth/auth-setup-contracts.js';
+import type { AuthSetup } from '../../src/control/auth/auth-setup-contracts.js';
 import {
   WORKER_AUTH_STATES,
   WORKER_LOGIN_FAILURE_STATES,
@@ -75,7 +75,8 @@ describe('T34c: the script login counts of AUTH_STATE', () => {
     expect(pointerValue(SCHEMA, '/$defs/scriptLoginCounts/properties/blockedByReason/required')).toEqual([...WORKER_SCRIPT_LOGIN_BLOCK_REASONS]);
     expect(Object.keys(pointerValue(SCHEMA, '/$defs/scriptLoginCounts/properties/blockedByReason/properties') as object))
       .toEqual([...WORKER_SCRIPT_LOGIN_BLOCK_REASONS]);
-    expect(pointerValue(SCHEMA, '/$defs/scriptLoginCounts/properties/sideRequestsAllowed/maxItems')).toBe(MAX_LOGIN_SIDE_REQUESTS);
+    // LZ-3a（DEF-259）: 登録の件数の上限は L11 で撤廃したので、数の一覧にも件数の上限（前は 8）を置かない。
+    expect(pointerValue(SCHEMA, '/$defs/scriptLoginCounts/properties/sideRequestsAllowed/maxItems')).toBeUndefined();
     expect(pointerValue(SCHEMA, '/$defs/authState/properties/scriptLogin')).toEqual({ $ref: '#/$defs/scriptLoginCounts' });
     expect(Object.isFrozen(WORKER_SCRIPT_LOGIN_BLOCK_REASONS)).toBe(true);
   });
@@ -93,8 +94,9 @@ describe('T34c: the script login counts of AUTH_STATE', () => {
     expect(validateWorkerToParentMessage(message)).toEqual({ ok: true, message });
   });
 
-  it('accepts the counts with no registered side request', () => {
-    const message = authState('AUTHENTICATED', { scriptLogin: { ...COUNTS, sideRequestsAllowed: [] } });
+  // LZ-3a（DEF-259）: 9 件以上の登録した送信の数も受ける（前は 8 件を超える報告を親が拒んだ）。
+  it.each([0, 9])('accepts the counts with %i registered side requests', (count) => {
+    const message = authState('AUTHENTICATED', { scriptLogin: { ...COUNTS, sideRequestsAllowed: Array.from({ length: count }, () => 0) } });
     expect(validateWorkerToParentMessage(message).ok).toBe(true);
   });
 
@@ -125,8 +127,6 @@ describe('T34c: the script login counts of AUTH_STATE', () => {
     ['the automated login result with the stop state', authState(WORKER_STOPPED_LOGIN_STAGE_STATE, { automatedLogin: SUCCEEDED_REPORT, scriptLogin: COUNTS })],
     ['a negative count', authState('AUTHENTICATED', { scriptLogin: { ...COUNTS, tokenRequestsAllowed: -1 } })],
     ['a fractional count', authState('AUTHENTICATED', { scriptLogin: { ...COUNTS, serviceOriginReads: 1.5 } })],
-    ['too many side request items', authState('AUTHENTICATED', {
-      scriptLogin: { ...COUNTS, sideRequestsAllowed: Array.from({ length: MAX_LOGIN_SIDE_REQUESTS + 1 }, () => 0) } })],
     ['an unknown reason', authState('AUTHENTICATED', { scriptLogin: { ...COUNTS, blockedByReason: reasonsWith({ OTHER: 1 }) } })],
     ['a missing reason', authState('AUTHENTICATED', { scriptLogin: { ...COUNTS, blockedByReason: missingReason } })],
     ['a URL in the counts', authState('AUTHENTICATED', { scriptLogin: { ...COUNTS, url: `${SERVICE_ORIGIN}/auth/v1/token` } })],

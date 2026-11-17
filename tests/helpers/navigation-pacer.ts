@@ -37,6 +37,8 @@ export function forwardingNavigationPacer(
 ): NavigationPacer {
   return {
     beforeNavigation,
+    // DEF-236: 見せたままの待ちは、`pacer` にそのまま渡す。
+    waitUntilNextNavigationDue: () => pacer.waitUntilNextNavigationDue(),
     snapshot: () => pacer.snapshot(),
     raiseMinimumInterval: (minIntervalMs) => pacer.raiseMinimumInterval(minIntervalMs),
     // 受け口を先に呼ぶ（受け口が読む時刻は、pacer が記録する時刻以下になる）。

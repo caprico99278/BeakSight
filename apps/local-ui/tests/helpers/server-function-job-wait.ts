@@ -1,6 +1,6 @@
 /**
  * 画面のサーバの関数（`getAuditJobFn`）を通して、ジョブが条件に当たるまで読み直して待つ、画面のテストの補助（PRE42-CC 組 UI-K。CC-112）。
- * - `audit-job-functions.test.ts`・`automated-login-setup-ui.test.ts`・`manual-login-confirm-ui.test.ts` が同じ形で書いていた待ち方を 1 つにした。
+ * - 画面のテストが同じ形で書いていた待ち方を 1 つにした。
  *   1 回の読み取り（Server Function の呼び方。応答の本文を集めるか、状態の符号を確かめるか）はテストごとに違うので、`readJob` で受ける。
  * - 組 UI-K2（CC-112 の続き）: `waitForEnd`・`waitForJobEnd` などの名前で書いていた繰り返しも、ここに寄せた。待つ間の記録（画面のサーバの子孫の
  *   process の記録など）は `onPending` で受ける（条件に当たらず、上限の前のときに、次に読み直す前に呼ぶ）。

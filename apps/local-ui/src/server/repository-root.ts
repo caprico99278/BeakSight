@@ -2,8 +2,8 @@
  * 画面のサーバが使うリポジトリの root を、このモジュール自身の場所から決める（Task 23 設計書 4.3、4.6。T23f）。
  * - 開発のサーバでは `apps/local-ui/src/server/…`、ビルドした画面のサーバでは `apps/local-ui/dist/server/…` にある。どちらも、パスの
  *   最後の `/apps/local-ui/` より前がリポジトリの root。
- * - データの場所を変える引数や環境変数は作らない（場所は `resolveControlDatabasePath(root)` だけで決まる）。テストは、画面の起動に要るものを
- *   一時のフォルダの `apps/local-ui/` に置いて起動するので、その一時のフォルダが root になる。
+ * - データの場所を変える引数や環境変数は作らない（場所は `resolveControlDatabasePath(root)` だけで決まる）。本番の値として使うのは
+ *   `local-ui-runtime.ts` だけ（RB-7。テストは、そこに一時のフォルダを入れる）。
  */
 import { fileURLToPath } from 'node:url';
 

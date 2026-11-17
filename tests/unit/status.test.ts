@@ -9,7 +9,6 @@ import {
   type ViewportAuditStatus,
 } from '../../src/core/contracts.js';
 import { ERROR_MESSAGE_FALLBACK } from '../../src/core/errors.js';
-import { MAX_ERROR_MESSAGE_LENGTH } from '../../src/core/limits.js';
 import {
   collectorIncompleteReason,
   derivePageAuditStatus,
@@ -276,10 +275,10 @@ describe('unhandledFailureReason (CC-021)', () => {
     expect(unhandledFailureReason('passive-context', 'closed: cause').detail).toBe('passive-context:closed: cause');
   });
 
-  it('bounds the message to MAX_ERROR_MESSAGE_LENGTH and keeps the scene whole', () => {
-    const reason = unhandledFailureReason('browser-close', new Error('x'.repeat(MAX_ERROR_MESSAGE_LENGTH + 10)));
+  it('keeps a long message whole (LZ-2)', () => {
+    const reason = unhandledFailureReason('browser-close', new Error('x'.repeat(2_049)));
 
-    expect(reason.detail).toBe(`browser-close:${'x'.repeat(MAX_ERROR_MESSAGE_LENGTH)}`);
+    expect(reason.detail).toBe(`browser-close:${'x'.repeat(2_049)}`);
   });
 
   it('keeps control characters in the message as safeErrorMessage does', () => {
@@ -338,11 +337,10 @@ describe('requiredArtifactInvalidReason (CC-022)', () => {
     expect(requiredArtifactInvalidReason('finding', 'FINDING-000001', []).detail).toBe('finding:FINDING-000001:invalid');
   });
 
-  it('bounds the whole detail to MAX_ERROR_MESSAGE_LENGTH', () => {
-    const reason = requiredArtifactInvalidReason('audit', 'RUN-1', ['e'.repeat(MAX_ERROR_MESSAGE_LENGTH)]);
+  it('keeps the whole detail (LZ-2)', () => {
+    const reason = requiredArtifactInvalidReason('audit', 'RUN-1', ['e'.repeat(2_049)]);
 
-    expect(reason.detail).toBe(`audit:RUN-1:${'e'.repeat(MAX_ERROR_MESSAGE_LENGTH)}`.slice(0, MAX_ERROR_MESSAGE_LENGTH));
-    expect(reason.detail).toHaveLength(MAX_ERROR_MESSAGE_LENGTH);
+    expect(reason.detail).toBe(`audit:RUN-1:${'e'.repeat(2_049)}`);
   });
 
   it('builds the same reason for the same artifact, so that duplicates can be removed by code and detail', () => {

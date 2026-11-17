@@ -25,10 +25,9 @@ import {
   TOO_MANY_REQUESTS_HTTP_STATUS,
   isHttpStatusInRange,
 } from '../../core/http-status.js';
-import { recordIdOfPathPattern } from '../../core/record-id-path-pattern.js';
+import { isUsableRecordId, recordIdOfPathPattern } from '../../core/record-id-path-pattern.js';
 import { hasControlOrLineSeparator, hasLoneSurrogate } from '../../core/text.js';
 import type { ReadCheckResult } from '../../discovery/read-check-contracts.js';
-import { MAX_RECORD_ID_LENGTH } from '../approval/scenario-contracts.js';
 import type {
   ActionOutcome,
   ActionOutcomeInput,
@@ -56,31 +55,21 @@ export const reservationSettlementOf = (submission: SubmissionState, responseRec
 };
 
 /**
- * 登録の ID として使える形の最大長（T30f。設計書 11 章の「登録の ID の形」。path の 1 区切りに入れる値として十分な長さ。`MAX_RECORD_ID_LENGTH` 以下）。
+ * 登録の ID として使える形（最大長・文字・判定）。LU-5（設計書 `2026-11-02-beaksight-list-row-update-design.md` 5.3 の 1）で、書き込みの段の照合
+ * （`src/safety/api-write-payload-policy.ts`）と共用するため `src/core/record-id-path-pattern.ts` へ移した。今の呼び手のために公開し直す。
  */
-export const MAX_SAFE_RECORD_ID_LENGTH = 64;
+export { SAFE_RECORD_ID_PATTERN, isUsableRecordId } from '../../core/record-id-path-pattern.js';
 
 /**
- * 登録の ID として使える文字（T30f。英数字・`_`・`-` だけ。path の区切り・`.`・percent-encode・空白・非 ASCII を含まない）。CCX-28: スキーマの
- * 対象のレコードの ID の `pattern`（`source`）と最大長がこの値と `MAX_SAFE_RECORD_ID_LENGTH` に同じことを、`schema-enum-consistency.test.ts` が
- * 確かめるので公開する（`g`・`y` を持たないので `test` は状態を持たない）。
+ * 成果物（`action-run.json`）の `recordId` に記録してよい値か（1 文字以上、制御文字・行の区切り・対でないサロゲートを含まない）。L12b（設計書
+ * `2026-11-09-beaksight-remove-limits-design.md` 6.2。設計者の判断 2）: 長さの上限（前は `MAX_RECORD_ID_LENGTH` の 256）は撤廃した。
  */
-export const SAFE_RECORD_ID_PATTERN = /^[A-Za-z0-9_-]+$/u;
-
-/** 成果物（`action-run.json`）の `recordId` に記録してよい値か（1 文字以上、上限以下、制御文字・行の区切り・対でないサロゲートを含まない）。 */
 const isRecordableRecordId = (recordId: string | null): recordId is string =>
   recordId !== null
   && recordId.length > 0
-  && recordId.length <= MAX_RECORD_ID_LENGTH
   && !hasControlOrLineSeparator(recordId)
   && !hasLoneSurrogate(recordId);
 
-/**
- * 登録の ID として使える値か（T30f で狭めた。Task 31 と共用する唯一の判定）: path の 1 区切りに入れて安全な閉じた形（英数字・`_`・`-`、1〜
- * `MAX_SAFE_RECORD_ID_LENGTH` 文字）。使えなければ、ID なしとして扱う。
- */
-export const isUsableRecordId = (recordId: string | null): recordId is string =>
-  recordId !== null && recordId.length <= MAX_SAFE_RECORD_ID_LENGTH && SAFE_RECORD_ID_PATTERN.test(recordId);
 
 /** 記録する登録の ID（使える値ならその値、使えない値や null なら null。T30d: 記録の部品が使う）。 */
 export const usableRecordIdOf = (recordId: string | null): string | null => (isUsableRecordId(recordId) ? recordId : null);
@@ -151,7 +140,7 @@ export const isFormStructureStatus = (status: number): boolean => Number.isSafeI
 
 /**
  * PL-6a（設計書 8.1 の「判定の順」の 2）: 送った後の URL から、登録の ID を取る（純粋。取れなければ null）。ID の型（`{id}` の区切りを持つ path の型。
- * 契約は `MAX_FORM_RECORD_ID_PATTERNS` まで）を順に当て、最初に当たって、次をすべて満たす値: 区切りが ID の形（core の `isRecordIdLikePathSegment`。
+ * 1 つ以上）を順に当て、最初に当たって、次をすべて満たす値: 区切りが ID の形（core の `isRecordIdLikePathSegment`。
  * 数字・UUID の形）、押す前の URL を同じ型に当てた値と違う、URL が押す前から変わった。当てるのは path だけ（query は見ない）。URL を読めなければ null。
  */
 export const recordIdOfResultUrl = (pathPatterns: readonly string[], beforeUrl: string, afterUrl: string): string | null => {

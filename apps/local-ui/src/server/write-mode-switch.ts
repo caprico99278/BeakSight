@@ -8,20 +8,23 @@
  *   （`saveProfileAndAuthSetup`。`validateSiteProfile`・`validateAuthSetup`・改訂の照合を 1 つのトランザクションで）で書く。プロファイルの改訂だけを進めると
  *   認証の設定が古い（`STALE`）になるため。資格情報（同じプロファイルの資格情報のファイル）・承認したサービスの Origin・設定のファイル・環境の証跡の参照は
  *   変えない（同じプロファイルのまま）。表示の設定（ジョブのブラウザ、監査の段の送信の扱い）は改訂の外なので、そのまま。
- * - 対象（`offersWriteMode`）: 有効で、書き込みのモードでなく、認証の設定を使い（`usesAuthSetup`）、書き込みのモードで同じ方式のシナリオを使える
+ * - 対象（`offersWriteMode`）: 有効で、書き込みのモードでなく、テスト用のサイトで（NL-3 から `usesDiscovery`。前は `usesAuthSetup`）、書き込みのモードで同じ方式のシナリオを使える
  *   （`usesScenarios`）プロファイル。判定は `execution-policy.ts` の行（`labels.ts` の部品）だけで、モードの値の文字列を比べない。公開のプロファイル、
  *   すでに書き込みのモードのプロファイル、取り消したプロファイルは `NOT_OFFERED`。認証の設定がない・古いプロファイルは `AUTH_SETUP_NOT_CURRENT`。
  * - 書き込みのモードから戻す操作は作らない（詳しい設定の編集で戻せる。設計書 4.5）。
+ * - NL-3（設計書 `2026-11-06-beaksight-no-login-test-site-design.md` 3.3 の 3）: ログインのないテスト用のサイト（`auth: NONE`。認証の設定が要らない
+ *   `requiresAuthSetup` が偽）も対象にする。認証の設定を求めず、プロファイルの次の改訂だけを保存の部品（`updateProfile`）で書く。
  */
-import { MAX_ENVIRONMENT_EVIDENCE_REF_LENGTH, WRITE_AUDIT_MODE } from '../../../../src/control/contracts.js';
+import { WRITE_AUDIT_MODE } from '../../../../src/control/contracts.js';
 import { isSecretLikeText } from '../../../../src/core/secret-like-text.js';
 import type { ProfileContextResolver } from '../../../../src/control/store/profile-store.js';
 import { CURRENT_AUTH_SETUP_FRESHNESS, getAuthSetup } from '../../../../src/control/store/auth-setup-store.js';
 import type { ControlDatabase } from '../../../../src/control/store/control-database.js';
 import { saveProfileAndAuthSetup, type ProfileAndAuthSetupSaveResult } from '../../../../src/control/store/profile-auth-setup-store.js';
 import { ACTIVE_PROFILE_STATUS } from '../../../../src/control/store/profile-records.js';
-import { getProfile, type StoredProfile } from '../../../../src/control/store/profile-store.js';
-import { usesAuthSetup, usesScenarios } from '../display/labels';
+import { getProfile, updateProfile, type GatedProfileStoreResult, type StoredProfile } from '../../../../src/control/store/profile-store.js';
+import { requiresAuthSetup } from '../../../../src/control/execution-policy.js';
+import { usesDiscovery, usesScenarios } from '../display/labels';
 import { localUiStore } from './control-store';
 import { approvedScenarioCountOf } from './scenario-facts';
 import type { AuthSetupErrorView } from './auth-setup-errors';
@@ -109,10 +112,14 @@ const NO_AUTH_SETUP_ERRORS: readonly AuthSetupErrorView[] = Object.freeze([]);
 const rejection = (reason: WriteModeSwitchRejectionReason, authSetupErrors: readonly AuthSetupErrorView[] = NO_AUTH_SETUP_ERRORS): WriteModeSwitchResultView =>
   Object.freeze({ ok: false, reason, authSetupErrors });
 
-/** 「書き込みにも使う」を出すプロファイルか（判定はファイルの先頭）。 */
+/**
+ * 「書き込みにも使う」を出すプロファイルか（判定はファイルの先頭）。NL-3（設計書 `2026-11-06-beaksight-no-login-test-site-design.md` 3.3 の 3）: テスト用の
+ * サイトか（公開でないか）は、操作さがしを使うか（`usesDiscovery`。`execution-policy.ts` の行。ログインを使う方式では、認証の設定を使うかと同じ範囲）で見る。
+ * ログインのないテスト用のサイト（`NONE`）も対象にする。
+ */
 const offersWriteMode = (stored: StoredProfile): boolean => {
   const { mode, auth } = stored.profile;
-  return stored.status === ACTIVE_PROFILE_STATUS && mode !== WRITE_AUDIT_MODE && usesAuthSetup(mode, auth) && usesScenarios(WRITE_AUDIT_MODE, auth);
+  return stored.status === ACTIVE_PROFILE_STATUS && mode !== WRITE_AUDIT_MODE && usesDiscovery(mode, auth) && usesScenarios(WRITE_AUDIT_MODE, auth);
 };
 
 /** 確認のダイアログに出す値（対象でない、プロファイルがない、認証の設定がないなら `null`）。 */
@@ -124,15 +131,17 @@ export const writeModeSwitchProposalOf = async (
   if (stored === null || !offersWriteMode(stored)) {
     return null;
   }
-  const setup = getAuthSetup(deps.database, profileId);
-  if (setup === null) {
+  // NL-3: 認証の設定が要らないプロファイル（ログインしない方式。`requiresAuthSetup`）は、認証の設定を読まない（いつも今の改訂に結びつくものとして扱う）。
+  const needsSetup = requiresAuthSetup(stored.profile.mode, stored.profile.auth);
+  const setup = needsSetup ? getAuthSetup(deps.database, profileId) : null;
+  if (needsSetup && setup === null) {
     return null;
   }
   const { revision, environmentEvidenceRef } = stored.profile;
   return Object.freeze({
     profileRevision: revision,
     nextProfileRevision: revision + 1,
-    authSetupCurrent: setup.freshness === CURRENT_AUTH_SETUP_FRESHNESS,
+    authSetupCurrent: setup === null || setup.freshness === CURRENT_AUTH_SETUP_FRESHNESS,
     environmentEvidenceRef,
     isolationUnverified: isIsolationUnverifiedEvidenceRef(environmentEvidenceRef),
     approvedScenarioCount: await deps.approvedScenarioCount(stored),
@@ -140,7 +149,7 @@ export const writeModeSwitchProposalOf = async (
 };
 
 /**
- * PL-5: 保存する環境の証跡の参照（要求に参照がなければ、保存の日の未確認の参照。あれば前後の空白を除いた参照。空か上限を超えれば null。書けない文字は、
+ * PL-5: 保存する環境の証跡の参照（要求に参照がなければ、保存の日の未確認の参照。あれば前後の空白を除いた参照。空なら null。LZ-2: 長さの上限は置かない。書けない文字は、
  * 保存の部品のプロファイルの確かめ（`validateSiteProfile`）が `PROFILE_INVALID` で拒む）。
  */
 const environmentEvidenceRefOf = (request: WriteModeSwitchRequest, now: Date): string | null => {
@@ -148,7 +157,7 @@ const environmentEvidenceRefOf = (request: WriteModeSwitchRequest, now: Date): s
     return isolationUnverifiedEvidenceRefOf(now);
   }
   const reference = request.isolationEvidenceRef.trim();
-  return reference.length === 0 || reference.length > MAX_ENVIRONMENT_EVIDENCE_REF_LENGTH ? null : reference;
+  return reference.length === 0 ? null : reference;
 };
 
 // MI-C（CC-115）: 保存の部品の拒否を、この操作の理由に写す変換は `profile-auth-setup-save-rejection.ts`（「次から自動でログインする」と共用）。
@@ -173,8 +182,10 @@ export const switchToWriteMode = (
   if (profile.revision !== request.expectedRevision) {
     return rejection('PROFILE_REVISION_CONFLICT');
   }
-  const current = getAuthSetup(deps.database, profile.profileId);
-  if (current === null || current.freshness !== CURRENT_AUTH_SETUP_FRESHNESS) {
+  // NL-3: 認証の設定が要らないプロファイル（ログインしない方式）は、認証の設定を求めない（下でプロファイルだけを保存する）。
+  const needsSetup = requiresAuthSetup(profile.mode, profile.auth);
+  const current = needsSetup ? getAuthSetup(deps.database, profile.profileId) : null;
+  if (needsSetup && (current === null || current.freshness !== CURRENT_AUTH_SETUP_FRESHNESS)) {
     return rejection('AUTH_SETUP_NOT_CURRENT');
   }
   if (options.resolveContext(profile.targetConfigPath) === undefined) {
@@ -188,13 +199,20 @@ export const switchToWriteMode = (
     return rejection('ISOLATION_REFERENCE_SECRET_LIKE');
   }
   const nextRevision = profile.revision + 1;
-  let saved: ProfileAndAuthSetupSaveResult;
+  const nextProfile = { ...profile, revision: nextRevision, mode: WRITE_AUDIT_MODE, environmentEvidenceRef };
+  let saved: ProfileAndAuthSetupSaveResult | ProfileOnlySaveResult;
   try {
-    saved = saveProfileAndAuthSetup(deps.database, {
-      profile: { ...profile, revision: nextRevision, mode: WRITE_AUDIT_MODE, environmentEvidenceRef },
-      expectedRevision: profile.revision,
-      setup: { ...current.setup, profileRevision: nextRevision },
-    }, { resolveContext: options.resolveContext, now: deps.now });
+    saved = current === null
+      // NL-3: ログインしない方式は、プロファイルだけを今の保存の部品（`updateProfile`。検証と改訂の照合）で書く。拒否は、同じ変換に渡せる形にする。
+      ? profileOnlySaveOf(updateProfile(deps.database, { profile: nextProfile, expectedRevision: profile.revision }, {
+        resolveContext: options.resolveContext,
+        now: deps.now,
+      }))
+      : saveProfileAndAuthSetup(deps.database, {
+        profile: nextProfile,
+        expectedRevision: profile.revision,
+        setup: { ...current.setup, profileRevision: nextRevision },
+      }, { resolveContext: options.resolveContext, now: deps.now });
   } catch {
     return rejection('SAVE_FAILED');
   }
@@ -203,3 +221,12 @@ export const switchToWriteMode = (
   }
   return Object.freeze({ ok: true, profileRevision: saved.profile.profile.revision });
 };
+
+/** プロファイルだけの保存の結果（保存したプロファイルか、まとめて保存の拒否と同じ形のプロファイルの側の拒否）。 */
+type ProfileOnlySaveResult =
+  | { readonly ok: true; readonly profile: StoredProfile }
+  | Extract<ProfileAndAuthSetupSaveResult, { ok: false; part: 'PROFILE' }>;
+
+/** NL-3: プロファイルの保存の部品の結果を、まとめて保存の結果と同じ扱いの形にする。 */
+const profileOnlySaveOf = (result: GatedProfileStoreResult<never>): ProfileOnlySaveResult =>
+  result.ok ? { ok: true, profile: result.stored } : { ...result, part: 'PROFILE' };

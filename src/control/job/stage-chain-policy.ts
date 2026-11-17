@@ -1,6 +1,6 @@
 /**
  * まとめて実行の決まり（FM2d。設計書 `2026-10-19-beaksight-fewer-manual-steps-design.md` 3A.1、5 章の 2026-10-22 の FM2d の Blocker の行）。純粋な関数と
- * 閉じた一覧だけ（管理データ・ジョブの管理・ブラウザに触れない。書き込みの連鎖 `apps/local-ui/src/server/write-chain-policy.ts` と同じ形）。ジョブの管理
+ * 閉じた一覧だけ（管理データ・ジョブの管理・ブラウザに触れない）。ジョブの管理
  * （`audit-job-manager.ts`）と、画面の表示と、表示のカタログの網羅の確かめが使う。
  * - 段の並び（`chainStagesOfMode`）: `TEST_AUTH_PASSIVE` と `TEST_APPROVED_WRITE`（MI-5 から。前は発見 → READ の確かめ）は監査 → 発見 → READ の確かめ
  *   （並びの一覧は IPC の契約 `WORKER_CHAIN_STAGE_SEQUENCES`）。公開の監査はログインしないので連鎖しない。
@@ -11,6 +11,9 @@
  * - 連鎖の表示（`StageChainView`）: メモリの中だけ（管理データに書かない。画面のサーバが止まれば消える）。状態と理由の表示は、画面のカタログが持つ。
  */
 import type { AuditMode } from '../contracts.js';
+import type { AuditPageScopeKind } from '../../core/audit-page-scope.js';
+import type { CandidateLocation } from '../../discovery/candidate-contracts.js';
+import { isOriginInAllowedOrigins } from '../../crawl/normalize-url.js';
 import { WORKER_CHAIN_STAGE_SEQUENCES, type WorkerChainStageKind, type WorkerChainStageSequence } from '../worker-protocol.js';
 import type { IncompleteReasonCode, RunStatus } from '../../core/contracts.js';
 import {
@@ -81,6 +84,54 @@ export const chainStagesOfMode = (mode: AuditMode): WorkerChainStageSequence | n
   }
 };
 
+/**
+ * WSO: 範囲つきの段の並び（範囲がなければ、モードの並び `chainStagesOfMode`）。「チェックした画面だけ」（`CHECKED_WRITE_SCREENS`）は、書き込みのモードだけ、
+ * 点検の段 1 つ（その後に書き込みの段）。ほかのモードは連鎖しない（`null`）。
+ */
+export const chainStagesOf = (mode: AuditMode, scope: AuditPageScopeKind | null): WorkerChainStageSequence | null => {
+  if (scope === null) {
+    return chainStagesOfMode(mode);
+  }
+  return mode === 'TEST_APPROVED_WRITE' ? WORKER_CHAIN_STAGE_SEQUENCES[1] : null;
+};
+
+/** WSO: チェックした画面 1 つの、読む画面を決める事実。 */
+export interface CheckedScreenPageFact {
+  /** チェックした画面（登録の画面。承認したシナリオの根拠の Origin と path）。 */
+  readonly page: CandidateLocation;
+  /**
+   * 関係する画面（答え合わせの画面・一覧の行の更新の一覧の画面など。分からなければ null）。REV-WSO の M-3: Origin は、その画面自身の Origin（承認したシナリオの
+   * 根拠や、READ の定義の対象の画面のもの）。
+   */
+  readonly relatedPages: readonly (CandidateLocation | null)[];
+}
+
+/** 型の印（`{id}` など）を含む path か（作ったデータの番号が要る画面は、点検の段では読めない）。 */
+const isTemplatePath = (path: string): boolean => path.includes('{') || path.includes('}');
+
+/**
+ * WSO: 「チェックした画面だけ」の点検が読む画面（チェックした画面ごとに、登録の画面 → 関係する画面の順。同じ画面は 1 回だけ。型の path と分からない画面は
+ * 読まない。REV-WSO の M-3: 許可 Origin の外の画面は読まない）。数で打ち切らない。
+ */
+export const checkedScreenPagesOf = (facts: readonly CheckedScreenPageFact[], allowedOrigins: readonly string[]): readonly CandidateLocation[] => {
+  const seen = new Set<string>();
+  const pages: CandidateLocation[] = [];
+  for (const { page, relatedPages } of facts) {
+    for (const candidate of [page, ...relatedPages]) {
+      if (candidate === null || isTemplatePath(candidate.path) || !isOriginInAllowedOrigins(allowedOrigins, candidate.origin)) {
+        continue;
+      }
+      const key = `${candidate.origin}${candidate.path}`;
+      if (seen.has(key)) {
+        continue;
+      }
+      seen.add(key);
+      pages.push(Object.freeze({ origin: candidate.origin, path: candidate.path }));
+    }
+  }
+  return Object.freeze(pages);
+};
+
 /** 次の段へ進むかの判定の入力（終えた段の事実）。 */
 export interface ChainAdvanceInput {
   /** 利用者が止めた（画面の「やめる」。連鎖の全体を止める）。 */
@@ -125,6 +176,12 @@ export const CHAIN_REASON_CODE_DECISIONS: { readonly [Code in IncompleteReasonCo
   INVALID_BROWSER_DATA: 'CONTINUE',
   PAGE_NAVIGATION_LIMIT_REACHED: 'CONTINUE',
   PAGE_SUBRESOURCE_LIMIT_REACHED: 'CONTINUE',
+  // DEF-210: 通知の枠の閉じる押下の移動を止めた（ページ単位の理由）。
+  NOTIFICATION_DISMISSAL_NAVIGATION_BLOCKED: 'CONTINUE',
+  // DEF-250 の c: 点検の途中で、画面が外部スキームへ移ろうとしたか、誤りの画面に替わった（ページ単位の理由）。
+  DOCUMENT_LEFT_DURING_AUDIT: 'CONTINUE',
+  // DEF-225: 開くとファイルのダウンロードになる画面（ページ単位の理由）。
+  DOWNLOAD_RESPONSE: 'CONTINUE',
   PREFLIGHT_FAILED: 'STAGE_FAILED',
   RUN_DIRECTORY_UNAVAILABLE: 'STAGE_FAILED',
   SAFETY_INVARIANT_VIOLATION: 'SAFETY_VIOLATION',
@@ -150,6 +207,9 @@ export const CHAIN_REASON_CODE_DECISIONS: { readonly [Code in IncompleteReasonCo
   SITE_UNAVAILABLE: 'SITE_UNAVAILABLE',
   AUTH_SESSION_LOST: 'SESSION_LOST',
   SERVICE_REQUEST_LIMIT_REACHED: 'SERVICE_REQUEST_LIMIT_REACHED',
+  // L0: 進みの見張りが段を終えた（ページ単位の理由。それまでの記録で次へ進む）。
+  STAGE_UNRESPONSIVE: 'CONTINUE',
+  STAGE_NEVER_QUIET: 'CONTINUE',
 });
 
 /** 理由のコードの止める理由（進むなら `null`。表にない値（型の外から来たもの）は、止める側に倒して段の失敗）。 */
@@ -298,4 +358,6 @@ export interface StageChainView {
   readonly stages: readonly StageChainStageView[];
   /** OP-2: 行った書き込みの段のジョブ（登録・更新。行った順。なければ空）。点検の要点の 1 行と、行ごとの結果に使う。 */
   readonly writeStageJobIds: readonly string[];
+  /** WSO: 点検の範囲（「チェックした画面だけ」なら `CHECKED_WRITE_SCREENS`。サイトの全部の画面なら null）。作業の画面の 1 行に使う。 */
+  readonly pageScope: AuditPageScopeKind | null;
 }

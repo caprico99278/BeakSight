@@ -31,6 +31,12 @@ export type AuthStrategy = (typeof AUTH_STRATEGIES)[number];
  */
 export const AUTOMATED_LOGIN_AUTH_STRATEGY = 'AUTOMATED_LOGIN' satisfies AuthStrategy;
 
+/**
+ * ログインしない認証の方式（NL-1。設計書 `2026-11-06-beaksight-no-login-test-site-design.md` 3.1）。公開の監査と、ログインのないテスト用のサイト
+ * （テストの 2 つのモード。`approvedTestOrigins` がすべて loopback のときだけ）が使う。この方式のプロファイルは、認証の設定を求めない。
+ */
+export const NO_LOGIN_AUTH_STRATEGY = 'NONE' satisfies AuthStrategy;
+
 /** プロファイルの版。スキーマの `schemaVersion` の const と一致する。 */
 export const SITE_PROFILE_SCHEMA_VERSION = 'beaksight-profile/1';
 
@@ -40,14 +46,10 @@ export const PROFILE_ID_PATTERN = /^[a-z0-9][a-z0-9-]{0,62}$/u;
 /** プロファイルの改訂の番号の最小値。スキーマの `revision` の minimum と一致する。 */
 export const MIN_PROFILE_REVISION = 1;
 
-/** 環境の隔離の確認の非秘密の参照（`environmentEvidenceRef`）の最大長（UTF-16 のコード単位）。スキーマの maxLength と一致する。 */
-export const MAX_ENVIRONMENT_EVIDENCE_REF_LENGTH = 200;
+// LZ-2: 環境の隔離の確認の非秘密の参照（`environmentEvidenceRef`）の長さの上限（前は `MAX_ENVIRONMENT_EVIDENCE_REF_LENGTH` 200）は撤廃した。
 
-/**
- * 承認したサービスの Origin（`approvedServiceOrigins`。認証のサービスと API の Origin。Task 34 の設計書 3.1）の最大の件数。スキーマの maxItems と
- * 一致する。
- */
-export const MAX_APPROVED_SERVICE_ORIGINS = 4;
+// L11（設計書 `2026-11-09-beaksight-remove-limits-design.md` 4。設計者の判断）: 承認したサービスの Origin（`approvedServiceOrigins`）の件数の上限（前は 4）は
+// 撤廃した（スキーマの maxItems を外した。定数は LZ-1 で消した）。
 
 /** サイト・環境のプロファイル（ロードマップ第 5 章の形のまま。フィールドの追加・改名はしない）。 */
 export interface SiteProfile {
@@ -67,7 +69,7 @@ export interface SiteProfile {
   readonly environmentEvidenceRef: string | null;
   /**
    * 承認したサービスの Origin（T34a。Task 34 の設計書 3.1。任意の項目で、ないときは空と同じ）。認証のサービスと API の Origin（テスト環境の 2 つの
-   * モードだけ。HTTPS の Origin の正規の直列化（loopback の host だけ http も受ける）。上限 `MAX_APPROVED_SERVICE_ORIGINS`、重なりなし）。ターゲット
+   * モードだけ。HTTPS の Origin の正規の直列化（loopback の host だけ http も受ける）。件数の上限なし（L11）、重なりなし）。ターゲット
    * 設定の `site.allowedOrigins` と重ならない（クロールの対象・読み込みの数え方・サイトの情報の取得の対象は広げない）。版を上げずに足した項目なので、
    * 項目のないプロファイルの文書は今のまま。
    */
@@ -111,6 +113,9 @@ export const PROFILE_VALIDATION_ERROR_CODES = Object.freeze([
   // PL-F 修正の 1 回目（PL-REV の Minor 2）: 環境の証跡の参照が秘密に見える（判定は `src/core/secret-like-text.ts` の `isSecretLikeText`）。
   // 「書き込みも試す」の切り替えの拒否の理由と同じコード。
   'ISOLATION_REFERENCE_SECRET_LIKE',
+  // NL-1（設計書 `2026-11-06-beaksight-no-login-test-site-design.md` 3.1 の 2）: テスト環境の認証・書き込みのモードでログインしない（`auth: NONE`）のに、
+  // `approvedTestOrigins` に loopback でない Origin がある。
+  'PROFILE_NO_LOGIN_REQUIRES_LOOPBACK',
 ] as const);
 export type ProfileValidationErrorCode = (typeof PROFILE_VALIDATION_ERROR_CODES)[number];
 

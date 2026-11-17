@@ -1,6 +1,6 @@
 // P14b（Task 14〜17 の設計書 4.5.7）: 各段階の期限は、ページの期限と「現在の時刻 + 段階の予算」の早い方。
 import { describe, expect, it } from 'vitest';
-import { stageDeadline } from '../../src/orchestration/stage-deadline.js';
+import { OPEN_ENDED_STAGE_MS, openEndedStageDeadline, stageDeadline } from '../../src/orchestration/stage-deadline.js';
 
 describe('stageDeadline', () => {
   it('returns now plus the stage budget when that is earlier than the page deadline', () => {
@@ -47,5 +47,17 @@ describe('stageDeadline', () => {
 
   it('throws RangeError when now plus the stage budget is not finite', () => {
     expect(() => stageDeadline(10_000, Number.MAX_VALUE, Number.MAX_VALUE)).toThrow(RangeError);
+  });
+});
+
+// L1（設計書 `2026-11-09-beaksight-remove-limits-design.md` 6 の L1）: 期限を撤廃した段で、期限の数を必ず受け取る部品に渡す値。
+describe('openEndedStageDeadline (L1)', () => {
+  it('is far beyond any page deadline (the maximum timer delay), and not later than the run time limit', () => {
+    expect(OPEN_ENDED_STAGE_MS).toBe(2_147_483_647);
+    // LZ-1: Run の時間の上限がないことは、番兵（`Infinity`）でなく、指定なし（省略）で表す。
+    expect(openEndedStageDeadline(1_000)).toBe(1_000 + OPEN_ENDED_STAGE_MS);
+    expect(openEndedStageDeadline(1_000, undefined)).toBe(1_000 + OPEN_ENDED_STAGE_MS);
+    expect(openEndedStageDeadline(1_000, 5_000)).toBe(5_000);
+    expect(() => openEndedStageDeadline(Number.NaN, 5_000)).toThrow(RangeError);
   });
 });

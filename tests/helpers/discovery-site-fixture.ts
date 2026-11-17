@@ -119,7 +119,8 @@ export const DISCOVERY_SITE_EXTRA_PATHS = Object.freeze({
 } as const);
 
 /** T27R2 の C1: ポーリングの画面（`pollingPages`。1 つ目から互いにリンクでつながる）。 */
-export const DISCOVERY_SITE_POLLING_PAGES: readonly string[] = Object.freeze(['/admin/poll/1', '/admin/poll/2', '/admin/poll/3']);
+// DEF-208-4（F）: 操作さがしは同じ型（番号の区切りを `{id}` にした path）の画面を 1 つだけ読むので、ポーリングの画面は型の違う path（番号でない区切り）にする。
+export const DISCOVERY_SITE_POLLING_PAGES: readonly string[] = Object.freeze(['/admin/poll/first', '/admin/poll/second', '/admin/poll/third']);
 
 /** T27R2 の I3: 行の目印を置いた所の要素の id（`markerShapes` の画面。main world の確かめに使う）。 */
 export const DISCOVERY_SITE_MARKER_SHAPE_IDS = Object.freeze({
@@ -194,7 +195,12 @@ export interface DiscoverySiteRequest {
   readonly adminDocument: boolean;
   /** 有効なセッションを持っていたか（管理画面の要求だけ）。 */
   readonly authenticated: boolean;
+  /** DEF-257: 読み取りでもログインでもない要求の本文（届き終わった後に入る。beacon の本文に目印がないことの確かめに使う）。 */
+  body?: string;
 }
+
+/** DEF-257: beacon の画面が読み込みで送る本文（決まった文字。目印を含まない）。 */
+export const DISCOVERY_SITE_BEACON_BODY = 'load';
 
 /** DEF-136: 不調の画面（`STATUS`）の本文にだけあるリンク（ほかの画面からはリンクしない。発見がエラーの画面からリンクを拾わないことを確かめる）。 */
 export const DISCOVERY_SITE_FAULT_LINK = '/admin/fault-only';
@@ -458,7 +464,7 @@ export async function startDiscoverySite(options: DiscoverySiteOptions = {}): Pr
       <form method="get" action="${p.list}"><input type="text" name="code" required pattern="[0-9]+"><button type="submit">照会</button></form>`,
     [p.beacon]: () => `<h1>beacon</h1>
       <form method="get" action="${p.list}"><input type="search" name="b"><button type="submit">検索</button></form>
-      <script>navigator.sendBeacon('${p.collect}', 'load');</script>`,
+      <script>navigator.sendBeacon('${p.collect}', '${DISCOVERY_SITE_BEACON_BODY}');</script>`,
   };
 
   const loginFormHtml = (): string => {
@@ -594,15 +600,22 @@ export async function startDiscoverySite(options: DiscoverySiteOptions = {}): Pr
     const url = new URL(request.url ?? '/', origin());
     const isRead = request.method === 'GET' || request.method === 'HEAD';
     let result = { adminDocument: false, authenticated: false };
+    const entry: DiscoverySiteRequest = { method: request.method ?? '', path: `${url.pathname}${url.search}`, at, ...result };
     if (!isRead && request.method === 'POST' && url.pathname === p.login) {
       handleLoginPost(request, response);
     } else if (!isRead) {
+      // DEF-257: 本文を読んで記録する（beacon の本文に目印がないことの確かめ）。
+      const chunks: Buffer[] = [];
+      request.on('data', (chunk: Buffer) => chunks.push(chunk));
+      request.on('end', () => {
+        entry.body = Buffer.concat(chunks).toString('utf8');
+      });
       response.writeHead(STATUS_NO_CONTENT);
       response.end();
     } else {
       result = handleRead(request, response, url);
     }
-    requests.push({ method: request.method ?? '', path: `${url.pathname}${url.search}`, at, ...result });
+    requests.push(Object.assign(entry, result));
   });
   server.server.on('upgrade', (request: IncomingMessage, socket: Duplex) => {
     requests.push({ method: 'UPGRADE', path: request.url ?? '/', at: Date.now(), adminDocument: false, authenticated: false });

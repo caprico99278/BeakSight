@@ -23,7 +23,6 @@ import {
 import { resolveRunCommandDependencies, runCli } from '../../src/cli/main.js';
 import {
   MAX_LISTED_CONFIG_DIFFERENCES,
-  activeRunLines,
   checkpointFinishFailedLines,
   differentConfigRunLines,
   differentVersionRunLines,
@@ -77,7 +76,6 @@ import {
   CLI_OPTION_DESCRIPTIONS,
   CLI_TEXT,
   RUN_SUMMARY_TEXT,
-  activeRunInOutputDirectoryText,
   cliCountText,
   cliFieldText,
   countWithDetailsText,
@@ -93,6 +91,7 @@ import {
   siteUnavailableRecheckText,
   siteUnavailableSlowdownText,
   serviceRequestPacingWaitText,
+  specifiedLimitText,
   siteUnavailableStopText,
   unreadableCheckpointText,
 } from '../../src/presentation/messages.js';
@@ -194,7 +193,7 @@ const expectedProgressLine = (report: RunProgressReport): string =>
         CLI_TEXT.progress.pagesFinished,
         countWithDetailsText(formatCount(report.pagesFinished), [
           cliCountText(RUN_SUMMARY_TEXT.coverage.discovered, formatCount(report.pagesDiscovered)),
-          cliCountText(CLI_TEXT.progress.maxPages, formatCount(report.maxPages)),
+          cliCountText(CLI_TEXT.progress.maxPages, specifiedLimitText(report.maxPages, formatCount)),
         ]),
       ),
       cliCountText(CLI_TEXT.run.navigationCount, formatTimes(report.navigationCount)),
@@ -494,17 +493,18 @@ describe('CLI: --help', () => {
     expect(existsSync(output)).toBe(false);
   });
 
-  // R17f（C17a の持ち越し。設計書 第7章）: 使い方の表示に、`--help` も載せる。文言は `messages.ts` のもの。
-  it('lists --help with its Japanese description among the options of the usage', () => {
+  // R17f・R5a（設計書 第7章、再開の設計書 4.7）: 使い方の表示に、値を取らないオプションも日本語の説明つきで載せる。文言は `messages.ts` のもの。
+  it.each(['help', 'headless', 'new'] as const)('lists --%s with its Japanese description among the options of the usage', (option) => {
     const lines = invokeCli('--help').stdout.split('\n');
     const optionsHeading = lines.indexOf(`${CLI_TEXT.usage.optionsHeading}:`);
     const exitCodesHeading = lines.indexOf(`${CLI_TEXT.usage.exitCodesHeading}:`);
-    const helpLine = lines.indexOf('  --help');
+    const optionLine = lines.indexOf(`  --${option}`);
 
-    expect(helpLine).toBeGreaterThan(optionsHeading);
-    expect(helpLine).toBeLessThan(exitCodesHeading);
-    expect(lines[helpLine + 1]).toMatch(JAPANESE_CHARACTER);
-    expect(lines[helpLine + 1]?.trim()).toBe(CLI_OPTION_DESCRIPTIONS.help.description);
+    expect(CLI_OPTION_NAMES).toContain(option);
+    expect(optionLine).toBeGreaterThan(optionsHeading);
+    expect(optionLine).toBeLessThan(exitCodesHeading);
+    expect(lines[optionLine + 1]).toMatch(JAPANESE_CHARACTER);
+    expect(lines[optionLine + 1]?.trim()).toBe(CLI_OPTION_DESCRIPTIONS[option].description);
   });
 
   // DEF-017（設計書 3.1、7章）: `--headed` と `--headless` の説明は、どちらも設定の browser.headed を上書きすることを書く。
@@ -515,37 +515,6 @@ describe('CLI: --help', () => {
       expect(description, option).toContain('browser.headed');
       expect(description, option).toContain('上書き');
     }
-  });
-
-  it('lists --headless with its description among the options of the usage', () => {
-    const lines = invokeCli('--help').stdout.split('\n');
-    const optionsHeading = lines.indexOf(`${CLI_TEXT.usage.optionsHeading}:`);
-    const exitCodesHeading = lines.indexOf(`${CLI_TEXT.usage.exitCodesHeading}:`);
-    const headlessLine = lines.indexOf('  --headless');
-
-    expect(headlessLine).toBeGreaterThan(optionsHeading);
-    expect(headlessLine).toBeLessThan(exitCodesHeading);
-    expect(lines[headlessLine + 1]).toMatch(JAPANESE_CHARACTER);
-    expect(lines[headlessLine + 1]?.trim()).toBe(CLI_OPTION_DESCRIPTIONS.headless.description);
-  });
-
-  // R5a（中断した Run の再開の設計書 4.7）: 使い方の表示に、`--new` も載せる。文言は `messages.ts` のもの。
-  it('lists --new with its Japanese description among the options of the usage, after --headless and before --help', () => {
-    const lines = invokeCli('--help').stdout.split('\n');
-    const optionsHeading = lines.indexOf(`${CLI_TEXT.usage.optionsHeading}:`);
-    const exitCodesHeading = lines.indexOf(`${CLI_TEXT.usage.exitCodesHeading}:`);
-    const newLine = lines.indexOf('  --new');
-
-    expect(newLine).toBeGreaterThan(optionsHeading);
-    expect(newLine).toBeLessThan(exitCodesHeading);
-    expect(newLine).toBeGreaterThan(lines.indexOf('  --headless'));
-    expect(newLine).toBeLessThan(lines.indexOf('  --help'));
-    expect(lines[newLine + 1]?.trim()).toBe(CLI_OPTION_DESCRIPTIONS.new.description);
-    expect(CLI_OPTION_DESCRIPTIONS.new).toEqual({
-      valueName: null,
-      description: '途中の Run があっても、続きから再開せずに、新しい Run を始めます（run のときだけ）。',
-    });
-    expect(CLI_OPTION_NAMES).toContain('new');
   });
 
   // R5a（中断した Run の再開の設計書 4.7.1）: 終了コード 4 の行は、設定のエラーと、Run を始められない場合の2つになる。
@@ -930,6 +899,9 @@ describe('CLI run: failures, in process without a browser', () => {
     const runDirectory = join(output, runId ?? '');
     const runJsonBefore = await readFile(join(runDirectory, 'run.json'), 'utf8');
     const before = await snapshotDirectory(runDirectory);
+    // DEF-281: 同じ秒の名前には 2 桁の連番（01〜99）を足して作り直すので、それらもすべて使われている場面にする。
+    const suffixed = Array.from({ length: 99 }, (_unused, index) => `${runId ?? ''}${String(index + 1).padStart(2, '0')}`);
+    await Promise.all(suffixed.map((name) => mkdir(join(output, name))));
 
     const stdout = captureCliOutput();
     const stderr = captureCliOutput();
@@ -938,7 +910,7 @@ describe('CLI run: failures, in process without a browser', () => {
     expect(code).toBe(EXIT_CODES.FAILED);
     expect(launches).toBe(1);
     expect(stderr.text()).toContain(CLI_TEXT.failure.runDirectoryExists);
-    expect(stderr.text()).toContain(cliFieldText(CLI_TEXT.failure.runDirectory, runDirectory));
+    expect(stderr.text()).toContain(cliFieldText(CLI_TEXT.failure.runDirectory, join(output, suffixed.at(-1) ?? '')));
     expect(stderr.text()).toContain(cliFieldText(RUN_SUMMARY_TEXT.runStatus, labelWithCodeText(RUN_STATUS_CATALOG.FAILED.label, 'FAILED')));
     expect(stderr.text()).toContain(CLI_TEXT.detailsHeading);
     expect(stderr.text()).toContain('EEXIST');
@@ -949,7 +921,7 @@ describe('CLI run: failures, in process without a browser', () => {
     // 1つ目の Run のディレクトリは、変わらない。
     expect(await snapshotDirectory(runDirectory)).toEqual(before);
     expect(await readFile(join(runDirectory, 'run.json'), 'utf8')).toBe(runJsonBefore);
-    expect(await readdir(output)).toEqual([runId]);
+    expect(await readdir(output)).toEqual([runId, ...suffixed]);
   });
 
   it('reports a run directory that cannot be created in Japanese with the path, and exits with 1 without the browser', async () => {
@@ -1080,7 +1052,7 @@ describe('CLI run: the checkpoint conclusion when the output cannot be written (
     return { code, stdout: stdout.text(), stderr: stderr.text(), runDirectory, finish, abandon, cleanUp };
   }
 
-  const checkpointPath = (runDirectory: string, file: 'state' | 'previousState' | 'lock'): string =>
+  const checkpointPath = (runDirectory: string, file: 'state' | 'previousState'): string =>
     artifactFilePath(runDirectory, checkpointArtifactRelativePath(file));
   const readState = async (runDirectory: string): Promise<unknown> =>
     JSON.parse(await readFile(checkpointPath(runDirectory, 'state'), 'utf8')) as unknown;
@@ -1104,9 +1076,8 @@ describe('CLI run: the checkpoint conclusion when the output cannot be written (
     expect(run.finish).toHaveBeenCalledWith(FINAL_CHECKPOINT);
     expect(run.abandon).not.toHaveBeenCalled();
     expect(run.stderr).not.toContain(CLI_TEXT.resume.finishFailed);
-    // 保存は FINISHED（次の起動で再開しない）。ロックは外れる。ページの保存と state.prev.json は残る（片付けをしないため）。
+    // 保存は FINISHED（次の起動で再開しない）。ページの保存と state.prev.json は残る（片付けをしないため）。
     expect(await readState(run.runDirectory)).toEqual(FINAL_CHECKPOINT);
-    expect(existsSync(checkpointPath(run.runDirectory, 'lock'))).toBe(false);
     expect(existsSync(checkpointPath(run.runDirectory, 'previousState'))).toBe(true);
     expect(existsSync(artifactFilePath(run.runDirectory, checkpointPageArtifactRelativePath(PAGE_1)))).toBe(true);
   });
@@ -1119,9 +1090,8 @@ describe('CLI run: the checkpoint conclusion when the output cannot be written (
     expect(run.finish).toHaveBeenCalledTimes(1);
     expect(run.abandon).toHaveBeenCalledTimes(1);
     expect(run.abandon.mock.invocationCallOrder[0]).toBeGreaterThan(run.finish.mock.invocationCallOrder[0] ?? Number.POSITIVE_INFINITY);
-    // 保存は、最後に書けた IN_PROGRESS のまま。ロックも残る。
+    // 保存は、最後に書けた IN_PROGRESS のまま。
     expect(await readState(run.runDirectory)).toEqual(SAVED_CHECKPOINT);
-    expect(existsSync(checkpointPath(run.runDirectory, 'lock'))).toBe(true);
   });
 
   it.each([
@@ -1135,9 +1105,8 @@ describe('CLI run: the checkpoint conclusion when the output cannot be written (
       expectOutputFailure(run);
       expect(run.abandon).toHaveBeenCalledTimes(1);
       expect(run.finish).not.toHaveBeenCalled();
-      // 保存の状態は変えない（出力をやり直せるよう、IN_PROGRESS のまま）。ロックも残る。
+      // 保存の状態は変えない（出力をやり直せるよう、IN_PROGRESS のまま）。
       expect(await readState(run.runDirectory)).toEqual(SAVED_CHECKPOINT);
-      expect(existsSync(checkpointPath(run.runDirectory, 'lock'))).toBe(true);
     },
   );
 
@@ -1453,6 +1422,9 @@ describe('CLI run: the progress line during the Run', () => {
       '進み具合: 監査を終えたページ 12件（発見したページ 85件、上限 50件）・ページの読み込み 284回・'
         + '許可 Origin への要求 1,930件（直近1分 38件、1分あたり最大 61件）・許可 Origin の外 12件・経過 24分10秒',
     ]);
+    // L14: ページの上限を指定していない Run は「指定なし」。
+    const { maxPages: _limit, ...unlimited } = progressSample;
+    expect(runProgressLines(unlimited)[0]).toContain(`上限 ${RUN_SUMMARY_TEXT.limitNotSpecified}）`);
   });
 
   it('shows the facts as they are given (does not count or compute again)', () => {
@@ -1654,7 +1626,6 @@ describe('CLI run: the notices of the resume', () => {
   });
 
   it('shows one line for the other notices', () => {
-    expect(activeRunLines(RUN_ID)).toEqual([activeRunInOutputDirectoryText(RUN_ID)]);
     expect(unreadableCheckpointLines(RUN_ID)).toEqual([unreadableCheckpointText(RUN_ID)]);
     expect(finalizingRunLines(RUN_ID)).toEqual([finalizingRunText(RUN_ID)]);
     expect(checkpointFinishFailedLines()).toEqual([CLI_TEXT.resume.finishFailed]);

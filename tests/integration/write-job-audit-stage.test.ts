@@ -1,14 +1,12 @@
 // T37a fix round 1（Task 37 の設計書 3.1 の「書き込みのジョブ」。T37a の報告の発見事項 1 への設計者の判断）: 書き込みのジョブ（`executeWriteCreateRun`）に、
 // ワーカーと同じく監査の段の口（`auditStage`）つきの認証の指定を渡したとき、送信の前に「ログインの状態の鍵が消えた」か「承認したサービスの Origin への
 // 要求の上限に届いた」なら、送らずに今の「送っていない」の終わり方（`NOT_SENT`・`PRECHECK_FAILED`）になる。判定は Run Coordinator・発見・READ の
-// 確かめと同じ共通の部品（`sessionKeyLostDetailOf`・`isServiceRequestLimitReached`）。成果物の形は変えない。
+// 確かめと同じ共通の部品（`sessionKeyLostDetailOf`。LZ-3c: 上限の判定 `isServiceRequestLimitReached` は、いつも偽なので捨てた）。成果物の形は変えない。
 // - 書き込みの画面は、自前の 127.0.0.1 の fixture（`tests/helpers/write-site-fixture.ts`）。サービスの Origin の代わりに、別の 127.0.0.1 のサーバを
 //   承認したサービスの Origin にし、登録の画面のページの JS がそこへ GET を送る（`setServiceReads`）。
 // - 比べの回（上限の中、鍵あり）は送る（POST 1）。鍵の消失は、ログインの状態の鍵の判定の口（`sessionKeyPresent`）が偽を返す形（ログアウトの代わり）。
-// - 上限は、画面の確かめの読み込みで届く回（書き込みの段を開く前に止める）。書き込みの段の読み込みは、サービスの Origin へ送らないので、上限を動かさない
-//   （確かめの回）。押す直前の確かめも置いてある（同じ部品）。
-// 届いた POST は、fixture のサーバの記録で数える（全部の後に、名前つきの時間だけ待ってから数え直す）。Chromium はテストの既定の headless と、CLI の起動の
-// 設定の両方。
+// - サービスの要求の上限は L11 で撤廃した（撤廃の確かめは `job-audit-stage-limit.test.ts`・`guard-audit-stage.test.ts`）。
+// 届いた POST は、fixture のサーバの記録で数える（全部の後に、名前つきの時間だけ待ってから数え直す）。Chromium はテストの既定の headless。
 import type { IncomingMessage, ServerResponse } from 'node:http';
 import { readFileSync } from 'node:fs';
 import { mkdtemp, rm } from 'node:fs/promises';
@@ -16,7 +14,6 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import type { Browser } from 'playwright';
 import { afterAll, beforeAll, beforeEach, describe, expect, it } from 'vitest';
-import { wait } from '../../src/core/deadline.js';
 import { BrowserContextFactory, type AuditStageServiceRequests } from '../../src/browser/context-factory.js';
 import type { AuditConfig } from '../../src/config/types.js';
 import type { ActionRunDocument } from '../../src/control/actions/action-contracts.js';
@@ -33,15 +30,12 @@ import { SafetyLedger } from '../../src/safety/safety-ledger.js';
 import { executeWriteCreateRun } from '../../src/worker/write-create-run.js';
 import type { WorkerWriteSubmissionReport } from '../../src/worker/write-ipc.js';
 import { sampleApprovalFacts } from '../helpers/approval-facts-sample.js';
-import { launchCliChromium, launchHeadlessChromium } from '../helpers/chromium.js';
-import { startLoopbackHttpServer, type LoopbackHttpServer } from '../helpers/loopback-server.js';
+import { DEFAULT_CHROMIUM_LAUNCHERS } from '../helpers/chromium.js';
+import { settleLateDeliveries, startLoopbackHttpServer, type LoopbackHttpServer } from '../helpers/loopback-server.js';
 import { TEST_FACTORY_OPTIONS, createTestConfig } from '../helpers/test-config.js';
+import { TEST_OBSERVATION_WINDOWS } from '../helpers/test-waits.js';
 import { WRITE_SITE_PATHS, WRITE_SITE_SESSION_COOKIE, startWriteSite, type WriteSite } from '../helpers/write-site-fixture.js';
 
-const LAUNCHERS: readonly (readonly [string, () => Promise<Browser>])[] = [
-  ['the default test Chromium', () => launchHeadlessChromium()],
-  ['the CLI Chromium', () => launchCliChromium()],
-];
 const TEST_TIMEOUT_MS = 180_000;
 const NAVIGATION_INTERVAL_MS = 300;
 const RESULT_TIMEOUT_MS = 3_000;
@@ -50,12 +44,6 @@ const LATE_DELIVERY_SETTLE_MS = 2_000;
 const VIEWPORT = Object.freeze({ width: 1280, height: 800 });
 /** 登録の画面を開くたびに、ページの JS がサービスの Origin へ送る GET の数。 */
 const SERVICE_READS_PER_LOAD = 10;
-/** 上限の中で終わる上限（比べの回と鍵の消失の回）。 */
-const WIDE_LIMITS = Object.freeze({ perMinute: 120, perRun: 600 });
-/** 画面の確かめの読み込み（書き込みの段を開く前）で届く上限。 */
-const BEFORE_STAGE_LIMITS = Object.freeze({ perMinute: 120, perRun: 2 });
-/** 画面の確かめの読み込みでは届かない上限（書き込みの段の読み込みがサービスの Origin へ送れば届く数）。 */
-const WITHIN_CHECK_LIMITS = Object.freeze({ perMinute: 120, perRun: SERVICE_READS_PER_LOAD + 2 });
 const NAME_VALUE = '上限 太郎';
 /** SHA-256 の 16 進の桁の数。 */
 const SHA256_HEX_LENGTH = 64;
@@ -63,7 +51,7 @@ const UNMATCHED_DIGEST = `sha256:${'0'.repeat(SHA256_HEX_LENGTH)}`;
 const HTTP_OK = 200;
 const HTTP_NO_CONTENT = 204;
 
-describe.each(LAUNCHERS)('T37a fix round 1: the write job stops before sending at the session key loss and the service request limit with %s', (_label, launch) => {
+describe.each(DEFAULT_CHROMIUM_LAUNCHERS)('T37a fix round 1: the write job stops before sending at the session key loss and the service request limit with %s', (_label, launch) => {
   let browser: Browser;
   let site: WriteSite;
   let service: LoopbackHttpServer;
@@ -72,8 +60,6 @@ describe.each(LAUNCHERS)('T37a fix round 1: the write job stops before sending a
   let formCandidate: DiscoveryCandidate;
   let searchCandidate: DiscoveryCandidate;
   let runCount = 0;
-  /** サービスの Origin の代わりのサーバに届いた GET の数（事前確認を除く）。 */
-  let serviceGets = 0;
 
   const configFor = (): AuditConfig => createTestConfig(site.origin, WRITE_SITE_PATHS.form, {
     crawl: { minNavigationIntervalMs: NAVIGATION_INTERVAL_MS },
@@ -81,15 +67,11 @@ describe.each(LAUNCHERS)('T37a fix round 1: the write job stops before sending a
     output: { directory: join(outputDirectory, `run-${runCount}`) },
   });
 
-  const authenticationFor = (
-    limits: { readonly perMinute: number; readonly perRun: number },
-    sessionKeyPresent: () => boolean,
-  ): RunAuthentication => {
+  const authenticationFor = (sessionKeyPresent: () => boolean): RunAuthentication => {
     const auditStage: AuditStageServiceRequests = {
       approvedServiceOrigins: [service.origin],
       auditReadRequests: [],
       scriptLogin: { origin: service.origin, path: '/auth/v1/token', requiredQuery: [{ name: 'grant_type', value: 'password' }] },
-      serviceRequestLimits: limits,
     };
     return {
       initialState: {
@@ -122,14 +104,13 @@ describe.each(LAUNCHERS)('T37a fix round 1: the write job stops before sending a
         response.writeHead(HTTP_NO_CONTENT, cors).end();
         return;
       }
-      serviceGets += 1;
       response.writeHead(HTTP_OK, { ...cors, 'content-type': 'application/json' }).end('{"n":1}');
     });
     outputDirectory = await mkdtemp(join(tmpdir(), 'beaksight-write-job-audit-stage-'));
     // 本物の発見の入口で、書き込みの画面の候補を読む（承認に縛る digest を手で書かない）。
     const factory = new BrowserContextFactory(browser, configFor(), () => new SafetyLedger(), {
       ...TEST_FACTORY_OPTIONS,
-      authentication: authenticatedContextOptions({ ...authenticationFor(WIDE_LIMITS, () => true), auditStage: undefined }),
+      authentication: authenticatedContextOptions({ ...authenticationFor(() => true), auditStage: undefined }),
     });
     const readPage = async (path: string): Promise<readonly DiscoveryCandidate[]> => {
       const context = await factory.createPassiveContext(VIEWPORT);
@@ -207,56 +188,42 @@ describe.each(LAUNCHERS)('T37a fix round 1: the write job stops before sending a
     readonly document: ActionRunDocument;
     readonly reports: readonly WorkerWriteSubmissionReport[];
     readonly posts: number;
-    readonly serviceGets: number;
   }> => {
     runCount += 1;
     const before = site.postBodies.length;
-    const serviceBefore = serviceGets;
     const reports: WorkerWriteSubmissionReport[] = [];
     const outcome = await executeWriteCreateRun({
       config: configFor(), jobId: `job-write-${runCount}`, authentication, write: writeSpec(verified), launchBrowser: launch,
       clock: () => new Date(), now: () => Date.now(), stopSignal: new AbortController().signal,
       recheck: () => Promise.resolve({ allowed: true }), reportSubmission: (report) => reports.push(report), resultTimeoutMs: RESULT_TIMEOUT_MS,
+      observationWindows: TEST_OBSERVATION_WINDOWS,
     }, { onRunStarted: () => undefined, onSessionLost: () => undefined });
     if (outcome.kind !== 'RAN') {
       throw new Error(`the write run did not run: ${outcome.kind}`);
     }
-    await wait(LATE_DELIVERY_SETTLE_MS);
+    // TEST-TIME-B（案 9）: Browser を閉じた後なので、受けている途中の要求が 0 になってから短い余白だけ待つ（上限は前の固定の待ち）。
+    await settleLateDeliveries(LATE_DELIVERY_SETTLE_MS, site, service);
     const document: unknown = JSON.parse(readFileSync(artifactFilePath(outcome.runDirectory, ACTION_RUN_ARTIFACT_FILE_NAME), 'utf8'));
     expect(await validateArtifact('action-run', document)).toEqual({ ok: true });
-    return { document: document as ActionRunDocument, reports, posts: site.postBodies.length - before, serviceGets: serviceGets - serviceBefore };
+    return { document: document as ActionRunDocument, reports, posts: site.postBodies.length - before };
   };
 
   const NOT_SENT = { submission: 'NOT_SENT', blockReason: 'PRECHECK_FAILED' } as const;
 
-  // PL-6a（設計書 `2026-10-26-beaksight-plain-ui-design.md` 8.1 の「事前の確かめ」）: 送る前に答え合わせの READ を読み、判定できなければ送らない
-  // （`VERIFICATION_READ_UNAVAILABLE`）。送る回の比べは、読める照合の READ の定義（`verified`）で行う（確かめたいのは監査の段の上限と鍵）。
-  it('sends within the limit with the key (the comparison)', async () => {
-    const run = await runWrite(authenticationFor(WIDE_LIMITS, () => true), true);
-    expect(run.document.submission).toBe('SENT');
-    expect(run.posts).toBe(1);
-  }, TEST_TIMEOUT_MS);
-
   it('does not send when the login state key disappeared before the write stage', async () => {
-    const run = await runWrite(authenticationFor(WIDE_LIMITS, () => false));
+    const run = await runWrite(authenticationFor(() => false));
     expect(run.document).toMatchObject(NOT_SENT);
     expect(run.reports).toEqual([NOT_SENT]);
     expect(run.posts).toBe(0);
   }, TEST_TIMEOUT_MS);
 
-  it('does not send when the service request limit was reached by the form page check', async () => {
-    const run = await runWrite(authenticationFor(BEFORE_STAGE_LIMITS, () => true));
-    expect(run.serviceGets).toBeLessThanOrEqual(BEFORE_STAGE_LIMITS.perRun);
-    expect(run.document).toMatchObject(NOT_SENT);
-    expect(run.reports).toEqual([NOT_SENT]);
-    expect(run.posts).toBe(0);
-  }, TEST_TIMEOUT_MS);
-
+  // PL-6a（設計書 `2026-10-26-beaksight-plain-ui-design.md` 8.1 の「事前の確かめ」）: 送る前に答え合わせの READ を読み、判定できなければ送らない
+  // （`VERIFICATION_READ_UNAVAILABLE`）。送る回の比べは、読める照合の READ の定義（`verified`）で行う。この回は、鍵の消失の回の比べ（鍵あり）も兼ねる。
   // T37R-fix-B（T37R の M-3）: 照合の READ にも、判定できない決まり（`UNDETERMINED`）を当てる。照合の READ の画面の読み込みで、同じ Origin の fetch の
   // POST（データを取る形）を Guard が止めたら、照らした結果に関係なく `UNDETERMINED` になり、書き込みの結果は今の「照合できない」の写し
   // （`PARTIAL`・`READ_VERIFICATION_UNDETERMINED`）。比べの回（止めた要求なし）は `VERIFIED`。
   it('verifies the write by the READ without blocked requests (the comparison of M-3)', async () => {
-    const run = await runWrite(authenticationFor(WIDE_LIMITS, () => true), true);
+    const run = await runWrite(authenticationFor(() => true), true);
     expect(run.document).toMatchObject({ submission: 'SENT', result: 'VERIFIED', readVerification: { result: 'MATCHED' } });
     expect(run.posts).toBe(1);
   }, TEST_TIMEOUT_MS);
@@ -267,7 +234,7 @@ describe.each(LAUNCHERS)('T37a fix round 1: the write job stops before sending a
   // （`BLOCKED`・`PRECHECK_FAILED`・`VERIFICATION_READ_UNAVAILABLE`。前は送ってから照合できない `PARTIAL`。送らない側に変わった）。
   it('makes the verification READ UNDETERMINED when the list page POST to the service origin was blocked (M-3)', async () => {
     site.setListDataRequest(true, service.origin);
-    const run = await runWrite(authenticationFor(WIDE_LIMITS, () => true), true);
+    const run = await runWrite(authenticationFor(() => true), true);
     expect(run.document).toMatchObject({
       ...NOT_SENT, precheckDetail: 'VERIFICATION_READ_UNAVAILABLE', result: 'BLOCKED', readVerification: null,
     });
@@ -279,18 +246,8 @@ describe.each(LAUNCHERS)('T37a fix round 1: the write job stops before sending a
   // 結果のまま（この画面はサーバが行を描くため `MATCHED`）。
   it('keeps the verification READ judged by its rows when only the same origin fetch POST was blocked (B2)', async () => {
     site.setListDataRequest(true);
-    const run = await runWrite(authenticationFor(WIDE_LIMITS, () => true), true);
+    const run = await runWrite(authenticationFor(() => true), true);
     expect(run.document).toMatchObject({ submission: 'SENT', result: 'VERIFIED', readVerification: { result: 'MATCHED' } });
-    expect(run.posts).toBe(1);
-  }, TEST_TIMEOUT_MS);
-
-  // 書き込みの段の Context は、承認したサービスの Origin へ送らない（Guard が止める。上限の部品にも数えない）。そのため、上限は書き込みの段の読み込みでは
-  // 動かず、書き込みの段を開く前の確かめで足りる（T37a fix round 1 の報告）。画面の確かめの読み込みの分だけが届き、上限の中なら送る。
-  it('sends no service request from the write stage, so the limit stays as it was after the form page check', async () => {
-    // PL-6a: 送る前の答え合わせが読める定義で送る（一覧の画面は、サービスの Origin へ送らない）。
-    const run = await runWrite(authenticationFor(WITHIN_CHECK_LIMITS, () => true), true);
-    expect(run.serviceGets).toBe(SERVICE_READS_PER_LOAD);
-    expect(run.document.submission).toBe('SENT');
     expect(run.posts).toBe(1);
   }, TEST_TIMEOUT_MS);
 });

@@ -175,7 +175,6 @@ const findOrchestrationImports = (source: ScannedSource): readonly string[] =>
 
 /** GATE-UI02 の除外（設計書 6.1.7）。 */
 const UI02_EXCLUDED_FILES: ReadonlyMap<string, string> = new Map([
-  ['src/evidence/color-collector.ts', 'ページから取った色の値を扱う'],
   ['src/report/html-tokens.ts', '色の値を定義する唯一のファイル'],
 ]);
 
@@ -205,6 +204,8 @@ const UI06_EXCLUDED_FILES: ReadonlyMap<string, string> = new Map([
   // T38R2-fix（Task 38 の設計書 7 章の最後の行。M-1）: API の書き込みの本文の鍵の名前と照らす、秘密に見える日本語の語の閉じた一覧（方針 6。利用者に
   // 見せる文言ではない）。
   ['src/core/secret-query-names.ts', '秘密に見える名前の方針で照らす語の一覧（表示の文言ではない）'],
+  // AUD-7（設計者の判断 2026-11-10）: 画面の誤りの表示の手がかりにする、汎用の語の閉じた一覧（利用者に見せる文言ではない）。
+  ['src/core/error-display-words.ts', '画面の誤りの表示と照らす汎用の語の一覧（表示の文言ではない）'],
 ]);
 
 /** GATE-UI06 の除外の、Rule の定義のファイル（Finding の `message` は Rule が持つ）。 */

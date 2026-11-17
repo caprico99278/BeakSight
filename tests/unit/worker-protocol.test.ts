@@ -17,9 +17,7 @@ import { CLI_FAILURE_KINDS } from '../../src/cli/failure.js';
 import { MAX_ADDITIONAL_NAVIGATION_WAIT_MS } from '../../src/crawl/navigation-pacer.js';
 import {
   MAX_WORKER_EXIT_CODE,
-  MAX_WORKER_FAILURE_DETAIL_LENGTH,
   MAX_WORKER_MESSAGE_PATH_LENGTH,
-  MAX_WORKER_NOTICE_URL_LENGTH,
   PARENT_TO_WORKER_MESSAGE_TYPES,
   WORKER_FAILURE_REASONS,
   WORKER_HEARTBEAT_INTERVAL_MS,
@@ -41,7 +39,6 @@ import {
   type WorkerToParentMessage,
 } from '../../src/control/worker-protocol.js';
 import { RUN_STATUSES, type RunId } from '../../src/core/contracts.js';
-import { MAX_URL_LENGTH } from '../../src/core/limits.js';
 
 const SCHEMA_PATH = resolve(process.cwd(), 'schemas', 'control', 'worker-message.schema.json');
 const SCHEMA = JSON.parse(readFileSync(SCHEMA_PATH, 'utf8')) as Record<string, unknown>;
@@ -113,10 +110,11 @@ const VALID_WORKER_MESSAGES: readonly (readonly [string, WorkerToParentMessage])
     type: 'NOTICE',
     notice: { kind: 'SITE_UNAVAILABLE_RECHECK', url: 'http://127.0.0.1:4173/a', delayMs: 30_000, attempt: 1, maxAttempts: 4 },
   }],
-  ['NOTICE (recheck, longest url)', {
+  // URL-LEN: 前の上限（2,048）より長い URL も受ける。
+  ['NOTICE (recheck, a url longer than the former limit)', {
     protocol: WORKER_PROTOCOL_VERSION,
     type: 'NOTICE',
-    notice: { kind: 'SITE_UNAVAILABLE_RECHECK', url: 'u'.repeat(MAX_WORKER_NOTICE_URL_LENGTH), delayMs: 0, attempt: 1, maxAttempts: 1 },
+    notice: { kind: 'SITE_UNAVAILABLE_RECHECK', url: `http://127.0.0.1/${'u'.repeat(2_049)}`, delayMs: 0, attempt: 1, maxAttempts: 1 },
   }],
   ['NOTICE (slowdown)', { protocol: WORKER_PROTOCOL_VERSION, type: 'NOTICE', notice: { kind: 'SITE_UNAVAILABLE_SLOWDOWN', minIntervalMs: 10_000 } }],
   // DEF-141: 承認したサービスへの要求の 1 分あたりの上限で、次の読み込みの前に待つ（待つ時間は 1 分まで）。
@@ -148,9 +146,6 @@ const VALID_WORKER_MESSAGES: readonly (readonly [string, WorkerToParentMessage])
   }],
   ['FAILED', { protocol: WORKER_PROTOCOL_VERSION, type: 'FAILED', reason: 'CONFIG_ERROR', detail: 'invalid configuration: crawl.maxPages must be positive' }],
   ['FAILED (empty detail)', { protocol: WORKER_PROTOCOL_VERSION, type: 'FAILED', reason: 'START_TIMEOUT', detail: '' }],
-  ['FAILED (longest detail)', {
-    protocol: WORKER_PROTOCOL_VERSION, type: 'FAILED', reason: 'UNEXPECTED_FAILURE', detail: 'd'.repeat(MAX_WORKER_FAILURE_DETAIL_LENGTH),
-  }],
 ];
 
 /** 正しい形の値の写しに、`change` を加えた値（入れ子の項目は、`path` の先を置き換える）。 */
@@ -299,7 +294,6 @@ describe('worker protocol: rejected messages (fail-closed)', () => {
     ['a progress report without a property', changed(progress, ['report', 'recentPerMinute'], REMOVE)],
     ['nested request counts with an extra property', changed(progress, ['report', 'requests', 'allowedOrigins', 'extra'], 1)],
     ['an unknown notice kind', changed(recheck, ['notice', 'kind'], 'SITE_DOWN')],
-    ['a notice url that is too long', changed(recheck, ['notice', 'url'], 'u'.repeat(MAX_WORKER_NOTICE_URL_LENGTH + 1))],
     ['a notice url with a lone surrogate', changed(recheck, ['notice', 'url'], 'http://127.0.0.1/\ud800')],
     ['a slowdown notice with a url', { ...workerExample('NOTICE (slowdown)'), notice: { kind: 'SITE_UNAVAILABLE_SLOWDOWN', minIntervalMs: 1, url: 'x' } }],
     // DEF-141: 待つ時間は 1 分（`MAX_ADDITIONAL_NAVIGATION_WAIT_MS`）まで。0 の待ちは知らせない。URL は持たない。
@@ -319,7 +313,6 @@ describe('worker protocol: rejected messages (fail-closed)', () => {
     ['an exit code that is too large', changed(ran, ['outcome', 'exitCode'], MAX_WORKER_EXIT_CODE + 1)],
     ['an outcome with the cause of an exception', changed(ran, ['outcome', 'cause'], 'Error: x')],
     ['an unknown failure reason', changed(failed, ['reason'], 'CRASHED')],
-    ['a failure detail that is too long', changed(failed, ['detail'], 'd'.repeat(MAX_WORKER_FAILURE_DETAIL_LENGTH + 1))],
     ['a failure detail with a line break', changed(failed, ['detail'], 'a\nb')],
     ['a failure detail with a lone surrogate', changed(failed, ['detail'], 'a\udc00')],
     ['a failure detail that is not a string', changed(failed, ['detail'], { message: 'x' })],
@@ -330,16 +323,9 @@ describe('worker protocol: rejected messages (fail-closed)', () => {
 });
 
 describe('worker protocol: failure detail', () => {
-  it('replaces control characters and lone surrogates, and cuts the detail at the limit', () => {
+  it('replaces control characters and lone surrogates', () => {
     expect(toWorkerFailureDetail('a\r\nb\u0000c\u2028d')).toBe('a  b c d');
     expect(toWorkerFailureDetail('x\ud800')).toBe('x\ufffd');
-    expect(toWorkerFailureDetail('e'.repeat(MAX_WORKER_FAILURE_DETAIL_LENGTH + 10))).toHaveLength(MAX_WORKER_FAILURE_DETAIL_LENGTH);
-    // 切った後に、対になっていないサロゲートを残さない。
-    const cut = toWorkerFailureDetail(`${'e'.repeat(MAX_WORKER_FAILURE_DETAIL_LENGTH - 1)}\u{1F600}`);
-    expect(cut.isWellFormed()).toBe(true);
-    expect(cut.length).toBeLessThanOrEqual(MAX_WORKER_FAILURE_DETAIL_LENGTH);
-    const message = { protocol: WORKER_PROTOCOL_VERSION, type: 'FAILED', reason: 'UNEXPECTED_FAILURE', detail: cut };
-    expect(validateWorkerToParentMessage(message).ok).toBe(true);
   });
 });
 
@@ -362,16 +348,14 @@ describe('worker protocol: value lists, limits and the schema', () => {
     expect(pointerValue(SCHEMA, '/$id')).toBe('urn:beaksight:schema:control:worker-message:1');
     expect(definitionOf('protocol')).toEqual({ const: WORKER_PROTOCOL_VERSION });
     // T30e: 書き込みのジョブの指定と、確かめ直しの往復と、送信の報告を足したので、版を上げた。
-    expect(WORKER_PROTOCOL_VERSION).toBe('beaksight-worker-message/7'); // OP-2: 書き込みの段で版 4。DEF-180: 前の読み込みの時刻で版 5。OP-H: チェックした画面の数で版 6。OP-L: 保存できなかった理由で版 7
+    expect(WORKER_PROTOCOL_VERSION).toBe('beaksight-worker-message/9'); // WSO: チェックした画面だけの段の並びと読む画面で版 9。DEF-200: ログインし直す段の指定（`RELOGIN_STAGE`）と、自動ログインの段の通した一覧（DEF-194）で版 8。 OP-2: 書き込みの段で版 4。DEF-180: 前の読み込みの時刻で版 5。OP-H: チェックした画面の数で版 6。OP-L: 保存できなかった理由で版 7
     expect(pointerValue(SCHEMA, '/$defs/start/properties/jobId/pattern')).toBe(WORKER_JOB_ID_PATTERN.source);
     expect(pointerValue(SCHEMA, '/$defs/start/properties/targetConfigSha256/pattern')).toBe(TARGET_CONFIG_SHA256_PATTERN.source);
     // 要約は、内容の SHA-256 の 16 進（Node の crypto と同じ値）。
     expect(targetConfigDigestOf(new TextEncoder().encode('abc'))).toBe('ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad');
     expect(TARGET_CONFIG_SHA256_PATTERN.test(SHA256)).toBe(true);
     expect(pointerValue(SCHEMA, '/$defs/path/maxLength')).toBe(MAX_WORKER_MESSAGE_PATH_LENGTH);
-    expect(pointerValue(SCHEMA, '/$defs/failed/properties/detail/maxLength')).toBe(MAX_WORKER_FAILURE_DETAIL_LENGTH);
-    expect(pointerValue(SCHEMA, '/$defs/siteUnavailableRecheck/properties/url/maxLength')).toBe(MAX_WORKER_NOTICE_URL_LENGTH);
-    expect(MAX_WORKER_NOTICE_URL_LENGTH).toBe(MAX_URL_LENGTH);
+    expect(pointerValue(SCHEMA, '/$defs/failed/properties/detail/maxLength')).toBeUndefined();
     // DEF-141: 待ちの知らせの待つ時間の上限は、読み込みの前の別の待ちの上限（1 分）と同じ。
     expect(pointerValue(SCHEMA, '/$defs/serviceRequestPacingWait/properties/waitMs/maximum')).toBe(MAX_ADDITIONAL_NAVIGATION_WAIT_MS);
     expect(pointerValue(SCHEMA, '/$defs/outcome/properties/exitCode/maximum')).toBe(MAX_WORKER_EXIT_CODE);

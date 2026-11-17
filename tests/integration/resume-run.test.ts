@@ -5,7 +5,7 @@
 // - B: k ページ目の保存の後で中断する Run と、その保存から再開した Run。中断は、本物の `ArtifactWriter` を包んだ書き手が、k+1 ページ目の
 //   ページの保存の前に、テスト用の例外を投げる形で模す。最初の Run Coordinator の結果は捨て（プロセスが終わったことを模す）、保存を
 //   `ArtifactWriter.readCheckpoint` で読み、`decideRunResumption` で `RESUME` を確かめてから、新しい Run Coordinator に `resumeFrom` で渡す。
-//   最初の Run のロックは、端末を再起動する前の OS の起動の時刻で取り（端末の再起動を模す）、再開のセッションが作り直す。
+//   SPEC-2: 保存のセッションはロックを持たない（監査中の印は、CLI とワーカーが持つ出力先のロック）。
 // 違反の後の再開（新しいページを始めず `ABORTED_BY_SAFETY`）も、同じ fixture のサイトで確かめる。
 // 再開の直後の最初の読み込みが、前の回の最後の読み込みから最小の間隔以上空くことは、注入した時計で、単体のテスト
 // （`tests/unit/run-coordinator.test.ts`）で確かめる（本物の時計では、再開までに間隔より長い時間がたつため）。ここでは、読み込みの
@@ -16,30 +16,18 @@ import { tmpdir } from 'node:os';
 import { join, relative } from 'node:path';
 import { afterAll, beforeAll, describe, expect, it } from 'vitest';
 import { startFixtureServer, type FixtureServer } from '../../fixtures/server.js';
-import { finishAuditRun } from '../../src/cli/run-command.js';
 import type { AuditConfig } from '../../src/config/types.js';
 import {
   artifactFilePath,
-  bundleFileName,
-  CHECKPOINT_ARTIFACT_DIRECTORY,
-  checkpointArtifactRelativePath,
-  isBundleFileName,
   pageArtifactRelativePath,
   PAGES_ARTIFACT_DIRECTORY,
   RUN_ARTIFACT_FILE_NAMES,
   runArtifactDirectory,
 } from '../../src/core/artifact-layout.js';
-import type { AuditRunResult, Finding, PageAuditResult, PageId, RunProgressReport, RunSummary } from '../../src/core/contracts.js';
+import type { AuditRunResult, Finding, PageAuditResult, PageId, RunSummary } from '../../src/core/contracts.js';
+import { decodePageRecord, type PageRecord } from '../../src/core/page-record-codec.js';
+import type { RunStageCarried, RunStageCarry } from '../../src/orchestration/audit-stage-run.js';
 import type { BrowserLauncher } from '../../src/orchestration/preflight.js';
-import {
-  currentProcessRunLockHost,
-  isProcessRunning,
-  judgeRunLock,
-  RUN_LOCK_BOOT_TIME_TOLERANCE_MS,
-  RUN_LOCK_HEARTBEAT_INTERVAL_MS,
-  type RunLock,
-  type RunLockHost,
-} from '../../src/core/process-lock.js';
 import {
   checkRunCheckpointConsistency,
   checkRunCheckpointPageConsistency,
@@ -56,8 +44,8 @@ import {
 } from '../../src/orchestration/run-coordinator.js';
 import { ArtifactWriter } from '../../src/report/artifact-writer.js';
 import { SafetyLedger } from '../../src/safety/safety-ledger.js';
+import { auditRunArrayOf } from '../helpers/audit-run-fixture.js';
 import {
-  captureCliOutput,
   createRunLauncher,
   expectOnlyReadRequests,
   expectSchemaValid,
@@ -94,7 +82,6 @@ class SimulatedInterruption extends Error {
 type StoreCall =
   | { readonly kind: 'page'; readonly pageId: PageId }
   | { readonly kind: 'state'; readonly completedPageIds: readonly PageId[] }
-  | { readonly kind: 'acquire lock' | 'rewrite lock' | 'read lock' | 'take over lock' | 'release lock' }
   | { readonly kind: 'clean up'; readonly removedPaths: readonly string[] };
 
 interface StoreOptions {
@@ -124,26 +111,6 @@ function wrappedStore(target: ArtifactWriter, calls: StoreCall[], options: Store
       await target.writeCheckpointState(directory, state);
       options.afterState?.(state);
     },
-    acquireRunLock: async (directory, lock) => {
-      calls.push({ kind: 'acquire lock' });
-      return target.acquireRunLock(directory, lock);
-    },
-    rewriteRunLock: async (directory, lock) => {
-      calls.push({ kind: 'rewrite lock' });
-      await target.rewriteRunLock(directory, lock);
-    },
-    readRunLock: async (directory) => {
-      calls.push({ kind: 'read lock' });
-      return target.readRunLock(directory);
-    },
-    takeOverRunLock: async (directory, judged, lock) => {
-      calls.push({ kind: 'take over lock' });
-      return target.takeOverRunLock(directory, judged, lock);
-    },
-    releaseRunLock: async (directory) => {
-      calls.push({ kind: 'release lock' });
-      await target.releaseRunLock(directory);
-    },
     cleanUpForResume: async (directory, completedPageIds) => {
       const removedPaths = await target.cleanUpForResume(directory, completedPageIds);
       calls.push({ kind: 'clean up', removedPaths });
@@ -151,15 +118,6 @@ function wrappedStore(target: ArtifactWriter, calls: StoreCall[], options: Store
     },
   };
 }
-
-/**
- * 端末を再起動する前の OS で取ったロックの値（OS の起動の時刻が、許す誤差より前。プロセスの ID は、動いているこのプロセスのもので、
- * ID の使い回しを模す）。最初の Run のセッションが使う。
- */
-const lockHostBeforeOsRestart = (nowMs: number): RunLockHost => {
-  const host = currentProcessRunLockHost(nowMs);
-  return { ...host, bootedAtMs: host.bootedAtMs - RUN_LOCK_BOOT_TIME_TOLERANCE_MS - RUN_LOCK_HEARTBEAT_INTERVAL_MS };
-};
 
 const findingKey = ({ findingId, ruleId, fingerprint }: Finding): readonly string[] => [findingId, ruleId, fingerprint];
 
@@ -228,17 +186,11 @@ async function filesUnder(directory: string): Promise<string[]> {
 let server: FixtureServer;
 let workDirectory: string;
 const runLauncher = createRunLauncher();
-/** 作った保存のセッション（後片付けで、ハートビートを止める）。 */
+/** 作った保存のセッション（後片付けで、やめる）。 */
 const sessions: RunCheckpointSession[] = [];
 
-function newSession(store: RunCheckpointStore, createLockHost?: (nowMs: number) => RunLockHost): RunCheckpointSession {
-  const session = new RunCheckpointSession({
-    store,
-    now: () => Date.now(),
-    ...(createLockHost === undefined ? {} : { createLockHost }),
-    // DEF-172: 動いている process の ID の古く見えるロックは、取り直す前に猶予を置いて読み直す（ここでは待たずに進める。ロックは変わらない）。
-    wait: async () => undefined,
-  });
+function newSession(store: RunCheckpointStore): RunCheckpointSession {
+  const session = new RunCheckpointSession({ store });
   sessions.push(session);
   return session;
 }
@@ -250,8 +202,9 @@ async function runCoordinator(input: {
   readonly session: RunCheckpointSession;
   readonly resumeFrom?: RunCoordinatorResumeInput;
   readonly createSafetyLedger?: () => SafetyLedger;
+  readonly stageCarry?: RunStageCarry;
 }): Promise<AuditRunResult> {
-  return await new RunCoordinator({
+  return await auditRunArrayOf(await new RunCoordinator({
     config: input.config,
     launchBrowser: runLauncher.launcher,
     createSafetyLedger: input.createSafetyLedger ?? (() => new SafetyLedger()),
@@ -260,7 +213,8 @@ async function runCoordinator(input: {
     outputDirectory: input.outputDirectory,
     checkpointSession: input.session,
     ...(input.resumeFrom === undefined ? {} : { resumeFrom: input.resumeFrom }),
-  }).run();
+    ...(input.stageCarry === undefined ? {} : { stageCarry: input.stageCarry }),
+  }).run());
 }
 
 /** fixture のサーバが、前に `resetRequestObservations` してから受け取った要求のパス。 */
@@ -294,7 +248,6 @@ describe('R4a2b: a Run interrupted after the k-th page checkpoint and resumed is
   let uninterruptedDirectory: string;
   let runDirectory: string;
   let saved: { readonly state: RunCheckpoint; readonly pages: readonly RunCheckpointPage[] };
-  let previousLock: RunLock;
   let interruptedPageId: PageId;
   let interruptedPageFilesBeforeResume: string[];
   let pathsObservedByResumedRun: string[];
@@ -302,6 +255,8 @@ describe('R4a2b: a Run interrupted after the k-th page checkpoint and resumed is
   let resumedAtMs: number;
   const interruptedCalls: StoreCall[] = [];
   const resumedCalls: StoreCall[] = [];
+  /** RB-6（前の stage-chain-fork の境目の場面）: 再開した Run の段の終わりの持ち越し。 */
+  const resumedCarry: RunStageCarried[] = [];
 
   beforeAll(async () => {
     // スクリーンショットを撮る（監査の途中だったページのディレクトリに、前の回のスクリーンショットが残るようにする）。性能の指標は
@@ -317,17 +272,15 @@ describe('R4a2b: a Run interrupted after the k-th page checkpoint and resumed is
     });
     uninterruptedDirectory = runArtifactDirectory(uninterruptedOutput, uninterrupted.run.runId);
 
-    // B-1: k+1 ページ目のページの保存の前に中断する Run（結果は捨てる）。ロックは、端末を再起動する前の OS で取る。
+    // B-1: k+1 ページ目のページの保存の前に中断する Run（結果は捨てる）。
     const interruptedOutput = join(workDirectory, 'interrupted');
     const interruptedSession = newSession(
       wrappedStore(new ArtifactWriter(), interruptedCalls, { interruptBeforePage: PAGES_BEFORE_INTERRUPTION + 1 }),
-      lockHostBeforeOsRestart,
     );
     const discarded = await runCoordinator({ config, outputDirectory: interruptedOutput, session: interruptedSession });
-    // プロセスが終わったことを模す（ハートビートを止める。ロックのファイルは残る）。
+    // プロセスが終わったことを模す。
     await interruptedSession.abandon();
     runDirectory = runArtifactDirectory(interruptedOutput, discarded.run.runId);
-    previousLock = await readJson(artifactFilePath(runDirectory, checkpointArtifactRelativePath('lock'))) as RunLock;
 
     // B-2: 保存を読み、再開できることを確かめてから、新しい Run Coordinator で再開する。
     saved = await readSavedCheckpoint(runDirectory);
@@ -344,6 +297,7 @@ describe('R4a2b: a Run interrupted after the k-th page checkpoint and resumed is
       outputDirectory: join(workDirectory, 'resumed-output-root'),
       session: newSession(wrappedStore(new ArtifactWriter(), resumedCalls)),
       resumeFrom: { runDirectory, checkpoint: saved.state, pages: saved.pages },
+      stageCarry: { serviceRequestWindowMs: [], record: (value) => resumedCarry.push(value) },
     });
     pathsObservedByResumedRun = observedPaths();
   }, SUITE_TIMEOUT_MS);
@@ -382,17 +336,16 @@ describe('R4a2b: a Run interrupted after the k-th page checkpoint and resumed is
     expect(resumed.run.load.requests.allowedOrigins.count).toBeGreaterThan(saved.state.load.meter.allowedOrigins.count);
   });
 
-  it('remakes the stale lock of the previous execution (before an OS restart) and removes the directory of the unfinished page', async () => {
-    // 前の回のロックは、OS の起動の時刻が違うので古いとみなされ、作り直される（原子的に取り直し、後始末をしてから保存する。LG-4: 書き換えて
-    // 読み直す前の方式は捨てた）。
-    // DEF-172: 動いている process の ID の古く見えるロックは、猶予の後に読み直してから取り直す（読み取りを除いた順は、今までどおり）。
-    expect(resumedCalls.map(({ kind }) => kind).filter((kind) => kind !== 'read lock').slice(0, 3)).toEqual(['acquire lock', 'take over lock', 'clean up']);
-    const lock = await readJson(artifactFilePath(runDirectory, checkpointArtifactRelativePath('lock'))) as RunLock;
-    expect(lock.bootedAtMs).not.toBe(previousLock.bootedAtMs);
-    expect(lock.acquiredAtMs).toBeGreaterThanOrEqual(resumedAtMs);
-    const judgedAtMs = Date.now();
-    expect(judgeRunLock(lock, { nowMs: judgedAtMs, bootedAtMs: currentProcessRunLockHost(judgedAtMs).bootedAtMs, isProcessRunning }))
-      .toBe('ACTIVE');
+  // FM2R の C-1（前の stage-chain-fork の境目の場面。RB-6）: 再開した Run は外の pacer を使わないので、自分の pacer の最後の読み込みを段の終わりに持ち越す（次の段は、
+  // そこから設定の間隔以上を待つ。待つことは `audit-worker-session-chain`・`stage-chain-carry` の単体）。
+  it('carries the last navigation of the resumed execution to the next stage', () => {
+    expect(resumedCarry).toHaveLength(1);
+    expect(resumedCarry[0]?.navigation.lastNavigationStartedAtMs ?? 0).toBeGreaterThanOrEqual(resumedAtMs);
+    expect(resumedCarry[0]?.navigation.minIntervalMs).toBe(config.crawl.minNavigationIntervalMs);
+  });
+
+  it('cleans up before saving, and removes the directory of the unfinished page', async () => {
+    expect(resumedCalls[0]?.kind).toBe('clean up');
     // 監査の途中だったページのディレクトリは消され、そのページは最初から監査し直される（古いファイルは残らず、スクリーンショットは
     // 中断しなかった Run と同じものがそろう）。
     const cleanUp = resumedCalls.find((call) => call.kind === 'clean up');
@@ -503,7 +456,6 @@ describe.each([
           }
         },
       }),
-      lockHostBeforeOsRestart,
     );
     // 最初の Run は、違反のページの保存の後、次のページを始めずに終わる。保存は、違反のページの後のもので終わっているので、その時点で
     // プロセスが終わった場合と同じである（結果は、比べるために使う）。
@@ -546,180 +498,7 @@ describe.each([
   });
 });
 
-// R4b2（中断した Run の再開の設計書 4.3.2、4.5、4.6.1、4.8、第7章）: 止める印の形の「中断しなかった場合と同じ」。
-// - A: 中断しない Run（セッションあり）。
-// - B: `onProgress` で k ページ目が終わったときに `AbortController.abort()` を呼ぶ Run（PARTIAL。保存の終わり方は `FINISH`・`STOPPED`）と、
-//   その最後の状態の保存から再開した Run。
-// どの Run も、CLI と同じ順（`finishAuditRun` で出力を書いた後に、`checkpointConclusion()` に従ってセッションの `finish` か `abandon`）で終える。
-// 比べる項目は、R4a2b と同じ（`comparableRun`）。加えて、B の再開の後の Run のディレクトリのファイルの一覧（`checkpoint/` を除く）が、
-// A と同じであること（STOPPED の回の出力が残っても、最後の出力のファイルの集まりが変わらない。設計書 4.5）。
-// 比べない項目（R4a2b と同じ）: Run の ID、時刻、時刻を含む Evidence の値、`load`、`executions`（A と B の間）、`environment`。
-describe('R4b2: a Run stopped by the stop signal after the k-th page and resumed is the same as the Run without the stop (resumable run design 4.6.1, 7)', () => {
-  /** 止める印を付ける前に監査を終えるページの数（k）。k ページ目の進み具合の報告で、印を付ける。 */
-  const PAGES_BEFORE_STOP = 2;
-
-  let uninterrupted: AuditRunResult;
-  let uninterruptedDirectory: string;
-  let uninterruptedConclusion: RunCoordinatorCheckpointConclusion;
-  let stopped: AuditRunResult;
-  let stoppedConclusion: RunCoordinatorCheckpointConclusion;
-  let stoppedState: RunCheckpoint;
-  let runDirectory: string;
-  let resumed: AuditRunResult;
-  let resumedConclusion: RunCoordinatorCheckpointConclusion;
-  let finalState: RunCheckpoint;
-  let resumedExecutionStartedAtMs: number;
-
-  /**
-   * CLI と同じ順で Run を終える（設計書 4.7.1）: `finishAuditRun` で出力を書いた後に、保存の終わり方に従って、`FINISH` ならセッションの
-   * `finish` に最後の状態の保存を渡し、`ABANDON` なら `abandon` を呼ぶ。表示の出力先は、テストの中の偽のもの。
-   */
-  async function finishLikeCli(
-    coordinator: RunCoordinator,
-    session: RunCheckpointSession,
-    result: AuditRunResult,
-    outputDirectory: string,
-  ): Promise<RunCoordinatorCheckpointConclusion> {
-    await finishAuditRun(result, outputDirectory, captureCliOutput().output);
-    const conclusion = coordinator.checkpointConclusion();
-    if (conclusion.action === 'FINISH') {
-      await session.finish(conclusion.checkpoint);
-    } else if (conclusion.action === 'ABANDON') {
-      await session.abandon();
-    }
-    return conclusion;
-  }
-
-  /** 本物の Chromium で Run を行う Run Coordinator（時計は実際の時刻）。 */
-  const coordinatorFor = (input: {
-    readonly config: AuditConfig;
-    readonly outputDirectory: string;
-    readonly session: RunCheckpointSession;
-    readonly resumeFrom?: RunCoordinatorResumeInput;
-    readonly stopSignal?: AbortSignal;
-    readonly onProgress?: (report: RunProgressReport) => void;
-  }): RunCoordinator => new RunCoordinator({
-    config: input.config,
-    launchBrowser: runLauncher.launcher,
-    createSafetyLedger: () => new SafetyLedger(),
-    clock: () => new Date(),
-    now: () => Date.now(),
-    outputDirectory: input.outputDirectory,
-    checkpointSession: input.session,
-    ...(input.resumeFrom === undefined ? {} : { resumeFrom: input.resumeFrom }),
-    ...(input.stopSignal === undefined ? {} : { stopSignal: input.stopSignal }),
-    ...(input.onProgress === undefined ? {} : { onProgress: input.onProgress }),
-  });
-
-  /** Run のディレクトリのファイルの一覧（`checkpoint/` の下を除く）。 */
-  const outputFilesUnder = async (directory: string): Promise<string[]> =>
-    (await filesUnder(directory)).filter((file) => !file.startsWith(`${CHECKPOINT_ARTIFACT_DIRECTORY}/`));
-
-  beforeAll(async () => {
-    // スクリーンショットを撮る（STOPPED の回と再開の後の出力のファイルの集まりを、スクリーンショットを含めて比べる）。性能の指標は
-    // 集めない（`RUN_IDENTITY_AUDIT_OVERRIDES`。DEF-079）。
-    const config = fastRunConfig(server.origin, START_PATH, { audit: { ...RUN_IDENTITY_AUDIT_OVERRIDES, screenshots: true } });
-
-    // A: 中断しない Run。
-    const uninterruptedOutput = join(workDirectory, 'signal-uninterrupted');
-    const uninterruptedSession = newSession(new ArtifactWriter());
-    const uninterruptedCoordinator = coordinatorFor({ config, outputDirectory: uninterruptedOutput, session: uninterruptedSession });
-    uninterrupted = await uninterruptedCoordinator.run();
-    uninterruptedConclusion = await finishLikeCli(uninterruptedCoordinator, uninterruptedSession, uninterrupted, uninterruptedOutput);
-    uninterruptedDirectory = runArtifactDirectory(uninterruptedOutput, uninterrupted.run.runId);
-
-    // B-1: k ページ目の監査が終わったときに、止める印を付ける Run。
-    const stoppedOutput = join(workDirectory, 'signal-stopped');
-    const controller = new AbortController();
-    const stoppedSession = newSession(new ArtifactWriter());
-    const stoppedCoordinator = coordinatorFor({
-      config,
-      outputDirectory: stoppedOutput,
-      session: stoppedSession,
-      stopSignal: controller.signal,
-      onProgress: (report) => {
-        if (report.pagesFinished === PAGES_BEFORE_STOP) {
-          controller.abort();
-        }
-      },
-    });
-    stopped = await stoppedCoordinator.run();
-    stoppedConclusion = await finishLikeCli(stoppedCoordinator, stoppedSession, stopped, stoppedOutput);
-    runDirectory = runArtifactDirectory(stoppedOutput, stopped.run.runId);
-
-    // B-2: 最後の状態の保存を読み、再開できることを確かめてから、新しい Run Coordinator で再開する。
-    const saved = await readSavedCheckpoint(runDirectory);
-    stoppedState = saved.state;
-    expect(decideRunResumption(stoppedState)).toBe('RESUME');
-    const resumedSession = newSession(new ArtifactWriter());
-    const resumedCoordinator = coordinatorFor({
-      config,
-      outputDirectory: join(workDirectory, 'signal-resumed-output-root'),
-      session: resumedSession,
-      resumeFrom: { runDirectory, checkpoint: saved.state, pages: saved.pages },
-    });
-    resumedExecutionStartedAtMs = Date.now();
-    resumed = await resumedCoordinator.run();
-    // 出力は、前の回と同じ Run のディレクトリ（`<出力先>/<Run の ID>`）に書く。
-    resumedConclusion = await finishLikeCli(resumedCoordinator, resumedSession, resumed, stoppedOutput);
-    finalState = (await readSavedCheckpoint(runDirectory)).state;
-  }, SUITE_TIMEOUT_MS);
-
-  it('stops after the k-th page with PARTIAL, skips the rest with RUN_INTERRUPTED, and leaves a STOPPED checkpoint', () => {
-    expect(uninterrupted.pages.map(({ pageUrl }) => new URL(pageUrl).pathname)).toEqual(CRAWL_PATHS);
-    expect(uninterruptedConclusion.action).toBe('FINISH');
-    expect(stopped.run.runStatus).toBe('PARTIAL');
-    const audited = stopped.pages.filter(({ status }) => status !== 'SKIPPED');
-    expect(audited.map(({ pageId }) => pageId)).toEqual(uninterrupted.pages.slice(0, PAGES_BEFORE_STOP).map(({ pageId }) => pageId));
-    const skipped = stopped.pages.filter(({ status }) => status === 'SKIPPED');
-    expect(skipped.length).toBeGreaterThan(0);
-    expect(skipped.every(({ incompleteReasons }) => JSON.stringify(incompleteReasons) === JSON.stringify([{ code: 'RUN_INTERRUPTED', detail: null }])))
-      .toBe(true);
-    expect(stopped.run.incompleteReasons).toContainEqual({ code: 'RUN_INTERRUPTED', detail: null });
-    expect(stopped.run.executions.map(({ endReason }) => endReason)).toEqual(['STOPPED_BY_SIGNAL']);
-    expect(stoppedConclusion.action).toBe('FINISH');
-    expect(stoppedState.state).toBe('STOPPED');
-    expect(stoppedState.completedPageIds).toEqual(audited.map(({ pageId }) => pageId));
-    expect(stoppedState.savedAt).toBe(stopped.run.finishedAt);
-  });
-
-  it('gives the same pages, IDs, Evidence, Findings, Run Status, skip reasons and Safety summary as the Run without the stop', async () => {
-    expect(comparableRun(resumed)).toEqual(comparableRun(uninterrupted));
-    await expectSchemaValid(resumed);
-  });
-
-  // BN1（ChatGPT 用バンドルのファイル名の設計書 2.1）: バンドルの名前は、その Run の最後の実行の終わりの時刻を含むので、中断しなかった Run と
-  // 再開した Run とで違う。名前の一致は求めず、ほかのファイルの一覧を比べる。バンドルは、それぞれの Run のディレクトリにちょうど1つあり、
-  // 名前は、それぞれの run.json の `executions` の最後の `finishedAt` から `bundleFileName` で作ったものであることを確かめる。
-  it('leaves the same set of output files in the run directory as the Run without the stop (except checkpoint/ and the bundle name)', async () => {
-    const files = await outputFilesUnder(runDirectory);
-    const withoutBundles = (paths: readonly string[]): readonly string[] => paths.filter((path) => !isBundleFileName(path));
-    expect(files.length).toBeGreaterThan(0);
-    expect(withoutBundles(files)).toEqual(withoutBundles(await outputFilesUnder(uninterruptedDirectory)));
-    for (const directory of [runDirectory, uninterruptedDirectory]) {
-      const written = await readJson(artifactFilePath(directory, RUN_ARTIFACT_FILE_NAMES.run)) as RunSummary;
-      const expectedBundle = bundleFileName(written.executions[written.executions.length - 1]?.finishedAt ?? '');
-      expect((await outputFilesUnder(directory)).filter(isBundleFileName), directory).toEqual([expectedBundle]);
-    }
-  });
-
-  it('records the stopped execution and the resumed one in run.json, and finishes the checkpoint as FINISHED', async () => {
-    expect(resumed.run.executions).toEqual([
-      { startedAt: stopped.run.startedAt, finishedAt: stopped.run.finishedAt, endReason: 'STOPPED_BY_SIGNAL' },
-      { startedAt: expect.any(String), finishedAt: resumed.run.finishedAt, endReason: 'COMPLETED' },
-    ]);
-    expect(Date.parse(resumed.run.executions[1]?.startedAt ?? '')).toBeGreaterThanOrEqual(resumedExecutionStartedAtMs);
-    const written = await readJson(artifactFilePath(runDirectory, RUN_ARTIFACT_FILE_NAMES.run)) as AuditRunResult['run'];
-    expect(written.executions).toEqual(resumed.run.executions);
-    expect(resumedConclusion.action).toBe('FINISH');
-    expect(finalState.state).toBe('FINISHED');
-    expect(finalState.savedAt).toBe(resumed.run.finishedAt);
-    expect(finalState.executions.map(({ endReason }) => endReason)).toEqual(['STOPPED_BY_SIGNAL', 'COMPLETED']);
-    expect(decideRunResumption(finalState)).toBe('NOT_RESUMABLE');
-    // セッションの `finish` がロックを外した。
-    expect(existsSync(artifactFilePath(runDirectory, checkpointArtifactRelativePath('lock')))).toBe(false);
-  });
-});
+// TEST-SLIM J2: 止める印で止めて再開する流れ（前の R4b2）は、CLI の流れで `cli-stop-resume.test.ts` の R5a（止めて再開）が確かめる。
 
 // R7b（中断した Run の再開の設計書 4.10 の DEF-022）: 再開した実行で PREFLIGHT に失敗しても、その実行の出力（本物の `ArtifactWriter.writeRun`
 // で書いた run.json、audit.json、ページの page.json）に、前の回までに終わったページが入り、残りの URL は、理由 `PREFLIGHT_FAILED`
@@ -744,14 +523,13 @@ describe('R7b: a resumed execution whose PREFLIGHT fails writes the pages finish
 
   beforeAll(async () => {
     const config = fastRunConfig(server.origin, START_PATH);
-    // k+1 ページ目のページの保存の前に中断する Run（ロックは、端末を再起動する前の OS で取る。再開のセッションが作り直す）。
+    // k+1 ページ目のページの保存の前に中断する Run。
     const output = join(workDirectory, 'preflight-failed');
     const interruptedSession = newSession(
       wrappedStore(new ArtifactWriter(), [], { interruptBeforePage: PAGES_BEFORE_INTERRUPTION + 1 }),
-      lockHostBeforeOsRestart,
     );
     interrupted = await runCoordinator({ config, outputDirectory: output, session: interruptedSession });
-    // プロセスが終わったことを模す（ハートビートを止める。ロックのファイルは残る）。
+    // プロセスが終わったことを模す。
     await interruptedSession.abandon();
     runDirectory = runArtifactDirectory(output, interrupted.run.runId);
     saved = await readSavedCheckpoint(runDirectory);
@@ -775,7 +553,7 @@ describe('R7b: a resumed execution whose PREFLIGHT fails writes the pages finish
     });
     server.resetCounters();
     server.resetRequestObservations();
-    resumed = await coordinator.run();
+    resumed = await auditRunArrayOf(await coordinator.run());
     pathsObservedByResumedRun = observedPaths();
     // CLI と同じく、出力を書いた後に、保存の終わり方に従う（設計書 4.7.1）。出力は、前の回と同じ Run のディレクトリに書く。
     await new ArtifactWriter().writeRun(resumed, { outputDirectory: output });
@@ -787,7 +565,8 @@ describe('R7b: a resumed execution whose PREFLIGHT fails writes the pages finish
     writtenAudit = await readRunAudit(runDirectory);
     writtenPages = [];
     for (const { pageId } of writtenAudit.pages) {
-      writtenPages.push(await readJson(artifactFilePath(runDirectory, pageArtifactRelativePath(pageId, 'page'))) as PageAuditResult);
+      // REC-3: page.json はディスクの形なので、メモリの形に戻して比べる。
+      writtenPages.push(decodePageRecord(await readJson(artifactFilePath(runDirectory, pageArtifactRelativePath(pageId, 'page'))) as PageRecord));
     }
     savedAfterResume = await readSavedCheckpoint(runDirectory);
   }, SUITE_TIMEOUT_MS);

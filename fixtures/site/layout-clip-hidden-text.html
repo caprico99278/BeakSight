@@ -1,0 +1,62 @@
+<!doctype html>
+<html lang="ja">
+  <head>
+    <meta charset="utf-8">
+    <title>Clip hidden text fixture</title>
+    <style>
+      body { margin: 0; font-family: sans-serif; }
+      main { width: 360px; }
+      /* スマホの幅で、押せる部品に最小の大きさを当てる（隠したリンクにも当たる）。 */
+      @media (max-width: 480px) {
+        a { display: inline-block; min-width: 44px; min-height: 44px; }
+      }
+      /* スクリーンリーダー向けに、画面から隠す（clip と clip-path）。最小の大きさで 1 × 1 px より大きくなる。 */
+      .skip-rect {
+        position: absolute;
+        width: 1px;
+        height: 1px;
+        overflow: hidden;
+        white-space: nowrap;
+        clip: rect(0 0 0 0);
+      }
+      .skip-rect-comma {
+        position: absolute;
+        width: 1px;
+        height: 1px;
+        overflow: hidden;
+        white-space: nowrap;
+        clip: rect(0, 0, 0, 0);
+      }
+      .skip-inset {
+        position: absolute;
+        width: 1px;
+        height: 1px;
+        overflow: hidden;
+        white-space: nowrap;
+        clip-path: inset(50%);
+      }
+      /* 祖先が隠す（clip-path の面が 0）。中の要素は static で、横にはみ出す。 */
+      .hidden-wrapper { clip-path: inset(50%); }
+      .wide-button { display: block; width: 600px; }
+      .hidden-wrapper .cut { width: 44px; overflow: hidden; white-space: nowrap; }
+      /* 本当に見切れる文字（隠していない）。 */
+      .really-cut { width: 44px; overflow: hidden; white-space: nowrap; }
+      /* 面が 0 にならない clip-path は、今のとおり数える。 */
+      .partly-inset { clip-path: inset(10%); width: 44px; overflow: hidden; white-space: nowrap; }
+    </style>
+  </head>
+  <body>
+    <a id="skip-rect" class="skip-rect" href="#content">メインコンテンツへスキップ</a>
+    <a id="skip-rect-comma" class="skip-rect-comma" href="#content">メインコンテンツへスキップ</a>
+    <a id="skip-inset" class="skip-inset" href="#content">メインコンテンツへスキップ</a>
+    <main id="content">
+      <div class="hidden-wrapper">
+        <button id="hidden-wide-button" class="wide-button" type="button">隠した横に長いボタン</button>
+        <p id="hidden-ancestor-cut" class="cut">祖先が隠している長い文字の行です</p>
+      </div>
+      <p id="really-cut" class="really-cut">本当に見切れている長い文字の行です</p>
+      <p id="partly-inset" class="partly-inset">一部だけ切り取る長い文字の行です</p>
+      <button id="visible-wide-button" class="wide-button" type="button">見える横に長いボタン</button>
+    </main>
+  </body>
+</html>

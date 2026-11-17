@@ -9,9 +9,8 @@
 //   要求をすべて記録する。ページの JS が入力の値を送ろうとする形（`AUTOMATED_LOGIN_INPUT_LEAK_VARIANTS`: 値が入ったら、画像・iframe・
 //   fetch（no-cors の GET）・stylesheet を C と同じ Origin へ、WebSocket、beacon と fetch の POST、query つきの favicon、別の GET のフォーム。
 //   `AUTOMATED_LOGIN_SUBMIT_LEAK_VARIANTS`: 押したときや送信の事象の中で GET に変えて送る）と、値を運べない favicon（`favicon-plain`）がある。
-// - 送信先（POST `/auth/<結果>`）は、結果（`AUTOMATED_LOGIN_OUTCOMES`）ごとに、成功・資格情報の誤り・ロック・MFA・期限切れ・429・500・どの条件にも
-//   当たらない画面・2 つの条件に当たる画面・状態のない成功・2 回目の POST を送ろうとする画面・止めるまで応答しない、応答の前に接続を切る
-//   （DEF-099 fix round 1）、を返す。
+// - 送信先（POST `/auth/<結果>`）は、結果（`AUTOMATED_LOGIN_OUTCOMES`）ごとに、成功・資格情報の誤り・429・状態のない成功・2 回目の POST を送ろうと
+//   する画面・止めるまで応答しない、応答の前に接続を切る（DEF-099 fix round 1）、を返す（RB-12: ほかの結果の区別は単体の結果の輪へ移した）。
 // - 資格情報は、テストが渡す目印（実行ごとのランダムな値）。値は、記録の本文の中にしか残さない（出力しない）。
 import type { IncomingMessage, ServerResponse } from 'node:http';
 import type { Duplex } from 'node:stream';
@@ -24,12 +23,8 @@ const STATUS_TOO_MANY_REQUESTS = 429;
 const STATUS_INTERNAL_SERVER_ERROR = 500;
 /** 429 の `Retry-After`（秒）。 */
 export const FIXTURE_RETRY_AFTER_SECONDS = 120;
-/** 429 の `Retry-After`（HTTP の日付）の、今からの長さ（ms。1 時間）。 */
-export const FIXTURE_RETRY_AFTER_DATE_OFFSET_MS = 3_600_000;
 /** WebSocket の upgrade を記録するときの method（T26g-1）。 */
 export const WEBSOCKET_UPGRADE_METHOD = 'WEBSOCKET';
-/** 秒の単位にそろえる（HTTP の日付は秒の単位）。 */
-const SECOND_MS = 1_000;
 
 /** セッションの Cookie の名前（originA）。 */
 export const FIXTURE_SESSION_COOKIE = 'sid';
@@ -44,12 +39,7 @@ export const AUTOMATED_LOGIN_FIXTURE_PATHS = Object.freeze({
   auth: '/auth/',
   home: '/home',
   homePlain: '/home-plain',
-  homeBoth: '/home/both',
   loginError: '/login-error',
-  locked: '/locked',
-  mfa: '/mfa',
-  expired: '/expired',
-  nowhere: '/nowhere',
   resubmit: '/resubmit',
   otherHop: '/b/hop',
   collect: '/collect',
@@ -77,14 +67,7 @@ export const AUTOMATED_LOGIN_OUTCOMES = Object.freeze([
   'success',
   'success-idp',
   'invalid',
-  'locked',
-  'mfa',
-  'expired',
   'rate-seconds',
-  'rate-date',
-  'error',
-  'nomatch',
-  'ambiguous',
   'nostate',
   'resubmit',
   'slow',
@@ -131,6 +114,9 @@ export const AUTOMATED_LOGIN_FORM_VARIANTS = Object.freeze([
   'leak-submit-get-third',
   'leak-click-get-submit',
   'leak-click-iframe-get',
+  // SLIM-GROUP L-4（設計書 `2026-11-14-beaksight-slim-and-simplify-design.md` 5.4）: 値が入った時点で送ろうとする形（`AUTOMATED_LOGIN_INPUT_LEAK_VARIANTS`）を、
+  // 1 つの画面に全部載せたもの（押す前の窓の通り道を 1 回で確かめる）。
+  'leak-input-all',
 ] as const);
 export type AutomatedLoginFormVariant = (typeof AUTOMATED_LOGIN_FORM_VARIANTS)[number];
 
@@ -286,6 +272,11 @@ function formHtml(variant: AutomatedLoginFormVariant, action: string, otherActio
       return `${standard}<iframe name="fr" src="about:blank"></iframe>`
         + '<script>document.getElementById("go").addEventListener("click", (event) => { event.preventDefault();'
         + ` ${form}.method = "get"; ${form}.target = "fr"; ${form}.action = "${third}/fr"; ${form}.submit(); });</script>`;
+    case 'leak-input-all':
+      // 各形のフォームの後ろの部分（スクリプトと、写し先のフォーム）を並べる。スクリプトはブロックで包み、形ごとの `let` をぶつけない。
+      return standard + AUTOMATED_LOGIN_INPUT_LEAK_VARIANTS
+        .map((leak) => formHtml(leak, action, otherAction, third).slice(standard.length).split('<script>').join('<script>{').split('</script>').join('}</script>'))
+        .join('');
     case 'standard':
       return `${open()}${USER}${PASS}${GO}</form>`;
     case 'button-outside':
@@ -375,31 +366,8 @@ export async function startAutomatedLoginFixture(options: AutomatedLoginFixtureO
       case 'invalid':
         redirect(response, p.loginError);
         return;
-      case 'locked':
-        redirect(response, p.locked);
-        return;
-      case 'mfa':
-        redirect(response, p.mfa);
-        return;
-      case 'expired':
-        redirect(response, p.expired);
-        return;
       case 'rate-seconds':
         sendHtml(response, '<p id="rate">slow down</p>', STATUS_TOO_MANY_REQUESTS, { 'retry-after': String(FIXTURE_RETRY_AFTER_SECONDS) });
-        return;
-      case 'rate-date': {
-        const until = new Date(Math.ceil((Date.now() + FIXTURE_RETRY_AFTER_DATE_OFFSET_MS) / SECOND_MS) * SECOND_MS);
-        sendHtml(response, '<p id="rate">slow down</p>', STATUS_TOO_MANY_REQUESTS, { 'retry-after': until.toUTCString() });
-        return;
-      }
-      case 'error':
-        sendHtml(response, '<p id="error">error</p>', STATUS_INTERNAL_SERVER_ERROR);
-        return;
-      case 'nomatch':
-        redirect(response, p.nowhere, { 'set-cookie': sessionCookie });
-        return;
-      case 'ambiguous':
-        redirect(response, p.homeBoth, { 'set-cookie': sessionCookie });
         return;
       case 'nostate':
         redirect(response, p.homePlain);
@@ -456,23 +424,8 @@ export async function startAutomatedLoginFixture(options: AutomatedLoginFixtureO
       case p.homePlain:
         sendHtml(response, '<p id="home-ok">home</p>');
         return;
-      case p.homeBoth:
-        sendHtml(response, '<p id="home-ok">home</p><p id="locked">locked</p>');
-        return;
       case p.loginError:
         sendHtml(response, '<p id="invalid">invalid</p>');
-        return;
-      case p.locked:
-        sendHtml(response, '<p id="locked">locked</p>');
-        return;
-      case p.mfa:
-        sendHtml(response, '<p id="mfa">mfa</p>');
-        return;
-      case p.expired:
-        sendHtml(response, '<p id="expired">expired</p>');
-        return;
-      case p.nowhere:
-        sendHtml(response, '<p id="nowhere">nowhere</p>');
         return;
       case p.resubmit:
         // 読み込みの直後に、同じ送信先へ 2 回目の POST を送ろうとする（Guard の回数の上限で止まる）。

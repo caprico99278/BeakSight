@@ -14,8 +14,8 @@
 //   → `SCENARIO_FIELD_NOT_ALLOWED`。
 // - 照らす READ の定義（参照ごと）: 同じプロファイルの定義がない → `SCENARIO_READ_CHECK_NOT_FOUND`、取り消した → `SCENARIO_READ_CHECK_CANCELED`、
 //   版が違う → `SCENARIO_READ_CHECK_REVISION_MISMATCH`。
-// - 上限と期限は既定以下（`SCENARIO_LIMIT_ABOVE_DEFAULT`、`SCENARIO_TTL_ABOVE_DEFAULT`）。1 回の Run の上限は累積の上限以下
-//   （`SCENARIO_LIMIT_INCONSISTENT`）。副作用の確認は形だけ（4 項目の真偽。未確認でも下書きは保存できる。承認の前の確かめは
+// - 1 回の Run の上限は既定以下（`SCENARIO_LIMIT_ABOVE_DEFAULT`）。LZ-3c: 累積の件数と期限の日数は判定に使わない名残（下限の形だけ。前の
+//   `SCENARIO_TTL_ABOVE_DEFAULT`・`SCENARIO_LIMIT_INCONSISTENT` は捨てた）。副作用の確認は形だけ（4 項目の真偽。未確認でも下書きは保存できる。承認の前の確かめは
 //   `unconfirmedSideEffectsOf`）。
 // - 誤りの詳しい文には、欄の名前と項目の位置だけを書く（値は入力にない）。
 // - 保存の前の確かめ直し（`assertStorableScenarioRevision`、`assertStorableApprovalReceipt`）は、スキーマ（`scenario`、`approval-receipt`）で形を
@@ -36,7 +36,7 @@
 //   （`SCENARIO_API_READ_VERIFICATION_NOT_BOUND`。判定は `hasGeneratedValueExpectation`。IPC の手書きの確かめと同じ部品）。
 // - T40R2-fix（Task 40 の設計書 7 章の「T40R2」の行）: 比べる欄が実行のたびに変わる値か（M-1）は、入力の規則がまだない保存の時には判定できないので、
 //   許可の発行（`READ_VERIFICATION_NOT_VARYING`。`src/control/data-rules/varying-values.ts`）で確かめる。画面から ID を取る型が書き込みの画面に当たる
-//   場合は、保存で拒まず、画面に注意を出す（使える度合い。core の `recordIdPatternMatchesPagePath`）。
+//   場合は、保存で拒まない（使える度合い。SPEC-4: 画面の注意は、出す画面がなくなったので捨てた）。
 // - LG-3（2026-10-24 のテストの組の設計 3.7.2）: 検証の指定の前に保存した版（`verification` の項目がない）を、すべて未指定として読む読み替えは
 //   捨てた。読むとき（`storedScenarioRevisionOf`）にスキーマの誤りになる（壊れた検証の指定と同じく、既定に直さない）。
 // - T30a fix round 1: 登録の ID の path の型（`{id}` の区切りを置き換えた形）の形は `isAcceptedPath`、セレクタの形は `isAcceptedSelector`（どれも Task 26
@@ -94,7 +94,6 @@ import {
   type ScenarioDraftRejectionReason,
 } from '../../core/scenario-draft-rejection-reasons.js';
 import {
-  MAX_FIELD_NAME_LENGTH,
   isDefaultValueFieldType,
   isMethodOverrideFieldName,
   isUnsendableFieldType,
@@ -104,10 +103,13 @@ import {
   fieldNameHasDestructiveWord,
   fieldNameHasRemovalWord,
   fieldNameHasStateWord,
+  isApiRowKeyNameUsable,
   isApiWriteKeyNameSecretLike,
 } from '../../discovery/classify.js';
 import {
+  actionPathRecordIdTemplateOf,
   concretePathOfTemplate,
+  listRowFormTemplatedIdentityDigestOf,
   pagePathTemplatedIdentityDigestOf,
   recordIdOfTemplates,
   recordIdSegmentPairOfTemplates,
@@ -118,7 +120,6 @@ import { isAcceptedPath, isAcceptedSelector } from '../auth/auth-setup-policy.js
 import { isOriginInAllowedOrigins } from '../../crawl/normalize-url.js';
 import {
   readListPagePathOf,
-  MAX_READ_CHECK_DETAIL_FIELD_LENGTH,
   hasGeneratedValueExpectation,
   isSecretLikeStateField,
   isSendableWriteFieldName,
@@ -132,18 +133,8 @@ import {
   DEFAULT_MAX_CUMULATIVE_CREATES,
   FORM_RECORD_ID_SOURCE,
   FORM_STRUCTURE_RESULT_JUDGEMENT,
-  MAX_FORM_RECORD_ID_PATTERNS,
-  MAX_RECORD_ID_PATH_PATTERN_LENGTH,
   RETIRED_SCENARIO_VERIFICATION_ITEMS,
   recordIdPathPatternsOf,
-  MAX_SCENARIO_FIELD_NAMES,
-  MAX_SCENARIO_KEEP_FIELD_NAMES,
-  MAX_UPDATE_PATH_TEMPLATE_LENGTH,
-  MAX_SCENARIO_READ_CHECKS,
-  MAX_VERIFICATION_BINDINGS,
-  MAX_VERIFICATION_EXPECTATIONS,
-  MAX_VERIFICATION_ROW_COUNT,
-  MAX_VERIFICATION_SELECTOR_LENGTH,
   MIN_APPROVAL_TTL_DAYS,
   MIN_SCENARIO_LIMIT,
   MIN_SCENARIO_REVISION,
@@ -167,6 +158,7 @@ import {
   type ScenarioApiRequestShape,
   type ScenarioKindFact,
   type ScenarioLimits,
+  type ScenarioListRow,
   type ScenarioReadCheckDefinitionFact,
   type ScenarioReadVerification,
   type ScenarioRequestShape,
@@ -180,14 +172,14 @@ import {
   type SideEffectConfirmation,
   type SideEffectConfirmations,
   type VerificationExpectation,
-  MAX_SCENARIO_API_KEY_LENGTH,
-  MAX_SCENARIO_API_KEYS,
   SCENARIO_API_RECORD_ID_SOURCES,
   SCENARIO_TRANSPORTS,
   isScenarioApiFieldJsonTypePair,
   scenarioApiFieldIdentityOf,
+  scenarioApiKeyFieldOfProbe,
   type ScenarioApiDraft,
   type ScenarioApiFieldIdentity,
+  type ScenarioApiArrayElements,
   type ScenarioApiKeyField,
   type ScenarioApiMethod,
   type ScenarioApiPageKey,
@@ -197,14 +189,26 @@ import {
 import {
   API_METHOD_OVERRIDE_HEADER_NAMES,
   API_SELECTION_QUERY_NAMES,
+  apiArrayElementPathOf,
+  apiArrayFieldPositionsOf,
+  apiArrayObjectRowsOf,
+  apiShapeApprovedOriginOf,
   isRecordIdLikePathSegment,
   lastRecordIdLikePathSegmentIndexOf,
   pageHeaderNamesOf,
+  type ApiArrayObjectRowsProblem,
   type ApiJsonValueType,
+  type ApiRequestArrayElements,
   type ApiRequestShape,
+  type ApiShapeOriginLists,
 } from '../../core/api-request-shape.js';
-import { apiShapeDigestOf, apiShapeHasSoftDeleteKey, classifyApiShapeObservation } from '../../discovery/api-shape-classification.js';
-import { submissionProbeKeyFieldsOf, submissionProbeWriteOf, type SubmissionProbeRecord } from '../../discovery/submission-probe-contracts.js';
+import { apiShapeDigestOf, apiShapeHasSoftDeleteKey, apiUpdateFiltersOf, classifyApiShapeObservation } from '../../discovery/api-shape-classification.js';
+import {
+  submissionProbeKeyFieldsOf,
+  submissionProbeWriteOf,
+  type SubmissionProbeOpener,
+  type SubmissionProbeRecord,
+} from '../../discovery/submission-probe-contracts.js';
 import { isDiscoveryProfileRevisionCurrent, type DiscoveryProfileRevisions } from './discovery-profile-freshness.js';
 import { CREATE_SCENARIO_KIND } from '../../core/scenario-kind.js';
 
@@ -242,9 +246,7 @@ const API_SCALAR_JSON_TYPES = Object.freeze(['string', 'number', 'boolean', 'nul
  *   （T30a: 上の 3 つは、検証の指定の照合の READ の定義にも使う。）
  * - `SCENARIO_VERIFICATION_PARAMETER_UNKNOWN`: 照合の READ で結び付ける送る値の名前が、READ の定義の今の版の送る値にない（T30a）。
  * - `SCENARIO_VERIFICATION_FIELD_NOT_SENT`: 照合の READ の結び付けか期待の欄が、シナリオの送る欄にない（生成した値がない。T30a）。
- * - `SCENARIO_LIMIT_ABOVE_DEFAULT`: 上限（1 回の Run、累積のそれぞれ）が既定を超える。
- * - `SCENARIO_LIMIT_INCONSISTENT`: 1 回の Run の上限が、累積の上限を超える。
- * - `SCENARIO_TTL_ABOVE_DEFAULT`: 期限の日数が既定を超える。
+ * - `SCENARIO_LIMIT_ABOVE_DEFAULT`: 1 回の Run の上限が既定を超える（LZ-3c: 累積の件数・期限の日数の確かめと、その理由は捨てた）。
  * - `SCENARIO_VERIFICATION_READ_CHECK_PAGE_TARGET`（T37d fix round 1）: 照合の READ の定義が、画面の path を読む定義（照合は、候補の送信先に生成した
  *   値を付けて読む形だけ）。書き込みの開始の拒否（`WRITE_READ_VERIFICATION_PAGE_TARGET`）と同じ意味で、保存の時点で拒む。T38c: API のシナリオの
  *   `{id}` つきの画面の path の定義だけは受ける（下の API の確かめの節）。
@@ -290,6 +292,11 @@ export interface ScenarioDraftContext {
    */
   readonly approvedServiceOrigins?: readonly string[];
   /**
+   * DEF-220（設計書 `2026-11-08-beaksight-same-origin-api-and-spa-routes-design.md` 3.1 の 3）: プロファイルの承認したテストの Origin（プロファイルの一覧の順。
+   * 型の Origin の区分 `APPROVED_TEST` の番号を文字列にする。省けば空。サービスの Origin の一覧とは混ぜない）。
+   */
+  readonly approvedTestOrigins?: readonly string[];
+  /**
    * T38c（T38b の報告の (2)）: 候補を見つけた発見のジョブのプロファイルの改訂（ジョブの行の `profile_revision`。分からなければ null）と、今の改訂。型の
    * Origin は probe の時の承認したサービスの Origin の一覧の番号なので、API の下書きは 2 つが同じであることを求める（省けば拒む。fail-closed）。
    */
@@ -333,6 +340,8 @@ const UPDATE_DRAFT_KEYS: readonly (keyof ScenarioUpdateDraft)[] = Object.freeze(
   'actionPathTemplate',
   'keepFieldNames',
 ]);
+/** LU-11: UPDATE の指定の省ける鍵（行の下に広がるフォームの行の選び方）。 */
+const OPTIONAL_UPDATE_DRAFT_KEYS: readonly (keyof ScenarioUpdateDraft)[] = Object.freeze(['listRow']);
 const READ_CHECK_REFERENCE_KEYS: readonly (keyof ReadCheckReference)[] = Object.freeze(['readCheckId', 'revision']);
 const LIMIT_KEYS: readonly (keyof ScenarioLimits)[] = Object.freeze(['maxCreatesPerRun', 'maxCumulativeCreates']);
 const READ_VERIFICATION_KEYS: readonly (keyof ScenarioReadVerification)[] = Object.freeze(['readCheckId', 'revision', 'bindings', 'expectations']);
@@ -393,12 +402,10 @@ const fieldNamesShapeErrorsOf = (value: unknown): readonly ScenarioDraftError[] 
     return [invalid('/fieldNames must be an array')];
   }
   const errors: ScenarioDraftError[] = [];
-  if (value.length > MAX_SCENARIO_FIELD_NAMES) {
-    errors.push(invalid(`/fieldNames must have at most ${MAX_SCENARIO_FIELD_NAMES} items`));
-  }
+  // L13（N28・N30）: 欄の数と名前の長さの上限（前は `MAX_SCENARIO_FIELD_NAMES`・`MAX_FIELD_NAME_LENGTH`）は置かない。
   value.forEach((name: unknown, index) => {
-    if (typeof name !== 'string' || name.length === 0 || name.length > MAX_FIELD_NAME_LENGTH) {
-      errors.push(invalid(`/fieldNames/${index} must be a string of 1 to ${MAX_FIELD_NAME_LENGTH} code units`));
+    if (!isFieldNameText(name)) {
+      errors.push(invalid(`/fieldNames/${index} must be a non-empty string`));
     } else if (value.indexOf(name) !== index) {
       errors.push(invalid(`/fieldNames/${index} is a duplicate`));
     }
@@ -411,9 +418,7 @@ const readChecksShapeErrorsOf = (value: unknown): readonly ScenarioDraftError[] 
     return [invalid('/readChecks must be an array')];
   }
   const errors: ScenarioDraftError[] = [];
-  if (value.length > MAX_SCENARIO_READ_CHECKS) {
-    errors.push(invalid(`/readChecks must have at most ${MAX_SCENARIO_READ_CHECKS} items`));
-  }
+  // L4（COV-7）: READ の確かめの参照の数に上限を置かない（前は 20）。
   const seen = new Set<string>();
   value.forEach((reference: unknown, index) => {
     const path = `/readChecks/${index}`;
@@ -463,20 +468,16 @@ const limitsShapeErrorsOf = (value: unknown): readonly ScenarioDraftError[] => {
 // 検証の指定の形（T30a。すべて `SCENARIO_INPUT_INVALID`）
 // ---------------------------------------------------------------------------------------------------------------
 
-/** 1 文字以上 `maxLength` 以下の文字列か。 */
-const isBoundedText = (value: unknown, maxLength: number): value is string =>
-  typeof value === 'string' && value.length > 0 && value.length <= maxLength;
-
-/** 上限以下で、Task 26 のセレクタの形（`isAcceptedSelector`）のセレクタか。 */
+/** Task 26 のセレクタの形（`isAcceptedSelector`）の、空でないセレクタか（LZ-2: 長さの上限は置かない）。 */
 const isVerificationSelector = (value: unknown): value is string =>
-  isBoundedText(value, MAX_VERIFICATION_SELECTOR_LENGTH) && isAcceptedSelector(value);
+  typeof value === 'string' && value.length > 0 && isAcceptedSelector(value);
 
 /**
  * path の型か（`{id}` をちょうど 1 つ、path の 1 つの区切りの全体に持ち、`{id}` の区切りを置き換えた path が Task 26 の path の形
- * （`isAcceptedPath`。`/` で始まり、`//`・`..`・符号化した `.` を含まず、使える文字だけ）に当たる）。
+ * （`isAcceptedPath`。`/` で始まり、`//`・`..`・符号化した `.` を含まず、使える文字だけ）に当たる）。URL-LEN: 長さの上限（前は 2,048）はない。
  */
-const isRecordIdPathPattern = (value: unknown, maxLength: number = MAX_RECORD_ID_PATH_PATTERN_LENGTH): value is string => {
-  if (!isBoundedText(value, maxLength)) {
+const isRecordIdPathPattern = (value: unknown): value is string => {
+  if (typeof value !== 'string' || value.length === 0) {
     return false;
   }
   const segments = value.split(PATH_SEPARATOR);
@@ -486,8 +487,8 @@ const isRecordIdPathPattern = (value: unknown, maxLength: number = MAX_RECORD_ID
 };
 
 /**
- * 登録の ID の取り方の形の誤り（null は未指定）。PL-6a（設計書 8.1）: form の下書きは ID の型の一覧（`URL_PATH_PATTERNS`。1〜`MAX_FORM_RECORD_ID_PATTERNS` 件、
- * 重なりなし）だけ、API の下書きは今の 2 つの取り方（`URL_PATH_PATTERN`・`ELEMENT`）だけ。
+ * 登録の ID の取り方の形の誤り（null は未指定）。PL-6a（設計書 8.1）: form の下書きは ID の型の一覧（`URL_PATH_PATTERNS`。1 件以上、
+ * 重なりなし。LZ-3c: 件数の上限（前は 2）はない）だけ、API の下書きは今の 2 つの取り方（`URL_PATH_PATTERN`・`ELEMENT`）だけ。
  */
 const recordIdShapeErrorsOf = (value: unknown, api: boolean): readonly ScenarioDraftError[] => {
   const path = '/verification/recordId';
@@ -500,10 +501,10 @@ const recordIdShapeErrorsOf = (value: unknown, api: boolean): readonly ScenarioD
     }
     const formErrors = [...keyErrorsOf(value, RECORD_ID_KEYS[FORM_RECORD_ID_SOURCE], path)];
     const patterns: unknown = value.pathPatterns;
-    if (!Array.isArray(patterns) || patterns.length === 0 || patterns.length > MAX_FORM_RECORD_ID_PATTERNS
+    if (!Array.isArray(patterns) || patterns.length === 0
       || !patterns.every((pattern: unknown) => isRecordIdPathPattern(pattern)) || new Set(patterns).size !== patterns.length) {
       formErrors.push(invalid(
-        `${path}/pathPatterns must be 1 to ${MAX_FORM_RECORD_ID_PATTERNS} distinct paths with ${RECORD_ID_PLACEHOLDER} once as a whole segment, without a query`,
+        `${path}/pathPatterns must be one or more distinct paths with ${RECORD_ID_PLACEHOLDER} once as a whole segment, without a query`,
       ));
     }
     return formErrors;
@@ -516,13 +517,15 @@ const recordIdShapeErrorsOf = (value: unknown, api: boolean): readonly ScenarioD
     errors.push(invalid(`${path}/pathPattern must be a path with ${RECORD_ID_PLACEHOLDER} once as a whole segment, without a query`));
   }
   if (value.source === 'ELEMENT' && !isVerificationSelector(value.selector)) {
-    errors.push(invalid(`${path}/selector must be a non-blank selector of at most ${MAX_VERIFICATION_SELECTOR_LENGTH} code units, without control characters`));
+    errors.push(invalid(`${path}/selector must be a non-blank selector without control characters`));
   }
   return errors;
 };
 
-/** 欄の名前の形か。 */
-const isFieldNameText = (value: unknown): value is string => isBoundedText(value, MAX_FIELD_NAME_LENGTH);
+/** 欄の名前の形か（1 文字以上。L13（N30）: 長さの上限（前は `MAX_FIELD_NAME_LENGTH`）は置かない）。 */
+function isFieldNameText(value: unknown): value is string {
+  return typeof value === 'string' && value.length > 0;
+}
 
 /**
  * 照合の READ の結び付けの形の誤り。T38c: API の下書きだけ、0 件を形として受ける（`{id}` つきの画面の path の READ は送る値を持たない。定義に照らした
@@ -530,8 +533,9 @@ const isFieldNameText = (value: unknown): value is string => isBoundedText(value
  */
 const bindingsShapeErrorsOf = (value: unknown, path: string, allowEmpty: boolean): readonly ScenarioDraftError[] => {
   const minimum = allowEmpty ? 0 : 1;
-  if (!Array.isArray(value) || value.length < minimum || value.length > MAX_VERIFICATION_BINDINGS) {
-    return [invalid(`${path} must be an array of ${minimum} to ${MAX_VERIFICATION_BINDINGS} bindings`)];
+  // LZ-3a: 件数の上限（前は `MAX_VERIFICATION_BINDINGS` 50）はない。
+  if (!Array.isArray(value) || value.length < minimum) {
+    return [invalid(`${path} must be an array of at least ${minimum} bindings`)];
   }
   const seen = new Set<string>();
   return value.flatMap((binding: unknown, index): readonly ScenarioDraftError[] => {
@@ -541,14 +545,14 @@ const bindingsShapeErrorsOf = (value: unknown, path: string, allowEmpty: boolean
     }
     const errors = [...keyErrorsOf(binding, BINDING_KEYS, itemPath)];
     if (!isFieldNameText(binding.parameterName)) {
-      errors.push(invalid(`${itemPath}/parameterName must be a string of 1 to ${MAX_FIELD_NAME_LENGTH} code units`));
+      errors.push(invalid(`${itemPath}/parameterName must be a non-empty string`));
     } else if (seen.has(binding.parameterName)) {
       errors.push(invalid(`${itemPath}/parameterName is a duplicate`));
     } else {
       seen.add(binding.parameterName);
     }
     if (!isFieldNameText(binding.fieldName)) {
-      errors.push(invalid(`${itemPath}/fieldName must be a string of 1 to ${MAX_FIELD_NAME_LENGTH} code units`));
+      errors.push(invalid(`${itemPath}/fieldName must be a non-empty string`));
     }
     return errors;
   });
@@ -562,23 +566,26 @@ const expectationShapeErrorsOf = (expectation: unknown, path: string): readonly 
   const kind = expectation.kind as VerificationExpectation['kind'];
   const errors = [...keyErrorsOf(expectation, VERIFICATION_EXPECTATION_KEYS[kind], path)];
   if (kind === 'ROW_COUNT_EQUALS') {
-    if (!isAtLeastMinimum(expectation.count, MIN_VERIFICATION_ROW_COUNT) || expectation.count > MAX_VERIFICATION_ROW_COUNT) {
-      errors.push(invalid(`${path}/count must be an integer of ${MIN_VERIFICATION_ROW_COUNT} to ${MAX_VERIFICATION_ROW_COUNT}`));
+    // LZ-3a: 行の数の上限（前は `MAX_VERIFICATION_ROW_COUNT` 100,000）はない。
+    if (!isAtLeastMinimum(expectation.count, MIN_VERIFICATION_ROW_COUNT)) {
+      errors.push(invalid(`${path}/count must be an integer of at least ${MIN_VERIFICATION_ROW_COUNT}`));
     }
     return errors;
   }
   if (!isFieldNameText(expectation.fieldName)) {
-    errors.push(invalid(`${path}/fieldName must be a string of 1 to ${MAX_FIELD_NAME_LENGTH} code units`));
+    errors.push(invalid(`${path}/fieldName must be a non-empty string`));
   }
-  if (kind === 'DETAIL_FIELD_EQUALS' && !isBoundedText(expectation.field, MAX_READ_CHECK_DETAIL_FIELD_LENGTH)) {
-    errors.push(invalid(`${path}/field must be a string of 1 to ${MAX_READ_CHECK_DETAIL_FIELD_LENGTH} code units`));
+  // LZ-2: 項目の名前の長さの上限（前は `MAX_READ_CHECK_DETAIL_FIELD_LENGTH` 256）は撤廃した。
+  if (kind === 'DETAIL_FIELD_EQUALS' && !(typeof expectation.field === 'string' && expectation.field.length > 0)) {
+    errors.push(invalid(`${path}/field must be a non-empty string`));
   }
   return errors;
 };
 
 const expectationsShapeErrorsOf = (value: unknown, path: string): readonly ScenarioDraftError[] => {
-  if (!Array.isArray(value) || value.length === 0 || value.length > MAX_VERIFICATION_EXPECTATIONS) {
-    return [invalid(`${path} must be an array of 1 to ${MAX_VERIFICATION_EXPECTATIONS} expectations`)];
+  // LZ-3a: 件数の上限（前は `MAX_VERIFICATION_EXPECTATIONS` 10）はない。
+  if (!Array.isArray(value) || value.length === 0) {
+    return [invalid(`${path} must be an array of at least 1 expectation`)];
   }
   const errors = value.flatMap((expectation: unknown, index) => expectationShapeErrorsOf(expectation, `${path}/${index}`));
   if (errors.length === 0) {
@@ -638,12 +645,13 @@ const resultJudgementOf = (api: boolean): ScenarioVerification['resultJudgement'
 
 /** 保つ欄の形の誤り（T31b）。 */
 const keepFieldNamesShapeErrorsOf = (value: unknown, path: string): readonly ScenarioDraftError[] => {
-  if (!Array.isArray(value) || value.length > MAX_SCENARIO_KEEP_FIELD_NAMES) {
-    return [invalid(`${path} must be an array of at most ${MAX_SCENARIO_KEEP_FIELD_NAMES} names`)];
+  // L13（N28）: 保つ欄の数の上限（前は `MAX_SCENARIO_KEEP_FIELD_NAMES`）は置かない。
+  if (!Array.isArray(value)) {
+    return [invalid(`${path} must be an array of names`)];
   }
   return value.flatMap((name: unknown, index): readonly ScenarioDraftError[] => {
     if (!isFieldNameText(name)) {
-      return [invalid(`${path}/${index} must be a string of 1 to ${MAX_FIELD_NAME_LENGTH} code units`)];
+      return [invalid(`${path}/${index} must be a non-empty string`)];
     }
     return value.indexOf(name) === index ? [] : [invalid(`${path}/${index} is a duplicate`)];
   });
@@ -658,14 +666,30 @@ const updateShapeErrorsOf = (value: unknown): readonly ScenarioDraftError[] => {
   if (!isRecord(value)) {
     return [invalid(`${path} must be null or an object`)];
   }
-  const errors = [...keyErrorsOf(value, UPDATE_DRAFT_KEYS, path)];
+  const errors = [...keyErrorsOf(value, UPDATE_DRAFT_KEYS, path, OPTIONAL_UPDATE_DRAFT_KEYS)];
   if (typeof value.targetCreateScenarioId !== 'string' || !SCENARIO_ID_PATTERN.test(value.targetCreateScenarioId)) {
     errors.push(invalid(`${path}/targetCreateScenarioId must match ${SCENARIO_ID_PATTERN.source}`));
   }
-  for (const key of ['formPathTemplate', 'actionPathTemplate'] as const) {
-    if (!isRecordIdPathPattern(value[key], MAX_UPDATE_PATH_TEMPLATE_LENGTH)) {
+  if (Object.hasOwn(value, 'listRow')) {
+    // LU-11（設計書 5.4 の 2・4、D5）: 行の下に広がるフォームの更新の画面は一覧の画面（`{id}` なし。行の選び方の一覧の path と同じ）。送信先の型は、最後の
+    // 区切りに `{id}` をちょうど 1 つ持つ。
+    errors.push(...listRowShapeErrorsOf(value.listRow, `${path}/listRow`));
+    if (isRecord(value.listRow) && value.formPathTemplate !== value.listRow.listPagePath) {
+      errors.push(invalid(`${path}/formPathTemplate must be the list page path of the list row`));
+    }
+    if (!isRecordIdPathPattern(value.actionPathTemplate)
+      || value.actionPathTemplate.split(PATH_SEPARATOR).at(-1) !== RECORD_ID_PLACEHOLDER) {
       errors.push(invalid(
-        `${path}/${key} must be a path of at most ${MAX_UPDATE_PATH_TEMPLATE_LENGTH} code units with ${RECORD_ID_PLACEHOLDER} once as a whole segment, without a query`,
+        `${path}/actionPathTemplate must be a path ending with ${RECORD_ID_PLACEHOLDER} once as a whole segment, without a query`,
+      ));
+    }
+    errors.push(...keepFieldNamesShapeErrorsOf(value.keepFieldNames, `${path}/keepFieldNames`));
+    return errors;
+  }
+  for (const key of ['formPathTemplate', 'actionPathTemplate'] as const) {
+    if (!isRecordIdPathPattern(value[key])) {
+      errors.push(invalid(
+        `${path}/${key} must be a path with ${RECORD_ID_PLACEHOLDER} once as a whole segment, without a query`,
       ));
     }
   }
@@ -710,24 +734,51 @@ const shapeErrorsOf = (input: unknown): readonly ScenarioDraftError[] => {
 const API_DRAFT_KEYS: readonly (keyof ScenarioApiDraft)[] = Object.freeze(['shapeDigest', 'pageKeys', 'filterName', 'recordId', 'ledger']);
 const API_RECORD_ID_KEYS = Object.freeze(['source', 'key'] as const);
 const API_LEDGER_KEYS = Object.freeze(['targetCreateScenarioId', 'formPathTemplate'] as const);
+/** LU-6: 台帳の任意の項目（一覧の行の更新の行の選び方）。 */
+const OPTIONAL_API_LEDGER_KEYS = Object.freeze(['listRow'] as const);
+const LIST_ROW_KEYS: readonly (keyof ScenarioListRow)[] = Object.freeze(['listPagePath', 'openerIdentityDigest', 'rowKeyField']);
 
 /** T41a: API の指定の省ける鍵（保つ鍵）。 */
 const OPTIONAL_API_DRAFT_KEYS: readonly (keyof ScenarioApiDraft)[] = Object.freeze(['keptKeys']);
 
-/** API の名前（鍵・filter）の形か（1 文字以上、`MAX_SCENARIO_API_KEY_LENGTH` 以下）。 */
-const isApiNameText = (value: unknown): value is string => isBoundedText(value, MAX_SCENARIO_API_KEY_LENGTH);
+/** API の名前（鍵・filter）の形か（1 文字以上。L13（N25）: 長さの上限（前は `MAX_SCENARIO_API_KEY_LENGTH`）は置かない）。 */
+const isApiNameText = (value: unknown): value is string => typeof value === 'string' && value.length > 0;
 
-/** 鍵の名前の一覧（ページが決める鍵、T41a の保つ鍵）の形の誤り（配列、件数の上限、名前の形、重複）。 */
+/** 鍵の名前の一覧（ページが決める鍵、T41a の保つ鍵）の形の誤り（配列、名前の形、重複。L13: 件数の上限（前は `MAX_SCENARIO_API_KEYS`）は置かない）。 */
 const apiKeyNamesShapeErrorsOf = (value: unknown, path: string): readonly ScenarioDraftError[] => {
-  if (!Array.isArray(value) || value.length > MAX_SCENARIO_API_KEYS) {
-    return [invalid(`${path} must be an array of at most ${MAX_SCENARIO_API_KEYS} keys`)];
+  if (!Array.isArray(value)) {
+    return [invalid(`${path} must be an array of keys`)];
   }
   return value.flatMap((key: unknown, index) => {
     if (!isApiNameText(key)) {
-      return [invalid(`${path}/${index} must be a string of 1 to ${MAX_SCENARIO_API_KEY_LENGTH} code units`)];
+      return [invalid(`${path}/${index} must be a non-empty string`)];
     }
     return value.indexOf(key) === index ? [] : [invalid(`${path}/${index} is a duplicate`)];
   });
+};
+
+/**
+ * LU-6: 一覧の画面の path か（`{id}` を持たない、Task 26 の path の形（`isAcceptedPath`）。波括弧・query・fragment は使える文字でないので拒まれる）。
+ * URL-LEN: 長さの上限（前は 2,048）はない。
+ */
+const isListPagePath = (value: unknown): value is string => typeof value === 'string' && value.length > 0 && isAcceptedPath(value);
+
+/** LU-6（設計書 5.4 の 1）: 一覧の行の更新の行の選び方の形の誤り（値は持たない）。 */
+const listRowShapeErrorsOf = (value: unknown, path: string): readonly ScenarioDraftError[] => {
+  if (!isRecord(value)) {
+    return [invalid(`${path} must be an object`)];
+  }
+  const errors = [...keyErrorsOf(value, LIST_ROW_KEYS, path)];
+  if (!isListPagePath(value.listPagePath)) {
+    errors.push(invalid(`${path}/listPagePath must be a path without ${RECORD_ID_PLACEHOLDER} and without a query`));
+  }
+  if (!isSha256Fingerprint(value.openerIdentityDigest)) {
+    errors.push(invalid(`${path}/openerIdentityDigest must be an identity digest`));
+  }
+  if (!isFieldNameText(value.rowKeyField)) {
+    errors.push(invalid(`${path}/rowKeyField must be a non-empty string`));
+  }
+  return errors;
 };
 
 /** API の指定の形の誤り。 */
@@ -746,7 +797,7 @@ const apiShapeErrorsOf = (value: unknown): readonly ScenarioDraftError[] => {
     errors.push(...apiKeyNamesShapeErrorsOf(value.keptKeys, `${path}/keptKeys`));
   }
   if (value.filterName !== null && !isApiNameText(value.filterName)) {
-    errors.push(invalid(`${path}/filterName must be null or a string of 1 to ${MAX_SCENARIO_API_KEY_LENGTH} code units`));
+    errors.push(invalid(`${path}/filterName must be null or a non-empty string`));
   }
   const { recordId, ledger } = value;
   if (recordId !== null) {
@@ -760,11 +811,17 @@ const apiShapeErrorsOf = (value: unknown): readonly ScenarioDraftError[] => {
     if (!isRecord(ledger)) {
       errors.push(invalid(`${path}/ledger must be null or an object`));
     } else {
-      errors.push(...keyErrorsOf(ledger, API_LEDGER_KEYS, `${path}/ledger`));
+      errors.push(...keyErrorsOf(ledger, API_LEDGER_KEYS, `${path}/ledger`, OPTIONAL_API_LEDGER_KEYS));
       if (typeof ledger.targetCreateScenarioId !== 'string' || !SCENARIO_ID_PATTERN.test(ledger.targetCreateScenarioId)) {
         errors.push(invalid(`${path}/ledger/targetCreateScenarioId must match ${SCENARIO_ID_PATTERN.source}`));
       }
-      if (!isRecordIdPathPattern(ledger.formPathTemplate, MAX_UPDATE_PATH_TEMPLATE_LENGTH)) {
+      if (Object.hasOwn(ledger, 'listRow')) {
+        // LU-6: 一覧の行の更新の画面は一覧の画面（`{id}` なし）。更新の画面の path の型は、一覧の画面の path と同じ。
+        errors.push(...listRowShapeErrorsOf(ledger.listRow, `${path}/ledger/listRow`));
+        if (isRecord(ledger.listRow) && ledger.formPathTemplate !== ledger.listRow.listPagePath) {
+          errors.push(invalid(`${path}/ledger/formPathTemplate must be the list page path of the list row`));
+        }
+      } else if (!isRecordIdPathPattern(ledger.formPathTemplate)) {
         errors.push(invalid(`${path}/ledger/formPathTemplate must be a path with ${RECORD_ID_PLACEHOLDER} once as a whole segment, without a query`));
       }
     }
@@ -912,6 +969,22 @@ const updatePathErrorsOf = (update: ScenarioUpdateDraft, candidate: DiscoveryCan
     : [];
 };
 
+/**
+ * LU-11（設計書 5.4 の 2・4、D5）: 行の下に広がるフォームの更新の path の型の誤り（`updatePathErrorsOf` の代わり）。候補が行の下に広がるフォーム（画面の
+ * path に番号がなく、送信先の最後が番号。`listRowFormTemplatedIdentityDigestOf`）で、送信先の型が候補の送信先の最後の番号の区切りを `{id}` にした形
+ * （`actionPathRecordIdTemplateOf`）と同じ。違えば `SCENARIO_UPDATE_PATH_MISMATCH`。送信先の最後の区切りがレコードの ID の形でなければ
+ * `SCENARIO_UPDATE_RECORD_ID_UNSAFE`。画面の型が一覧の path（候補の画面の path）であることは、行の選び方の確かめ（`listRowLedgerErrorsOf`）が見る。
+ */
+const listRowUpdatePathErrorsOf = (update: ScenarioUpdateDraft, candidate: DiscoveryCandidate): readonly ScenarioDraftError[] => {
+  if (listRowFormTemplatedIdentityDigestOf(candidate) === null || actionPathRecordIdTemplateOf(candidate) !== update.actionPathTemplate) {
+    return [errorOf('SCENARIO_UPDATE_PATH_MISMATCH', '/update/actionPathTemplate is not the action path of the list row form with its last record id as {id}')];
+  }
+  const recordId = candidate.action?.path.split(PATH_SEPARATOR).at(-1) ?? '';
+  return usableRecordIdOf(recordId) === null
+    ? [errorOf('SCENARIO_UPDATE_RECORD_ID_UNSAFE', '/update the last segment of the action path of the candidate is not of the record id form')]
+    : [];
+};
+
 /** 台帳の結び付けの決まり（T41b）: form の UPDATE の送信先の型（今まで）と、API の UPDATE の更新の画面の型。 */
 const FORM_ACTION_LEDGER_BINDING = 'FORM_ACTION';
 const API_PAGE_LEDGER_BINDING = 'API_PAGE';
@@ -1054,7 +1127,14 @@ const updateErrorsOf = (
   if (update === null) {
     return [errorOf('SCENARIO_UPDATE_SPEC_MISSING', '/update is required for an UPDATE candidate')];
   }
-  const pathErrors = updatePathErrorsOf(update, candidate);
+  // LU-11: 行の下に広がるフォームの更新は、画面の型の `{id}` の代わりに、送信先の型と行の選び方を確かめる（API の形と同じ判定 `listRowLedgerErrorsOf`）。
+  const { listRow } = update;
+  const pathErrors = listRow === undefined
+    ? updatePathErrorsOf(update, candidate)
+    : [
+      ...listRowUpdatePathErrorsOf(update, candidate),
+      ...listRowLedgerErrorsOf(listRow, candidate.rowOpener, candidate, ledgerFactOf(draft, update, context), '/update/listRow'),
+    ];
   return [
     ...updateTargetErrorsOf(draft, update, context),
     ...pathErrors,
@@ -1071,7 +1151,10 @@ const updateContentOf = (draft: ScenarioDraftInput, candidate: DiscoveryCandidat
     return null;
   }
   const pair = recordIdSegmentPairOfTemplates(update.formPathTemplate, update.actionPathTemplate);
-  const templatedIdentityDigest = pair === null ? null : templatedIdentityDigestOf(candidate, pair);
+  // LU-11: 行の下に広がるフォームの更新は、送信先を型にした識別の digest（行ごとのフォームで同じ。発見の索引の一覧にも入る）。
+  const templatedIdentityDigest = update.listRow !== undefined
+    ? listRowFormTemplatedIdentityDigestOf(candidate)
+    : (pair === null ? null : templatedIdentityDigestOf(candidate, pair));
   if (templatedIdentityDigest === null) {
     throw new Error('validateScenarioDraft accepted path templates without a templated identity digest');
   }
@@ -1080,6 +1163,7 @@ const updateContentOf = (draft: ScenarioDraftInput, candidate: DiscoveryCandidat
     formPathTemplate: update.formPathTemplate,
     actionPathTemplate: update.actionPathTemplate,
     keepFieldNames: [...update.keepFieldNames].sort(compareCodeUnits),
+    ...(update.listRow === undefined ? {} : { listRow: listRowCopyOf(update.listRow) }),
     templatedIdentityDigest,
   };
 };
@@ -1190,24 +1274,14 @@ const verificationErrorsOf = (
   listPagePath: string | null = null,
 ): readonly ScenarioDraftError[] => readVerificationErrorsOf(draft, readChecks, listPagePath);
 
-/** 上限と期限の誤り（1 回の Run、累積、上限どうし、期限の順）。 */
-const limitErrorsOf = (draft: ScenarioDraftInput): readonly ScenarioDraftError[] => {
-  const { maxCreatesPerRun, maxCumulativeCreates } = draft.limits;
-  return [
-    ...(maxCreatesPerRun > DEFAULT_MAX_CREATES_PER_RUN
-      ? [errorOf('SCENARIO_LIMIT_ABOVE_DEFAULT', `/limits/maxCreatesPerRun must be at most ${DEFAULT_MAX_CREATES_PER_RUN}`)]
-      : []),
-    ...(maxCumulativeCreates > DEFAULT_MAX_CUMULATIVE_CREATES
-      ? [errorOf('SCENARIO_LIMIT_ABOVE_DEFAULT', `/limits/maxCumulativeCreates must be at most ${DEFAULT_MAX_CUMULATIVE_CREATES}`)]
-      : []),
-    ...(maxCreatesPerRun > maxCumulativeCreates
-      ? [errorOf('SCENARIO_LIMIT_INCONSISTENT', '/limits/maxCreatesPerRun must be at most /limits/maxCumulativeCreates')]
-      : []),
-    ...(draft.approvalTtlDays > APPROVAL_TTL_DAYS
-      ? [errorOf('SCENARIO_TTL_ABOVE_DEFAULT', `/approvalTtlDays must be at most ${APPROVAL_TTL_DAYS}`)]
-      : []),
-  ];
-};
+/**
+ * 上限の誤り（1 回の Run の件数だけ。1 つのジョブが送るのは承認した 1 回）。LZ-3c（設計者の判断 (b)）: 累積の件数（`maxCumulativeCreates`）と承認の期限の日数
+ * （`approvalTtlDays`）は、承認の digest の版を変えないための名残で、判定には使わない（前の「既定以下」「1 回の Run が累積以下」の確かめは捨てた。形の下限だけ）。
+ */
+const limitErrorsOf = (draft: ScenarioDraftInput): readonly ScenarioDraftError[] =>
+  (draft.limits.maxCreatesPerRun > DEFAULT_MAX_CREATES_PER_RUN
+    ? [errorOf('SCENARIO_LIMIT_ABOVE_DEFAULT', `/limits/maxCreatesPerRun must be at most ${DEFAULT_MAX_CREATES_PER_RUN}`)]
+    : []);
 
 /** 登録の ID の取り方の写し（PL-6a: form の ID の型の一覧は、入力の順のまま。当てる順なので並べ替えない）。 */
 const recordIdContentOf = (spec: ScenarioVerificationRecordId | null): ScenarioVerificationRecordId | null => {
@@ -1264,7 +1338,8 @@ const verificationContentOf = (verification: ScenarioVerificationDraft, api: boo
 //   鍵 status・is_published・published_at などだけなら論理削除にしない）。
 // - `SCENARIO_API_METHOD_OVERRIDE`: 本文の最上位の鍵 `_method`（`isMethodOverrideFieldName`）。
 // - `SCENARIO_API_HEADER_METHOD_OVERRIDE`: 許すヘッダの名前（ページが付けた名前）に、method を上書きする名前（`API_METHOD_OVERRIDE_HEADER_NAMES`）。
-// - `SCENARIO_API_ORIGIN_NOT_APPROVED`: 型の Origin が、プロファイルの承認したサービスの Origin（文脈の一覧の番号）にない。
+// - `SCENARIO_API_ORIGIN_NOT_APPROVED`: 型の Origin が、プロファイルの承認したサービスの Origin（文脈の一覧の番号）にない。DEF-220: 区分 `APPROVED_TEST` の型は、
+//   承認したテストの Origin（文脈の一覧の番号）にない。
 // - `SCENARIO_API_SHAPE_NOT_EXECUTABLE`: I21 の確かめ直し（probe の分類と同じ部品 `classifyApiShapeObservation` で 1 つの型を分類し直した結果が、probe の
 //   結果と違う。method が `POST`（CREATE）・`PATCH`（UPDATE）と組でない）。
 // 鍵と欄（送る欄 `fieldNames` は送る本文の鍵。鍵と欄の対応は `submissionProbeKeyFieldsOf`）:
@@ -1314,21 +1389,23 @@ interface AcceptedApiCandidate {
   readonly headerNames: readonly string[];
 }
 
-/** 型の送り先の Origin の文字列（承認したサービスの Origin の一覧の番号から。承認した Origin でなければ undefined）。 */
-const apiShapeOriginOf = (shape: ApiRequestShape, approvedServiceOrigins: readonly string[]): string | undefined =>
-  (shape.origin.kind === 'APPROVED_API' ? approvedServiceOrigins[shape.origin.index] : undefined);
+/**
+ * 型の送り先の Origin の文字列（承認したサービスの Origin・承認したテストの Origin の一覧の番号から。承認した Origin でなければ undefined）。DEF-220: 番号は
+ * 区分ごとの一覧で解く（契約の 1 か所 `apiShapeApprovedOriginOf`）。
+ */
+const apiShapeOriginOf = (shape: ApiRequestShape, origins: ApiShapeOriginLists): string | undefined => apiShapeApprovedOriginOf(shape.origin, origins);
 
 /**
  * T41e-3（T41R-fix-B の申し送り）: probe の型の要求の送り先（Origin の文字列と path の型。下書きの確かめが API の指定の `request` に写すのと同じ値）。型が
- * ないか、承認したサービスの Origin でなければ null。画面が、API の更新の台帳の選択肢を絞る確かめ（`apiUpdateLedgerBindingRejectionOf`）の、確かめのための
- * 事実に使う。
+ * ないか、承認した Origin（サービスの Origin か、DEF-220 のテストの Origin）でなければ null。画面が、API の更新の台帳の選択肢を絞る確かめ
+ * （`apiUpdateLedgerBindingRejectionOf`）の、確かめのための事実に使う。`origins` は番号を解く一覧（下書きの確かめの文脈をそのまま渡せる）。
  */
 export const apiRequestTargetOfProbe = (
   probe: SubmissionProbeRecord,
-  approvedServiceOrigins: readonly string[],
+  origins: ApiShapeOriginLists,
 ): Pick<ScenarioApiRequestShape, 'origin' | 'pathShape'> | null => {
   const shape = probe.shape ?? null;
-  const origin = shape === null ? undefined : apiShapeOriginOf(shape, approvedServiceOrigins);
+  const origin = shape === null ? undefined : apiShapeOriginOf(shape, origins);
   return shape === null || origin === undefined ? null : { origin, pathShape: shape.pathShape };
 };
 
@@ -1357,14 +1434,18 @@ const apiCandidateOf = (
   if (shape.body.keys.some(({ name }) => isMethodOverrideFieldName(name))) {
     return failed('SCENARIO_API_METHOD_OVERRIDE', 'the body of the request overrides the method');
   }
+  // ARR-5 fix round 1（SREV-ARR2 の M2）: 本文の object（最上位と一覧の中）に同じ鍵が 2 回ある型は、どちらの値が使われるか分からないので拒む。
+  if (shape.body.duplicateKeyPresent === true) {
+    return failed('SCENARIO_API_BODY_KEY_DUPLICATE', 'the body of the request has the same key twice in an object');
+  }
   // T38R-fix の M-2: ページが付けたヘッダの名前の正規化は、契約の 1 か所（型の digest と同じ）。
   const headerNames = pageHeaderNamesOf(shape.headerNames);
   if (headerNames.some((name) => (API_METHOD_OVERRIDE_HEADER_NAMES as readonly string[]).includes(name))) {
     return failed('SCENARIO_API_HEADER_METHOD_OVERRIDE', 'a header name of the request overrides the method');
   }
-  const origin = apiShapeOriginOf(shape, context.approvedServiceOrigins ?? []);
+  const origin = apiShapeOriginOf(shape, context);
   if (origin === undefined) {
-    return failed('SCENARIO_API_ORIGIN_NOT_APPROVED', 'the origin of the request is not an approved service origin of the profile');
+    return failed('SCENARIO_API_ORIGIN_NOT_APPROVED', 'the origin of the request is not an approved service origin or an approved test origin of the profile');
   }
   // T38R-fix の C-1: 記録できなかった型がある probe は、どの要求を承認するか分からないので拒む。
   if (probe.unrecordedShapeCount > 0) {
@@ -1372,7 +1453,12 @@ const apiCandidateOf = (
   }
   // I21 の確かめ直し: probe の分類と同じ部品で、この 1 つの型を分類し直す（probe の結果を信じない）。T38R-fix の C-1: 読み取りでない要求の数は、probe
   // の記録の数を使う（2 つの要求なら `MULTIPLE_REQUESTS`）。
-  const reclassified = classifyApiShapeObservation({ shapes: [shape], nonReadRequestCount: probe.nonReadRequestCount });
+  // LU-6（設計書 5.2 の 6）: 開き手のある記録（一覧の行から開いた窓の保存）は、probe と同じく `openedFromRow` で分類し直す（食い違わない）。
+  const reclassified = classifyApiShapeObservation({
+    shapes: [shape],
+    nonReadRequestCount: probe.nonReadRequestCount,
+    openedFromRow: probe.opener !== undefined,
+  });
   if (reclassified.classification !== probe.result || shape.method !== expected.method) {
     return failed('SCENARIO_API_SHAPE_NOT_EXECUTABLE',
       `the shape is ${reclassified.classification}${reclassified.reason === null ? '' : ` (${reclassified.reason})`}, not ${probe.result}`);
@@ -1403,20 +1489,202 @@ const pageKeyFieldOf = (probe: SubmissionProbeRecord, key: string): ScenarioApiF
   return fields.length === 1 && only !== undefined ? scenarioApiFieldIdentityOf(only) : null;
 };
 
+/** DEF-198: probe の型の、更新の番号の filter の名前と、ほかの filter の名前（名前の順）。 */
+export interface ApiUpdateFilterNames {
+  readonly filterName: string | null;
+  readonly otherFilterNames: readonly string[];
+}
+
+/**
+ * DEF-198（設計書 `2026-11-02-beaksight-list-row-update-design.md` 5.9 の 1・2）: probe の型の、更新の番号の filter の名前と、ほかの filter の名前（分類と同じ
+ * 唯一の決まり `apiUpdateFiltersOf`。開き手のある記録は一覧の行から開いた形）。分けられない・filter のない型は、名前なし（null と空）。下書き・自動の下書き・
+ * 確かめが共用する。
+ */
+export const apiUpdateFilterNamesOfProbe = (probe: Pick<SubmissionProbeRecord, 'shape' | 'opener'>): ApiUpdateFilterNames => {
+  const split = probe.shape === null ? null : apiUpdateFiltersOf(probe.shape, probe.opener !== undefined);
+  return Object.freeze({ filterName: split?.record.name ?? null, otherFilterNames: Object.freeze(split?.others.map(({ name }) => name) ?? []) });
+};
+
+/**
+ * DEF-198（設計書 5.9 の 4）: 更新の本文の鍵のうち、更新の画面の欄として見分けなくてよい鍵の名前（ほかの filter があるときの、番号の filter とほかの filter の
+ * 名前。照合が台帳の番号と照らした値を求める）。ほかの filter のない型は空（今のまま）。
+ */
+const filterBoundPageKeyNamesOf = (probe: Pick<SubmissionProbeRecord, 'shape' | 'opener'>): ReadonlySet<string> => {
+  const { filterName, otherFilterNames } = apiUpdateFilterNamesOfProbe(probe);
+  return new Set(filterName === null || otherFilterNames.length === 0 ? [] : [filterName, ...otherFilterNames]);
+};
+
+/**
+ * DEF-203（設計書 `2026-11-02-beaksight-list-row-update-design.md` 5.10 の 2）: 更新の本文の、欄と結びつかない鍵（番号・所属の鍵のほか。更新の画面の欄として
+ * 識別できない鍵）のうち、登録のページが決める鍵の名前（`createPageKeyNames`）にある鍵の名前（台帳の登録の値と照らす鍵）。5.9 の形（ほかの filter がある、
+ * 一覧の行から開かない更新）だけ。ほかの形・登録・名前が分からないときは空（今のまま `SCENARIO_API_PAGE_KEY_NOT_IDENTIFIABLE`）。型の入口・下書きの確かめ・
+ * 自動の下書きが共用する唯一の判定。
+ */
+export const ledgerBoundPageKeyNamesOf = (
+  probe: SubmissionProbeRecord,
+  createPageKeyNames: readonly string[] | null | undefined,
+): ReadonlySet<string> => {
+  const filterBound = filterBoundPageKeyNamesOf(probe);
+  if (submissionProbeWriteOf(probe.result)?.kind !== 'UPDATE' || probe.opener !== undefined || filterBound.size === 0
+    || createPageKeyNames === null || createPageKeyNames === undefined) {
+    return new Set();
+  }
+  return new Set(submissionProbeKeyFieldsOf(probe)
+    .filter(({ key, field }) => field === null && !filterBound.has(key) && pageKeyFieldOf(probe, key) === null
+      && createPageKeyNames.includes(key))
+    .map(({ key }) => key));
+};
+
 /**
  * T41e-2（Task 41 の設計書 3.3。発見事項 1 の設計者の判断）: その型から API のシナリオを作れない理由（候補の一覧の入口で示す。作れるなら null）。更新の型の、
  * 欄に対応しないページが決める鍵のうち、更新の画面の欄として識別できない鍵（`pageKeyFieldOf` が null）があれば、その鍵を許すと
  * `SCENARIO_API_PAGE_KEY_NOT_IDENTIFIABLE`、外すと `SCENARIO_API_KEY_NOT_ALLOWED` で、どう選んでも保存できない。判定は下書きの確かめ
- * （`apiKeyErrorsOf`）と同じ部品。
+ * （`apiKeyErrorsOf`）と同じ部品。DEF-203（設計書 5.10 の 2）: 同じ表の登録のページが決める鍵の名前（`createPageKeyNames`。省けばなし）にある鍵は、台帳の
+ * 登録の値と照らすので止めない（`ledgerBoundPageKeyNamesOf`）。
  */
-export const apiScenarioShapeRejectionOf = (probe: SubmissionProbeRecord): 'SCENARIO_API_PAGE_KEY_NOT_IDENTIFIABLE' | null =>
-  (submissionProbeWriteOf(probe.result)?.kind === 'UPDATE'
-    && submissionProbeKeyFieldsOf(probe).some(({ key, field }) => field === null && pageKeyFieldOf(probe, key) === null)
+export const apiScenarioShapeRejectionOf = (
+  probe: SubmissionProbeRecord,
+  createPageKeyNames: readonly string[] = [],
+): 'SCENARIO_API_PAGE_KEY_NOT_IDENTIFIABLE' | null => {
+  if (submissionProbeWriteOf(probe.result)?.kind !== 'UPDATE') {
+    return null;
+  }
+  // DEF-198（設計書 5.9 の 4）: ほかの filter があるときの、番号と所属の鍵は、欄として見分けなくてよい。
+  const filterBound = filterBoundPageKeyNamesOf(probe);
+  const ledgerBound = ledgerBoundPageKeyNamesOf(probe, createPageKeyNames);
+  return submissionProbeKeyFieldsOf(probe).some(({ key, field }) => field === null && !filterBound.has(key) && !ledgerBound.has(key)
+    && pageKeyFieldOf(probe, key) === null)
     ? 'SCENARIO_API_PAGE_KEY_NOT_IDENTIFIABLE'
-    : null);
+    : null;
+};
+
+/**
+ * DEF-203（設計書 5.10 の 2）: 下書きの台帳の登録のページが決める鍵の名前（台帳の事実の `apiPageKeyNames`。一覧の行の更新・台帳がない・事実が分からないときは
+ * null。照らす鍵を受けない側）。
+ */
+const ledgerPageKeyNamesOfDraft = (draft: ScenarioDraftInput, api: ScenarioApiDraft, context: ScenarioDraftContext): readonly string[] | null => {
+  const ledger = api.ledger;
+  if (ledger === null || ledger.listRow !== undefined) {
+    return null;
+  }
+  const fact = context.scenarios.find(({ scenarioId, profileId }) => scenarioId === ledger.targetCreateScenarioId && profileId === draft.profileId);
+  return fact?.kind === 'CREATE' ? fact.apiPageKeyNames ?? null : null;
+};
+
+// ARR-2（設計書 `2026-11-08-beaksight-api-array-keys-design.md` 3.1、3.3）: 登録（CREATE）の一覧の鍵（array）。
+// - ページが決める一覧の鍵: 要素に object・array がある → `SCENARIO_API_ARRAY_NESTED`（L13 fix round 1: 要素の数と文字の長さの上限 →
+//   `SCENARIO_API_ARRAY_OVER_LIMIT` は撤廃した）。受けた鍵は、要素の型の集合と数を API の指定に持つ（承認の digest に入る）。
+// - 欄に対応づけた一覧の鍵（文字の欄 × 文字の一覧）: 上の 2 つに加え、要素が文字でない → `SCENARIO_API_ARRAY_ELEMENT_TYPE_MISMATCH`、要素が 1 つでない →
+//   `SCENARIO_API_ARRAY_ELEMENT_COUNT_MISMATCH`（書き込みの段の照合は、本文の値が `[生成した値]` と完全一致することを求める）。
+// - 要素の情報のない古い型の一覧の鍵と、更新（UPDATE）の一覧の鍵（ページが決める鍵・変える鍵・保つ鍵）は、今のまま `SCENARIO_API_PAGE_KEY_NOT_SCALAR`。
+// ARR-3（設計書 `2026-11-09-beaksight-api-array-rows-design.md` 2.2 の 2・3）: 欄の一覧は、印の位置 1 つとほかの空の位置の形も受け、位置ごとの役を鍵と欄の
+// 対応に持つ（`scenarioApiKeyFieldOfProbe`）。一覧の中に欄の印がある鍵は、ページが決める一覧として受けない（`SCENARIO_API_ARRAY_MULTIPLE_FIELDS`）。
+
+/** ARR-2: 一覧の鍵の要素の情報（probe の型の本文の鍵から。array でない鍵と、要素の情報のない古い型は undefined）。 */
+const arrayElementsOfKey = (shape: ApiRequestShape, key: string): ApiRequestArrayElements | undefined =>
+  shape.body.keys.find(({ name, type }) => name === key && type === 'array')?.elements;
+
+/** ARR-2: ページが決める一覧の鍵を拒む理由（受けるなら null）。 */
+const pageArrayRejectionOf = (elements: ApiRequestArrayElements | undefined): ScenarioDraftRejectionReason | null => {
+  if (elements === undefined) {
+    return 'SCENARIO_API_PAGE_KEY_NOT_SCALAR';
+  }
+  // L13 fix round 1: 要素の数と文字の長さの上限（前は `apiArrayElementsWithinLimits` で `SCENARIO_API_ARRAY_OVER_LIMIT`）は置かない。
+  return elements.nested ? 'SCENARIO_API_ARRAY_NESTED' : null;
+};
+
+/**
+ * ARR-2: 欄に対応づけた一覧の鍵を拒む理由（受けるなら null）。ARR-3（設計書 `2026-11-09-beaksight-api-array-rows-design.md` 2.2 の 2）: 要素は、欄の文字
+ * ちょうど 1 つ（DEF-226 の形）か、型の記録の位置の情報で、印の位置（欄の文字）1 つとほかの空の値の位置（`""` か `null`）の形（契約の 1 か所
+ * `apiArrayFieldPositionsOf`）。欄の位置が文字でない → `SCENARIO_API_ARRAY_ELEMENT_TYPE_MISMATCH`、空でない値が混ざる・位置の情報のない 2 つ以上の一覧
+ * （ARR-3 の前の型）→ `SCENARIO_API_ARRAY_ELEMENT_COUNT_MISMATCH`。
+ */
+const fieldArrayRejectionOf = (
+  elements: ApiRequestArrayElements | undefined,
+  elementIndex?: number,
+): ScenarioDraftRejectionReason | null => {
+  // ARR-5: object の行のある一覧を行の中の鍵ごとに分けられなかったとき（上限の超過など）は、行の形の理由（分けられた形は入れ子として拒む）。
+  if (elements?.types.includes('object') === true) {
+    const rows = apiArrayObjectRowsOf(elements);
+    return rows.ok ? 'SCENARIO_API_ARRAY_NESTED' : OBJECT_ROWS_PROBLEM_REASONS[rows.problem];
+  }
+  const rejection = pageArrayRejectionOf(elements);
+  if (rejection !== null || elements === undefined) {
+    return rejection;
+  }
+  // ARR-4（設計書 2.3）: 要素の位置の欄（`elementIndex`）は、その位置が欄の文字で、一覧の全体が欄の位置と空の位置の形のとき受ける。
+  const fieldPosition = elementIndex === undefined
+    ? elements.positions?.find(({ markers }) => markers.length > 0)
+    : elements.positions?.[elementIndex];
+  const fieldIsText = elements.positions === undefined
+    ? elementIndex === undefined && elements.types.length === 1 && elements.types[0] === 'string'
+    : fieldPosition?.type === 'string';
+  if (!fieldIsText) {
+    return 'SCENARIO_API_ARRAY_ELEMENT_TYPE_MISMATCH';
+  }
+  const roles = apiArrayFieldPositionsOf(elements);
+  const fields = roles?.filter((role) => role === 'FIELD').length ?? 0;
+  const fits = roles !== null && (elementIndex === undefined ? fields === 1 : roles[elementIndex] === 'FIELD');
+  return fits ? null : 'SCENARIO_API_ARRAY_ELEMENT_COUNT_MISMATCH';
+};
+
+/** ARR-5: object の一覧の役にできない理由（契約の `apiArrayObjectRowsOf`）を、下書きを拒む理由にする対応。 */
+const OBJECT_ROWS_PROBLEM_REASONS: Readonly<Record<ApiArrayObjectRowsProblem, ScenarioDraftRejectionReason>> = Object.freeze({
+  NOT_OBJECT_ROWS: 'SCENARIO_API_ARRAY_NESTED',
+  NESTED: 'SCENARIO_API_ARRAY_NESTED',
+  OVER_LIMIT: 'SCENARIO_API_ARRAY_OVER_LIMIT',
+  ROW_KEYS: 'SCENARIO_API_ARRAY_ROW_KEYS_MISMATCH',
+  FIELD_TYPE: 'SCENARIO_API_ARRAY_ELEMENT_TYPE_MISMATCH',
+  NOT_EMPTY: 'SCENARIO_API_ARRAY_ELEMENT_COUNT_MISMATCH',
+});
+
+/**
+ * ARR-5（設計書 `2026-11-09-beaksight-api-array-rows-design.md` 2.4）: object の一覧の行の中の鍵の欄を拒む理由（受けるなら null）。中の鍵の名前が
+ * 使えない（唯一の判定 `isApiRowKeyNameUsable`。伏せた名前・秘密に見える名前・method の上書き・論理削除・危険な語と削除の語・状態の語）なら
+ * `SCENARIO_API_ARRAY_INNER_KEY_NOT_ALLOWED`。形の理由は `apiArrayObjectRowsOf` の結果から。行の中のその鍵が欄でなければ
+ * `SCENARIO_API_ARRAY_ELEMENT_COUNT_MISMATCH`。
+ */
+const objectRowsRejectionOf = (
+  elements: ApiRequestArrayElements | undefined,
+  index: number,
+  name: string,
+): ScenarioDraftRejectionReason | null => {
+  if (elements === undefined) {
+    return 'SCENARIO_API_PAGE_KEY_NOT_SCALAR';
+  }
+  const innerNames = (elements.positions ?? []).flatMap(({ keys }) => (keys ?? []).map((inner) => inner.name));
+  // ARR-5 fix round 1（SREV-ARR2 の C1）: 判定は、最上位の鍵の分類・承認の部品を重ねた唯一の部品 `isApiRowKeyNameUsable`。
+  if (innerNames.some((inner) => !isApiRowKeyNameUsable(inner))) {
+    return 'SCENARIO_API_ARRAY_INNER_KEY_NOT_ALLOWED';
+  }
+  const rows = apiArrayObjectRowsOf(elements);
+  if (!rows.ok) {
+    return OBJECT_ROWS_PROBLEM_REASONS[rows.problem];
+  }
+  return rows.rows[index]?.some((inner) => inner.name === name && inner.role === 'FIELD') === true ? null : 'SCENARIO_API_ARRAY_ELEMENT_COUNT_MISMATCH';
+};
+
+/**
+ * ARR-3（設計書 2.2 の 3）: 一覧の中に欄の印がある鍵か（型の記録の、一覧の中の印）。欄に対応づかない（印が 2 つ以上の）一覧の鍵を、ページが決める一覧として
+ * 受けない（`SCENARIO_API_ARRAY_MULTIPLE_FIELDS`）。ARR-4（設計書 2.3）: 印の位置ごとの欄の鍵（道 `key[i]`）に分けられる一覧は、この鍵として現れない。
+ * この理由が残るのは、分けられない形（1 つの位置に印が 2 つ、位置の情報がない（上限を超えた）、道が本文の鍵と重なるか名前の上限を超える）だけ。
+ */
+const hasMarkerInArray = (shape: ApiRequestShape, key: string): boolean =>
+  shape.body.markerKeys.some(({ key: name, markers, inArray }) => name === key && inArray === true && markers.length > 0);
+
+/** ARR-2: 受けたページが決める一覧の鍵の、API の指定に持つ要素の形（型の集合と数。一覧でない鍵・要素の情報がない鍵は undefined）。 */
+const scenarioArrayElementsOf = (shape: ApiRequestShape, key: string): ScenarioApiArrayElements | undefined => {
+  const elements = arrayElementsOfKey(shape, key);
+  return elements === undefined ? undefined : { types: [...elements.types], count: elements.count };
+};
 
 /** 送る鍵と欄の対応の誤り、ページが決める鍵の誤り、filter の名前の誤り（ファイルの説明の順）。 */
-const apiKeyErrorsOf = (draft: ScenarioDraftInput, api: ScenarioApiDraft, accepted: AcceptedApiCandidate): readonly ScenarioDraftError[] => {
+const apiKeyErrorsOf = (
+  draft: ScenarioDraftInput,
+  api: ScenarioApiDraft,
+  accepted: AcceptedApiCandidate,
+  ledgerBound: ReadonlySet<string>,
+): readonly ScenarioDraftError[] => {
   const keyFields = submissionProbeKeyFieldsOf(accepted.probe);
   const sent = new Set(draft.fieldNames);
   const identities = keyFields.map(({ field }) => (field === null ? null : scenarioApiFieldIdentityOf(field)));
@@ -1429,6 +1697,20 @@ const apiKeyErrorsOf = (draft: ScenarioDraftInput, api: ScenarioApiDraft, accept
   const errors: ScenarioDraftError[] = [];
   const mismatch = (key: string, detail: string): ScenarioDraftError =>
     errorOf('SCENARIO_API_FIELD_KEY_MISMATCH', `the key ${JSON.stringify(key)} ${detail}`, { fieldName: key });
+  const update = accepted.kind === 'UPDATE';
+  /** ARR-2: 欄に対応づけた一覧の鍵の誤り（更新は今のまま scalar でない鍵として拒む。登録は要素の形を確かめる）。 */
+  const fieldArrayErrorOf = (key: string): ScenarioDraftError | null => {
+    // ARR-4: 要素の位置の欄（道 `key[i]`）は、本文の一覧の鍵の要素の情報で確かめる。
+    const element = keyFields.find((keyField) => keyField.key === key)?.element;
+    const elements = arrayElementsOfKey(accepted.shape, element?.key ?? key);
+    // ARR-5: object の行の中の鍵の欄（道 `key[i].name`）は、行と中の鍵の役で確かめる。
+    const rejection = update
+      ? 'SCENARIO_API_PAGE_KEY_NOT_SCALAR'
+      : element?.name === undefined
+        ? fieldArrayRejectionOf(elements, element?.index)
+        : objectRowsRejectionOf(elements, element.index, element.name);
+    return rejection === null ? null : errorOf(rejection, `the key ${JSON.stringify(key)} is a list that cannot be sent from its input field`, { fieldName: key });
+  };
   for (const fieldName of draft.fieldNames) {
     const index = keyFields.findIndex(({ key }) => key === fieldName);
     const keyField = keyFields[index];
@@ -1440,9 +1722,13 @@ const apiKeyErrorsOf = (draft: ScenarioDraftInput, api: ScenarioApiDraft, accept
     } else if (!isScenarioApiFieldJsonTypePair(keyField.field.type, keyField.type)) {
       errors.push(errorOf('SCENARIO_API_FIELD_TYPE_MISMATCH',
         `the key ${JSON.stringify(fieldName)} is a JSON ${keyField.type} from a ${keyField.field.type} field`, { fieldName }));
+    } else if (keyField.type === 'array') {
+      const arrayError = fieldArrayErrorOf(fieldName);
+      if (arrayError !== null) {
+        errors.push(arrayError);
+      }
     }
   }
-  const update = accepted.kind === 'UPDATE';
   const kept = keptKeyNamesOf(draft, api, accepted);
   if (!update && kept.length > 0) {
     errors.push(mismatch(kept[0] ?? '', 'is kept, but a CREATE sends every key with an input field'));
@@ -1460,6 +1746,12 @@ const apiKeyErrorsOf = (draft: ScenarioDraftInput, api: ScenarioApiDraft, accept
     } else if (isApiWriteKeyNameSecretLike(keptKey)) {
       errors.push(errorOf('SCENARIO_UPDATE_FORM_HAS_SECRET_LIKE_FIELD',
         `the kept key ${JSON.stringify(keptKey)} looks like a secret, and its value cannot be read for an update`, { fieldName: keptKey }));
+    } else if (keyFields[index]?.type === 'array') {
+      // ARR-2: 更新の一覧の鍵は、前の値を画面から読めないので、今のまま拒む。
+      const arrayError = fieldArrayErrorOf(keptKey);
+      if (arrayError !== null) {
+        errors.push(arrayError);
+      }
     }
   }
   const keptSet = new Set(update ? kept : []);
@@ -1474,6 +1766,8 @@ const apiKeyErrorsOf = (draft: ScenarioDraftInput, api: ScenarioApiDraft, accept
     errors.push(errorOf('SCENARIO_UPDATE_NO_CHANGED_FIELD', 'an UPDATE changes at least one key'));
   }
   const pageKeys = new Set(api.pageKeys);
+  // DEF-198（設計書 5.9 の 4）: ほかの filter があるときの、番号と所属の鍵は、更新の画面の欄として見分けなくてよい（照合が台帳の番号・所属の値と照らす）。
+  const filterBound = update ? filterBoundPageKeyNamesOf(accepted.probe) : new Set<string>();
   for (const { key, field } of keyFields) {
     if (field === null && !sent.has(key) && !pageKeys.has(key)) {
       errors.push(errorOf('SCENARIO_API_KEY_NOT_ALLOWED', `the key ${JSON.stringify(key)} has no input field and is not a key decided by the page`));
@@ -1486,10 +1780,28 @@ const apiKeyErrorsOf = (draft: ScenarioDraftInput, api: ScenarioApiDraft, accept
     } else if (isApiWriteKeyNameSecretLike(pageKey)) {
       // T38R-fix の I-2: 秘密に見える名前は、部分一致の fail-closed の方針（`src/core/secret-query-names.ts` の方針 6）で拒む。
       errors.push(errorOf('SCENARIO_API_PAGE_KEY_SECRET_LIKE', `the page key ${JSON.stringify(pageKey)} looks like a secret`));
-    } else if (!(API_SCALAR_JSON_TYPES as readonly string[]).includes(keyField.type)) {
-      // T38R-fix の I-2: ページが決める鍵は scalar の値だけ（object・array の中の値は照らせない）。
+    } else if (!(API_SCALAR_JSON_TYPES as readonly string[]).includes(keyField.type) && (update || keyField.type !== 'array')) {
+      // T38R-fix の I-2: ページが決める鍵は scalar の値だけ（object・array の中の値は照らせない）。ARR-2: 登録の一覧の鍵は下で確かめる（更新は今のまま）。
       errors.push(errorOf('SCENARIO_API_PAGE_KEY_NOT_SCALAR', `the page key ${JSON.stringify(pageKey)} is a JSON ${keyField.type}, not a scalar`));
-    } else if (update && pageKeyFieldOf(accepted.probe, pageKey) === null) {
+    } else if (keyField.type === 'array') {
+      // ARR-2: 登録のページが決める一覧の鍵は、入れ子がなく上限の中のものだけ（要素の型の集合と数は承認の内容に入れる）。
+      // ARR-3（設計書 2.2 の 3）: 一覧の中に欄の印がある鍵（印が 2 つ以上で欄に対応づかない）は、ページが決める一覧として受けない。
+      const elements = arrayElementsOfKey(accepted.shape, pageKey);
+      if (keyField.pathConflict === true) {
+        // ARR-5 fix round 1（SREV-ARR2 の M1）: 一覧の位置の道が、ほかの鍵かほかの道と重なる（欄ごとに照らせない）。
+        errors.push(errorOf('SCENARIO_API_ARRAY_PATH_CONFLICT', `the page key ${JSON.stringify(pageKey)} is a list whose paths of the fields overlap another key or path`));
+      } else if (hasMarkerInArray(accepted.shape, pageKey)) {
+        // 印の入った位置を道 `key[i]` で示す（値は示さない）。
+        const marked = (elements?.positions ?? []).flatMap(({ markers }, index) => (markers.length > 0 ? [apiArrayElementPathOf(pageKey, index)] : []));
+        errors.push(errorOf('SCENARIO_API_ARRAY_MULTIPLE_FIELDS',
+          `the page key ${JSON.stringify(pageKey)} is a list with the values of two or more input fields${marked.length === 0 ? '' : ` (${marked.join(', ')})`}`));
+      }
+      const arrayRejection = hasMarkerInArray(accepted.shape, pageKey) ? null : pageArrayRejectionOf(elements);
+      if (arrayRejection !== null) {
+        errors.push(errorOf(arrayRejection, `the page key ${JSON.stringify(pageKey)} is a list that has the values of input fields, is nested, over the limits or of an older shape`));
+      }
+    } else if (update && !filterBound.has(pageKey) && !ledgerBound.has(pageKey) && pageKeyFieldOf(accepted.probe, pageKey) === null) {
+      // DEF-203（設計書 5.10 の 2）: 台帳の登録のページが決める鍵にもある鍵（`ledgerBound`）は、台帳の登録の値と照らすので受ける。
       // T41a（ユーザーの判断 2）: 更新では、前の値と照らせる鍵（更新の画面の欄として識別できる鍵）だけを受ける。
       errors.push(errorOf('SCENARIO_API_PAGE_KEY_NOT_IDENTIFIABLE',
         `the page key ${JSON.stringify(pageKey)} of an UPDATE is not identified as a field of the update page`));
@@ -1499,10 +1811,56 @@ const apiKeyErrorsOf = (draft: ScenarioDraftInput, api: ScenarioApiDraft, accept
   if (api.recordId !== null && isApiWriteKeyNameSecretLike(api.recordId.key)) {
     errors.push(errorOf('SCENARIO_API_RECORD_ID_KEY_SECRET_LIKE', `the record id key ${JSON.stringify(api.recordId.key)} looks like a secret`));
   }
-  const [filter] = accepted.shape.filters;
-  const expectedFilter = accepted.kind === 'UPDATE' ? filter?.name ?? null : null;
+  // DEF-198（設計書 5.9 の 1・2）: 更新の番号の filter は、並び順でなく画面の番号の印で選ぶ（分類と同じ唯一の決まり）。
+  const expectedFilter = accepted.kind === 'UPDATE' ? apiUpdateFilterNamesOfProbe(accepted.probe).filterName : null;
   if (api.filterName !== expectedFilter) {
-    errors.push(errorOf('SCENARIO_API_FILTER_MISMATCH', 'the filter name is not the filter of the request (an UPDATE has exactly one, a CREATE has none)'));
+    errors.push(errorOf('SCENARIO_API_FILTER_MISMATCH', 'the filter name is not the record id filter of the request (an UPDATE has exactly one, a CREATE has none)'));
+  }
+  return errors;
+};
+
+/** API の UPDATE の、更新の画面の path の型の誤り（一覧の行の更新でないとき。T41a）。 */
+const updatePagePathLedgerErrorsOf = (formPathTemplate: string, candidate: DiscoveryCandidate): readonly ScenarioDraftError[] => {
+  // 更新の画面の path の型に、候補の画面の同じ位置の区切りの値を入れて、候補の画面の path に戻る（型の owner の部品）。
+  const pair = recordIdSegmentPairOfTemplates(formPathTemplate, formPathTemplate);
+  const recordId = pair === null ? undefined : candidate.page.path.split(PATH_SEPARATOR)[pair.pageSegment];
+  if (recordId === undefined || concretePathOfTemplate(formPathTemplate, recordId) !== candidate.page.path) {
+    return [errorOf('SCENARIO_UPDATE_PATH_MISMATCH', '/api/ledger/formPathTemplate does not give back the page path of the candidate')];
+  }
+  if (pair?.pageSegment !== lastRecordIdLikePathSegmentIndexOf(candidate.page.path) || pagePathTemplatedIdentityDigestOf(candidate) === null) {
+    // T41a: 型の `{id}` は、画面の path の最後の ID の区切り（probe の分類が filter の値と比べる ID。型にした識別の digest もこの区切りで求める）。
+    return [errorOf('SCENARIO_UPDATE_PATH_MISMATCH', '/api/ledger/formPathTemplate the {id} is not the last record id segment of the page path')];
+  }
+  return usableRecordIdOf(recordId) === null
+    ? [errorOf('SCENARIO_UPDATE_RECORD_ID_UNSAFE', '/api/ledger the record id segment of the page path is not of the record id form')]
+    : [];
+};
+
+/**
+ * LU-6（設計書 5.4 の 2、4.0 の D3）: 一覧の行の更新の行の選び方の誤り。
+ * - 一覧の画面の path が候補の画面の path と違う → `SCENARIO_UPDATE_PATH_MISMATCH`。
+ * - 候補の probe の記録に開き手がない、開き手の識別の digest が違う、開き手に名前がない（D3。書き込みの段で押さない）→ `SCENARIO_UPDATE_PATH_MISMATCH`
+ *   （一覧の画面から更新の入力へ至る道が、承認するものと合わない）。
+ * - 行を選ぶ欄が、台帳の登録の実行のたびに違う値になる欄（文脈の事実 `uniqueEachRunFieldNames`。分からなければ拒む）にない →
+ *   `SCENARIO_UPDATE_PATH_NOT_BOUND_TO_LEDGER_ID`（行が台帳のレコードに結び付かない）。台帳の参照が見つからない・登録でないときは確かめない（その理由が出る）。
+ */
+const listRowLedgerErrorsOf = (
+  listRow: ScenarioListRow,
+  opener: SubmissionProbeOpener | undefined,
+  candidate: DiscoveryCandidate,
+  fact: ScenarioKindFact | undefined,
+  path: string,
+): readonly ScenarioDraftError[] => {
+  const errors: ScenarioDraftError[] = [];
+  if (listRow.listPagePath !== candidate.page.path) {
+    errors.push(errorOf('SCENARIO_UPDATE_PATH_MISMATCH', `${path}/listPagePath is not the page path of the candidate`));
+  }
+  if (opener === undefined || opener.identityDigest !== listRow.openerIdentityDigest || !opener.hasName) {
+    errors.push(errorOf('SCENARIO_UPDATE_PATH_MISMATCH', `${path}/openerIdentityDigest is not the named opener of the row`));
+  }
+  if (fact !== undefined && fact.kind === CREATE_SCENARIO_KIND && !(fact.uniqueEachRunFieldNames ?? []).includes(listRow.rowKeyField)) {
+    errors.push(errorOf('SCENARIO_UPDATE_PATH_NOT_BOUND_TO_LEDGER_ID',
+      `${path}/rowKeyField is not a field of the ledger scenario whose value differs each run`));
   }
   return errors;
 };
@@ -1534,16 +1892,11 @@ const apiLedgerErrorsOf = (
   } else if (fact.kind !== 'CREATE' || fact.scenarioId === context.scenarioId) {
     errors.push(errorOf('SCENARIO_UPDATE_TARGET_NOT_CREATE', '/api/ledger/targetCreateScenarioId is not another CREATE scenario'));
   }
-  // 更新の画面の path の型に、候補の画面の同じ位置の区切りの値を入れて、候補の画面の path に戻る（型の owner の部品）。
-  const pair = recordIdSegmentPairOfTemplates(ledger.formPathTemplate, ledger.formPathTemplate);
-  const recordId = pair === null ? undefined : candidate.page.path.split(PATH_SEPARATOR)[pair.pageSegment];
-  if (recordId === undefined || concretePathOfTemplate(ledger.formPathTemplate, recordId) !== candidate.page.path) {
-    errors.push(errorOf('SCENARIO_UPDATE_PATH_MISMATCH', '/api/ledger/formPathTemplate does not give back the page path of the candidate'));
-  } else if (pair?.pageSegment !== lastRecordIdLikePathSegmentIndexOf(candidate.page.path) || pagePathTemplatedIdentityDigestOf(candidate) === null) {
-    // T41a: 型の `{id}` は、画面の path の最後の ID の区切り（probe の分類が filter の値と比べる ID。型にした識別の digest もこの区切りで求める）。
-    errors.push(errorOf('SCENARIO_UPDATE_PATH_MISMATCH', '/api/ledger/formPathTemplate the {id} is not the last record id segment of the page path'));
-  } else if (usableRecordIdOf(recordId) === null) {
-    errors.push(errorOf('SCENARIO_UPDATE_RECORD_ID_UNSAFE', '/api/ledger the record id segment of the page path is not of the record id form'));
+  if (ledger.listRow !== undefined) {
+    // LU-6（設計書 5.4 の 2）: 一覧の行の更新は、画面の path の `{id}` の代わりに、一覧の画面・開き手・行を選ぶ欄を確かめる。
+    errors.push(...listRowLedgerErrorsOf(ledger.listRow, accepted.probe.opener, candidate, fact, '/api/ledger/listRow'));
+  } else {
+    errors.push(...updatePagePathLedgerErrorsOf(ledger.formPathTemplate, candidate));
   }
   // T41a: 台帳の ID の取り方と filter の名前・画面の path の型の結び付き（台帳の参照と path の型のほかの誤りがないときだけ）。
   const rejection = fact === undefined || errors.length > ledgerErrorCount
@@ -1580,16 +1933,48 @@ export const apiUpdateLedgerBindingRejectionOf = (
   ledger: Pick<ScenarioKindFact, 'recordId' | 'apiRecordId' | 'apiRequest'>,
 ): 'SCENARIO_API_FILTER_NOT_BOUND_TO_LEDGER_ID' | 'SCENARIO_UPDATE_PATH_NOT_BOUND_TO_LEDGER_ID' | null => {
   const ledgerRequest = ledger.apiRequest ?? null;
-  if (ledgerRequest === null || ledgerRequest.pathShape !== update.pathShape || !isOriginInAllowedOrigins([ledgerRequest.origin], update.origin)) {
+  const table = ledgerRequest === null ? null : apiLedgerTableMatchOf(ledgerRequest, update);
+  if (table === null) {
     return 'SCENARIO_API_FILTER_NOT_BOUND_TO_LEDGER_ID';
   }
   const apiRecordId = ledger.apiRecordId ?? null;
+  if (table === 'RECORD_PATH') {
+    // LU-6（設計書 5.4 の 3）: path の形（型の最後の `{id}` が台帳の ID）。番号の鍵は登録の応答の鍵。filter と `{id}` の両方は結ばない。
+    return apiRecordId !== null && update.filterName === null ? null : 'SCENARIO_API_FILTER_NOT_BOUND_TO_LEDGER_ID';
+  }
   if (apiRecordId !== null) {
     return apiRecordId.key === update.filterName ? null : 'SCENARIO_API_FILTER_NOT_BOUND_TO_LEDGER_ID';
+  }
+  // LU-6: 一覧の行の更新（更新の画面の path の型に `{id}` がない）は、画面の path から ID を取れないので、応答の鍵の台帳だけに結ぶ。
+  if (!isRecordIdPathPattern(update.formPathTemplate)) {
+    return 'SCENARIO_API_FILTER_NOT_BOUND_TO_LEDGER_ID';
   }
   return isUpdatePathBoundToLedger(update.formPathTemplate, ledger.recordId ?? null, API_PAGE_LEDGER_BINDING)
     ? null
     : 'SCENARIO_UPDATE_PATH_NOT_BOUND_TO_LEDGER_ID';
+};
+
+/** LU-6: 台帳の登録の API の要求と、更新の API の要求が同じ表のときの形（`apiLedgerTableMatchOf` の結果）。 */
+export type ApiLedgerTableMatch = 'SAME_PATH' | 'RECORD_PATH';
+
+/**
+ * LU-6（設計書 5.4 の 3）: 台帳の登録の要求の送り先と、更新の要求の送り先が同じ表か（純粋。台帳への結び付きと、自動の下書きの番号の鍵の推しが共用する
+ * 唯一の判定）。Origin が同じ（比べ方は URL の意味の owner の `isOriginInAllowedOrigins`。GATE-ARCH04）で、
+ * - path の型が同じ → `SAME_PATH`（filter の形の更新）。
+ * - 更新の path の型が、登録の path の型の後ろに `/{id}` を 1 つ足したもの → `RECORD_PATH`（path の形の更新。D1）。
+ * - ほか（`/items/{id}/x`、別の資源の `/other/{id}` など）→ null。
+ */
+export const apiLedgerTableMatchOf = (
+  ledger: Pick<ScenarioApiRequestShape, 'origin' | 'pathShape'>,
+  update: Pick<ScenarioApiRequestShape, 'origin' | 'pathShape'>,
+): ApiLedgerTableMatch | null => {
+  if (!isOriginInAllowedOrigins([ledger.origin], update.origin)) {
+    return null;
+  }
+  if (update.pathShape === ledger.pathShape) {
+    return 'SAME_PATH';
+  }
+  return update.pathShape === `${ledger.pathShape}${PATH_SEPARATOR}${RECORD_ID_PLACEHOLDER}` ? 'RECORD_PATH' : null;
 };
 
 /**
@@ -1614,26 +1999,48 @@ const apiFieldNameErrorsOf = (draft: ScenarioDraftInput): readonly ScenarioDraft
     : [];
 });
 
+/** LU-6: 一覧の行の更新の行の選び方の写し（項目を選んで写す）。 */
+const listRowCopyOf = ({ listPagePath, openerIdentityDigest, rowKeyField }: ScenarioListRow): ScenarioListRow =>
+  ({ listPagePath, openerIdentityDigest, rowKeyField });
+
 /** 受けた API の指定（型から作る。値を持たない）。 */
-const apiSpecOf = (draft: ScenarioDraftInput, api: ScenarioApiDraft, accepted: AcceptedApiCandidate, candidate: DiscoveryCandidate): ScenarioApiSpec => {
+const apiSpecOf = (
+  draft: ScenarioDraftInput,
+  api: ScenarioApiDraft,
+  accepted: AcceptedApiCandidate,
+  candidate: DiscoveryCandidate,
+  ledgerBound: ReadonlySet<string>,
+): ScenarioApiSpec => {
   const keyFields = submissionProbeKeyFieldsOf(accepted.probe);
-  const keyFieldsNamed = (names: readonly string[]): ScenarioApiKeyField[] => keyFields.flatMap(({ key, type, field }) => {
-    const identity = field === null ? null : scenarioApiFieldIdentityOf(field);
-    return names.includes(key) && field !== null && identity !== null ? [{ key, type, field: identity, fieldType: field.type }] : [];
+  // ARR-3: 鍵と欄の対応は、索引と同じ唯一の作り方（欄の一覧の位置の役を持つ）。
+  const keyFieldsNamed = (names: readonly string[]): ScenarioApiKeyField[] => keyFields.flatMap(({ key, type, field, element }) => {
+    const keyField = names.includes(key) && field !== null ? scenarioApiKeyFieldOfProbe(accepted.probe, key, type, field, element) : null;
+    return keyField === null ? [] : [keyField];
   });
   const sentKeyFields = keyFieldsNamed(draft.fieldNames);
   const { shape } = accepted;
   // T41a: UPDATE は、保つ鍵と、ページが決める鍵の欄の識別と、画面の path を型にした識別の digest を持つ（登録は持たない）。
   const update = accepted.kind === 'UPDATE';
-  const templatedIdentityDigest = update ? pagePathTemplatedIdentityDigestOf(candidate) : null;
+  // LU-6: 一覧の行の更新は、画面の path に ID がないので、画面の path を型にした識別の digest を持たない（候補は一覧の画面そのもの）。
+  const templatedIdentityDigest = update && api.ledger?.listRow === undefined ? pagePathTemplatedIdentityDigestOf(candidate) : null;
   const updateItems = update ? {
     keptKeys: keyFieldsNamed(keptKeyNamesOf(draft, api, accepted)).sort((left, right) => compareCodeUnits(left.key, right.key)),
     ...(templatedIdentityDigest === null ? {} : { templatedIdentityDigest }),
   } : {};
+  const otherFilterNames = update ? apiUpdateFilterNamesOfProbe(accepted.probe).otherFilterNames : [];
+  const filterBound = update ? filterBoundPageKeyNamesOf(accepted.probe) : new Set<string>();
   const pageKeyOf = (key: string, type: ApiJsonValueType): ScenarioApiPageKey => {
-    const field = update ? pageKeyFieldOf(accepted.probe, key) : null;
+    // DEF-198（設計書 5.9 の 4）: 番号と所属の鍵（ほかの filter があるとき）は、欄の識別を持たない（照らす値は台帳の番号と、登録の時のページの値）。
+    // DEF-203（設計書 5.10 の 2）: 台帳の登録の値と照らす鍵も、欄の識別を持たない。
+    const field = update && !filterBound.has(key) && !ledgerBound.has(key) ? pageKeyFieldOf(accepted.probe, key) : null;
+    // ARR-2: 登録のページが決める一覧の鍵は、承認した要素の形（型の集合と数）を持つ（一覧のない鍵は項目を持たない。今の承認の digest は変わらない）。
+    const elements = type === 'array' && !update ? scenarioArrayElementsOf(shape, key) : undefined;
+    if (elements !== undefined) {
+      return { key, type, elements };
+    }
     return field === null ? { key, type } : { key, type, field };
   };
+  const ledgerPageKeys = update ? api.pageKeys.filter((key) => ledgerBound.has(key)).sort(compareCodeUnits) : [];
   return {
     ...updateItems,
     shapeDigest: api.shapeDigest,
@@ -1651,8 +2058,16 @@ const apiSpecOf = (draft: ScenarioDraftInput, api: ScenarioApiDraft, accepted: A
       .sort((left, right) => compareCodeUnits(left.key, right.key)),
     headerNames: accepted.headerNames,
     filterName: api.filterName,
+    // DEF-198（設計書 5.9 の 2）: ほかの filter の名前は、人の入力でなく probe の型から作る（空なら項目を持たない。今の承認の digest は変わらない）。
+    ...(otherFilterNames.length === 0 ? {} : { otherFilterNames: [...otherFilterNames] }),
+    // DEF-203（設計書 5.10 の 2）: 台帳の登録の値と照らす鍵の名前は、人の入力でなく probe の型と台帳の事実から作る（空なら項目を持たない）。
+    ...(ledgerPageKeys.length === 0 ? {} : { ledgerPageKeys: [...new Set(ledgerPageKeys)] }),
     recordId: api.recordId === null ? null : { source: api.recordId.source, key: api.recordId.key },
-    ledger: api.ledger === null ? null : { targetCreateScenarioId: api.ledger.targetCreateScenarioId, formPathTemplate: api.ledger.formPathTemplate },
+    ledger: api.ledger === null ? null : {
+      targetCreateScenarioId: api.ledger.targetCreateScenarioId,
+      formPathTemplate: api.ledger.formPathTemplate,
+      ...(api.ledger.listRow === undefined ? {} : { listRow: listRowCopyOf(api.ledger.listRow) }),
+    },
   };
 };
 
@@ -1670,16 +2085,21 @@ const validateApiScenarioDraft = (
     ...apiProfileRevisionErrorsOf(context),
     ...apiFieldNameErrorsOf(draft),
   ];
+  // DEF-203（設計書 5.10 の 2）: 台帳の登録の値と照らす鍵（台帳の登録のページが決める鍵にもある、欄と結びつかない鍵。5.9 の形の更新だけ）。
+  const ledgerBound = candidateResult.ok ? ledgerBoundPageKeyNamesOf(candidateResult.accepted.probe, ledgerPageKeyNamesOfDraft(draft, api, context)) : new Set<string>();
   if (candidateResult.ok && candidate !== null) {
     errors.push(
-      ...apiKeyErrorsOf(draft, api, candidateResult.accepted),
+      ...apiKeyErrorsOf(draft, api, candidateResult.accepted, ledgerBound),
       ...apiLedgerErrorsOf(draft, api, candidateResult.accepted, candidate, context),
     );
   }
-  // OP-R（R1）: 一覧の画面の定義を照合の READ に使えるのは、API の登録だけ（登録の画面の 1 つ上の path）。
-  const listPagePath = candidateResult.ok && candidate !== null && candidateResult.accepted.kind === CREATE_SCENARIO_KIND
-    ? readListPagePathOf(candidate.page.path)
-    : null;
+  // OP-R（R1）: 一覧の画面の定義を照合の READ に使えるのは、API の登録（登録の画面の 1 つ上の path）と、LU-7 fix round 2: 一覧の行の更新（一覧の画面の path。
+  // 候補の画面の path と同じことは `listRowLedgerErrorsOf` が確かめる）。生成した値と比べる期待が要るのは同じ。
+  const listPagePath = !candidateResult.ok || candidate === null
+    ? null
+    : candidateResult.accepted.kind === CREATE_SCENARIO_KIND
+      ? readListPagePathOf(candidate.page.path)
+      : api.ledger?.listRow?.listPagePath ?? null;
   errors.push(...readCheckErrorsOf(draft, readChecks), ...verificationErrorsOf(draft, readChecks, listPagePath), ...limitErrorsOf(draft));
   if (errors.length > 0 || !candidateResult.ok || candidate === null) {
     return rejected(errors);
@@ -1690,7 +2110,7 @@ const validateApiScenarioDraft = (
     content: deepFreeze({
       ...contentOf(draft, candidate, accepted.kind, null),
       transport: API_SCENARIO_TRANSPORT,
-      api: apiSpecOf(draft, api, accepted, candidate),
+      api: apiSpecOf(draft, api, accepted, candidate, ledgerBound),
       update: null,
     }),
   });

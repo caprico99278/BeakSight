@@ -190,3 +190,17 @@ describe('T32g: the audited data ledger reader', () => {
     expect(ledger[0]?.updates).toEqual({ count: 2, last: { jobId: 'job-u3', result: 'UNKNOWN', recordedAt: writeSlotAt(3) } });
   });
 });
+
+// L12b（設計書 `2026-11-09-beaksight-remove-limits-design.md` 6.2 と L12b の設計者の判断 1）: 登録の ID の長さの上限（前は 64 文字）を撤廃した。65 文字以上の ID で
+// 登録を記録し、その ID を対象にした更新の許可の発行・消費・記録が通る（管理データの版 19 で、対象のレコードの ID の列の上限を外した）。
+describe('L12b: a record id longer than the former 64 characters', () => {
+  it('registers and then updates a record whose id has 70 characters', () => {
+    const longId = `rec_${'a1'.repeat(33)}`;
+    expect(longId.length).toBe(70);
+    register(CREATE_SCENARIO_ID, 0, longId);
+    expect(readPlannedUpdateTarget(database, UPDATE_SCENARIO_ID)).toBe(longId);
+    update(1, longId, 'VERIFIED');
+    const ledger = readAuditedDataLedger(database, GRANT_PROFILE_ID);
+    expect(ledger[0]?.updates).toMatchObject({ count: 1, last: { jobId: 'job-u1', result: 'VERIFIED' } });
+  });
+});

@@ -1,15 +1,14 @@
 /**
- * シナリオの画面の流れの目印の検査の作り（T28f の `scenario-approval-secret-markers.test.ts` の作りを、T29f の
- * `data-rule-secret-markers.test.ts` と共用するために、ここへ移した。T29f）。CCX-16（CC-081）で、T27g の
- * `discovery-secret-markers.test.ts` も、この作りを使う（プロファイルのモード、読み込みの間隔、プロファイルごとに読む画面と Server Function を
+ * シナリオの画面の流れの目印の検査の作り（T28f の検査の作りを、T29f の入力の規則の画面の目印の検査と共用するために、ここへ移した。T29f）。
+ * SLIM-GROUP UI-6 で、T27g と T28f の検査は `discovery-approval-secret-markers.test.ts`、T25f と T26f の検査は `login-secret-markers.test.ts` になり、
+ * どちらもこの作りを使う（プロファイルのモード、読み込みの間隔、プロファイルごとに読む画面と Server Function を
  * 設定で替える。既定は T28f・T29f の値）。
  * - ビルドした画面を一時の root の起動の部品で起動し（子プロセスの起動を記録する、テストだけの前処理つき）、ワーカーの入口をテストだけの入口
  *   （`helpers/auth-worker.ts` の `installTestAuthWorkerEntry`。IPC と親から受けたメッセージを記録する）に替える。手動のログインは、受け渡しの
  *   サーバ（`startCredentialRelay`）がテストだけの入口に資格情報を渡す。
- * - 画面の操作: 発見のジョブ（候補の画面の開始のボタン）、READ の確かめの定義の作成、登録（CREATE）の候補からのシナリオの作成、承認と撤回（確認の
- *   ダイアログ）、資格情報の登録、書き込みのモードのプロファイルと認証の設定の作成。T31h-1: 更新（UPDATE）の候補からのシナリオの作成（台帳・型・欄の
- *   役割）。ブラウザで開いた画面の HTML と、ブラウザが受けた Server Function の
- *   応答を集める。ジョブごとに、サイトへの要求の窓を記録する。
+ * - 画面の操作: 発見のジョブ（候補の画面の開始のボタン）、READ の確かめの定義の作成、サイトの画面の一覧のチェックを入れる・外す（SPEC-4。書き込みの
+ *   手順の下書き・承認・撤回は、チェックの保存が行う。手で作る作成の画面と承認・撤回のダイアログは外した）、資格情報の登録、書き込みのモードのプロファイルと
+ *   認証の設定の作成。ブラウザで開いた画面の HTML と、ブラウザが受けた Server Function の応答を集める。ジョブごとに、サイトへの要求の窓を記録する。
  * - 検索する場所（`searchedPlaces`）: 一時の root のすべてのファイル（`node_modules` の junction は除く）、管理データのすべての表のすべての行、画面の
  *   サーバの標準出力と標準エラー、子プロセスの起動の記録、すべての画面の HTML（サーバで描いたもの・ブラウザで開いたもの・成果物の画面。足す画面は
  *   `extraScreenPaths`）、Server Function の応答（集めたものと、いま読むもの。足す呼び出しは `extraFunctionCalls`）。検索は
@@ -25,18 +24,16 @@ import { closeControlDatabase, openControlDatabase, type ControlDatabase } from 
 import { CONTROL_DATA_DIRECTORY_NAME, resolveControlDatabasePath } from '../../../../src/control/store/database-path.js';
 import { formatCompactUtcTimestamp } from '../../../../src/core/utc-timestamp.js';
 import { READ_CHECK_EXPECTATION_KIND_CATALOG } from '../../../../src/presentation/catalog.js';
-import {
-  LOCAL_UI_CREDENTIAL_TEXT,
-  LOCAL_UI_READ_CHECK_TEXT,
-  LOCAL_UI_SCENARIO_TEXT,
-  LOCAL_UI_WRITE_TEXT,
-} from '../../../../src/presentation/messages.js';
+import { LOCAL_UI_CREDENTIAL_TEXT, LOCAL_UI_READ_CHECK_TEXT } from '../../../../src/presentation/messages.js';
 import { launchHeadlessChromium } from '../../../../tests/helpers/chromium.js';
+import { nonReadRequestsOf } from '../../../../tests/helpers/leak-places.js';
 import {
+  DISCOVERY_SITE_BEACON_BODY,
   DISCOVERY_SITE_LOGIN_FIELDS,
   DISCOVERY_SITE_PATHS,
   DISCOVERY_SITE_READ_CHECK_PATHS,
   type DiscoverySite,
+  type DiscoverySiteRequest,
 } from '../../../../tests/helpers/discovery-site-fixture.js';
 import { descendantsOf, listProcesses, waitUntilExited, type ProcessIdentity } from '../../../../tests/helpers/process-tree.js';
 import {
@@ -49,6 +46,7 @@ import {
   type RelayedCredentials,
 } from './auth-worker.ts';
 import {
+  BUILT_SERVER_ENTRY,
   createTemporaryUiRoot,
   findFreePort,
   parseSetCookie,
@@ -72,7 +70,6 @@ import { callServerFunction, readServerFunctionIds, type ServerFunctionCall } fr
 import { waitForJobViaServerFunctions } from './server-function-job-wait.ts';
 import { createProfileInStore, saveAuthSetupRequestInStore } from './profile-store-setup.ts';
 import { createUiPageKit } from './ui-page.ts';
-import { SCENARIO_ADVANCED_SETTINGS, SCENARIO_DETAIL_ADVANCED_SETTINGS, openAdvancedSettings } from './advanced-settings.ts';
 
 /** 画面の操作を待つ上限（ms）。 */
 export const UI_TIMEOUT_MS = 20_000;
@@ -104,8 +101,6 @@ export const LOGIN_POSTS_PER_JOB = 1;
 const LOOKUP_ID = 'A-1';
 const DETAIL_FIELD = '名前';
 const DETAIL_VALUE = 'りんご';
-/** シナリオで送る欄（登録の候補の、送れる欄の 1 つ）。 */
-export const SCENARIO_FIELD_NAME = 'name';
 /** プロファイルごとの画面のパスの頭（すべての画面の HTML を検索する。設定の既定）。 */
 const PROFILE_SCREEN_PREFIXES = Object.freeze(['/profiles/', '/auth-setup/', '/credentials/', '/login-check/', '/discovery/', '/read-checks/']);
 /** プロファイルごとに、いま読む Server Function（設定の既定）。 */
@@ -113,16 +108,6 @@ const PROFILE_FUNCTIONS = Object.freeze(['getProfileFn', 'getAuthSetupFn', 'getC
 
 const readText = LOCAL_UI_READ_CHECK_TEXT;
 const credentialText = LOCAL_UI_CREDENTIAL_TEXT;
-const scenarioText = LOCAL_UI_SCENARIO_TEXT;
-const writeText = LOCAL_UI_WRITE_TEXT;
-/**
- * シナリオの検証の指定の値（T30g。T30d から、検証の指定がそろわないシナリオには実行の許可を出さないので、画面で入れる）。fixture のサイトの path と、
- * 画面の構造のセレクタだけ（値ではない）。照合の READ は、照会の定義の送る値 `id` を送る欄に結び付ける。
- */
-const VERIFICATION_VALUES = Object.freeze({
-  recordIdPathPattern: `${DISCOVERY_SITE_PATHS.admin}/items/{id}`,
-  lookupParameter: 'id',
-});
 
 /** ジョブの詳細（画面の Server Function の値のうち、確かめに使うもの）。 */
 export interface JobDetail {
@@ -171,13 +156,47 @@ export interface ScenarioMarkerFlowOptions {
    * `expectCleanPages` で確かめられる。
    */
   readonly recordPages?: boolean;
+  /** UI-6: Tab を押す回数の上限（`tabTo` を使うときだけ渡す）。 */
+  readonly maxTabPresses?: number;
 }
 
+/** UI-6（INV-SLIM）: 検索の画面と Server Function を、同時にこの本数まで読む（読む場所と数は変えない）。 */
+const SEARCH_READ_CONCURRENCY = 4;
+
+/** `items` を、同時に `limit` 本まで `read` で読み、元の順に並べて返す。 */
+const readInPool = async <T, R>(items: readonly T[], limit: number, read: (item: T) => Promise<R>): Promise<readonly R[]> => {
+  const results: R[] = new Array<R>(items.length);
+  let next = 0;
+  const lane = async (): Promise<void> => {
+    while (next < items.length) {
+      const index = next;
+      next += 1;
+      results[index] = await read(items[index] as T);
+    }
+  };
+  await Promise.all(Array.from({ length: Math.min(limit, items.length) }, lane));
+  return results;
+};
+
 /** 窓の中の、GET と HEAD 以外の要求（`<method> <path>`。CC-093: 定義は `tests/helpers/leak-places.ts` の 1 か所）。 */
-export { nonReadRequestsOf } from '../../../../tests/helpers/leak-places.js';
+export { nonReadRequestsOf };
 
 /** ログインの POST を `count` 回（`<method> <path>`）。 */
 export const loginPosts = (count: number): readonly string[] => Array.from({ length: count }, () => `POST ${DISCOVERY_SITE_PATHS.login}`);
+
+/** DEF-257: 仮のサイトの beacon の画面が、読み込みで自分で送る POST（`<method> <path>`。既定の送信の扱い `PASS_EXCEPT_DELETE` の決まりどおり通る）。 */
+const SITE_BEACON_POST = `POST ${DISCOVERY_SITE_PATHS.collect}`;
+
+/**
+ * DEF-257: 要求の、GET・HEAD と、beacon の POST のほかの要求（`<method> <path>`。3 つの secret-markers の唯一の数え方）。beacon の POST は、本文が決まった文字
+ * （`DISCOVERY_SITE_BEACON_BODY`。目印を含まない）であることを、ここで確かめる。
+ */
+export const nonReadRequestsBesidesBeaconOf = (requests: readonly DiscoverySiteRequest[], label?: string): readonly string[] => {
+  const nonRead = nonReadRequestsOf(requests);
+  const beacons = requests.filter(({ method, path }) => `${method} ${path}` === SITE_BEACON_POST);
+  expect(beacons.map(({ body }) => body), label).toEqual(beacons.map(() => DISCOVERY_SITE_BEACON_BODY));
+  return nonRead.filter((request) => request !== SITE_BEACON_POST);
+};
 
 /** `<場所> (<文字の形>)` から場所の名前を取り出す。 */
 export const placeNameOf = (leaked: string): string => leaked.slice(0, leaked.lastIndexOf(' ('));
@@ -284,7 +303,7 @@ export const createScenarioMarkerFlow = (options: ScenarioMarkerFlowOptions) => 
     });
     const preload = writeChildProcessRecordingPreload(`${rootOf()}/${options.label}-child-process-recording.mjs`,
       `${recordDirectory()}/${SERVER_CHILD_PROCESS_RECORD}`, 'server');
-    ids = readServerFunctionIds(`${rootOf()}/apps/local-ui/dist/server/server.js`);
+    ids = readServerFunctionIds(BUILT_SERVER_ENTRY);
     functionNames = new Map([...ids].map(([name, id]) => [id, name]));
     browser = await launchHeadlessChromium();
     server = await startLauncherWithNodeArguments(root, await findFreePort(), ['--import', preload]);
@@ -310,10 +329,11 @@ export const createScenarioMarkerFlow = (options: ScenarioMarkerFlowOptions) => 
    * 画面のページを開く（記録は付けない。ブラウザが受けた Server Function の応答の本文を集める）と、開いたページを閉じる（各テストの後）。
    * CCX-16 の共通の補助（`ui-page.ts`）。
    */
-  const { openPage, forgetPages: closePages, expectCleanPages } = createUiPageKit({
+  const { openPage, forgetPages: closePages, expectCleanPages, tabTo } = createUiPageKit({
     contextOf: () => context,
     originOf: () => started().origin,
     recordPages: options.recordPages ?? false,
+    ...(options.maxTabPresses === undefined ? {} : { maxTabPresses: options.maxTabPresses }),
     onPageCreated: (page) => {
       page.on('response', (response) => {
         const url = new URL(response.url());
@@ -351,9 +371,16 @@ export const createScenarioMarkerFlow = (options: ScenarioMarkerFlowOptions) => 
     }
   };
 
+  /** 画面のサーバの子孫（ワーカーと Chromium）を記録する（止めるときに、残らないことを確かめる）。見つけた子孫を返す。 */
+  const recordDescendants = async (): Promise<readonly ProcessIdentity[]> => {
+    const found = descendantsOf(started().child.pid ?? 0, await listProcesses());
+    descendants.push(...found);
+    return found;
+  };
+
   /** ジョブが終わるまで待つ（その間の画面のサーバの子孫を記録する）。 */
   const waitForJobEnd = async (jobId: string): Promise<JobDetail> => {
-    descendants.push(...descendantsOf(started().child.pid ?? 0, await listProcesses()));
+    await recordDescendants();
     // PRE42-CC 組 UI-K2（CC-112）: 読み直して待つのは補助 `waitForJobViaServerFunctions`（上限と間隔は前と同じ）。
     return waitForJobViaServerFunctions(
       (id) => valueOf<JobDetail | null>('getAuditJobFn', 'GET', { jobId: id }),
@@ -401,102 +428,31 @@ export const createScenarioMarkerFlow = (options: ScenarioMarkerFlowOptions) => 
     return all[0] ?? '';
   };
 
-  /**
-   * 候補の画面の登録（CREATE）の候補から「シナリオを作る」で作成の画面へ移り、送る欄と照らす READ を選んで保存する（上限と期限は既定のまま。
-   * MI-6: 副作用の確認のチェックは画面にない。承認のダイアログの 1 回で確かめる）。T30g: 検証の指定（成功と入力の誤りの条件、登録の ID の取り方、照合の READ）も画面で入れる。候補の digest と
-   * シナリオの ID を返す。
-   */
-  const createScenarioOnScreen = async (profileId: string, readCheckId: string): Promise<{ readonly candidateDigest: string; readonly scenarioId: string }> => {
-    // PL-5（設計書 `2026-10-26-beaksight-plain-ui-design.md` 4 章の 6）: 操作さがしの画面の候補ごとの「書き込みの手順を作る」のリンクはなくした（下書きは
-    // 「書き込みの手順を作る」の 1 つ）。手で作る作成の画面は、候補の digest の URL で開く（候補の digest は詳しい内容の中の候補の行の印）。
+  /** 操作さがしの画面の、登録の画面の登録（CREATE）の候補の digest（サイトの画面の一覧の行の鍵と同じ値）。 */
+  const createCandidateDigestOf = async (profileId: string): Promise<string> => {
     const discovery = await openPage(`/discovery/${profileId}`);
     const candidate = discovery.locator(candidateSelectorOf(DISCOVERY_SITE_PATHS.create, 'CREATE')).first();
     await candidate.waitFor({ state: 'attached', timeout: UI_TIMEOUT_MS });
-    const candidateDigest = await candidate.getAttribute('data-digest') ?? '';
-    const page = await openPage(`/scenarios/${profileId}/new?candidate=${encodeURIComponent(candidateDigest)}`);
-    await page.getByTestId('scenario-form').waitFor({ timeout: UI_TIMEOUT_MS });
-    await snapshot(page);
-    await page.locator(`[data-testid="scenario-field"][data-field-name="${SCENARIO_FIELD_NAME}"] input[type="checkbox"]`).check();
-    // PL-5（4 章の 5、8 章）: 照らす見るだけの確かめを選ぶ所はない。答え合わせ（検証の指定）は、たたんだ詳しい内容の中で入れる。
-    await openAdvancedSettings(page, SCENARIO_ADVANCED_SETTINGS, UI_TIMEOUT_MS);
-    // MI-6（設計書 `2026-10-26-beaksight-minimal-input-ux-design.md` 4.6）: 副作用の確認のチェックはない。
-    expect(await page.locator('input[data-side-effect]').count()).toBe(0);
-    // T30g: 検証の指定。
-    // PL-6a（設計書 `2026-10-26-beaksight-plain-ui-design.md` 8.1）: 成功の条件と入力の誤りの条件の欄はない（BeakSight が構造で判定する）。
-    // form の ID の取り方は、送った後のアドレスの形の一覧（`URL_PATH_PATTERNS`）。
-    const recordId = page.getByTestId('scenario-verification-recordId');
-    await recordId.getByLabel(writeText.recordIdSource, { exact: true }).selectOption('URL_PATH_PATTERNS');
-    await recordId.getByLabel(writeText.recordIdValue, { exact: true }).fill(VERIFICATION_VALUES.recordIdPathPattern);
-    const read = page.getByTestId('scenario-verification-readVerification');
-    await read.getByLabel(writeText.readVerificationCheck, { exact: true }).selectOption(readCheckId);
-    await read.locator(`[data-testid="scenario-verification-binding"][data-parameter-name="${VERIFICATION_VALUES.lookupParameter}"] select`)
-      .selectOption(SCENARIO_FIELD_NAME);
-    await read.getByTestId('scenario-verification-add-expectation').click();
-    await page.getByTestId('scenario-save').click();
-    await page.waitForURL(new RegExp(`/scenarios/${profileId}/[a-z0-9-]+\\?notice=saved$`, 'u'), { timeout: UI_TIMEOUT_MS });
-    const scenarioId = new URL(page.url()).pathname.split('/').at(-1) ?? '';
-    // PL-5: 状態の印は、詳しい内容の中（要点は今の様子の文）。
-    await page.getByTestId('scenario-state').waitFor({ state: 'attached', timeout: UI_TIMEOUT_MS });
-    expect(await page.getByTestId('scenario-state').getAttribute('data-state')).toBe('DRAFT');
-    await snapshot(page);
-    return { candidateDigest, scenarioId };
+    return await candidate.getAttribute('data-digest') ?? '';
   };
 
   /**
-   * T31h-1: 候補の画面の更新（UPDATE）の候補から「シナリオを作る」で作成の画面へ移り、台帳（`ledgerScenarioId`）を選び、`SCENARIO_FIELD_NAME` を変える欄に
-   * して（ほかは既定の保つ。型は既定の候補の path から作る組）保存する。作成と詳細の画面の HTML を集める。候補の digest とシナリオの ID を返す。
+   * SPEC-4（設計書 `2026-11-14-beaksight-slim-and-simplify-design.md` 5.1）: サイトの画面の「登録・更新を試せる画面」の一覧で、登録の画面の行のチェックを入れる
+   * （`checked`）か外す。チェックの保存が、書き込みのモードへの切り替え・下書き・承認（外すと撤回）を 1 回で行う。行の状態が変わるまで待ち、前後の画面の HTML を
+   * 集める。行の鍵（候補の digest）を返す。
    */
-  const createUpdateScenarioOnScreen = async (
-    profileId: string,
-    ledgerScenarioId: string,
-  ): Promise<{ readonly candidateDigest: string; readonly scenarioId: string }> => {
-    // PL-5: 作成の画面は、候補の digest の URL で開く（`createScenarioOnScreen` の説明）。
-    const discovery = await openPage(`/discovery/${profileId}`);
-    const candidate = discovery.locator(candidateSelectorOf(DISCOVERY_SITE_PATHS.update, 'UPDATE')).first();
-    await candidate.waitFor({ state: 'attached', timeout: UI_TIMEOUT_MS });
-    const candidateDigest = await candidate.getAttribute('data-digest') ?? '';
-    const page = await openPage(`/scenarios/${profileId}/new?candidate=${encodeURIComponent(candidateDigest)}`);
-    await page.getByTestId('scenario-update').waitFor({ timeout: UI_TIMEOUT_MS });
+  const setWriteScreenCheckOnList = async (profileId: string, checked: boolean): Promise<string> => {
+    const rowKey = await createCandidateDigestOf(profileId);
+    const page = await openPage(`/profiles/${profileId}`);
+    const row = page.locator(`[data-testid="write-screen-row"][data-row-key="${rowKey}"]`);
+    await row.waitFor({ timeout: UI_TIMEOUT_MS });
+    expect(await row.getAttribute('data-state')).toBe(checked ? 'CHECKABLE' : 'CHECKED');
     await snapshot(page);
-    // OP-3（設計書 `2026-10-27-beaksight-one-pass-flow-design.md` 4.1 の D12 の 4）: 作ったデータの一覧を選ぶ欄は、詳しい内容の中。
-    await openAdvancedSettings(page, SCENARIO_ADVANCED_SETTINGS, UI_TIMEOUT_MS);
-    await page.getByTestId('scenario-update-ledger').selectOption(ledgerScenarioId);
-    await page.locator(`[data-testid="scenario-update-role"][data-field-name="${SCENARIO_FIELD_NAME}"] input[type="radio"][value="CHANGE"]`).check();
-    await page.getByTestId('scenario-save').click();
-    await page.waitForURL(new RegExp(`/scenarios/${profileId}/[a-z0-9-]+\\?notice=saved$`, 'u'), { timeout: UI_TIMEOUT_MS });
-    const scenarioId = new URL(page.url()).pathname.split('/').at(-1) ?? '';
-    // PL-5: 書き換えの手順の詳細は、要点のパネルと詳しい内容（書き換えの対象）。
-    await page.getByTestId('scenario-summary').waitFor({ timeout: UI_TIMEOUT_MS });
+    await row.getByTestId('write-screen-check').click();
+    await expect.poll(() => row.getAttribute('data-state'), { timeout: UI_TIMEOUT_MS }).toBe(checked ? 'CHECKED' : 'CHECKABLE');
+    expect(await row.getByTestId('write-screen-rejection').count()).toBe(0);
     await snapshot(page);
-    return { candidateDigest, scenarioId };
-  };
-
-  /** 詳細の画面で、確認のダイアログの後に承認する（`APPROVED` になるまで待つ）。ダイアログと承認の後の画面の HTML を集める。 */
-  const approveOnScreen = async (profileId: string, scenarioId: string): Promise<void> => {
-    const page = await openPage(`/scenarios/${profileId}/${scenarioId}`);
-    await page.getByTestId('scenario-approve').click();
-    const dialog = page.getByRole('dialog', { name: scenarioText.approveDialog.title });
-    await dialog.waitFor({ timeout: UI_TIMEOUT_MS });
-    await snapshot(page);
-    await dialog.getByRole('button', { name: scenarioText.approveDialog.confirm, exact: true }).click();
-    await page.waitForURL(new RegExp(`/scenarios/${profileId}/${scenarioId}\\?notice=approved$`, 'u'), { timeout: UI_TIMEOUT_MS });
-    await expect.poll(() => page.getByTestId('scenario-state').getAttribute('data-state'), { timeout: UI_TIMEOUT_MS }).toBe('APPROVED');
-    await snapshot(page);
-  };
-
-  /** 詳細の画面で、確認のダイアログの後に撤回する（`REVOKED` になるまで待つ）。ダイアログと撤回の後の画面の HTML を集める。 */
-  const revokeOnScreen = async (profileId: string, scenarioId: string): Promise<void> => {
-    const page = await openPage(`/scenarios/${profileId}/${scenarioId}`);
-    // PL-5（設計書 3 章の 1）: OK の取り消しは、書き込みの手順の詳細の詳しい内容の中。
-    await openAdvancedSettings(page, SCENARIO_DETAIL_ADVANCED_SETTINGS, UI_TIMEOUT_MS);
-    await page.getByTestId('scenario-revoke').click();
-    const dialog = page.getByRole('dialog', { name: scenarioText.revokeDialog.title });
-    await dialog.waitFor({ timeout: UI_TIMEOUT_MS });
-    await snapshot(page);
-    await dialog.getByRole('button', { name: scenarioText.revokeDialog.confirm, exact: true }).click();
-    await page.waitForURL(new RegExp(`/scenarios/${profileId}/${scenarioId}\\?notice=revoked$`, 'u'), { timeout: UI_TIMEOUT_MS });
-    await expect.poll(() => page.getByTestId('scenario-state').getAttribute('data-state'), { timeout: UI_TIMEOUT_MS }).toBe('REVOKED');
-    await snapshot(page);
+    return rowKey;
   };
 
   /**
@@ -545,18 +501,14 @@ export const createScenarioMarkerFlow = (options: ScenarioMarkerFlowOptions) => 
       paths.push(...(options.profileScreenPrefixes ?? PROFILE_SCREEN_PREFIXES).map((prefix) => `${prefix}${profileId}`));
     }
     paths.push(...options.extraScreenPaths());
-    const artifactPaths: string[] = [];
-    for (const { jobId } of jobs) {
-      paths.push(`/jobs/${jobId}`);
-      const job = await valueOf<JobDetail | null>('getAuditJobFn', 'GET', { jobId });
-      artifactPaths.push(...(job?.artifacts ?? []).map(({ href }) => href));
-    }
-    const places: SearchedPlace[] = [];
-    for (const path of [...paths, ...artifactPaths]) {
+    paths.push(...jobs.map(({ jobId }) => `/jobs/${jobId}`));
+    const artifactPaths = (await readInPool(jobs, SEARCH_READ_CONCURRENCY, ({ jobId }) => valueOf<JobDetail | null>('getAuditJobFn', 'GET', { jobId })))
+      .flatMap((job) => (job?.artifacts ?? []).map(({ href }) => href));
+    const places: SearchedPlace[] = [...await readInPool([...paths, ...artifactPaths], SEARCH_READ_CONCURRENCY, async (path) => {
       const response = await rawRequest(started().port, path, { headers: { cookie } });
       expect(response.status, path).toBe(STATUS.OK);
-      places.push(textPlace(`html:${path}`, response.body));
-    }
+      return textPlace(`html:${path}`, response.body);
+    })];
     places.push(...htmlSnapshots.map(({ path, html }, index) => textPlace(`browser-html:${index}:${path}`, html)));
     return places;
   };
@@ -569,9 +521,7 @@ export const createScenarioMarkerFlow = (options: ScenarioMarkerFlowOptions) => 
     }
     calls.push(...options.extraFunctionCalls());
     calls.push(...jobs.map(({ jobId }) => ['getAuditJobFn', { jobId }] as const));
-    for (const [name, data] of calls) {
-      await callFunction(name, 'GET', data);
-    }
+    await readInPool(calls, SEARCH_READ_CONCURRENCY, ([name, data]) => callFunction(name, 'GET', data));
     return responseBodies.map(({ name, body }, index) => textPlace(`function:${name}:${index}`, body));
   };
 
@@ -615,6 +565,10 @@ export const createScenarioMarkerFlow = (options: ScenarioMarkerFlowOptions) => 
     closePages,
     // T32h: 記録を付けたとき（`recordPages`）の、開いたページの記録の確かめ。
     expectCleanPages,
+    // UI-6: Tab だけのフォーカスの移動（`maxTabPresses` を渡したとき）と、画面のサーバの子孫の記録と、画面の Cookie と token。
+    tabTo,
+    recordDescendants,
+    screenSecrets,
     rootOf,
     started,
     relayOf,
@@ -632,10 +586,7 @@ export const createScenarioMarkerFlow = (options: ScenarioMarkerFlowOptions) => 
     waitForJobEnd,
     runDiscoveryFrom,
     saveLookupDefinition,
-    createScenarioOnScreen,
-    createUpdateScenarioOnScreen,
-    approveOnScreen,
-    revokeOnScreen,
+    setWriteScreenCheckOnList,
     prepareProfile,
     registerCredentialOnPage,
     searchedPlaces,

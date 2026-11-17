@@ -1,6 +1,6 @@
 /**
- * 一時的なビルドの CLI（`<一時ビルド>/dist/cli/index.js`）を、別のプロセスで動かす補助（T19a。`tests/integration/cli.test.ts` と
- * `tests/integration/fixture-full-crawl.test.ts` が共通に使う）。
+ * 一時的なビルドの CLI（RB-4 fix: `<一時ビルド>/dist/cli/main.js` の `runCli` を、テストだけの入口 `test-cli-entry.ts` で）を、別のプロセスで動かす補助
+ * （T19a。`tests/integration/cli.test.ts` が使う）。
  *
  * - プロセスの起動と、標準出力・標準エラーの受け取り、上限の時間を過ぎたときの停止。
  * - 上限の時間の中で終わったことの確かめ、スタックトレースの行の形、出力先の根の下にある Run のディレクトリの取り出し。
@@ -11,6 +11,7 @@ import { readdir } from 'node:fs/promises';
 import { join } from 'node:path';
 import { expect } from 'vitest';
 import type { TemporaryBuild } from './temporary-build.js';
+import { installTestCliEntry } from './test-cli-entry.js';
 
 /** CLI のプロセスが終わるまでの上限（これを過ぎたら、プロセスを止めてテストを失敗にする）。 */
 export const CLI_PROCESS_LIMIT_MS = 120_000;
@@ -37,7 +38,8 @@ export interface CliProcessResult {
 export function runCliProcess(build: TemporaryBuild, cwd: string, arguments_: readonly string[]): Promise<CliProcessResult> {
   const startedAt = Date.now();
   return new Promise((resolvePromise, rejectPromise) => {
-    const child = spawn(process.execPath, [join(build.distDirectory, 'cli', 'index.js'), ...arguments_], {
+    // RB-4 fix（M-1）: テストだけの入口（`test-cli-entry.ts`。Browser の起動にテストだけの外へ出ない引数を足す）で動かす。
+    const child = spawn(process.execPath, [installTestCliEntry(build), ...arguments_], {
       cwd,
       stdio: ['ignore', 'pipe', 'pipe'],
     });

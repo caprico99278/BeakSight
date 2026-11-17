@@ -178,17 +178,7 @@ export const WRITE_REPORT_CHECKS = Object.freeze([
 ] as const);
 export type WriteReportCheck = (typeof WRITE_REPORT_CHECKS)[number];
 
-/**
- * ジョブのログインの段のまとめ（T34e。管理データの版 11 の `jobs.login_stage_summary`。JSON の object）の最大長（UTF-16 のコード単位。表の CHECK）。
- * 最も大きいまとめ（上限の件数・長さの一覧と、安全な整数の最大の回数）が収まる大きさ（`tests/integration/control-store-job-summaries.test.ts` で確かめる）。
- */
-export const MAX_LOGIN_STAGE_SUMMARY_LENGTH = 32_768;
-
-/**
- * DEF-138: ジョブのセッションの切れの証拠（管理データの版 16 の `jobs.session_loss`。JSON の object）の最大長（UTF-16 のコード単位。表の CHECK）。最も大きい
- * 証拠（上限の件数の経路と止めた要求の、最大の長さの path の表記）が収まる大きさ（`tests/integration/control-store-job-summaries.test.ts` で確かめる）。
- */
-export const MAX_SESSION_LOSS_RECORD_LENGTH = 65_536;
+// URL-LEN（管理データの版 20）: ジョブのログインの段のまとめ（前は 32,768）とセッションの切れの証拠（前は 65,536）の大きさの上限は撤廃した。
 
 /**
  * ジョブの開始を拒むときの理由（行を作らず、ワーカーを起動しない）。PRE42-CC 組 UI-K2（CC-113）: 一覧の定義と値の意味は、画面のブラウザ側からも読める

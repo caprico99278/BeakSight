@@ -3,7 +3,7 @@
 //   `kind` で表し、外から要る値（Run の ID、Run のディレクトリ、Run Status、終了コード、再開の判断）を持つ。日本語の文は書かない。
 // - 観測の口（`onRunStarting`、`onRunStarted`、`onProgress`、`onNotice`）が呼ばれる順と値。口の例外と reject は、監査を止めない。
 // 偽の Run Coordinator（`createRunCoordinator`）で確かめる（Browser を起動しない）。本物の Chromium での確かめは
-// `tests/integration/audit-run.test.ts`、CLI の出力が変わらないことは `tests/integration/cli-output-parity.test.ts`。
+// `tests/integration/audit-run.test.ts`、CLI の出力は `tests/integration/cli-stop-resume.test.ts`。
 import { existsSync } from 'node:fs';
 import { mkdir, mkdtemp, readdir, readFile, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
@@ -29,9 +29,7 @@ import {
   runArtifactDirectory,
 } from '../../src/core/artifact-layout.js';
 import type { AuditRunResult, RunProgressReport } from '../../src/core/contracts.js';
-import { createRunId } from '../../src/core/ids.js';
 import { readPlaywrightVersion, readToolVersion } from '../../src/orchestration/environment.js';
-import { createRunLock, currentProcessRunLockHost } from '../../src/core/process-lock.js';
 import { checkRunCheckpointConsistency } from '../../src/orchestration/run-checkpoint.js';
 import { RunCheckpointSession } from '../../src/orchestration/run-checkpoint-session.js';
 import {
@@ -301,22 +299,7 @@ describe('executeAuditRun: a new Run (RAN)', () => {
 });
 
 describe('executeAuditRun: the Runs that do not start or cannot be finished', () => {
-  it('returns RUN_ACTIVE with the run ID of the running Run, without creating the Run Coordinator or calling the observer', async () => {
-    const config = configFor('active');
-    const activeRunId = createRunId(20261001000000);
-    await new ArtifactWriter().acquireRunLock(
-      runArtifactDirectory(config.output.directory, activeRunId),
-      createRunLock(currentProcessRunLockHost(Date.now())),
-    );
-    const { dependencies, created } = fakeDependencies();
-    const { observer, calls } = recordingObserver();
-
-    const outcome = await executeAuditRun(config, dependencies, { startNew: true }, observer);
-
-    expect(outcome).toEqual({ kind: 'RUN_ACTIVE', activeRunId, exitCode: RUN_UNAVAILABLE_EXIT_CODE });
-    expect(created).toHaveLength(0);
-    expect(calls).toEqual([]);
-  });
+  // SPEC-2: 出力先で別の Run が動いているときの `RUN_ACTIVE` は `tests/unit/output-start-lock.test.ts` が確かめる。
 
   it('returns RUN_DIRECTORY_UNAVAILABLE with the confirmed Run Status and its exit code', async () => {
     const config = configFor('directory-unavailable');
@@ -355,7 +338,6 @@ describe('executeAuditRun: the Runs that do not start or cannot be finished', ()
           runId: FIXTURE_RUN_ID,
           runDirectory,
           reason: 'CHECKPOINT_STORE_FAILED',
-          existingLock: null,
           cause,
         });
       },

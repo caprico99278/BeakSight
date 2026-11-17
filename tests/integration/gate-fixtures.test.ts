@@ -5,9 +5,9 @@ import { BrowserContextFactory } from '../../src/browser/context-factory.js';
 import type { Viewport } from '../../src/config/types.js';
 import { SafetyLedger } from '../../src/safety/safety-ledger.js';
 import {
+  BOTH_CHROMIUM_LAUNCHERS,
   BROWSER_DEFAULT_FAVICON_PATH,
   isCliChromiumSelected,
-  launchCliChromium,
   launchHeadlessChromium,
   oopifTargetUrls,
   SITE_PER_PROCESS_ARGS,
@@ -115,15 +115,6 @@ const describeControl = describe.skipIf(isCliChromiumSelected());
 const itControl = it.skipIf(isCliChromiumSelected());
 
 /**
- * TS-f: 前に CLI の Chromium でも流していた対照（`guard-unload-requests`・`guard-worker-websocket` の `describe.each`）を、ここでも両方の
- * Chromium で流すための起動の仕方。
- */
-const CONTROL_CHROMIUM_LAUNCHES = [
-  { name: 'the headless shell', launch: (): Promise<Browser> => launchHeadlessChromium() },
-  { name: 'the CLI Chromium', launch: (): Promise<Browser> => launchCliChromium() },
-] as const;
-
-/**
  * 対照の確認で使う、click を数えて既定の動作を止めるスクリプト（GATE-S03。TS-f で `safety-gates.test.ts` から移した）。Guard のない
  * Context で `mailto:` や `tel:` を実際に開くと、端末の外部のアプリが起動しうるので、対照の確認では既定の動作を止める。
  */
@@ -203,7 +194,7 @@ describeControl('DEF-038 fixture: a page that sends POST requests only while it 
 // DEF-042 の対照: ページ自身が別の文書へ移る fixture は、Guard のない Context では、ページを離れるときの POST（`pagehide` の beacon と
 // keepalive の `fetch`、`fetchLater()` の予約）をサーバに届ける。Gate と Guard のテストの「届かなかった」の確認が空振りしないためである。
 // TS-f: `guard-unload-requests.test.ts` の両方の Chromium の対照をここにまとめたので、両方の Chromium で流す。
-describeControl.each(CONTROL_CHROMIUM_LAUNCHES)('DEF-042 fixtures: pages that send POST requests only while they leave by themselves, with $name', ({ launch }) => {
+describeControl.each(BOTH_CHROMIUM_LAUNCHERS)('DEF-042 fixtures: pages that send POST requests only while they leave by themselves, with %s', (_name, launch) => {
   let leavingBrowser: Browser;
 
   beforeAll(async () => {
@@ -290,7 +281,7 @@ describeControl('Task 18 fixtures: DELETE requests reach the server in an unguar
       await page.waitForLoadState('load');
       expect(server.getCounters().delete).toBe(0);
 
-      await page.getByRole('button', { name: 'Send DELETE' }).click();
+      await page.getByRole('button', { name: 'Send request' }).click();
 
       await expect.poll(() => server.getCounters().delete).toBe(1);
       expect(serverWindow.count('DELETE', '/__mutation')).toBeGreaterThan(0);
@@ -587,7 +578,7 @@ describeControl('C18i fixtures: a cross-site iframe that runs in a separate proc
  * TS-f: `safety-gates.test.ts` の GATE-S07 の対照と、`guard-worker-websocket.test.ts` の両方の Chromium の対照をここにまとめたので、両方の
  * Chromium で流す。
  */
-describeControl.each(CONTROL_CHROMIUM_LAUNCHES)('DEF-040 fixtures: pages that open a WebSocket from inside a Worker while they load, and the connection controls, with $name', ({ launch }) => {
+describeControl.each(BOTH_CHROMIUM_LAUNCHERS)('DEF-040 fixtures: pages that open a WebSocket from inside a Worker while they load, and the connection controls, with %s', (_name, launch) => {
   let workerBrowser: Browser;
 
   beforeAll(async () => {
@@ -665,14 +656,11 @@ describeControl('Task 18 fixtures: a Service Worker that sends a POST itself', (
  * テストの既定の headless shell と、CLI の起動の設定（`chromiumLaunchOptions`）から引数を外したものの両方で確かめる。
  * TS-f（7c）: 両方の Chromium をこの中で流すので、CLI の回では飛ばす（`describeControl`）。
  */
-describeControl.each([
-  { name: 'the headless shell', launch: (): Promise<Browser> => launchHeadlessChromium({ sharedWorkers: 'allow' }) },
-  { name: 'the CLI Chromium', launch: (): Promise<Browser> => launchCliChromium({ sharedWorkers: 'allow' }) },
-])('DEF-044 fixtures: a Shared Worker posts from inside, with $name launched without the Shared Worker disabling arguments', ({ launch }) => {
+describeControl.each(BOTH_CHROMIUM_LAUNCHERS)('DEF-044 fixtures: a Shared Worker posts from inside, with %s launched without the Shared Worker disabling arguments', (_name, launch) => {
   let allowingBrowser: Browser;
 
   beforeAll(async () => {
-    allowingBrowser = await launch();
+    allowingBrowser = await launch({ sharedWorkers: 'allow' });
   });
 
   afterAll(async () => {
@@ -701,10 +689,7 @@ describeControl.each([
  * POST が届くことを確かめる（GATE-S08 の迂回の確かめで 0 になるのが、fixture の不具合でないことの確認）。
  * TS-f（7c）: 両方の Chromium をこの中で流すので、CLI の回では飛ばす（`describeControl`）。
  */
-describeControl.each([
-  { name: 'the headless shell', launch: (): Promise<Browser> => launchHeadlessChromium() },
-  { name: 'the CLI Chromium', launch: (): Promise<Browser> => launchCliChromium() },
-])('DEF-049 fixtures: the Service Worker registration bypasses register a worker when the browser allows registration, with $name', ({ launch }) => {
+describeControl.each(BOTH_CHROMIUM_LAUNCHERS)('DEF-049 fixtures: the Service Worker registration bypasses register a worker when the browser allows registration, with %s', (_name, launch) => {
   let bypassBrowser: Browser;
 
   beforeAll(async () => {

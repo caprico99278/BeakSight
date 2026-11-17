@@ -4,9 +4,14 @@
  */
 import { fileURLToPath } from 'node:url';
 import { defineConfig } from 'vitest/config';
+import { maxLimitMsOf, TEST_TIME_LIMITS } from '../../tests/helpers/test-time-limits.js';
 
-/** 子の process（サーバ、Chromium）を起動するテストの上限（ミリ秒）。 */
-const SERVER_TEST_TIMEOUT_MS = 90_000;
+/**
+ * 子の process（サーバ、Chromium）を起動する hook の上限（ミリ秒）。場面の上限は、ルートと同じ表（`tests/test-time-limits.json`）と見張り
+ * （`tests/helpers/test-time-limit-setup.ts`。RB-0）が受け持つ。
+ */
+const SERVER_HOOK_TIMEOUT_MS = 90_000;
+const TEST_TIME_LIMIT_SETUP = fileURLToPath(new URL('../../tests/helpers/test-time-limit-setup.ts', import.meta.url));
 
 /**
  * 画面のテストのファイルを同時に流す数（TS-e。設計書 `doc/design/2026-10-24-beaksight-test-suite-tiers-design.md` 3.5）。前は直列
@@ -26,8 +31,9 @@ export default defineConfig({
   root: fileURLToPath(new URL('./', import.meta.url)),
   test: {
     include: ['tests/**/*.test.ts'],
-    testTimeout: SERVER_TEST_TIMEOUT_MS,
-    hookTimeout: SERVER_TEST_TIMEOUT_MS,
+    testTimeout: maxLimitMsOf(TEST_TIME_LIMITS),
+    hookTimeout: SERVER_HOOK_TIMEOUT_MS,
+    setupFiles: [TEST_TIME_LIMIT_SETUP],
     restoreMocks: true,
     maxWorkers: UI_MAX_WORKERS,
   },

@@ -8,6 +8,7 @@ import {
   RESOURCE_DELIVERY_ROLES,
   ResourceCache,
   decideResourceDelivery,
+  resourceCacheEntryOverheadBytes,
   type ResourceCacheLimits,
   type ResourceCacheResponseFact,
   type ResourceCacheStoreFact,
@@ -21,7 +22,12 @@ const STYLE_URL = `${ALLOWED_ORIGIN}/assets/site.css`;
 const OTHER_SCRIPT_URL = `${OTHER_ORIGIN}/tag.js`;
 
 /** 小さい上限（LRU をテストで確かめるため）。 */
-const SMALL_LIMITS: ResourceCacheLimits = Object.freeze({ maxEntryBytes: 4, maxTotalBytes: 10 });
+/**
+ * 付属分の大きさ（`resourceCacheEntryOverheadBytes`）: 合計の上限は、本文に、URL の鍵と持つ header を足して数える（要求を出し続ける画面でメモリが増え続けた件）。
+ * 小さい上限は、`${ALLOWED_ORIGIN}/a.css` と同じ長さの URL の 4 バイトの項目が 2 件入り、3 件は入らない大きさにする（入れ直しの場面の `etag` の header の分の余裕 10 を足す）。
+ */
+const ENTRY_OVERHEAD = resourceCacheEntryOverheadBytes(`${ALLOWED_ORIGIN}/a.css`, { 'content-type': 'text/css' });
+const SMALL_LIMITS: ResourceCacheLimits = Object.freeze({ maxEntryBytes: 4, maxTotalBytes: 2 * (4 + ENTRY_OVERHEAD) + 10 });
 
 const bytes = (length: number, fill = 1): Uint8Array => new Uint8Array(length).fill(fill);
 
@@ -235,16 +241,17 @@ describe('ResourceCache の LRU と入れ直し', () => {
   });
 
   it('合計の上限に収まるまで、前に使われたものから続けて捨てる', () => {
-    const limits: ResourceCacheLimits = Object.freeze({ maxEntryBytes: 10, maxTotalBytes: 10 });
+    // 合計の上限は、10 バイトの項目 1 件と、その付属分がちょうど入る大きさ。
+    const limits: ResourceCacheLimits = Object.freeze({ maxEntryBytes: 10, maxTotalBytes: 10 + ENTRY_OVERHEAD });
     const cache = new ResourceCache({ limits });
     cache.store(storableFact({ url: urlA, body: bytes(3) }));
     cache.store(storableFact({ url: urlB, body: bytes(3) }));
     cache.store(storableFact({ url: urlC, body: bytes(3) }));
 
-    cache.store(storableFact({ url: urlD, body: bytes(limits.maxTotalBytes) }));
+    cache.store(storableFact({ url: urlD, body: bytes(limits.maxEntryBytes) }));
 
     expect(cachedUrls(cache, [urlA, urlB, urlC, urlD])).toEqual([urlD]);
-    expect(cache.stats()).toEqual({ entryCount: 1, totalBytes: limits.maxTotalBytes });
+    expect(cache.stats()).toEqual({ entryCount: 1, totalBytes: limits.maxEntryBytes });
   });
 
   it('同じ URL を入れ直すと、新しい内容で置き換え、合計の大きさと LRU の順を更新する', () => {
@@ -686,7 +693,8 @@ describe('decideResourceDelivery', () => {
   });
 
   it('PRIMARY の役割でキャッシュから返すと、その項目は最も新しく使われたものになる', () => {
-    const limits: ResourceCacheLimits = Object.freeze({ maxEntryBytes: 4, maxTotalBytes: 8 });
+    // 4 バイトの項目 2 件と、その付属分（`/a.png` は `/a.css` と同じ長さ）がちょうど入る合計の上限。
+    const limits: ResourceCacheLimits = Object.freeze({ maxEntryBytes: 4, maxTotalBytes: 2 * (4 + ENTRY_OVERHEAD) });
     const cache = new ResourceCache({ limits });
     const urlA = `${ALLOWED_ORIGIN}/a.png`;
     const urlB = `${ALLOWED_ORIGIN}/b.png`;
@@ -756,7 +764,8 @@ describe('decideResourceDelivery', () => {
   });
 
   it('REVISIT の役割でキャッシュから返すと、その項目は最も新しく使われたものになる', () => {
-    const limits: ResourceCacheLimits = Object.freeze({ maxEntryBytes: 4, maxTotalBytes: 8 });
+    // 4 バイトの項目 2 件と、その付属分（`/a.png` は `/a.css` と同じ長さ）がちょうど入る合計の上限。
+    const limits: ResourceCacheLimits = Object.freeze({ maxEntryBytes: 4, maxTotalBytes: 2 * (4 + ENTRY_OVERHEAD) });
     const cache = new ResourceCache({ limits });
     const urlA = `${ALLOWED_ORIGIN}/a.png`;
     const urlB = `${ALLOWED_ORIGIN}/b.png`;

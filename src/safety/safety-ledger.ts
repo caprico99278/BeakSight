@@ -17,7 +17,11 @@ import {
   type BlockedWebSocketEvent,
   type ExcludedInteractionCandidateEvent,
   type ExternalSchemeNavigationEvent,
+  type FrameClassificationFailureEvent,
+  type FrameClassificationFailuresRecord,
   type InteractionRejectionReasonEvidence,
+  type ReadNavigationFailureEvent,
+  type ReadNavigationFailuresRecord,
   type PassedAuditSendRequestsRecord,
   type PassedAuditSendWebSocketsRecord,
   type SafetyEventKind,
@@ -26,9 +30,7 @@ import {
   type SafetyEvidenceScope,
 } from '../core/evidence-types.js';
 import { deepFreeze } from '../core/immutable.js';
-import { MAX_HTTP_METHOD_LENGTH } from '../core/limits.js';
 import { saturatingAdd, saturatingIncrement } from '../core/saturating-count.js';
-import { truncateText } from '../core/text.js';
 import { redactValueLikePathSegments } from '../core/url-path-redaction.js';
 import { canonicalHttpOriginOf, redactUrlCredentials } from '../crawl/normalize-url.js';
 
@@ -50,6 +52,10 @@ export type {
   BlockedWebSocketEvent,
   ExcludedInteractionCandidateEvent,
   ExternalSchemeNavigationEvent,
+  FrameClassificationFailureEvent,
+  FrameClassificationFailuresRecord,
+  ReadNavigationFailureEvent,
+  ReadNavigationFailuresRecord,
   SafetyLedgerRecordLimits,
 } from '../core/evidence-types.js';
 
@@ -69,17 +75,24 @@ export interface InvariantViolationInput {
 }
 
 /**
- * 事象と違反の記録の分類の名前（CC-028）。記録の上限に達したときに `recordLimits.reachedCategories` に残す。
+ * 事象と違反の記録の分類の名前（CC-028）。記録の上限に達したときに `recordLimits.reachedCategories` に残した（LZ-3a: 事象の数の上限は撤廃したので、
+ * 今は残さない。前の記録を読むために型を残す）。
  * 事象の一覧の名前は core の `SafetyEventKind` から取り、書き間違いを型のエラーにする。
- * `blockedRequestsByMethod` の上限の分類（`#recordUncountedBlockedRequest`）は、この型に含めない
- * （`SafetyLedgerUncountedBlockedRequestCategory`）。
+ * `blockedRequestsByMethod` の上限の分類は、この型に含めない（`SafetyLedgerUncountedBlockedRequestCategory`）。
  */
-export type SafetyLedgerRecordCategory = SafetyEventKind | 'blockedAuditExclusions' | 'blockedClosingRequests' | 'invariantViolations';
+export type SafetyLedgerRecordCategory =
+  | SafetyEventKind
+  | 'blockedAuditExclusions'
+  | 'blockedClosingRequests'
+  | 'frameClassificationFailures'
+  | 'readNavigationFailures'
+  | 'invariantViolations';
 
 /**
- * 上限のために `blockedRequestsByMethod` で数えられなかった遮断の分類の名前（CC-028 の残り。P18e）。
- * - `'blockedRequestsByMethod'`: メソッドの種類の数の上限（`MAX_LEDGER_METHOD_KEYS`）に達した。
- * - `` `blockedRequestsByMethod.${method}.counter` ``: そのメソッドの件数が、安全な整数の上限に達した。
+ * 上限のために `blockedRequestsByMethod` で数えられなかった遮断の分類の名前（CC-028 の残り。P18e）。LZ-3c: method の種類と数の上限は撤廃したので、
+ * 今は残さない（前の記録を読むために型を残す）。
+ * - `'blockedRequestsByMethod'`: メソッドの種類の数の上限（前は 64）に達した。
+ * - `` `blockedRequestsByMethod.${method}.counter` ``: そのメソッドの件数が、数の上限（前は 65,535）に達した。
  * メソッドの名前は、観測した値そのものなので、`string` のままにする（値は変えない）。
  */
 export type SafetyLedgerUncountedBlockedRequestCategory =
@@ -165,7 +178,12 @@ export function summarizePageSafety(snapshots: readonly SafetyLedgerSnapshot[]):
   let invariantViolationCount = 0;
   const invariantViolations: InvariantViolationEvent[] = [];
   let recordTruncated = false;
+  // SAFE-2 の 4: 違反でない記録の数（止めた記録として数に出す）。
+  let frameClassificationFailureCount = 0;
+  let readNavigationFailureCount = 0;
   for (const snapshot of snapshots) {
+    frameClassificationFailureCount = saturatingAdd(frameClassificationFailureCount, snapshot.frameClassificationFailures?.count ?? 0);
+    readNavigationFailureCount = saturatingAdd(readNavigationFailureCount, snapshot.readNavigationFailures?.count ?? 0);
     invariantViolationCount = saturatingAdd(invariantViolationCount, snapshot.invariantViolationCount);
     // DEF-144: 違反に結びつく要求（あるときだけ）も写す。
     invariantViolations.push(...snapshot.invariantViolations.map(({ code, message, request }) => ({
@@ -173,14 +191,12 @@ export function summarizePageSafety(snapshots: readonly SafetyLedgerSnapshot[]):
     })));
     recordTruncated ||= snapshot.recordLimits.truncated;
   }
-  return deepFreeze({ invariantViolationCount, invariantViolations, recordTruncated });
+  return deepFreeze({ invariantViolationCount, invariantViolations, recordTruncated, frameClassificationFailureCount, readNavigationFailureCount });
 }
 
-const MAX_LEDGER_EVENTS = 256;
-const MAX_LEDGER_INVARIANT_VIOLATIONS = 256;
-const MAX_LEDGER_TEXT_LENGTH = 2_048;
-const MAX_LEDGER_METHOD_KEYS = 64;
-const MAX_LEDGER_COUNTER = 65_535;
+// LZ-3a: 事象の数の上限（前は `MAX_LEDGER_EVENTS` 256・`MAX_LEDGER_INVARIANT_VIOLATIONS` 256。超えた事象は捨て、記録を不完全にした）は撤廃した。
+// 事象を残らず記録する（`recordLimits.droppedEventCount` は前の記録の形のために残し、いつも 0）。LZ-3c: method の種類 64 と数 65,535 の上限も撤廃した。
+// LZ-2: 文の長さの上限（前は `MAX_LEDGER_TEXT_LENGTH` 2,048）は撤廃した。文・URL・Origin・path は切り詰めない。
 
 export class SafetyLedger {
   readonly #blockedRequestsByMethod: Record<string, number> = Object.create(null) as Record<string, number>;
@@ -195,27 +211,19 @@ export class SafetyLedger {
   readonly #blockedDownloads: BlockedDownloadEvent[] = [];
   readonly #blockedInteractionWebSockets: BlockedInteractionWebSocketEvent[] = [];
   readonly #externalSchemeNavigations: ExternalSchemeNavigationEvent[] = [];
-  /** 監査の段の除外で遮断した要求（T25b round 1）。件数は、記録の上限を超えた分も数える。 */
+  /** 監査の段の除外で遮断した要求（T25b round 1）。 */
   readonly #blockedAuditExclusions: BlockedAuditExclusionEvent[] = [];
   #blockedAuditExclusionCount = 0;
-  /**
-   * 監査の段の除外の記録のうち、上限のために記録しなかった件数（T25c。`#droppedEventCount` にも数える）。除外の記録は、設定どおりに止めた
-   * 記録で、件数（`#blockedAuditExclusionCount`）は上限を超えた分も正しく数えるので、この分だけでは記録を不完全（`truncated`）にしない。
-   */
-  #droppedAuditExclusionEventCount = 0;
-  /**
-   * BN-a: 閉じる途中に止めた要求（`blockedClosingRequests`）。件数は、記録の上限を超えた分と、method・URL を読めなかった分も数える。上限のために記録しなかった
-   * 件数（`#droppedEventCount` にも数える）だけでは、記録を不完全（`truncated`）にしない（監査の段の除外の記録と同じ）。
-   */
+  /** BN-a: 閉じる途中に止めた要求（`blockedClosingRequests`）。件数は、method・URL を読めなかった分も数える。 */
   readonly #blockedClosingRequests: BlockedClosingRequestEvent[] = [];
   #blockedClosingRequestCount = 0;
-  #droppedClosingRequestEventCount = 0;
+  /** SAFE-2 の 4: frame の判定の失敗と、読み取りの main frame の移動の失敗の記録（違反でない）。 */
+  readonly #frameClassificationFailures: FrameClassificationFailureEvent[] = [];
+  #frameClassificationFailureCount = 0;
+  readonly #readNavigationFailures: ReadNavigationFailureEvent[] = [];
+  #readNavigationFailureCount = 0;
   readonly #invariantViolations: InvariantViolationEvent[] = [];
   #invariantViolationCount = 0;
-  #droppedEventCount = 0;
-  #uncountedBlockedRequestCount = 0;
-  #truncatedTextCount = 0;
-  readonly #reachedCategories = new Set<SafetyLedgerReachedCategory>();
   /** AS-a: 監査の段の送信の扱いで通した読み取りでない要求（総数、method ごとの数、method・Origin・path ごとの行、一覧に入れなかった数）。 */
   #passedAuditSendCount = 0;
   readonly #passedAuditSendByMethod: Record<string, number> = Object.create(null) as Record<string, number>;
@@ -238,26 +246,20 @@ export class SafetyLedger {
   #passedWebSocketDangerous = 0;
 
   recordBlockedRequest(event: BlockedRequestEvent): void {
-    const method = this.#boundedMethod(event.method);
-    const counted = this.#countByMethod(this.#blockedRequestsByMethod, method);
-    if (counted === 'METHOD_KEYS_FULL') {
-      this.#recordUncountedBlockedRequest('blockedRequestsByMethod');
-    } else if (counted === 'COUNTER_FULL') {
-      this.#recordUncountedBlockedRequest(`blockedRequestsByMethod.${method}.counter`);
-    }
+    const method = this.#recordedMethod(event.method);
+    this.#countByMethod(this.#blockedRequestsByMethod, method);
     this.#pushEvent(this.#blockedRequests, {
       ...event,
       method,
-      url: this.#boundedText(event.url),
-    }, 'blockedRequests');
+      url: event.url,
+    });
   }
 
   /**
    * AS-a（設計書 `2026-10-19-beaksight-audit-send-policy-design.md` 2.3）: 監査の段の送信の扱い `PASS_EXCEPT_DELETE` で、Guard が通した読み取りでない要求を
    * 記録する。URL からは Origin と path だけを取り出す（query・fragment・本文・値は持たない。path の値に見える区切りは伏せる）。method ごとの数は、止めた要求の
-   * method ごとの数と同じ上限の部品（`#countByMethod`）で数える（上限で数えられなかった分は、総数と一覧には数える）。同じ method・Origin・path は重ねて
-   * 回数を足す。一覧の行の上限は、ほかの記録と同じ `MAX_LEDGER_EVENTS`（超えた新しい行と、Origin を作れない URL は `unlisted` に数える）。総数は
-   * 一覧に入れなかった分も数えるので、この記録だけでは記録を不完全（`truncated`）にしない。
+   * method ごとの数と同じ部品（`#countByMethod`）で数える。同じ method・Origin・path は重ねて
+   * 回数を足す。Origin を作れない URL は `unlisted` に数える（LZ-3a: 一覧の行の数の上限（前は 256）はない）。総数は一覧に入れなかった分も数える。
    */
   recordPassedAuditSendRequest(event: { readonly method: string; readonly url: string; readonly otherOrigin?: boolean }): void {
     this.#passedAuditSendCount = saturatingIncrement(this.#passedAuditSendCount);
@@ -265,7 +267,7 @@ export class SafetyLedger {
     if (event.otherOrigin === true) {
       this.#passedAuditSendOtherOrigins = saturatingIncrement(this.#passedAuditSendOtherOrigins);
     }
-    const method = this.#boundedMethod(event.method);
+    const method = this.#recordedMethod(event.method);
     this.#countByMethod(this.#passedAuditSendByMethod, method);
     const facts = this.#originAndPathOf(event.url);
     if (facts === null) {
@@ -279,17 +281,13 @@ export class SafetyLedger {
       row.count = saturatingIncrement(row.count);
       return;
     }
-    if (this.#passedAuditSendRows.size >= MAX_LEDGER_EVENTS) {
-      this.#passedAuditSendUnlisted = saturatingIncrement(this.#passedAuditSendUnlisted);
-      return;
-    }
     this.#passedAuditSendRows.set(key, { method, origin, path, count: 1 });
   }
 
   /**
    * AS-c（設計書 5 章の「ユーザーの言葉と選択（AS-c）」の行）: 監査の段の送信の扱い `PASS_EXCEPT_DELETE` で、Guard が通した WebSocket の接続を記録する。URL からは
    * Origin（`ws:`・`wss:`）と path だけを取り出す（query・接続の上の送受信・値は持たない。path の値に見える区切りは伏せる）。同じ Origin・path は重ねて数を足す。
-   * 一覧の行の上限は `MAX_LEDGER_EVENTS`（超えた新しい行と、Origin を作れない URL は `unlisted` に数える）。総数は一覧に入れなかった分も数えるので、この記録
+   * Origin を作れない URL は `unlisted` に数える（LZ-3a: 一覧の行の数の上限（前は 256）はない）。総数は一覧に入れなかった分も数えるので、この記録
    * だけでは記録を不完全（`truncated`）にしない。
    * AS-c fix round 1（C-1・C-2）: 記録するのは、ブラウザが実際に開いた接続（Guard の CDP の観察）。Guard の route を通らずに開いた接続（`outsideGuard`）と、
    * 危険な語に当たる接続（`dangerous`）は、印を付けて別の行に数え、それぞれの数も数える。
@@ -315,16 +313,12 @@ export class SafetyLedger {
       this.#passedWebSocketUnlisted = saturatingIncrement(this.#passedWebSocketUnlisted);
       return;
     }
-    const origin = this.#boundedText(parsed.origin);
-    const path = redactValueLikePathSegments(this.#boundedText(redactValueLikePathSegments(parsed.pathname)));
+    const origin = parsed.origin;
+    const path = redactValueLikePathSegments(parsed.pathname);
     const key = JSON.stringify([origin, path, outsideGuard, dangerous]);
     const row = this.#passedWebSocketRows.get(key);
     if (row !== undefined) {
       row.count = saturatingIncrement(row.count);
-      return;
-    }
-    if (this.#passedWebSocketRows.size >= MAX_LEDGER_EVENTS) {
-      this.#passedWebSocketUnlisted = saturatingIncrement(this.#passedWebSocketUnlisted);
       return;
     }
     this.#passedWebSocketRows.set(key, {
@@ -339,70 +333,70 @@ export class SafetyLedger {
   recordBlockedNavigation(event: BlockedNavigationEvent): void {
     this.#pushEvent(this.#blockedNavigations, {
       ...event,
-      method: this.#boundedMethod(event.method),
-      url: this.#boundedText(event.url),
-    }, 'blockedNavigations');
+      method: this.#recordedMethod(event.method),
+      url: event.url,
+    });
   }
 
   recordBlockedWebSocket(event: BlockedWebSocketEvent): void {
     this.#pushEvent(this.#blockedWebSockets, {
       ...event,
-      url: this.#boundedText(event.url),
-    }, 'blockedWebSockets');
+      url: event.url,
+    });
   }
 
   recordBlockedExternalAction(event: BlockedExternalActionEvent): void {
     this.#pushEvent(this.#blockedExternalActions, {
-      candidateId: this.#boundedText(event.candidateId),
-      url: event.url === null ? null : this.#boundedText(event.url),
+      candidateId: event.candidateId,
+      url: event.url === null ? null : event.url,
       // 理由は閉じた一覧（`BLOCKED_EXTERNAL_ACTION_REASONS`、CC-014）なので、切り詰めずに記録する。
       reason: event.reason,
-    }, 'blockedExternalActions');
+    });
   }
 
   recordExcludedInteractionCandidate(event: ExcludedInteractionCandidateEvent): void {
     this.#pushEvent(this.#excludedInteractionCandidates, {
-      candidateId: this.#boundedText(event.candidateId),
+      candidateId: event.candidateId,
       reason: event.reason,
-    }, 'excludedInteractionCandidates');
+    });
   }
 
   recordBlockedInteractionRequest(event: BlockedInteractionRequestEvent): void {
     this.#pushEvent(this.#blockedInteractionRequests, {
       ...event,
-      method: this.#boundedMethod(event.method),
-      url: this.#boundedText(event.url),
-    }, 'blockedInteractionRequests');
+      method: this.#recordedMethod(event.method),
+      url: event.url,
+    });
   }
 
   recordBlockedInteractionNavigation(event: BlockedInteractionNavigationEvent): void {
     this.#pushEvent(this.#blockedInteractionNavigations, {
       ...event,
-      method: this.#boundedMethod(event.method),
-      url: this.#boundedText(event.url),
-    }, 'blockedInteractionNavigations');
+      method: this.#recordedMethod(event.method),
+      url: event.url,
+    });
   }
 
   recordBlockedPopup(event: BlockedPopupEvent): void {
     this.#pushEvent(this.#blockedPopups, {
       ...event,
-      url: this.#boundedText(event.url),
-    }, 'blockedPopups');
+      url: event.url,
+    });
   }
 
   recordBlockedDownload(event: BlockedDownloadEvent): void {
     this.#pushEvent(this.#blockedDownloads, {
       ...event,
-      url: this.#boundedText(event.url),
-      suggestedFilename: this.#boundedText(event.suggestedFilename),
-    }, 'blockedDownloads');
+      url: event.url,
+      suggestedFilename: event.suggestedFilename,
+    });
   }
 
   recordBlockedInteractionWebSocket(event: BlockedInteractionWebSocketEvent): void {
     this.#pushEvent(this.#blockedInteractionWebSockets, {
       ...event,
-      url: this.#boundedText(event.url),
-    }, 'blockedInteractionWebSockets');
+      url: event.url,
+    });
   }
 
   /**
@@ -411,12 +405,12 @@ export class SafetyLedger {
    */
   recordExternalSchemeNavigation(event: ExternalSchemeNavigationEvent): void {
     this.#pushEvent(this.#externalSchemeNavigations, {
-      url: this.#boundedText(redactUrlCredentials(event.url)),
-      scheme: this.#boundedText(event.scheme),
+      url: redactUrlCredentials(event.url),
+      scheme: event.scheme,
       frame: event.frame,
       phase: event.phase,
       reason: event.reason,
-    }, 'externalSchemeNavigations');
+    });
   }
 
   /**
@@ -425,12 +419,9 @@ export class SafetyLedger {
    */
   recordBlockedAuditExclusion(event: BlockedAuditExclusionEvent): void {
     this.#blockedAuditExclusionCount = saturatingIncrement(this.#blockedAuditExclusionCount);
-    if (this.#blockedAuditExclusions.length >= MAX_LEDGER_EVENTS) {
-      this.#droppedAuditExclusionEventCount = saturatingIncrement(this.#droppedAuditExclusionEventCount);
-    }
     this.#pushEvent(this.#blockedAuditExclusions, {
-      method: this.#boundedMethod(event.method),
-      url: this.#boundedText(event.url),
+      method: this.#recordedMethod(event.method),
+      url: event.url,
       mainFrameNavigation: event.mainFrameNavigation,
       reason: event.reason,
       // BN-a: 要求の種類と時点（閉じた一覧なので切り詰めない）。
@@ -438,7 +429,7 @@ export class SafetyLedger {
       phase: event.phase,
       // BN-R1 の M-2: 先読みの要求の印（先読みのときだけ）。
       ...(event.speculative === true ? { speculative: true as const } : {}),
-    }, 'blockedAuditExclusions');
+    });
   }
 
   /**
@@ -451,16 +442,40 @@ export class SafetyLedger {
     if (event === null) {
       return;
     }
-    if (this.#blockedClosingRequests.length >= MAX_LEDGER_EVENTS) {
-      this.#droppedClosingRequestEventCount = saturatingIncrement(this.#droppedClosingRequestEventCount);
-    }
     this.#pushEvent(this.#blockedClosingRequests, {
-      method: this.#boundedMethod(event.method),
-      url: this.#boundedText(event.url),
+      method: this.#recordedMethod(event.method),
+      url: event.url,
       resourceType: event.resourceType,
       phase: 'CLOSING',
       ...(event.speculative === true ? { speculative: true as const } : {}),
-    }, 'blockedClosingRequests');
+    });
+  }
+
+  /**
+   * SAFE-2 の 4（違反の区分の (3)）: Guard が移動の frame の種類を判定できなかった 1 件を記録する（前は違反 `FRAME_CLASSIFICATION_FAILED`。違反にしない）。URL の
+   * 認証情報は伏せ字にしてから、上限の長さまで切り詰める。
+   */
+  recordFrameClassificationFailure(event: FrameClassificationFailureEvent): void {
+    this.#frameClassificationFailureCount = saturatingIncrement(this.#frameClassificationFailureCount);
+    this.#pushEvent(this.#frameClassificationFailures, {
+      url: redactUrlCredentials(event.url),
+      phase: event.phase,
+    });
+  }
+
+  /**
+   * SAFE-2 の 4（DEF-145）: 許した読み取り（GET・HEAD）の main frame の移動の配送の失敗を、読み取りの失敗として記録する（前は違反 `HTTP_MAIN_FRAME_DELIVERY_FAILED`。
+   * 違反にしない）。URL は Origin と path だけを残す（違反の要求と同じ部品。query・fragment・値は持たない）。
+   */
+  recordReadNavigationFailure(event: ReadNavigationFailureEvent): void {
+    this.#readNavigationFailureCount = saturatingIncrement(this.#readNavigationFailureCount);
+    const facts = this.#originAndPathOf(event.url);
+    this.#pushEvent(this.#readNavigationFailures, {
+      method: this.#recordedMethod(event.method),
+      url: facts === null ? '' : `${facts.origin}${facts.path}`,
+      errorText: event.errorText,
+      phase: event.phase,
+    });
   }
 
   /**
@@ -471,12 +486,12 @@ export class SafetyLedger {
     this.#invariantViolationCount = saturatingIncrement(this.#invariantViolationCount);
     const request = event.request === undefined
       ? undefined
-      : { method: this.#boundedMethod(event.request.method), ...(this.#originAndPathOf(event.request.url) ?? { origin: null, path: '' }) };
+      : { method: this.#recordedMethod(event.request.method), ...(this.#originAndPathOf(event.request.url) ?? { origin: null, path: '' }) };
     this.#pushEvent(this.#invariantViolations, {
-      code: this.#boundedText(event.code),
-      message: this.#boundedText(event.message),
+      code: event.code,
+      message: event.message,
       ...(request === undefined ? {} : { request }),
-    }, 'invariantViolations', MAX_LEDGER_INVARIANT_VIOLATIONS);
+    });
   }
 
   snapshot(): SafetyLedgerSnapshot {
@@ -530,6 +545,25 @@ export class SafetyLedger {
             events: immutableEvents(this.#blockedClosingRequests),
           }),
         };
+    // SAFE-2 の 4: frame の判定の失敗と、読み取りの main frame の移動の失敗の記録も、1 件でもあったときだけ snapshot に入れる。
+    const frameClassificationFailures: { readonly frameClassificationFailures?: FrameClassificationFailuresRecord } =
+      this.#frameClassificationFailureCount === 0
+        ? {}
+        : {
+          frameClassificationFailures: Object.freeze({
+            count: this.#frameClassificationFailureCount,
+            events: immutableEvents(this.#frameClassificationFailures),
+          }),
+        };
+    const readNavigationFailures: { readonly readNavigationFailures?: ReadNavigationFailuresRecord } =
+      this.#readNavigationFailureCount === 0
+        ? {}
+        : {
+          readNavigationFailures: Object.freeze({
+            count: this.#readNavigationFailureCount,
+            events: immutableEvents(this.#readNavigationFailures),
+          }),
+        };
     return Object.freeze({
       blockedRequestsByMethod: Object.freeze(Object.assign(
         Object.create(null) as Record<string, number>,
@@ -549,40 +583,29 @@ export class SafetyLedger {
       invariantViolations: immutableEvents(this.#invariantViolations),
       invariantViolationCount: this.#invariantViolationCount,
       recordLimits: Object.freeze({
-        // T25c: 監査の段の除外の記録だけが上限を超えた場合は、不完全にしない（件数は `blockedAuditExclusions.count` に正しく残る）。
-        // BN-a: 閉じる途中に止めた要求の記録も同じ（件数は `blockedClosingRequests.count` に正しく残る）。
-        truncated: this.#droppedEventCount > saturatingAdd(this.#droppedAuditExclusionEventCount, this.#droppedClosingRequestEventCount)
-          || this.#uncountedBlockedRequestCount > 0,
-        droppedEventCount: this.#droppedEventCount,
-        uncountedBlockedRequestCount: this.#uncountedBlockedRequestCount,
-        truncatedTextCount: this.#truncatedTextCount,
-        reachedCategories: Object.freeze([...this.#reachedCategories]),
+        // LZ-3a・LZ-3c: 事象を捨てず、method ごとの数も残らず数えるので、記録はいつも完全（4 つの項目は前の記録の形のために残す）。
+        truncated: false,
+        droppedEventCount: 0,
+        uncountedBlockedRequestCount: 0,
+        // LZ-2: 文を切り詰めないので、いつも 0（前の記録の形のために残す）。
+        truncatedTextCount: 0,
+        reachedCategories: Object.freeze([]),
       }),
       ...blockedAuditExclusions,
       ...passedAuditSendRequests,
       ...passedAuditSendWebSockets,
       ...blockedClosingRequests,
+      ...frameClassificationFailures,
+      ...readNavigationFailures,
     });
   }
 
   /**
-   * method ごとの数を 1 つ足す（止めた要求と、AS-a の通した要求の共通の上限の部品）。method の種類の数の上限（`MAX_LEDGER_METHOD_KEYS`）か、数の上限
-   * （`MAX_LEDGER_COUNTER`）に達していたら足さず、その種類を返す。
+   * method ごとの数を 1 つ足す（止めた要求と、AS-a の通した要求の共通の部品）。LZ-3c: method の種類の数（前は 64）と数（前は 65,535）の上限は撤廃した
+   * （数の型は JavaScript の数で、16 bit などの型には結び付かない。数え方は、ほかの数と同じ `saturatingIncrement`）。
    */
-  #countByMethod(counts: Record<string, number>, method: string): 'COUNTED' | 'METHOD_KEYS_FULL' | 'COUNTER_FULL' {
-    const currentCount = counts[method];
-    if (currentCount === undefined) {
-      if (Object.keys(counts).length >= MAX_LEDGER_METHOD_KEYS) {
-        return 'METHOD_KEYS_FULL';
-      }
-      counts[method] = 1;
-      return 'COUNTED';
-    }
-    if (currentCount >= MAX_LEDGER_COUNTER) {
-      return 'COUNTER_FULL';
-    }
-    counts[method] = currentCount + 1;
-    return 'COUNTED';
+  #countByMethod(counts: Record<string, number>, method: string): void {
+    counts[method] = saturatingIncrement(counts[method] ?? 0);
   }
 
   /**
@@ -601,45 +624,18 @@ export class SafetyLedger {
       return null;
     }
     return {
-      origin: this.#boundedText(canonicalOrigin),
-      path: redactValueLikePathSegments(this.#boundedText(redactValueLikePathSegments(parsed.pathname))),
+      origin: canonicalOrigin,
+      path: redactValueLikePathSegments(parsed.pathname),
     };
   }
 
-  #boundedMethod(value: string): string {
-    return this.#bounded(value.toUpperCase(), MAX_HTTP_METHOD_LENGTH);
+  /** LZ-2: method は大文字にするだけ（長さの上限（前は `MAX_HTTP_METHOD_LENGTH` 32）は置かない。切り詰めない）。 */
+  #recordedMethod(value: string): string {
+    return value.toUpperCase();
   }
 
-  #boundedText(value: string): string {
-    return this.#bounded(value, MAX_LEDGER_TEXT_LENGTH);
-  }
-
-  /** 上限を超えた文字列は、違反ではなく、切り詰めて記録する。 */
-  #bounded(value: string, maxLength: number): string {
-    const bounded = truncateText(value, maxLength);
-    if (bounded.truncated) {
-      this.#truncatedTextCount = saturatingIncrement(this.#truncatedTextCount);
-    }
-    return bounded.text;
-  }
-
-  /** 上限に達したら、既存の記録を上書きせずに新しいイベントを捨て、記録が不完全であることを残す。 */
-  #pushEvent<Event extends object>(
-    events: Event[],
-    event: Event,
-    category: SafetyLedgerRecordCategory,
-    limit: number = MAX_LEDGER_EVENTS,
-  ): void {
-    if (events.length >= limit) {
-      this.#droppedEventCount = saturatingIncrement(this.#droppedEventCount);
-      this.#reachedCategories.add(category);
-      return;
-    }
+  /** 事象を記録する（LZ-3a: 数の上限はない。捨てない）。 */
+  #pushEvent<Event extends object>(events: Event[], event: Event): void {
     events.push(event);
-  }
-
-  #recordUncountedBlockedRequest(category: SafetyLedgerUncountedBlockedRequestCategory): void {
-    this.#uncountedBlockedRequestCount = saturatingIncrement(this.#uncountedBlockedRequestCount);
-    this.#reachedCategories.add(category);
   }
 }

@@ -104,10 +104,6 @@ const handWrittenServersOf = (file: Pick<SourceFile, 'code' | 'bare'>): readonly
 
 /** 除外（ファイル → 手で作るサーバの件数と理由）。寄せたら件数を減らすか、消す。 */
 const HAND_WRITTEN_SERVER_EXCEPTIONS: Readonly<Record<string, { readonly count: number; readonly reason: string }>> = Object.freeze({
-  'tests/helpers/chromium-egress-recorder.ts': {
-    count: 1,
-    reason: '記録用の中継（要求を 127.0.0.1 へ転送する HTTP の proxy。CONNECT のトンネルを持つ。CC-043 の D）',
-  },
   'apps/local-ui/tests/request-guard.test.ts': {
     count: 1,
     reason: '守りの部品（`guardNodeRequest`）を掛けて要求 1 件ごとに起こして閉じるサーバ（接続を記録して切る形ではない。CC-043 の D）',

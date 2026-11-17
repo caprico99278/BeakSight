@@ -75,8 +75,11 @@ describe('restoreRunCheckpointCrawl (CCX-1, CC-040)', () => {
   it('takes the allowed query parameters from the effective config of the checkpoint', () => {
     const withQuery = [...BASE_ENTRIES, entry('/c?page=2', MAX_DEPTH, ADDED_ENTRY_SEQUENCE, 'QUEUED')];
 
-    expect(() => restoreRunCheckpointCrawl(checkpointWith(withQuery))).toThrow(RangeError);
+    // L14（設計書 `2026-11-09-beaksight-remove-limits-design.md` 6 の L14、表 A の N7）: 残す名前を選んでいない設定（空）は query を残すので、`?page=2` の
+    // 記録は正規形で、作り直せる。名前を選んだ設定は、その名前だけを残すので、選んだ名前に当たらない query の記録は正規形でなく、作り直せない。
+    expect(restoreRunCheckpointCrawl(checkpointWith(withQuery)).frontier.entries()).toHaveLength(3);
     expect(restoreRunCheckpointCrawl(checkpointWith(withQuery, { allowedQueryParameters: ['page'] })).frontier.entries()).toHaveLength(3);
+    expect(() => restoreRunCheckpointCrawl(checkpointWith(withQuery, { allowedQueryParameters: ['other'] }))).toThrow(RangeError);
   });
 
   it('puts AUDITING records and SKIPPED records of RESUME_REQUEUE_SKIP_REASON_CODES back to QUEUED, and keeps the other SKIPPED records', () => {

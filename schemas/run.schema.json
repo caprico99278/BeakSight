@@ -65,6 +65,13 @@
               "STOPPED_BY_AUTH_SESSION_LOST",
               "STOPPED_BY_SERVICE_REQUEST_LIMIT"
             ]
+          },
+          "automaticRelogin": {
+            "description": "DEF-200: this execution was started automatically after the sign-in was lost and the automated login signed in again (the count of the re-logins of the stage at that point). Absent on the other executions and on the run.json written before.",
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["count"],
+            "properties": { "count": { "type": "integer", "minimum": 1, "maximum": 2 } }
           }
         }
       }
@@ -134,15 +141,7 @@
           "type": "object",
           "additionalProperties": false,
           "required": [
-            "maxPages",
-            "maxDepth",
-            "maxRuntimeMs",
-            "navigationTimeoutMs",
-            "overallPageTimeoutMs",
-            "resourceSettlingTimeoutMs",
-            "interactionTimeoutMs",
             "minNavigationIntervalMs",
-            "maxInteractionsPerPage",
             "allowedQueryParameters"
           ],
           "properties": {
@@ -152,9 +151,9 @@
             "navigationTimeoutMs": { "type": "integer", "minimum": 1 },
             "overallPageTimeoutMs": { "type": "integer", "minimum": 1 },
             "resourceSettlingTimeoutMs": { "type": "integer", "minimum": 1 },
-            "interactionTimeoutMs": { "type": "integer", "minimum": 1001 },
+            "interactionTimeoutMs": { "type": "integer", "minimum": 1 },
             "minNavigationIntervalMs": { "type": "integer", "minimum": 0 },
-            "maxInteractionsPerPage": { "type": "integer", "minimum": 1, "maximum": 100 },
+            "maxInteractionsPerPage": { "type": "integer", "minimum": 1 },
             "allowedQueryParameters": { "type": "array", "items": { "type": "string" } }
           }
         },
@@ -236,6 +235,21 @@
           "items": { "$ref": "#/$defs/invariantViolation" }
         },
         "recordTruncated": { "type": "boolean" },
+        "frameClassificationFailureCount": {
+          "description": "SAFE-2 item 4: the number of the navigations whose frame kind the Guard could not classify (recorded, not violations; the sum of frameClassificationFailures.count of the safety evidence). Optional: a Run written before SAFE-2 does not have it.",
+          "type": "integer",
+          "minimum": 0
+        },
+        "readNavigationFailureCount": {
+          "description": "SAFE-2 item 4 (DEF-145): the number of the failed main frame navigations that are reads (recorded, not violations; the sum of readNavigationFailures.count of the safety evidence). Optional: a Run written before SAFE-2 does not have it.",
+          "type": "integer",
+          "minimum": 0
+        },
+        "externalSchemeNavigationCount": {
+          "description": "SAFE-2 item 4: the number of the recorded attempts to move to an external scheme (shown as stopped records). Optional: a Run written before SAFE-2 does not have it.",
+          "type": "integer",
+          "minimum": 0
+        },
         "auditSend": {
           "description": "AS-b (audit send policy design 2.3): the effective audit send policy and the number of non-read requests the Guard let through (in total and by method; no value). Optional: a Run written before AS-b does not have it and is read as READ_ONLY.",
           "type": "object",
@@ -317,7 +331,7 @@
     "load": {
       "type": "object",
       "additionalProperties": false,
-      "required": ["minNavigationIntervalMs", "maxInteractionsPerPage", "navigationCount", "pacingWaitMs", "requests"],
+      "required": ["minNavigationIntervalMs", "navigationCount", "pacingWaitMs", "requests"],
       "properties": {
         "minNavigationIntervalMs": { "type": "integer", "minimum": 0 },
         "maxInteractionsPerPage": { "$ref": "#/properties/effectiveConfig/properties/crawl/properties/maxInteractionsPerPage" },
@@ -335,6 +349,16 @@
           }
         },
         "approvedServiceOrigins": { "$ref": "#/$defs/loadOriginRequests" }
+      }
+    },
+    "pageScope": {
+      "description": "Optional (WSO): the scope of the inspection of the checked screens only (src/core/audit-page-scope.ts). The run read only the screens checked in the list of the screens to try a create and an update (and their related list screens), and did not follow links to other screens. pageCount is the number of the given screens that could be read (inside the allowed origins and not excluded; REV-WSO M-1; no URL). 0 means none could be read and the run failed without reading any page. A run of the whole site does not have it.",
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["kind", "pageCount"],
+      "properties": {
+        "kind": { "enum": ["CHECKED_WRITE_SCREENS"] },
+        "pageCount": { "type": "integer", "minimum": 0 }
       }
     },
     "authentication": {
@@ -406,6 +430,9 @@
             "INVALID_BROWSER_DATA",
             "PAGE_NAVIGATION_LIMIT_REACHED",
             "PAGE_SUBRESOURCE_LIMIT_REACHED",
+            "NOTIFICATION_DISMISSAL_NAVIGATION_BLOCKED",
+            "DOCUMENT_LEFT_DURING_AUDIT",
+            "DOWNLOAD_RESPONSE",
             "PREFLIGHT_FAILED",
             "RUN_DIRECTORY_UNAVAILABLE",
             "SAFETY_INVARIANT_VIOLATION",
@@ -430,7 +457,9 @@
             "RUN_INTERRUPTED",
             "SITE_UNAVAILABLE",
             "AUTH_SESSION_LOST",
-            "SERVICE_REQUEST_LIMIT_REACHED"
+            "SERVICE_REQUEST_LIMIT_REACHED",
+            "STAGE_UNRESPONSIVE",
+            "STAGE_NEVER_QUIET"
           ]
         },
         "detail": { "type": ["string", "null"] }
@@ -478,9 +507,9 @@
           "additionalProperties": false,
           "required": ["method", "origin", "path"],
           "properties": {
-            "method": { "type": "string", "maxLength": 32 },
-            "origin": { "anyOf": [{ "type": "string", "maxLength": 2048 }, { "type": "null" }] },
-            "path": { "type": "string", "maxLength": 2048 }
+            "method": { "type": "string" },
+            "origin": { "anyOf": [{ "type": "string" }, { "type": "null" }] },
+            "path": { "type": "string" }
           }
         }
       }
@@ -491,7 +520,7 @@
       "additionalProperties": false,
       "required": ["pagePath", "stage", "press", "invariantViolationCount", "invariantViolations", "recordTruncated"],
       "properties": {
-        "pagePath": { "type": "string", "maxLength": 2048 },
+        "pagePath": { "type": "string" },
         "stage": { "enum": ["CONTEXT_OPEN", "PAGE_LOAD", "SUBMISSION_PROBE", "CONTEXT_CLOSE"] },
         "press": {
           "anyOf": [
@@ -510,11 +539,10 @@
         "invariantViolationCount": { "type": "integer", "minimum": 1, "maximum": 9007199254740991 },
         "invariantViolations": {
           "type": "array",
-          "maxItems": 16,
           "items": {
             "allOf": [
               { "$ref": "#/$defs/invariantViolation" },
-              { "type": "object", "properties": { "message": { "type": "string", "maxLength": 1024, "pattern": "^[^\\u0000-\\u001f\\u007f\\u2028\\u2029]*$" } } }
+              { "type": "object", "properties": { "message": { "type": "string", "pattern": "^[^\\u0000-\\u001f\\u007f\\u2028\\u2029]*$" } } }
             ]
           }
         },
@@ -550,10 +578,9 @@
       "enum": ["ALLOWED", "SERVICE", "OTHER"]
     },
     "sessionLossPath": {
-      "description": "DEF-138: a path notation (the path with the value-like segments redacted, and the query names only after ?; never a query value).",
+      "description": "DEF-138: a path notation (the path with the value-like segments redacted, and the query names only after ?; never a query value). URL-LEN: no length limit.",
       "type": "string",
-      "minLength": 1,
-      "maxLength": 2048
+      "minLength": 1
     },
     "sessionLoss": {
       "description": "DEF-138 (the session loss evidence design 2.1): the evidence of the load where the session was lost. Never a whole URL, a query value, a token, a cookie value, a body or a header value.",
@@ -561,13 +588,12 @@
       "additionalProperties": false,
       "required": ["stage", "requestedPath", "landedPath", "landedBy", "redirectPaths", "redirectPathsOmitted", "blockedRequests", "blockedRequestsUnlisted", "storageKeyChange"],
       "properties": {
-        "stage": { "anyOf": [{ "type": "string", "minLength": 1, "maxLength": 256 }, { "type": "null" }] },
+        "stage": { "anyOf": [{ "type": "string", "minLength": 1 }, { "type": "null" }] },
         "requestedPath": { "anyOf": [{ "$ref": "#/$defs/sessionLossPath" }, { "type": "null" }] },
         "landedPath": { "anyOf": [{ "$ref": "#/$defs/sessionLossPath" }, { "type": "null" }] },
         "landedBy": { "enum": ["PAGE_URL", "BLOCKED_REDIRECT"] },
         "redirectPaths": {
           "type": "array",
-          "maxItems": 10,
           "items": {
             "type": "object",
             "additionalProperties": false,
@@ -581,13 +607,12 @@
         "redirectPathsOmitted": { "type": "integer", "minimum": 0, "maximum": 9007199254740991 },
         "blockedRequests": {
           "type": "array",
-          "maxItems": 8,
           "items": {
             "type": "object",
             "additionalProperties": false,
             "required": ["method", "originKind", "path", "reason", "count"],
             "properties": {
-              "method": { "type": "string", "minLength": 1, "maxLength": 32 },
+              "method": { "type": "string", "minLength": 1 },
               "originKind": { "$ref": "#/$defs/sessionLossOriginKind" },
               "path": { "$ref": "#/$defs/sessionLossPath" },
               "reason": {
@@ -599,6 +624,8 @@
                   "PAGE_SUBRESOURCE_LIMIT_REACHED",
                   "AUDIT_SEND_OVER_LIMIT",
                   "PAGE_LEAVE_REQUEST_LIMIT_REACHED",
+                  "NOTIFICATION_DISMISSAL_RESTRICTED",
+                  "SCROLL_KEY_PRESS_RESTRICTED",
                   "EXTERNAL_MAIN_FRAME_NAVIGATION",
                   "AUDIT_EXCLUDED_URL"
                 ]
@@ -624,7 +651,6 @@
                   "count": { "type": "integer", "minimum": 1, "maximum": 9007199254740991 },
                   "shapes": {
                     "type": "array",
-                    "maxItems": 4,
                     "items": {
                       "type": "object",
                       "additionalProperties": false,

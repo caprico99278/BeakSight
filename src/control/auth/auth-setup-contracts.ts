@@ -11,7 +11,6 @@
 // - 判定（検証）は `auth-setup-policy.ts` の 1 か所。既定で読まない危険な語の一覧は、平らなデータとして `src/core/default-excluded-url-words.ts` に置き
 //   （AS-b で移した。ここから同じ名前で公開し直す）、判定そのものは要求の判定の owner（`src/safety/request-policy.ts`。T25b）が、この一覧を受け取って行う。
 // Node 専用。Playwright と監査エンジン（`src/browser/`、`src/safety/`、`src/orchestration/`）を import しない。
-import { MAX_CRAWL_MAX_PAGES, MAX_URL_LENGTH } from '../../core/limits.js';
 
 /** 認証の設定の版 3（Task 34 の設計書 3.2。T34a）。版 3 のスキーマの `schemaVersion` の const と一致する（受ける版はこれだけ。LG-3b）。 */
 export const AUTH_SETUP_SCHEMA_VERSION_3 = 'beaksight-auth-setup/3';
@@ -36,51 +35,43 @@ export const SCRIPT_REQUEST_TRANSPORT = 'SCRIPT_REQUEST' satisfies LoginTranspor
 /** スクリプトの token の送信の method（`POST` に固定。設定の項目には持たない）。 */
 export const SCRIPT_LOGIN_METHOD = 'POST';
 
-/** スクリプトの送信先の必須の query（名前と値の完全な一致の組）の最大の件数（スキーマの maxItems）。 */
-export const MAX_SCRIPT_LOGIN_REQUIRED_QUERY = 4;
+// LZ-2: 必須の query の名前と値の長さの上限（前は `MAX_SCRIPT_LOGIN_QUERY_PART_LENGTH` 256）は撤廃した。
 
-/** 必須の query の名前と値の、それぞれの最大長（UTF-16 のコード単位。スキーマの maxLength）。 */
-export const MAX_SCRIPT_LOGIN_QUERY_PART_LENGTH = 256;
-
-/** ログインに伴う送信（利用者が登録した、ログインの段で通す送信）の最大の件数（スキーマの maxItems）。既定は空。 */
-export const MAX_LOGIN_SIDE_REQUESTS = 8;
+/**
+ * L11（設計書 `2026-11-09-beaksight-remove-limits-design.md` 4。設計者の判断 (b)）: 次の件数と回数の上限は撤廃した（スキーマの maxItems・maximum を外し、検証と
+ * Guard は使わない。下限は残す）。ログインに伴う送信の件数・ログインの段 1 回あたりの回数の最大・監査の段の読み取りの手続きの呼び出しの件数・1 回の
+ * 読み込みあたりの回数の最大・承認したサービスへの要求の上限の最大・ログインの送信先の件数・IdP の Origin の件数・必須の query の件数。登録した送信先は
+ * 何回でも通す。ログインの段の POST の回数（`MAX_LOGIN_ATTEMPTS`。自動ログインの回数）は残す。どこからも使われない定数は LZ-1 で消した。
+ * LZ-3a（DEF-259）: ワーカーの報告の数の一覧（`worker-message.schema.json` の `scriptLoginCounts.sideRequestsAllowed`）に残っていた件数の上限（前は
+ * `MAX_LOGIN_SIDE_REQUESTS` 8）も撤廃した（9 件以上を登録すると、ワーカーの報告を親が受けなかった）。
+ */
 
 /** ログインに伴う送信の method（閉じた一覧。`POST` だけ）。版 3 のスキーマの enum と一致する。 */
 export const LOGIN_SIDE_REQUEST_METHODS = Object.freeze(['POST'] as const);
 export type LoginSideRequestMethod = (typeof LOGIN_SIDE_REQUEST_METHODS)[number];
 
-/** ログインに伴う送信の、ログインの段 1 回あたりの上限の下限と上限（スキーマの minimum と maximum）。 */
+/**
+ * ログインに伴う送信の、ログインの段 1 回あたりの回数の下限（スキーマの minimum）と、画面の手での登録が書き込む値（`MAX_…`。L11 で上限としては撤廃した。
+ * `src/control/manual-login-registration.ts` が登録の値として使う）。
+ */
 export const MIN_LOGIN_SIDE_REQUESTS_PER_LOGIN_STAGE = 1;
 export const MAX_LOGIN_SIDE_REQUESTS_PER_LOGIN_STAGE = 3;
-
-/**
- * 監査の段で通す、読み取りのための手続きの呼び出し（`auditReadRequests`。T35a。Task 35 の設計書 3.1）の最大の件数（スキーマの maxItems）。版 3 の任意の
- * 項目で、ないときは空と同じ。
- */
-export const MAX_AUDIT_READ_REQUESTS = 8;
 
 /** 監査の段の読み取りの手続きの呼び出しの method（閉じた一覧。`POST` だけ。T35a）。版 3 のスキーマの enum と一致する。 */
 export const AUDIT_READ_REQUEST_METHODS = Object.freeze(['POST'] as const);
 export type AuditReadRequestMethod = (typeof AUDIT_READ_REQUEST_METHODS)[number];
 
-/** 監査の段の読み取りの手続きの呼び出しの、1 回の読み込み（Context）あたりの上限の下限と上限（スキーマの minimum と maximum。T35a）。 */
+/** 監査の段の読み取りの手続きの呼び出しの、1 回の読み込み（Context）あたりの回数の下限（スキーマの minimum。T35a。上限は L11 で撤廃した）。 */
 export const MIN_AUDIT_READ_REQUESTS_PER_PAGE_LOAD = 1;
-export const MAX_AUDIT_READ_REQUESTS_PER_PAGE_LOAD = 10;
 
 /**
- * 承認したサービスの Origin への要求の上限（`serviceRequestLimits`。T35a。Task 35 の設計書 2 の利用者の判断、3.1、3.4）。1 分あたり（直近 60 秒）と、
- * 1 回の Run あたり。設定で小さくできるが、大きくできない（スキーマの minimum と maximum）。
- * DEF-141（設計書 `2026-10-20-beaksight-service-request-pacing-design.md` 2.1。ユーザーの判断 2026-10-20）: 最大（既定）を 120・600 から 600・10,000 に上げた。
- * 1 分あたりの上限では要求を断らず、次の読み込みの前に待つ（`src/crawl/service-request-budget.ts`）。1 回の Run あたりの上限に届いたら、今どおり止める。
- * 前の範囲で保存した値は、新しい範囲の中なので、そのまま読める。
+ * 承認したサービスの Origin への要求の上限（`serviceRequestLimits`。T35a）の値の下限（スキーマの minimum。前に保存した設定の形の確かめだけに使う）。
+ * L11 で上限としては使わなくなり、LZ-3c で最大（前は `MAX_SERVICE_REQUESTS_PER_MINUTE` 600・`MAX_SERVICE_REQUESTS_PER_RUN` 10,000）と既定の値を捨てた。
  */
 export const MIN_SERVICE_REQUESTS_PER_MINUTE = 1;
-export const MAX_SERVICE_REQUESTS_PER_MINUTE = 600;
 export const MIN_SERVICE_REQUESTS_PER_RUN = 1;
-export const MAX_SERVICE_REQUESTS_PER_RUN = 10_000;
 
-/** 成功のローカル ストレージの鍵の形の、接頭辞と接尾辞のそれぞれの最大長（UTF-16 のコード単位。スキーマの maxLength）。 */
-export const MAX_SUCCESS_STORAGE_KEY_PART_LENGTH = 256;
+// LZ-2: 成功のローカル ストレージの鍵の形の接頭辞と接尾辞の長さの上限（前は `MAX_SUCCESS_STORAGE_KEY_PART_LENGTH` 256）は撤廃した。
 
 /** ログインの段で許す POST の回数の下限（設計書 4.1。スキーマの `maxLoginAttempts` の minimum）。 */
 export const MIN_LOGIN_ATTEMPTS = 1;
@@ -88,26 +79,11 @@ export const MIN_LOGIN_ATTEMPTS = 1;
 /** ログインの段で許す POST の回数の上限（設計書 4.1。総当たりをしない。I05。スキーマの `maxLoginAttempts` の maximum）。 */
 export const MAX_LOGIN_ATTEMPTS = 3;
 
-/** URL と Origin と path の最大長（UTF-16 のコード単位）。監査の URL の上限（`MAX_URL_LENGTH`）と同じ。スキーマの maxLength。 */
-export const MAX_AUTH_SETUP_URL_LENGTH = MAX_URL_LENGTH;
+// URL-LEN: URL と Origin と path の長さの上限（前は 2,048）は撤廃した（スキーマにも `maxLength` を置かない）。
 
-/** `loginPostEndpoints` の最大の件数（スキーマの maxItems。最小は 1 件）。 */
-export const MAX_LOGIN_POST_ENDPOINTS = 5;
+// LZ-3a: `excludedPaths` と `auditPathPrefixes` の件数の上限（前は `MAX_AUTH_SETUP_PATH_LIST_ITEMS` 50）は撤廃した（スキーマにも maxItems を置かない）。
 
-/** `excludedPaths` と `auditPathPrefixes` の、それぞれの最大の件数（スキーマの maxItems）。 */
-export const MAX_AUTH_SETUP_PATH_LIST_ITEMS = 50;
-
-/**
- * `allowedIdpOrigins` の形の上の最大の件数（スキーマの maxItems）。Stage 1 では空だけを受ける（`AUTH_SETUP_IDP_NOT_SUPPORTED`。
- * 別の Origin の IdP は Task 26 以降）。
- */
-export const MAX_ALLOWED_IDP_ORIGINS = 5;
-
-/**
- * `successCondition.selector`（CSS セレクタ）の最大長（UTF-16 のコード単位。スキーマの maxLength）。自動ログインの 3 つのセレクタと、
- * 失敗の条件のセレクタも、同じ上限（Task 26 の設計書 4.3。成功の条件のセレクタと同じ決まり）。
- */
-export const MAX_SUCCESS_SELECTOR_LENGTH = 256;
+// LZ-2: 成功の条件・自動ログインの 3 つの欄・失敗の条件のセレクタの長さの上限（前は `MAX_SUCCESS_SELECTOR_LENGTH` 256）は撤廃した。
 
 /**
  * 自動ログインのプロファイル（`AUTOMATED_LOGIN`）で受ける `maxLoginAttempts` の値（Task 26 の設計書 4.3、4.5。1 回のジョブでログインの
@@ -184,7 +160,7 @@ export interface ScriptLoginQueryParameter {
  * スクリプトの token の送信先（版 3。`SCRIPT_REQUEST` のとき必須）。method は `SCRIPT_LOGIN_METHOD` に固定（項目に持たない）。
  * - `origin`: プロファイルの承認したサービスの Origin（`approvedServiceOrigins`）のどれか。
  * - `path`: `/` で始まる path（query を持たない。query は `requiredQuery`）。
- * - `requiredQuery`: 要求の query に、この組がすべてあること（上限 `MAX_SCRIPT_LOGIN_REQUIRED_QUERY`。名前の重なりなし。秘密に見える名前は持てない）。
+ * - `requiredQuery`: 要求の query に、この組がすべてあること（L11: 件数の上限なし。名前の重なりなし。秘密に見える名前は持てない）。
  */
 export interface ScriptLoginTarget {
   readonly origin: string;
@@ -218,34 +194,15 @@ export interface AuditReadRequest {
   readonly maxPerPageLoad: number;
 }
 
-/** 承認したサービスの Origin への要求の上限（版 3 の任意の項目 `serviceRequestLimits`。T35a）。 */
+/**
+ * 承認したサービスの Origin への要求の上限（版 3 の任意の項目 `serviceRequestLimits`。T35a）。LZ-3c: 前に保存した設定を読むために、項目は受けて形を確かめるが、
+ * 使わない（監査の段の口にもワーカーへも写さない）。画面は書かない。既定の値（前の `DEFAULT_SERVICE_REQUEST_LIMITS`・`defaultServiceRequestLimitsFor`・
+ * `SERVICE_REQUESTS_PER_PAGE_ALLOWANCE`）は捨てた。
+ */
 export interface ServiceRequestLimits {
   readonly perMinute: number;
   readonly perRun: number;
 }
-
-/** 要求の上限の項目がないときの値（上限の値。T35a）。T44f: 1 回の Run あたりの値は、ページの上限に比べて広げる（`defaultServiceRequestLimitsFor`）。 */
-export const DEFAULT_SERVICE_REQUEST_LIMITS: ServiceRequestLimits = Object.freeze({
-  perMinute: MAX_SERVICE_REQUESTS_PER_MINUTE,
-  perRun: MAX_SERVICE_REQUESTS_PER_RUN,
-});
-
-/**
- * T44f（Task 44 の設計書 P3-3。設計者の判断の案 (a)）: 要求の上限の項目がないときの、1 ページあたりの承認したサービスの Origin への要求の量（名前つきの量）。
- * 根拠: 実テスト環境の 140 ページの監査で、Desktop と Mobile の最初の 2 回の読み込みで 1 ページ約 70 件（1 回の読み込み約 35 件）。T44b の後は幅の走査の
- * 読み込み（最初の読み込みと同じ幅を除く 3 回）でも送るので、1 ページ約 5 回 × 35 件 ≒ 175 件。余裕を見て 200 件。
- */
-export const SERVICE_REQUESTS_PER_PAGE_ALLOWANCE = 200;
-
-/**
- * T44f: 要求の上限の項目がないときの値（1 分あたりは今の既定のまま。1 回の Run あたりは `max(MAX_SERVICE_REQUESTS_PER_RUN, ページの上限 ×
- * SERVICE_REQUESTS_PER_PAGE_ALLOWANCE)`）。1 分あたりの上限（待って続ける。DEF-141）が速さを抑えるので、サイトへの速さの上限は変わらない。
- * T44R（Task 44 のレビューの M-3）: ページの上限は、設定の検証の上限（`MAX_CRAWL_MAX_PAGES`）を超える値を上限として数える（結果は安全な整数）。
- */
-export const defaultServiceRequestLimitsFor = (maxPages: number): ServiceRequestLimits => Object.freeze({
-  perMinute: DEFAULT_SERVICE_REQUEST_LIMITS.perMinute,
-  perRun: Math.max(DEFAULT_SERVICE_REQUEST_LIMITS.perRun, Math.min(maxPages, MAX_CRAWL_MAX_PAGES) * SERVICE_REQUESTS_PER_PAGE_ALLOWANCE),
-});
 
 /**
  * 成功のローカル ストレージの鍵の形（版 3。`SCRIPT_REQUEST` のとき必須）。成功の条件に足す（その Origin のローカル ストレージに、接頭辞で始まり接尾辞で
@@ -263,7 +220,7 @@ export interface SuccessStorageKey {
  * - `FORM_NAVIGATION`: `scriptLogin` と `successStorageKey` は null、`loginSideRequests` は空、`loginPostEndpoints` は 1 つ以上（今の形）。
  * - `SCRIPT_REQUEST`: `scriptLogin` と `successStorageKey` が必須、`loginPostEndpoints` は空でよい。
  * - T35a（Task 35 の設計書 3.1）: 任意の項目 `auditReadRequests`（監査の段の読み取りの手続きの呼び出し）と `serviceRequestLimits`（承認したサービスの
- *   Origin への要求の上限）。`SCRIPT_REQUEST` のときだけ持てる。項目のない文書は、版 3 の今の文書のまま（digest も変わらない）。
+ *   Origin への要求の上限。LZ-3c: 受けて使わない）。`SCRIPT_REQUEST` のときだけ持てる。項目のない文書は、版 3 の今の文書のまま（digest も変わらない）。
  */
 export interface AuthSetupV3 extends AuthSetupFields {
   readonly schemaVersion: typeof AUTH_SETUP_SCHEMA_VERSION_3;

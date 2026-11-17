@@ -335,10 +335,14 @@ export function createHarnessPage(harness: GuardHarness, options: {
 } = {}): Page {
   let closed = false;
   const closeHandlers = new Set<() => void>();
+  // DEF-217: 本物の Page の `mainFrame()` は、いつも main frame を返す（Playwright の client の Page は、作るときに main frame を持ち、閉じた後も同じものを返す）。
+  // Guard は凍結の段の `framenavigated` で main frame と子の frame を見分ける（DEF-208-1）ので、偽の page も main frame を持つ。
+  const mainFrame = { url: () => options.url ?? 'about:blank' };
   const page = {
     context: () => harness.context,
     isClosed: () => closed,
     url: () => options.url ?? 'about:blank',
+    mainFrame: () => mainFrame,
     on(event: string, handler: (...arguments_: unknown[]) => void): Page {
       options.onEvent?.(event, handler);
       return page as unknown as Page;

@@ -31,7 +31,7 @@ import {
   type AutomatedLoginFixture,
   type AutomatedLoginFormVariant,
 } from '../helpers/automated-login-fixture.js';
-import { launchCliChromium, launchHeadlessChromium } from '../helpers/chromium.js';
+import { DEFAULT_CHROMIUM_LAUNCHERS } from '../helpers/chromium.js';
 import { READ_METHODS } from '../helpers/leak-places.js';
 import {
   SPA_APP_PATHS,
@@ -43,10 +43,6 @@ import {
 } from '../helpers/spa-auth-site-fixture.js';
 import { createTestConfig } from '../helpers/test-config.js';
 
-const LAUNCHERS = [
-  ['the default test Chromium', () => launchHeadlessChromium()],
-  ['the CLI launch settings', () => launchCliChromium()],
-] as const;
 /** 入力できない欄で、`fill` が待つ時間（ms）。 */
 const SHORT_STEP_TIMEOUT_MS = 500;
 const NAVIGATION_SETTLE_TIMEOUT_MS = 10_000;
@@ -118,7 +114,7 @@ const FORMLESS_INSPECTIONS: readonly (readonly [SpaLoginLayout, LoginFormInvalid
   ['disabledSubmit', 'SUBMIT_BUTTON_INVALID'],
 ];
 
-describe.each(LAUNCHERS)('T26d-1: the login form submitter (%s)', (_name, launch) => {
+describe.each(DEFAULT_CHROMIUM_LAUNCHERS)('T26d-1: the login form submitter (%s)', (_name, launch) => {
   const username = marker('u');
   const password = marker('p');
   let browser: Browser;
@@ -249,7 +245,7 @@ describe.each(LAUNCHERS)('T26d-1: the login form submitter (%s)', (_name, launch
   });
 });
 
-describe.each(LAUNCHERS)('T36a: the login form of the script login site (%s)', (_name, launch) => {
+describe.each(DEFAULT_CHROMIUM_LAUNCHERS)('T36a: the login form of the script login site (%s)', (_name, launch) => {
   let browser: Browser;
   let site: SpaAuthSite;
   const factories: BrowserContextFactory[] = [];
@@ -297,7 +293,7 @@ describe.each(LAUNCHERS)('T36a: the login form of the script login site (%s)', (
   });
 });
 
-describe.each(LAUNCHERS)('T36R-fix: the login page without a form element for the script login (%s)', (_name, launch) => {
+describe.each(DEFAULT_CHROMIUM_LAUNCHERS)('T36R-fix: the login page without a form element for the script login (%s)', (_name, launch) => {
   let browser: Browser;
   const sites: SpaAuthSite[] = [];
   const factories: BrowserContextFactory[] = [];

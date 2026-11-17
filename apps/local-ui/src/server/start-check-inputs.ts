@@ -97,7 +97,7 @@ export const readProfileStart = async (profileId: string): Promise<ProfileStartR
   const { profile } = stored;
   const pathAccepted = isAcceptedTargetConfigPath(profile.targetConfigPath);
   const { context, configError } = pathAccepted ? await loadTargetContext(profile.targetConfigPath) : { context: undefined, configError: null };
-  const storedSetup = requiresAuthSetup(profile.mode) ? getAuthSetup(localUiStore(), profile.profileId) : null;
+  const storedSetup = requiresAuthSetup(profile.mode, profile.auth) ? getAuthSetup(localUiStore(), profile.profileId) : null;
   const autoLogin = await autoLoginInputsOf(profile);
   return {
     stored,

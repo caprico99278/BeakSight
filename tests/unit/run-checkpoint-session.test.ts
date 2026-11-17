@@ -1,69 +1,38 @@
-// 中断した Run の再開（`2026-10-01-beaksight-resumable-run-design.md` 4.3.1、4.4、4.5）の R4a と R4a2a: 保存のセッション
-// （`src/orchestration/run-checkpoint-session.ts`）。偽の保存の書き手と、注入した時刻・タイマー・プロセスの判定で確かめる。
+// 中断した Run の再開（`2026-10-01-beaksight-resumable-run-design.md` 4.3.1、4.5）の R4a と R4a2a: 保存のセッション
+// （`src/orchestration/run-checkpoint-session.ts`）。偽の保存の書き手で確かめる。SPEC-2: セッションはロックを持たない（監査中の印は、
+// 出力先のロック。`tests/unit/output-start-lock.test.ts`）。
 // 本物の `ArtifactWriter` を書き手にした確かめは、結合テスト（`tests/integration/run-checkpoint.test.ts`）で行う。
 import { afterEach, describe, expect, expectTypeOf, it, vi } from 'vitest';
 import type { PageId } from '../../src/core/contracts.js';
 import { validateArtifact } from '../../src/core/schema-validator.js';
 import {
-  createRunLock,
-  currentProcessRunLockHost,
-  renewRunLock,
-  RUN_LOCK_BOOT_TIME_TOLERANCE_MS,
-  RUN_LOCK_HEARTBEAT_INTERVAL_MS,
-  RUN_LOCK_STALE_AFTER_MS,
-  type RunLock,
-  type RunLockHost,
-} from '../../src/core/process-lock.js';
-import {
   checkRunCheckpointConsistency,
   checkRunCheckpointPageConsistency,
   type RunCheckpoint,
-  type RunCheckpointLockAcquisition,
   type RunCheckpointPage,
   type RunCheckpointStore,
 } from '../../src/orchestration/run-checkpoint.js';
 import {
-  RUN_CHECKPOINT_SESSION_RESUME_FAILURE_REASONS,
   RUN_CHECKPOINT_SESSION_START_MODES,
-  RUN_LOCK_REREAD_DELAY_MS,
   RunCheckpointSession,
-  RunLockLostError,
-  type RunCheckpointHeartbeatTimer,
   type RunCheckpointSessionOptions,
   type RunCheckpointSessionStartOptions,
-  type RunCheckpointSessionTimers,
 } from '../../src/orchestration/run-checkpoint-session.js';
 import { ArtifactWriter } from '../../src/report/artifact-writer.js';
 import { PAGE_1, PAGE_2 } from '../helpers/audit-run-fixture.js';
 import { sampleRunCheckpoint, sampleRunCheckpointPage } from '../helpers/run-checkpoint-samples.js';
 
 const RUN_DIRECTORY = 'C:/work/output/RUN-20261001000000';
-const PROCESS_ID = 4_321;
-const BOOTED_AT_MS = 500_000;
-const STARTED_AT_MS = 1_000_000;
-
-/** 今のプロセスの値（注入した時刻から作る）。 */
-const lockHost = (nowMs: number): RunLockHost => Object.freeze({ processId: PROCESS_ID, nowMs, bootedAtMs: BOOTED_AT_MS });
 
 /** 書き手が呼ばれた順の記録の1件。 */
 type StoreCall =
   | { readonly kind: 'writeCheckpointPage'; readonly runDirectory: string; readonly page: RunCheckpointPage }
   | { readonly kind: 'writeCheckpointState'; readonly runDirectory: string; readonly state: RunCheckpoint }
-  | { readonly kind: 'acquireRunLock'; readonly runDirectory: string; readonly lock: RunLock }
-  | { readonly kind: 'rewriteRunLock'; readonly runDirectory: string; readonly lock: RunLock }
-  | { readonly kind: 'readRunLock'; readonly runDirectory: string }
-  | { readonly kind: 'takeOverRunLock'; readonly runDirectory: string; readonly judged: unknown; readonly lock: RunLock }
-  | { readonly kind: 'releaseRunLock'; readonly runDirectory: string }
   | { readonly kind: 'cleanUpForResume'; readonly runDirectory: string; readonly completedPageIds: readonly PageId[] };
 
-/**
- * 偽の書き手。呼ばれた順に `calls` に記録する。振る舞いは、各操作の差し替え口で変える。差し替えていない `readRunLock` は、
- * 最後に書いたロック（`acquireRunLock` で作れたものか、`rewriteRunLock` で書き換えたもの、`takeOverRunLock` で取り直したもの。なければ `null`）を
- * 返す。差し替えていない `takeOverRunLock` は、原子的な取り直しに成功する（`ACQUIRED`。LG-4: 書き手は必ず持つ）。
- */
+/** 偽の書き手。呼ばれた順に `calls` に記録する。振る舞いは、各操作の差し替え口で変える。 */
 function fakeStore(overrides: Partial<RunCheckpointStore> = {}): { readonly store: RunCheckpointStore; readonly calls: StoreCall[] } {
   const calls: StoreCall[] = [];
-  let lockOnDisk: unknown = null;
   const store: RunCheckpointStore = {
     writeCheckpointPage: async (runDirectory, page) => {
       calls.push({ kind: 'writeCheckpointPage', runDirectory, page });
@@ -73,35 +42,6 @@ function fakeStore(overrides: Partial<RunCheckpointStore> = {}): { readonly stor
       calls.push({ kind: 'writeCheckpointState', runDirectory, state });
       await overrides.writeCheckpointState?.(runDirectory, state);
     },
-    acquireRunLock: async (runDirectory, lock) => {
-      calls.push({ kind: 'acquireRunLock', runDirectory, lock });
-      const acquisition: RunCheckpointLockAcquisition = overrides.acquireRunLock === undefined
-        ? { acquired: true }
-        : await overrides.acquireRunLock(runDirectory, lock);
-      lockOnDisk = acquisition.acquired ? lock : acquisition.existing;
-      return acquisition;
-    },
-    rewriteRunLock: async (runDirectory, lock) => {
-      calls.push({ kind: 'rewriteRunLock', runDirectory, lock });
-      await overrides.rewriteRunLock?.(runDirectory, lock);
-      lockOnDisk = lock;
-    },
-    readRunLock: async (runDirectory) => {
-      calls.push({ kind: 'readRunLock', runDirectory });
-      return overrides.readRunLock === undefined ? lockOnDisk : overrides.readRunLock(runDirectory);
-    },
-    takeOverRunLock: async (runDirectory, judged, lock) => {
-      calls.push({ kind: 'takeOverRunLock', runDirectory, judged, lock });
-      const takeover = overrides.takeOverRunLock === undefined ? { outcome: 'ACQUIRED' as const } : await overrides.takeOverRunLock(runDirectory, judged, lock);
-      if (takeover.outcome === 'ACQUIRED') {
-        lockOnDisk = lock;
-      }
-      return takeover;
-    },
-    releaseRunLock: async (runDirectory) => {
-      calls.push({ kind: 'releaseRunLock', runDirectory });
-      await overrides.releaseRunLock?.(runDirectory);
-    },
     cleanUpForResume: async (runDirectory, completedPageIds) => {
       calls.push({ kind: 'cleanUpForResume', runDirectory, completedPageIds });
       return overrides.cleanUpForResume === undefined ? [] : overrides.cleanUpForResume(runDirectory, completedPageIds);
@@ -110,79 +50,13 @@ function fakeStore(overrides: Partial<RunCheckpointStore> = {}): { readonly stor
   return { store, calls };
 }
 
-/** 偽のタイマー1つ（`setInterval` の戻り値）。 */
-interface FakeTimer extends RunCheckpointHeartbeatTimer {
-  readonly callback: () => void;
-  readonly intervalMs: number;
-  readonly unref: ReturnType<typeof vi.fn<() => unknown>>;
-  cleared: boolean;
-}
-
-/** 偽のタイマー。`tick` で、解除されていないタイマーの関数を1回ずつ呼ぶ（1回分の間隔が過ぎたものとする）。 */
-function fakeTimers(): { readonly timers: RunCheckpointSessionTimers; readonly created: FakeTimer[]; tick(): void } {
-  const created: FakeTimer[] = [];
-  return {
-    timers: {
-      setInterval: (callback, intervalMs) => {
-        const timer: FakeTimer = { callback, intervalMs, unref: vi.fn<() => unknown>(), cleared: false };
-        created.push(timer);
-        return timer;
-      },
-      clearInterval: (timer) => {
-        (timer as FakeTimer).cleared = true;
-      },
-    },
-    created,
-    tick: () => {
-      for (const timer of created.filter(({ cleared }) => !cleared)) {
-        timer.callback();
-      }
-    },
-  };
-}
-
-/**
- * 偽の書き手、偽のタイマー、注入した時刻で作ったセッション。`isProcessRunning` を渡すと、ロックの判定に使うプロセスの判定を
- * 差し替える（省略すると、セッションの既定の `isProcessRunning`）。
- */
-function createSession(
-  overrides: Partial<RunCheckpointStore> = {},
-  options: Pick<RunCheckpointSessionOptions, 'isProcessRunning' | 'wait'> = {},
-) {
+/** 偽の書き手で作ったセッション。 */
+function createSession(overrides: Partial<RunCheckpointStore> = {}) {
   const { store, calls } = fakeStore(overrides);
-  const clock = { nowMs: STARTED_AT_MS };
-  const timers = fakeTimers();
-  const session = new RunCheckpointSession({
-    store,
-    now: () => clock.nowMs,
-    createLockHost: lockHost,
-    timers: timers.timers,
-    isProcessRunning: options.isProcessRunning,
-    // DEF-172: 猶予と読み直しの待ちは、実際には待たない（差し替えがあれば、それを使う）。
-    wait: options.wait ?? (async () => undefined),
-  });
-  return { session, calls, clock, timers };
+  return { session: new RunCheckpointSession({ store }), calls };
 }
-
-/** 書き出しの Promise の後の処理を終わらせる（ハートビートの書き出しは、待たれないため）。 */
-const flush = async (): Promise<void> => {
-  await new Promise<void>((resolve) => {
-    setImmediate(resolve);
-  });
-};
 
 const kindsOf = (calls: readonly StoreCall[]): string[] => calls.map(({ kind }) => kind);
-
-/** 外から解決する Promise。 */
-function deferred(): { readonly promise: Promise<void>; resolve(): void; reject(error: unknown): void } {
-  let resolve!: () => void;
-  let reject!: (error: unknown) => void;
-  const promise = new Promise<void>((resolvePromise, rejectPromise) => {
-    resolve = resolvePromise;
-    reject = rejectPromise;
-  });
-  return { promise, resolve, reject };
-}
 
 afterEach(() => {
   vi.restoreAllMocks();
@@ -206,85 +80,16 @@ describe('R4a: the checkpoint store interface (design 4.3.1)', () => {
     expectTypeOf<ArtifactWriter>().toExtend<RunCheckpointStore>();
     const store: RunCheckpointStore = new ArtifactWriter();
     expect(typeof store.writeCheckpointPage).toBe('function');
-    expectTypeOf<Awaited<ReturnType<ArtifactWriter['acquireRunLock']>>>().toExtend<RunCheckpointLockAcquisition>();
   });
 });
 
-describe('R4a: starting the checkpoint session of a new Run (design 4.3.1, 4.4)', () => {
-  it('creates the lock exclusively from the values of the current process and the injected clock', async () => {
+describe('R4a: starting the checkpoint session of a new Run (design 4.3.1)', () => {
+  it('starts without writing anything (SPEC-2: no lock in the run directory)', async () => {
     const { session, calls } = createSession();
 
     await expect(session.start(RUN_DIRECTORY, { mode: 'NEW_RUN' })).resolves.toEqual({ ok: true });
 
-    expect(calls).toEqual([{ kind: 'acquireRunLock', runDirectory: RUN_DIRECTORY, lock: createRunLock(lockHost(STARTED_AT_MS)) }]);
-  });
-
-  it('uses currentProcessRunLockHost when no lock host function is given', async () => {
-    const { store, calls } = fakeStore();
-    const session = new RunCheckpointSession({ store, now: () => STARTED_AT_MS, timers: fakeTimers().timers });
-
-    await session.start(RUN_DIRECTORY, { mode: 'NEW_RUN' });
-
-    const [call] = calls;
-    expect(call?.kind).toBe('acquireRunLock');
-    const host = currentProcessRunLockHost(STARTED_AT_MS);
-    expect(call?.kind === 'acquireRunLock' ? call.lock : null).toMatchObject({
-      processId: process.pid,
-      acquiredAtMs: STARTED_AT_MS,
-      heartbeatAtMs: STARTED_AT_MS,
-    });
-    // OS の起動の時刻は、`os.uptime()` から作るので、呼ぶたびに少しずれることがある。
-    expect(Math.abs((call?.kind === 'acquireRunLock' ? call.lock.bootedAtMs : 0) - host.bootedAtMs)).toBeLessThanOrEqual(1_000);
-  });
-
-  it('returns a failure with the existing lock and starts no heartbeat when the lock cannot be created', async () => {
-    const existing = { processId: 1, bootedAtMs: 0, acquiredAtMs: 0, heartbeatAtMs: 0 };
-    const { session, calls, timers } = createSession({ acquireRunLock: async () => ({ acquired: false, existing }) });
-
-    await expect(session.start(RUN_DIRECTORY, { mode: 'NEW_RUN' })).resolves.toEqual({ ok: false, existingLock: existing });
-
-    expect(timers.created).toEqual([]);
-    expect(kindsOf(calls)).toEqual(['acquireRunLock']);
-    // 始められなかったセッションでは、保存しない。やめる操作は、何もしない。
-    await expect(session.saveState(sampleRunCheckpoint())).rejects.toThrow(/not active/u);
-    await expect(session.abandon()).resolves.toBeUndefined();
-    expect(kindsOf(calls)).toEqual(['acquireRunLock']);
-  });
-
-  it('passes on the failure of the store when the lock cannot be written', async () => {
-    const failure = new Error('lock write failed');
-    const { session, timers } = createSession({ acquireRunLock: async () => Promise.reject(failure) });
-
-    await expect(session.start(RUN_DIRECTORY, { mode: 'NEW_RUN' })).rejects.toBe(failure);
-    expect(timers.created).toEqual([]);
-  });
-
-  it('stops the timer it made when the heartbeat cannot be started, and can be started again', async () => {
-    const { store } = fakeStore();
-    const failing: RunCheckpointHeartbeatTimer = {
-      unref: () => {
-        throw new Error('unref failed');
-      },
-    };
-    const working: RunCheckpointHeartbeatTimer = { unref: () => undefined };
-    const made: RunCheckpointHeartbeatTimer[] = [failing, working];
-    const cleared: RunCheckpointHeartbeatTimer[] = [];
-    const session = new RunCheckpointSession({
-      store,
-      now: () => STARTED_AT_MS,
-      createLockHost: lockHost,
-      timers: {
-        setInterval: () => made.shift() ?? working,
-        clearInterval: (timer) => {
-          cleared.push(timer);
-        },
-      },
-    });
-
-    await expect(session.start(RUN_DIRECTORY, { mode: 'NEW_RUN' })).rejects.toThrow('unref failed');
-    expect(cleared).toEqual([failing]);
-    await expect(session.start(RUN_DIRECTORY, { mode: 'NEW_RUN' })).resolves.toEqual({ ok: true });
-    expect(cleared).toEqual([failing]);
+    expect(calls).toEqual([]);
   });
 
   it('rejects a second start, a start mode outside the closed list, and an empty run directory', async () => {
@@ -298,168 +103,13 @@ describe('R4a: starting the checkpoint session of a new Run (design 4.3.1, 4.4)'
     await expect(session.start(RUN_DIRECTORY, { mode: 'NEW_RUN' })).rejects.toThrow(/already/u);
   });
 
-  it('rejects options that are not a store, a clock, a lock host function, or timers with TypeError', () => {
+  it('rejects options without the store operations with TypeError', () => {
     const { store } = fakeStore();
-    const valid: RunCheckpointSessionOptions = { store, now: () => STARTED_AT_MS };
-    const invalid: unknown[] = [
-      undefined,
-      { ...valid, store: undefined },
-      { ...valid, store: { ...store, releaseRunLock: undefined } },
-      { ...valid, now: 1 },
-      { ...valid, createLockHost: 'host' },
-      { ...valid, timers: { setInterval: () => ({ unref: () => undefined }) } },
-    ];
+    const invalid: unknown[] = [undefined, { store: undefined }, { store: { ...store, cleanUpForResume: undefined } }];
     for (const options of invalid) {
       expect(() => new RunCheckpointSession(options as RunCheckpointSessionOptions)).toThrow(TypeError);
     }
-    expect(() => new RunCheckpointSession(valid)).not.toThrow();
-  });
-});
-
-describe('R4a: the heartbeat of the lock (design 4.3.1, 4.4)', () => {
-  it('rewrites the heartbeat time of the lock every minute with an unref timer', async () => {
-    const { session, calls, clock, timers } = createSession();
-    await session.start(RUN_DIRECTORY, { mode: 'NEW_RUN' });
-    const lock = createRunLock(lockHost(STARTED_AT_MS));
-
-    expect(timers.created).toHaveLength(1);
-    expect(timers.created[0]?.intervalMs).toBe(RUN_LOCK_HEARTBEAT_INTERVAL_MS);
-    expect(timers.created[0]?.unref).toHaveBeenCalledOnce();
-
-    clock.nowMs = STARTED_AT_MS + RUN_LOCK_HEARTBEAT_INTERVAL_MS;
-    timers.tick();
-    await flush();
-    clock.nowMs = STARTED_AT_MS + 2 * RUN_LOCK_HEARTBEAT_INTERVAL_MS;
-    timers.tick();
-    await flush();
-
-    // DEF-170: 書き換える前に読み直し、自分のロックのときだけ書き換える。
-    expect(calls.slice(1)).toEqual([
-      { kind: 'readRunLock', runDirectory: RUN_DIRECTORY },
-      { kind: 'rewriteRunLock', runDirectory: RUN_DIRECTORY, lock: renewRunLock(lock, STARTED_AT_MS + RUN_LOCK_HEARTBEAT_INTERVAL_MS) },
-      { kind: 'readRunLock', runDirectory: RUN_DIRECTORY },
-      { kind: 'rewriteRunLock', runDirectory: RUN_DIRECTORY, lock: renewRunLock(lock, STARTED_AT_MS + 2 * RUN_LOCK_HEARTBEAT_INTERVAL_MS) },
-    ]);
-  });
-
-  it('does not rewrite and stops the heartbeat when the lock read again is not its own (DEF-170)', async () => {
-    const other = createRunLock({ ...lockHost(STARTED_AT_MS), processId: PROCESS_ID + 1 });
-    const { session, calls, timers } = createSession({ readRunLock: async () => other });
-    await session.start(RUN_DIRECTORY, { mode: 'NEW_RUN' });
-
-    timers.tick();
-    await flush();
-    timers.tick();
-    await flush();
-
-    expect(kindsOf(calls)).toEqual(['acquireRunLock', 'readRunLock']);
-    expect(session.lockLost).toBe(true);
-    expect(session.lockLostSignal.aborted).toBe(true);
-    expect(timers.created[0]?.cleared).toBe(true);
-    // ロックを失った後は、Run のディレクトリに書かない（保存も、終えるも、書き手に頼まずに拒む）。
-    await expect(session.saveState(sampleRunCheckpoint())).rejects.toBeInstanceOf(RunLockLostError);
-    await expect(session.finish(sampleRunCheckpoint({ state: 'FINISHED' }))).rejects.toBeInstanceOf(RunLockLostError);
-    expect(kindsOf(calls)).toEqual(['acquireRunLock', 'readRunLock']);
-  });
-
-  it('reads the lock once more after RUN_LOCK_REREAD_DELAY_MS when it cannot be read, and loses it only when it is still not its own (DEF-170)', async () => {
-    const lock = createRunLock(lockHost(STARTED_AT_MS));
-    for (const [second, lost] of [[lock, false], [null, true]] as const) {
-      let reads = 0;
-      const waits: number[] = [];
-      const waiting = deferred();
-      const { session, calls, timers } = createSession({
-        readRunLock: async () => {
-          reads += 1;
-          return reads === 1 ? null : second;
-        },
-      }, {
-        wait: async (ms) => {
-          waits.push(ms);
-          await waiting.promise;
-        },
-      });
-      await session.start(RUN_DIRECTORY, { mode: 'NEW_RUN' });
-      timers.tick();
-      await flush();
-      // 1 回目が読めなければ、すぐには失ったとせず、間（`RUN_LOCK_REREAD_DELAY_MS`）を置いて読み直す。
-      expect(reads).toBe(1);
-      expect(waits).toEqual([RUN_LOCK_REREAD_DELAY_MS]);
-      expect(session.lockLost).toBe(false);
-      waiting.resolve();
-      await flush();
-      expect(reads).toBe(2);
-      expect(session.lockLost, String(lost)).toBe(lost);
-      expect(kindsOf(calls)).toEqual(lost
-        ? ['acquireRunLock', 'readRunLock', 'readRunLock']
-        : ['acquireRunLock', 'readRunLock', 'readRunLock', 'rewriteRunLock']);
-    }
-  });
-
-  it('does not throw or reject when a heartbeat write fails, and writes again at the next minute', async () => {
-    let failures = 0;
-    const { session, calls, timers } = createSession({
-      rewriteRunLock: async () => {
-        failures += 1;
-        if (failures === 1) {
-          throw new Error('heartbeat write failed');
-        }
-      },
-    });
-    await session.start(RUN_DIRECTORY, { mode: 'NEW_RUN' });
-
-    expect(() => timers.tick()).not.toThrow();
-    await flush();
-    timers.tick();
-    await flush();
-
-    expect(kindsOf(calls)).toEqual(['acquireRunLock', 'readRunLock', 'rewriteRunLock', 'readRunLock', 'rewriteRunLock']);
-    await expect(session.saveState(sampleRunCheckpoint())).resolves.toBeUndefined();
-  });
-
-  it('does not throw when the store throws synchronously from a heartbeat write', async () => {
-    const { store } = fakeStore();
-    const timers = fakeTimers();
-    const session = new RunCheckpointSession({
-      store: {
-        ...store,
-        rewriteRunLock: () => {
-          throw new Error('synchronous heartbeat failure');
-        },
-      },
-      now: () => STARTED_AT_MS,
-      createLockHost: lockHost,
-      timers: timers.timers,
-    });
-    await session.start(RUN_DIRECTORY, { mode: 'NEW_RUN' });
-
-    expect(() => timers.tick()).not.toThrow();
-    await flush();
-  });
-
-  it('skips a heartbeat while the previous heartbeat write is still in progress', async () => {
-    const writing = deferred();
-    let writes = 0;
-    const { session, calls, timers } = createSession({
-      rewriteRunLock: async () => {
-        writes += 1;
-        if (writes === 1) {
-          await writing.promise;
-        }
-      },
-    });
-    await session.start(RUN_DIRECTORY, { mode: 'NEW_RUN' });
-
-    timers.tick();
-    timers.tick();
-    await flush();
-    expect(kindsOf(calls)).toEqual(['acquireRunLock', 'readRunLock', 'rewriteRunLock']);
-
-    writing.resolve();
-    await flush();
-    timers.tick();
-    await flush();
-    expect(kindsOf(calls)).toEqual(['acquireRunLock', 'readRunLock', 'rewriteRunLock', 'readRunLock', 'rewriteRunLock']);
+    expect(() => new RunCheckpointSession({ store })).not.toThrow();
   });
 });
 
@@ -473,11 +123,8 @@ describe('R4a: saving pages and the run state (design 4.3)', () => {
     await expect(session.savePage(page)).resolves.toBeUndefined();
     await expect(session.saveState(state)).resolves.toBeUndefined();
 
-    // DEF-172: 書く前に、ロックが今も自分のものかを読んで確かめる。
-    expect(calls.slice(1)).toEqual([
-      { kind: 'readRunLock', runDirectory: RUN_DIRECTORY },
+    expect(calls).toEqual([
       { kind: 'writeCheckpointPage', runDirectory: RUN_DIRECTORY, page },
-      { kind: 'readRunLock', runDirectory: RUN_DIRECTORY },
       { kind: 'writeCheckpointState', runDirectory: RUN_DIRECTORY, state },
     ]);
   });
@@ -505,112 +152,38 @@ describe('R4a: saving pages and the run state (design 4.3)', () => {
 });
 
 describe('R4a: finishing and abandoning the session (design 4.3.1)', () => {
-  it('finishes by writing the final state, stopping the heartbeat, and then releasing the lock', async () => {
-    const { session, calls, timers } = createSession();
+  it('finishes by writing the final state, and saves nothing after that', async () => {
+    const { session, calls } = createSession();
     await session.start(RUN_DIRECTORY, { mode: 'NEW_RUN' });
     const finalState = sampleRunCheckpoint({ startPageFinished: true, state: 'FINISHED' });
 
     await session.finish(finalState);
 
-    expect(calls.slice(1)).toEqual([
-      { kind: 'readRunLock', runDirectory: RUN_DIRECTORY },
-      { kind: 'writeCheckpointState', runDirectory: RUN_DIRECTORY, state: finalState },
-      { kind: 'releaseRunLock', runDirectory: RUN_DIRECTORY },
-    ]);
-    expect(timers.created[0]?.cleared).toBe(true);
-    // 終えた後は、ハートビートも保存もしない。
-    timers.tick();
-    await flush();
-    expect(kindsOf(calls)).toEqual(['acquireRunLock', 'readRunLock', 'writeCheckpointState', 'releaseRunLock']);
+    expect(calls).toEqual([{ kind: 'writeCheckpointState', runDirectory: RUN_DIRECTORY, state: finalState }]);
     await expect(session.saveState(finalState)).rejects.toThrow(/not active/u);
     await expect(session.finish(finalState)).rejects.toThrow(/not active/u);
   });
 
-  it('stops the heartbeat before the lock is released', async () => {
-    const order: string[] = [];
-    const timers = fakeTimers();
-    const { store } = fakeStore();
-    const session = new RunCheckpointSession({
-      store: { ...store, releaseRunLock: async () => { order.push(`release cleared=${String(timers.created[0]?.cleared)}`); } },
-      now: () => STARTED_AT_MS,
-      createLockHost: lockHost,
-      timers: timers.timers,
-    });
-    await session.start(RUN_DIRECTORY, { mode: 'NEW_RUN' });
-
-    await session.finish(sampleRunCheckpoint({ state: 'FINISHED' }));
-
-    expect(order).toEqual(['release cleared=true']);
-  });
-
-  it('waits for a heartbeat write in progress before releasing the lock (the write must not recreate the released lock)', async () => {
-    const writing = deferred();
-    const { session, calls, timers } = createSession({ rewriteRunLock: async () => writing.promise });
-    await session.start(RUN_DIRECTORY, { mode: 'NEW_RUN' });
-    timers.tick();
-    await flush();
-
-    const finished = session.finish(sampleRunCheckpoint({ state: 'FINISHED' }));
-    await flush();
-    expect(kindsOf(calls)).toEqual(['acquireRunLock', 'readRunLock', 'rewriteRunLock', 'readRunLock', 'writeCheckpointState']);
-
-    writing.resolve();
-    await finished;
-    expect(kindsOf(calls)).toEqual(['acquireRunLock', 'readRunLock', 'rewriteRunLock', 'readRunLock', 'writeCheckpointState', 'releaseRunLock']);
-  });
-
-  it('keeps the lock and stops the heartbeat when the final state cannot be written', async () => {
+  it('passes on the failure of writing the final state, and ends the session', async () => {
     const failure = new Error('final state write failed');
-    const { session, calls, timers } = createSession({ writeCheckpointState: async () => Promise.reject(failure) });
+    const { session } = createSession({ writeCheckpointState: async () => Promise.reject(failure) });
     await session.start(RUN_DIRECTORY, { mode: 'NEW_RUN' });
 
     await expect(session.finish(sampleRunCheckpoint({ state: 'FINISHED' }))).rejects.toBe(failure);
-
-    expect(kindsOf(calls)).toEqual(['acquireRunLock', 'readRunLock', 'writeCheckpointState']);
-    expect(timers.created[0]?.cleared).toBe(true);
+    await expect(session.saveState(sampleRunCheckpoint())).rejects.toThrow(/not active/u);
   });
 
-  it('passes on the failure of releasing the lock after stopping the heartbeat', async () => {
-    const failure = new Error('lock release failed');
-    const { session, timers } = createSession({ releaseRunLock: async () => Promise.reject(failure) });
-    await session.start(RUN_DIRECTORY, { mode: 'NEW_RUN' });
-
-    await expect(session.finish(sampleRunCheckpoint({ state: 'FINISHED' }))).rejects.toBe(failure);
-    expect(timers.created[0]?.cleared).toBe(true);
-  });
-
-  it('abandons by stopping the heartbeat without releasing the lock (the state stays IN_PROGRESS for a resume)', async () => {
-    const { session, calls, timers } = createSession();
+  it('abandons without writing (the state stays IN_PROGRESS for a resume)', async () => {
+    const { session, calls } = createSession();
     await session.start(RUN_DIRECTORY, { mode: 'NEW_RUN' });
     await session.saveState(sampleRunCheckpoint());
 
     await expect(session.abandon()).resolves.toBeUndefined();
 
-    expect(timers.created[0]?.cleared).toBe(true);
-    timers.created[0]?.callback();
-    await flush();
-    expect(kindsOf(calls)).toEqual(['acquireRunLock', 'readRunLock', 'writeCheckpointState']);
+    expect(kindsOf(calls)).toEqual(['writeCheckpointState']);
     await expect(session.saveState(sampleRunCheckpoint())).rejects.toThrow(/not active/u);
     // 2回目のやめる操作は、何もしない。
     await expect(session.abandon()).resolves.toBeUndefined();
-  });
-
-  it('waits for a heartbeat write in progress when it is abandoned, and never rejects', async () => {
-    const writing = deferred();
-    const { session, timers } = createSession({ rewriteRunLock: async () => writing.promise });
-    await session.start(RUN_DIRECTORY, { mode: 'NEW_RUN' });
-    timers.tick();
-
-    let abandoned = false;
-    const abandoning = session.abandon().then(() => {
-      abandoned = true;
-    });
-    await flush();
-    expect(abandoned).toBe(false);
-
-    writing.reject(new Error('heartbeat write failed'));
-    await abandoning;
-    expect(abandoned).toBe(true);
   });
 });
 
@@ -618,8 +191,6 @@ describe('R4a: finishing and abandoning the session (design 4.3.1)', () => {
 // R4a2a: 再開のときの始め方（設計書 4.4、4.5）
 // ---------------------------------------------------------------------------------------------------------------
 
-/** 前の回のロックを取った、別のプロセスの ID。 */
-const OTHER_PROCESS_ID = 8_765;
 /** 再開する保存の、終わったページの ID。 */
 const COMPLETED_PAGE_IDS: readonly PageId[] = Object.freeze([PAGE_1]);
 /** 後始末で消したもの（偽の書き手が返す、Run のディレクトリからの相対パス）。 */
@@ -629,192 +200,26 @@ const REMOVED_PATHS: readonly string[] = Object.freeze([`pages/${PAGE_2}`, `chec
 const resume = (completedPageIds: readonly PageId[] = COMPLETED_PAGE_IDS): RunCheckpointSessionStartOptions =>
   Object.freeze({ mode: 'RESUME', completedPageIds });
 
-/**
- * 前の回のロック。既定は、別のプロセスが、今と同じ OS の起動の時刻で取り、ハートビートが1分前のもの（そのプロセスが動いていれば、
- * 動いている Run のもの）。
- */
-const previousLock = (overrides: Partial<RunLock> = {}): RunLock => Object.freeze({
-  processId: OTHER_PROCESS_ID,
-  bootedAtMs: BOOTED_AT_MS,
-  acquiredAtMs: STARTED_AT_MS - 2 * RUN_LOCK_STALE_AFTER_MS,
-  heartbeatAtMs: STARTED_AT_MS - RUN_LOCK_HEARTBEAT_INTERVAL_MS,
-  ...overrides,
-});
-
-/** すでにあったロックを返す、ロックの作成の差し替え。 */
-const lockExists = (existing: unknown): Pick<RunCheckpointStore, 'acquireRunLock'> => ({
-  acquireRunLock: async () => ({ acquired: false, existing }),
-});
-
-describe('R4a2a: starting the checkpoint session of a resumed Run (design 4.4, 4.5)', () => {
-  it('has the closed list of the reasons why a resume does not start', () => {
-    expect(RUN_CHECKPOINT_SESSION_RESUME_FAILURE_REASONS).toEqual(['LOCK_HELD_BY_ACTIVE_RUN', 'LOCK_TAKEN_OVER_CONCURRENTLY']);
-    expect(Object.isFrozen(RUN_CHECKPOINT_SESSION_RESUME_FAILURE_REASONS)).toBe(true);
-  });
-
-  it('creates the lock when there is none, cleans up the run directory before the heartbeat, and then starts the heartbeat', async () => {
-    let timersAtCleanUp = -1;
-    const { session, calls, clock, timers } = createSession({
-      cleanUpForResume: async () => {
-        timersAtCleanUp = timers.created.length;
-        return REMOVED_PATHS;
-      },
-    });
-    const lock = createRunLock(lockHost(STARTED_AT_MS));
+describe('R4a2a: starting the checkpoint session of a resumed Run (design 4.5)', () => {
+  it('cleans up the run directory, and then saves', async () => {
+    const { session, calls } = createSession({ cleanUpForResume: async () => REMOVED_PATHS });
 
     await expect(session.start(RUN_DIRECTORY, resume())).resolves.toEqual({ ok: true, removedPaths: REMOVED_PATHS });
 
-    // DEF-170: 後始末の後に、ロックが自分のものかを読み直す。
-    expect(calls).toEqual([
-      { kind: 'acquireRunLock', runDirectory: RUN_DIRECTORY, lock },
-      { kind: 'cleanUpForResume', runDirectory: RUN_DIRECTORY, completedPageIds: COMPLETED_PAGE_IDS },
-      { kind: 'readRunLock', runDirectory: RUN_DIRECTORY },
-    ]);
-    expect(timersAtCleanUp).toBe(0);
-    expect(timers.created).toHaveLength(1);
-    expect(timers.created[0]?.intervalMs).toBe(RUN_LOCK_HEARTBEAT_INTERVAL_MS);
-    expect(timers.created[0]?.unref).toHaveBeenCalledOnce();
-
-    // 始めた後は、新しい Run と同じく、ハートビートと保存を行う。
-    clock.nowMs = STARTED_AT_MS + RUN_LOCK_HEARTBEAT_INTERVAL_MS;
-    timers.tick();
-    await flush();
-    expect(calls.at(-1)).toEqual({
-      kind: 'rewriteRunLock',
-      runDirectory: RUN_DIRECTORY,
-      lock: renewRunLock(lock, STARTED_AT_MS + RUN_LOCK_HEARTBEAT_INTERVAL_MS),
-    });
+    expect(calls).toEqual([{ kind: 'cleanUpForResume', runDirectory: RUN_DIRECTORY, completedPageIds: COMPLETED_PAGE_IDS }]);
     await expect(session.saveState(sampleRunCheckpoint({ startPageFinished: true }))).resolves.toBeUndefined();
   });
 
-  it('fails without rewriting the lock, cleaning up or starting the heartbeat when the lock belongs to a running Run', async () => {
-    const existing = previousLock();
-    const isProcessRunning = vi.fn((processId: number) => processId === OTHER_PROCESS_ID);
-    const { session, calls, timers } = createSession(lockExists(existing), { isProcessRunning });
-
-    await expect(session.start(RUN_DIRECTORY, resume())).resolves.toEqual({
-      ok: false,
-      reason: 'LOCK_HELD_BY_ACTIVE_RUN',
-      existingLock: existing,
-    });
-
-    expect(isProcessRunning).toHaveBeenCalledWith(OTHER_PROCESS_ID);
-    expect(kindsOf(calls)).toEqual(['acquireRunLock']);
-    expect(timers.created).toEqual([]);
-    // 始められなかったセッションでは、保存しない。
-    await expect(session.saveState(sampleRunCheckpoint())).rejects.toThrow(/not active/u);
-    expect(kindsOf(calls)).toEqual(['acquireRunLock']);
-  });
-
-  it('judges the lock with isProcessRunning when no process check is given', async () => {
-    // このプロセスが取ったロック（今の OS の起動の時刻で、ハートビートは1分前）。このプロセスは動いているので、動いている Run のもの。
-    const existing = previousLock({ processId: process.pid });
-    const { store, calls } = fakeStore(lockExists(existing));
-    const timers = fakeTimers();
-    const session = new RunCheckpointSession({ store, now: () => STARTED_AT_MS, createLockHost: lockHost, timers: timers.timers });
-
-    await expect(session.start(RUN_DIRECTORY, resume())).resolves.toEqual({
-      ok: false,
-      reason: 'LOCK_HELD_BY_ACTIVE_RUN',
-      existingLock: existing,
-    });
-    expect(kindsOf(calls)).toEqual(['acquireRunLock']);
-    expect(timers.created).toEqual([]);
-  });
-
-  it.each([
-    [
-      'the OS has been restarted since (another boot time, even with the process ID of a running process)',
-      previousLock({ processId: PROCESS_ID, bootedAtMs: BOOTED_AT_MS - RUN_LOCK_BOOT_TIME_TOLERANCE_MS - 1 }),
-      true,
-    ],
-    ['the process of the lock is not running', previousLock(), false],
-    ['the heartbeat of the lock is older than the limit', previousLock({ heartbeatAtMs: STARTED_AT_MS - RUN_LOCK_STALE_AFTER_MS - 1 }), true],
-    ['the lock could not be read as JSON', null, true],
-  ] as const)('takes over the stale lock atomically when %s: takes it over through the store, cleans up, and then starts the heartbeat', async (
-    _case,
-    existing,
-    running,
-  ) => {
-    let timersAtCleanUp = -1;
-    const { session, calls, clock, timers } = createSession({
-      ...lockExists(existing),
-      cleanUpForResume: async () => {
-        timersAtCleanUp = timers.created.length;
-        return REMOVED_PATHS;
-      },
-    }, { isProcessRunning: () => running });
-    const lock = createRunLock(lockHost(STARTED_AT_MS));
-
-    await expect(session.start(RUN_DIRECTORY, resume())).resolves.toEqual({ ok: true, removedPaths: REMOVED_PATHS });
-
-    // DEF-172: 持ち主の process が動いているのに古く見えるロックは、猶予（注入した待ち）の後に読み直し、変わらなければ取り直す。
-    const graced = running && existing !== null;
-    expect(calls).toEqual([
-      { kind: 'acquireRunLock', runDirectory: RUN_DIRECTORY, lock },
-      ...(graced ? [{ kind: 'readRunLock', runDirectory: RUN_DIRECTORY }] : []),
-      { kind: 'takeOverRunLock', runDirectory: RUN_DIRECTORY, judged: existing, lock },
-      { kind: 'cleanUpForResume', runDirectory: RUN_DIRECTORY, completedPageIds: COMPLETED_PAGE_IDS },
-      { kind: 'readRunLock', runDirectory: RUN_DIRECTORY },
-    ]);
-    expect(timersAtCleanUp).toBe(0);
-    expect(timers.created).toHaveLength(1);
-    expect(timers.created[0]?.unref).toHaveBeenCalledOnce();
-    // ハートビートは、取り直した自分のロックを更新する。
-    clock.nowMs = STARTED_AT_MS + RUN_LOCK_HEARTBEAT_INTERVAL_MS;
-    timers.tick();
-    await flush();
-    expect(calls.at(-1)).toEqual({
-      kind: 'rewriteRunLock',
-      runDirectory: RUN_DIRECTORY,
-      lock: renewRunLock(lock, STARTED_AT_MS + RUN_LOCK_HEARTBEAT_INTERVAL_MS),
-    });
-  });
-
-  // LG-4（テストの組の設計書 3.7.3）: 書き換えて読み直す前の方式は捨てた。ほかの起動が同時に取り直したら（原子的な取り直しの `wx` に負けた）、
-  // ロックに触れずに（相手のロックのまま）、読み直した今の中身で断る。
-  it('fails without touching the lock again, cleaning up or starting the heartbeat when another start took the stale lock over at the same time', async () => {
-    const theirs = { ...createRunLock(lockHost(STARTED_AT_MS)), processId: OTHER_PROCESS_ID };
-    const { session, calls, timers } = createSession({
-      ...lockExists(previousLock()),
-      takeOverRunLock: async () => ({ outcome: 'LOST' }),
-      readRunLock: async () => theirs,
-    }, { isProcessRunning: () => false });
-
-    await expect(session.start(RUN_DIRECTORY, resume())).resolves.toEqual({
-      ok: false,
-      reason: 'LOCK_TAKEN_OVER_CONCURRENTLY',
-      existingLock: theirs,
-    });
-
-    expect(kindsOf(calls)).toEqual(['acquireRunLock', 'takeOverRunLock', 'readRunLock']);
-    expect(timers.created).toEqual([]);
-    timers.tick();
-    await flush();
-    await expect(session.saveState(sampleRunCheckpoint())).rejects.toThrow(/not active/u);
-    await expect(session.abandon()).resolves.toBeUndefined();
-    // ロックは相手のもののまま（書き換えも、消すこともしない）。
-    expect(kindsOf(calls)).toEqual(['acquireRunLock', 'takeOverRunLock', 'readRunLock']);
-  });
-
-  it.each([
-    ['taking over the stale lock', 'takeOverRunLock', ['acquireRunLock', 'takeOverRunLock']],
-    ['cleaning up the run directory', 'cleanUpForResume', ['acquireRunLock', 'takeOverRunLock', 'cleanUpForResume']],
-  ] as const)('passes on the failure of the store in %s, and starts no heartbeat', async (_case, operation, expectedKinds) => {
-    const failure = new Error(`${operation} failed`);
-    const { session, calls, timers } = createSession({
-      ...lockExists(previousLock()),
-      [operation]: async () => Promise.reject(failure),
-    }, { isProcessRunning: () => false });
+  it('passes on the failure of the cleanup, and does not start', async () => {
+    const failure = new Error('cleanUpForResume failed');
+    const { session } = createSession({ cleanUpForResume: async () => Promise.reject(failure) });
 
     await expect(session.start(RUN_DIRECTORY, resume())).rejects.toBe(failure);
 
-    expect(kindsOf(calls)).toEqual(expectedKinds);
-    expect(timers.created).toEqual([]);
     await expect(session.saveState(sampleRunCheckpoint())).rejects.toThrow(/not active/u);
   });
 
-  it('rejects a resume without the list of completed page IDs, or with a malformed page ID, before touching the lock', async () => {
+  it('rejects a resume without the list of completed page IDs, or with a malformed page ID, before touching the store', async () => {
     const { session, calls } = createSession();
 
     await expect(session.start(RUN_DIRECTORY, { mode: 'RESUME' } as unknown as RunCheckpointSessionStartOptions)).rejects.toThrow(TypeError);
@@ -823,21 +228,5 @@ describe('R4a2a: starting the checkpoint session of a resumed Run (design 4.4, 4
 
     await expect(session.start(RUN_DIRECTORY, resume([]))).resolves.toEqual({ ok: true, removedPaths: [] });
     await expect(session.start(RUN_DIRECTORY, resume())).rejects.toThrow(/already/u);
-  });
-
-  it('rejects a process check that is not a function, and a store without the operations of a resume, with TypeError', () => {
-    const { store } = fakeStore();
-    const valid: RunCheckpointSessionOptions = { store, now: () => STARTED_AT_MS };
-    const invalid: unknown[] = [
-      { ...valid, isProcessRunning: true },
-      { ...valid, store: { ...store, readRunLock: undefined } },
-      { ...valid, store: { ...store, cleanUpForResume: undefined } },
-      // LG-4: 原子的な取り直しの口は必須（前の方式の取り直しは捨てた）。
-      { ...valid, store: { ...store, takeOverRunLock: undefined } },
-    ];
-    for (const options of invalid) {
-      expect(() => new RunCheckpointSession(options as RunCheckpointSessionOptions)).toThrow(TypeError);
-    }
-    expect(() => new RunCheckpointSession({ ...valid, isProcessRunning: () => true })).not.toThrow();
   });
 });

@@ -1,13 +1,12 @@
 /**
  * `run` のコマンドの CLI の表示（Task 14〜17 の設計書 第7章、6.1.8、6.1.9、実装計画 Task 17 の Step 2。Task 24 の設計書 4.1。T24a）。
  * Run の実行、書き出し、保存の終わり方は、監査の中核（`audit-run.ts` の `executeAuditRun`）が行い、型つきの結果を返す。このファイルは、
- * 中核を呼び、結果と観測の口の値から、今と同じ日本語の行を、今と同じ順と内容で、標準出力と標準エラーに出すだけにする（行の組み立ては
- * `output.ts`）。CLI の標準出力・標準エラー・終了コードは、切り出す前と1文字も変えない（`tests/integration/cli-output-parity.test.ts`）。
+ * 中核を呼び、結果と観測の口の値から、日本語の行を、標準出力と標準エラーに出すだけにする（行の組み立ては `output.ts`。文言は
+ * `src/presentation/messages.ts`）。
  * Playwright を読み込むので（中核が読み込む）、`main.ts` は、`run` のときだけ、このファイルを読み込む。
  *
  * 出し方（中断した Run の再開の設計書 4.7、4.7.1。DEF-009）:
  * - 出力先の実行中の Run（`RUN_ACTIVE`）: 文言を標準エラーに示して終える（終了コード 4。`--new` でも同じ）。標準出力には何も書かない。
- *   別の起動が開始の段にいて、Run の ID がまだ決まっていない場合（DEF-057）は、Run の ID のない文言にする。
  * - 版の違い（`VERSION_MISMATCH`）: 文言を標準エラーに示して終える（終了コード 4）。標準出力には何も書かない。
  * - Run を始める前（観測の口 `onRunStarting`）: 開始の知らせ（壊れた保存、設定が違う）と、再開の知らせ（再開する、最後の処理だけを行う）を、
  *   この順に1回の書き込みで標準出力に示し、続けて開始の行を示す。
@@ -37,7 +36,6 @@ import {
 } from './audit-run.js';
 import type { CliStreams } from './main.js';
 import {
-  activeRunLines,
   checkpointFinishFailedLines,
   differentConfigRunLines,
   differentVersionRunLines,
@@ -54,8 +52,7 @@ import {
   unreadableCheckpointLines,
 } from './output.js';
 import type { CliOutput } from './output-stream.js';
-import { formatDuration } from '../presentation/format.js';
-import { runLockGraceWaitText, runLockLostText, startingRunInOutputDirectoryText } from '../presentation/messages.js';
+import { runActiveInOutputDirectoryText } from '../presentation/messages.js';
 
 export { PRODUCTION_RUN_DEPENDENCIES, artifactFileReader } from './audit-run.js';
 
@@ -137,10 +134,6 @@ export async function runAuditCommand(
       onNotice: (notice) => {
         writeStdoutLines(runNoticeLines(notice));
       },
-      // DEF-172: 取り直す前に、動いている持ち主のロックが更新されるかを待つことを知らせる。
-      onLockGraceWait: (waitMs) => {
-        writeStdoutLines([runLockGraceWaitText(formatDuration(waitMs))]);
-      },
     });
   } catch (error) {
     await stdoutWritten;
@@ -150,15 +143,7 @@ export async function runAuditCommand(
 
   switch (outcome.kind) {
     case 'RUN_ACTIVE':
-      // DEF-170: Run を始めた後にロックを別の起動に持たれたときは、その知らせにする。別の起動が開始の段にいて、Run の ID がまだ決まっていないとき
-      // （DEF-057）は、Run の ID のない文にする。
-      if (outcome.lockLost === true) {
-        await streams.stderr.write(joinLines([runLockLostText]));
-        return outcome.exitCode;
-      }
-      await streams.stderr.write(joinLines(outcome.activeRunId === null
-        ? [startingRunInOutputDirectoryText]
-        : activeRunLines(outcome.activeRunId)));
+      await streams.stderr.write(joinLines([runActiveInOutputDirectoryText]));
       return outcome.exitCode;
     case 'VERSION_MISMATCH':
       await streams.stderr.write(joinLines(differentVersionRunLines(outcome.runId, outcome.differences)));
@@ -186,10 +171,11 @@ export async function runAuditCommand(
 
 /** 結果の行（空行と、表示用モデルの要約の行）を標準出力に示す。 */
 async function writeRunSummary(
-  outputs: { readonly summary: RunSummaryView; readonly runDirectory: string },
+  outputs: { readonly summary: RunSummaryView; readonly runDirectory: string; readonly bundlePartCount?: number },
   stdout: CliOutput,
 ): Promise<void> {
-  await stdout.write(joinLines(['', ...runSummaryLines(outputs.summary, outputs.runDirectory)]));
+  // AUD-1d: 部に分けたバンドルは、全部の部のパスを示す。
+  await stdout.write(joinLines(['', ...runSummaryLines(outputs.summary, outputs.runDirectory, outputs.bundlePartCount ?? 1)]));
 }
 
 /**

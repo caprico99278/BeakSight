@@ -1,0 +1,7 @@
+[
+{"version":"v25.1.0","date":"2026-10-28","files":["headers","linux-arm64","linux-x64","osx-arm64-tar","osx-x64-tar","src","win-x64-zip"],"npm":"11.6.2","lts":false,"security":false},
+{"version":"v24.31.0","date":"2026-10-30","files":["headers","linux-arm64","linux-x64","osx-arm64-tar","osx-x64-tar","src"],"npm":"11.6.1","lts":"Krypton","security":false},
+{"version":"v24.30.2","date":"2026-10-21","files":["headers","linux-arm64","linux-x64","osx-arm64-tar","osx-x64-tar","src","win-x64-zip"],"npm":"11.6.1","lts":"Krypton","security":true},
+{"version":"v24.22.0","date":"2026-05-01","files":["headers","linux-arm64","linux-x64","osx-arm64-tar","osx-x64-tar","src","win-x64-zip"],"npm":"11.4.0","lts":"Krypton","security":false},
+{"version":"v22.20.0","date":"2026-04-01","files":["headers","linux-x64","osx-arm64-tar","src","win-x64-zip"],"npm":"10.9.3","lts":"Jod","security":false}
+]

@@ -1,6 +1,6 @@
 // T37R-fix-A（Task 37 の設計書 8 章の T37R の行の M-4）: Guard の段階を読む口（`passiveRequestGuardStageOf`。読み取りだけ）と、probe の押す前の
 // 凍結の確かめ（`src/interaction/submission-probe.ts` の `interactionFreezeHolds`）がそれを使うこと。
-// 通す部品（どれも本物。Chromium はテストの既定の headless と、CLI の起動の設定の両方）: `BrowserContextFactory` と Guard、127.0.0.1 の自前のサーバ。
+// 通す部品（どれも本物。Chromium はテストの既定の Chromium。TEST-SLIM G1）: `BrowserContextFactory` と Guard、127.0.0.1 の自前のサーバ。
 // - 口は、凍結の前に `PASSIVE_ACTIVE`、凍結の後に `FROZEN_ACTIVE`、Context を閉じた後に `CLOSED` を返す。Guard のない Context の page は `null`。
 // - 口を読んでも、段階も要求の扱いも変わらない（読み取りだけ）。
 import type { Browser } from 'playwright';
@@ -8,19 +8,16 @@ import { afterAll, afterEach, beforeAll, describe, expect, it } from 'vitest';
 import { BrowserContextFactory } from '../../src/browser/context-factory.js';
 import { activateInteractionFreeze, passiveRequestGuardStageOf } from '../../src/safety/passive-request-guard.js';
 import { SafetyLedger } from '../../src/safety/safety-ledger.js';
-import { closeTestContexts, launchCliChromium, launchHeadlessChromium } from '../helpers/chromium.js';
+import { closeTestContexts, DEFAULT_CHROMIUM_LAUNCHERS } from '../helpers/chromium.js';
 import { startLoopbackHttpServer, type LoopbackHttpServer } from '../helpers/loopback-server.js';
 import { fastRunConfig } from '../helpers/run-harness.js';
 import { TEST_FACTORY_OPTIONS } from '../helpers/test-config.js';
 
-const LAUNCHERS: readonly (readonly [string, () => Promise<Browser>])[] = [
-  ['the default test Chromium', () => launchHeadlessChromium()],
-  ['the CLI Chromium', () => launchCliChromium()],
-];
 const TEST_TIMEOUT_MS = 60_000;
 const PAGE_HTML = '<!doctype html><html lang="ja"><head><meta charset="utf-8"><title>段階</title><link rel="icon" href="data:,"></head><body><p>段階</p></body></html>';
 
-describe.each(LAUNCHERS)('T37R-fix-A: the Guard stage reader with %s', (_label, launch) => {
+// TEST-SLIM G1: 段階を読む口の確かめで、サーバに届く要求の漏れではないので、既定の Chromium だけで流す。
+describe.each(DEFAULT_CHROMIUM_LAUNCHERS)('T37R-fix-A: the Guard stage reader with %s', (_label, launch) => {
   let browser: Browser;
   let server: LoopbackHttpServer | undefined;
   const factories: BrowserContextFactory[] = [];

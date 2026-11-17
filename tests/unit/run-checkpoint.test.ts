@@ -23,18 +23,7 @@ import { createLoadMeter } from '../../src/crawl/load-meter.js';
 import { createNavigationPacer } from '../../src/crawl/navigation-pacer.js';
 import { CrawlFrontier, type CrawlFrontierSnapshot, type CrawlUrlEntry } from '../../src/orchestration/crawl-frontier.js';
 import { IdAllocator } from '../../src/orchestration/id-allocator.js';
-import {
-  createRunLock,
-  currentProcessRunLockHost,
-  isProcessRunning,
-  judgeRunLock,
-  renewRunLock,
-  RUN_LOCK_BOOT_TIME_TOLERANCE_MS,
-  RUN_LOCK_HEARTBEAT_INTERVAL_MS,
-  RUN_LOCK_STALE_AFTER_MS,
-  type RunLock,
-  type RunLockJudgementInput,
-} from '../../src/core/process-lock.js';
+import { currentProcessRunLockHost, isProcessRunning, RUN_LOCK_BOOT_TIME_TOLERANCE_MS } from '../../src/core/process-lock.js';
 import {
   checkRunCheckpointConsistency,
   checkRunCheckpointPageConsistency,
@@ -243,6 +232,9 @@ const samplePages = (): readonly RunCheckpointPage[] => [
 
 /** 保存の値の一部を上書きした値（`RunCheckpoint` の形のまま。整合と判定のテスト用）。 */
 const withCheckpoint = (checkpoint: RunCheckpoint, overrides: Partial<RunCheckpoint>): RunCheckpoint => ({ ...checkpoint, ...overrides });
+
+/** L14: 深さの確かめで、保存の設定に足す深さの上限（指定したときだけ効く）。 */
+const SAMPLE_MAX_DEPTH = 20;
 
 const expectSchemaRejects = async (
   schema: 'checkpoint' | 'checkpoint-page',
@@ -531,8 +523,9 @@ describe('R2: checkpoint.schema.json rejects broken checkpoints (design 4.2)', (
       value.completedPageIds = [PAGE_1, PAGE_1];
     }, '/completedPageIds'],
     ['an effective configuration in another shape than run.json', (value: Record<string, unknown>) => {
-      delete ((value.effectiveConfig as { crawl: Record<string, unknown> }).crawl).maxPages;
-    }, 'maxPages'],
+      // L14: ページの上限は任意になったので、必ず持つ読み込みの間隔で確かめる。
+      delete ((value.effectiveConfig as { crawl: Record<string, unknown> }).crawl).minNavigationIntervalMs;
+    }, 'minNavigationIntervalMs'],
   ] as const)('rejects %s', async (_name, breakValue, errorPart) => {
     const value = mutableCopy(await sampleCheckpoint());
     breakValue(value);
@@ -698,6 +691,13 @@ describe('R8: the allocator and the crawl frontier must be restorable from the c
     withCheckpoint(checkpoint, {
       frontier: { entries: checkpoint.frontier.entries.map((entry) => (entry.pageId === pageId ? change(entry) : entry)) },
     });
+  /** L14: 深さの上限は指定したときだけ効くので、深さの確かめは、保存の設定に上限（`SAMPLE_MAX_DEPTH`）を足した保存で行う。 */
+  const withMaxDepth = (checkpoint: RunCheckpoint): RunCheckpoint => withCheckpoint(checkpoint, {
+    effectiveConfig: {
+      ...checkpoint.effectiveConfig,
+      crawl: { ...checkpoint.effectiveConfig.crawl, maxDepth: SAMPLE_MAX_DEPTH },
+    },
+  });
   /** 保存の実効の設定の `crawl` の一部を変えた保存。 */
   const withCrawlConfig = (checkpoint: RunCheckpoint, crawl: Partial<EffectiveAuditConfig['crawl']>): RunCheckpoint =>
     withCheckpoint(checkpoint, {
@@ -709,7 +709,8 @@ describe('R8: the allocator and the crawl frontier must be restorable from the c
     return result.ok ? [] : result.errors;
   };
   /** 保存の実効の設定が残さない query の引数を付けた、正規形でない URL。 */
-  const withUnkeptQuery = (url: typeof THIRD_URL): typeof THIRD_URL => `${url}?page=2` as typeof THIRD_URL;
+  // L14: 残す名前を選んでいない設定は query を残すので、正規化で捨てる query（追跡用の名前）にする。
+  const withUnkeptQuery = (url: typeof THIRD_URL): typeof THIRD_URL => `${url}?utm_source=mail` as typeof THIRD_URL;
 
   it.each([
     [
@@ -718,7 +719,7 @@ describe('R8: the allocator and the crawl frontier must be restorable from the c
     ],
     [
       'a URL deeper than the max depth of the saved configuration, without MAX_DEPTH_REACHED',
-      (checkpoint: RunCheckpoint) => withEntry(checkpoint, PAGE_3, (entry) => ({ ...entry, depth: checkpoint.effectiveConfig.crawl.maxDepth + 1 })),
+      (checkpoint: RunCheckpoint) => withEntry(withMaxDepth(checkpoint), PAGE_3, (entry) => ({ ...entry, depth: SAMPLE_MAX_DEPTH + 1 })),
     ],
     [
       'the same URL twice',
@@ -746,7 +747,7 @@ describe('R8: the allocator and the crawl frontier must be restorable from the c
   it('reports both the allocator and the crawl frontier that cannot be restored at once, without throwing', async () => {
     const checkpoint = await sampleCheckpoint();
     const broken = withCheckpoint(
-      withEntry(checkpoint, PAGE_3, (entry) => ({ ...entry, depth: checkpoint.effectiveConfig.crawl.maxDepth + 1 })),
+      withEntry(withMaxDepth(checkpoint), PAGE_3, (entry) => ({ ...entry, depth: SAMPLE_MAX_DEPTH + 1 })),
       { allocator: { ...checkpoint.allocator, nextEvidenceSequence: Number.MAX_SAFE_INTEGER + 1 } },
     );
 
@@ -758,10 +759,11 @@ describe('R8: the allocator and the crawl frontier must be restorable from the c
 
   it('restores the crawl frontier with the max depth and the query parameters of the saved effective configuration', async () => {
     const checkpoint = await sampleCheckpoint();
-    const withQuery = withEntry(checkpoint, PAGE_3, (entry) => ({ ...entry, url: withUnkeptQuery(entry.url) }));
+    const withQuery = withEntry(checkpoint, PAGE_3, (entry) => ({ ...entry, url: `${entry.url}?page=2` as typeof THIRD_URL }));
 
-    // 保存の設定が `page` を残すなら、その URL は正規形である。
+    // 保存の設定が `page` を残すなら、その URL は正規形である。L14: 別の名前だけを残す設定では、正規形でない。
     expect(checkRunCheckpointConsistency(withCrawlConfig(withQuery, { allowedQueryParameters: ['page'] }))).toEqual({ ok: true });
+    expect(errorsOf(withCrawlConfig(withQuery, { allowedQueryParameters: ['other'] }))).toEqual([expect.stringContaining(FRONTIER_NOT_RESTORABLE)]);
     // 保存の設定の深さの上限より深い URL（深さ 1 の記録）は、作り直せない。
     expect(errorsOf(withCrawlConfig(checkpoint, { maxDepth: 0 }))).toEqual([expect.stringContaining(FRONTIER_NOT_RESTORABLE)]);
   });
@@ -778,9 +780,9 @@ describe('R8: the allocator and the crawl frontier must be restorable from the c
 
   it('accepts a URL deeper than the max depth that is SKIPPED by MAX_DEPTH_REACHED', async () => {
     const checkpoint = await sampleCheckpoint();
-    const deeper = withEntry(checkpoint, PAGE_3, (entry) => ({
+    const deeper = withEntry(withMaxDepth(checkpoint), PAGE_3, (entry) => ({
       ...entry,
-      depth: checkpoint.effectiveConfig.crawl.maxDepth + 1,
+      depth: SAMPLE_MAX_DEPTH + 1,
       state: 'SKIPPED',
       skipReason: { code: 'MAX_DEPTH_REACHED', detail: null },
     }));
@@ -1315,7 +1317,7 @@ describe('R2: comparing the effective configurations (design 4.7)', () => {
 
   it('returns the path of one different item', () => {
     expect(effectiveConfigDifferences(config(), changed((value) => {
-      writable(value).crawl.maxPages += 1;
+      writable(value).crawl.maxPages = (value.crawl.maxPages ?? 1) + 1;
     }))).toEqual(['crawl.maxPages']);
   });
 
@@ -1350,8 +1352,9 @@ describe('R2: comparing the effective configurations (design 4.7)', () => {
     const saved = changed((value) => {
       (value.audit as unknown as Record<string, unknown>).legacy = true;
     });
+    // L14: 深さの上限は、指定したときだけ持つ。片方だけが指定した形にする。
     const current = changed((value) => {
-      delete (value.crawl as unknown as Record<string, unknown>).maxDepth;
+      (value.crawl as unknown as Record<string, unknown>).maxDepth = 7;
     });
 
     expect(effectiveConfigDifferences(saved, current)).toEqual(['crawl.maxDepth', 'audit.legacy']);
@@ -1476,7 +1479,7 @@ describe('R5a: selecting the run to resume (design 4.7.1)', () => {
   it('starts a new Run with the paths of the different items when the latest run of the same target has another configuration', async () => {
     const checkpoint = await resumable();
     const otherConfig = withCheckpoint(checkpoint, {
-      effectiveConfig: { ...checkpoint.effectiveConfig, crawl: { ...checkpoint.effectiveConfig.crawl, maxPages: checkpoint.effectiveConfig.crawl.maxPages + 1 } },
+      effectiveConfig: { ...checkpoint.effectiveConfig, crawl: { ...checkpoint.effectiveConfig.crawl, maxPages: (checkpoint.effectiveConfig.crawl.maxPages ?? 1) + 1 } },
     });
     const latest = runOf(2, otherConfig, NEWER);
     // 設定が同じ古い途中の Run があっても、候補は最も新しいものだけである。
@@ -1489,7 +1492,7 @@ describe('R5a: selecting the run to resume (design 4.7.1)', () => {
     const checkpoint = await finished();
     // 比べる項目（ページ数の上限）を変える（R5-fix-round-1 から、出力先は比べないため）。
     const otherConfig = withCheckpoint(checkpoint, {
-      effectiveConfig: { ...checkpoint.effectiveConfig, crawl: { ...checkpoint.effectiveConfig.crawl, maxPages: checkpoint.effectiveConfig.crawl.maxPages + 1 } },
+      effectiveConfig: { ...checkpoint.effectiveConfig, crawl: { ...checkpoint.effectiveConfig.crawl, maxPages: (checkpoint.effectiveConfig.crawl.maxPages ?? 1) + 1 } },
     });
 
     expect(selectRunToResume([runOf(1, otherConfig, NEWER)], current())).toEqual({ kind: 'START_NEW' });
@@ -1528,7 +1531,7 @@ describe('R5a: selecting the run to resume (design 4.7.1)', () => {
     it('does not resume, without the output directory in the different items, when another item differs too', async () => {
       const checkpoint = withAbsoluteOutput(await resumable());
       const latest = runOf(1, withCheckpoint(checkpoint, {
-        effectiveConfig: { ...checkpoint.effectiveConfig, crawl: { ...checkpoint.effectiveConfig.crawl, maxPages: checkpoint.effectiveConfig.crawl.maxPages + 1 } },
+        effectiveConfig: { ...checkpoint.effectiveConfig, crawl: { ...checkpoint.effectiveConfig.crawl, maxPages: (checkpoint.effectiveConfig.crawl.maxPages ?? 1) + 1 } },
       }), NEWER);
       expect(effectiveConfigDifferences(latest.checkpoint.effectiveConfig, current())).toEqual(['crawl.maxPages', 'output.directory']);
 
@@ -1551,7 +1554,7 @@ describe('R5a: selecting the run to resume (design 4.7.1)', () => {
         effectiveConfig: {
           ...checkpoint.effectiveConfig,
           browser: { ...checkpoint.effectiveConfig.browser, headed: !checkpoint.effectiveConfig.browser.headed },
-          crawl: { ...checkpoint.effectiveConfig.crawl, maxPages: checkpoint.effectiveConfig.crawl.maxPages + 1 },
+          crawl: { ...checkpoint.effectiveConfig.crawl, maxPages: (checkpoint.effectiveConfig.crawl.maxPages ?? 1) + 1 },
         },
       }), NEWER);
       expect(effectiveConfigDifferences(latest.checkpoint.effectiveConfig, current())).toEqual(['crawl.maxPages', 'browser.headed']);
@@ -1594,56 +1597,11 @@ describe('R5a: selecting the run to resume (design 4.7.1)', () => {
   });
 });
 
-describe('R2: the run lock (design 4.4)', () => {
+describe('R2: the process parts (the control instance lock uses them)', () => {
   const PROCESS_ID = 4242;
-  const BOOTED_AT_MS = 1_790_000_000_000;
-  const NOW_MS = BOOTED_AT_MS + 3_600_000;
-  const lockAt = (heartbeatAtMs: number, overrides: Partial<RunLock> = {}): RunLock => ({
-    ...renewRunLock(createRunLock({ processId: PROCESS_ID, bootedAtMs: BOOTED_AT_MS, nowMs: heartbeatAtMs - 1 }), heartbeatAtMs),
-    ...overrides,
-  });
-  const judgement = (overrides: Partial<RunLockJudgementInput> = {}): RunLockJudgementInput => ({
-    nowMs: NOW_MS,
-    bootedAtMs: BOOTED_AT_MS,
-    isProcessRunning: () => true,
-    ...overrides,
-  });
 
   afterEach(() => {
     vi.restoreAllMocks();
-  });
-
-  it('uses the times of design 4.4 (OS boot time tolerance of 120 seconds, heartbeat every minute, stale after 5 minutes)', () => {
-    expect(RUN_LOCK_BOOT_TIME_TOLERANCE_MS).toBe(120_000);
-    expect(RUN_LOCK_HEARTBEAT_INTERVAL_MS).toBe(60_000);
-    expect(RUN_LOCK_STALE_AFTER_MS).toBe(300_000);
-    expect(RUN_LOCK_HEARTBEAT_INTERVAL_MS).toBeLessThan(RUN_LOCK_STALE_AFTER_MS);
-  });
-
-  it('creates a frozen lock from the process values, acquired and renewed at the current time', () => {
-    const lock = createRunLock({ processId: PROCESS_ID, bootedAtMs: BOOTED_AT_MS, nowMs: NOW_MS });
-
-    expect(lock).toEqual({ processId: PROCESS_ID, bootedAtMs: BOOTED_AT_MS, acquiredAtMs: NOW_MS, heartbeatAtMs: NOW_MS });
-    expect(Object.isFrozen(lock)).toBe(true);
-    expect(throughJson(lock)).toEqual(lock);
-  });
-
-  it('renews only the time of the last update', () => {
-    const lock = createRunLock({ processId: PROCESS_ID, bootedAtMs: BOOTED_AT_MS, nowMs: NOW_MS });
-    const renewed = renewRunLock(lock, NOW_MS + RUN_LOCK_HEARTBEAT_INTERVAL_MS);
-
-    expect(renewed).toEqual({ ...lock, heartbeatAtMs: NOW_MS + RUN_LOCK_HEARTBEAT_INTERVAL_MS });
-    expect(Object.isFrozen(renewed)).toBe(true);
-    expect(lock.heartbeatAtMs).toBe(NOW_MS);
-  });
-
-  it.each([
-    ['a negative process ID', { processId: -1, bootedAtMs: BOOTED_AT_MS, nowMs: NOW_MS }],
-    ['process ID 0', { processId: 0, bootedAtMs: BOOTED_AT_MS, nowMs: NOW_MS }],
-    ['a fractional time', { processId: PROCESS_ID, bootedAtMs: BOOTED_AT_MS, nowMs: NOW_MS + 0.5 }],
-    ['a negative boot time', { processId: PROCESS_ID, bootedAtMs: -1, nowMs: NOW_MS }],
-  ] as const)('rejects %s when creating a lock', (_name, host) => {
-    expect(() => createRunLock(host)).toThrow(RangeError);
   });
 
   it('reads the values of the current process (process ID and the OS boot time from the uptime)', () => {
@@ -1654,66 +1612,6 @@ describe('R2: the run lock (design 4.4)', () => {
     expect(host.nowMs).toBe(nowMs);
     expect(Number.isSafeInteger(host.bootedAtMs)).toBe(true);
     expect(Math.abs(host.bootedAtMs - (nowMs - uptime() * 1000))).toBeLessThan(RUN_LOCK_BOOT_TIME_TOLERANCE_MS);
-    expect(judgeRunLock(createRunLock(host), { ...judgement(), nowMs, bootedAtMs: host.bootedAtMs, isProcessRunning })).toBe('ACTIVE');
-  });
-
-  it('judges a lock as ACTIVE only when the OS boot time, the process, and the last update all match', () => {
-    const isRunning = vi.fn(() => true);
-
-    expect(judgeRunLock(lockAt(NOW_MS - RUN_LOCK_HEARTBEAT_INTERVAL_MS), judgement({ isProcessRunning: isRunning }))).toBe('ACTIVE');
-    expect(isRunning).toHaveBeenCalledWith(PROCESS_ID);
-  });
-
-  it.each([
-    ['later', RUN_LOCK_BOOT_TIME_TOLERANCE_MS + 1],
-    ['earlier', -(RUN_LOCK_BOOT_TIME_TOLERANCE_MS + 1)],
-  ] as const)('judges a lock as STALE when the OS booted more than 120 seconds %s (the PC was restarted), even if the process ID is running', (_name, offsetMs) => {
-    const isRunning = vi.fn(() => true);
-
-    expect(judgeRunLock(lockAt(NOW_MS), judgement({ bootedAtMs: BOOTED_AT_MS + offsetMs, isProcessRunning: isRunning }))).toBe('STALE');
-    expect(isRunning).not.toHaveBeenCalled();
-  });
-
-  it.each([RUN_LOCK_BOOT_TIME_TOLERANCE_MS, -RUN_LOCK_BOOT_TIME_TOLERANCE_MS])(
-    'goes on to the next conditions when the OS boot time differs by exactly %i ms',
-    (offsetMs) => {
-      const isRunning = vi.fn(() => true);
-
-      expect(judgeRunLock(lockAt(NOW_MS), judgement({ bootedAtMs: BOOTED_AT_MS + offsetMs, isProcessRunning: isRunning }))).toBe('ACTIVE');
-      expect(isRunning).toHaveBeenCalledWith(PROCESS_ID);
-      expect(judgeRunLock(lockAt(NOW_MS), judgement({ bootedAtMs: BOOTED_AT_MS + offsetMs, isProcessRunning: () => false }))).toBe('STALE');
-    },
-  );
-
-  it('judges a lock as STALE when its process is not running', () => {
-    expect(judgeRunLock(lockAt(NOW_MS), judgement({ isProcessRunning: () => false }))).toBe('STALE');
-  });
-
-  it('judges a lock as STALE when its last update is older than 5 minutes, and ACTIVE at exactly 5 minutes', () => {
-    expect(judgeRunLock(lockAt(NOW_MS - RUN_LOCK_STALE_AFTER_MS - 1), judgement())).toBe('STALE');
-    expect(judgeRunLock(lockAt(NOW_MS - RUN_LOCK_STALE_AFTER_MS), judgement())).toBe('ACTIVE');
-  });
-
-  it.each([
-    ['null', null],
-    ['a string', 'locked'],
-    ['an array', [PROCESS_ID]],
-    ['an empty object', {}],
-    ['a lock without the boot time', (() => {
-      const { bootedAtMs: _bootedAtMs, ...rest } = lockAt(NOW_MS);
-      return rest;
-    })()],
-    ['a lock with an extra property', { ...lockAt(NOW_MS), host: 'other' }],
-    ['a string process ID', { ...lockAt(NOW_MS), processId: String(PROCESS_ID) }],
-    ['process ID 0', lockAt(NOW_MS, { processId: 0 })],
-    ['a negative process ID', lockAt(NOW_MS, { processId: -1 })],
-    ['a fractional time', lockAt(NOW_MS, { heartbeatAtMs: NOW_MS + 0.5 })],
-    ['a negative time', lockAt(NOW_MS, { acquiredAtMs: -1 })],
-  ] as const)('judges %s as a STALE lock (it is rebuilt), without asking whether a process is running', (_name, lock) => {
-    const isRunning = vi.fn(() => true);
-
-    expect(judgeRunLock(lock, judgement({ isProcessRunning: isRunning }))).toBe('STALE');
-    expect(isRunning).not.toHaveBeenCalled();
   });
 
   it('checks whether a process is running with signal 0, and treats a process of another user (EPERM) as running', () => {

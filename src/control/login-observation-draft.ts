@@ -22,12 +22,12 @@ import {
   isLoginObservedSuccessSelector,
   type LoginObservedQueryValueName,
 } from '../discovery/login-observation.js';
-import { LOGIN_SIDE_REQUEST_METHODS, MAX_LOGIN_SIDE_REQUESTS, MIN_LOGIN_SIDE_REQUESTS_PER_LOGIN_STAGE, type LoginSideRequestMethod } from './auth/auth-setup-contracts.js';
+import { LOGIN_SIDE_REQUEST_METHODS, MIN_LOGIN_SIDE_REQUESTS_PER_LOGIN_STAGE, type LoginSideRequestMethod } from './auth/auth-setup-contracts.js';
 import { isAcceptedPath } from './auth/auth-setup-policy.js';
 import { draftValueOf, type DraftValue } from './approval/draft-value-origin.js';
 import { ENTRY_CHECK_FIELDS, isAcceptedEntrySelector, type EntryCheckField } from './entry-check.js';
 import {
-  MAX_WORKER_LOGIN_STAGE_BLOCKED_PATH_LENGTH,
+  WORKER_LOGIN_STAGE_SEND_RULE_ROW_REASONS,
   type WorkerLoginObservation,
   type WorkerLoginStageBlockedRequest,
   type WorkerLoginStageBlockReason,
@@ -55,10 +55,15 @@ export type LoginStageRegistration =
     readonly method: LoginSideRequestMethod;
     readonly maxPerLoginStage: number;
   }
-  | { readonly kind: 'MANUAL'; readonly reason: 'REDACTED_PATH' | 'ALREADY_REGISTERED' };
+  // DEF-194: `NOT_NEEDED` は、自動ログインの段で通した行と、その通し方の決まりで止めた行（登録は要らない。ボタンも案内の手直しも出さない）。
+  | { readonly kind: 'MANUAL'; readonly reason: 'REDACTED_PATH' | 'ALREADY_REGISTERED' | 'NOT_NEEDED' };
 
 /** 止めた要求の行の登録先（ファイルの先頭の「振り分け」）。 */
 export const loginStageRegistrationOf = (row: WorkerLoginStageBlockedRequest): LoginStageRegistration => {
+  // DEF-194（設計書 `2026-11-04-beaksight-login-session-design.md` 3.3 の 2）: 自動ログインの段の行だけの理由の行は、登録の対象にしない（最初に決める）。
+  if ((WORKER_LOGIN_STAGE_SEND_RULE_ROW_REASONS as readonly string[]).includes(row.reason)) {
+    return { kind: 'MANUAL', reason: 'NOT_NEEDED' };
+  }
   if (hasRedactedPathSegment(row.path)) {
     return { kind: 'MANUAL', reason: 'REDACTED_PATH' };
   }
@@ -146,11 +151,11 @@ const hasOnlyKeys = (value: Record<string, unknown>, keys: readonly string[]): b
 const isOrigin = (value: unknown): value is string => typeof value === 'string' && canonicalHttpOriginOf(value) === value;
 
 /**
- * 下書きの path か（T43R-fix の M-1: 形は保存の側の owner `isAcceptedPath`、長さの上限は止めた一覧の path の IPC の上限。加えて、伏せた区切りと値に
+ * 下書きの path か（T43R-fix の M-1: 形は保存の側の owner `isAcceptedPath`。URL-LEN: 長さの上限（前は 1,024）はない。加えて、伏せた区切りと値に
  * 見える区切りがない）。
  */
 const isDraftPath = (value: unknown): value is string =>
-  typeof value === 'string' && value.length <= MAX_WORKER_LOGIN_STAGE_BLOCKED_PATH_LENGTH && isAcceptedPath(value)
+  typeof value === 'string' && isAcceptedPath(value)
   && !hasRedactedPathSegment(value) && !hasValueLikePathSegment(value);
 
 const isRequiredQuery = (value: unknown): value is ObservedRequiredQuery =>
@@ -179,7 +184,8 @@ export const parseObservedAuthSetupDraft = (value: unknown): ObservedAuthSetupDr
   const { scriptLogin, sideRequests, storageKey, successSelector } = value;
   const ok = (scriptLogin === undefined || isScriptLoginDraft(scriptLogin))
     && (sideRequests === undefined
-      || (Array.isArray(sideRequests) && sideRequests.length > 0 && sideRequests.length <= MAX_LOGIN_SIDE_REQUESTS && sideRequests.every(isSideRequestDraft)))
+      // L11: 件数の上限は撤廃した（`MAX_LOGIN_SIDE_REQUESTS` で切らない）。
+      || (Array.isArray(sideRequests) && sideRequests.length > 0 && sideRequests.every(isSideRequestDraft)))
     && (storageKey === undefined || isStorageKeyDraft(storageKey))
     && (successSelector === undefined
       || (typeof successSelector === 'string' && isAcceptedEntrySelector(successSelector) && isLoginObservedSuccessSelector(successSelector)));

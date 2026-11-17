@@ -26,8 +26,7 @@ const WRITE_ENDPOINT = Object.freeze({ origin: SERVICE_ORIGIN, path: '/rest/v1/m
 const auditSend = (extra: Partial<AuditSendPolicy> = {}): AuditSendPolicy => ({
   approvedServiceOrigins: [SERVICE_ORIGIN],
   dangerousTerms: DANGEROUS_TERMS,
-  remainingPasses: 1,
-  remainingWebSockets: 1,
+  webSockets: true,
   ...extra,
 });
 
@@ -60,14 +59,17 @@ describe('OP-Q (Q1): the audit send policy in the Passive Contexts of a write jo
     expect(decide(facts('POST', `${APP_ORIGIN}/rest/v1/members-list`), writeJob)).toEqual(PASSED);
   });
 
-  it('does not pass a request outside the test and the approved service Origins, a DELETE, a dangerous word, or a navigation', () => {
-    expect(decide(facts('POST', `${OTHER_ORIGIN}/collect-post`), writeJob)).toEqual(NON_READ);
-    expect(decide(facts('DELETE', `${SERVICE_ORIGIN}/rest/v1/previews?id=eq.1`), writeJob)).toEqual(NON_READ);
-    expect(decide(facts('POST', `${APP_ORIGIN}/logout`), writeJob)).toEqual(NON_READ);
-    expect(decide(facts('POST', `${APP_ORIGIN}/rpc/status`, true), writeJob)).toMatchObject({ action: 'BLOCK' });
+  // RB-4b: 許可の外への送信と form の送信も通す（サイトの通信は止めない）。DELETE と危険な語は止める。
+  // SD-2（設計書 `2026-11-16-beaksight-action-based-delete-guard-design.md` 2.4）: DELETE と危険な語も通す。
+  it('passes a request outside the test and the approved service Origins, a form post, a DELETE and a dangerous word', () => {
+    expect(decide(facts('POST', `${OTHER_ORIGIN}/collect-post`), writeJob)).toMatchObject({ action: 'ALLOW', auditSendAdmission: true });
+    expect(decide(facts('DELETE', `${SERVICE_ORIGIN}/rest/v1/previews?id=eq.1`), writeJob)).toMatchObject({ action: 'ALLOW', auditSendAdmission: true });
+    expect(decide(facts('POST', `${APP_ORIGIN}/logout`), writeJob)).toMatchObject({ action: 'ALLOW', auditSendAdmission: true });
+    expect(decide(facts('POST', `${APP_ORIGIN}/rpc/status`, true), writeJob)).toMatchObject({ action: 'ALLOW', auditSendAdmission: true });
     expect(decide(facts('POST', 'not a url'), writeJob)).toMatchObject({ action: 'BLOCK' });
   });
 
+  // RB-4b: この口だけでは WebSocket を通さない（リアルタイムの通信を止めない口は、Guard が別に渡す。`audit-send-wider.test.ts`）。
   it('does not pass a WebSocket', () => {
     expect(classifyPassiveRequest({ kind: 'WEBSOCKET', url: `wss://${new URL(SERVICE_ORIGIN).host}/realtime` }, ALLOWED_ORIGINS, writeJob))
       .toEqual({ action: 'BLOCK', category: 'WEBSOCKET', reason: 'PASSIVE_WEBSOCKET' });

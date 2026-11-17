@@ -1,7 +1,7 @@
 // P14b（Task 14〜17 の設計書 第3章、4.5.3）: Page Auditor は、collector の出力を1つの関数で EvidenceRecord に包む。
 // ID は Run で1つの採番器（IdAllocator）から、observedAt は注入した時計から作る。結果は深く凍結する。
 import { describe, expect, expectTypeOf, it } from 'vitest';
-import type { EvidenceRecordFor, PageId } from '../../src/core/contracts.js';
+import { EVIDENCE_STATE_ID_PATTERN, evidenceStateIdOf, type EvidenceRecordFor, type PageId } from '../../src/core/contracts.js';
 import type { ConsoleEvidence } from '../../src/core/evidence-types.js';
 import { createEvidenceId, createPageId } from '../../src/core/ids.js';
 import { createEvidenceRecord } from '../../src/orchestration/evidence-builder.js';
@@ -38,6 +38,31 @@ describe('createEvidenceRecord', () => {
       observedAt: '2026-09-24T01:02:03.456Z',
       payload,
     });
+  });
+
+  // AUD-2a: 集めた状態と時刻は、渡したときだけ持つ（複製して凍結する。状態 ID は `evidenceStateIdOf` の形）。
+  it('keeps the capture only when given, as a frozen copy (AUD-2a)', () => {
+    const capture = {
+      stateId: evidenceStateIdOf(pageId, 'desktop', 1),
+      phase: 'dom' as const,
+      startedAt: '2026-09-24T01:02:03.000Z',
+      finishedAt: '2026-09-24T01:02:03.400Z',
+      url: 'https://example.test/',
+      scrollPosition: { x: 0, y: 0 },
+    };
+    const record = createEvidenceRecord(
+      { type: 'console', pageId, viewport: 'desktop', payload: consolePayload(), capture },
+      { allocator: new IdAllocator(), clock: fixedClock },
+    );
+    expect(record.capture).toEqual(capture);
+    expect(record.capture).not.toBe(capture);
+    expect(Object.isFrozen(record.capture?.scrollPosition)).toBe(true);
+    expect(record.capture?.stateId).toMatch(EVIDENCE_STATE_ID_PATTERN);
+    const without = createEvidenceRecord(
+      { type: 'console', pageId, viewport: 'desktop', payload: consolePayload() },
+      { allocator: new IdAllocator(), clock: fixedClock },
+    );
+    expect(Object.hasOwn(without, 'capture')).toBe(false);
   });
 
   it('uses the one Run-wide Evidence sequence of the allocator across Evidence types', () => {

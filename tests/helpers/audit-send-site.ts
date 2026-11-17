@@ -216,18 +216,6 @@ export const sendFromPage = (page: Page, url: string, method: string, headers: R
   { target: url, verb: method, sentHeaders: headers, sentBody: body },
 );
 
-/** AS-c fix round 2（I-E。AS-R2 の A26）: 型のない Blob の本文の POST（`Content-Type` が付かない。応答の状態。届かなければ 0）。 */
-export const postUntypedBlobFromPage = (page: Page, url: string, body: string): Promise<number> => page.evaluate(
-  async ({ target, text }) => {
-    try {
-      return (await fetch(target, { method: 'POST', body: new Blob([text]) })).status;
-    } catch {
-      return 0;
-    }
-  },
-  { target: url, text: body },
-);
-
 /** AS-c fix round 1（I-1。AS-R の P01・P02・P05）: CORS の事前確認が要る fetch（JSON の本文。応答の状態。届かない・CORS で失敗なら 0）。 */
 export const corsFetchFromPage = (page: Page, url: string, method: string, credentials: RequestCredentials): Promise<number> => page.evaluate(
   async ({ target, verb, mode }) => {

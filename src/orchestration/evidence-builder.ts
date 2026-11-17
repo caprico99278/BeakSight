@@ -2,6 +2,7 @@ import {
   EVIDENCE_TYPES,
   VIEWPORT_PROFILES,
   type EvidencePayloadByType,
+  type EvidenceCapture,
   type EvidenceRecordFor,
   type EvidenceType,
   type PageId,
@@ -17,6 +18,8 @@ export interface EvidenceRecordInput<TType extends EvidenceType> {
   /** Evidence を集めたビューポート。ビューポートによらない Evidence は `null`。 */
   readonly viewport: ViewportProfile | null;
   readonly payload: EvidencePayloadByType[TType];
+  /** AUD-2a: 集めた状態と時刻（Page Auditor のビューポートの Evidence だけが渡す）。省略すると記録に持たない。 */
+  readonly capture?: EvidenceCapture | undefined;
 }
 
 /** Evidence の ID と観測の時刻を決めるもの。Run Coordinator が作って注入する（Task 14〜17 の設計書 第3章、4.5.3）。 */
@@ -41,7 +44,7 @@ export function createEvidenceRecord<TType extends EvidenceType>(
   input: EvidenceRecordInput<TType>,
   context: EvidenceRecordContext,
 ): EvidenceRecordFor<TType> {
-  const { type, pageId, viewport, payload } = input;
+  const { type, pageId, viewport, payload, capture } = input;
   if (!(EVIDENCE_TYPES as readonly unknown[]).includes(type)) {
     throw new RangeError('Evidence type must be one of EVIDENCE_TYPES');
   }
@@ -54,7 +57,16 @@ export function createEvidenceRecord<TType extends EvidenceType>(
   const observedAt = observedAtFrom(context.clock);
   const payloadCopy = structuredClone(payload);
   const evidenceId = context.allocator.allocateEvidenceId(type);
-  return deepFreeze({ evidenceId, type, pageId, viewport, observedAt, payload: payloadCopy });
+  return deepFreeze({
+    evidenceId,
+    type,
+    pageId,
+    viewport,
+    observedAt,
+    payload: payloadCopy,
+    // AUD-2a: 集めた状態と時刻は、渡したときだけ持つ（複製して持つ）。
+    ...(capture === undefined ? {} : { capture: structuredClone(capture) }),
+  });
 }
 
 function observedAtFrom(clock: () => Date): string {

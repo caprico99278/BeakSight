@@ -1,8 +1,9 @@
-// テストの補助 `tests/helpers/process-tree.ts` の子孫の判定の単体テスト（DEF-059）。プロセスの一覧は、作った値だけを使う（OS を読まない）。
+// テストの補助 `tests/helpers/process-tree.ts` の子孫の判定の単体テスト（DEF-059）。子孫の判定は、作った値だけを使う（OS を読まない）。SLIM-2（X8）: 一覧の
+// 読み取り（続けて使う PowerShell）だけは、OS を 2 回読む。
 // - 使い回された PID の子（親より前に起動した）を数えない。名前が監査で起動するもの（node、Chromium）でないものを数えない。
 // - 本物の子孫（3 段）は、今までどおり数える。
 import { describe, expect, it } from 'vitest';
-import { AUDIT_PROCESS_NAMES, descendantsOf, isAuditProcessName, type ProcessIdentity } from '../helpers/process-tree.js';
+import { AUDIT_PROCESS_NAMES, descendantsOf, isAuditProcessName, listProcesses, type ProcessIdentity } from '../helpers/process-tree.js';
 
 /** 起動の時刻（Windows の `CreationDate` の `ToString('o')` と同じ形）。 */
 const at = (seconds: number): string => `2026-10-09T12:00:${String(seconds).padStart(2, '0')}.1234567+09:00`;
@@ -55,5 +56,14 @@ describe('descendantsOf (DEF-059)', () => {
       expect(isAuditProcessName(name), name).toBe(false);
     }
     expect(Object.isFrozen(AUDIT_PROCESS_NAMES)).toBe(true);
+  });
+});
+
+describe('listProcesses (SLIM-2 X8)', () => {
+  it('reads this node process from the OS, again on the next call', async () => {
+    for (let round = 0; round < 2; round += 1) {
+      const self = (await listProcesses()).find((identity) => identity.processId === process.pid);
+      expect(self === undefined ? '' : isAuditProcessName(self.name), `round ${String(round)}`).toBe(true);
+    }
   });
 });

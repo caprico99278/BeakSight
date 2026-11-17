@@ -15,7 +15,11 @@ import type { Finding, PageAuditResult, RunAuthenticationSummary, RunSummary } f
 import type { LayoutEvidence, LayoutEvidencePayload } from '../../src/core/evidence-types.js';
 import type { DiscoveryDocument } from '../../src/discovery/discovery-result.js';
 import type { ReadEvidenceDocument } from '../../src/discovery/read-check-evaluation.js';
-import { SUBMISSION_PROBE_QUIET_WAIT_MS, hasSubmissionProbePriorityWord } from '../../src/discovery/submission-probe-contracts.js';
+import {
+  SUBMISSION_PROBE_NOT_PRESSED_REASONS,
+  SUBMISSION_PROBE_QUIET_WAIT_MS,
+  hasSubmissionProbePriorityWord,
+} from '../../src/discovery/submission-probe-contracts.js';
 import type { BrowserLauncher } from '../../src/orchestration/preflight.js';
 import { stressWidthFindingMessageText } from '../../src/presentation/messages.js';
 import { overrideBrowser } from './browser-proxies.js';
@@ -154,8 +158,8 @@ export interface StageTimings {
   readonly browser: BrowserTimings;
 }
 
-/** 発見の成果物から、押した数を数える（押さなかった理由の結果は数えない）。 */
-const NOT_PRESSED_REASONS: ReadonlySet<string> = new Set(['TARGET_NOT_FOUND', 'PRESS_LIMIT_REACHED', 'EXTERNAL_SCHEME', 'CONTEXT_CLOSED_BY_GUARD']);
+/** 発見の成果物から、押した数を数える（押さなかった理由の結果は数えない。LU-4: 理由は契約の閉じた一覧 `SUBMISSION_PROBE_NOT_PRESSED_REASONS`）。 */
+const NOT_PRESSED_REASONS: ReadonlySet<string> = new Set(SUBMISSION_PROBE_NOT_PRESSED_REASONS);
 
 export const probePressesOf = (document: DiscoveryDocument): number => document.pages.reduce((sum, page) => sum + (page.state === 'READ'
   ? page.record.candidates.filter((candidate) => candidate.submissionProbe !== undefined

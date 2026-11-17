@@ -93,6 +93,17 @@ describe('awaitBeforeDeadline', () => {
     expect(vi.getTimerCount()).toBe(0);
   });
 
+  // LZ-3b: 期限なし（undefined）は番兵の大きな数の代わり。タイマーを置かずに、操作の終わりを待つ。
+  it('waits for the operation without a timer when no deadline is given', async () => {
+    vi.useFakeTimers();
+    const operation = deferred<string>();
+    const pending = awaitBeforeDeadline(operation.promise, undefined);
+    expect(vi.getTimerCount()).toBe(0);
+    operation.resolve('done');
+
+    expect(await pending).toEqual({ status: 'FULFILLED', value: 'done' });
+  });
+
   it('clears its deadline timer as soon as the operation settles', async () => {
     vi.useFakeTimers();
     const fulfilled = deferred<string>();

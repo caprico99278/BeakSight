@@ -5,8 +5,11 @@
  */
 import { createServerFn } from '@tanstack/react-start';
 import {
+  readProfileDisplayNames,
   readProfileDisplaySettings,
+  saveProfileDisplayName,
   saveProfileDisplaySettings,
+  type ProfileDisplayNameSaveResult,
   type ProfileDisplaySettings,
   type ProfileDisplaySettingsSaveResult,
 } from '../../../../src/control/store/profile-store.js';
@@ -36,3 +39,19 @@ export const saveProfileDisplaySettingsFn = createServerFn({ method: 'POST' })
       showJobBrowser: data.showJobBrowser,
       ...(data.auditSendPolicy === undefined ? {} : { auditSendPolicy: data.auditSendPolicy }),
     }));
+
+/** DN-1: 画面に出す名前の保存の入力。 */
+interface DisplayNameSaveRequest extends ProfileKeyRequest {
+  readonly displayName: string;
+}
+
+/**
+ * DN-1（設計書 `2026-11-16-beaksight-profile-display-name-design.md` 2 章）: 画面に出す名前のあるサイトの、ID と名前の組。根の route の loader が読み、
+ * 画面の名前の決め方（`display/site-name.ts` の `siteNameOf`）に渡す。
+ */
+export const siteNamesFn = createServerFn({ method: 'GET' }).handler((): Readonly<Record<string, string>> => readProfileDisplayNames(localUiStore()));
+
+/** DN-1: 画面に出す名前を保存する（決まりと拒む理由は管理データの部品 `saveProfileDisplayName`）。 */
+export const saveProfileDisplayNameFn = createServerFn({ method: 'POST' })
+  .validator(requestOf<DisplayNameSaveRequest>('ui-profile-display-name'))
+  .handler(({ data }): ProfileDisplayNameSaveResult => saveProfileDisplayName(localUiStore(), data.profileId, data.displayName));

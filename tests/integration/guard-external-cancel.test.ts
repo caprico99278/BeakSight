@@ -2,8 +2,9 @@
 // 受ける前に、BeakSight の外の操作（タブを閉じる、停止、再読み込み、別の URL への移動）やページのスクリプト（`location.replace` の連続）で
 // 取り消された場合は、Guard の違反（`HTTP_MAIN_FRAME_DELIVERY_FAILED`）にしない。違反にしないのは、Guard 自身の証拠（Guard の page の
 // CDP の session で受けたもの）で、Guard が許可して進めた読み取りの文書の要求が、応答を1つも受けずにブラウザに取り消されたと確かめた
-// 場合だけである。応答のヘッダの後の取り消し（ダウンロード）、凍結の段階、証拠がない場合、区別できない場合は、今のとおり違反にする
-// （fail-closed）。204 は、Chromium 156 では取り消しでなく終わった要求として報告され、違反にならない（DEF-163。対照の describe の説明を見る）。
+// 場合だけである。応答のヘッダの後の取り消し、凍結の段階、証拠がない場合、区別できない場合は、今のとおり違反にする
+// （fail-closed）。ただし DEF-225: 応答のヘッダの後の取り消しのうち、Guard 自身が止めたダウンロード（同じ page・同じ URL）と対応付けたものは、違反にしない
+// （対照の describe の説明を見る）。204 は、Chromium 156 では取り消しでなく終わった要求として報告され、違反にならない（DEF-163。対照の describe の説明を見る）。
 // 外からタブを閉じた場合は、読み込みの取り消しは違反にならないが、Guard の page の CDP の session が外れたことは、今のとおり
 // `CDP_SESSION_DETACHED` の違反になりうる（設計書 2.4）。
 //
@@ -11,7 +12,8 @@
 //   headless-shell では、振る舞いが CLI と違うことがある）。
 // - Guard の付いた Passive Context は、製品と同じ `BrowserContextFactory`（`createGateFactory`）で作る。
 // - サーバは、このテストの中の 127.0.0.1 の `node:http` のサーバだけを使う。
-// - 証拠の部品の上限、session を閉じた後、区別できない場合は、偽の page の session と偽の Context で確かめる（DEF-026 のテストのやり方）。
+// - 証拠の部品の上限、session を閉じた後、区別できない場合は、偽の page の session と偽の Context で確かめる（DEF-026 のテストのやり方。SLIM-GROUP で
+//   `tests/component/guard-external-cancel-evidence.test.ts` へ移した。このファイルは Chromium の版を上げるときの束 `CHROMIUM_UPGRADE_TEST_FILES`）。
 import { mkdtemp, rm } from 'node:fs/promises';
 import type { ServerResponse } from 'node:http';
 import { tmpdir } from 'node:os';
@@ -19,9 +21,8 @@ import { join } from 'node:path';
 import type { Browser, BrowserContext, CDPSession, Page, Request } from 'playwright';
 import { afterAll, afterEach, beforeAll, describe, expect, it, vi } from 'vitest';
 import { BrowserContextFactory } from '../../src/browser/context-factory.js';
-import { INVALID_INTERCEPTION_ID_FAILURE_TEXTS } from '../../src/browser/playwright-errors.js';
 import { DEFAULT_CONFIG } from '../../src/config/defaults.js';
-import { wait, yieldMacrotask } from '../../src/core/deadline.js';
+import { wait } from '../../src/core/deadline.js';
 import { normalizeUrl } from '../../src/crawl/normalize-url.js';
 import { IdAllocator } from '../../src/orchestration/id-allocator.js';
 import { PageAuditor } from '../../src/orchestration/page-auditor.js';
@@ -29,26 +30,19 @@ import {
   activateInteractionFreeze,
   announceOwnMainFrameNavigation,
   assertPassiveRequestGuardActive,
-  awaitPassiveRequestGuardReady,
-  CANCELED_DOCUMENT_EVIDENCE_RETENTION_MS,
   CANCELED_DOCUMENT_EVIDENCE_WAIT_MS,
-  closePassiveGuardedContext,
-  installPassiveRequestGuard,
+  CDP_SESSION_DETACHED_MESSAGE,
   isPassiveRequestGuardClosed,
-  MAX_CANCELED_DOCUMENT_EVIDENCE,
   pageLoadFactsOf,
-  PENDING_MAIN_FRAME_DOCUMENT_RETENTION_MS,
 } from '../../src/safety/passive-request-guard.js';
 import { SafetyLedger } from '../../src/safety/safety-ledger.js';
 import { launchCliChromium, testContextsOf, withoutBrowserFaviconRequestLines } from '../helpers/chromium.js';
 import { createDeferred } from '../helpers/deferred.js';
-import { fakeFrame, fakePlaywrightRequest } from '../helpers/fake-playwright-request.js';
 import { createGateFactory } from '../helpers/gate-harness.js';
 import { nonReadRequestsOf } from '../helpers/leak-places.js';
 import { startLoopbackHttpServer } from '../helpers/loopback-server.js';
 import { createTestNavigationPacer } from '../helpers/navigation-pacer.js';
 import { closePassiveResources } from '../helpers/passive-cleanup.js';
-import { createGuardHarness, createHarnessPage, GUARD_HARNESS_ROOT_FRAME_ID } from '../helpers/passive-guard-harness.js';
 import { fastRunConfig } from '../helpers/run-harness.js';
 
 /** ブラウザが文書の要求を取り消したときの、失敗の理由（Playwright の `requestfailed` と CDP の `Network.loadingFailed` の `errorText`）。 */
@@ -81,7 +75,8 @@ const DELIVERY_FAILED = Object.freeze({
 /** Guard の page の CDP の session が、page が開いたまま外れた違反（設計書 2.4。外からタブを閉じたときに記録されうる）。 */
 const SESSION_DETACHED = Object.freeze({
   code: 'CDP_SESSION_DETACHED',
-  message: 'Document interception session detached while its page remained active',
+  // L10: 文は実態に合わせた（`CDP_SESSION_DETACHED_MESSAGE`。判定は変えない）。
+  message: CDP_SESSION_DETACHED_MESSAGE,
 });
 
 const HTML_TYPE = Object.freeze({ 'Content-Type': 'text/html; charset=utf-8' });
@@ -350,10 +345,14 @@ async function expectNextLoadSucceeds(server: CancelServer, page: Page, context:
   expect(ledger.snapshot().invariantViolations).toEqual([]);
 }
 
-/** 違反（`HTTP_MAIN_FRAME_DELIVERY_FAILED`）だけが記録され、Guard が Context を閉じることを確かめる。 */
+/**
+ * SAFE-2 の 4（違反の区分の (3)）: 取り消しを確かめられない読み取りの main frame の移動の失敗は、前は違反（`HTTP_MAIN_FRAME_DELIVERY_FAILED`）で Guard が Context を
+ * 閉じた。今は、違反にせず読み取りの失敗の記録（`readNavigationFailures`）に残し、Context は閉じないことを確かめる。
+ */
 async function expectDeliveryFailedViolation(context: BrowserContext, ledger: SafetyLedger): Promise<void> {
-  await expect.poll(() => ledger.snapshot().invariantViolations, { timeout: VIOLATION_POLL_TIMEOUT_MS }).toEqual([DELIVERY_FAILED]);
-  await expect.poll(() => isPassiveRequestGuardClosed(context), { timeout: VIOLATION_POLL_TIMEOUT_MS }).toBe(true);
+  await expect.poll(() => ledger.snapshot().readNavigationFailures?.events.length ?? 0, { timeout: VIOLATION_POLL_TIMEOUT_MS }).toBeGreaterThan(0);
+  expect(ledger.snapshot().invariantViolations).not.toContainEqual(expect.objectContaining({ code: DELIVERY_FAILED.code }));
+  expect(isPassiveRequestGuardClosed(context)).toBe(false);
 }
 
 /**
@@ -416,7 +415,9 @@ describe('DEF-027: a main-frame document request canceled before any response is
     });
   });
 
-  it('reloading from outside (Page.reload) while the next document is loading: no violation, and the Context stays usable', async () => {
+  // L10 の S4（設計者の判断。2026-11-12）: 輪は、同じ移りのくり返しで止める。外からの読み込み直し（start → hang → start）は 1 回目の移りなので、通って届く。
+  // 取り消しが違反にならないことと、Context が使えることを確かめる。
+  it('reloading from outside (Page.reload) while the next document is loading: no violation, the reload is delivered once, and the Context stays usable (L10)', async () => {
     const server = await startCancelServer();
     await withGuardedPage(server, async (page, context, ledger) => {
       expect((await page.goto(`${server.origin}${PATHS.start}`))?.status()).toBe(STATUS.ok);
@@ -432,9 +433,8 @@ describe('DEF-027: a main-frame document request canceled before any response is
       expect(await navigation).toBe('REJECTED');
       // 修正の前は、ここで `HTTP_MAIN_FRAME_DELIVERY_FAILED` が記録され、Guard が Context を閉じる（RED）。
       await expectNoViolationAfterSettle(context, ledger);
-      // 再読み込みは、確定した文書（`PATHS.start`）を読み込み直す。
+      // 再読み込みは、確定した文書（`PATHS.start`）へ 1 回だけ届く。
       await expect.poll(() => server.getCount(PATHS.start)).toBe(2);
-      await page.waitForLoadState('load');
       expect(server.getCount(path)).toBe(1);
       await expectNextLoadSucceeds(server, page, context, ledger);
     });
@@ -569,15 +569,18 @@ describe('DEF-027 controls: cancellations that stay violations (before and after
       expect(withoutBrowserFaviconRequestLines(server.requests.map(({ method, pathname }) => `${method} ${pathname}`)))
         .toEqual([`GET ${PATHS.noContent}`]);
       expect(nonReadRequestsOf(server.requests.map(({ method, pathname }) => ({ method, path: pathname })))).toEqual([]);
-      expect(pageLoadFactsOf(page)?.documentRequests).toBe(1);
+      // SPEC-1: 文書の要求の数は Guard が数えない（届いた数は上のサーバの記録で確かめる）。Guard が文書を受けたことだけを見る。
+      expect(pageLoadFactsOf(page)).not.toBeNull();
     });
   });
 
-  // 応答のヘッダを受けた後の取り消し（Chromium が、ダウンロードに切り替える）。
+  // 応答のヘッダを受けた後の取り消し（Chromium が、ダウンロードに切り替える）。DEF-225（設計者の判断。指示書 DEF-225-brief.md）: 前は違反のままだったが、
+  // Guard 自身が止めたダウンロード（同じ page・同じ URL。`PASSIVE_DOWNLOAD`）と 1 対 1 に対応付けられた失敗は、予期した失敗として違反にしない（Context は閉じない）。
+  // ダウンロードの記録のない応答の後の `net::ERR_ABORTED` が違反のままであることは、`def-225-download-link.test.ts` で確かめる。
   it.each([
     { name: 'Content-Disposition: attachment', path: PATHS.attachment },
     { name: 'application/octet-stream', path: PATHS.octetStream },
-  ])('$name: the load is aborted after the response headers, so it stays a violation and invalidates the Context', async ({ path }) => {
+  ])('$name: the load is aborted after the response headers by the download the Guard blocked, so it is not a violation (DEF-225)', async ({ path }) => {
     const server = await startCancelServer();
     await withGuardedPage(server, async (page, context, ledger) => {
       const url = `${server.origin}${path}`;
@@ -587,7 +590,9 @@ describe('DEF-027 controls: cancellations that stay violations (before and after
 
       expect(await failed).toBe(ABORTED);
       expect(server.getCount(path)).toBe(1);
-      await expectDeliveryFailedViolation(context, ledger);
+      await expectNoViolationAfterSettle(context, ledger);
+      expect(ledger.snapshot().blockedDownloads.map((event) => [event.url, event.reason])).toEqual([[url, 'PASSIVE_DOWNLOAD']]);
+      expect(pageLoadFactsOf(page)?.mainFrameDownloadBlocked).toBe(true);
     });
   });
 
@@ -595,7 +600,7 @@ describe('DEF-027 controls: cancellations that stay violations (before and after
   // Guard が Request の段階で進める前に、2回目の移動で取り消される。(a)（Guard が許可して進めた）を満たさないので、今も違反のまま残る。
   // その要求はサーバに届かない（いちばん安全な場合が、違反のまま残る）。この限界を外すには、新しい安全の分析が要る（DEF-028 と合わせて後で
   // 考える）。
-  it('limit (design 2.1.1): location.replace twice with a 0ms gap cancels the first move before the Guard continues it, so it stays a violation', async () => {
+  it('limit (design 2.1.1): location.replace twice with a 0ms gap cancels the first move before the Guard continues it, so it is recorded as a read failure (SAFE-2)', async () => {
     const server = await startCancelServer();
     await withGuardedPage(server, async (page, context, ledger) => {
       const failed = observeRequestFailure(context, `${server.origin}${REPLACE_CHAIN_IMMEDIATE_FIRST_PATH}`);
@@ -611,7 +616,7 @@ describe('DEF-027 controls: cancellations that stay violations (before and after
   });
 
   // 凍結の段階での取り消し（DEF-029 の凍結の確かめ方に合わせる。凍結の前に要求をサーバに届け、凍結の後に外から止める）。
-  it('a cancellation during the interaction freeze stays a violation and invalidates the Context', async () => {
+  it('a cancellation during the interaction freeze is recorded as a read failure and keeps the Context (SAFE-2)', async () => {
     const server = await startCancelServer();
     await withGuardedPage(server, async (page, context, ledger) => {
       expect((await page.goto(`${server.origin}${PATHS.start}`))?.status()).toBe(STATUS.ok);
@@ -630,7 +635,7 @@ describe('DEF-027 controls: cancellations that stay violations (before and after
 
   // 証拠（Guard の page の session の `Network.loadingFailed`）が Guard に届かない場合。Guard のコードは変えず、Guard の CDP の session を
   // Proxy で包み、Guard が付ける `Network.loadingFailed` の listener を付けずに捨てる（DEF-026 の対照と同じやり方）。
-  it('when the cancellation evidence never reaches the Guard, an outside stop stays a violation', async () => {
+  it('when the cancellation evidence never reaches the Guard, an outside stop is recorded as a read failure (SAFE-2)', async () => {
     const server = await startCancelServer();
     await withGuardedPage(server, async (page, context, ledger) => {
       const path = hangPath('no-evidence');
@@ -667,384 +672,5 @@ function dropLoadingFailed(real: CDPSession): CDPSession {
   });
 }
 
-// ---------------------------------------------------------------------------------------------------------------
-// 偽の page の session と偽の Context（証拠の部品の上限、session を閉じた後、区別できない場合。DEF-026 のテストのやり方）
-// ---------------------------------------------------------------------------------------------------------------
-
-const FAKE_ORIGIN = 'https://example.test';
-const FAKE_ROOT_FRAME_ID = GUARD_HARNESS_ROOT_FRAME_ID;
-
-interface FakeCommand {
-  readonly method: string;
-  readonly params: { readonly requestId?: string } | undefined;
-}
-
-/** 偽の page の session の命令の応答を決める（`undefined` なら、成功）。 */
-type FakeResponder = (method: string, params: FakeCommand['params']) => Promise<unknown> | undefined;
-
-interface FakeGuard {
-  readonly ledger: SafetyLedger;
-  readonly page: Page;
-  readonly context: BrowserContext;
-  readonly commands: readonly FakeCommand[];
-  /** Guard の page の session に、CDP の事象を送る。 */
-  emitCdp(method: string, params?: unknown): void;
-  /** Guard に、Playwright の `requestfailed` を送る。 */
-  emitRequestFailed(request: Request): void;
-}
-
-/**
- * 偽の Context に Guard を取り付け、偽の page を Guard の準備ができた状態にする。偽の Context と page の session と page は、
- * Guard のテストの共通の補助（`createGuardHarness`・`createHarnessPage`。CC-044）で作る。session の命令の応答は `respond` で決め、
- * `Page.getFrameTree` には main frame（`FAKE_ROOT_FRAME_ID`）を返す。
- */
-async function startFakeGuard(respond: FakeResponder = () => undefined): Promise<FakeGuard> {
-  const harness = createGuardHarness({ cdpSendOverride: (method, params) => respond(method, params as FakeCommand['params']) });
-  const ledger = new SafetyLedger();
-  await installPassiveRequestGuard(harness.context, ledger, new Set([FAKE_ORIGIN]));
-  const page = createHarnessPage(harness, { url: `${FAKE_ORIGIN}/` });
-  await awaitPassiveRequestGuardReady(page);
-  fakeGuards.push(harness.context);
-  return {
-    ledger,
-    page,
-    context: harness.context,
-    commands: harness.cdpCommandLog as readonly FakeCommand[],
-    // DEF-042: この偽の Guard が送る `Fetch.requestPaused` は、すべて main frame の文書の要求なので、`resourceType` を `Document` にして渡す。
-    emitCdp: (method, params) => harness.emitCdp(
-      method,
-      method === 'Fetch.requestPaused' ? { resourceType: 'Document', ...(params as object) } : params,
-    ),
-    emitRequestFailed: (request) => {
-      void harness.requestFailedHandler?.(request);
-    },
-  };
-}
-
-const fakeGuards: BrowserContext[] = [];
-
-afterEach(async () => {
-  for (const context of fakeGuards.splice(0)) {
-    await closePassiveGuardedContext(context).catch(() => undefined);
-  }
-});
-
-/** main frame の文書の要求（偽の Guard の、1つの要求）。 */
-interface FakeDocument {
-  readonly requestId: string;
-  readonly networkId: string;
-  readonly url: string;
-  readonly method?: string;
-}
-
-const fakeDocument = (index: number, url = `${FAKE_ORIGIN}/document-${index}`): FakeDocument => ({
-  requestId: `interception-${index}`,
-  networkId: `network-${index}`,
-  url,
-});
-
-/** Guard の page の session に、main frame の文書の要求の Request の段階の一時停止を送り、Guard が `Fetch.continueRequest` を送るまで待つ。 */
-async function pauseAndContinue(guard: FakeGuard, document: FakeDocument): Promise<void> {
-  const sentBefore = guard.commands.length;
-  guard.emitCdp('Fetch.requestPaused', {
-    requestId: document.requestId,
-    networkId: document.networkId,
-    frameId: FAKE_ROOT_FRAME_ID,
-    request: { method: document.method ?? 'GET', url: document.url },
-  });
-  for (let turn = 0; turn < 10; turn += 1) {
-    await yieldMacrotask();
-    if (guard.commands.slice(sentBefore).some((command) => command.method === 'Fetch.continueRequest'
-      && command.params?.requestId === document.requestId)) {
-      // 命令の成功の処理（`await` の後）まで進める。
-      await yieldMacrotask();
-      return;
-    }
-  }
-  throw new Error(`the Guard did not continue ${document.requestId}: ${JSON.stringify(guard.commands.slice(sentBefore))}`);
-}
-
-/** 同じ session の、文書の要求の取り消しの証拠（`Network.loadingFailed`）。 */
-const canceledEvidence = (document: FakeDocument, overrides: Record<string, unknown> = {}): Record<string, unknown> => ({
-  requestId: document.networkId,
-  canceled: true,
-  type: 'Document',
-  errorText: ABORTED,
-  ...overrides,
-});
-
-/** Playwright の `requestfailed` が受ける、main frame のナビゲーションの要求。 */
-// CC-094: 偽の要求は共通の補助で作る（DEF-120: main frame のナビゲーションの種類は `document`）。
-const failedNavigation = (page: Page, document: FakeDocument, errorText = ABORTED): Request => fakePlaywrightRequest({
-  method: document.method ?? 'GET',
-  url: document.url,
-  navigation: true,
-  frame: fakeFrame(page),
-  failureText: errorText,
-  response: null,
-});
-
-/** Guard の作業が終わり、記録された違反を返す（証拠を待つ時間より長く待つ）。 */
-async function violationsAfterSettle(guard: FakeGuard): Promise<readonly { readonly code: string; readonly message: string }[]> {
-  await wait(SETTLE_AFTER_CANCEL_MS);
-  return guard.ledger.snapshot().invariantViolations;
-}
-
-describe('DEF-027: the Guard\'s evidence of a main-frame document canceled before any response (fake page session)', () => {
-  it('baseline: continued, canceled with net::ERR_ABORTED, and no response → not a violation (the harness reaches the new path)', async () => {
-    const guard = await startFakeGuard();
-    const document = fakeDocument(1);
-    await pauseAndContinue(guard, document);
-
-    guard.emitCdp('Network.loadingFailed', canceledEvidence(document));
-    guard.emitRequestFailed(failedNavigation(guard.page, document));
-
-    expect(await violationsAfterSettle(guard)).toEqual([]);
-    expect(isPassiveRequestGuardClosed(guard.context)).toBe(false);
-  });
-
-  it('the evidence arrives after the requestfailed event, within the wait: not a violation', async () => {
-    const guard = await startFakeGuard();
-    const document = fakeDocument(1);
-    await pauseAndContinue(guard, document);
-
-    guard.emitRequestFailed(failedNavigation(guard.page, document));
-    await wait(CANCELED_DOCUMENT_EVIDENCE_WAIT_MS / 5);
-    guard.emitCdp('Network.loadingFailed', canceledEvidence(document));
-
-    expect(await violationsAfterSettle(guard)).toEqual([]);
-  });
-
-  // 8. 証拠がない場合。
-  it('the evidence never arrives: a violation after the wait', async () => {
-    const guard = await startFakeGuard();
-    const document = fakeDocument(1);
-    await pauseAndContinue(guard, document);
-
-    guard.emitRequestFailed(failedNavigation(guard.page, document));
-
-    expect(await violationsAfterSettle(guard)).toEqual([DELIVERY_FAILED]);
-  });
-
-  it('beyond the evidence limit: the canceled request\'s evidence is not remembered, so it stays a violation', async () => {
-    const guard = await startFakeGuard();
-    const document = fakeDocument(1);
-    await pauseAndContinue(guard, document);
-    for (let index = 0; index < MAX_CANCELED_DOCUMENT_EVIDENCE; index += 1) {
-      guard.emitCdp('Network.loadingFailed', { requestId: `other-${index}`, canceled: true, type: 'Document', errorText: ABORTED });
-    }
-
-    guard.emitCdp('Network.loadingFailed', canceledEvidence(document));
-    guard.emitRequestFailed(failedNavigation(guard.page, document));
-
-    expect(await violationsAfterSettle(guard)).toEqual([DELIVERY_FAILED]);
-  });
-
-  it('beyond the main-frame document record limit: the request is not remembered, so its cancellation stays a violation', async () => {
-    const guard = await startFakeGuard();
-    // 応答を受けたまま終わっていない main frame の文書の要求で、記録を上限まで埋める（Response の段階の一時停止で、リダイレクトの
-    // 対応付けの登録も消す）。
-    for (let index = 0; index < MAX_CANCELED_DOCUMENT_EVIDENCE; index += 1) {
-      const filler = fakeDocument(index);
-      await pauseAndContinue(guard, filler);
-      guard.emitCdp('Fetch.requestPaused', {
-        requestId: filler.requestId,
-        networkId: filler.networkId,
-        frameId: FAKE_ROOT_FRAME_ID,
-        request: { method: 'GET', url: filler.url },
-        responseStatusCode: STATUS.ok,
-        responseHeaders: [],
-      });
-      await yieldMacrotask();
-    }
-    expect(guard.ledger.snapshot().invariantViolations).toEqual([]);
-    const document = fakeDocument(MAX_CANCELED_DOCUMENT_EVIDENCE);
-    await pauseAndContinue(guard, document);
-
-    guard.emitCdp('Network.loadingFailed', canceledEvidence(document));
-    guard.emitRequestFailed(failedNavigation(guard.page, document));
-
-    expect(await violationsAfterSettle(guard)).toEqual([DELIVERY_FAILED]);
-  });
-
-  it('the evidence is older than its retention: a violation', async () => {
-    const guard = await startFakeGuard();
-    const document = fakeDocument(1);
-    await pauseAndContinue(guard, document);
-    guard.emitCdp('Network.loadingFailed', canceledEvidence(document));
-
-    // 時計だけを進める（Guard の待ちの setTimeout は、実際の時間で動かす）。
-    vi.useFakeTimers({ toFake: ['Date'] });
-    vi.setSystemTime(Date.now() + CANCELED_DOCUMENT_EVIDENCE_RETENTION_MS + 1);
-    guard.emitRequestFailed(failedNavigation(guard.page, document));
-
-    expect(await violationsAfterSettle(guard)).toEqual([DELIVERY_FAILED]);
-  });
-
-  it('the record of the continued request is older than its retention when it is canceled: a violation', async () => {
-    const guard = await startFakeGuard();
-    const document = fakeDocument(1);
-    await pauseAndContinue(guard, document);
-
-    vi.useFakeTimers({ toFake: ['Date'] });
-    vi.setSystemTime(Date.now() + PENDING_MAIN_FRAME_DOCUMENT_RETENTION_MS + 1);
-    guard.emitCdp('Network.loadingFailed', canceledEvidence(document));
-    guard.emitRequestFailed(failedNavigation(guard.page, document));
-
-    expect(await violationsAfterSettle(guard)).toEqual([DELIVERY_FAILED]);
-  });
-
-  it('the session closes while the Guard waits for the evidence: still a violation, and later evidence is ignored', async () => {
-    const guard = await startFakeGuard();
-    const document = fakeDocument(1);
-    await pauseAndContinue(guard, document);
-
-    guard.emitRequestFailed(failedNavigation(guard.page, document));
-    await yieldMacrotask();
-    guard.emitCdp('close');
-    guard.emitCdp('Network.loadingFailed', canceledEvidence(document));
-
-    // session を閉じたこと自体の違反（`CDP_SESSION_DETACHED`）は、修正の前は記録されない（先に記録された違反で、Guard が閉じる途中に
-    // なるため）。ここでは、取り消しの失敗が違反のままであることだけを確かめる。
-    expect(await violationsAfterSettle(guard)).toContainEqual(DELIVERY_FAILED);
-  });
-
-  // 9. 区別できない場合。
-  it('two continued requests with the same page, method and URL: the cancellation cannot be told apart, so it stays a violation', async () => {
-    const guard = await startFakeGuard();
-    const url = `${FAKE_ORIGIN}/same`;
-    const first = fakeDocument(1, url);
-    const second = fakeDocument(2, url);
-    await pauseAndContinue(guard, first);
-    await pauseAndContinue(guard, second);
-
-    guard.emitCdp('Network.loadingFailed', canceledEvidence(first));
-    guard.emitRequestFailed(failedNavigation(guard.page, first));
-
-    expect(await violationsAfterSettle(guard)).toEqual([DELIVERY_FAILED]);
-  });
-
-  it('a request that finished (Network.loadingFinished) is no longer a candidate', async () => {
-    const guard = await startFakeGuard();
-    const url = `${FAKE_ORIGIN}/same`;
-    const loaded = fakeDocument(1, url);
-    const canceled = fakeDocument(2, url);
-    await pauseAndContinue(guard, loaded);
-    guard.emitCdp('Network.loadingFinished', { requestId: loaded.networkId });
-    await pauseAndContinue(guard, canceled);
-
-    guard.emitCdp('Network.loadingFailed', canceledEvidence(canceled));
-    guard.emitRequestFailed(failedNavigation(guard.page, canceled));
-
-    expect(await violationsAfterSettle(guard)).toEqual([]);
-  });
-
-  it('the evidence is used once: a second requestfailed for the same request is a violation', async () => {
-    const guard = await startFakeGuard();
-    const document = fakeDocument(1);
-    await pauseAndContinue(guard, document);
-    guard.emitCdp('Network.loadingFailed', canceledEvidence(document));
-
-    guard.emitRequestFailed(failedNavigation(guard.page, document));
-    await wait(SETTLE_AFTER_CANCEL_MS);
-    expect(guard.ledger.snapshot().invariantViolations).toEqual([]);
-    guard.emitRequestFailed(failedNavigation(guard.page, document));
-
-    expect(await violationsAfterSettle(guard)).toEqual([DELIVERY_FAILED]);
-  });
-
-  // (c) 応答を1つでも受けた要求は、対象にしない。
-  it.each([
-    ['a Response-stage pause', (guard: FakeGuard, document: FakeDocument): void => guard.emitCdp('Fetch.requestPaused', {
-      requestId: document.requestId,
-      networkId: document.networkId,
-      frameId: FAKE_ROOT_FRAME_ID,
-      request: { method: 'GET', url: document.url },
-      responseStatusCode: STATUS.noContent,
-      responseHeaders: [],
-    })],
-    ['Network.responseReceived', (guard: FakeGuard, document: FakeDocument): void => guard.emitCdp('Network.responseReceived', {
-      requestId: document.networkId,
-      type: 'Document',
-      frameId: FAKE_ROOT_FRAME_ID,
-      response: { status: STATUS.ok },
-    })],
-    ['a redirect (Network.requestWillBeSent with redirectResponse)', (guard: FakeGuard, document: FakeDocument): void => guard.emitCdp(
-      'Network.requestWillBeSent',
-      { requestId: document.networkId, type: 'Document', frameId: FAKE_ROOT_FRAME_ID, redirectResponse: { status: 302 } },
-    )],
-  ] as const)('after %s, a cancellation stays a violation', async (_name, respond) => {
-    const guard = await startFakeGuard();
-    const document = fakeDocument(1);
-    await pauseAndContinue(guard, document);
-
-    respond(guard, document);
-    await yieldMacrotask();
-    guard.emitCdp('Network.loadingFailed', canceledEvidence(document));
-    guard.emitRequestFailed(failedNavigation(guard.page, document));
-
-    expect(await violationsAfterSettle(guard)).toEqual([DELIVERY_FAILED]);
-  });
-
-  // (b) 取り消しの証拠の形。
-  it.each([
-    ['not canceled', { canceled: false }],
-    ['not a Document', { type: 'Other' }],
-    ['another error text', { errorText: 'net::ERR_FAILED' }],
-  ] as const)('a loadingFailed that is %s is not the evidence: a violation', async (_name, overrides) => {
-    const guard = await startFakeGuard();
-    const document = fakeDocument(1);
-    await pauseAndContinue(guard, document);
-
-    guard.emitCdp('Network.loadingFailed', canceledEvidence(document, overrides));
-    guard.emitRequestFailed(failedNavigation(guard.page, document));
-
-    expect(await violationsAfterSettle(guard)).toEqual([DELIVERY_FAILED]);
-  });
-
-  // (a) Guard が許可して進めた（`Fetch.continueRequest` が成功した）要求に限る。一時停止の間に取り消された要求への命令の失敗（DEF-026 で
-  // 違反にしない）は、進めたことにならない。
-  it('a request canceled while paused (the continue command failed, tolerated by DEF-026): its requestfailed stays a violation', async () => {
-    const [invalidInterceptionId] = INVALID_INTERCEPTION_ID_FAILURE_TEXTS;
-    const document = fakeDocument(1);
-    let guardForEvidence: FakeGuard | undefined;
-    const guard = await startFakeGuard((method) => (method === 'Fetch.continueRequest'
-      ? Promise.resolve().then(() => {
-        guardForEvidence?.emitCdp('Network.loadingFailed', canceledEvidence(document));
-        throw new Error(invalidInterceptionId);
-      })
-      : undefined));
-    guardForEvidence = guard;
-    guard.emitCdp('Fetch.requestPaused', {
-      requestId: document.requestId,
-      networkId: document.networkId,
-      frameId: FAKE_ROOT_FRAME_ID,
-      request: { method: 'GET', url: document.url },
-    });
-    await expect.poll(() => guard.commands.some((command) => command.method === 'Fetch.continueRequest')).toBe(true);
-
-    guard.emitRequestFailed(failedNavigation(guard.page, document));
-
-    // DEF-026 のとおり、命令の失敗は違反にならない。main frame の失敗は、進めた証拠がないので違反のまま。
-    expect(await violationsAfterSettle(guard)).toEqual([DELIVERY_FAILED]);
-  });
-
-  it('a request of a subframe is not a main-frame candidate: a main-frame failure with the same URL stays a violation', async () => {
-    const guard = await startFakeGuard();
-    const document = fakeDocument(1);
-    const sentBefore = guard.commands.length;
-    guard.emitCdp('Fetch.requestPaused', {
-      requestId: document.requestId,
-      networkId: document.networkId,
-      frameId: 'child-frame',
-      request: { method: 'GET', url: document.url },
-    });
-    await expect.poll(() => guard.commands.slice(sentBefore).some((command) => command.method === 'Fetch.continueRequest')).toBe(true);
-    await yieldMacrotask();
-
-    guard.emitCdp('Network.loadingFailed', canceledEvidence(document));
-    guard.emitRequestFailed(failedNavigation(guard.page, document));
-
-    expect(await violationsAfterSettle(guard)).toEqual([DELIVERY_FAILED]);
-  });
-});
+// SLIM-GROUP: 偽の page の session と偽の Context の場面（証拠の部品の上限、session を閉じた後、区別できない場合）は、区切りで流すよう
+// `tests/component/guard-external-cancel-evidence.test.ts` へ移した（このファイルは Chromium の版を上げるときの束）。

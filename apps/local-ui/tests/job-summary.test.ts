@@ -1,17 +1,18 @@
 /**
  * PL-2（設計書 `doc/design/2026-10-26-beaksight-plain-ui-design.md` 3 章の 1・5、4 章の 2、13 章の 11・13）: 作業の画面の要点を決める 1 か所
- * （`server/audit-job-functions.ts` の `jobSummaryOf`）と、点検が終わるまでの上限の見積もり（`auditRemainingUpperBoundMs`）を、作業の状態ごとに確かめる。
+ * （`server/audit-job-functions.ts` の `jobSummaryOf`）と、作業が終わるまでの見積もり（`progressRemainingMs`。DEF-192）を、作業の状態ごとに確かめる。
  * - 主のボタンは 1 つまでで、押す先がないときは出さない。
  * - 成功のときだけ、次の画面へ移す先を返す（入口の確かめ → サイト、点検 → サイト、まとめて実行 → 次のステップの作業かサイト、書き込み → 続けて始めた
  *   更新の作業か書き込みの手順）。失敗・中断・安全の違反・ログインの切れ・書き込みの結果が分からない（UNKNOWN）・自動の登録を待つ間は返さない。
- *   OP-U: 移す先は、ページが出す送信の扱い（既定は削除のほかを通す）によらない。
+ *   OP-U: 移す先は、ページが出す送信の扱い（既定はサイトの通信を止めない）によらない。
  * - 自動の登録が済んだ後は、ログインの段の行の登録を「済み」にする（済んだ操作を出さない）。
  * 値は匿名（ループバック）。画面のサーバとブラウザは起動しない。
  */
 import { describe, expect, it } from 'vitest';
+import { LOCAL_UI_JOB_SUMMARY_TEXT } from '../../../src/presentation/messages.js';
 import {
-  auditRemainingUpperBoundMs,
   jobSummaryOf,
+  progressRemainingMs,
   type AuditJobDetailView,
 } from '../src/server/audit-job-functions';
 
@@ -45,7 +46,6 @@ const BASE: Facts = Object.freeze({
   sessionLoss: null,
   autoLogin: null,
   write: null,
-  writeChain: null,
   stageChain: null,
   stageChainWriteKind: null,
   inspectionWrite: null,
@@ -55,7 +55,6 @@ const BASE: Facts = Object.freeze({
   auditStage: null,
   safetyViolation: null,
   externalSchemeProbes: null,
-  pressLimitProbes: null,
   pageIncompleteReasons: null,
   auditSend: null,
   currentProfile: { mode: 'PUBLIC_PASSIVE', auth: 'NONE' },
@@ -114,6 +113,7 @@ const chainOf = (state: 'RUNNING' | 'FINISHED' | 'STOPPED', stages: readonly (re
   })),
   // OP-2: 書き込みの段は行っていない。
   writeStageJobIds: [],
+  pageScope: null,
 });
 
 /** ログインの段のまとめ（登録できる token の送信の行が 1 つ）。 */
@@ -202,7 +202,9 @@ describe('PL-2: the automatic move after a success (3 章の 5)', () => {
     expect(summaryOf({ runStatus: 'PARTIAL', artifacts: [REPORT] })).toMatchObject({ result: 'AUDIT_PARTIAL', advance: { kind: 'SITE' } });
     // PL-U の修正の 1 回目（14.1 の判断）: 利用者が「止める」で止めた点検（Run の終わりの理由が `STOPPED_BY_SIGNAL`）は、作業の画面に残す。
     // OP-1 修正の 2 回目: 人が止めたかは、ジョブに残る「止める」の要求の記録（`stopRequestedAt`）で決める（止めた点検の行には、いつも要求の日時が残る）。
-    const stoppedEnd = { lastExecutionEndReason: 'STOPPED_BY_SIGNAL', reasons: ['RUN_INTERRUPTED'], partialPageCount: 0, failedPageCount: 0, skippedPageCount: 1 } as const;
+    const stoppedEnd = {
+      lastExecutionEndReason: 'STOPPED_BY_SIGNAL', reasons: ['RUN_INTERRUPTED'], partialPageCount: 0, failedPageCount: 0, skippedPageCount: 1, checkedScreensOnly: false,
+    } as const;
     const stopRequestedAt = '2026-10-26T00:00:30Z';
     expect(summaryOf({ runStatus: 'PARTIAL', artifacts: [REPORT], runEnd: stoppedEnd, stopRequestedAt } as Partial<Facts>))
       .toMatchObject({ result: 'AUDIT_PARTIAL', advance: null });
@@ -224,7 +226,7 @@ describe('PL-2: the automatic move after a success (3 章の 5)', () => {
     }
   });
 
-  // OP-U（設計者の判断の 1）: 移り先は送信の扱いによらない。既定の「削除のほかを通す」で通した点検も、読み取りだけと同じ所へ移す（前は移さなかった）。
+  // OP-U（設計者の判断の 1）: 移り先は送信の扱いによらない。既定の「サイトの通信を止めない」で通した点検も、読み取りだけと同じ所へ移す（前は移さなかった）。
   it('moves a finished audit and the stages of a finished chain to the same place whatever the send policy', () => {
     const passed = {
       policy: 'PASS_EXCEPT_DELETE', passedRequests: 2, passedOtherOriginRequests: 0, passedWebSockets: 0,
@@ -254,13 +256,8 @@ describe('PL-2: the automatic move after a success (3 章の 5)', () => {
     expect(summaryOf({}, true)).toMatchObject({ advance: null, awaitingRegistration: true });
   });
 
-  it('moves a verified write to its scenario, or to the update job it started, and never an unknown or partial write', () => {
+  it('moves a verified write to its scenario, and never an unknown or partial write', () => {
     expect(summaryOf({ jobKind: 'WRITE_CREATE', runStatus: null, write: writeOf('VERIFIED') }).advance).toEqual({ kind: 'SCENARIO', scenarioId: 'scenario-pl2' });
-    const chain = { createJobId: BASE.jobId, createScenarioId: 'scenario-pl2', updateScenarioId: 'scenario-pl2-update', reason: null, nextStartAt: null };
-    expect(summaryOf({ jobKind: 'WRITE_CREATE', runStatus: null, write: writeOf('VERIFIED'), writeChain: { ...chain, state: 'UPDATE_STARTED', updateJobId: 'job-pl2-update' } }).advance)
-      .toEqual({ kind: 'JOB', jobId: 'job-pl2-update' });
-    expect(summaryOf({ jobKind: 'WRITE_CREATE', runStatus: null, write: writeOf('VERIFIED'), writeChain: { ...chain, state: 'CREATING', updateJobId: null } }).advance)
-      .toBeNull();
     for (const result of ['UNKNOWN', 'PARTIAL', 'BLOCKED', 'FAILED', null] as const) {
       expect(summaryOf({ jobKind: 'WRITE_CREATE', runStatus: null, write: writeOf(result) }).advance, String(result)).toBeNull();
     }
@@ -327,33 +324,81 @@ describe('PL-2: the registration of the login stage rows (4 章の 2)', () => {
     expect(summaryOf({ loginStage: { ...LOGIN_STAGE, blockedRequests: { requests: [], unlisted: 0 } } }).loginStageRegistration).toBe('NONE');
     expect(summaryOf({}).loginStageRegistration).toBe('NONE');
   });
+
+  // DEF-194（設計書 `2026-11-04-beaksight-login-session-design.md` 3.3）: 自動ログインの段で通した行と、削除・危険な語で止めた行だけなら、「行を選んで登録して
+  // ください」を出さない（登録の案がない）。決まりで止めたのでない登録のない行が残れば、今のとおり出す。
+  it('is none when only the rows passed as the site sends and the rows blocked by the send rule remain (DEF-194)', () => {
+    const rowOf = (reason: 'AUTOMATED_LOGIN_PASSED' | 'AUTOMATED_LOGIN_RULE_BLOCKED' | 'UNREGISTERED_NON_READ', path: string) =>
+      ({ origin: 'https://service.example.invalid', path, resourceType: 'fetch' as const, reason, count: 1 });
+    const automatedOnly = {
+      scriptLogin: null,
+      blockedRequests: { requests: [rowOf('AUTOMATED_LOGIN_RULE_BLOCKED', '/rest/v1/rpc/delete_member')], unlisted: 0 },
+      passedRequests: { requests: [rowOf('AUTOMATED_LOGIN_PASSED', '/functions/v1/sync_access')], unlisted: 0 },
+    } as unknown as NonNullable<Facts['loginStage']>;
+    expect(summaryOf({ state: 'FAILED', runStatus: null, failureReason: 'LOGIN_TIMEOUT', loginStage: automatedOnly }).loginStageRegistration).toBe('NONE');
+    expect(summaryOf({ loginStage: automatedOnly }).loginStageRegistration).toBe('NONE');
+    const withUnregistered = {
+      ...automatedOnly,
+      blockedRequests: { requests: [...automatedOnly.blockedRequests!.requests, rowOf('UNREGISTERED_NON_READ', '/rest/v1/rpc/resolve_tenant')], unlisted: 0 },
+    } as unknown as NonNullable<Facts['loginStage']>;
+    expect(summaryOf({ state: 'FAILED', runStatus: null, failureReason: 'LOGIN_TIMEOUT', loginStage: withUnregistered }).loginStageRegistration).toBe('NEEDED');
+  });
 });
 
-describe('PL-2: the estimate while waiting (13 章の 11)', () => {
-  it('is the smaller of the remaining pages times the interval and the rest of the runtime limit', () => {
-    expect(auditRemainingUpperBoundMs({ pagesFinished: 3, maxPages: 20, elapsedMs: 0, minNavigationIntervalMs: 10_000, maxRuntimeMs: 3_600_000 })).toBe(170_000);
-    expect(auditRemainingUpperBoundMs({ pagesFinished: 0, maxPages: 500, elapsedMs: 600_000, minNavigationIntervalMs: 10_000, maxRuntimeMs: 3_600_000 })).toBe(3_000_000);
-    expect(auditRemainingUpperBoundMs({ pagesFinished: 20, maxPages: 20, elapsedMs: 0, minNavigationIntervalMs: 10_000, maxRuntimeMs: 3_600_000 })).toBe(0);
-    expect(auditRemainingUpperBoundMs({ pagesFinished: 1, maxPages: 20, elapsedMs: 4_000_000, minNavigationIntervalMs: 10_000, maxRuntimeMs: 3_600_000 })).toBe(0);
+describe('PL-2: the estimate while waiting (13 章の 11。DEF-192: 2026-11-04 改)', () => {
+  /** 進み具合の知らせ（読んだページ・見つけたページ・ページの上限・経過だけを変える）。 */
+  const progressOf = (pagesFinished: number, pagesDiscovered: number, maxPages: number, elapsedMs: number) => ({
+    pagesFinished, pagesDiscovered, maxPages, elapsedMs, navigationCount: pagesFinished, pacingWaitMs: 0,
+    requests: { allowedOrigins: { count: 3, peakPerMinute: 3 }, otherOrigins: { count: 0, peakPerMinute: 0 }, servedFromCache: 0, withheldOtherOrigins: 0 },
+    recentPerMinute: { allowedOrigins: 3, otherOrigins: 0 },
+  });
+  const limits = { maxRuntimeMs: 3 * 3_600_000 };
+  const running: Partial<Facts> = { active: true, state: 'RUNNING', runStatus: null, finishedAt: null };
+
+  it('is the remaining pages times the actual time of one page, not over the rest of the runtime limit', () => {
+    // 140 ページを 140 × 50 秒で読んだ。残り 3 ページ × 50 秒 = 150 秒。
+    expect(progressRemainingMs({ pagesFinished: 140, pagesTotal: 143, elapsedMs: 140 * 50_000, maxRuntimeMs: 3 * 3_600_000 })).toBe(150_000);
+    // 時間の上限の残り（10 秒）を超えない。
+    expect(progressRemainingMs({ pagesFinished: 2, pagesTotal: 20, elapsedMs: 3_590_000, maxRuntimeMs: 3_600_000 })).toBe(10_000);
+    // L14: 時間の上限を指定していなければ、残りのページの時間だけ（18 ページ × 1,795 秒）。
+    expect(progressRemainingMs({ pagesFinished: 2, pagesTotal: 20, elapsedMs: 3_590_000, maxRuntimeMs: undefined })).toBe(18 * 1_795_000);
+    expect(progressRemainingMs({ pagesFinished: 20, pagesTotal: 20, elapsedMs: 0, maxRuntimeMs: 3_600_000 })).toBe(0);
+    expect(progressRemainingMs({ pagesFinished: 1, pagesTotal: 20, elapsedMs: 4_000_000, maxRuntimeMs: 3_600_000 })).toBe(0);
+    // 読んだページがまだなければ、求めない。
+    expect(progressRemainingMs({ pagesFinished: 0, pagesTotal: 20, elapsedMs: 1_000, maxRuntimeMs: 3_600_000 })).toBeNull();
   });
 
-  it('uses the progress report, or the limits before the first page, and the slowed interval of the site notice', () => {
-    const limits = { maxPages: 20, maxRuntimeMs: 3_600_000, minNavigationIntervalMs: 10_000 };
-    const running: Partial<Facts> = { active: true, state: 'RUNNING', runStatus: null, finishedAt: null };
-    expect(jobSummaryOf({ ...BASE, ...running }, { estimateLimits: limits, awaitingRegistration: false }).estimate)
-      .toEqual({ pagesFinished: 0, maxPages: 20, remainingUpperBoundMs: 200_000 });
-    const progress = {
-      pagesFinished: 3, pagesDiscovered: 5, maxPages: 20, elapsedMs: 30_000, navigationCount: 3, pacingWaitMs: 0,
-      requests: { allowedOrigins: { count: 3, peakPerMinute: 3 }, otherOrigins: { count: 0, peakPerMinute: 0 }, servedFromCache: 0, withheldOtherOrigins: 0 },
-      recentPerMinute: { allowedOrigins: 3, otherOrigins: 0 },
-    };
-    expect(jobSummaryOf({ ...BASE, ...running, lastProgress: progress }, { estimateLimits: limits, awaitingRegistration: false }).estimate)
-      .toEqual({ pagesFinished: 3, maxPages: 20, remainingUpperBoundMs: 170_000 });
+  it('divides by the found pages up to the page limit, which grows with the found pages', () => {
+    const at = (pagesDiscovered: number) =>
+      jobSummaryOf({ ...BASE, ...running, lastProgress: progressOf(140, pagesDiscovered, 1000, 140 * 50_000) }, { estimateLimits: limits, awaitingRegistration: false }).estimate;
+    expect(at(143)).toEqual({ pagesFinished: 140, pagesTotal: 143, remainingMs: 150_000 });
+    expect(at(150)).toEqual({ pagesFinished: 140, pagesTotal: 150, remainingMs: 500_000 });
+    // 見つけたページがページの上限を超えても、分母は上限まで。
+    expect(at(1500)?.pagesTotal).toBe(1000);
+    // 時間の上限の残りを超えない。
     expect(jobSummaryOf(
-      { ...BASE, ...running, lastProgress: progress, lastNotice: { kind: 'SITE_UNAVAILABLE_SLOWDOWN', minIntervalMs: 20_000 } as Facts['lastNotice'] },
+      { ...BASE, ...running, lastProgress: progressOf(3, 500, 1000, 3_500_000) },
+      { estimateLimits: { maxRuntimeMs: 3_600_000 }, awaitingRegistration: false },
+    ).estimate).toEqual({ pagesFinished: 3, pagesTotal: 500, remainingMs: 100_000 });
+  });
+
+  it('shows nothing before the first page is read, or without the limits', () => {
+    expect(jobSummaryOf({ ...BASE, ...running }, { estimateLimits: limits, awaitingRegistration: false }).estimate).toBeNull();
+    expect(jobSummaryOf({ ...BASE, ...running, lastProgress: progressOf(3, 5, 20, 30_000) }, { estimateLimits: null, awaitingRegistration: false }).estimate)
+      .toBeNull();
+  });
+
+  it('DEF-195: gives the discovery job the same estimate', () => {
+    expect(jobSummaryOf(
+      { ...BASE, ...running, jobKind: 'DISCOVERY', lastProgress: progressOf(2, 6, 20, 20_000) },
       { estimateLimits: limits, awaitingRegistration: false },
-    ).estimate).toEqual({ pagesFinished: 3, maxPages: 20, remainingUpperBoundMs: 340_000 });
-    expect(jobSummaryOf({ ...BASE, ...running }, { estimateLimits: null, awaitingRegistration: false }).estimate).toBeNull();
+    ).estimate).toEqual({ pagesFinished: 2, pagesTotal: 6, remainingMs: 40_000 });
+  });
+
+  it('does not say "at most" in the line (見つけたページが増えうる)', () => {
+    const line = LOCAL_UI_JOB_SUMMARY_TEXT.progressEstimate('140', '143', '3');
+    expect(line).toBe('読んだページ 140 / 143。あと 約 3 分');
+    expect(line).not.toContain('長くても');
   });
 });
 

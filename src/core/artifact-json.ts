@@ -14,5 +14,38 @@ const utf8Encoder = new TextEncoder();
 /** artifact の JSON の文字列（字下げなし。末尾に LF を1つ付ける）。 */
 export const serializeArtifactJson = (value: unknown): string => `${JSON.stringify(value)}\n`;
 
+/** MEM-1: 断片に分けて書く JSON のオブジェクトの項目（`value` は 1 つの値、`items` は配列の項目を 1 つずつ渡すもの）。 */
+export type ArtifactJsonStreamField =
+  | { readonly name: string; readonly value: unknown }
+  | { readonly name: string; readonly items: Iterable<unknown> };
+
+/**
+ * MEM-1（DEF-266）: 項目（`fields`。この順）を持つオブジェクトの `serializeArtifactJson` と同じ文字列を、断片に分けて返す（つなぐと同じ文字列。文字列の長さの
+ * 上限を超える文書を、ファイルに書き足して書くため）。1 つの断片は、区切りと 1 つの項目か、配列の 1 つの項目の JSON（`JSON.stringify` の決まりのまま:
+ * JSON にならない値の項目は書かず、配列の項目は `null`）。
+ */
+export async function* artifactJsonObjectChunks(fields: readonly ArtifactJsonStreamField[]): AsyncGenerator<string, void, undefined> {
+  let separator = '{';
+  for (const field of fields) {
+    if ('items' in field) {
+      yield `${separator}${JSON.stringify(field.name)}:[`;
+      let itemSeparator = '';
+      for (const item of field.items) {
+        yield `${itemSeparator}${JSON.stringify(item) ?? 'null'}`;
+        itemSeparator = ',';
+      }
+      yield ']';
+    } else {
+      const json: string | undefined = JSON.stringify(field.value);
+      if (json === undefined) {
+        continue;
+      }
+      yield `${separator}${JSON.stringify(field.name)}:${json}`;
+    }
+    separator = ',';
+  }
+  yield separator === '{' ? '{}\n' : '}\n';
+}
+
 /** artifact の JSON のバイト列（`serializeArtifactJson` の文字列を、UTF-8（BOM なし）にしたもの）。 */
 export const artifactJsonBytes = (value: unknown): Uint8Array => utf8Encoder.encode(serializeArtifactJson(value));

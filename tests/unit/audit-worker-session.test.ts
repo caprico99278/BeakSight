@@ -12,14 +12,13 @@ import { EXIT_CODES, FAILURE_EXIT_CODE, INTERRUPTED_EXIT_CODE } from '../../src/
 import { ConfigError } from '../../src/config/config-error.js';
 import type { AuditConfig, AuditConfigOverrides } from '../../src/config/types.js';
 import {
-  MAX_WORKER_FAILURE_DETAIL_LENGTH,
-  MAX_WORKER_NOTICE_URL_LENGTH,
   WORKER_PROTOCOL_VERSION,
   targetConfigDigestOf,
   validateWorkerToParentMessage,
   type WorkerToParentMessage,
 } from '../../src/control/worker-protocol.js';
 import type { RunId, RunProgressReport } from '../../src/core/contracts.js';
+import type { RunCoordinatorDependencies } from '../../src/orchestration/run-coordinator.js';
 import type { RunSummaryView } from '../../src/report/view-model.js';
 import { CLI_TEXT } from '../../src/presentation/messages.js';
 import {
@@ -36,6 +35,8 @@ const OUTPUT_DIRECTORY = resolve('worker-session-output');
 const RUN_ID = 'RUN-20261009000001' as RunId;
 const RUN_DIRECTORY = join(OUTPUT_DIRECTORY, RUN_ID);
 const TARGET_CONFIG_PATH = 'config/targets/example.json';
+/** URL-LEN: 前の URL の上限（2,048）より長い URL。 */
+const LONG_URL = `http://127.0.0.1/${'p'.repeat(2_049)}`;
 /** テストの時間（ワーカーの名前つきの時間の代わりに注入する。ms）。 */
 const START_TIMEOUT_MS = 50;
 const HEARTBEAT_INTERVAL_MS = 10;
@@ -149,6 +150,10 @@ function startHarness(options: {
   readonly loadConfigError?: unknown;
   /** ターゲット JSON を読むたびに返す内容（順に使い、尽きたら最後のもの。`Error` なら読めない）。既定は親が検証した内容。 */
   readonly targetConfigReads?: readonly (Uint8Array | Error)[];
+  /** L0: 中核の依存に渡す、Run Coordinator を作る関数（省略すると渡さない）。 */
+  readonly createRunCoordinator?: AuditRunDependencies['createRunCoordinator'];
+  /** RB-6: 設定の読み込みの最小の間隔（省略すると設定に `crawl` を入れない）。 */
+  readonly minNavigationIntervalMs?: number;
 } = {}): Harness {
   const reads = [...(options.targetConfigReads ?? [TARGET_CONFIG_BYTES])];
   const readCalls: string[] = [];
@@ -174,14 +179,22 @@ function startHarness(options: {
       if (options.loadConfigError !== undefined) {
         return Promise.reject(options.loadConfigError);
       }
-      return Promise.resolve({ output: { directory: OUTPUT_DIRECTORY } } as AuditConfig);
+      return Promise.resolve({
+        output: { directory: OUTPUT_DIRECTORY },
+        ...(options.minNavigationIntervalMs === undefined ? {} : { crawl: { minNavigationIntervalMs: options.minNavigationIntervalMs } }),
+      } as AuditConfig);
     },
     executeAuditRun: (_config, dependencies, runOptions, observer) => {
       runCalls.push({ dependencies, options: runOptions, observer });
       runStartedDeferred.resolve(undefined);
       return outcome.promise;
     },
-    runDependencies: { launchBrowser: () => Promise.reject(new Error('not used')), clock: () => new Date(), now: () => Date.now() },
+    runDependencies: {
+      launchBrowser: () => Promise.reject(new Error('not used')),
+      clock: () => new Date(),
+      now: () => Date.now(),
+      ...(options.createRunCoordinator === undefined ? {} : { createRunCoordinator: options.createRunCoordinator }),
+    },
     startTimeoutMs: START_TIMEOUT_MS,
     heartbeatIntervalMs: HEARTBEAT_INTERVAL_MS,
   });
@@ -276,7 +289,7 @@ describe('audit worker session: from READY to FINISHED', () => {
 
     call.observer.onRunStarted?.({ runId: RUN_ID, runDirectory: RUN_DIRECTORY, resumeDecision: { kind: 'RESUME', runId: RUN_ID, runDirectory: RUN_DIRECTORY, completedPages: 2 } });
     call.observer.onProgress?.(PROGRESS);
-    call.observer.onNotice?.({ kind: 'SITE_UNAVAILABLE_RECHECK', url: `http://127.0.0.1/${'p'.repeat(MAX_WORKER_NOTICE_URL_LENGTH)}`, delayMs: 30_000, attempt: 1, maxAttempts: 4 });
+    call.observer.onNotice?.({ kind: 'SITE_UNAVAILABLE_RECHECK', url: LONG_URL, delayMs: 30_000, attempt: 1, maxAttempts: 4 });
     call.observer.onNotice?.({ kind: 'SITE_UNAVAILABLE_SLOWDOWN', minIntervalMs: 10_000 });
     harness.outcome.resolve(ranOutcome(EXIT_CODES.PARTIAL));
 
@@ -288,8 +301,8 @@ describe('audit worker session: from READY to FINISHED', () => {
       protocol: WORKER_PROTOCOL_VERSION, type: 'RUN_STARTED', runId: RUN_ID, runDirectory: RUN_ID, resumeDecision: { kind: 'RESUME', completedPages: 2 },
     });
     expect(progress).toEqual({ protocol: WORKER_PROTOCOL_VERSION, type: 'PROGRESS', report: PROGRESS });
-    expect(recheck?.type === 'NOTICE' && recheck.notice.kind === 'SITE_UNAVAILABLE_RECHECK' ? recheck.notice.url.length : 0)
-      .toBe(MAX_WORKER_NOTICE_URL_LENGTH);
+    // URL-LEN: 知らせの URL は切り詰めない（前は 2,048 まで）。
+    expect(recheck?.type === 'NOTICE' && recheck.notice.kind === 'SITE_UNAVAILABLE_RECHECK' ? recheck.notice.url : null).toBe(LONG_URL);
     expect(slowdown).toEqual({ protocol: WORKER_PROTOCOL_VERSION, type: 'NOTICE', notice: { kind: 'SITE_UNAVAILABLE_SLOWDOWN', minIntervalMs: 10_000 } });
     expect(finished).toEqual({
       protocol: WORKER_PROTOCOL_VERSION,
@@ -301,11 +314,53 @@ describe('audit worker session: from READY to FINISHED', () => {
     expect(harness.stderr).toEqual([]);
   });
 
+  // DEF-180（前の job-boundary-interval-fork の場面。RB-6）: 親が渡した前のワーカーの終わりの時刻から、設定の間隔を空けてから Run を始める（親が時刻を渡すことは
+  // `control-audit-jobs.test.ts`、サーバに届く間隔は `navigation-pacing.test.ts`）。
+  it('DEF-180: waits for the interval from the end of the previous worker before it starts the Run', async () => {
+    const intervalMs = 300;
+    vi.useFakeTimers();
+    try {
+      const harness = startHarness({ minNavigationIntervalMs: intervalMs });
+      harness.channel.emit({ ...START, previousNavigationAtMs: Date.now() });
+      await vi.advanceTimersByTimeAsync(intervalMs - 1);
+      expect(harness.runCalls).toHaveLength(0);
+      await vi.advanceTimersByTimeAsync(1);
+      await harness.runStarted;
+      expect(harness.runCalls).toHaveLength(1);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  // L0（設計書 `2026-11-09-beaksight-remove-limits-design.md` 5 の 1 の 3）: ページを始めた知らせを、今のページの URL つきの `PROGRESS` で送る（止まった
+  // ページが、ジョブの最後の進み具合に残る）。URL-LEN: URL は切り詰めない。中核の Run Coordinator の作り方（本番は既定）に、受け手を足して渡す。
+  it('L0: sends PROGRESS with the URL of the page the Run Coordinator starts', async () => {
+    const created: RunCoordinatorDependencies[] = [];
+    const harness = startHarness({
+      createRunCoordinator: (coordinatorDependencies) => {
+        created.push(coordinatorDependencies);
+        return { run: () => Promise.reject(new Error('not used')), checkpointConclusion: () => null } as unknown as ReturnType<NonNullable<AuditRunDependencies['createRunCoordinator']>>;
+      },
+    });
+    harness.channel.emit(START);
+    await harness.runStarted;
+    const call = onlyRunCall(harness);
+    call.dependencies.createRunCoordinator?.({ config: {} } as unknown as RunCoordinatorDependencies);
+    expect(created).toHaveLength(1);
+    created[0]?.onPageStarted?.({ ...PROGRESS, currentPageUrl: 'http://127.0.0.1/admin/list' });
+    created[0]?.onPageStarted?.({ ...PROGRESS, currentPageUrl: LONG_URL });
+    harness.outcome.resolve(ranOutcome(EXIT_CODES.COMPLETE));
+    await harness.worker.exited;
+
+    const progress = harness.channel.sent.filter((message) => message.type === 'PROGRESS');
+    expect(progress.map((message) => (message.type === 'PROGRESS' ? message.report.currentPageUrl : null)))
+      .toEqual(['http://127.0.0.1/admin/list', LONG_URL]);
+    expect(progress.every((message) => validateWorkerToParentMessage(message).ok)).toBe(true);
+  });
+
   it.each([
-    ['RUN_ACTIVE', { kind: 'RUN_ACTIVE', activeRunId: RUN_ID, exitCode: EXIT_CODES.RUN_UNAVAILABLE } as AuditRunOutcome,
-      { kind: 'RUN_ACTIVE', exitCode: EXIT_CODES.RUN_UNAVAILABLE, runId: RUN_ID, runDirectory: null, runStatus: null }],
-    // DEF-057 の開始のロック: 別の起動が開始の段にいて、実行中の Run の ID がまだ決まっていない。
-    ['RUN_ACTIVE (the run id is not decided yet)', { kind: 'RUN_ACTIVE', activeRunId: null, exitCode: EXIT_CODES.RUN_UNAVAILABLE } as AuditRunOutcome,
+    // SPEC-2: 出力先のロックには Run の ID がないので、Run の ID は知らせない。
+    ['RUN_ACTIVE', { kind: 'RUN_ACTIVE', exitCode: EXIT_CODES.RUN_UNAVAILABLE } as AuditRunOutcome,
       { kind: 'RUN_ACTIVE', exitCode: EXIT_CODES.RUN_UNAVAILABLE, runId: null, runDirectory: null, runStatus: null }],
     ['VERSION_MISMATCH', { kind: 'VERSION_MISMATCH', runId: RUN_ID, runDirectory: RUN_DIRECTORY, differences: [], exitCode: EXIT_CODES.RUN_UNAVAILABLE } as AuditRunOutcome,
       { kind: 'VERSION_MISMATCH', exitCode: EXIT_CODES.RUN_UNAVAILABLE, runId: RUN_ID, runDirectory: RUN_ID, runStatus: null }],
@@ -315,7 +370,7 @@ describe('audit worker session: from READY to FINISHED', () => {
     } as AuditRunOutcome,
     { kind: 'RUN_DIRECTORY_UNAVAILABLE', exitCode: EXIT_CODES.FAILED, runId: RUN_ID, runDirectory: RUN_ID, runStatus: 'FAILED' }],
     ['RESUME_UNAVAILABLE (without the cause)', {
-      kind: 'RESUME_UNAVAILABLE', runId: RUN_ID, runDirectory: RUN_DIRECTORY, reason: 'LOCK_HELD_BY_ACTIVE_RUN', cause: new Error('secret'),
+      kind: 'RESUME_UNAVAILABLE', runId: RUN_ID, runDirectory: RUN_DIRECTORY, reason: 'CHECKPOINT_STORE_FAILED', cause: new Error('secret'),
       exitCode: EXIT_CODES.RUN_UNAVAILABLE, resumeDecision: { kind: 'NEW_RUN' }, notices: [],
     } as AuditRunOutcome,
     { kind: 'RESUME_UNAVAILABLE', exitCode: EXIT_CODES.RUN_UNAVAILABLE, runId: RUN_ID, runDirectory: RUN_ID, runStatus: null }],
@@ -411,17 +466,16 @@ describe('audit worker session: failures', () => {
     expect(harness.runCalls).toEqual([]);
   });
 
-  it('sends FAILED UNEXPECTED_FAILURE with a short clean detail for an unexpected exception, and exits with 1', async () => {
+  it('sends FAILED UNEXPECTED_FAILURE with a clean whole detail for an unexpected exception, and exits with 1', async () => {
     const harness = startHarness();
     harness.channel.emit(START);
     await harness.runStarted;
-    harness.outcome.reject(new Error(`boom\r\n${'x'.repeat(MAX_WORKER_FAILURE_DETAIL_LENGTH * 2)}`));
+    harness.outcome.reject(new Error(`boom\r\n${'x'.repeat(2_049)}`));
 
     expect(await harness.worker.exited).toBe(FAILURE_EXIT_CODE);
     const [failed] = failedOf(harness);
     expect(failed?.reason).toBe('UNEXPECTED_FAILURE');
-    expect(failed?.detail.startsWith('boom  x')).toBe(true);
-    expect(failed?.detail).toHaveLength(MAX_WORKER_FAILURE_DETAIL_LENGTH);
+    expect(failed?.detail).toBe(`boom  ${'x'.repeat(2_049)}`);
     expect(typesOf(harness.channel.sent)).toEqual(['READY', 'FAILED']);
   });
 

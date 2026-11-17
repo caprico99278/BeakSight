@@ -56,24 +56,11 @@ export const CONTROL_SCHEMA_NAMES = Object.freeze([
   'approval-receipt',
   // ローカルの管理画面の、シナリオの Server Function の入力（Task 28 の設計書 4.6。T28e）。
   'ui-scenario-key',
-  'ui-scenario-form',
-  'ui-scenario-create',
-  'ui-scenario-update',
-  'ui-scenario-approve',
-  'ui-scenario-revoke',
   // ローカルの管理画面の、シナリオの下書きをボタン 1 回で作る Server Function の入力（手を減らす段 2 の設計書 3A.2。FM2b）。
   'ui-scenario-auto-draft',
   // 入力の規則の集まりの版 2（Task 29 の設計書 4.1。手動の操作を減らす設計書 3A.3。FM2c）。契約は `src/control/data-rules/rule-contracts.ts`。
   // LG-3（2026-10-24 のテストの組の設計 3.7.2）: 版 1（`data-rule`）は捨てた（保存も読み出しも版 2 だけ）。
   'data-rule-v2',
-  // ローカルの管理画面の、入力の規則の保存の Server Function の入力（Task 29 の設計書 4.4。T29e）。
-  'ui-data-rule-save',
-  // ローカルの管理画面の、書き込みの開始の Server Function の入力（Task 30 の設計書 3 章、10 章。T30g fix round 1）。
-  'ui-write-start',
-  // ローカルの管理画面の、更新の書き込みの開始の Server Function の入力（Task 31 の設計書 3 章、10 章。T31h-2）。
-  'ui-write-update-start',
-  // ローカルの管理画面の、「登録してから更新する」の Server Function の入力（Task 41 の設計書 3.5.1。T41g-3）。
-  'ui-write-chain-start',
   // ローカルの管理画面の、入口の確かめの開始の Server Function の入力（Task 43 の設計書 4.3。T43c）。
   'ui-entry-check-start',
   // ローカルの管理画面の、ログインの段の表の 1 行の「登録する」の Server Function の入力（手動の操作を減らす設計書 2.1。FM-1）。
@@ -81,6 +68,8 @@ export const CONTROL_SCHEMA_NAMES = Object.freeze([
   'ui-login-stage-row-register',
   // ローカルの管理画面の、プロファイルの表示の設定の保存の Server Function の入力（手動の操作を減らす設計書 2.2。FM-1）。
   'ui-profile-display-settings',
+  // DN-1（設計書 `2026-11-16-beaksight-profile-display-name-design.md` 2 章）: ローカルの管理画面の、サイトの画面に出す名前の保存の Server Function の入力。
+  'ui-profile-display-name',
   // ローカルの管理画面の、プロファイルの負荷の値（ページの上限・時間の上限・読み込みの間隔）の確かめと保存の Server Function の入力（Task 44 の設計書 P2-1。T44d）。
   'ui-target-crawl-limits',
   // ローカルの管理画面の、1 回の操作で自動ログインの設定を終える Server Function の入力（手を減らす段 2 の設計書 3A.4。FM2e）。
@@ -123,21 +112,13 @@ const schemaIdByName: Readonly<Record<ControlSchemaName, string>> = Object.freez
   scenario: 'urn:beaksight:schema:control:scenario:1',
   'approval-receipt': 'urn:beaksight:schema:control:approval-receipt:1',
   'ui-scenario-key': 'urn:beaksight:schema:control:ui-scenario-key:1',
-  'ui-scenario-form': 'urn:beaksight:schema:control:ui-scenario-form:1',
-  'ui-scenario-create': 'urn:beaksight:schema:control:ui-scenario-create:1',
-  'ui-scenario-update': 'urn:beaksight:schema:control:ui-scenario-update:1',
-  'ui-scenario-approve': 'urn:beaksight:schema:control:ui-scenario-approve:1',
-  'ui-scenario-revoke': 'urn:beaksight:schema:control:ui-scenario-revoke:1',
   'ui-scenario-auto-draft': 'urn:beaksight:schema:control:ui-scenario-auto-draft:1',
   'data-rule-v2': 'urn:beaksight:schema:control:data-rule:2',
-  'ui-data-rule-save': 'urn:beaksight:schema:control:ui-data-rule-save:1',
-  'ui-write-start': 'urn:beaksight:schema:control:ui-write-start:1',
-  'ui-write-update-start': 'urn:beaksight:schema:control:ui-write-update-start:1',
-  'ui-write-chain-start': 'urn:beaksight:schema:control:ui-write-chain-start:1',
   'ui-entry-check-start': 'urn:beaksight:schema:control:ui-entry-check-start:1',
   'ui-login-stage-row-key': 'urn:beaksight:schema:control:ui-login-stage-row-key:1',
   'ui-login-stage-row-register': 'urn:beaksight:schema:control:ui-login-stage-row-register:1',
   'ui-profile-display-settings': 'urn:beaksight:schema:control:ui-profile-display-settings:1',
+  'ui-profile-display-name': 'urn:beaksight:schema:control:ui-profile-display-name:1',
   'ui-target-crawl-limits': 'urn:beaksight:schema:control:ui-target-crawl-limits:1',
   'ui-automated-login-setup': 'urn:beaksight:schema:control:ui-automated-login-setup:1',
   'ui-write-screen-check': 'urn:beaksight:schema:control:ui-write-screen-check:1',

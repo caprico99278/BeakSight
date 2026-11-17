@@ -11,7 +11,6 @@
     "finishedAt",
     "runStatus",
     "endReason",
-    "maxPages",
     "pages",
     "omittedUnreadPages"
   ],
@@ -38,12 +37,21 @@
         "PREFLIGHT_FAILED"
       ]
     },
-    "maxPages": { "type": "integer", "minimum": 1, "maximum": 9007199254740991 },
+    "maxPages": {
+      "description": "Optional (L14): present only when the user chose crawl.maxPages (absent means no page limit).",
+      "type": "integer",
+      "minimum": 1,
+      "maximum": 9007199254740991
+    },
     "pages": { "type": "array", "items": { "$ref": "#/$defs/page" } },
     "omittedUnreadPages": { "type": "integer", "minimum": 0, "maximum": 9007199254740991 },
+    "frozenStartFallbacks": {
+      "description": "Optional (COV-2c M-1): how many times an ancestor of a state read only inside the freeze could not be read in a Context frozen from the start, and was loaded outside the freeze instead. Present only when 1 or more.",
+      "type": "integer", "minimum": 1, "maximum": 9007199254740991
+    },
     "endReasonDetail": {
-      "description": "Optional (T37a; Task 37 design 3.1): the detail of the end. session-key: the session was taken as lost because the key of the login state disappeared (endReason AUTH_SESSION_LOST). Absent otherwise.",
-      "enum": ["session-key"]
+      "description": "Optional (T37a; Task 37 design 3.1): the detail of the end. session-key: the session was taken as lost because the key of the login state disappeared (endReason AUTH_SESSION_LOST). SERVICE_UNAUTHORIZED (DEF-233): the session was taken as lost because an approved service origin answered 401 and the page could not be drawn (endReason AUTH_SESSION_LOST). Absent otherwise.",
+      "enum": ["session-key", "SERVICE_UNAUTHORIZED"]
     },
     "authentication": {
       "description": "Optional (T37a; Task 37 design 3.1): the counts of the audit stage of the job (the same counts as run.json). Counts only; never a URL or a value.",
@@ -79,11 +87,17 @@
       "properties": {
         "priorityNotPressed": { "type": "integer", "minimum": 0, "maximum": 9007199254740991 }
       }
+    },
+    "resumedRedactedUrlPages": {
+      "description": "Optional (SFIX-1104; SREV-1104 M-3): the pages read, in the continuation after the automatic re-login, with a URL that has the redaction mark as is (the saved state keeps the URLs redacted, so the secret query values are not restored). Absent when there are none and in the documents of the earlier writers (the version stays 1.1).",
+      "type": "integer",
+      "minimum": 1,
+      "maximum": 9007199254740991
     }
   },
   "$defs": {
     "compactUtcTimestamp": { "type": "string", "pattern": "^[0-9]{14}$" },
-    "url": { "type": "string", "minLength": 1, "maxLength": 2048 },
+    "url": { "type": "string", "minLength": 1 },
     "page": {
       "oneOf": [
         {
@@ -112,6 +126,22 @@
               "type": "integer",
               "minimum": 0,
               "maximum": 9007199254740991
+            },
+            "frozenReadRequests": {
+              "description": "Optional (DEF-208-1; discovery coverage design 3.1): the reads (GET and HEAD other than main frame documents) that the Guard sent after the discovery freeze in the context of the page (passed), and how many of them carried a value the probe entered in the URL (carryingMarker). No values and no URLs. The current writer always writes it; absent in the artifacts of the earlier writers.",
+              "type": "object",
+              "additionalProperties": false,
+              "required": ["passed", "carryingMarker"],
+              "properties": {
+                "passed": { "type": "integer", "minimum": 0, "maximum": 9007199254740991 },
+                "carryingMarker": { "type": "integer", "minimum": 0, "maximum": 9007199254740991 },
+                "tokenRefreshes": {
+                  "description": "Optional (DEF-233): the token refreshes of the site script that the Guard sent after the discovery freeze in the context of the page (not counted in passed). No values and no URLs. The current writer always writes it; absent in the artifacts of the earlier writers.",
+                  "type": "integer",
+                  "minimum": 0,
+                  "maximum": 9007199254740991
+                }
+              }
             },
             "safetyViolations": {
               "description": "Optional (DEF-144; probe external scheme design 2.2): the contents of the violations of a press that tried to move to an external scheme on this page (the discovery went on; at most 2: before and after the reload). Absent otherwise.",
@@ -146,7 +176,9 @@
                 "SERVICE_REQUEST_LIMIT_REACHED",
                 "SITE_UNAVAILABLE",
                 "SAFETY_VIOLATION",
-                "PREFLIGHT_FAILED"
+                "PREFLIGHT_FAILED",
+                "SAME_TEMPLATE_PAGE_READ",
+                "REBUILD_FAILED"
               ]
             }
           }
@@ -174,6 +206,45 @@
           "properties": {
             "heading": { "anyOf": [{ "type": "string", "minLength": 1, "maxLength": 60 }, { "type": "null" }] },
             "title": { "anyOf": [{ "type": "string", "minLength": 1, "maxLength": 60 }, { "type": "null" }] }
+          }
+        },
+        "optionChoices": {
+          "description": "Optional (COV-3; coverage by state design 3.2, 3.3): the fields (a select or a radio group of one name) whose options the submission probe chose one by one, in the order chosen (the stages read again add theirs). No option value and no option label: an option is its index and the SHA-256 digest of its value and label. Absent when there are none and in the documents of the earlier writers (the version stays 1.1).",
+          "type": "array",
+          "items": { "$ref": "#/$defs/optionChoice" }
+        }
+      }
+    },
+    "optionChoice": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["stage", "field", "optionCount", "chosenCount", "unchangedCount", "changed"],
+      "properties": {
+        "stage": { "type": "integer", "minimum": 1, "maximum": 9007199254740991 },
+        "field": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["kind", "name", "ordinal"],
+          "properties": {
+            "kind": { "enum": ["SELECT", "RADIO"] },
+            "name": { "anyOf": [{ "type": "string", "minLength": 1 }, { "type": "null" }] },
+            "ordinal": { "type": "integer", "minimum": 0, "maximum": 9007199254740991 }
+          }
+        },
+        "optionCount": { "type": "integer", "minimum": 0, "maximum": 9007199254740991 },
+        "chosenCount": { "type": "integer", "minimum": 0, "maximum": 9007199254740991 },
+        "unchangedCount": { "type": "integer", "minimum": 0, "maximum": 9007199254740991 },
+        "changed": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["optionIndex", "optionDigest", "newStage"],
+            "properties": {
+              "optionIndex": { "type": "integer", "minimum": 0, "maximum": 9007199254740991 },
+              "optionDigest": { "type": "string", "pattern": "^sha256:[0-9a-f]{64}$" },
+              "newStage": { "type": "boolean" }
+            }
           }
         }
       }

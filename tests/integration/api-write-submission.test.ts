@@ -6,14 +6,15 @@
 // - 応答の本文から、登録の ID の取り方の鍵で ID を取り出す口（`recordIdOf`）が、使える形の ID を返す。
 // - 送り手の失敗（接続が切れる、時間切れ）では再送しない（サーバに 1 回だけ届く）。
 // - `Authorization` と応答の本文は、Safety Ledger と書き込みの段の記録と送信の報告に出ない。
-// - 中継の予算: 送り手の 1 回の後に、中継へ直に送った同じ形の要求は止まり、記録される。
 // - 照合が止める形（値の書き換え）は、本物の送り手でも 0 回。
+// - SLIM（W-4）: 中継の予算（送り手の 1 回の後に中継へ直に送った要求は 403）は、write-stage-context の LU-SFIX2-B（form）と guard-api-write-stage の
+//   LU-SFIX2-B（API）に任せた。L12b の「応答のないサーバを待ち続ける」（撤廃した上限の名残）は消した（閉じたときに止めることは guard-write-stage の DEF-099）。
 // - T39R-fix: 窓の前に登録した読み取りの手続きを http で呼んでも、中継の予算（承認の endpoint だけを数える）は残り、承認の書き込みが届く（M-1）。
 //   窓の中の手続きの呼び出しは、照合にかけずに止まり（サーバに届かない）、その後の承認の書き込みが 1 回届く（M-2）。
 // 届いたかは API のサーバの記録で数える。各場面の終わりに、名前つきの時間（`LATE_DELIVERY_SETTLE_MS`）だけ待ってから数え直す。値は出力しない。
-import { request as httpRequest, type IncomingMessage, type ServerResponse } from 'node:http';
+import type { IncomingMessage, ServerResponse } from 'node:http';
 import type { Socket } from 'node:net';
-import type { Browser, BrowserContext, BrowserContextOptions, Page } from 'playwright';
+import type { Browser, Page } from 'playwright';
 import { afterAll, afterEach, beforeAll, describe, expect, it } from 'vitest';
 import { BrowserContextFactory } from '../../src/browser/context-factory.js';
 import { apiRecordIdOfResponseBody } from '../../src/control/actions/api-record-id.js';
@@ -21,23 +22,16 @@ import { createServiceRequestBudget } from '../../src/crawl/service-request-budg
 import type { ApiWritePayloadExpectation } from '../../src/safety/api-write-payload-policy.js';
 import { AuditStageMonitor, WriteStageMonitor, type GuardApiWriteStage } from '../../src/safety/passive-request-guard.js';
 import { SafetyLedger } from '../../src/safety/safety-ledger.js';
-import { overrideBrowser } from '../helpers/browser-proxies.js';
-import { closeTestContexts, launchCliChromium, launchHeadlessChromium } from '../helpers/chromium.js';
+import { BOTH_CHROMIUM_LAUNCHERS, closeTestContexts } from '../helpers/chromium.js';
 import { startLoopbackHttpServer } from '../helpers/loopback-server.js';
 import { TEST_FACTORY_OPTIONS, createTestConfig } from '../helpers/test-config.js';
 import { LOOPBACK_TEST_CERTIFICATE, LOOPBACK_TEST_KEY, TEST_BROWSER_IGNORE_CERTIFICATE_ERRORS_ARGS } from '../helpers/tls-test-certificate.js';
 
-const LAUNCHERS: readonly (readonly [string, () => Promise<Browser>])[] = [
-  ['the default test Chromium', () => launchHeadlessChromium({ args: TEST_BROWSER_IGNORE_CERTIFICATE_ERRORS_ARGS })],
-  ['the CLI Chromium', () => launchCliChromium({ args: TEST_BROWSER_IGNORE_CERTIFICATE_ERRORS_ARGS })],
-];
 const VIEWPORT = Object.freeze({ width: 1280, height: 800 });
 const TEST_TIMEOUT_MS = 120_000;
 const UI_TIMEOUT_MS = 15_000;
 /** 各場面の終わりに、遅れて届く要求を待つ時間（ms）。 */
 const LATE_DELIVERY_SETTLE_MS = 1_500;
-/** 送り手の時間切れ（製品の `WRITE_SUBMISSION_TIMEOUT_MS`）を待つ上限（ms）。 */
-const SENDER_TIMEOUT_WAIT_MS = 40_000;
 const MEMBERS_PATH = '/rest/v1/members';
 const VALUES = Object.freeze({ name: '試験 太郎', email: 't39c@example.test' });
 /** ページの JS が付ける Bearer の目印（記録に出ないことを確かめる）。 */
@@ -48,9 +42,8 @@ const RESPONSE_RECORD_ID = 'rec-1001';
 const PREFER = 'return=representation';
 /** T39R-fix: 登録した読み取りの手続きの呼び出しの path（監査の段の口）と、要求の上限。 */
 const RPC_PATH = '/rest/v1/rpc/search';
-const SERVICE_LIMITS = Object.freeze({ perMinute: 120, perRun: 600 });
 
-type ApiMode = 'ok' | 'drop' | 'hang';
+type ApiMode = 'ok' | 'drop';
 
 interface ApiServer {
   readonly origin: string;
@@ -68,9 +61,6 @@ async function startApiServer(tls: boolean, appOrigin: () => string): Promise<Ap
       state.received.push({ method: request.method ?? '', url: request.url ?? '' });
       if (state.mode === 'drop') {
         request.socket.destroy();
-        return;
-      }
-      if (state.mode === 'hang') {
         return;
       }
       response.writeHead(201, {
@@ -110,33 +100,23 @@ document.getElementById('save').addEventListener('click', async () => {
 });
 </script></body></html>`;
 
-describe.each(LAUNCHERS)('T39c: the API write sender of the write stage with %s', (_label, launch) => {
-  let realBrowser: Browser;
+describe.each(BOTH_CHROMIUM_LAUNCHERS)('T39c: the API write sender of the write stage with %s', (_label, launch) => {
   let browser: Browser;
-  const proxyServers = new WeakMap<BrowserContext, string>();
   const cleanups: (() => Promise<void>)[] = [];
   const factories: BrowserContextFactory[] = [];
 
   beforeAll(async () => {
-    realBrowser = await launch();
-    // 中継に直に送る確かめのため、Context の proxy の server を覚える（製品のコードは変えない）。
-    browser = overrideBrowser(realBrowser, {
-      newContext: async (options?: BrowserContextOptions): Promise<BrowserContext> => {
-        const context = await realBrowser.newContext(options);
-        if (options?.proxy?.server !== undefined) proxyServers.set(context, options.proxy.server);
-        return context;
-      },
-    });
+    browser = await launch({ args: TEST_BROWSER_IGNORE_CERTIFICATE_ERRORS_ARGS });
   });
 
   afterEach(async () => {
     await Promise.all(factories.splice(0).map((factory) => factory.close()));
-    await closeTestContexts(realBrowser);
+    await closeTestContexts(browser);
     for (const cleanup of cleanups.splice(0).reverse()) await cleanup();
   });
 
   afterAll(async () => {
-    await realBrowser?.close();
+    await browser?.close();
   });
 
   /** アプリと API のサーバを起動し、API の書き込みの段の Context でページを開く。 */
@@ -171,14 +151,12 @@ describe.each(LAUNCHERS)('T39c: the API write sender of the write stage with %s'
             auditStage: {
               approvedServiceOrigins: [api.origin],
               auditReadRequests: [{ origin: api.origin, path: RPC_PATH, method: 'POST', maxPerPageLoad: 5 }],
-              scriptLogin: { origin: api.origin, path: '/auth/v1/token', requiredQuery: [] },
-              serviceRequestLimits: SERVICE_LIMITS,
-            },
+              scriptLogin: { origin: api.origin, path: '/auth/v1/token', requiredQuery: [] },            },
           }
           : {}),
       },
       ...(options.auditRpc === true
-        ? { serviceRequestBudget: createServiceRequestBudget({ ...SERVICE_LIMITS, now: () => Date.now() }), auditStageMonitor: new AuditStageMonitor() }
+        ? { serviceRequestBudget: createServiceRequestBudget({ now: () => Date.now() }), auditStageMonitor: new AuditStageMonitor() }
         : {}),
       writeSubmissionCertificates: [LOOPBACK_TEST_CERTIFICATE],
     });
@@ -253,38 +231,6 @@ describe.each(LAUNCHERS)('T39c: the API write sender of the write stage with %s'
     expect(monitor.submissionReport()).toMatchObject({ submission: 'SENT', sendAttempts: 1, sendOutcome: 'NO_RESPONSE' });
     expect(monitor.apiWriteRecordId()).toBeNull();
     expectNoSecrets(ledger, monitor);
-  }, TEST_TIMEOUT_MS);
-
-  it('does not send again when the sender times out (NO_RESPONSE)', async () => {
-    const { api, page, monitor } = await openStage({ mode: 'hang' });
-    await fillAndSave(page, monitor);
-    await expect.poll(() => resultState(page), { timeout: SENDER_TIMEOUT_WAIT_MS, interval: 1_000 }).toBe('error');
-    await page.waitForTimeout(LATE_DELIVERY_SETTLE_MS);
-    expect(writes(api)).toEqual([`POST ${MEMBERS_PATH}`]);
-    expect(monitor.submissionReport()).toMatchObject({ submission: 'SENT', sendAttempts: 1, sendOutcome: 'NO_RESPONSE' });
-  }, TEST_TIMEOUT_MS);
-
-  it('stops a write sent straight to the egress proxy after the one of the sender (the request budget), and records it', async () => {
-    const { api, page, monitor, context, ledger } = await openStage();
-    await fillAndSave(page, monitor);
-    await expect.poll(() => resultState(page), { timeout: UI_TIMEOUT_MS }).toBe('saved');
-    const proxyUrl = new URL(proxyServers.get(context) ?? 'http://127.0.0.1:9');
-    const status = await new Promise<number>((resolvePromise) => {
-      const request = httpRequest({
-        host: proxyUrl.hostname, port: Number(proxyUrl.port), method: 'POST', path: `${api.origin}${MEMBERS_PATH}`,
-        headers: { host: new URL(api.origin).host, 'content-type': 'application/json', connection: 'close' },
-      }, (response) => {
-        response.resume();
-        response.on('end', () => resolvePromise(response.statusCode ?? 0));
-      });
-      request.on('error', () => resolvePromise(0));
-      request.end(JSON.stringify(VALUES));
-    });
-    await page.waitForTimeout(LATE_DELIVERY_SETTLE_MS);
-    expect(status).toBe(403);
-    expect(writes(api)).toEqual([`POST ${MEMBERS_PATH}`]);
-    expect(ledger.snapshot().blockedInteractionRequests.map(({ method, url, reason }) => `${method} ${new URL(url).pathname} ${reason}`))
-      .toContain(`POST ${MEMBERS_PATH} GUARD_BYPASS_EGRESS`);
   }, TEST_TIMEOUT_MS);
 
   it('still sends nothing for a write the check stops (a value rewritten), with the real sender', async () => {

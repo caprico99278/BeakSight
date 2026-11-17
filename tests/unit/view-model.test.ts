@@ -470,6 +470,10 @@ describe('buildReportViewModel: screenshots and relatedFindingIds (design 6.1.3,
         captureType: 'FULL_PAGE',
         relativePath: 'pages/PAGE-000001/desktop/full-page.png',
         relatedFindingIds: [F1.findingId, F2.findingId],
+        // AUD-1c: 発表の前の確かめをしていない表示用モデルでは、欠けていない。
+        missing: false,
+        // AUD-3d: 主の画像（幅の走査の幅の画像でない）。
+        stressWidth: null,
       },
       expect.objectContaining({ evidenceId: idOf(E_SHOT_DESKTOP), relativePath: 'pages/PAGE-000001/desktop/viewport.png' }),
     ]);
@@ -582,13 +586,6 @@ describe('buildReportViewModel: the rule that relates screenshots to Findings (d
       }
     }
   });
-
-  it('keeps the Evidence places pointing to the Findings that refer to them directly', () => {
-    const model = buildReportViewModel(relationRun());
-    expect(model.evidence.find((location) => location.evidenceId === idOf(D_SHOT))?.relatedFindingIds).toEqual([]);
-    expect(model.evidence.find((location) => location.evidenceId === idOf(M_SHOT))?.relatedFindingIds).toEqual([G5.findingId]);
-  });
-
 });
 
 describe('buildReportViewModel: pages and the records before a retry (design 6.1.3, 5.6.4)', () => {
@@ -632,26 +629,13 @@ describe('buildReportViewModel: pages and the records before a retry (design 6.1
           captureType: 'VIEWPORT',
           relativePath: 'pages/PAGE-000001/retry-1/desktop/viewport.png',
           relatedFindingIds: [],
+          missing: false,
+          // AUD-3d: 主の画像（幅の走査の幅の画像でない）。
+          stressWidth: null,
         }],
       },
     ]);
     expect(pageView(model, PAGE_2).retryAttempts).toEqual([]);
-  });
-
-  it('indexes every Evidence of every page with its place, marking the records before a retry', () => {
-    const model = buildReportViewModel(auditRun());
-    expect(model.evidence.map((location) => location.evidenceId)).toEqual([
-      E_METADATA, E_RETRY_SAFETY, E_RETRY_SCREENSHOT, E_RETRY_INTERACTION, E_DOM_DESKTOP, E_SHOT_DESKTOP,
-      E_SHOT_DESKTOP_FULL, E_INTERACTION_1, E_SHOT_MOBILE, E_SHOT_PAGE_2, E_INTERACTION_2, E_INTERACTION_3,
-    ].map(idOf));
-    expect(model.evidence.filter((location) => location.retryAttempt !== null).map((location) => location.evidenceId)).toEqual(
-      [E_RETRY_SAFETY, E_RETRY_SCREENSHOT, E_RETRY_INTERACTION].map(idOf),
-    );
-    expect(model.evidence.find((location) => location.evidenceId === idOf(E_SHOT_PAGE_2))).toMatchObject({
-      path: 'pages/PAGE-000002/page.json',
-      pointer: '/evidence/0',
-      relatedFindingIds: [F3.findingId],
-    });
   });
 });
 
@@ -745,13 +729,11 @@ describe('buildReportViewModel: Interactions and Safety (design 6.1.4)', () => {
   });
 
   // C16d（設計書 6.1.10）: HTML は、Interaction の Evidence の参照を `location` から描く（ID から引き直さない）。
-  it('gives each Interaction the place of its Evidence, the same as the Evidence index', () => {
+  it('gives each Interaction the place of its Evidence', () => {
     const model = buildReportViewModel(auditRun());
     expect(model.interactions.items.length).toBeGreaterThan(0);
     for (const item of model.interactions.items) {
-      const indexed = model.evidence.find((location) => location.evidenceId === item.evidenceId);
-      expect(indexed, item.evidenceId).toBeDefined();
-      expect(item.location, item.evidenceId).toEqual(indexed);
+      expect(item.location?.evidenceId, item.evidenceId).toBe(item.evidenceId);
     }
     expect(model.interactions.items.map((item) => item.location?.pointer)).toEqual(['/evidence/7', '/evidence/1', '/evidence/2']);
   });
@@ -818,8 +800,8 @@ describe('buildReportViewModel: the Safety events (design 6.1.10)', () => {
   it('gives each event its fields, with null for the fields its record does not have', () => {
     const model = buildReportViewModel(safetyRun());
     const all = model.safety.events.filter((event) => event.evidenceId === idOf(S_ALL));
-    const location = model.evidence.find((candidate) => candidate.evidenceId === idOf(S_ALL));
-    expect(location).toBeDefined();
+    const location = all[0]?.location;
+    expect(location).toMatchObject({ evidenceId: idOf(S_ALL), path: 'pages/PAGE-000001/page.json' });
     const common = { evidenceId: idOf(S_ALL), pageId: PAGE_1, viewport: 'desktop', scope: 'PASSIVE', retryAttempt: null, location };
     const samples = safetyEventSamples();
     expect(all).toEqual([
@@ -905,7 +887,7 @@ describe('buildReportViewModel: the Safety events (design 6.1.10)', () => {
   it('points each event to the place of its Safety Evidence', () => {
     const model = buildReportViewModel(safetyRun());
     for (const event of model.safety.events) {
-      expect(event.location, event.evidenceId).toEqual(model.evidence.find((location) => location.evidenceId === event.evidenceId));
+      expect(event.location?.evidenceId, event.evidenceId).toBe(event.evidenceId);
     }
   });
 

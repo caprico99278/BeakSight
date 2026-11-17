@@ -84,14 +84,15 @@ describe('PL-6b: the shared parts of the automatic drafts', () => {
       .toEqual([['CREATE', '/members/new'], ['UPDATE', '/members/1/edit']]);
   });
 
-  it('reuses the same definition, stops at the limit, and creates otherwise (the API and the form share the choice)', () => {
+  // LZ-3c: 定義の数では止めない（前の `maxDefinitions` と `LIMIT_REACHED` は捨てた。前の呼び方の項目を渡しても、作る）。
+  it('reuses the same definition and creates otherwise, whatever the number of the definitions (the API and the form share the choice)', () => {
     const definitions = [{ readCheckId: 'read-1', revision: 3, targetPagePath: '/a/{id}' }];
-    expect(autoDraftDefinitionChoiceOf({ definitions, isSame: ({ targetPagePath }) => targetPagePath === '/a/{id}', maxDefinitions: 5, definition: 'new' }))
+    expect(autoDraftDefinitionChoiceOf({ definitions, isSame: ({ targetPagePath }) => targetPagePath === '/a/{id}', definition: 'new' }))
       .toEqual({ kind: 'EXISTING', reference: { readCheckId: 'read-1', revision: 3 } });
-    expect(autoDraftDefinitionChoiceOf({ definitions, isSame: () => false, maxDefinitions: 1, definition: 'new' })).toEqual({ kind: 'LIMIT_REACHED' });
-    expect(autoDraftDefinitionChoiceOf({ definitions, isSame: () => false, maxDefinitions: 5, definition: 'new' })).toEqual({ kind: 'CREATE', definition: 'new' });
+    const former = { definitions, isSame: () => false, definition: 'new', maxDefinitions: 1 } as Parameters<typeof autoDraftDefinitionChoiceOf<string>>[0];
+    expect(autoDraftDefinitionChoiceOf(former)).toEqual({ kind: 'CREATE', definition: 'new' });
     // API の形は同じ部品で選ぶ（型の推しの後）。
-    expect(autoDraftReadCheckChoiceOf({ createPagePath: '/admin/members/new', readPagePaths: ['/admin/members/12'], definitions: [], maxDefinitions: 5 }))
+    expect(autoDraftReadCheckChoiceOf({ createPagePath: '/admin/members/new', readPagePaths: ['/admin/members/12'], definitions: [] }))
       .toMatchObject({ kind: 'CREATE', definition: { targetPagePath: '/admin/members/{id}' } });
   });
 });
@@ -145,8 +146,8 @@ describe('PL-6b: the automatic draft of a form create', () => {
       .toEqual({ targetIdentityDigest: READ_CANDIDATE.identityDigest, parameters: { q: '' }, expectations: AUTO_DRAFT_READ_CHECK_PLACEHOLDER_EXPECTATIONS });
     // 照合の専用の印で参照される同じ定義だけを使う（人が作った定義は使わない）。
     const fact = { readCheckId: 'read-1', revision: 2, targetPagePath: null, targetIdentityDigest: READ_CANDIDATE.identityDigest, parameterNames: ['q'] };
-    expect(formAnswerReadChoiceOf({ answerRead, definitions: [fact], verificationOnlyReadCheckIds: [], maxDefinitions: 20 })).toMatchObject({ kind: 'CREATE' });
-    expect(formAnswerReadChoiceOf({ answerRead, definitions: [fact], verificationOnlyReadCheckIds: ['read-1'], maxDefinitions: 20 }))
+    expect(formAnswerReadChoiceOf({ answerRead, definitions: [fact], verificationOnlyReadCheckIds: [] })).toMatchObject({ kind: 'CREATE' });
+    expect(formAnswerReadChoiceOf({ answerRead, definitions: [fact], verificationOnlyReadCheckIds: ['read-1'] }))
       .toEqual({ kind: 'EXISTING', reference: { readCheckId: 'read-1', revision: 2 } });
     // 結び付けと期待（作った値を含む）は、実行のたびに値が変わる文字の欄。変わる欄がなければ結ばない。
     expect(formAnswerReadVerificationOf({ reference: { readCheckId: 'read-1', revision: 2 }, parameterName: 'q', textFieldNames: ['name'], varyingFieldNames: ['plan', 'name'] }))

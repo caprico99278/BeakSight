@@ -7,7 +7,8 @@
 // - 登録に結ぶ更新（`draftUpdateForCreate`）: 既にあれば、その更新。なければ、規則 F で作れて台帳がその登録に決まる更新を作る（ほかの登録の台帳に結ぶ更新は
 //   作らない）。
 // - チェックの範囲の承認（`approveForCheck`）: 承認が今も有効なものはそのまま。ほかは今の承認の口（`approveScenario`。版・digest・今の事実を確かめ直す）で、
-//   副作用の確認を兼ねて（`confirmSideEffects: true`）承認する。承認の有効さの判定は変えない。
+//   副作用の確認を兼ねて（`confirmSideEffects: true`）承認する。承認の有効さの判定は変えない。SPEC-4: 外した規則の画面で人が保存した規則は使わず、推した
+//   規則に替えてから承認する（`replaceHumanRules`。判定は `humanRulesAttachedOf`）。
 // - 承認・実行の許可は、ここでは出さない（許可の発行は、点検の書き込みの段の前にジョブの管理が行う）。サイトには接続しない。
 import { randomUUID } from 'node:crypto';
 import { API_SCENARIO_TRANSPORT, FORM_SCENARIO_TRANSPORT, type ScenarioTransport } from '../../core/scenario-transport.js';
@@ -16,24 +17,33 @@ import { dateOfCompactUtcTimestamp } from '../../core/utc-timestamp.js';
 import { mergedDiscoveryCandidatesOf } from '../discovery-candidate-lookup.js';
 import type { DiscoveryDocument } from '../../discovery/discovery-result.js';
 import { inferRuleSetContent } from '../data-rules/rule-set-inference.js';
-import type { FieldRuleProblem, RuleSetRevision } from '../data-rules/rule-contracts.js';
-import { defaultRuleSetIdOf, saveRuleSetAndAttach, type RuleSetStoreRejectionReason } from '../data-rules/rule-store.js';
+import { ruleSetHasHumanItems, type FieldRuleProblem, type RuleSetRevision } from '../data-rules/rule-contracts.js';
+import {
+  defaultRuleSetIdOf,
+  readLatestRuleSet,
+  readRuleSetRevisions,
+  saveRuleSetAndAttach,
+  type RuleSetStoreRejectionReason,
+} from '../data-rules/rule-store.js';
 import { listReadChecks } from '../job/read-check-store.js';
 import type { ControlDatabase } from '../store/control-database.js';
 import {
   apiAutoDraftPlanOf,
+  apiUpdateAutoDraftInputOf,
   apiUpdateDraftPresetOf,
   autoDraftScenarioIdOf,
+  listShownFieldNamesOf,
   type AutoDraftReadCheckFact,
   type AutoDraftScenarioFact,
   type AutoDraftUpdatePlan,
   type AutoDraftUpdateResultStatus,
 } from './api-scenario-autodraft.js';
-import { apiScenarioDraftInputOf, apiScenarioFormOf } from './api-scenario-draft.js';
+import { apiScenarioFormOf } from './api-scenario-draft.js';
 import { updateNotifyConfirmedByCheckOf, writeScreenMayNotifyOf } from './autodraft-shared.js';
 import type { DraftValue } from './draft-value-origin.js';
 import {
   formAutoDraftPlanOf,
+  formListRowUpdateOf,
   formScenarioProbeDraftOf,
   formTextFieldNamesOf,
   formUpdateDraftPresetOf,
@@ -109,11 +119,19 @@ export const autoDraftReadCheckFactsOf = (database: ControlDatabase, profileId: 
     targetIdentityDigest: definition.targetIdentityDigest ?? null, parameterNames: Object.keys(definition.parameters),
   }));
 
+/** 推した規則の集まりを保存する先（新しく作るなら版は null。人の規則を替えるなら、その規則の集まりの id と最新の版）。 */
+interface InferredRulesTarget {
+  readonly ruleSetId: string;
+  readonly expectedRevision: number | null;
+}
+
 /**
- * 推した規則の集まりを作り、シナリオに付ける（今の 2 段の保存の口。承認の前だけ）。書き込みの手順の保存の口（画面の `scenario-functions.ts` の作成と変更）も、
- * 規則がまだない下書きに、これで付ける（付け方の 1 か所）。
+ * 推した規則の集まりを作り、シナリオに付ける（今の 2 段の保存の口。承認の前だけ。自動の下書きの、規則がまだない下書きに付ける 1 か所）。
  */
-export const attachInferredRules = (database: ControlDatabase, scenario: ScenarioView, clock: AutoDraftClock): InferredRulesAttachment => {
+export const attachInferredRules = (database: ControlDatabase, scenario: ScenarioView, clock: AutoDraftClock): InferredRulesAttachment =>
+  saveInferredRulesOf(database, scenario, clock, { ruleSetId: defaultRuleSetIdOf(scenario.scenarioId), expectedRevision: null });
+
+const saveInferredRulesOf = (database: ControlDatabase, scenario: ScenarioView, clock: AutoDraftClock, target: InferredRulesTarget): InferredRulesAttachment => {
   let inferred: ReturnType<typeof inferRuleSetContent>;
   try {
     inferred = inferRuleSetContent(scenario.current, scenario.evidence);
@@ -124,9 +142,9 @@ export const attachInferredRules = (database: ControlDatabase, scenario: Scenari
     throw error;
   }
   const saved = saveRuleSetAndAttach(database, {
-    ruleSetId: defaultRuleSetIdOf(scenario.scenarioId),
+    ruleSetId: target.ruleSetId,
     scenarioId: scenario.scenarioId,
-    expectedRevision: null,
+    expectedRevision: target.expectedRevision,
     content: inferred.content,
     expectedScenarioRevision: scenario.revision,
     at: clock('automatic input rule save time'),
@@ -142,6 +160,38 @@ export const attachInferredRules = (database: ControlDatabase, scenario: Scenari
   return { summary, scenario: saved.attachment.scenario, ruleSet: saved.ruleSet.ruleSet, rejection: null };
 };
 
+/** SPEC-4: シナリオの今の版に付いた規則の集まりが、人の項目を持つか（外した規則の画面で人が保存したもの。判定は `ruleSetHasHumanItems`）。 */
+export const humanRulesAttachedOf = (database: ControlDatabase, scenario: ScenarioView): boolean => {
+  const reference = scenario.current.inputRuleReference;
+  const attached = reference === null
+    ? undefined
+    : readRuleSetRevisions(database, scenario.scenarioId)
+      .find((stored) => stored.reference.revision === reference.revision && stored.reference.digest === reference.digest);
+  return attached !== undefined && ruleSetHasHumanItems(attached.ruleSet);
+};
+
+/**
+ * SPEC-4（設計書 `2026-11-14-beaksight-slim-and-simplify-design.md` 5.1）: 人が保存した規則（`humanRulesAttachedOf`）を使わず、推した規則に替える（チェックの範囲の
+ * 承認の前）。承認していれば、今の撤回の口で取り消してから、推した規則を同じ規則の集まりの新しい版にして付ける。人の規則でなければ何もしない。替えなくてよい・
+ * 替えたら真、替えられなければ（推せない・保存の口が拒んだ）偽。
+ */
+export const replaceHumanRules = (database: ControlDatabase, scenarioId: string, clock: AutoDraftClock): boolean => {
+  const scenario = readScenario(database, scenarioId);
+  const latest = scenario === null ? null : readLatestRuleSet(database, scenarioId);
+  if (scenario === null || latest === null || !humanRulesAttachedOf(database, scenario)) {
+    return true;
+  }
+  let draft = scenario;
+  if (scenario.state === 'APPROVED') {
+    const revoked = revokeScenarioApproval(database, { scenarioId, expectedRevision: scenario.revision, receiptId: randomUUID(), at: clock('human rules revoke time') });
+    if (!revoked.ok) {
+      return false;
+    }
+    draft = revoked.scenario;
+  }
+  return saveInferredRulesOf(database, draft, clock, { ruleSetId: latest.reference.ruleSetId, expectedRevision: latest.reference.revision }).scenario !== null;
+};
+
 /**
  * 規則 F で変える欄を決めた更新の下書きを保存する（台帳の検証の指定は、写しの決まり `updateVerificationCopyOf` で台帳から写す。写せなければ照合なしの下書きのまま
  * 保存し、承認の前の確かめが止める）。保存した後に、推した入れる値の決まりを付ける。保存したシナリオ（拒まれたら null）。
@@ -149,7 +199,14 @@ export const attachInferredRules = (database: ControlDatabase, scenario: Scenari
 const saveUpdateDraftOf = (
   facts: UpdateAutoDraftFacts,
   draft: Readonly<Record<string, unknown>>,
-  input: { readonly transport: ScenarioTransport; readonly ledgerId: string; readonly changedFieldNames: readonly string[]; readonly changedTextFieldNames: readonly string[] },
+  input: {
+    readonly transport: ScenarioTransport;
+    readonly ledgerId: string;
+    readonly changedFieldNames: readonly string[];
+    readonly changedTextFieldNames: readonly string[];
+    /** LU-7 fix round 2: API の一覧の行の更新の行の選び方（一覧の画面の照合の READ を写す）。 */
+    readonly listRow?: { readonly listPagePath: string } | null;
+  },
 ): { readonly scenario: ScenarioView | null; readonly reason: ScenarioDraftRejectionReason | null } => {
   const { database, profileId } = facts;
   const ledger = listScenarios(database, profileId).find(({ scenarioId }) => scenarioId === input.ledgerId) ?? null;
@@ -159,6 +216,7 @@ const saveUpdateDraftOf = (
     readChecks: autoDraftReadCheckFactsOf(database, profileId),
     changedFieldNames: input.changedFieldNames,
     changedTextFieldNames: input.changedTextFieldNames,
+    listRow: input.listRow ?? null,
   });
   const verified = copy.kind === 'FILLED' ? { ...draft, verification: { recordId: copy.recordId, readVerification: copy.readVerification } } : draft;
   const created = createScenario(database, {
@@ -197,18 +255,22 @@ export const apiUpdateAutoDraftOf = (
     return base;
   }
   const { database, profileId } = facts;
+  const scenarios = listScenarios(database, profileId);
+  const readChecks = autoDraftReadCheckFactsOf(database, profileId);
   const { form } = apiScenarioFormOf({
     profileId,
     candidate: item.row.candidate,
     context,
     // MI-7: 作成の画面と同じく、台帳の照合の READ と定義を渡す（台帳の選択肢の判定は変わらない）。
-    scenarios: listScenarios(database, profileId).map((scenario) => ({
+    scenarios: scenarios.map((scenario) => ({
       scenarioId: scenario.scenarioId,
       kind: scenario.current.kind,
       pagePath: scenario.evidence.page.path,
       readVerification: scenario.current.verification.readVerification,
     })),
-    readChecks: autoDraftReadCheckFactsOf(database, profileId),
+    readChecks,
+    // LU-7 fix round 1: 一覧の行の更新の型の案は、自動の下書きだけが受ける（作成の画面は受けない）。
+    listRowUpdate: true,
   });
   if (form === null) {
     return save ? { ...base, status: 'NOT_SAVED' } : base;
@@ -222,21 +284,26 @@ export const apiUpdateAutoDraftOf = (
   if (preset.ledger === null || preset.formPathTemplate === null || probe === undefined) {
     return { ...view, status: 'NOT_SAVED' };
   }
-  const pageKeys = form.pageKeys.filter(({ rejection }) => rejection === null).map(({ key }) => key);
-  const draft = apiScenarioDraftInputOf(profileId, item.row.candidate, probe, {
-    fieldNames: item.changedFieldNames, pageKeys, formPathTemplate: preset.formPathTemplate.value,
+  // LU-7（一覧の行の更新の設計書 5.4 の 4）: 下書きの組み立ては純粋な部品の 1 か所（一覧の行の更新は、台帳の事実から行を選ぶ欄を選ぶ。選べなければ作らない）。
+  const ledgerId = preset.ledger.value;
+  const ledgerRead = scenarios.find(({ scenarioId }) => scenarioId === ledgerId)?.current.verification.readVerification ?? null;
+  const draft = apiUpdateAutoDraftInputOf({
+    profileId, item, form, ledgerScenarioId: ledgerId, formPathTemplate: preset.formPathTemplate.value,
+    ledgerFact: context.scenarios.find(({ scenarioId }) => scenarioId === ledgerId),
+    listShownFieldNames: listShownFieldNamesOf(ledgerRead, readChecks, preset.formPathTemplate.value),
   });
-  const saved = saveUpdateDraftOf(facts, {
-    ...draft,
-    api: {
-      ...(draft['api'] as Record<string, unknown>),
-      keptKeys: [...item.keepFieldNames],
-      ledger: { targetCreateScenarioId: preset.ledger.value, formPathTemplate: preset.formPathTemplate.value },
-    },
-  }, { transport: API_SCENARIO_TRANSPORT, ledgerId: preset.ledger.value, changedFieldNames: item.changedFieldNames, changedTextFieldNames: [] });
+  if (draft === null) {
+    return { ...view, status: 'NOT_SAVED' };
+  }
+  // LU-11 fix round 2: 一覧の行の更新では、変える鍵は行を選ぶ鍵を除いて選び直した値（下書きの送る鍵）。
+  const changedFieldNames = (draft['fieldNames'] as readonly string[] | undefined) ?? item.changedFieldNames;
+  const saved = saveUpdateDraftOf(facts, draft, {
+    transport: API_SCENARIO_TRANSPORT, ledgerId, changedFieldNames, changedTextFieldNames: [],
+    listRow: ((draft['api'] as { readonly ledger?: { readonly listRow?: { readonly listPagePath: string } } }).ledger?.listRow) ?? null,
+  });
   return saved.scenario === null
     ? { ...view, status: 'NOT_SAVED', reason: saved.reason }
-    : { ...view, status: 'CREATED', scenarioId: saved.scenario.scenarioId };
+    : { ...view, status: 'CREATED', scenarioId: saved.scenario.scenarioId, changedFieldNames: [...changedFieldNames] };
 };
 
 /**
@@ -263,22 +330,44 @@ export const formUpdateAutoDraftOf = (facts: UpdateAutoDraftFacts, item: FormAut
   if (preset.ledger === null || preset.templates === null) {
     return { ...view, status: 'NOT_SAVED' };
   }
+  // LU-11（一覧の行の更新の設計書 5.4 の 4、D5）: 行の下に広がるフォーム（同じ行の開き手 `rowOpener`）は、行の選び方を足す（組み立ては純粋な部品
+  // `formListRowUpdateOf`。行を選ぶ欄を台帳の事実から API の形と同じ決め方で先に決め、変える欄はそれを除いて選び直す。決められなければ作らない）。
+  const ledgerId = preset.ledger.value;
+  const { formPathTemplate, actionPathTemplate } = preset.templates.value;
+  let listRowUpdate: ReturnType<typeof formListRowUpdateOf> = null;
+  if (item.row.candidate.rowOpener !== undefined) {
+    const context = facts.discovery === null ? null : readScenarioDraftContext(database, profileId, facts.discovery.jobId, null);
+    const ledgerRead = listScenarios(database, profileId).find(({ scenarioId }) => scenarioId === ledgerId)?.current.verification.readVerification ?? null;
+    listRowUpdate = formListRowUpdateOf({
+      update: item.row.candidate,
+      formPathTemplate,
+      facts: item.changedFieldFacts,
+      ledgerFact: context?.scenarios.find(({ scenarioId }) => scenarioId === ledgerId),
+      listShownFieldNames: listShownFieldNamesOf(ledgerRead, autoDraftReadCheckFactsOf(database, profileId), formPathTemplate),
+    });
+    if (listRowUpdate === null) {
+      return { ...view, status: 'NOT_SAVED' };
+    }
+  }
+  const changedFieldNames = listRowUpdate?.changedFieldNames ?? item.changedFieldNames;
+  const keepFieldNames = listRowUpdate?.keepFieldNames ?? item.keepFieldNames;
   const draft = {
-    ...formScenarioProbeDraftOf(profileId, item.row.candidate, item.changedFieldNames, item.keepFieldNames),
+    ...formScenarioProbeDraftOf(profileId, item.row.candidate, changedFieldNames, keepFieldNames),
     update: {
-      targetCreateScenarioId: preset.ledger.value,
-      formPathTemplate: preset.templates.value.formPathTemplate,
-      actionPathTemplate: preset.templates.value.actionPathTemplate,
-      keepFieldNames: [...item.keepFieldNames],
+      targetCreateScenarioId: ledgerId,
+      formPathTemplate,
+      actionPathTemplate,
+      keepFieldNames: [...keepFieldNames],
+      ...(listRowUpdate === null ? {} : { listRow: { ...listRowUpdate.listRow } }),
     },
   };
   const saved = saveUpdateDraftOf(facts, draft, {
-    transport: FORM_SCENARIO_TRANSPORT, ledgerId: preset.ledger.value, changedFieldNames: item.changedFieldNames,
-    changedTextFieldNames: formTextFieldNamesOf(item.row.candidate, item.changedFieldNames),
+    transport: FORM_SCENARIO_TRANSPORT, ledgerId: preset.ledger.value, changedFieldNames,
+    changedTextFieldNames: formTextFieldNamesOf(item.row.candidate, changedFieldNames),
   });
   return saved.scenario === null
     ? { ...view, status: 'NOT_SAVED', reason: saved.reason }
-    : { ...view, status: 'CREATED', scenarioId: saved.scenario.scenarioId };
+    : { ...view, status: 'CREATED', scenarioId: saved.scenario.scenarioId, changedFieldNames: [...changedFieldNames] };
 };
 
 /** 更新の台帳（登録のシナリオ。なければ null）。 */
@@ -378,6 +467,10 @@ export const approveForCheck = (
     return { ok: false, reason: 'APPROVAL_REJECTED' };
   };
   for (const scenarioId of scenarioIds) {
+    // SPEC-4: 人が保存した規則は使わない（推した規則に替えてから承認する）。
+    if (!replaceHumanRules(database, scenarioId, clock)) {
+      return rejectedTakingBack();
+    }
     const at = clock('write screen check time');
     const status = readScenarioApprovalStatus(database, scenarioId, external, dateOfCompactUtcTimestamp(at));
     if (status === null) {

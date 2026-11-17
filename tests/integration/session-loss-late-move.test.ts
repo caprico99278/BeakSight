@@ -1,10 +1,10 @@
 // DF-3（DEF-167）: 読み込み（DOMContentLoaded）が返った後に、画面のスクリプトがログインの画面へ移すサイトでも、セッションの切れを判定する。
 // - fixture（認証つきの SPA）の 2 ページ目（`SPA_SESSION_LOSS_PATH`）が、`load` の後に少し待ってから、ログインの画面へ移る（`client-late`。ログインの状態の
-//   鍵は消さない）。ログインの画面は読む範囲の外なので、Guard がその移動を止める（DEF-167 の形）。
+//   鍵は消さない）。ログインの画面は読む範囲の外。FIN-1（SD-2）: Guard はその移動を止めない（届く）。移った先の URL（`PAGE_URL`）で判定する。
 // - 監査の Run・発見・READ の確かめの 3 つで、直した後は `AUTH_SESSION_LOST` で止まり、そのページは捨てられ、次のページへの読み込みが 0 件である。直す前は、
 //   読み込みの直後の 1 回の判定に記録がなく、Run は続いた（RED）。
-// - 対照（`client-late-other`）: 同じ時機に、セッションの切れの path に当たらない画面へ移る（Guard が止める）ときは、止めない（誤検知を増やさない）。
-// 本物の factory と Guard。Chromium はテストの既定と、CLI の起動の設定の両方。サーバは 127.0.0.1 だけで待ち受ける。値は出力しない。
+// - 対照（`client-late-other`）: 同じ時機に、セッションの切れの path に当たらない画面へ移るときは、止めない（誤検知を増やさない）。
+// 本物の factory と Guard。Chromium はテストの既定だけ。サーバは 127.0.0.1 だけで待ち受ける。値は出力しない。
 import { readFileSync } from 'node:fs';
 import { mkdtemp, rm } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
@@ -26,7 +26,7 @@ import { SESSION_LOSS_CHECK_POINTS, type RunAuthentication } from '../../src/orc
 import { executeDiscoveryRun } from '../../src/worker/discovery-run.js';
 import { hasSuccessStorageKey } from '../../src/worker/login-stage-checks.js';
 import { executeReadCheckRun } from '../../src/worker/read-check-run.js';
-import { launchCliChromium, launchHeadlessChromium } from '../helpers/chromium.js';
+import { DEFAULT_CHROMIUM_LAUNCHERS } from '../helpers/chromium.js';
 import { READ_METHODS } from '../helpers/leak-places.js';
 import { fastRunConfig } from '../helpers/run-harness.js';
 import {
@@ -40,13 +40,8 @@ import {
   type SpaSessionLossPage,
 } from '../helpers/spa-auth-site-fixture.js';
 
-const LAUNCHERS = [
-  ['the default test Chromium', () => launchHeadlessChromium()],
-  ['the CLI launch settings', () => launchCliChromium()],
-] as const;
 const TEST_TIMEOUT_MS = 180_000;
 const MAX_PAGES = 4;
-const LIMITS = Object.freeze({ perMinute: 120, perRun: 600 });
 /** 移る先の path の表記（query は名前だけ）。 */
 const LANDED_PATH = `${SPA_APP_PATHS.auth}?from&ticket`;
 /** fixture の鍵の名前（`fixture-auth-token`）に当たる、成功の鍵の形。 */
@@ -60,7 +55,7 @@ const LATER_POINTS: readonly string[] = [
   SESSION_LOSS_CHECK_POINTS.pageEnd,
 ];
 
-describe.each(LAUNCHERS)('DF-3 (DEF-167): the session loss after a late script move to the login page (%s)', (_name, launch) => {
+describe.each(DEFAULT_CHROMIUM_LAUNCHERS)('DF-3 (DEF-167): the session loss after a late script move to the login page (%s)', (_name, launch) => {
   let site: SpaAuthSite | undefined;
   let workDirectory = '';
   let runCount = 0;
@@ -94,9 +89,7 @@ describe.each(LAUNCHERS)('DF-3 (DEF-167): the session loss after a late script m
     const auditStage: AuditStageServiceRequests = {
       approvedServiceOrigins: [spa.backendOrigin],
       auditReadRequests: [],
-      scriptLogin: { origin: spa.tokenOrigin, path: SPA_BACKEND_PATHS.token, requiredQuery: [{ name: 'grant_type', value: SPA_GRANT_TYPES.password }] },
-      serviceRequestLimits: LIMITS,
-    };
+      scriptLogin: { origin: spa.tokenOrigin, path: SPA_BACKEND_PATHS.token, requiredQuery: [{ name: 'grant_type', value: SPA_GRANT_TYPES.password }] },    };
     const authentication: RunAuthentication = {
       initialState: { cookies: [], origins: [{ origin: spa.appOrigin, localStorage: [{ name: SPA_AUTH_STORAGE_KEY, value: spa.issueStoredSession() }] }] },
       approvedTestOrigins: [spa.appOrigin],
@@ -117,23 +110,22 @@ describe.each(LAUNCHERS)('DF-3 (DEF-167): the session loss after a late script m
     .filter(({ origin, method, path }) => origin === 'app' && method === 'GET' && path !== SPA_APP_PATHS.script)
     .map(({ path }) => path);
 
-  /** 移る画面の最初の読み込みの後の、ほかの画面の読み込み（移る画面の読み直しを除く）。 */
+  /** 移る画面の最初の読み込みの後の、ほかの画面の読み込み（移る画面の読み直しと、SD-2 でその画面が自分で移って届くログインの画面を除く）。 */
   const loadsAfterLatePage = (spa: SpaAuthSite): readonly string[] => {
     const loads = pageLoadsOf(spa);
     const first = loads.indexOf(SPA_SESSION_LOSS_PATH);
     expect(first, 'the late moving page was loaded').toBeGreaterThanOrEqual(0);
-    return loads.slice(first + 1).filter((path) => path !== SPA_SESSION_LOSS_PATH);
+    return loads.slice(first + 1).filter((path) => path !== SPA_SESSION_LOSS_PATH && !path.startsWith(`${SPA_APP_PATHS.auth}?`));
   };
 
+  // SD-2（設計書 `2026-11-16-beaksight-action-based-delete-guard-design.md` 2.4）: ページの script のログインの画面への移動は、読む範囲の外でも止めずに届く
+  // （移った画面は点検しない）。読み取りでない要求は届かない。
   const expectOnlyReads = (spa: SpaAuthSite): void => {
     expect(spa.requests.filter(({ method, preflight }) => !READ_METHODS.has(method) && !preflight)).toEqual([]);
-    // ログインの画面へは移らない（Guard が読む範囲の外として止める）。
-    expect(pageLoadsOf(spa).filter((path) => path.startsWith(SPA_APP_PATHS.auth))).toEqual([]);
   };
 
   const expectLateEvidence = (loss: SessionLossEvidence | null | undefined): void => {
-    expect(loss).toMatchObject({ requestedPath: SPA_SESSION_LOSS_PATH, landedPath: LANDED_PATH, landedBy: 'BLOCKED_REDIRECT' });
-    expect(loss?.blockedRequests).toContainEqual({ method: 'GET', originKind: 'ALLOWED', path: SPA_APP_PATHS.auth, reason: 'AUDIT_EXCLUDED_URL', count: 1 });
+    expect(loss).toMatchObject({ requestedPath: SPA_SESSION_LOSS_PATH, landedPath: LANDED_PATH, landedBy: 'PAGE_URL', blockedRequests: [] });
   };
 
   const audit = async (spa: SpaAuthSite): Promise<RunSummary> => {

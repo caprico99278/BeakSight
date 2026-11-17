@@ -7,7 +7,6 @@ import {
 } from '../core/evidence-types.js';
 import { isNonNegativeSafeInteger } from '../core/guards.js';
 import { isSha256Fingerprint } from '../core/ids.js';
-import { MAX_URL_LENGTH } from '../core/limits.js';
 
 /** Interaction の候補の `href` の種類。定義は `src/core/evidence-types.ts` に1か所だけ置く。 */
 export type InteractionHrefKind = InteractionHrefKindEvidence;
@@ -18,21 +17,9 @@ export type InteractionBoundingBox = InteractionBoundingBoxEvidence;
 /** Interaction の候補の事実。定義は `src/core/evidence-types.ts` に1か所だけ置く。 */
 export type InteractionCandidate = InteractionCandidateEvidence;
 
-export const INTERACTION_CANDIDATE_LIMITS = Object.freeze({
-  maxCandidates: 100,
-  maxTextLength: 256,
-  maxTextNodes: 512,
-  maxAttributeLength: 512,
-  /**
-   * 対象自身の属性の記録で、class の値だけに使う上限（設計書 2026-09-23 4.4.1「長い class」、F20b）。
-   * Tailwind などで組んだボタンは、class が `maxAttributeLength` を超えることがあるためである。
-   * この上限でも切り詰められた可能性がある class の変化は、VERIFIED の根拠にしない（fail-closed）。
-   */
-  maxClassAttributeLength: 4_096,
-  maxUrlLength: MAX_URL_LENGTH,
-  maxOrdinal: 99,
-  maxDomWork: 16_384,
-});
+// L10（設計書 `2026-11-09-beaksight-remove-limits-design.md` 4。INV-LIMITS の N3・N4）: Interaction の候補の数と長さの上限（前の
+// `INTERACTION_CANDIDATE_LIMITS`。候補 100・文字 256・テキストのノード 512・属性 512・class 4,096・URL 2,048・順番 99・DOM の作業量 16,384）は撤廃した
+// （定数は LZ-1 で消した）。
 
 /**
  * Interaction の候補を実行しない理由。閉じた一覧は `src/core/evidence-types.ts` の `INTERACTION_REJECTION_REASONS` に
@@ -53,8 +40,9 @@ function isInteractionCandidateId(value: unknown): boolean {
     && isSha256Fingerprint(value.slice(INTERACTION_CANDIDATE_ID_PREFIX.length));
 }
 
-function boundedNullable(value: string | null, maxLength: number): boolean {
-  return value === null || (typeof value === 'string' && value.length <= maxLength);
+/** null か文字列か（L10: 長さは見ない）。 */
+function nullableString(value: string | null): boolean {
+  return value === null || typeof value === 'string';
 }
 
 function finiteRectangle(rect: InteractionBoundingBox, visible: boolean): boolean {
@@ -89,31 +77,35 @@ function validControlledState(
     && controlledVisible !== controlledHidden;
 }
 
+/**
+ * 候補が形の契約を満たすか。L10（設計書 `2026-11-09-beaksight-remove-limits-design.md` 4。INV-LIMITS の N3・N4）: 数と長さの上限（前は順番が `maxOrdinal` 99
+ * 以下、属性の長さが `maxAttributeLength`・`maxTextLength`・`maxUrlLength` 以下）は撤廃した。数と長さでは拒まず、形（種類・印の形・矩形など）だけを見る。
+ */
 function candidateIsWellFormed(candidate: InteractionCandidate): boolean {
   return candidate !== null
     && typeof candidate === 'object'
     && isInteractionCandidateId(candidate.candidateId)
     && isSha256Fingerprint(candidate.textFingerprint)
     && isNonNegativeSafeInteger(candidate.ordinal)
-    && candidate.ordinal <= INTERACTION_CANDIDATE_LIMITS.maxOrdinal
+    && typeof candidate.tagName === 'string'
     && candidate.tagName.length > 0
-    && candidate.tagName.length <= INTERACTION_CANDIDATE_LIMITS.maxAttributeLength
-    && boundedNullable(candidate.role, INTERACTION_CANDIDATE_LIMITS.maxAttributeLength)
-    && candidate.accessibleName.length <= INTERACTION_CANDIDATE_LIMITS.maxTextLength
-    && boundedNullable(candidate.ariaExpanded, INTERACTION_CANDIDATE_LIMITS.maxAttributeLength)
-    && boundedNullable(candidate.ariaControls, INTERACTION_CANDIDATE_LIMITS.maxAttributeLength)
-    && boundedNullable(candidate.ariaSelected, INTERACTION_CANDIDATE_LIMITS.maxAttributeLength)
+    && nullableString(candidate.role)
+    && typeof candidate.accessibleName === 'string'
+    && nullableString(candidate.ariaExpanded)
+    && nullableString(candidate.ariaControls)
+    && nullableString(candidate.ariaSelected)
     && validAriaBoolean(candidate.ariaExpanded)
     && validAriaBoolean(candidate.ariaSelected)
-    && boundedNullable(candidate.formMethod, INTERACTION_CANDIDATE_LIMITS.maxAttributeLength)
-    && boundedNullable(candidate.formAction, INTERACTION_CANDIDATE_LIMITS.maxUrlLength)
-    && boundedNullable(candidate.href, INTERACTION_CANDIDATE_LIMITS.maxUrlLength)
-    && boundedNullable(candidate.type, INTERACTION_CANDIDATE_LIMITS.maxAttributeLength)
+    && nullableString(candidate.formMethod)
+    && nullableString(candidate.formAction)
+    && nullableString(candidate.href)
+    && nullableString(candidate.type)
     && (INTERACTION_HREF_KINDS as readonly string[]).includes(candidate.hrefKind)
     && typeof candidate.formAssociated === 'boolean'
     && typeof candidate.download === 'boolean'
     && typeof candidate.disabled === 'boolean'
     && typeof candidate.visible === 'boolean'
+    && typeof candidate.destructiveAction === 'boolean'
     && finiteRectangle(candidate.boundingBox, candidate.visible)
     && (candidate.href === null) === (candidate.hrefKind === 'NONE')
     && validControlledState(candidate.ariaControls, candidate.controlledVisible, candidate.controlledHidden);
@@ -142,7 +134,7 @@ export function freezeInteractionCandidate(candidate: InteractionCandidate): Int
  * 除外した候補を Safety Ledger のどの記録に残すか（設計書 2026-09-23 4.6）。
  * - `BLOCKED_EXTERNAL_ACTION`: 外部への作用（外部Origin、`tel:`・`mailto:` などの特殊scheme、ダウンロード）。
  *   `blockedExternalActions` に残す。
- * - `EXCLUDED_CANDIDATE`: 外部への作用ではないが、安全のため機械的に除外した候補（送信・リセット・フォーム関連・同一Originの遷移）。
+ * - `EXCLUDED_CANDIDATE`: 外部への作用ではないが、安全のため機械的に除外した候補（送信・リセット・フォーム関連・同一Originの遷移・削除に関する操作）。
  *   `excludedInteractionCandidates` に残す。
  * - `NONE`: 安全のための除外ではない（無効・不可視・不正な候補）。Ledger には残さない。
  */
@@ -154,6 +146,7 @@ const INTERACTION_REJECTION_LEDGER_RECORDS: Readonly<Record<InteractionRejection
     RESET_CONTROL: 'EXCLUDED_CANDIDATE',
     FORM_ASSOCIATED: 'EXCLUDED_CANDIDATE',
     NAVIGATION_HREF: 'EXCLUDED_CANDIDATE',
+    DESTRUCTIVE_ACTION_SKIPPED: 'EXCLUDED_CANDIDATE',
     EXTERNAL_ACTION: 'BLOCKED_EXTERNAL_ACTION',
     DOWNLOAD: 'BLOCKED_EXTERNAL_ACTION',
     DISABLED: 'NONE',
@@ -199,6 +192,10 @@ export function classifyInteractionCandidate(candidate: InteractionCandidate): I
     }
     if (candidate.href !== null) {
       return reject('NAVIGATION_HREF');
+    }
+    // SD-1（設計書 `2026-11-16-beaksight-action-based-delete-guard-design.md` 2.3）: 削除に関する操作は押さない（判定は候補を作るときの `isDestructiveAction`）。
+    if (candidate.destructiveAction) {
+      return reject('DESTRUCTIVE_ACTION_SKIPPED');
     }
     if (candidate.disabled) {
       return reject('DISABLED');

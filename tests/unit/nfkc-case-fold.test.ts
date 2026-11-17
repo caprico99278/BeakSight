@@ -1,5 +1,5 @@
 // CCX-15（共通化の台帳の CC-069）: Unicode の正規化（NFKC）と大文字小文字の畳み込み（`toUpperCase` の後に `toLowerCase`）の結果を固定する表。
-// - 呼び出し側の 2 か所の結果を固定する: 要求の判定の owner の、除外のパスと危険な語の比べ（`classifyPassiveRequest` の `auditExclusions`）と、
+// - 呼び出し側の 2 か所の結果を固定する: 除外のパスと危険な語の比べ（SD-2 から移る前の判定の `isAuditExcludedUrl`）と、
 //   発見の候補の分類（`classifyCandidate`）。畳み込みを `src/core/text.ts` の 1 か所に移しても、結果が変わらないことを確かめる（移す前に
 //   PASS させた表）。
 // - 文字の表: `ſ`（U+017F）、ケルビン記号（U+212A）、全角の英字と `／`・`；`、ドイツ語の `ß`、トルコ語の `İ`（U+0130）、合字（U+FB01）、
@@ -9,7 +9,7 @@ import { describe, expect, it } from 'vitest';
 import { foldNfkcCase } from '../../src/core/text.js';
 import type { DiscoveredCandidate } from '../../src/discovery/candidate-contracts.js';
 import { classifyCandidate } from '../../src/discovery/classify.js';
-import { classifyPassiveRequest, type AuditExclusionPolicy } from '../../src/safety/request-policy.js';
+import { isAuditExcludedUrl, type AuditExclusionPolicy } from '../../src/safety/request-policy.js';
 import { SAMPLE_ALLOWED_ORIGINS, SAMPLE_ORIGIN, sampleField, sampleForm } from './discovery-candidate-samples.js';
 
 const LONG_S = 'ſ';
@@ -58,11 +58,12 @@ describe('CCX-15: foldNfkcCase (the owner in src/core/text.ts, CC-069)', () => {
 
 describe('CCX-15: the exclusion comparison of the request policy keeps its results (CC-069)', () => {
   const ALLOWED_ORIGINS: ReadonlySet<string> = new Set([SAMPLE_ORIGIN]);
-  const decide = (path: string, exclusions: Partial<AuditExclusionPolicy>): string => classifyPassiveRequest(
-    { kind: 'HTTP', method: 'GET', url: `${SAMPLE_ORIGIN}${path}`, isNavigationRequest: true, isMainFrame: true },
+  // SD-2: 除外は要求の判定では当てず、BeakSight 自身の移動の前の判定（`isAuditExcludedUrl`）が当てる。
+  const decide = (path: string, exclusions: Partial<AuditExclusionPolicy>): string => (isAuditExcludedUrl(
+    `${SAMPLE_ORIGIN}${path}`,
     ALLOWED_ORIGINS,
-    { auditExclusions: { excludedPathPrefixes: [], auditPathPrefixes: [], dangerousTerms: [], ...exclusions } },
-  ).action;
+    { excludedPathPrefixes: [], auditPathPrefixes: [], dangerousTerms: [], ...exclusions },
+  ) ? 'BLOCK' : 'ALLOW');
 
   /** [説明, path, 除外の口, 期待] */
   const TABLE: readonly (readonly [string, string, Partial<AuditExclusionPolicy>, 'ALLOW' | 'BLOCK'])[] = [

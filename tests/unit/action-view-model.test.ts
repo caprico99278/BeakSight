@@ -88,9 +88,13 @@ describe('action report view model (T32f)', () => {
       AUTOMATED_ACTION_CATALOG.READ_VERIFICATION,
     ]);
     expect(create).toMatchObject({
-      approver: 'LOCAL_OPERATOR', revokedAtStartText: ACTION_REPORT_TEXT.no, cumulativeText: ACTION_REPORT_TEXT.cumulativeValue(formatInteger(1), formatInteger(20)),
+      approver: 'LOCAL_OPERATOR', revokedAtStartText: ACTION_REPORT_TEXT.no, cumulativeText: ACTION_REPORT_TEXT.cumulativeValue(formatInteger(1)),
       capturedAtText: timeText('20261015000005'), grantConsumedAtText: timeText('20261015000005'),
     });
+    // LZ-3c: 累積の上限・承認の期限・期限の日数は出さない（判定に使わない名残を上限に見せない）。
+    expect(create).not.toHaveProperty('expiresAtText');
+    expect(create).not.toHaveProperty('approvalTtlDaysText');
+    expect(create.limitsText).toBe(ACTION_REPORT_TEXT.limitsValue(formatInteger(1)));
     expect(create.sideEffects.every((item) => item.confirmedText === ACTION_REPORT_TEXT.sideEffectConfirmed)).toBe(true);
     const update = modelOf(verifiedUpdateDocuments()).approval;
     expect(update.humanDecisions).toContain(HUMAN_DECISION_CATALOG.UPDATE_FIELD_ROLES);

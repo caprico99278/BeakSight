@@ -15,7 +15,6 @@ import {
   type MainFrameLoadSettlement,
 } from '../../src/browser/main-frame-load.js';
 import { awaitBeforeDeadline } from '../../src/core/deadline.js';
-import { MAX_ERROR_MESSAGE_LENGTH } from '../../src/core/limits.js';
 import { SITE_UNAVAILABLE_HTTP_STATUSES, siteUnavailabilityOf } from '../../src/orchestration/site-availability.js';
 import { useHeadlessChromium } from '../helpers/chromium.js';
 import { fakePlaywrightRequest } from '../helpers/fake-playwright-request.js';
@@ -194,11 +193,10 @@ function expectWaitedUntilDeadline(elapsedMs: number, deadlineMs: number): void 
   expect(elapsedMs).toBeGreaterThanOrEqual(deadlineMs - TIMER_TOLERANCE_MS);
 }
 
-/** Playwright の期限切れの観測の、失敗の詳細（上限付きのメッセージ）を確かめる。 */
+/** Playwright の期限切れの観測の、失敗の詳細（メッセージ）を確かめる。 */
 function expectPlaywrightFailureDetail(observation: MainFrameLoadObservation): void {
   expect(observation.failureDetail).toEqual(expect.any(String));
   expect(observation.failureDetail?.length).toBeGreaterThan(0);
-  expect(observation.failureDetail?.length).toBeLessThanOrEqual(MAX_ERROR_MESSAGE_LENGTH);
 }
 
 describe('observeMainFrameLoad with a real Chromium and a local server (design 2.1)', () => {

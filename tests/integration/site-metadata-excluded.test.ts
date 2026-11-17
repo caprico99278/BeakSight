@@ -1,7 +1,7 @@
 // T25c round 3（Task 25 の設計書 4.2、4.7 と、発見事項 3 の判断の案 1）: 認証つきの Run で、監査の段の除外に当たる robots.txt と sitemap.xml は、
 // 取りに行かず、`metadata` の Evidence に結果 `EXCLUDED`（取らなかった）を残す。判定は呼び出し側が渡す関数（`isExcludedUrl`。Run Coordinator は
 // 巡回の候補の判定 `isExcludedCrawlCandidate` を渡す）。渡さなければ、今のまま（公開監査）。127.0.0.1 の fixture のサーバと、本物の factory と
-// Guard で確かめる。Chromium は headless だけ。
+// Guard で確かめる。Chromium はテストの既定だけ（取りに行くかは Chromium によらない判定。TEST-POLICY の 3）。
 import type { Browser } from 'playwright';
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 import { BrowserContextFactory } from '../../src/browser/context-factory.js';
@@ -13,7 +13,7 @@ import { IdAllocator } from '../../src/orchestration/id-allocator.js';
 import { skippedPageResult } from '../../src/orchestration/skipped-page.js';
 import { SafetyLedger } from '../../src/safety/safety-ledger.js';
 import { startFixtureServer, type FixtureServer } from '../../fixtures/server.js';
-import { BROWSER_DEFAULT_FAVICON_PATH, launchCliChromium, launchHeadlessChromium, testContextsOf } from '../helpers/chromium.js';
+import { BROWSER_DEFAULT_FAVICON_PATH, DEFAULT_CHROMIUM_LAUNCHERS, testContextsOf } from '../helpers/chromium.js';
 import { NO_PACING_WAIT } from '../helpers/navigation-pacer.js';
 import { createTestConfig } from '../helpers/test-config.js';
 
@@ -21,12 +21,7 @@ const OBSERVED_AT = new Date('2026-10-10T00:00:00.000Z');
 const ROBOTS_PATH = '/robots.txt';
 const SITEMAP_PATH = '/sitemap.xml';
 
-const LAUNCHERS = [
-  ['the default test Chromium', () => launchHeadlessChromium()],
-  ['the CLI launch settings', () => launchCliChromium()],
-] as const;
-
-describe.each(LAUNCHERS)('T25c round 3: collectSiteMetadata does not fetch excluded files (%s)', (_name, launch) => {
+describe.each(DEFAULT_CHROMIUM_LAUNCHERS)('T25c round 3: collectSiteMetadata does not fetch excluded files (%s)', (_name, launch) => {
   let browser: Browser;
   let server: FixtureServer;
   const factories: BrowserContextFactory[] = [];

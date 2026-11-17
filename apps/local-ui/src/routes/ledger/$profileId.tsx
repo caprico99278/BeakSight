@@ -4,7 +4,6 @@ import { LOCAL_UI_LEDGER_TEXT, LOCAL_UI_WRITE_SCREENS_TEXT, LOCAL_UI_WRITE_STAGE
 import { AdvancedSettings } from '../../components/AdvancedSettings';
 import { Notice } from '../../components/Notice';
 import { PageFrame, siteTrail } from '../../components/PageFrame';
-import { AUTO_DRAFT_SEARCH_MARK } from '../../display/auto-draft-search';
 import {
   actionResultDisplay,
   readCheckResultDisplay,
@@ -13,23 +12,14 @@ import {
   type DisplayValue,
 } from '../../display/labels';
 import { auditedDataLedgerPageFn, type LedgerEntryView } from '../../server/ledger-functions';
-import { scenarioAutoDraftPreviewFn, type AutoDraftUpdateLinkView } from '../../server/scenario-autodraft-functions';
 
 export const Route = createFileRoute('/ledger/$profileId')({
   loader: async ({ params }) => {
-    // PL-5（設計書 6 章の 8）: 「書き換えを試す」の行き先は、自動の下書きの書き換えの案内（PL-6b。今の管理データから求め直す。保存しない）。
-    const [page, autoDraft] = await Promise.all([
-      auditedDataLedgerPageFn({ data: { profileId: params.profileId } }),
-      scenarioAutoDraftPreviewFn({ data: { profileId: params.profileId } }),
-    ]);
+    const page = await auditedDataLedgerPageFn({ data: { profileId: params.profileId } });
     if (page === null) {
       throw notFound();
     }
-    const ledgerIds = new Set(page.entries.filter((entry) => entry.recordId !== null).map((entry) => entry.scenarioId));
-    // 作ったデータ（ID のある行）の書き込みの手順を台帳に前もって選んだ、最初の書き換えの案内（台帳を選べない案内でも、作成の画面で選べる）。
-    const updates = autoDraft?.updates.filter((item) => item.link !== null) ?? [];
-    const update = updates.find((item) => item.presetLedger !== null && ledgerIds.has(item.presetLedger.value)) ?? updates[0] ?? null;
-    return { ...page, updateLink: ledgerIds.size === 0 ? null : update?.link ?? null };
+    return page;
   },
   component: LedgerPage,
 });
@@ -53,30 +43,9 @@ function Verification({ entry }: Readonly<{ entry: LedgerEntryView }>) {
   );
 }
 
-/** 「書き換えを試す」（作成の画面へ。変える欄は人が選ぶ。前もって選ぶ台帳と画面の型は案）。 */
-function UpdateTryLink({ profileId, link }: Readonly<{ profileId: string; link: AutoDraftUpdateLinkView }>) {
-  return (
-    <Link
-      to="/scenarios/$profileId/new"
-      params={{ profileId }}
-      search={{
-        candidate: link.candidate,
-        ...(link.shape === '' ? {} : { shape: link.shape }),
-        ...(link.ledger === null ? {} : { ledger: link.ledger }),
-        ...(link.template === null ? {} : { template: link.template }),
-        autoDraft: AUTO_DRAFT_SEARCH_MARK,
-      }}
-      className="button button--primary"
-      data-testid="ledger-update-try"
-    >
-      {stageText.updateTry}
-    </Link>
-  );
-}
-
 /**
  * 作ったデータの一覧（監査済みデータの台帳。T32g。PL-5 で設計書 `2026-10-26-beaksight-plain-ui-design.md` 3 章の形に作り直した）。上から: 要点のパネル（作ったデータの
- * 数、「消さない」の注記、行は「何を作ったか・いつ・書き換えたか」、主のボタン「書き換えを試す」）→ 詳しい内容 1 つ（データの ID と答え合わせの結果、
+ * 数、「消さない」の注記、行は「何を作ったか・いつ・書き換えたか」。SPEC-4 で「書き換えを試す」を外した）→ 詳しい内容 1 つ（データの ID と答え合わせの結果、
  * 書き込みの手順ごとの累計の件数）。許可の ID・digest・作業と点検の回の ID・書き込みの手順の ID と版は出さない（3 章の 2）。
  */
 function LedgerPage() {
@@ -127,14 +96,6 @@ function LedgerPage() {
                 </table>
               </div>
             )}
-            {page.updateLink === null ? null : (
-              <>
-                <p>{stageText.nextUpdate}</p>
-                <div className="button-row">
-                  <UpdateTryLink profileId={profile.profileId} link={page.updateLink} />
-                </div>
-              </>
-            )}
           </section>
           <section className="panel">
             <AdvancedSettings testId="ledger-advanced">
@@ -176,8 +137,8 @@ function LedgerPage() {
                   <ul>
                     {page.scenarios.map((scenario) => (
                       <li key={scenario.scenarioId} data-testid="ledger-scenario" data-scenario-id={scenario.scenarioId}
-                        data-used={String(scenario.used)} data-limit={String(scenario.limit)}>
-                        {text.cumulativeValue(formatCount(scenario.used), formatCount(scenario.limit))}
+                        data-used={String(scenario.used)}>
+                        {text.cumulativeValue(formatCount(scenario.used))}
                       </li>
                     ))}
                   </ul>

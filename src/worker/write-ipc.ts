@@ -1,14 +1,13 @@
 // ワーカーの側の、書き込みのジョブの IPC の小さな部品（Task 30 の設計書 3 章の「送る直前の確かめ直し」、4 章の「IPC」。T30e）。T30f の書き込みの流れが
 // 使う（流れは、送る直前に `requestRecheck` を待ち、許されたときだけ送る。送った・止めた・分からないを `reportSubmission` で 1 回だけ報告する）。
 // - 確かめ直しの依頼（`WRITE_RECHECK_REQUEST`）は 1 つのジョブで 1 回だけ送る。2 回目は送らずに `RECHECK_ALREADY_REQUESTED` で拒む。
-// - 親の結果（`WRITE_RECHECK_RESULT`）を、名前つきの上限（`WORKER_WRITE_RECHECK_TIMEOUT_MS`）だけ待つ。来なければ `RECHECK_TIMEOUT` で許さない
+// - 親の結果（`WRITE_RECHECK_RESULT`）を待つ（L12b: 期限なし。注入した期限があれば、来なければ `RECHECK_TIMEOUT` で許さない
 //   （送らない）。上限の後に届いた結果、依頼していない結果、2 回目の結果は受けない（`receiveRecheckResult` が偽を返す。呼ぶ側が契約の違反として
 //   扱う）。
 // - 送信の報告（`WRITE_SUBMISSION`）は 1 回だけ送る（2 回目は送らずに偽）。
 // 管理データ・ブラウザに触れない。送る関数は呼ぶ側が渡す（本番は、ワーカーのセッションの送る口）。
 import {
   WORKER_PROTOCOL_VERSION,
-  WORKER_WRITE_RECHECK_TIMEOUT_MS,
   type WorkerToParentMessage,
   type WorkerWriteRecheckRejectionReason,
   type WorkerWriteRecheckResultMessage,
@@ -31,7 +30,7 @@ export type WorkerWriteSubmissionReport = Pick<WorkerWriteSubmissionMessage, 'su
 export interface WorkerWriteIpcOptions {
   /** 親へ送る（ワーカーのセッションの送る口）。 */
   readonly send: (message: WorkerToParentMessage) => void;
-  /** 結果を待つ上限（ms。省略すると `WORKER_WRITE_RECHECK_TIMEOUT_MS`）。 */
+  /** 結果を待つ上限（ms。L12b: 省略すると期限なし）。 */
   readonly timeoutMs?: number;
 }
 
@@ -51,7 +50,9 @@ const ALLOWED: WorkerWriteRecheckOutcome = Object.freeze({ allowed: true });
 
 /** 書き込みのジョブの IPC の部品を作る（ジョブごとに 1 つ）。 */
 export const createWorkerWriteIpc = (options: WorkerWriteIpcOptions): WorkerWriteIpc => {
-  const timeoutMs = options.timeoutMs ?? WORKER_WRITE_RECHECK_TIMEOUT_MS;
+  // L12b（設計書 `2026-11-09-beaksight-remove-limits-design.md` 4 の S17）: 親の結果を待つ期限（前は 10 秒）は
+  // 置かない。親は同じ PC の管理の process で、落ちればワーカーも終わる（IPC が切れる）。注入した期限（テスト）だけを当てる。依頼は 1 回だけのまま。
+  const timeoutMs = options.timeoutMs;
   let requested = false;
   let reported = false;
   /** 待っている依頼の受け手（待っていなければ null）。 */
@@ -63,12 +64,14 @@ export const createWorkerWriteIpc = (options: WorkerWriteIpcOptions): WorkerWrit
     }
     requested = true;
     return new Promise<WorkerWriteRecheckOutcome>((resolvePromise) => {
-      const timer = setTimeout(() => {
-        pending = null;
-        resolvePromise(TIMED_OUT);
-      }, timeoutMs);
+      const timer = timeoutMs === undefined
+        ? undefined
+        : setTimeout(() => {
+          pending = null;
+          resolvePromise(TIMED_OUT);
+        }, timeoutMs);
       pending = (outcome) => {
-        clearTimeout(timer);
+        if (timer !== undefined) clearTimeout(timer);
         pending = null;
         resolvePromise(outcome);
       };

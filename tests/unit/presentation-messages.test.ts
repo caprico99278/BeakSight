@@ -1,7 +1,7 @@
 import { describe, expect, it } from 'vitest';
 import { formatCount } from '../../src/presentation/format.js';
 import { INCOMPLETE_REASON_CODES } from '../../src/core/contracts.js';
-import { INTERACTION_REASON_CODES } from '../../src/core/evidence-types.js';
+import { INTERACTION_LEGACY_NOT_VERIFIABLE_REASON_CODES, INTERACTION_REASON_CODES } from '../../src/core/evidence-types.js';
 import {
   CLI_TEXT,
   FORMAT_UNIT_TEXT,
@@ -15,7 +15,6 @@ import {
   PAGE_COVERAGE_ITEMS,
   PRECHECK_FAILURE_DETAIL_DESCRIPTIONS,
   RUN_SUMMARY_TEXT,
-  activeRunInOutputDirectoryText,
   checkpointStoreFailedText,
   countWithDetailsText,
   countWithPeakPerMinuteText,
@@ -32,8 +31,7 @@ import {
   progressItemsText,
   resumingRunText,
   retryAttemptText,
-  runLockHeldText,
-  runLockTakenOverText,
+  runActiveInOutputDirectoryText,
   siteUnavailableRecheckText,
   siteUnavailableSlowdownText,
   siteUnavailableStopText,
@@ -66,8 +64,13 @@ describe('incomplete reason descriptions', () => {
   });
 
   // T44c（Task 44 の設計書 P1-4）: 内側のスクロールの領域を走査しきれなかった理由と、次にできること。
-  it('explains INNER_SCROLL_CONTAINER_NOT_TRAVERSED with its next step (T44c)', () => {
+  // DEF-207: 今の振る舞いは、いちばん大きくスクロールできる枠 1 つを、画面の全体と同じ決まりでたどる（`controlled-scroll.ts` の `traverseInnerScrollContainer`）。
+  // この理由が付くのは、その枠をたどりきれなかったときだけ（前の説明の「画面の全体だけをスクロールする」は、今の振る舞いと違う）。
+  it('explains INNER_SCROLL_CONTAINER_NOT_TRAVERSED with its next step (T44c, DEF-207)', () => {
     expect(describeIncompleteReason('INNER_SCROLL_CONTAINER_NOT_TRAVERSED')).toContain('読み込みの後に動く別のスクロールの枠');
+    expect(describeIncompleteReason('INNER_SCROLL_CONTAINER_NOT_TRAVERSED')).toContain('その枠もスクロールしてたどります');
+    expect(describeIncompleteReason('INNER_SCROLL_CONTAINER_NOT_TRAVERSED')).toContain('たどりきれませんでした');
+    expect(describeIncompleteReason('INNER_SCROLL_CONTAINER_NOT_TRAVERSED')).not.toContain('画面の全体だけをスクロールする');
     expect(describeIncompleteReason('INNER_SCROLL_CONTAINER_NOT_TRAVERSED')).toContain('全部は確かめていません');
     expect(nextStepOfIncompleteReason('INNER_SCROLL_CONTAINER_NOT_TRAVERSED')).toContain('手で確かめてください');
     expect(Object.isFrozen(INCOMPLETE_REASON_NEXT_STEPS)).toBe(true);
@@ -90,10 +93,9 @@ describe('incomplete reason descriptions', () => {
     expect(nextStepOfIncompleteReason('MAX_PAGES_REACHED')).toContain('crawl.maxPages');
   });
 
-  // T44R2 の I-7: DOM の準備の理由は、落ち着きの待ち（`resourceSettlingTimeoutMs` の期限）が PARTIAL のときに付くので、効く設定を案内する。
-  it('points DOM_READINESS_FAILED to crawl.resourceSettlingTimeoutMs, the setting that bounds the settling wait (T44R2 I-7)', () => {
-    expect(nextStepOfIncompleteReason('DOM_READINESS_FAILED')).toContain('crawl.resourceSettlingTimeoutMs');
-    expect(nextStepOfIncompleteReason('DOM_READINESS_FAILED')).not.toContain('crawl.navigationTimeoutMs');
+  // LZ-1: 落ち着きの待ちの期限（`crawl.resourceSettlingTimeoutMs`）は今は使わないので、その設定を長くする案内をしない（前は T44R2 の I-7 で案内した）。
+  it('does not point DOM_READINESS_FAILED to a setting that is no longer used (LZ-1)', () => {
+    expect(nextStepOfIncompleteReason('DOM_READINESS_FAILED')).not.toContain('crawl.');
   });
 
   // T44R2 の M-11: 不具合と見られる理由の、知らせる宛先は「BeakSight の開発者」（BeakSight はローカルの道具で、窓口の仕組みはない）。
@@ -113,7 +115,6 @@ describe('incomplete reason descriptions', () => {
 // lifecycle の理由のコードは表示しないので、説明を持たない（C18p で消した。RC18 の M8）。
 describe('interaction reason descriptions', () => {
   it('has exactly one Japanese description for every interaction reason code', () => {
-    expect(INTERACTION_REASON_CODES.length).toBe(69);
     expect(Object.keys(INTERACTION_REASON_DESCRIPTIONS).sort()).toEqual([...INTERACTION_REASON_CODES].sort());
     for (const code of INTERACTION_REASON_CODES) {
       const description = describeInteractionReason(code);
@@ -122,9 +123,15 @@ describe('interaction reason descriptions', () => {
     }
   });
 
-  it('gives different codes different descriptions', () => {
-    const descriptions = INTERACTION_REASON_CODES.map((code) => describeInteractionReason(code));
-    expect(new Set(descriptions).size).toBe(INTERACTION_REASON_CODES.length);
+  // SPEC-5: 前の版だけが書いたコード（読むだけ）は、1 つの説明にまとめる。今の版が書くコードは、コードごとに違う説明。
+  it('gives the written codes different descriptions, and the read-only codes one shared description', () => {
+    const readOnly: readonly string[] = INTERACTION_LEGACY_NOT_VERIFIABLE_REASON_CODES;
+    const written = INTERACTION_REASON_CODES.filter((code) => !readOnly.includes(code));
+    const writtenDescriptions = new Set(written.map((code) => describeInteractionReason(code)));
+    expect(writtenDescriptions.size).toBe(written.length);
+    const readOnlyDescriptions = new Set(INTERACTION_LEGACY_NOT_VERIFIABLE_REASON_CODES.map((code) => describeInteractionReason(code)));
+    expect(readOnlyDescriptions.size).toBe(1);
+    expect(writtenDescriptions.has([...readOnlyDescriptions][0] as string)).toBe(false);
   });
 
   it('is frozen', () => {
@@ -158,6 +165,8 @@ describe('Run summary text', () => {
         skipped: 'スキップしたページ',
       },
       reasonsHeading: '未完了の理由',
+      // L14: 上限・期限を指定していないときの値（HTML・CLI・画面で共通）。
+      limitNotSpecified: '指定なし',
       // L6（サイトへの負荷の制御の設計書 4.5）: 要約の小節の見出しと、CLI の1行にも出る項目の名前。
       loadHeading: 'サイトへの負荷',
       allowedOriginRequests: '許可 Origin への要求',
@@ -310,9 +319,7 @@ describe('resume text of the CLI', () => {
   });
 
   it('tells that another Run is running in the same output directory', () => {
-    expect(activeRunInOutputDirectoryText(RUN_ID)).toBe(
-      '同じ出力先で、別の Run（RUN-20261001000000）が実行中です。その Run が終わってから実行してください。',
-    );
+    expect(runActiveInOutputDirectoryText).toBe('同じ出力先で、別の Run が実行中です。その Run が終わってから実行してください。');
   });
 
   it('tells that a checkpoint cannot be read, and that a run with another configuration is not resumed', () => {
@@ -339,8 +346,6 @@ describe('resume text of the CLI', () => {
   });
 
   it('tells why the session of the resume could not start', () => {
-    expect(runLockHeldText(RUN_ID)).toBe('別のプロセスが、この Run（RUN-20261001000000）を実行しています。');
-    expect(runLockTakenOverText(RUN_ID)).toBe('別のプロセスが、同時にこの Run（RUN-20261001000000）の再開を始めました。');
     expect(checkpointStoreFailedText(RUN_ID)).toBe('再開のための保存を読み書きできませんでした（RUN-20261001000000）。');
   });
 

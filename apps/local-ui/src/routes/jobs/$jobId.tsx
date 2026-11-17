@@ -42,6 +42,7 @@ import {
   serviceRequestPacingWaitText,
   siteUnavailableRecheckText,
   siteUnavailableSlowdownText,
+  specifiedLimitText,
 } from '../../../../../src/presentation/messages.js';
 import { MINUTE_MS } from '../../../../../src/core/time-units.js';
 import { AdvancedSettings } from '../../components/AdvancedSettings';
@@ -50,18 +51,18 @@ import { EntryCheckFacts, EntryCheckOutcome } from '../../components/EntryCheckR
 import { ProfileJobEndReason, RunEndReasons, profileJobEndHasNextStep } from '../../components/JobEndReasons';
 import { arrivedFromJobSearch } from '../../components/JobArrival';
 import { StageChainSteps, StageChainStopNotice } from '../../components/StageChainPanel';
-import { ExternalSchemeProbes, JobSafetyViolation, JobSafetyViolationDetails, PressLimitProbes } from '../../components/JobSafetyViolation';
+import { ExternalSchemeProbes, JobSafetyViolation, JobSafetyViolationDetails } from '../../components/JobSafetyViolation';
 import { PageIncompleteReasons } from '../../components/PageIncompleteReasons';
 import { LoginStageObservationPanel, LoginStageQueryCell, LoginStageRegisterCell } from '../../components/LoginStageObservation';
-import { LoginStageStateNames } from '../../components/LoginStageStateNames';
 import { NextStepLinks } from '../../components/NextSteps';
 import { Notice } from '../../components/Notice';
 import { ARRIVAL_SEARCH, PageFrame, arrivalSearchOf, scenarioTrail, siteTrail } from '../../components/PageFrame';
-import { SessionLossEvidence } from '../../components/SessionLossEvidence';
 import { WriteResultDetails, WriteResultFacts, WriteResultWarning } from '../../components/WriteResultDetails';
+import { bundlePartLabelOf } from '../../display/bundle-part-label';
 import { AUDIT_JOB_POLL_INTERVAL_MS } from '../../display/job-polling';
 import { finishedJobResultTextOf } from '../../display/next-steps';
 import { closedListReason, settleServerFunction, type ServerFunctionOutcome } from '../../display/server-function-outcome';
+import { useSiteNameOf } from '../../display/site-name';
 import {
   auditJobAuthStateDisplay,
   auditJobEndKindDisplay,
@@ -74,8 +75,6 @@ import {
   toneClass,
   usesAuthSetup,
   usesAutomatedLogin,
-  writeChainStateDisplay,
-  writeChainStopReasonDisplay,
 } from '../../display/labels';
 // T34e fix round 1・T43R-fix の M-7: 伏せた区切りがあるかの判定（path の値に見える区切りを伏せる唯一の部品）。
 import { hasRedactedPathSegment } from '../../../../../src/core/url-path-redaction.js';
@@ -102,9 +101,8 @@ import {
   WORKER_ENTRY_CHECK_JOB_KIND,
   WORKER_LOGIN_CHECK_JOB_KIND,
 } from '../../../../../src/core/audit-job-values.js';
-// PRE42-CC 組 UI-K2（CC-113）: 認証の状態、まとめて実行の状態、続けて更新する状態の値も、純粋な core の owner から読む（書き写さない。文字列で比べない）。
+// PRE42-CC 組 UI-K2（CC-113）: 認証の状態、まとめて実行の状態の値も、純粋な core の owner から読む（書き写さない。文字列で比べない）。
 import { RUNNING_CHAIN_STATE } from '../../../../../src/core/stage-chain-states.js';
-import { PENDING_WRITE_CHAIN_STATES } from '../../../../../src/core/write-chain-states.js';
 
 export const Route = createFileRoute('/jobs/$jobId')({
   // PL-2（設計書 `2026-10-26-beaksight-plain-ui-design.md` 3 章の 5）: 続けて始まった作業へ自動で移ったときの印（h1 にフォーカスを置く）を受ける。
@@ -221,12 +219,12 @@ function ResultLine({ job }: Readonly<{ job: AuditJobDetailView }>) {
   );
 }
 
-/** 待つ間の進み具合の 1 行（13 章の 11。見積もりはサーバの `auditRemainingUpperBoundMs` の値を分に切り上げるだけ）。 */
+/** 待つ間の進み具合の 1 行（13 章の 11。見積もりはサーバの `progressRemainingMs` の値を分に切り上げるだけ）。 */
 function ProgressEstimate({ estimate }: Readonly<{ estimate: NonNullable<AuditJobDetailView['summary']['estimate']> }>) {
-  const minutes = Math.max(1, Math.ceil(estimate.remainingUpperBoundMs / MINUTE_MS));
+  const minutes = Math.max(1, Math.ceil(estimate.remainingMs / MINUTE_MS));
   return (
     <p data-testid="job-progress-estimate">
-      {LOCAL_UI_JOB_SUMMARY_TEXT.progressEstimate(formatInteger(estimate.pagesFinished), formatInteger(estimate.maxPages), formatInteger(minutes))}
+      {LOCAL_UI_JOB_SUMMARY_TEXT.progressEstimate(formatInteger(estimate.pagesFinished), formatInteger(estimate.pagesTotal), formatInteger(minutes))}
     </p>
   );
 }
@@ -327,6 +325,8 @@ function JobFacts({ job }: Readonly<{ job: AuditJobDetailView }>) {
   const kind = auditJobKindDisplay(job.jobKind);
   // T26e: ログインの確かめは Run を作らないので、始め方と Run の項目を出さない。
   const loginCheck = job.jobKind === WORKER_LOGIN_CHECK_JOB_KIND;
+  // DN-1: サイトは画面に出す名前（なければ見分けの印）。
+  const siteNameOf = useSiteNameOf();
   return (
     <section className="panel" data-testid="job-facts">
       <h2 className="panel-heading">{text.summaryHeading}</h2>
@@ -337,7 +337,7 @@ function JobFacts({ job }: Readonly<{ job: AuditJobDetailView }>) {
         <dd data-testid="job-kind" data-kind={job.jobKind}>{kind.label}</dd>
         <dt>{text.profileId}</dt>
         <dd>
-          {job.profileId}
+          {siteNameOf(job.profileId)}
           {' '}
           {LOCAL_UI_TEXT.profileForm.revisionText(job.profileRevision)}
         </dd>
@@ -388,14 +388,20 @@ function Progress({ job }: Readonly<{ job: AuditJobDetailView }>) {
   return (
     <section className="panel">
       <h2 className="panel-heading">{text.progressHeading}</h2>
-      <progress className="progress" value={report.pagesFinished} max={report.maxPages} aria-label={text.pagesProgressLabel} />
+      {/* L14: ページの上限を指定していなければ、見つけたページの数を分母にする（0 のときは 1。progress の max は正の数）。 */}
+      <progress
+        className="progress"
+        value={report.pagesFinished}
+        max={report.maxPages ?? Math.max(report.pagesDiscovered, report.pagesFinished, 1)}
+        aria-label={text.pagesProgressLabel}
+      />
       <dl className="facts" data-testid="job-progress">
         <dt>{CLI_TEXT.progress.pagesFinished}</dt>
         <dd data-testid="job-pages-finished">{formatCount(report.pagesFinished)}</dd>
         <dt>{RUN_SUMMARY_TEXT.coverage.discovered}</dt>
         <dd>{formatCount(report.pagesDiscovered)}</dd>
         <dt>{LOCAL_UI_AUDIT_TEXT.start.maxPages}</dt>
-        <dd>{formatCount(report.maxPages)}</dd>
+        <dd>{specifiedLimitText(report.maxPages, formatCount)}</dd>
         <dt>{CLI_TEXT.progress.elapsed}</dt>
         <dd>{formatElapsedTime(report.elapsedMs)}</dd>
         <dt>{CLI_TEXT.run.navigationCount}</dt>
@@ -435,7 +441,7 @@ function AuthState({ job }: Readonly<{ job: AuditJobDetailView }>) {
         )}
       </dl>
       {state.description === null ? null : <p data-testid="job-auth-description">{state.description}</p>}
-      <SessionLossEvidence evidence={job.sessionLoss} />
+      {/* SPEC-1: セッションが切れたと判定した読み込みの技術の記録（DEF-138）は、画面に出さない（記録は run.json と管理データに残る）。 */}
     </section>
   );
 }
@@ -680,8 +686,7 @@ function LoginStageBlocked({ job }: Readonly<{ job: AuditJobDetailView }>) {
         omitted={loginStage.observationOmitted === true}
         registrationDone={registrationDone}
       />
-      {/* DEF-139: ログインの後のブラウザの状態の名前（引き継いだか外したか。値は記録にない）。 */}
-      <LoginStageStateNames names={loginStage.stateNames} />
+      {/* SPEC-1: ログインの後のブラウザの状態の名前の技術の表（DEF-139）は、画面に出さない（記録はジョブの記録に残る）。 */}
     </section>
   );
 }
@@ -800,47 +805,6 @@ function AutoLoginResult({ job, succeeded }: Readonly<{ job: AuditJobDetailView;
   );
 }
 
-/**
- * T41g-2: 続けて更新する予定が、まだ決まっていない状態（この間は、ジョブが終わった後も読み直しを続ける）。登録のジョブの終わりを待っている間と、T41g-3 の
- * 自動ログインの間隔を待っている間。PRE42-CC 組 UI-K2: 一覧は core の `PENDING_WRITE_CHAIN_STATES` を読む（ここに書き写さない）。
- */
-const CHAIN_PENDING_STATES: ReadonlySet<string> = new Set<string>(PENDING_WRITE_CHAIN_STATES);
-
-/**
- * T41g（Task 41 の設計書 3.5.1）: 登録のジョブの、続けて更新する予定と状態（「登録してから更新する」で始めた登録のジョブだけ）。状態と理由のラベルは
- * カタログ。更新のジョブを始めたら、その画面へのリンクを出す（PL-2: 成功のときは、その画面へ自動で移る）。PL-2（3 章の 2）: 書き込みの手順の ID は出さない。
- */
-function WriteChainState({ chain }: Readonly<{ chain: NonNullable<AuditJobDetailView['writeChain']> }>) {
-  const chainText = LOCAL_UI_WRITE_TEXT.chain;
-  const state = writeChainStateDisplay(chain.state);
-  const reason = chain.reason === null ? null : writeChainStopReasonDisplay(chain.reason);
-  return (
-    <div data-testid="job-write-chain" data-state={chain.state} data-reason={chain.reason ?? ''}>
-      <h3>{chainText.stateHeading}</h3>
-      <dl className="facts">
-        <dt>{chainText.stateLabel}</dt>
-        <dd><span className={toneClass(state.tone)}>{state.label}</span></dd>
-        {reason === null ? null : [
-          <dt key="reason:name">{chainText.reasonLabel}</dt>,
-          <dd key="reason:value"><span className={toneClass(reason.tone)}>{reason.label}</span></dd>,
-        ]}
-        {/* T41g-3: 自動ログインの間隔を待っている間は、更新を始め直す時刻を出す。 */}
-        {chain.nextStartAt === null ? null : [
-          <dt key="next:name">{chainText.nextStartAt}</dt>,
-          <dd key="next:value" data-testid="job-write-chain-next">{formatDateTime(chain.nextStartAt)}</dd>,
-        ]}
-      </dl>
-      {state.description === null ? null : <p className="muted">{state.description}</p>}
-      {reason === null || reason.description === null ? null : <p className="muted">{reason.description}</p>}
-      {chain.updateJobId === null ? null : (
-        <p>
-          <Link to="/jobs/$jobId" params={{ jobId: chain.updateJobId }} data-testid="job-write-chain-update">{chainText.openUpdateJob}</Link>
-        </p>
-      )}
-    </div>
-  );
-}
-
 /** 詳しい内容の「できたファイル」（要点の主のボタンと書き込みの詳しい記録が出すものを除く）。 */
 function JobArtifacts({ job }: Readonly<{ job: AuditJobDetailView }>) {
   const text = LOCAL_UI_AUDIT_TEXT.job;
@@ -854,12 +818,14 @@ function JobArtifacts({ job }: Readonly<{ job: AuditJobDetailView }>) {
       <ul className="link-list" data-testid="job-artifacts">
         {artifacts.map((artifact) => {
           const link = ARTIFACT_LINKS[artifact.kind];
+          // AUD-1d: 分けたまとめファイルは、全部の数と番号を添える。
+          const label = artifact.part === undefined ? link.label : bundlePartLabelOf(artifact.part);
           return (
-            <li key={artifact.kind}>
+            <li key={artifact.relativePath}>
               {link.download ? (
-                <a href={artifact.href} download data-artifact={artifact.kind}>{link.label}</a>
+                <a href={artifact.href} download data-artifact={artifact.kind}>{label}</a>
               ) : (
-                <a href={artifact.href} target="_blank" rel="noopener noreferrer" data-artifact={artifact.kind}>{link.label}</a>
+                <a href={artifact.href} target="_blank" rel="noopener noreferrer" data-artifact={artifact.kind}>{label}</a>
               )}
             </li>
           );
@@ -874,12 +840,12 @@ function JobArtifacts({ job }: Readonly<{ job: AuditJobDetailView }>) {
 // ---------------------------------------------------------------------------------------------------------------
 
 /**
- * 画面が読み直しを続ける間か（作業が動いている、続けて更新する予定を待つ、まとめて実行が動いている、手でのログインからの自動の登録を待つ）。PL-2: 自動の
+ * 画面が読み直しを続ける間か（作業が動いている、まとめて実行が動いている、手でのログインからの自動の登録を待つ）。PL-2: 自動の
  * 登録を待つかは、サーバの要点（`summary.awaitingRegistration`。管理データの日時で決める）を読む。
  */
 const isUnsettled = (job: AuditJobDetailView | null | undefined): boolean =>
   job !== undefined && job !== null
-  && (job.active || CHAIN_PENDING_STATES.has(job.writeChain?.state ?? '') || job.stageChain?.state === RUNNING_CHAIN_STATE || job.summary.awaitingRegistration);
+  && (job.active || job.stageChain?.state === RUNNING_CHAIN_STATE || job.summary.awaitingRegistration);
 
 /**
  * 成功のときに移す（サーバの `summary.advance`）。移すのは、この画面がその作業を動いている間（読み直しの間）に見ていたときだけ（作業の一覧から終わった作業を
@@ -924,8 +890,7 @@ function JobDetailPage() {
     queryKey: ['audit-job', jobId],
     queryFn: () => fetchJob({ data: { jobId } }),
     initialData: initial,
-    // T41g-2: 登録してから更新する、の予定が「登録中」の間は、登録のジョブが終わった後も同じ間隔で読み直す（更新のジョブへのリンクを、読み込み直しなしで出す）。
-    // T41g-3: 自動ログインの間隔を待っている間も読み直す。FM2d: まとめて実行の連鎖が動いている間も読み直す（段のジョブが終わった後も、次の段が始まるまで）。
+    // FM2d: まとめて実行の連鎖が動いている間も読み直す（段のジョブが終わった後も、次の段が始まるまで）。
     // ML-b-2: 手動のログインの成功からの自動の登録の結果を、ジョブの管理が終わりの後に書くまで、短い間だけ読み直す（PL-2: サーバの要点が決める）。
     refetchInterval: (current) => (isUnsettled(current.state.data) ? AUDIT_JOB_POLL_INTERVAL_MS : false),
   });
@@ -976,6 +941,8 @@ function JobDetailPage() {
     <PageFrame title={kind.label} trail={trail}>
       <section className="panel" aria-live="polite" data-testid="job-summary-panel">
         <ResultLine job={job} />
+        {/* WSO: 「チェックした画面だけ」の点検は、点検する範囲を 1 行で言う。 */}
+        {job.stageChain === null || job.stageChain.pageScope === null ? null :<p data-testid="job-checked-screens-only">{LOCAL_UI_JOB_SUMMARY_TEXT.checkedScreensOnly}</p>}
         {/* 書き込みの作業は、サイトに書いたこと（テスト用のサイトに 1 件だけ）を必ず出す（7 章）。 */}
         {job.write === null || kind.description === null ? null : <p data-testid="job-kind-description">{kind.description}</p>}
         {/* PL-S（7 章）: 書き込みの後の要点に、BeakSight は作ったデータを消さないこと。 */}
@@ -1123,8 +1090,6 @@ function JobDetailPage() {
         <section className="panel" data-testid="job-write">
           <h2 className="panel-heading">{LOCAL_UI_WRITE_TEXT.resultHeading}</h2>
           <WriteResultDetails result={job.write} />
-          {/* T41g（Task 41 の設計書 3.5.1）: 登録してから更新する、の続けて更新する予定と状態（更新のジョブを始めたら、その画面へのリンク）。 */}
-          {job.writeChain === null ? null : <WriteChainState chain={job.writeChain} />}
         </section>
       )}
 
@@ -1160,8 +1125,6 @@ function JobDetailPage() {
         <JobSafetyViolationDetails violation={job.safetyViolation} />
         {/* DEF-144: 発見のジョブの、外部のアプリへ移るので押さなかったボタンの数と、読み込み直した画面の数。 */}
         <ExternalSchemeProbes counts={job.externalSchemeProbes} />
-        {/* T44c: 発見のジョブの、押す数の上限で押せなかった登録・更新の語のボタンの数。 */}
-        <PressLimitProbes counts={job.pressLimitProbes} />
         {/* T44c: 監査のジョブの、ページの未完了の理由ごとのページ数（説明と次にできること）。 */}
         <PageIncompleteReasons counts={job.pageIncompleteReasons} />
         {/* T37a: 発見と READ の確かめのジョブの監査の段の数（ログインの段の要約と並べる）。 */}

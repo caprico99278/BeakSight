@@ -409,6 +409,15 @@ const SCENARIO_STORE_FILE = 'src/control/approval/scenario-store.ts';
 const RULE_STORE_FILE = 'src/control/data-rules/rule-store.ts';
 const SQL_WRITE_FILES: readonly string[] = [
   MIGRATIONS_FILE, BASE_SCHEMA_FILE, PROFILE_STORE_FILE, AUTH_SETUP_STORE_FILE, SCENARIO_STORE_FILE, RULE_STORE_FILE,
+  'src/control/store/control-schema-v18.ts',
+  // L12b: 版 19 の文（対象のレコードの ID の長さの上限を外す。凍結の文）。
+  'src/control/store/control-schema-v19.ts',
+  // URL-LEN: 版 20 の文（URL の長さの上限を外す。凍結の文）。
+  'src/control/store/control-schema-v20.ts',
+  // LZ-3a: 版 21 の文（読み切れた画面の path の数の上限を外す。凍結の文）。
+  'src/control/store/control-schema-v21.ts',
+  // DN-1: 版 22 の文（表示の設定に画面に出す名前の列を足す。凍結の文）。
+  'src/control/store/control-schema-v22.ts',
 ];
 /** T24e: 監査のジョブの管理のフォルダ（どのファイルも、書き込みは `withWriteTransaction` の中だけ）と、行の読み書きのファイル。 */
 const JOB_DIRECTORY = 'src/control/job/';
@@ -422,7 +431,7 @@ const SQL_WRITER_PATHS: readonly string[] = [...SQL_WRITE_FILES, ...JOB_FILES];
  * 文のファイルの `CONTROL_SCHEMA_V17`）も、版の一覧と同じデータとして扱う。文の配列（`CONTROL_SCHEMA_V17_STATEMENTS`）は公開しないので、一覧に入れない
  * （外で流す漏れを見る）。
  */
-const MIGRATION_LIST_NAMES: readonly string[] = ['CONTROL_MIGRATIONS', 'CONTROL_SCHEMA_BASE', 'CONTROL_SCHEMA_V17'];
+const MIGRATION_LIST_NAMES: readonly string[] = ['CONTROL_MIGRATIONS', 'CONTROL_SCHEMA_BASE', 'CONTROL_SCHEMA_V17', 'CONTROL_SCHEMA_V18', 'CONTROL_SCHEMA_V19', 'CONTROL_SCHEMA_V20', 'CONTROL_SCHEMA_V21', 'CONTROL_SCHEMA_V22'];
 
 /**
  * T43d fix round 1（Task 43 の設計書 7 章。設計者の判断 2026-10-17）: (g) の閉じた例外（ファイル → 公開の名前と理由）。プロファイルと認証の設定を
@@ -1098,7 +1107,8 @@ describe('Control store boundary detectors (T28c)', () => {
 /** (l) 版 6 の表。 */
 const VERSION_6_TABLES: readonly string[] = ['scenarios', 'scenario_revisions', 'approval_receipts', 'execution_grants', 'write_reservations'];
 /** (l) 版 6 の表に書いてよいファイル（表を作る移行のファイルは、作る文だけを持つ）。 */
-const VERSION_6_WRITER_FILES: readonly string[] = [SCENARIO_STORE_FILE, MIGRATIONS_FILE];
+// L12b: 版 19 の文（表を作り直して、行を元のまま写す。`control-schema-v19.ts`）も、版 6 の表（実行の許可）に書いてよい。
+const VERSION_6_WRITER_FILES: readonly string[] = [SCENARIO_STORE_FILE, MIGRATIONS_FILE, 'src/control/store/control-schema-v19.ts'];
 
 /** (l) 版 6 の表に書く文（`INSERT [OR …] INTO`・`REPLACE INTO`・`UPDATE [OR …] … SET`・`DELETE FROM`。大文字と小文字を区別しない）。 */
 /**
@@ -1212,7 +1222,12 @@ describe('Control store boundary (T29d)', () => {
 /** (l) 版 8 の表。 */
 const VERSION_8_TABLES: readonly string[] = ['write_results'];
 /** (l) 版 8 の表に書いてよいファイル。 */
-const VERSION_8_WRITER_FILES: readonly string[] = [SCENARIO_STORE_FILE, MIGRATIONS_FILE];
+// L12b: 版 19 の文（書き込みの結果の表を作り直して、行を元のまま写す。`control-schema-v19.ts`）も、版 8 の表に書いてよい。URL-LEN: 版 20 の文も同じ。
+const VERSION_8_WRITER_FILES: readonly string[] = [
+  SCENARIO_STORE_FILE, MIGRATIONS_FILE, 'src/control/store/control-schema-v19.ts', 'src/control/store/control-schema-v20.ts',
+];
+/** (m) 版の作り直しの組を持つ、移行のファイル（版 19・20 の文のファイルも、移行のファイルとして扱う）。 */
+const WRITE_RESULT_REBUILD_FILES: readonly string[] = [MIGRATIONS_FILE, 'src/control/store/control-schema-v19.ts', 'src/control/store/control-schema-v20.ts'];
 /** (m) 締めで書いてよい列（送信の状態から締めの時刻まで）。 */
 const WRITE_RESULT_SETTLEMENT_COLUMNS: ReadonlySet<string> = new Set([
   'submission', 'block_reason', 'http_status', 'response_judgement', 'record_id', 'read_verification', 'result', 'reason', 'reservation_state',
@@ -1344,7 +1359,9 @@ describe('Control store boundary (T30d)', () => {
     expect((scenarioStore?.wholeLiterals ?? []).map(literalBodyOf).some((text) => WRITE_RESULT_UPDATE_PATTERN.test(text))).toBe(true);
     // T31e: 移行のファイルは、版の作り直しの組だけを受ける（`findWriteResultRewritesOutsideRebuilds`）。
     const violations = [...SOURCE_FILES, ...UI_SOURCE_FILES]
-      .flatMap((file) => findWriteResultRewritesOutsideRebuilds(file, file.path === MIGRATIONS_FILE).map((text) => `${file.path}: ${text.trim()}`));
+      // L12b・URL-LEN: 版 19・20 の文のファイル（作り直しの組 1 つずつ）も、移行のファイルとして扱う。
+      .flatMap((file) => findWriteResultRewritesOutsideRebuilds(file, WRITE_RESULT_REBUILD_FILES.includes(file.path))
+        .map((text) => `${file.path}: ${text.trim()}`));
     expect(violations).toEqual([]);
   });
 });
@@ -1421,7 +1438,6 @@ const SETTLER_TEST_EXCEPTIONS: Readonly<Record<string, string>> = Object.freeze(
   'tests/integration/write-result-store.test.ts': '書き込みの結果の記録と締めの口そのものを確かめる（保存の部品のテスト）',
   'tests/integration/execution-grant-store.test.ts': '予約を返す口（settleWriteReservation）の遷移と拒否そのものを確かめる（保存の部品のテスト）',
   'tests/integration/control-write-jobs.test.ts': 'ジョブを通さずに書いた送る前の記録を、再起動の後にジョブの管理が締めること（回復）を確かめる',
-  'tests/integration/write-job-g30.test.ts': 'G30 の結合の確かめで、送る前の記録と締めを直接作る（Task 30 の G30 の担当のテスト）',
 });
 /** (o) 予約を締める口と送る前の記録（(n) の 5 つ）。 */
 const ALL_SETTLERS: readonly string[] = [...RESERVATION_ONLY_SETTLERS, ...WRITE_RESULT_SETTLERS];

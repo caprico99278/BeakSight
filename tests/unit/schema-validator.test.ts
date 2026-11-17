@@ -8,18 +8,13 @@ import { describe, expect, it } from 'vitest';
 import { startFixtureServer, type FixtureServer } from '../../fixtures/server.js';
 import { BrowserContextFactory } from '../../src/browser/context-factory.js';
 import { controlledScroll } from '../../src/browser/controlled-scroll.js';
-import {
-  MAX_NAVIGATION_DIAGNOSTICS_DOCUMENT_REQUESTS,
-  MAX_NAVIGATION_DIAGNOSTICS_EVENTS,
-  NAVIGATION_DIAGNOSTICS_START_DEADLINE_MESSAGE,
-} from '../../src/browser/navigation-diagnostics.js';
 import { DEFAULT_CONFIG } from '../../src/config/defaults.js';
+import { OLD_HIDDEN_CRAWL_DEFAULTS } from '../../src/config/load-config.js';
 import type { Viewport } from '../../src/config/types.js';
 import {
   FINDING_CATEGORIES,
   INCOMPLETE_REASON_CODES,
   INTERACTION_STATUSES,
-  MAX_STRESS_WIDTH_NAVIGATION_DIAGNOSTICS,
   RUN_EXECUTION_END_REASONS,
   VIEWPORT_PROFILES,
   type AuditRunResult,
@@ -29,16 +24,10 @@ import {
   type EvidenceRecordFor,
   type EvidenceType,
   type Finding,
-  type InteractionCandidateNavigationDiagnostics,
   type InteractionStatus,
-  type NavigationDocumentRequestDiagnostics,
-  type NavigationDocumentRequestHop,
-  type NotObservedNavigationDiagnostics,
-  type ObservedNavigationDiagnostics,
   type PageAuditResult,
   type PageId,
   type RunSummary,
-  type StressWidthNavigationDiagnostics,
 } from '../../src/core/contracts.js';
 import type {
   InteractionCandidateEvidence,
@@ -65,18 +54,12 @@ import {
   createRunId,
   createSha256Fingerprint,
 } from '../../src/core/ids.js';
-import {
-  MAX_ERROR_MESSAGE_LENGTH,
-  MAX_HTTP_METHOD_LENGTH,
-  MAX_URL_LENGTH,
-  MIN_INTERACTION_TIMEOUT_EXCLUSIVE_MS,
-} from '../../src/core/limits.js';
 import { validateArtifact } from '../../src/core/schema-validator.js';
 import { escapeJsonPointerSegment } from '../../src/core/json-pointer.js';
 import { createSchemaValidatorRegistry, describeSchemaError, schemaIssuePointerOf } from '../../src/core/schema-validator.js';
 import { discoverLinks } from '../../src/crawl/discover-links.js';
 import { collectAccessibilityEvidence } from '../../src/evidence/accessibility-collector.js';
-import { collectColorEvidence } from '../../src/evidence/color-collector.js';
+import { collectFocusChecks } from '../../src/evidence/focus-check-collector.js';
 import { ConsoleCollector } from '../../src/evidence/console-collector.js';
 import { collectDomEvidence } from '../../src/evidence/dom-collector.js';
 import { collectLayoutEvidence, collectStressLayout } from '../../src/evidence/layout-collector.js';
@@ -85,11 +68,6 @@ import { PerformanceCollector } from '../../src/evidence/performance-collector.j
 import { captureScreenshots } from '../../src/evidence/screenshot-collector.js';
 import { discoverInteractionCandidates } from '../../src/interaction/discover-candidates.js';
 import { auditInteraction } from '../../src/interaction/isolated-auditor.js';
-import {
-  SITE_UNAVAILABLE_DIAGNOSTIC_SCHEMA_VERSION,
-  type SiteUnavailableDiagnosticRecord,
-} from '../../src/orchestration/run-coordinator.js';
-import { INTERACTION_CANDIDATE_LIMITS } from '../../src/safety/interaction-policy.js';
 import { SafetyLedger, safetyEventsEvidenceFromSnapshot } from '../../src/safety/safety-ledger.js';
 import { useHeadlessChromium } from '../helpers/chromium.js';
 import { NO_PACING_WAIT, NO_SETTLING_WAIT } from '../helpers/navigation-pacer.js';
@@ -97,6 +75,9 @@ import { closePassiveResources } from '../helpers/passive-cleanup.js';
 import { sampleRunCheckpoint } from '../helpers/run-checkpoint-samples.js';
 import { buildIntoTemporaryDirectory, snapshotDirectory } from '../helpers/temporary-build.js';
 import { createTestConfig, TEST_FACTORY_OPTIONS } from '../helpers/test-config.js';
+
+/** L10: 撤廃した Interaction の候補の数の上限（前の値 100）の写し。 */
+const FORMER_MAX_INTERACTION_CANDIDATES = 100;
 
 const pageId = createPageId(1);
 const observedAt = '2026-08-27T00:00:00.000Z';
@@ -667,6 +648,7 @@ const interactionCandidate = {
   type: 'button',
   disabled: false,
   visible: true,
+  destructiveAction: false,
   boundingBox: { x: 8, y: 8, width: 100, height: 20, top: 8, right: 108, bottom: 28, left: 8 },
 } satisfies InteractionCandidateEvidence;
 
@@ -833,6 +815,23 @@ const evidenceSamples = {
   scroll: evidenceRecord('scroll', 23, scrollPayload),
   metadata: evidenceRecord('metadata', 22, metadataPayload),
   safety: evidenceRecord('safety', 24, safetyPayload),
+  // AUD-4d: フォーカスの確かめ。
+  focus: evidenceRecord('focus', 25, {
+    status: 'COMPLETE',
+    viewportWidth: 1280,
+    viewportHeight: 800,
+    scrollPosition: { scrollX: 0, scrollY: 0 },
+    items: [{
+      selector: '#skip',
+      tagName: 'a',
+      beforeRect: { x: -9999, y: 0, top: 0, right: -9919, bottom: 20, left: -9999, width: 80, height: 20 },
+      focused: true,
+      afterRect: { x: 8, y: 8, top: 8, right: 88, bottom: 28, left: 8, width: 80, height: 20 },
+      visibleAfterFocus: true,
+      hitAfterFocus: true,
+      screenshotEvidenceId: null,
+    }],
+  }),
 } satisfies { readonly [TType in EvidenceType]: EvidenceRecordFor<TType> };
 
 const allEvidence: readonly EvidenceRecord[] = Object.values(evidenceSamples);
@@ -920,7 +919,8 @@ const validRun = {
   incompleteReasons: [{ code: 'DEADLINE_EXCEEDED', detail: 'PAGE-000001 mobile accessibility' }],
   load: {
     minNavigationIntervalMs: createTestConfig('https://example.test').crawl.minNavigationIntervalMs,
-    maxInteractionsPerPage: createTestConfig('https://example.test').crawl.maxInteractionsPerPage,
+    // L14: 利用者が指定したときだけ持つ項目。持つ形を確かめるため、指定した値（前の既定と同じ値）を置く。
+    maxInteractionsPerPage: OLD_HIDDEN_CRAWL_DEFAULTS.maxInteractionsPerPage,
     navigationCount: 3,
     pacingWaitMs: 120,
     requests: {
@@ -932,10 +932,11 @@ const validRun = {
   },
 } satisfies RunSummary;
 
+/** REC-2: audit.json は目録（run.json のパス、ページの page.json のパス、Run だけの Finding）。 */
 const validAudit = {
-  schemaVersion: 'audit-schema/1.0',
-  run: validRun,
-  pages: [validPage],
+  schemaVersion: 'audit-schema/2.0',
+  run: 'run.json',
+  pages: [`pages/${validPage.pageId}/page.json`],
   findings: [validFinding],
 };
 
@@ -973,6 +974,21 @@ describe('validateArtifact', () => {
     await expect(validateArtifact('audit', validAudit)).resolves.toEqual({ ok: true });
   });
 
+  // 設計者の判断 2026-11-11: network の記録は、同じ口の成功した読み取りのくり返しをまとめた記録（`repeatedReads`）を持てる（ない記録も、今までどおり読める）。
+  it('accepts the network Evidence with the repeated reads, and rejects a repeated read without its count', async () => {
+    const repeated = {
+      method: 'GET', origin: 'https://example.test', path: '/api/ping', resourceType: 'fetch', status: 200, isMainFrame: true, count: 3,
+      firstRequestId: networkPayload.requests[0]!.requestId,
+      first: { url: 'https://example.test/api/ping?t=a', timing: networkTiming },
+      slowest: { url: 'https://example.test/api/ping?t=b', timing: networkTiming },
+      firstStartTime: 1_000, lastStartTime: 1_040, transfer: { observedCount: 3, totalBytes: 36 }, distinctQueryCount: 2,
+    };
+    const withRepeated = (payload: unknown) => ({ ...validPage, evidence: [{ ...validEvidence, payload }] });
+    await expect(validateArtifact('page', withRepeated({ ...networkPayload, repeatedReads: [repeated] }))).resolves.toEqual({ ok: true });
+    const { count: _count, ...withoutCount } = repeated;
+    await expect(validateArtifact('page', withRepeated({ ...networkPayload, repeatedReads: [withoutCount] }))).resolves.toMatchObject({ ok: false });
+  });
+
   it('rejects malformed nested Evidence and Findings in Page and Audit artifacts', async () => {
     await expect(validateArtifact('page', {
       ...validPage,
@@ -980,22 +996,21 @@ describe('validateArtifact', () => {
     })).resolves.toMatchObject({ ok: false });
     await expect(validateArtifact('audit', {
       ...validAudit,
-      pages: [{ ...validPage, findings: [{ ...validFinding, evidenceRefs: undefined }] }],
+      findings: [{ ...validFinding, evidenceRefs: undefined }],
     })).resolves.toMatchObject({ ok: false });
   });
 
-  it('rejects an audit with a malformed nested Run summary', async () => {
-    await expect(validateArtifact('audit', { ...validAudit, run: {} })).resolves.toMatchObject({ ok: false });
+  // REC-2: audit.json は目録。run とページは写さず、パスだけを持つ。
+  it('rejects an audit with a copy of the Run or of a page instead of their paths', async () => {
+    await expect(validateArtifact('audit', { ...validAudit, run: validRun })).resolves.toMatchObject({ ok: false });
+    await expect(validateArtifact('audit', { ...validAudit, pages: [validPage] })).resolves.toMatchObject({ ok: false });
   });
 
   // R2（中断した Run の再開の設計書 4.2）: 再開のための保存の2つのスキーマ（`state.json` とページの保存）を、スキーマの名前の
   // 閉じた一覧に加えた。保存の内容の詳しい検査は `tests/unit/run-checkpoint.test.ts` にある。
-  // D2（サイトの不調で止めたときの診断の記録の設計書 2.3）: 診断の記録のスキーマも、スキーマの名前の閉じた一覧に加えた。中身の検査は、
-  // このファイルの末尾の「D2」にある。
   it.each([
     ['checkpoint', 'checkpoint-schema/1.0'],
-    ['checkpoint-page', 'checkpoint-page-schema/1.0'],
-    ['site-unavailable-diagnostic', SITE_UNAVAILABLE_DIAGNOSTIC_SCHEMA_VERSION],
+    ['checkpoint-page', 'checkpoint-page-schema/1.1'],
   ] as const)('validates %s artifacts with their own schema', async (schemaName, schemaVersion) => {
     await expect(validateArtifact(schemaName, {})).resolves.toMatchObject({
       ok: false,
@@ -1021,17 +1036,16 @@ describe('validateArtifact', () => {
     });
   });
 
-  it('accepts a run.json and an audit.json whose Run reason is RUN_INTERRUPTED (a stop signal)', async () => {
+  it('accepts a run.json whose Run reason is RUN_INTERRUPTED (a stop signal)', async () => {
     const run = { ...validRun, incompleteReasons: [{ code: 'RUN_INTERRUPTED', detail: null }] };
 
     await expect(validateArtifact('run', run)).resolves.toEqual({ ok: true });
-    await expect(validateArtifact('audit', { ...validAudit, run })).resolves.toEqual({ ok: true });
   });
 
   // SU1（サイトが応答しないときに Run を止める設計書 3.2）: サイトの不調で止めた Run の理由 `SITE_UNAVAILABLE`（`detail` は、最初に検知した
   // 失敗）と、実行の終わり方 `STOPPED_BY_SITE_UNAVAILABLE` は、run.json の閉じた一覧にある。保存（state.json）でも、巡回の記録の
   // SKIPPED の理由（`detail` は null）、Run の理由、実行の終わり方に使える。
-  it('accepts a run.json and an audit.json of a Run stopped by site unavailability (SU1)', async () => {
+  it('accepts a run.json of a Run stopped by site unavailability (SU1)', async () => {
     const run = {
       ...validRun,
       incompleteReasons: [{ code: 'SITE_UNAVAILABLE', detail: 'desktop:passive:TIMEOUT' }],
@@ -1039,7 +1053,6 @@ describe('validateArtifact', () => {
     };
 
     await expect(validateArtifact('run', run)).resolves.toEqual({ ok: true });
-    await expect(validateArtifact('audit', { ...validAudit, run })).resolves.toEqual({ ok: true });
   });
 
   it('accepts a checkpoint state stopped by site unavailability (SU1)', async () => {
@@ -1152,6 +1165,46 @@ describe('C8: Evidence payload schemas', () => {
     await expect(validateArtifact('page', { ...validPage, evidence: [broken] })).resolves.toMatchObject({ ok: false });
   });
 
+  it('accepts the AUD-4a facts of a clipped text and the COV-6 count of parts in layout Evidence, and rejects an unknown clipping kind', async () => {
+    const [clipped] = layout.clippedText;
+    if (clipped === undefined) {
+      throw new Error('the layout sample has no clipped text');
+    }
+    // 閉じた一覧の外の値も試すため、区分は文字列で受けて型を合わせる。
+    const withFacts = (intendedClipping: string | null) => evidenceRecord('layout', 33, {
+      ...layoutPayload,
+      primary: {
+        status: 'COMPLETE',
+        layout: {
+          ...layout,
+          clippedText: [{
+            ...clipped,
+            clippingStyle: {
+              textOverflow: 'ellipsis',
+              whiteSpace: 'nowrap',
+              webkitLineClamp: 'none',
+              lineClamp: '',
+              display: 'block',
+              webkitBoxOrient: 'horizontal',
+              maxHeight: 'none',
+            },
+            lineHeightPx: 20,
+            visibleLineCount: 1,
+            lineClampCount: null,
+            collapsedByControl: false,
+            intendedClipping: intendedClipping as 'INTENDED_ELLIPSIS' | null,
+          }],
+          collectedInParts: 2,
+        },
+      },
+    });
+
+    await expect(validateArtifact('page', { ...validPage, evidence: [withFacts('INTENDED_ELLIPSIS')] })).resolves.toEqual({ ok: true });
+    await expect(validateArtifact('page', { ...validPage, evidence: [withFacts(null)] })).resolves.toEqual({ ok: true });
+    await expect(validateArtifact('page', { ...validPage, evidence: [withFacts('TRUNCATED')] }))
+      .resolves.toMatchObject({ ok: false });
+  });
+
   it('accepts partial collector results with their reason codes', async () => {
     await expect(validateArtifact('page', {
       ...validPage,
@@ -1229,14 +1282,6 @@ describe('C8: page results per viewport', () => {
 });
 
 describe('C8: structured incomplete reasons', () => {
-  it('uses the closed reason codes of INCOMPLETE_REASON_CODES in the schema', async () => {
-    const runSchema = await readSchema('run');
-
-    expect(schemaAt(runSchema, ['$defs', 'incompleteReason', 'properties', 'code', 'enum'])).toEqual(
-      INCOMPLETE_REASON_CODES,
-    );
-  });
-
   it('accepts every reason code of INCOMPLETE_REASON_CODES on runs, pages, and viewports', async () => {
     expect(INCOMPLETE_REASON_CODES?.length).toBeGreaterThan(0);
     for (const code of INCOMPLETE_REASON_CODES) {
@@ -1331,12 +1376,6 @@ describe('C8: run.json items of design 18.1 and chapter 35', () => {
 });
 
 describe('C8: finding categories', () => {
-  it('uses the closed categories of FINDING_CATEGORIES in the schema', async () => {
-    const findingSchema = await readSchema('finding');
-
-    expect(schemaAt(findingSchema, ['properties', 'category', 'enum'])).toEqual(FINDING_CATEGORIES);
-  });
-
   it('accepts every category of FINDING_CATEGORIES', async () => {
     expect(FINDING_CATEGORIES?.length).toBeGreaterThan(0);
     for (const category of FINDING_CATEGORIES) {
@@ -1371,7 +1410,14 @@ describe('F07 M1: integer viewport sizes and interaction timeout in the effectiv
 // P14a（Task 14〜17 の設計書 4.5.7）: 時間の設定は、正の整数に限る。設定の検証（`validateConfig`）と同じ規則。
 describe('P14a: integer durations in the effective configuration', () => {
   const config = validRun.effectiveConfig;
-  const durationKeys = ['maxRuntimeMs', 'navigationTimeoutMs', 'overallPageTimeoutMs', 'resourceSettlingTimeoutMs'] as const;
+  // SPEC-5: `interactionTimeoutMs` の下限（前は 1,001。F17b）は、安定と持続の窓をやめたので撤廃し、ほかの期限と同じく 1 以上の整数にした。
+  const durationKeys = [
+    'maxRuntimeMs',
+    'navigationTimeoutMs',
+    'overallPageTimeoutMs',
+    'resourceSettlingTimeoutMs',
+    'interactionTimeoutMs',
+  ] as const;
   const withCrawl = (change: Record<string, unknown>) => ({
     ...validRun,
     effectiveConfig: { ...config, crawl: { ...config.crawl, ...change } },
@@ -1394,40 +1440,8 @@ describe('P14a: integer durations in the effective configuration', () => {
   });
 });
 
-// F17b（F17 の発見事項3）: 設定のスキーマの interactionTimeoutMs の下限を、設定の検証と同じ定数にそろえる。
-describe('F17b: the lower bound of the interaction timeout in the effective configuration', () => {
-  const config = validRun.effectiveConfig;
-  const lowestAcceptedTimeoutMs = MIN_INTERACTION_TIMEOUT_EXCLUSIVE_MS + 1;
-  const withInteractionTimeout = (interactionTimeoutMs: number) => ({
-    ...validRun,
-    effectiveConfig: { ...config, crawl: { ...config.crawl, interactionTimeoutMs } },
-  });
-
-  it('uses MIN_INTERACTION_TIMEOUT_EXCLUSIVE_MS + 1 as the minimum of the schema', async () => {
-    const runSchema = await readSchema('run');
-
-    expect(
-      schemaAt(runSchema, ['properties', 'effectiveConfig', 'properties', 'crawl', 'properties', 'interactionTimeoutMs', 'minimum']),
-    ).toBe(lowestAcceptedTimeoutMs);
-  });
-
-  it.each([1, MIN_INTERACTION_TIMEOUT_EXCLUSIVE_MS - 1, MIN_INTERACTION_TIMEOUT_EXCLUSIVE_MS])(
-    'rejects an interaction timeout of %s ms, which is below the lower bound',
-    async (interactionTimeoutMs) => {
-      await expect(validateArtifact('run', withInteractionTimeout(interactionTimeoutMs))).resolves.toMatchObject({
-        ok: false,
-        errors: expect.arrayContaining([expect.stringContaining('interactionTimeoutMs')]),
-      });
-    },
-  );
-
-  it('accepts an interaction timeout at the lower bound', async () => {
-    await expect(validateArtifact('run', withInteractionTimeout(lowestAcceptedTimeoutMs))).resolves.toEqual({ ok: true });
-  });
-});
-
 // L1（サイトへの負荷の制御の設計書 3.2、4.2）: ページの読み込みの最小の間隔と、1ページの Interaction の候補の上限。
-// スキーマは数値を直接書くので、上限が `INTERACTION_CANDIDATE_LIMITS.maxCandidates` と一致することを確かめる。
+// L10（INV-LIMITS の N3・N4）: 候補の数の上限は撤廃したので、スキーマに上限を置かないことを確かめる。
 // ループバックの例外（許可 Origin による下限）は、設定の検証（`validateConfig`）だけが確かめる。
 describe('L1: the navigation interval and the Interaction limit per page in the effective configuration', () => {
   const config = validRun.effectiveConfig;
@@ -1438,16 +1452,20 @@ describe('L1: the navigation interval and the Interaction limit per page in the 
   const crawlSchemaAt = async (path: readonly string[]): Promise<unknown> =>
     schemaAt(await readSchema('run'), ['properties', 'effectiveConfig', 'properties', 'crawl', ...path]);
 
-  it('requires crawl.minNavigationIntervalMs and crawl.maxInteractionsPerPage', async () => {
-    expect(await crawlSchemaAt(['required'])).toEqual(expect.arrayContaining(['minNavigationIntervalMs', 'maxInteractionsPerPage']));
-    for (const key of ['minNavigationIntervalMs', 'maxInteractionsPerPage']) {
+  // L14: `maxInteractionsPerPage` は、利用者が指定したときだけ持つ（必須でない）。
+  it('requires crawl.minNavigationIntervalMs, and does not require crawl.maxInteractionsPerPage', async () => {
+    expect(await crawlSchemaAt(['required'])).toEqual(expect.arrayContaining(['minNavigationIntervalMs']));
+    expect(await crawlSchemaAt(['required'])).not.toContain('maxInteractionsPerPage');
+    for (const key of ['minNavigationIntervalMs']) {
       await expect(validateArtifact('run', { ...validRun, effectiveConfig: { ...config, crawl: withoutKey(config.crawl, key) } }), key)
         .resolves.toMatchObject({ ok: false, errors: expect.arrayContaining([expect.stringContaining(key)]) });
     }
   });
 
-  it('uses INTERACTION_CANDIDATE_LIMITS.maxCandidates as the maximum of crawl.maxInteractionsPerPage', async () => {
-    expect(await crawlSchemaAt(['properties', 'maxInteractionsPerPage', 'maximum'])).toBe(INTERACTION_CANDIDATE_LIMITS.maxCandidates);
+  // L10（設計書 `2026-11-09-beaksight-remove-limits-design.md` 4。INV-LIMITS の N3・N4）: 前は、候補の数の上限（100）を `maximum` に置いた。上限は撤廃したので、
+  // `maximum` を置かない（1 以上の整数なら受ける）。
+  it('has no maximum of crawl.maxInteractionsPerPage (L10)', async () => {
+    expect(await crawlSchemaAt(['properties', 'maxInteractionsPerPage', 'maximum'])).toBeUndefined();
   });
 
   it.each([
@@ -1455,7 +1473,6 @@ describe('L1: the navigation interval and the Interaction limit per page in the 
     ['minNavigationIntervalMs', 1_000.5],
     ['minNavigationIntervalMs', '5000'],
     ['maxInteractionsPerPage', 0],
-    ['maxInteractionsPerPage', INTERACTION_CANDIDATE_LIMITS.maxCandidates + 1],
     ['maxInteractionsPerPage', 1.5],
   ] as const)('rejects crawl.%s = %j', async (key, value) => {
     await expect(validateArtifact('run', withCrawl({ [key]: value }))).resolves.toMatchObject({
@@ -1468,7 +1485,7 @@ describe('L1: the navigation interval and the Interaction limit per page in the 
     ['minNavigationIntervalMs', 0],
     ['minNavigationIntervalMs', DEFAULT_CONFIG.crawl.minNavigationIntervalMs],
     ['maxInteractionsPerPage', 1],
-    ['maxInteractionsPerPage', INTERACTION_CANDIDATE_LIMITS.maxCandidates],
+    ['maxInteractionsPerPage', FORMER_MAX_INTERACTION_CANDIDATES + 1],
   ] as const)('accepts crawl.%s = %j', async (key, value) => {
     await expect(validateArtifact('run', withCrawl({ [key]: value }))).resolves.toEqual({ ok: true });
   });
@@ -1748,13 +1765,6 @@ describe('F07 M4: bounded Link Evidence', () => {
 });
 
 describe('F07 M5: URL rejection reason codes', () => {
-  it('uses the closed codes of URL_REJECTION_REASONS in the schema', async () => {
-    const pageSchema = await readSchema('page');
-
-    expect(schemaAt(pageSchema, ['$defs', 'urlRejectionReason', 'enum'])).toEqual(URL_REJECTION_REASONS);
-    expect(Object.isFrozen(URL_REJECTION_REASONS)).toBe(true);
-  });
-
   it('accepts every code of URL_REJECTION_REASONS on the normalization and the admission of a link', async () => {
     for (const reason of URL_REJECTION_REASONS) {
       const link = {
@@ -1964,11 +1974,8 @@ describe('R\'2 I-2: scroll Evidence', () => {
     expect(createEvidenceId('scroll', 7)).toBe('EV-SCROLL-000007');
   });
 
-  it('lists exactly the scroll incomplete reasons of the core constant as the PARTIAL reasons (F11)', async () => {
-    const pageSchema = await readSchema('page');
-
-    expect(schemaAt(pageSchema, ['$defs', 'scrollEvidence', 'oneOf', '1', 'properties', 'reason', 'enum']))
-      .toEqual(SCROLL_INCOMPLETE_REASONS);
+  // 一覧と schema の一致は schema-enum-consistency の対応表が確かめる。
+  it('accepts every scroll incomplete reason of the core constant as a PARTIAL reason (F11)', async () => {
     for (const reason of SCROLL_INCOMPLETE_REASONS) {
       await expect(validateArtifact('page', withScroll({ ...partialScrollPayload, reason }))).resolves.toEqual({ ok: true });
     }
@@ -2335,7 +2342,6 @@ describe('C8: real collector output from local fixtures', () => {
           },
         };
       }, url, [320], { deadlineAtMs, beforeNavigation: NO_PACING_WAIT, settleBeforeLayout: NO_SETTLING_WAIT });
-      const color = await collectColorEvidence(page);
       const networkEvidence = await network.snapshot();
       const performance = await performanceCollector.collect(page, networkEvidence, { deadlineAtMs });
       const consoleEvidence = await consoleHandle.snapshot();
@@ -2353,14 +2359,16 @@ describe('C8: real collector output from local fixtures', () => {
       });
       // DEF-001 の修正の後、axe はレガシーの方式（`setLegacyMode(true)`）で対象の page の中だけで実行され、別の page を開かないので、
       // Guard の付いた Passive の Context を無効にしない。検査の範囲は同じOriginの文書に限られる（`frameScope: 'SAME_ORIGIN_ONLY'`。DEF-001b）。
-      const accessibility = await collectAccessibilityEvidence(page, { deadlineAtMs });
+      const accessibility = await collectAccessibilityEvidence(page);
+      // AUD-4d: フォーカスの確かめ（ほかの証拠を集め終えた後）。
+      const focus = await collectFocusChecks(page, { stressWidth: null });
       return [
+        evidenceRecord('focus', sequenceBase + 21, focus),
         evidenceRecord('network', sequenceBase + 1, networkEvidence),
         evidenceRecord('console', sequenceBase + 2, consoleEvidence),
         evidenceRecord('link', sequenceBase + 3, linkEvidence),
         evidenceRecord('dom', sequenceBase + 4, dom),
         evidenceRecord('layout', sequenceBase + 5, { primary, stressSweep }),
-        evidenceRecord('color', sequenceBase + 6, color),
         evidenceRecord('accessibility', sequenceBase + 7, accessibility),
         evidenceRecord('performance', sequenceBase + 8, performance),
         ...screenshots.map((screenshot, index) => evidenceRecord('screenshot', sequenceBase + 9 + index, screenshot)),
@@ -2424,8 +2432,9 @@ describe('C8: real collector output from local fixtures', () => {
         evidence.push(evidenceRecord('safety', 901, safetyEventsEvidenceFromSnapshot(safety, 'INTERACTION', { kind: 'INTERACTION', candidateIndex: 0 })));
       }
 
+      // REC-1: 色の Evidence（`color`）は集めなくなったので、集める部品の出力には出ない（形の確かめは上の見本で行う）。
       expect(new Set(evidence.map((record) => record.type))).toEqual(
-        new Set(evidenceTypes.filter((type) => type !== 'metadata')),
+        new Set(evidenceTypes.filter((type) => type !== 'metadata' && type !== 'color')),
       );
       const result = await validateArtifact('page', {
         ...validPage,
@@ -2448,6 +2457,7 @@ describe('C8: real collector output from local fixtures', () => {
         '/body-scroll-late-growth.html',
         '/inner-scroll-container.html',
         '/shadow-scan-limit.html',
+        '/scroll-locked.html',
       ]) {
         const context = await factory.createPassiveContext(viewport);
         const page = await factory.createPassivePage(context);
@@ -2463,8 +2473,11 @@ describe('C8: real collector output from local fixtures', () => {
         }
       }
 
-      expect(results.map((result) => result.status)).toEqual(['COMPLETE', 'COMPLETE', 'PARTIAL', 'COMPLETE']);
-      expect(results.map((result) => result.innerScrollScan?.scanLimitReached)).toEqual([false, false, false, true]);
+      // DEF-207: 内側の領域だけが動く画面（`/inner-scroll-container.html`）は、その領域をたどって COMPLETE になる。PARTIAL の例は、動かない画面で確かめる。
+      expect(results.map((result) => result.status)).toEqual(['COMPLETE', 'COMPLETE', 'COMPLETE', 'COMPLETE', 'PARTIAL']);
+      // L9（N16）: 走査の上限は撤廃したので、どの画面でも上限に達しない。内側の領域をたどった画面は、領域ごとの記録（`innerScrollContainers`）を持つ。
+      expect(results.map((result) => result.innerScrollScan?.scanLimitReached)).toEqual([false, false, false, false, undefined]);
+      expect(results[2]?.innerScrollContainers?.length).toBe(1);
       const records = results.map((result, index) => evidenceRecord('scroll', 700 + index, result));
       await expect(validateArtifact('page', {
         ...validPage,
@@ -2591,7 +2604,8 @@ describe('L4: run summary load', () => {
     });
   });
 
-  it.each(['minNavigationIntervalMs', 'maxInteractionsPerPage', 'navigationCount', 'pacingWaitMs', 'requests'])(
+  // L14: `maxInteractionsPerPage` は、指定したときだけ書く（必須でない）。
+  it.each(['minNavigationIntervalMs', 'navigationCount', 'pacingWaitMs', 'requests'])(
     'rejects a load record without %s',
     async (key) => {
       await expect(validateArtifact('run', { ...validRun, load: withoutKey(load, key) })).resolves.toMatchObject({ ok: false });
@@ -2633,7 +2647,7 @@ describe('L4: run summary load', () => {
   });
 
   // RL-fix（RL の Minor-6）: `load.maxInteractionsPerPage` は、実効の設定の `crawl.maxInteractionsPerPage` の値なので、設定と同じ
-  // 範囲（1 以上、`INTERACTION_CANDIDATE_LIMITS.maxCandidates` 以下の整数）にする。形は二重に定義せず、設定の定義を JSON Pointer で参照する。
+  // 範囲（1 以上の整数。L10 で上限は撤廃した）にする。形は二重に定義せず、設定の定義を JSON Pointer で参照する。
   describe('the range of load.maxInteractionsPerPage (the same definition as the setting)', () => {
     const SETTING_POINTER_PATH = ['properties', 'effectiveConfig', 'properties', 'crawl', 'properties', 'maxInteractionsPerPage'] as const;
 
@@ -2644,21 +2658,21 @@ describe('L4: run summary load', () => {
         $ref: `#/${SETTING_POINTER_PATH.join('/')}`,
       });
       // 参照の先は、設定の定義（1 以上、候補の発見の上限以下の整数）である。
+      // L10（INV-LIMITS の N3・N4）: 上限（前は 100）は撤廃した（`maximum` を置かない）。
       expect(schemaAt(schema, SETTING_POINTER_PATH)).toEqual({
         type: 'integer',
         minimum: 1,
-        maximum: INTERACTION_CANDIDATE_LIMITS.maxCandidates,
       });
     });
 
-    it.each([0, INTERACTION_CANDIDATE_LIMITS.maxCandidates + 1, 1.5])('rejects load.maxInteractionsPerPage = %j', async (value) => {
+    it.each([0, 1.5])('rejects load.maxInteractionsPerPage = %j', async (value) => {
       await expect(validateArtifact('run', { ...validRun, load: { ...load, maxInteractionsPerPage: value } })).resolves.toMatchObject({
         ok: false,
         errors: expect.arrayContaining([expect.stringContaining('/load/maxInteractionsPerPage')]),
       });
     });
 
-    it.each([1, INTERACTION_CANDIDATE_LIMITS.maxCandidates])('accepts load.maxInteractionsPerPage = %j', async (value) => {
+    it.each([1, FORMER_MAX_INTERACTION_CANDIDATES + 1])('accepts load.maxInteractionsPerPage = %j', async (value) => {
       await expect(validateArtifact('run', { ...validRun, load: { ...load, maxInteractionsPerPage: value } }))
         .resolves.toEqual({ ok: true });
     });
@@ -2674,7 +2688,6 @@ describe('R4b2: run summary executions', () => {
     const executions = RUN_EXECUTION_END_REASONS.map((endReason) => ({ ...execution, endReason }));
 
     await expect(validateArtifact('run', { ...validRun, executions })).resolves.toEqual({ ok: true });
-    await expect(validateArtifact('audit', { ...validAudit, run: { ...validRun, executions } })).resolves.toEqual({ ok: true });
   });
 
   it('rejects a run summary without executions, or with no execution', async () => {
@@ -2712,314 +2725,10 @@ describe('R4b2: run summary executions', () => {
   });
 });
 
-// R15a（Task 14〜17 の設計書 5.6.1）: 確定した Run（`AuditRunResult`）は、audit.schema.json の最上位の run・pages・findings と合う。
-// U16b（設計書 6.1.1）: メモリの上だけの `statusInput` は、audit.json に書かない。
-describe('R15a: the confirmed run and the audit schema', () => {
-  it('matches the top level of the audit schema except the schema version of the artifact and the in-memory Run Status input', async () => {
-    const auditRun = { run: validRun, pages: [validPage], findings: [validFinding] } satisfies Omit<AuditRunResult, 'statusInput'>;
-    const auditSchema = await readSchema('audit');
-
-    expect(schemaAt(auditSchema, ['required'])).toEqual(['schemaVersion', ...Object.keys(auditRun)]);
-    expect(Object.keys(schemaAt(auditSchema, ['properties']) as object)).toEqual(['schemaVersion', ...Object.keys(auditRun)]);
-    await expect(validateArtifact('audit', { schemaVersion: 'audit-schema/1.0', ...auditRun })).resolves.toEqual({ ok: true });
-  });
-});
-
-// ---------------------------------------------------------------------------------------------------------------
-// D2（サイトの不調で止めたときの診断の記録の設計書 2.3）: 診断の記録（`diagnostics/site-unavailable-<pageId>-<実行の番号>.json`）の
-// スキーマ。ページの結果はページのスキーマのまま、ページ本体の要求の観察の結果は `contracts.ts` の型の形で持つ。header の中身は持たない。
-// 上限は、観察の部品（`navigation-diagnostics.ts`）の定数と、`limits.ts` の定数（定数との一致は `schema-enum-consistency.test.ts`）。
-// ---------------------------------------------------------------------------------------------------------------
-
-/** 診断の記録の見本の時刻（`Date.now()` と同じ基準の ms）。 */
-const DIAGNOSTIC_ISSUED_AT_MS = 1_790_000_000_000;
-
-/** 要求のヘッダを送り、応答のない文書の要求の1回分（見本）。`overrides` で項目を変える。 */
-const diagnosticHop = (overrides: Partial<NavigationDocumentRequestHop> = {}): NavigationDocumentRequestHop => ({
-  url: validPage.pageUrl,
-  method: 'GET',
-  truncated: false,
-  issuedAtMs: DIAGNOSTIC_ISSUED_AT_MS,
-  requestHeadersSentAtMs: DIAGNOSTIC_ISSUED_AT_MS + 5,
-  responseHeadersReceivedAtMs: null,
-  httpStatus: null,
-  remoteIpAddress: null,
-  remotePort: null,
-  ...overrides,
-});
-
-/** 文書の要求1つ（見本）。読み込みは、取り消しで失敗した。 */
-const diagnosticDocumentRequest = (
-  hops: readonly NavigationDocumentRequestHop[] = [diagnosticHop()],
-): NavigationDocumentRequestDiagnostics => ({
-  hops,
-  loadingFinishedAtMs: null,
-  loadingFailure: { failedAtMs: DIAGNOSTIC_ISSUED_AT_MS + 3_000, errorText: 'net::ERR_ABORTED', canceled: true },
-});
-
-/** 観察した結果（見本）。文書の要求は1つで、ヘッダを送り、応答がなく、取り消しで失敗した。 */
-const observedDiagnostics = (): ObservedNavigationDiagnostics => ({
-  status: 'OBSERVED',
-  observationStartedAtMs: DIAGNOSTIC_ISSUED_AT_MS - 10,
-  observationEndedAtMs: DIAGNOSTIC_ISSUED_AT_MS + 3_010,
-  documentRequests: [diagnosticDocumentRequest()],
-  omittedDocumentRequestCount: 0,
-  omittedEventCount: 0,
-});
-
-/** 観察できなかった結果（見本）。 */
-const notObservedDiagnostics = (): NotObservedNavigationDiagnostics =>
-  ({ status: 'NOT_OBSERVED', reason: NAVIGATION_DIAGNOSTICS_START_DEADLINE_MESSAGE });
-
-/** 幅の走査の幅の観察（見本。D3）。 */
-const stressWidthDiagnostics = (width: number): StressWidthNavigationDiagnostics => ({ width, diagnostics: observedDiagnostics() });
-
-/** Interaction の候補の観察（見本。D3）。 */
-const interactionCandidateDiagnostics = (index: number): InteractionCandidateNavigationDiagnostics =>
-  ({ index, diagnostics: notObservedDiagnostics() });
-
-/**
- * スキーマに合う診断の記録（D3 の形。設計書 2.2 の 2026-10-07 の改訂、2.3）。Desktop は、Passive を観察し、幅の走査の1つの幅と Interaction の
- * 1つの候補の観察を持つ。Mobile は、Passive を観察できず、幅の走査と Interaction はない（Mobile では行わない）。
- */
-const validSiteUnavailableDiagnostic = {
-  schemaVersion: SITE_UNAVAILABLE_DIAGNOSTIC_SCHEMA_VERSION,
-  runId: createRunId(1),
-  executionNumber: 1,
-  writtenAt: '2026-08-27T00:01:00.000Z',
-  pageId,
-  url: validPage.pageUrl,
-  siteUnavailableDetail: 'desktop:interaction:TIMEOUT',
-  page: validPage,
-  navigationDiagnostics: {
-    desktop: {
-      passive: observedDiagnostics(),
-      stressWidths: [stressWidthDiagnostics(320)],
-      interactionCandidates: [interactionCandidateDiagnostics(0)],
-    },
-    mobile: { passive: notObservedDiagnostics(), stressWidths: [], interactionCandidates: [] },
-  },
-} satisfies SiteUnavailableDiagnosticRecord;
-
-/**
- * D3 の前の形（`site-unavailable-diagnostic-schema/1.0`）の診断の記録。ビューポートごとの値は、Passive の観察の結果そのもので、幅ごとと
- * 候補ごとの項目がない。1.1 のスキーマは、この形を拒む。
- */
-const previousShapeSiteUnavailableDiagnostic = {
-  ...validSiteUnavailableDiagnostic,
-  schemaVersion: 'site-unavailable-diagnostic-schema/1.0',
-  siteUnavailableDetail: 'desktop:passive:TIMEOUT',
-  navigationDiagnostics: { desktop: observedDiagnostics(), mobile: notObservedDiagnostics() },
-};
-
-/** 見本の診断の記録の、変えてよい写し（JSON として読み戻した値）。 */
-const diagnosticCopy = (): Record<string, unknown> =>
-  JSON.parse(JSON.stringify(validSiteUnavailableDiagnostic)) as Record<string, unknown>;
-
-/** 記録の中の場所（項目の名前と、配列の位置の並び）。 */
-type DiagnosticPath = readonly (string | number)[];
-
-/** `record` の `path` の場所の、親の値と、最後の鍵。途中の値がなければ、テストの誤りとして例外を投げる。 */
-function parentAt(record: Record<string, unknown>, path: DiagnosticPath): { readonly parent: Record<string | number, unknown>; readonly key: string | number } {
-  let current: unknown = record;
-  for (const key of path.slice(0, -1)) {
-    current = (current as Record<string | number, unknown> | undefined)?.[key];
-  }
-  const key = path.at(-1);
-  if (typeof current !== 'object' || current === null || key === undefined) {
-    throw new Error(`no value at ${path.join('/')}`);
-  }
-  return { parent: current as Record<string | number, unknown>, key };
-}
-
-/** 写しの `path` の場所を `value` にする変更。 */
-const setAt = (path: DiagnosticPath, value: unknown) => (record: Record<string, unknown>): void => {
-  const { parent, key } = parentAt(record, path);
-  parent[key] = value;
-};
-
-/** 写しの `path` の場所の項目を消す変更。 */
-const deleteAt = (path: DiagnosticPath) => (record: Record<string, unknown>): void => {
-  const { parent, key } = parentAt(record, path);
-  delete parent[key];
-};
-
-/** Desktop のビューポートの観察の結果の中の場所（D3）。 */
-const DESKTOP_VIEWPORT = ['navigationDiagnostics', 'desktop'] as const;
-/** Desktop の Passive の観察の結果の中の場所。 */
-const DESKTOP = [...DESKTOP_VIEWPORT, 'passive'] as const;
-/** Desktop の最初の文書の要求の中の場所。 */
-const FIRST_REQUEST = [...DESKTOP, 'documentRequests', 0] as const;
-/** Desktop の最初の文書の要求の、最初の回の中の場所。 */
-const FIRST_HOP = [...FIRST_REQUEST, 'hops', 0] as const;
-/** Desktop の幅の走査の観察の配列と、その最初の幅の中の場所（D3）。 */
-const STRESS_WIDTHS = [...DESKTOP_VIEWPORT, 'stressWidths'] as const;
-const FIRST_STRESS_WIDTH = [...STRESS_WIDTHS, 0] as const;
-/** Desktop の Interaction の候補の観察の配列と、その最初の候補の中の場所（D3）。 */
-const INTERACTION_CANDIDATES = [...DESKTOP_VIEWPORT, 'interactionCandidates'] as const;
-const FIRST_INTERACTION_CANDIDATE = [...INTERACTION_CANDIDATES, 0] as const;
-
-describe('D2: the schema of the site-unavailable diagnostic (site-unavailable diagnostics design 2.3)', () => {
-  it('accepts the diagnostic with an observed Desktop and a Mobile that could not be observed', async () => {
-    await expect(validateArtifact('site-unavailable-diagnostic', diagnosticCopy())).resolves.toEqual({ ok: true });
-  });
-
-  // D3: スキーマの版は 1.1（形が変わった）。
-  it('has the schema version 1.1 (D3)', () => {
-    expect(SITE_UNAVAILABLE_DIAGNOSTIC_SCHEMA_VERSION).toBe('site-unavailable-diagnostic-schema/1.1');
-  });
-
-  // D3: 幅の走査の幅ごとの観察と、Interaction の候補ごとの観察を、上限（幅の数の上限と、候補の数の上限）まで受け付ける。
-  it('accepts as many stress widths and interaction candidates as their limits, each observed or not observed (D3)', async () => {
-    const record = diagnosticCopy();
-    setAt(STRESS_WIDTHS, Array.from({ length: MAX_STRESS_WIDTH_NAVIGATION_DIAGNOSTICS }, (_, offset) => ({
-      ...stressWidthDiagnostics(320 + offset),
-      diagnostics: offset % 2 === 0 ? observedDiagnostics() : notObservedDiagnostics(),
-    })))(record);
-    setAt(INTERACTION_CANDIDATES, Array.from({ length: INTERACTION_CANDIDATE_LIMITS.maxCandidates }, (_, index) => ({
-      ...interactionCandidateDiagnostics(index),
-      diagnostics: index % 2 === 0 ? notObservedDiagnostics() : observedDiagnostics(),
-    })))(record);
-
-    await expect(validateArtifact('site-unavailable-diagnostic', record)).resolves.toEqual({ ok: true });
-  });
-
-  // D3: Passive の読み込みを始めなかったビューポート（Context と page を作れなかった）は、Passive が `null` で、幅と候補の配列は空。
-  it('accepts a viewport whose Passive load did not start, with a null Passive and no stress width nor candidate (D3)', async () => {
-    const record = diagnosticCopy();
-    setAt(DESKTOP_VIEWPORT, { passive: null, stressWidths: [], interactionCandidates: [] })(record);
-
-    await expect(validateArtifact('site-unavailable-diagnostic', record)).resolves.toEqual({ ok: true });
-  });
-
-  // D3: 1.0 の形（ビューポートごとの値が Passive の観察の結果そのもので、幅ごとと候補ごとの項目がない）は、版の値によらず拒む。
-  it.each([
-    ['with its schema version 1.0', (record: Record<string, unknown>): void => undefined],
-    ['with the schema version 1.1', setAt(['schemaVersion'], SITE_UNAVAILABLE_DIAGNOSTIC_SCHEMA_VERSION)],
-  ])('rejects the previous shape (schema 1.0, without the stress widths and the interaction candidates) %s (D3)', async (_name, change) => {
-    const record = JSON.parse(JSON.stringify(previousShapeSiteUnavailableDiagnostic)) as Record<string, unknown>;
-    change(record);
-
-    await expect(validateArtifact('site-unavailable-diagnostic', record)).resolves.toMatchObject({ ok: false });
-  });
-
-  it('accepts null for a viewport that did not start, and a redirect with a 503 response and its remote address', async () => {
-    const record = diagnosticCopy();
-    setAt(['navigationDiagnostics', 'mobile'], null)(record);
-    setAt([...DESKTOP, 'documentRequests'], [{
-      ...diagnosticDocumentRequest([
-        diagnosticHop({ responseHeadersReceivedAtMs: DIAGNOSTIC_ISSUED_AT_MS + 7, httpStatus: 302, remoteIpAddress: '127.0.0.1', remotePort: 80 }),
-        diagnosticHop({ responseHeadersReceivedAtMs: DIAGNOSTIC_ISSUED_AT_MS + 9, httpStatus: 503, remoteIpAddress: '::1', remotePort: 8080 }),
-      ]),
-      loadingFinishedAtMs: DIAGNOSTIC_ISSUED_AT_MS + 11,
-      loadingFailure: null,
-    }])(record);
-    setAt(['siteUnavailableDetail'], 'desktop:passive:HTTP 503')(record);
-    setAt(['executionNumber'], 2)(record);
-
-    await expect(validateArtifact('site-unavailable-diagnostic', record)).resolves.toEqual({ ok: true });
-  });
-
-  it('accepts as many document requests as the limit of the observation, and as many hops as the limit of the events', async () => {
-    const record = diagnosticCopy();
-    setAt([...DESKTOP, 'documentRequests'], Array.from({ length: MAX_NAVIGATION_DIAGNOSTICS_DOCUMENT_REQUESTS }, () => diagnosticDocumentRequest()))(record);
-    await expect(validateArtifact('site-unavailable-diagnostic', record)).resolves.toEqual({ ok: true });
-
-    setAt([...FIRST_REQUEST, 'hops'], Array.from({ length: MAX_NAVIGATION_DIAGNOSTICS_EVENTS }, () => diagnosticHop()))(record);
-    await expect(validateArtifact('site-unavailable-diagnostic', record)).resolves.toEqual({ ok: true });
-  });
-
-  it.each<[string, (record: Record<string, unknown>) => void]>([
-    ['an extra top-level item', setAt(['unexpectedField'], true)],
-    ['the request headers in a hop', setAt([...FIRST_HOP, 'requestHeaders'], { cookie: 'session=1' })],
-    ['the response headers in a hop', setAt([...FIRST_HOP, 'responseHeaders'], { 'set-cookie': 'session=1' })],
-    ['the headers in a document request', setAt([...FIRST_REQUEST, 'headers'], { cookie: 'session=1' })],
-    ['an extra item in the observed result', setAt([...DESKTOP, 'body'], '<html></html>')],
-    [
-      'more document requests than the limit of the observation',
-      setAt([...DESKTOP, 'documentRequests'], Array.from({ length: MAX_NAVIGATION_DIAGNOSTICS_DOCUMENT_REQUESTS + 1 }, () => diagnosticDocumentRequest())),
-    ],
-    ['more hops than the limit of the events', setAt([...FIRST_REQUEST, 'hops'], Array.from({ length: MAX_NAVIGATION_DIAGNOSTICS_EVENTS + 1 }, () => diagnosticHop()))],
-    ['a document request without a hop', setAt([...FIRST_REQUEST, 'hops'], [])],
-    ['a URL longer than MAX_URL_LENGTH', setAt([...FIRST_HOP, 'url'], 'h'.repeat(MAX_URL_LENGTH + 1))],
-    ['a method longer than MAX_HTTP_METHOD_LENGTH', setAt([...FIRST_HOP, 'method'], 'G'.repeat(MAX_HTTP_METHOD_LENGTH + 1))],
-    ['an error text longer than MAX_ERROR_MESSAGE_LENGTH', setAt([...FIRST_REQUEST, 'loadingFailure', 'errorText'], 'e'.repeat(MAX_ERROR_MESSAGE_LENGTH + 1))],
-    [
-      'a reason of the unobserved result longer than MAX_ERROR_MESSAGE_LENGTH',
-      setAt(['navigationDiagnostics', 'mobile', 'reason'], 'r'.repeat(MAX_ERROR_MESSAGE_LENGTH + 1)),
-    ],
-    ['a status outside NAVIGATION_DIAGNOSTICS_STATUSES', setAt([...DESKTOP, 'status'], 'PARTIALLY_OBSERVED')],
-    ['an unobserved result with the items of an observed result', setAt([...DESKTOP, 'status'], 'NOT_OBSERVED')],
-    ['a negative time', setAt([...FIRST_HOP, 'issuedAtMs'], -1)],
-    ['a fractional time', setAt([...FIRST_HOP, 'requestHeadersSentAtMs'], DIAGNOSTIC_ISSUED_AT_MS + 0.5)],
-    ['a negative count of omitted events', setAt([...DESKTOP, 'omittedEventCount'], -1)],
-    ['no Mobile viewport', deleteAt(['navigationDiagnostics', 'mobile'])],
-    ['an unknown viewport', setAt(['navigationDiagnostics', 'tablet'], null)],
-    ['an execution number 0', setAt(['executionNumber'], 0)],
-    ['a fractional execution number', setAt(['executionNumber'], 1.5)],
-    ['an empty detail of the site unavailability', setAt(['siteUnavailableDetail'], '')],
-    ['an empty written time', setAt(['writtenAt'], '')],
-    ['a page ID that is not a page ID', setAt(['pageId'], 'page-1')],
-    ['a run ID that is not a run ID', setAt(['runId'], 'run-1')],
-    ['a page that does not match the page schema', setAt(['page', 'unexpectedField'], true)],
-    ['another schema version', setAt(['schemaVersion'], 'site-unavailable-diagnostic-schema/2.0')],
-    ['the previous schema version 1.0', setAt(['schemaVersion'], 'site-unavailable-diagnostic-schema/1.0')],
-    ['no page', deleteAt(['page'])],
-    // D3: ビューポートごとの観察の結果の形（Passive、幅ごと、候補ごと）。
-    ['no Passive item of a viewport', deleteAt(DESKTOP)],
-    ['no stress widths of a viewport', deleteAt(STRESS_WIDTHS)],
-    ['no interaction candidates of a viewport', deleteAt(INTERACTION_CANDIDATES)],
-    ['an extra item of a viewport', setAt([...DESKTOP_VIEWPORT, 'robots'], null)],
-    ['a null stress width observation', setAt([...FIRST_STRESS_WIDTH, 'diagnostics'], null)],
-    ['a stress width observation without the width', deleteAt([...FIRST_STRESS_WIDTH, 'width'])],
-    ['a stress width observation without the diagnostics', deleteAt([...FIRST_STRESS_WIDTH, 'diagnostics'])],
-    ['a stress width of 0', setAt([...FIRST_STRESS_WIDTH, 'width'], 0)],
-    ['a fractional stress width', setAt([...FIRST_STRESS_WIDTH, 'width'], 320.5)],
-    ['an extra item of a stress width observation', setAt([...FIRST_STRESS_WIDTH, 'height'], 900)],
-    ['a status outside NAVIGATION_DIAGNOSTICS_STATUSES in a stress width observation', setAt([...FIRST_STRESS_WIDTH, 'diagnostics', 'status'], 'PARTIALLY_OBSERVED')],
-    [
-      'more stress widths than the limit',
-      setAt(STRESS_WIDTHS, Array.from({ length: MAX_STRESS_WIDTH_NAVIGATION_DIAGNOSTICS + 1 }, (_, offset) => stressWidthDiagnostics(320 + offset))),
-    ],
-    ['a null interaction candidate observation', setAt([...FIRST_INTERACTION_CANDIDATE, 'diagnostics'], null)],
-    ['an interaction candidate observation without the index', deleteAt([...FIRST_INTERACTION_CANDIDATE, 'index'])],
-    ['an interaction candidate observation without the diagnostics', deleteAt([...FIRST_INTERACTION_CANDIDATE, 'diagnostics'])],
-    ['a negative candidate index', setAt([...FIRST_INTERACTION_CANDIDATE, 'index'], -1)],
-    ['a fractional candidate index', setAt([...FIRST_INTERACTION_CANDIDATE, 'index'], 0.5)],
-    ['an extra item of an interaction candidate observation', setAt([...FIRST_INTERACTION_CANDIDATE, 'selector'], 'button')],
-    [
-      'a reason of an unobserved candidate longer than MAX_ERROR_MESSAGE_LENGTH',
-      setAt([...FIRST_INTERACTION_CANDIDATE, 'diagnostics', 'reason'], 'r'.repeat(MAX_ERROR_MESSAGE_LENGTH + 1)),
-    ],
-    [
-      'more interaction candidates than the limit',
-      setAt(INTERACTION_CANDIDATES, Array.from({ length: INTERACTION_CANDIDATE_LIMITS.maxCandidates + 1 }, (_, index) => interactionCandidateDiagnostics(index))),
-    ],
-  ])('rejects %s', async (_name, change) => {
-    // 対照: 変える前の記録は受け付ける（拒むのは、変えた項目のため）。
-    const record = diagnosticCopy();
-    await expect(validateArtifact('site-unavailable-diagnostic', record)).resolves.toEqual({ ok: true });
-
-    change(record);
-
-    await expect(validateArtifact('site-unavailable-diagnostic', record)).resolves.toMatchObject({ ok: false });
-  });
-
-  it('refers to the page schema for the page, and to the run and page schemas for the IDs, the URL and the time', async () => {
-    const schema = await readSchema('site-unavailable-diagnostic');
-
-    expect(schemaAt(schema, ['properties', 'page'])).toEqual({ $ref: 'urn:beaksight:schema:page:1.0' });
-    expect(schemaAt(schema, ['properties', 'pageId'])).toEqual({ $ref: 'urn:beaksight:schema:page:1.0#/properties/pageId' });
-    expect(schemaAt(schema, ['properties', 'url'])).toEqual({ $ref: 'urn:beaksight:schema:page:1.0#/properties/pageUrl' });
-    expect(schemaAt(schema, ['properties', 'runId'])).toEqual({ $ref: 'urn:beaksight:schema:run:1.0#/properties/runId' });
-    expect(schemaAt(schema, ['properties', 'writtenAt'])).toEqual({ $ref: 'urn:beaksight:schema:run:1.0#/properties/startedAt' });
-  });
-});
-
 // T22a-fix-round-1（Task 22 の設計書 6 の 2026-10-09 の改訂）: Ajv の扱いをこのファイルの owner の 1 か所に残したまま、
 // Control のスキーマ（`schemas/control/`）も検証できるように公開した部品（`createSchemaValidatorRegistry`、`describeSchemaError`）。
 describe('createSchemaValidatorRegistry and describeSchemaError', () => {
-  const ARTIFACT_SCHEMA_FILES = ['run', 'audit', 'page', 'finding', 'checkpoint', 'checkpoint-page', 'site-unavailable-diagnostic'];
+  const ARTIFACT_SCHEMA_FILES = ['run', 'audit', 'page', 'finding', 'checkpoint', 'checkpoint-page'];
   const readArtifactSchemas = async (): Promise<readonly object[]> => Promise.all(ARTIFACT_SCHEMA_FILES.map(readSchema));
   const TEST_SCHEMA_ID = 'urn:beaksight:test:registry:1';
   const twoRequiredSchema = Object.freeze({
@@ -3037,8 +2746,8 @@ describe('createSchemaValidatorRegistry and describeSchemaError', () => {
 
     expect(validateFinding(validFinding)).toEqual({ ok: true });
     expect(validateFinding(missingEvidenceRefs)).toEqual(await validateArtifact('finding', missingEvidenceRefs));
-    expect(registry.validatorFor('urn:beaksight:schema:audit:1.0')(validAudit)).toEqual({ ok: true });
-    expect(registry.validatorFor('urn:beaksight:schema:audit:1.0')({ ...validAudit, run: {} })).toMatchObject({ ok: false });
+    expect(registry.validatorFor('urn:beaksight:schema:audit:2.0')(validAudit)).toEqual({ ok: true });
+    expect(registry.validatorFor('urn:beaksight:schema:audit:2.0')({ ...validAudit, run: {} })).toMatchObject({ ok: false });
   });
 
   it('reports every error (allErrors) in the describeSchemaError form', () => {

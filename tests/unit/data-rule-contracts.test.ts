@@ -17,13 +17,6 @@ import {
   FIELD_RULE_STATUSES,
   FIXED_LIST_GENERATION_METHOD,
   GENERATION_METHODS,
-  MAX_FIELD_RELATIONS,
-  MAX_FIELD_RULES,
-  MAX_FIXED_VALUE_LENGTH,
-  MAX_FIXED_VALUES,
-  MAX_RULE_FIELD_NAME_LENGTH,
-  MAX_RULE_RANGE_VALUE_LENGTH,
-  MAX_UNIQUE_KEY_FIELDS,
   MAX_UNIQUE_RETRIES,
   MIN_RULE_SET_REVISION,
   NEEDS_RULE_INPUT_DETAILS,
@@ -130,10 +123,6 @@ describe('data rule closed lists (T29a)', () => {
 
   it('names the limits (the unique retries are a positive bound)', () => {
     expect(Number.isSafeInteger(MAX_UNIQUE_RETRIES) && MAX_UNIQUE_RETRIES > 0).toBe(true);
-    for (const limit of [MAX_FIELD_RULES, MAX_FIELD_RELATIONS, MAX_UNIQUE_KEY_FIELDS, MAX_FIXED_VALUES, MAX_FIXED_VALUE_LENGTH,
-      MAX_RULE_RANGE_VALUE_LENGTH, MAX_RULE_FIELD_NAME_LENGTH]) {
-      expect(Number.isSafeInteger(limit) && limit > 0).toBe(true);
-    }
   });
 });
 
@@ -214,14 +203,10 @@ describe('data rule schema (T29a)', () => {
     expect(prop(schema, 'ruleSetId').pattern).toBe(RULE_SET_ID_PATTERN.source);
     expect(prop(schema, 'scenarioId').pattern).toBe(RULE_SET_ID_PATTERN.source);
     expect(prop(schema, 'revision').minimum).toBe(MIN_RULE_SET_REVISION);
-    expect(prop(schema, 'fieldRules').maxItems).toBe(MAX_FIELD_RULES);
-    expect(prop(schema, 'relations').maxItems).toBe(MAX_FIELD_RELATIONS);
-    expect(prop(schema, 'uniqueKeyFieldNames').maxItems).toBe(MAX_UNIQUE_KEY_FIELDS);
-    expect(defs.fieldName?.maxLength).toBe(MAX_RULE_FIELD_NAME_LENGTH);
-    expect(defs.rangeValue?.maxLength).toBe(MAX_RULE_RANGE_VALUE_LENGTH);
+    // LZ-2: 範囲の値と固定の値の長さの上限（前は 512・256）はない。
+    expect(defs.rangeValue?.maxLength).toBeUndefined();
     const fixedValues = prop(defs.fieldRule, 'fixedValues');
-    expect(fixedValues.maxItems).toBe(MAX_FIXED_VALUES);
-    expect(fixedValues.items?.maxLength).toBe(MAX_FIXED_VALUE_LENGTH);
+    expect(fixedValues.items?.maxLength).toBeUndefined();
     expect(((defs.fieldRule?.allOf as readonly JsonSchema[] | undefined)?.[0]?.if as JsonSchema | undefined)?.properties?.method?.const)
       .toBe(FIXED_LIST_GENERATION_METHOD);
     expect(Object.keys(defs.range?.properties ?? {})).toEqual(['min', 'max', 'step']);
@@ -242,6 +227,20 @@ describe('data rule schema (T29a)', () => {
       relations: [],
       uniqueKeyFieldNames: ['phone'],
     }))).toEqual({ ok: true });
+    // LZ-2: 固定の値・範囲の値の長さに上限を置かない（前は 256・512）。
+    expect(validateControlDocument('data-rule-v2', sampleRuleSet({
+      fieldRules: [sampleFieldRule('a', { method: 'FROM_FIXED_LIST', fixedValues: ['x'.repeat(257)], range: { min: '1'.repeat(513), max: null, step: null } })],
+      relations: [],
+      uniqueKeyFieldNames: [],
+    }))).toEqual({ ok: true });
+    // L13（N28〜N30）: 欄の規則・一意にする欄の数、欄の名前の長さ、固定の値の数に上限を置かない（前は 200・256・50）。
+    const names = [...Array.from({ length: 201 }, (_value, index) => `f${String(index)}`), 'n'.repeat(300)];
+    expect(validateControlDocument('data-rule-v2', sampleRuleSet({
+      fieldRules: [...names.map((name) => sampleFieldRule(name)),
+        sampleFieldRule('choice', { method: 'FROM_FIXED_LIST', fixedValues: Array.from({ length: 51 }, (_value, index) => String(index)) })],
+      relations: [],
+      uniqueKeyFieldNames: names,
+    }))).toEqual({ ok: true });
   });
 
   it.each<readonly [string, unknown]>([
@@ -251,12 +250,6 @@ describe('data rule schema (T29a)', () => {
     ['fixed values of another method', sampleRuleSet({ fieldRules: [sampleFieldRule('a', { method: 'FROM_TYPE', fixedValues: ['1'] })] })],
     ['duplicate fixed values', sampleRuleSet({ fieldRules: [sampleFieldRule('a', { method: 'FROM_FIXED_LIST', fixedValues: ['1', '1'] })] })],
     ['an empty fixed value', sampleRuleSet({ fieldRules: [sampleFieldRule('a', { method: 'FROM_FIXED_LIST', fixedValues: [''] })] })],
-    ['too many fixed values', sampleRuleSet({ fieldRules: [sampleFieldRule('a', {
-      method: 'FROM_FIXED_LIST', fixedValues: Array.from({ length: MAX_FIXED_VALUES + 1 }, (_value, index) => String(index)),
-    })] })],
-    ['a too long fixed value', sampleRuleSet({ fieldRules: [sampleFieldRule('a', {
-      method: 'FROM_FIXED_LIST', fixedValues: ['x'.repeat(MAX_FIXED_VALUE_LENGTH + 1)],
-    })] })],
     ['an empty field name', sampleRuleSet({ fieldRules: [sampleFieldRule('')] })],
     ['a partial range', sampleRuleSet({ fieldRules: [sampleFieldRule('a', { range: { min: '1', max: '2' } as never })] })],
     ['a numeric range value', sampleRuleSet({ fieldRules: [sampleFieldRule('a', { range: { min: 1, max: null, step: null } as never })] })],
@@ -274,32 +267,6 @@ describe('data rule schema (T29a)', () => {
     ['another schema version', sampleRuleSet({ schemaVersion: 'beaksight-data-rule/1' as never })],
   ])('rejects a rule set with %s', (_label, document) => {
     expect(validateControlDocument('data-rule-v2', document).ok).toBe(false);
-  });
-});
-
-describe('ui-data-rule-save schema (T29e)', () => {
-  const input = (overrides: Record<string, unknown> = {}): Record<string, unknown> => {
-    const { fieldRules, relations, uniqueKeyFieldNames } = sampleRuleSet();
-    return { scenarioId: 'scenario-1', expectedScenarioRevision: 2, expectedRuleSetRevision: null, fieldRules, relations, uniqueKeyFieldNames, ...overrides };
-  };
-
-  it('accepts the content of a rule set with the revisions the screen read', () => {
-    expect(validateControlDocument('ui-data-rule-save', input())).toEqual({ ok: true });
-    expect(validateControlDocument('ui-data-rule-save', input({ expectedRuleSetRevision: 3, fieldRules: [], relations: [], uniqueKeyFieldNames: [] })))
-      .toEqual({ ok: true });
-  });
-
-  it.each<readonly [string, Record<string, unknown>]>([
-    ['an extra property', input({ ruleSetId: 'rules-1' })],
-    ['a bad scenario id', input({ scenarioId: '../x' })],
-    ['a revision of 0', input({ expectedScenarioRevision: 0 })],
-    ['a rule set revision of 0', input({ expectedRuleSetRevision: 0 })],
-    ['an unknown semantic kind', input({ fieldRules: [sampleFieldRule('a', { semanticKind: 'ADDRESS' as never })] })],
-    ['fixed values of another method', input({ fieldRules: [sampleFieldRule('a', { fixedValues: ['1'] })] })],
-    ['a relation of an unknown kind', input({ relations: [{ kind: 'SAME_AS' }] })],
-    ['a missing content', (({ fieldRules: _omitted, ...rest }) => rest)(input())],
-  ])('rejects %s', (_label, document) => {
-    expect(validateControlDocument('ui-data-rule-save', document).ok).toBe(false);
   });
 });
 

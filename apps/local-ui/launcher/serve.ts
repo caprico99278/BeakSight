@@ -65,8 +65,8 @@ const CLIENT_DIRECTORY = resolve(DIST_DIRECTORY, 'client');
 /** TanStack Start のサーバの入口。 */
 const SERVER_ENTRY_PATH = resolve(DIST_DIRECTORY, 'server', 'server.js');
 
-/** 起動の部品が読む、画面のサーバの 2 つ目の入口（管理データの準備と文言）。 */
-const LAUNCHER_BRIDGE_PATH = resolve(DIST_DIRECTORY, 'server', 'launcher-bridge.js');
+/** 起動の部品が読む、画面のサーバの 2 つ目の入口（管理データの準備と文言。RB-7: テストの起動の入口も、同じ module を読む）。 */
+export const LAUNCHER_BRIDGE_PATH = resolve(DIST_DIRECTORY, 'server', 'launcher-bridge.js');
 
 /** 2 つ目の入口の形（型だけを `src/server/launcher-bridge.ts` から取る）。 */
 type Bridge = Pick<
@@ -368,7 +368,11 @@ function reportStartFailure(bridge: Bridge, failure: LocalUiStartFailure): void 
 
 const isMain = process.argv[1] !== undefined && import.meta.url === pathToFileURL(resolve(process.argv[1])).href;
 
-if (isMain) {
+/**
+ * 起動の部品の本体（`argv` はコマンドの引数。本番の入口が呼ぶ）。RB-7: テストの起動の入口（`apps/local-ui/tests/helpers/ui-test-launcher.ts`）も、
+ * 2 つ目の入口に別のデータの根を入れてから、同じ本体を呼ぶ（本体は何も入れない。入れていなければ、本番のデータの根）。
+ */
+export async function runLocalUiLauncher(argv: readonly string[]): Promise<void> {
   let bridge: Bridge | undefined;
   try {
     bridge = await loadBridge();
@@ -387,7 +391,7 @@ if (isMain) {
     process.on('exit', (code) => {
       logBridge.recordLocalUiServerExit(code, logBridge.runningLocalUiAuditJobCount());
     });
-    const portArgument = parsePortArgument(process.argv.slice(2));
+    const portArgument = parsePortArgument(argv);
     if (!portArgument.ok) {
       reportStartFailure(bridge, { kind: 'PORT_INVALID', value: portArgument.value });
     } else {
@@ -432,7 +436,6 @@ if (isMain) {
             // 後に数える）。
             const resumable = recovered > 0 ? ready.resumableRecoveredLocalUiJobCount() : 0;
             // UI-close: 管理画面のブラウザが閉じられ、動いているジョブがなければ、Ctrl+C と同じ止め方（1 回目）で止める。
-            const argv = process.argv.slice(2);
             let stopWhenClosed: ((cause: PresenceIdleCause) => void) | undefined;
             const presence = createPresenceMonitor({
               closedGraceMs: durationArgument(argv, '--ui-close-grace-ms', UI_PRESENCE_CLOSED_GRACE_MS),
@@ -485,4 +488,8 @@ if (isMain) {
       }
     }
   }
+}
+
+if (isMain) {
+  await runLocalUiLauncher(process.argv.slice(2));
 }

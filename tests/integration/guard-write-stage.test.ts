@@ -6,9 +6,12 @@
 //   ある）: 2 回目の POST、別の path、別の Origin、未知の欄つき、値の違い、`text/plain`、GET の form、307・308 の再 POST、iframe の中の form、
 //   popup の POST、Worker・Service Worker の fetch、`navigator.sendBeacon`、`fetch` の `keepalive`、WebSocket、送信の窓の中の別の要求、送信の前に
 //   ページの JS が form の action を書き換える、送信の前にページの JS が欄を足す、UTF-8 でない文書、送信の窓を開かない送信、file の中身。
-// - 送信の報告: 通さなかった → `NOT_SENT`、通して応答あり、通して応答なし。
+// - 送信の報告: 通さなかった → `NOT_SENT`、通して応答あり、通して応答なし（Guard を閉じると `NO_RESPONSE`）。
 // - CSRF の hidden の値と readonly の値は、Guard の記録（Safety Ledger と書き込みの段の記録）に出ない（目印の値で確かめる）。
-// - Chromium は headless だけ。テストの既定（headless shell）と、CLI の起動の設定（`launchCliChromium`）の両方で確かめる。
+// - T31c（もとの guard-update-payload をまとめた）: 更新の POST で、ページの JS が状態の hidden を `active=0`（削除にあたる変更）にすると届かない
+//   （urlencoded と multipart）。ほかの更新の書き換えの照合は単体 `tests/unit/write-payload-update.test.ts` と結合 write-update-run に任せる。
+// - LU-12a: 前の値を後から入れる口の約束（代表 1。照合の網羅は単体 write-payload-update の「deferred」の場面）。
+// - 書き込みの段（form）の Guard の結合の家（SLIM）。Chromium は `BOTH_CHROMIUM_LAUNCHERS`（既定は CLI の起動の設定の 1 つ、両方に広げる回だけ 2 つ）。
 import type { Browser, BrowserContext, Page } from 'playwright';
 import { afterAll, afterEach, beforeAll, describe, expect, it } from 'vitest';
 import { wait } from '../../src/core/deadline.js';
@@ -19,10 +22,19 @@ import {
   WriteStageMonitor,
   type GuardWriteStage,
 } from '../../src/safety/passive-request-guard.js';
+import { recordPathShapeOf } from '../../src/safety/request-policy.js';
 import { SafetyLedger } from '../../src/safety/safety-ledger.js';
 import type { WriteFormEnctype, WritePayloadExpectation } from '../../src/safety/write-payload-policy.js';
-import { launchCliChromium, launchHeadlessChromium } from '../helpers/chromium.js';
+import { BOTH_CHROMIUM_LAUNCHERS } from '../helpers/chromium.js';
 import { QUIET_PERIOD_MS } from '../helpers/gate-harness.js';
+import { READ_METHODS } from '../helpers/leak-places.js';
+import {
+  UPDATE_FIXTURE_PATHS,
+  UPDATE_FIXTURE_VALUES,
+  startUpdatePayloadFixtureServer,
+  type UpdateFixtureServer,
+  type UpdateFormEnctype,
+} from '../helpers/update-payload-fixture-server.js';
 import { startWriteSubmissionProxy, type WriteSubmissionProxy } from '../helpers/write-submission-proxy.js';
 import {
   WRITE_FIXTURE_PATHS,
@@ -48,23 +60,15 @@ const URLENCODED: WriteFormEnctype = 'application/x-www-form-urlencoded';
 const MULTIPART: WriteFormEnctype = 'multipart/form-data';
 const NAME_VALUE = '山田 太郎';
 const MEMO_VALUE = 'メモ & 1+1=2\n二行目';
-
-interface ChromiumLaunch {
-  readonly name: string;
-  launch(): Promise<Browser>;
-}
-
-const CHROMIUM_LAUNCHES: readonly ChromiumLaunch[] = [
-  { name: 'the headless shell (test default)', launch: () => launchHeadlessChromium() },
-  { name: 'the CLI Chromium (launchCliChromium, headless)', launch: () => launchCliChromium() },
-];
+/** T31c: 更新の画面で変える欄に入れる新しい値。 */
+const UPDATED_NAME = '佐藤 花子';
 
 /** サーバに届いた、GET と HEAD 以外の要求（WebSocket の upgrade を含む）。 */
 const nonReadRequests = (requests: readonly WriteFixtureRequest[]): string[] => requests
   .filter((entry) => entry.method !== 'GET' && entry.method !== 'HEAD')
   .map((entry) => `${entry.site} ${entry.method} ${entry.path}`);
 
-describe.each(CHROMIUM_LAUNCHES)('T30b: the write stage of the Guard, with $name', ({ name, launch }) => {
+describe.each(BOTH_CHROMIUM_LAUNCHERS)('T30b: the write stage of the Guard, with %s', (name, launch) => {
   let browser: Browser;
   let server: WriteFixtureServer;
   const contexts: BrowserContext[] = [];
@@ -74,16 +78,20 @@ describe.each(CHROMIUM_LAUNCHES)('T30b: the write stage of the Guard, with $name
   const blockedRounds: string[] = [];
 
   let submissionProxy: WriteSubmissionProxy;
+  /** T31c: 更新の画面のサーバ（状態の hidden の回）。 */
+  let updateServer: UpdateFixtureServer;
 
   beforeAll(async () => {
     browser = await launch();
     server = await startWriteFixtureServer();
+    updateServer = await startUpdatePayloadFixtureServer();
     // DEF-099 fix: 承認の POST は、Guard が送り手に送らせる（中継を通して 1 回だけ）。
     submissionProxy = await startWriteSubmissionProxy();
   });
 
   afterAll(async () => {
     await submissionProxy?.close();
+    await updateServer?.close();
     await server?.close();
     await browser?.close();
   });
@@ -117,7 +125,10 @@ describe.each(CHROMIUM_LAUNCHES)('T30b: the write stage of the Guard, with $name
     contexts.push(context);
     const ledger = new SafetyLedger();
     const monitor = new WriteStageMonitor();
-    const writeStage: GuardWriteStage = { expectation, monitor };
+    // LU-SFIX4（LU-REV の Minor-1）: 前の値を後から入れる印のある期待（一覧の行の更新）は、窓の前に守る型が必須（作り方は Guard と同じ部品 `recordPathShapeOf`）。
+    const { path } = expectation.request;
+    const guardedPathShape = expectation.deferredPriorValues === undefined ? null : recordPathShapeOf(path, path.split('/').at(-1) ?? '');
+    const writeStage: GuardWriteStage = guardedPathShape === null ? { expectation, monitor } : { expectation, monitor, guardedPathShape };
     await installPassiveRequestGuard(context, ledger, new Set([server.originA]), { writeStage, writeSubmission: submissionProxy.options });
     const page = await context.newPage();
     await awaitPassiveRequestGuardReady(page);
@@ -175,6 +186,11 @@ describe.each(CHROMIUM_LAUNCHES)('T30b: the write stage of the Guard, with $name
     blockedRounds.push(round);
   };
 
+  /** T31c: 更新の画面のサーバに届いた、GET と HEAD 以外の要求（どの回でも 0 件）。 */
+  const updateNonReadRequests = (): string[] => updateServer.requests
+    .filter((entry) => !READ_METHODS.has(entry.method))
+    .map((entry) => `${entry.method} ${entry.path}`);
+
   const blockedPosts = (ledger: SafetyLedger, path: string): number => ledger.snapshot().blockedRequests
     .filter((entry) => entry.method === 'POST' && new URL(entry.url).pathname === path).length;
 
@@ -201,42 +217,6 @@ describe.each(CHROMIUM_LAUNCHES)('T30b: the write stage of the Guard, with $name
     expect(monitor.submissionReport().submission).toBe('SENT');
   }, ROUND_TIMEOUT_MS);
 
-  it('delivers the approved multipart POST with an empty file field once', async () => {
-    const { page, ledger, monitor } = await openGuarded(expectationFor(WRITE_FIXTURE_PATHS.create, MULTIPART, ['att']));
-    await submitForm(page, monitor, 'file');
-    expectedNonRead.push(`A POST ${WRITE_FIXTURE_PATHS.create}`);
-    expect(nonReadRequests(server.requests)).toEqual(expectedNonRead);
-    expect(server.requests.filter((entry) => entry.method === 'POST').at(-1)?.contentType?.startsWith('multipart/form-data; boundary=')).toBe(true);
-    expect(monitor.submissionReport()).toEqual({ submission: 'SENT', responseReceived: true, responseStatus: 303, sendAttempts: 1, sendOutcome: 'RESPONDED' });
-    expect(ledger.snapshot().invariantViolations).toEqual([]);
-    expectNoMarkers(ledger, monitor);
-  }, ROUND_TIMEOUT_MS);
-
-  it('delivers the approved POST with the approved method override (_method=PUT) once (T30b fix round 1)', async () => {
-    const { page, ledger, monitor } = await openGuarded(expectationFor(WRITE_FIXTURE_PATHS.create, URLENCODED, [], 'PUT'));
-    await submitForm(page, monitor, 'method-override');
-    expectedNonRead.push(`A POST ${WRITE_FIXTURE_PATHS.create}`);
-    expect(nonReadRequests(server.requests)).toEqual(expectedNonRead);
-    expect(monitor.submissionReport()).toEqual({ submission: 'SENT', responseReceived: true, responseStatus: 303, sendAttempts: 1, sendOutcome: 'RESPONDED' });
-    expect(ledger.snapshot().invariantViolations).toEqual([]);
-  }, ROUND_TIMEOUT_MS);
-
-  it('reports SENT without a response when the server does not answer the approved POST', async () => {
-    const { page, ledger, monitor } = await openGuarded(expectationFor(WRITE_FIXTURE_PATHS.createHang));
-    await page.goto(server.formUrl('hang'));
-    await monitor.openSubmissionWindow(page);
-    await page.fill('#customer_name', NAME_VALUE);
-    await page.fill('#memo', MEMO_VALUE);
-    // T40R-fix-A: 押す直前に送信の段を開く。
-    monitor.openSubmissionPhase();
-    await page.click('#go', { noWaitAfter: true });
-    await wait(QUIET_PERIOD_MS * 2);
-    expectedNonRead.push(`A POST ${WRITE_FIXTURE_PATHS.createHang}`);
-    expect(nonReadRequests(server.requests)).toEqual(expectedNonRead);
-    expect(monitor.submissionReport()).toEqual({ submission: 'SENT', responseReceived: false, responseStatus: null, sendAttempts: 1, sendOutcome: null });
-    expect(ledger.snapshot().invariantViolations).toEqual([]);
-  }, ROUND_TIMEOUT_MS);
-
   // T30R-fix-1（M-1）: ページの JS の二重の送信。後の送信がブラウザで前の送信（送り手が送った承認の POST）を取り消すので、送り手の応答の
   // `Fetch.fulfillRequest` が取り消された要求への命令になる。DEF-026 と同じく違反にしない（記録する）。後の送信は回数を使い切っているので止まる。
   // 届く POST は 1 件のまま。
@@ -251,25 +231,10 @@ describe.each(CHROMIUM_LAUNCHES)('T30b: the write stage of the Guard, with $name
     expectNoMarkers(ledger, monitor);
   }, ROUND_TIMEOUT_MS);
 
-  // T30R-fix-1（M-1）: 送り手が送っている間（応答が遅い）に、後の送信が前の送信を取り消す。取り消しの証拠の保ち時間を過ぎてから届いた応答の
-  // `Fetch.fulfillRequest` が、取り消された要求への命令として失敗する。違反にしない（記録する）。届く POST は 1 件のまま。
-  it('delivers the approved POST once when the page submits twice during a slow response, without a violation for the canceled request', async () => {
-    const { page, ledger, monitor } = await openGuarded(expectationFor(WRITE_FIXTURE_PATHS.createSlow));
-    await submitForm(page, monitor, 'double-submit-slow');
-    while (monitor.submissionReport().sendOutcome === null) {
-      await wait(QUIET_PERIOD_MS);
-    }
-    await wait(QUIET_PERIOD_MS * 2);
-    expectedNonRead.push(`A POST ${WRITE_FIXTURE_PATHS.createSlow}`);
-    expect(nonReadRequests(server.requests)).toEqual(expectedNonRead);
-    expect(monitor.submissionReport()).toMatchObject({ submission: 'SENT', sendAttempts: 1, sendOutcome: 'RESPONDED' });
-    expect(ledger.snapshot().invariantViolations).toEqual([]);
-    expect(monitor.snapshot().responseDeliveryCanceled).toBe(true);
-  }, ROUND_TIMEOUT_MS);
-
   // DEF-099 fix round 1: Guard が閉じるとき、送信中の送り手を止める（書いた後なので `NO_RESPONSE`。時間の上限まで待たない）。
-  it('stops the write submission in flight when the Guard closes (NO_RESPONSE), without waiting for the time limit', async () => {
-    const { page, monitor } = await openGuarded(expectationFor(WRITE_FIXTURE_PATHS.createHang));
+  // SLIM: 承認の届き方の 4 場面（multipart・`_method=PUT`・応答なし・遅い応答）の代表。閉じる前に「通して応答なし」の報告を確かめる。
+  it('reports SENT without a response, and stops the write submission in flight when the Guard closes (NO_RESPONSE), without waiting for the time limit', async () => {
+    const { page, ledger, monitor } = await openGuarded(expectationFor(WRITE_FIXTURE_PATHS.createHang));
     await page.goto(server.formUrl('hang'));
     await monitor.openSubmissionWindow(page);
     await page.fill('#customer_name', NAME_VALUE);
@@ -279,7 +244,9 @@ describe.each(CHROMIUM_LAUNCHES)('T30b: the write stage of the Guard, with $name
     await page.click('#go', { noWaitAfter: true });
     await wait(QUIET_PERIOD_MS * 2);
     expectedNonRead.push(`A POST ${WRITE_FIXTURE_PATHS.createHang}`);
-    expect(monitor.submissionReport().sendOutcome).toBeNull();
+    expect(nonReadRequests(server.requests)).toEqual(expectedNonRead);
+    expect(monitor.submissionReport()).toEqual({ submission: 'SENT', responseReceived: false, responseStatus: null, sendAttempts: 1, sendOutcome: null });
+    expect(ledger.snapshot().invariantViolations).toEqual([]);
     const context = contexts.pop();
     const closedAt = Date.now();
     await closePassiveGuardedContext(context as BrowserContext);
@@ -501,21 +468,98 @@ describe.each(CHROMIUM_LAUNCHES)('T30b: the write stage of the Guard, with $name
     );
   }, ROUND_TIMEOUT_MS);
 
-  it('blocks another request in the submission window (the value in an image URL), and then delivers the approved POST', async () => {
-    const { page, ledger, monitor } = await openGuarded();
-    await submitForm(page, monitor, 'window-request');
+  // LU-12a（設計書 `2026-11-02-beaksight-list-row-update-design.md` 4.0.1 の K1、5.3 の 2・5.5。LU-9 の API の形と同じ約束）: 前の値を後から入れる印のある
+  // フォームの期待。前の値は、窓を一度も開いていない間に 1 回だけ、Guard の口（`supplyFormPriorValues`）で入れる。入れていなければ、窓の中の正しい POST も
+  // 照合で止まる（fail-closed）。ここでは `memo` を保つ見える欄（前の値に頼る欄）にする。
+  /** LU-12a: 保つ見える欄 `memo` の前の値を後から入れる印のある期待（`memo` を送る欄に持たない）。 */
+  const deferredExpectationFor = (): WritePayloadExpectation => ({
+    ...expectationFor(),
+    submittedFields: [{ name: 'customer_name', value: NAME_VALUE }],
+    deferredPriorValues: { keptFieldNames: ['memo'], checkedPassthroughNames: [], keptCheckboxPairNames: [], changedCheckboxPairs: [], nullableFieldNames: [] },
+  });
+  /** LU-12a: 後から入れる前の値（書き換えられる一覧。写しを確かめる）。 */
+  const suppliedPriorValues = (): { keptFields: { name: string; value: string | null }[]; checkedPassthroughFields: []; checkboxPairs: [] } =>
+    ({ keptFields: [{ name: 'memo', value: MEMO_VALUE }], checkedPassthroughFields: [], checkboxPairs: [] });
+  // SLIM: LU-12a の 5 場面の代表 1。入れていないときの fail-closed（`EXPECTATION_INVALID`）は単体 write-payload-update の「blocks the approved body with
+  // EXPECTATION_INVALID before the prior values are supplied」、API の形は guard-api-write-stage の LU-9 に任せる。
+  it('delivers the POST once after the prior values are supplied before the window, and rejects the wrong supplies (LU-12a)', async () => {
+    // Guard のない口と、印のない期待の口は拒む。
+    expect(new WriteStageMonitor().supplyFormPriorValues(suppliedPriorValues())).toBe(false);
+    const unmarked = await openGuarded();
+    expect(unmarked.monitor.supplyFormPriorValues({ keptFields: [{ name: 'memo', value: '別の値' }], checkedPassthroughFields: [], checkboxPairs: [] })).toBe(false);
+    const { page, ledger, monitor } = await openGuarded(deferredExpectationFor());
+    const prior = suppliedPriorValues();
+    // fix round 1（設計者の判断 (b)）: null を許すのは、印の `nullableFieldNames` の欄だけ。text の欄（`memo`）の null は拒み、状態を変えない。
+    expect(monitor.supplyFormPriorValues({ ...prior, keptFields: [{ name: 'memo', value: null }] })).toBe(false);
+    // 鍵の集合が違えば拒み、Guard の状態を変えない（続く正しい 1 回を受ける）。API の形の口は、フォームの段では拒む。
+    expect(monitor.supplyFormPriorValues({ ...prior, keptFields: [] })).toBe(false);
+    expect(monitor.supplyFormPriorValues({ ...prior, keptFields: [...prior.keptFields, { name: 'customer_name', value: NAME_VALUE }] })).toBe(false);
+    expect(monitor.supplyApiPriorValues({ keptKeys: [{ key: 'memo', value: MEMO_VALUE }], pageKeyPriorValues: [] })).toBe(false);
+    expect(monitor.supplyFormPriorValues(prior)).toBe(true);
+    // 2 回目は、同じ値でも拒む。
+    expect(monitor.supplyFormPriorValues(prior)).toBe(false);
+    // 入れた値は写して持つ（呼び手が後で元の object を変えても照合は変わらない）。
+    const [first] = prior.keptFields;
+    if (first !== undefined) first.value = '書き換え';
+    await submitForm(page, monitor, 'plain');
     expectedNonRead.push(`A POST ${WRITE_FIXTURE_PATHS.create}`);
-    expect(server.requests.filter((entry) => entry.path.startsWith(WRITE_FIXTURE_PATHS.pixel))).toEqual([]);
-    expect(monitor.unexpectedRequestCount()).toBeGreaterThan(0);
+    expect(nonReadRequests(server.requests)).toEqual(expectedNonRead);
     expect(monitor.submissionReport()).toEqual({ submission: 'SENT', responseReceived: true, responseStatus: 303, sendAttempts: 1, sendOutcome: 'RESPONDED' });
-    finishBlockedRound('another request in the submission window', ledger, monitor, monitor.snapshot().blockedByReason.SUBMISSION_WINDOW >= 1);
+    expect(Object.values(monitor.snapshot().blockedByPayloadReason).every((count) => count === 0)).toBe(true);
+    expect(ledger.snapshot().invariantViolations).toEqual([]);
+    expectNoMarkers(ledger, monitor);
+    // 窓を開いた後に入れる値は拒む。
+    expect(monitor.supplyFormPriorValues(suppliedPriorValues())).toBe(false);
   }, ROUND_TIMEOUT_MS);
+
+  // T31c（もとの guard-update-payload）: 更新の POST で、送信の前にページの JS が状態の hidden を `active=0`（削除にあたる変更）にすると、届かない。
+  const updateExpectationFor = (enctype: UpdateFormEnctype): WritePayloadExpectation => ({
+    request: { origin: updateServer.origin, path: UPDATE_FIXTURE_PATHS.record, enctype: enctype === 'multipart' ? MULTIPART : URLENCODED },
+    submittedFields: [{ name: 'customer_name', value: UPDATED_NAME }, { name: 'memo', value: UPDATE_FIXTURE_VALUES.memo }],
+    passthroughFieldNames: ['authenticity_token', 'lock_version'],
+    emptyFileFieldNames: [],
+    methodOverride: 'PATCH',
+    checkedPassthroughFields: [{ name: 'active', value: UPDATE_FIXTURE_VALUES.active }],
+    checkboxPairs: [{ name: 'published', offValue: UPDATE_FIXTURE_VALUES.publishedOff, checkedValue: UPDATE_FIXTURE_VALUES.publishedOn }],
+    absentFieldNames: ['notify'],
+  });
+
+  it.each<UpdateFormEnctype>(['urlencoded', 'multipart'])('does not deliver the update POST whose state hidden the page sets to active=0 (%s), and reports NOT_SENT (T31c)', async (enctype) => {
+    const context = await browser.newContext({ viewport: VIEWPORT, serviceWorkers: 'block', acceptDownloads: false });
+    contexts.push(context);
+    const ledger = new SafetyLedger();
+    const monitor = new WriteStageMonitor();
+    await installPassiveRequestGuard(context, ledger, new Set([updateServer.origin]), {
+      writeStage: { expectation: updateExpectationFor(enctype), monitor },
+      writeSubmission: submissionProxy.options,
+    });
+    const page = await context.newPage();
+    await awaitPassiveRequestGuardReady(page);
+    await page.goto(updateServer.formUrl('js-state', enctype));
+    await monitor.openSubmissionWindow(page);
+    await page.fill('#customer_name', UPDATED_NAME);
+    monitor.openSubmissionPhase();
+    await Promise.all([
+      page.waitForEvent('framenavigated', { timeout: NAVIGATION_SETTLE_TIMEOUT_MS }).catch(() => undefined),
+      page.click('#go'),
+    ]);
+    await page.waitForLoadState('load', { timeout: NAVIGATION_SETTLE_TIMEOUT_MS }).catch(() => undefined);
+    await wait(QUIET_PERIOD_MS);
+    expect(updateNonReadRequests()).toEqual([]);
+    expect(monitor.submissionReport()).toEqual({ submission: 'NOT_SENT', responseReceived: false, responseStatus: null, sendAttempts: 0, sendOutcome: null });
+    expect(JSON.stringify([ledger.snapshot(), monitor.snapshot(), monitor.submissionReport()])).not.toContain(updateServer.csrfMarker);
+    finishBlockedRound(`the state hidden set to active=0 (${enctype})`, ledger, monitor, payloadReason(monitor, 'PASSTHROUGH_VALUE_MISMATCH'));
+  }, ROUND_TIMEOUT_MS);
+
+  // RB-4b: 送信の窓の中のほかの要求（値を入れた画像の URL）を止める場面は外した（書き込みの最中も、サイトの通信は止めない。ユーザーの判断 2026-11-15）。
+  // 止める先がないので、別の所の確かめはない。
 
   it('after all the rounds, no request arrives late (counted again after a named wait)', async () => {
     await wait(LATE_DELIVERY_SETTLE_MS);
     console.info(`T30b (${name}) late check: blocked rounds ${blockedRounds.length}; server ${JSON.stringify(nonReadRequests(server.requests))}`);
     expect(nonReadRequests(server.requests)).toEqual(expectedNonRead);
     expect(server.requests.filter((entry) => entry.site === 'B')).toEqual([]);
-    expect(blockedRounds.length).toBe(21);
+    expect(updateNonReadRequests()).toEqual([]);
+    expect(blockedRounds.length).toBe(22);
   }, ROUND_TIMEOUT_MS);
 });

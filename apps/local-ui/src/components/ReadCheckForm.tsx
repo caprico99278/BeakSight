@@ -217,7 +217,6 @@ export function ReadCheckForm({ target, form, initial, onSave, onSaved, onReload
                 type="text"
                 required
                 autoComplete="off"
-                maxLength={form.maxPagePathLength}
                 value={pagePath}
                 aria-describedby={describedBy}
                 aria-invalid={invalid}
@@ -250,7 +249,6 @@ export function ReadCheckForm({ target, form, initial, onSave, onSaved, onReload
                   className="input"
                   type="text"
                   autoComplete="off"
-                  maxLength={form.maxParameterValueLength}
                   value={parameters[field.name] ?? ''}
                   aria-describedby={describedBy}
                   aria-invalid={invalid}
@@ -266,7 +264,8 @@ export function ReadCheckForm({ target, form, initial, onSave, onSaved, onReload
 
       <fieldset className="field-group" data-testid="read-check-expectations">
         <legend className="field-group-heading">{text.expectationsHeading}</legend>
-        <p className="field-hint">{text.expectationsNote(formatCount(form.maxExpectations))}</p>
+        {/* L4（COV-7）: 期待の数の上限を出さない（上限を置かない）。 */}
+        <p className="field-hint">{text.expectationsNote}</p>
         {expectations.map((expectation, index) => (
           <fieldset key={expectation.key} className="field-group" data-testid="read-check-expectation" data-index={String(index)}>
             <legend className="field-group-subheading">{text.expectationNumber(formatInteger(index + 1))}</legend>
@@ -303,7 +302,6 @@ export function ReadCheckForm({ target, form, initial, onSave, onSaved, onReload
                     type="number"
                     required
                     min={0}
-                    max={form.maxRowCount}
                     step={1}
                     value={expectation.count}
                     aria-describedby={describedBy}
@@ -321,7 +319,6 @@ export function ReadCheckForm({ target, form, initial, onSave, onSaved, onReload
                     type="text"
                     required
                     autoComplete="off"
-                    maxLength={form.maxExpectedTextLength}
                     value={expectation.text}
                     aria-describedby={describedBy}
                     onChange={(event) => updateExpectation(expectation.key, { text: event.target.value })}
@@ -339,7 +336,6 @@ export function ReadCheckForm({ target, form, initial, onSave, onSaved, onReload
                       type="text"
                       required
                       autoComplete="off"
-                      maxLength={form.maxDetailFieldLength}
                       value={expectation.field}
                       aria-describedby={describedBy}
                       onChange={(event) => updateExpectation(expectation.key, { field: event.target.value })}
@@ -355,7 +351,6 @@ export function ReadCheckForm({ target, form, initial, onSave, onSaved, onReload
                       type="text"
                       required
                       autoComplete="off"
-                      maxLength={form.maxExpectedTextLength}
                       value={expectation.value}
                       aria-describedby={describedBy}
                       onChange={(event) => updateExpectation(expectation.key, { value: event.target.value })}
@@ -377,21 +372,20 @@ export function ReadCheckForm({ target, form, initial, onSave, onSaved, onReload
             ) : null}
           </fieldset>
         ))}
-        {expectations.length < form.maxExpectations ? (
-          <div className="button-row">
-            <button
-              type="button"
-              className="button"
-              data-testid="read-check-add-expectation"
-              onClick={() => {
-                setExpectations((current) => [...current, blankExpectation(nextKey)]);
-                setNextKey(nextKey + 1);
-              }}
-            >
-              {text.addExpectation}
-            </button>
-          </div>
-        ) : null}
+        {/* L4（COV-7）: 期待はいくつでも足せる。 */}
+        <div className="button-row">
+          <button
+            type="button"
+            className="button"
+            data-testid="read-check-add-expectation"
+            onClick={() => {
+              setExpectations((current) => [...current, blankExpectation(nextKey)]);
+              setNextKey(nextKey + 1);
+            }}
+          >
+            {text.addExpectation}
+          </button>
+        </div>
       </fieldset>
 
       <div className="button-row">

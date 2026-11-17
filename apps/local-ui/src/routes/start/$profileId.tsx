@@ -2,6 +2,7 @@ import { useState } from 'react';
 import { Link, createFileRoute, notFound, useNavigate, useRouter } from '@tanstack/react-router';
 import { useServerFn } from '@tanstack/react-start';
 import { WRITE_AUDIT_MODE } from '../../../../../src/control/contracts.js';
+import { CHECKED_WRITE_SCREENS_SCOPE } from '../../../../../src/core/audit-page-scope.js';
 import { DEFAULT_EXCLUDED_URL_WORDS } from '../../../../../src/core/default-excluded-url-words.js';
 import { formatCount, formatDateTime, formatDuration, formatElapsedTime } from '../../../../../src/presentation/format.js';
 import {
@@ -11,6 +12,7 @@ import {
   LOCAL_UI_AUTOMATED_LOGIN_SETUP_TEXT,
   LOCAL_UI_NEXT_STEP_TEXT,
   LOCAL_UI_TEXT,
+  specifiedLimitText,
 } from '../../../../../src/presentation/messages.js';
 import { AdvancedSettings } from '../../components/AdvancedSettings';
 import { authSetupErrorSummaryText } from '../../components/AuthSetupForm';
@@ -188,6 +190,8 @@ function StartAuditPage() {
   const navigate = useNavigate();
   const router = useRouter();
   const [startNew, setStartNew] = useState(false);
+  // WSO: 点検する画面（既定は「サイトの全部の画面」。覚えない）。
+  const [checkedScreensOnly, setCheckedScreensOnly] = useState(false);
   const [submitting, setSubmitting] = useState(false);
   const [rejection, setRejection] = useState<Extract<AuditJobStartView, { ok: false }> | null>(null);
   const { authSetup, primaryStart, target, chain } = summary;
@@ -197,6 +201,7 @@ function StartAuditPage() {
   const authText = LOCAL_UI_AUTH_TEXT.start;
   const automated = summary.autoLogin !== null;
   const startable = primaryStart.blocker === null;
+  const resumeChoiceShown = startable && summary.resumeChoiceOffered && !(checkedScreensOnly && summary.writesOnCheckedScreens);
   /** 読まないパスを変えたときだけ、認証の設定を保存する（保存できたか。変えていなければ真）。 */
   const saveExcludedPaths = async (): Promise<boolean> => {
     if (authSetup === null || !excludedPathsChanged(excludedText, authSetup.excludedPaths)) {
@@ -213,7 +218,11 @@ function StartAuditPage() {
       return undefined;
     }
     const data = { profileId: summary.profileId, expectedRevision: summary.revision, startNew };
-    return primaryStart.kind === 'STAGE_CHAIN' ? startChain({ data }) : startAudit({ data });
+    // WSO: 「チェックした画面だけ」は、チェックした画面があるまとめて実行だけ（範囲を渡す）。
+    const scoped = checkedScreensOnly && summary.writesOnCheckedScreens;
+    return primaryStart.kind === 'STAGE_CHAIN'
+      ? startChain({ data: scoped ? { ...data, scope: CHECKED_WRITE_SCREENS_SCOPE } : data })
+      : startAudit({ data });
   };
 
   return (
@@ -237,7 +246,8 @@ function StartAuditPage() {
             <p data-testid="start-write-mode-read-only">{text.readOnlyInWriteMode}</p>
           </Notice>
         ) : null}
-        {startable && summary.resumeChoiceOffered ? (
+        {/* REV-WSO の M-2: 「チェックした画面だけ」はいつも新しく始めるので、選んだ間は「前回の続き」の一文と始め方の選択を出さない。 */}
+        {resumeChoiceShown ? (
           <p data-testid="start-resume-note">{text.resumeNote(LOCAL_UI_TEXT.advancedSettings.summary)}</p>
         ) : null}
         {primaryStart.blocker === null ? (
@@ -265,6 +275,20 @@ function StartAuditPage() {
                 <p data-testid="start-excluded-paths-not-saved">{authText.excludedPathsRejectedNote(LOCAL_UI_TEXT.advancedSettings.summary)}</p>
               </Notice>
             )}
+            {/* WSO: チェックした画面があるときだけ、点検する画面を選べる（既定は「サイトの全部の画面」）。 */}
+            {summary.writesOnCheckedScreens ? (
+              <fieldset className="field" data-testid="start-page-scope">
+                <legend className="field-label">{text.pageScope.legend}</legend>
+                <label className="choice">
+                  <input type="radio" name="start-page-scope" value="all" checked={!checkedScreensOnly} onChange={() => setCheckedScreensOnly(false)} />
+                  <span>{text.pageScope.all}</span>
+                </label>
+                <label className="choice">
+                  <input type="radio" name="start-page-scope" value="checked" checked={checkedScreensOnly} onChange={() => setCheckedScreensOnly(true)} />
+                  <span>{text.pageScope.checkedOnly}</span>
+                </label>
+              </fieldset>
+            ) : null}
             <div className="button-row">
               <button
                 type="button"
@@ -311,7 +335,7 @@ function StartAuditPage() {
       {/* 3 章の 1: 詳しい内容 1 つ（開かなくても点検は始められる）。保存が拒まれた読まないパスの欄は、開いて理由を見せる。 */}
       <section className="panel">
         <AdvancedSettings testId="start-advanced-settings" openRequested={excludedRejection !== null}>
-          {startable && summary.resumeChoiceOffered ? (
+          {resumeChoiceShown ? (
             <fieldset className="field">
               <legend className="field-label">{text.modeLegend}</legend>
               <label className="choice">
@@ -353,9 +377,9 @@ function StartAuditPage() {
                 <dt>{text.startUrl}</dt>
                 <dd className="cell-break"><code>{target.startUrl}</code></dd>
                 <dt>{text.maxPages}</dt>
-                <dd>{formatCount(target.maxPages)}</dd>
+                <dd>{specifiedLimitText(target.maxPages, formatCount)}</dd>
                 <dt>{text.maxRuntime}</dt>
-                <dd>{formatElapsedTime(target.maxRuntimeMs)}</dd>
+                <dd>{specifiedLimitText(target.maxRuntimeMs, formatElapsedTime)}</dd>
                 <dt>{text.minNavigationInterval}</dt>
                 <dd data-testid="start-interval">{formatDuration(target.minNavigationIntervalMs)}</dd>
               </dl>

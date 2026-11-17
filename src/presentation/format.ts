@@ -35,6 +35,18 @@ export const formatDecimal = (value: number, maxFractionDigits: number = DEFAULT
   return String(Math.round(value * scale) / scale);
 };
 
+/** EV-1: 比の値を書くときの小数の桁数（コントラスト比の `4.49` の形）。 */
+const RATIO_FRACTION_DIGITS = 2;
+
+/**
+ * EV-1: 比の値を、小数 2 桁で切り捨てて書く（例: 4.4999 → `4.49`。末尾の 0 は書く）。基準に届かない値を、丸めで基準の値（`4.50`）に見せないため。浮動小数点の
+ * 誤差で 1 つ下の値にならないよう、ごく小さな値を足してから切り捨てる。
+ */
+export const formatRatioFloor = (value: number): string => {
+  const scale = 10 ** RATIO_FRACTION_DIGITS;
+  return (Math.floor(value * scale + 1e-9) / scale).toFixed(RATIO_FRACTION_DIGITS);
+};
+
 /** px の値を、`formatDecimal` の書式に単位を付けて書く（例: `390 px`）。 */
 export const formatPixels = (value: number): string => `${formatDecimal(value)} px`;
 

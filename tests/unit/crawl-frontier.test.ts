@@ -369,7 +369,14 @@ describe('CrawlFrontier restore rejects invalid records', () => {
     ['a URL with a fragment', withEntry(QUEUED_INDEX, { url: `${ORIGIN}/c#top` }), /normalized/u],
     ['a URL with non-canonical percent encoding', withEntry(QUEUED_INDEX, { url: `${ORIGIN}/%7ec` }), /normalized/u],
     ['a URL with a tracking parameter', withEntry(QUEUED_INDEX, { url: `${ORIGIN}/c?utm_source=ad` }), /normalized/u],
-    ['a URL with a query parameter that is not allowed', withEntry(QUEUED_INDEX, { url: `${ORIGIN}/c?page=2` }), /normalized/u],
+    // L14: 残す名前を選んでいなければ query を残すので、選んだ名前に当たらない query を、選んだときに確かめる。
+    [
+      'a URL with a query parameter that is not allowed',
+      withEntry(QUEUED_INDEX, { url: `${ORIGIN}/c?page=2` }),
+      /normalized/u,
+      { allowedQueryParameters: new Set(['a']) },
+    ],
+    ['a URL with a secret-like query parameter', withEntry(QUEUED_INDEX, { url: `${ORIGIN}/c?token=2` }), /normalized/u],
     [
       'a URL with an unsorted query',
       withEntry(QUEUED_INDEX, { url: `${ORIGIN}/c?page=2&a=1` }),

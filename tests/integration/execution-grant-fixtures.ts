@@ -27,7 +27,6 @@ import {
 import type { WriteUpdateEvidence } from '../../src/control/actions/action-contracts.js';
 import type { DataSeed } from '../../src/control/data-rules/deterministic-stream.js';
 import {
-  MIN_WRITE_INTERVAL_MS,
   type InputRuleReference,
   type ScenarioLimits,
   type ScenarioVerification,
@@ -358,10 +357,10 @@ export const GRANT_CHILD_PROTOCOL = Object.freeze({
 export const GRANT_CHILD_ROUNDS = 12;
 
 /**
- * T30d: 書き込みをくり返すテストの 1 回の時刻の幅（発行の時刻を、回ごとにこの幅だけ進める）。同じシナリオの連続の書き込みの間隔
- * （`MIN_WRITE_INTERVAL_MS`）の 2 倍にして、回の中で発行から 5 分未満で締めても、次の回の発行が間隔を守るようにする。
+ * T30d: 書き込みをくり返すテストの 1 回の時刻の幅（発行の時刻を、回ごとにこの幅だけ進める。10 分）。LZ-3c: 連続の書き込みの間隔は撤廃したので、
+ * 幅は回の時刻が重ならないための値だけ（前の間隔の 2 倍のまま）。
  */
-export const WRITE_SLOT_MS = 2 * MIN_WRITE_INTERVAL_MS;
+export const WRITE_SLOT_MS = 10 * 60 * 1_000;
 
 /** テストだけの締めの入力（消費した許可と、その予約）。 */
 export interface TestWriteSettlement {

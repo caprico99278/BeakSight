@@ -1,7 +1,7 @@
 import type { Browser, Page } from 'playwright';
 import { describe, expect, it, vi } from 'vitest';
 import { createPageId } from '../../src/core/ids.js';
-import { DOM_LIMITS, collectDomEvidence } from '../../src/evidence/dom-collector.js';
+import { DOM_COLLECTION_PART_SIZE, DOM_TEXT_PART_LENGTH, collectDomEvidence } from '../../src/evidence/dom-collector.js';
 import { useHeadlessChromium } from '../helpers/chromium.js';
 
 let browser: Browser;
@@ -52,8 +52,10 @@ describe('collectDomEvidence', () => {
 
     const evidence = await collectDomEvidence(page, pageId);
 
-    expect(evaluate).toHaveBeenCalledTimes(1);
+    // AUD-7: 文書の事実の読み取り 1 回と、画面の誤りの表示の手がかりの読み取り 1 回（どちらも読むだけ）。
+    expect(evaluate).toHaveBeenCalledTimes(2);
     expect(page.url()).toBe(beforeUrl);
+    expect(evidence.errorDisplay).toEqual({ status: 'OBSERVED', matches: [] });
     expect(evidence).toMatchObject({
       pageId,
       title: 'Fixture audit',
@@ -562,220 +564,180 @@ describe('collectDomEvidence resolved image URLs (V14)', () => {
   });
 });
 
-describe('collectDomEvidence limits and truncation records (V9)', () => {
-  it('bounds headings, images, forms, fields, submit controls, and duplicate ids and records omitted counts', async () => {
+describe('collectDomEvidence collection in parts and truncation records (V9, COV-6)', () => {
+  it('COV-6: records every heading, image, form, field, submit control, and duplicate id, reading the page in parts', async () => {
     const page = await browser.newPage();
     try {
       await page.setContent('<html><head><title>Limits</title></head><body></body></html>');
-      await page.evaluate((limits) => {
+      const size = { part: DOM_COLLECTION_PART_SIZE, fields: 205, submits: 56 };
+      await page.evaluate(({ part, fields: fieldCount, submits: submitCount }) => {
         const append = (html: string, count: number): void => {
           const container = document.createElement('div');
           container.innerHTML = Array.from({ length: count }, (_, index) => html.replaceAll('{i}', String(index))).join('');
           document.body.append(container);
         };
-        const fields = Array.from({ length: limits.maxFieldsPerForm + 5 }, (_, index) => `<input name="f${index}">`).join('');
-        const submits = Array.from(
-          { length: limits.maxSubmitControlsPerForm + 6 },
-          (_, index) => `<button type="submit" name="s${index}">Send</button>`,
-        ).join('');
+        const fields = Array.from({ length: fieldCount }, (_, index) => `<input name="f${index}">`).join('');
+        const submits = Array.from({ length: submitCount }, (_, index) => `<button type="submit" name="s${index}">Send</button>`).join('');
         append(`<form>${fields}${submits}</form>`, 1);
-        append('<form><input name="small"></form>', limits.maxForms);
-        append('<h2>Heading {i}</h2>', limits.maxHeadings + 3);
-        append('<img alt="Image {i}">', limits.maxImages + 2);
-        append('<span id="dup-{i}"></span><span id="dup-{i}"></span>', limits.maxDuplicateIds + 4);
-      }, DOM_LIMITS);
+        append('<form><input name="small"></form>', part);
+        append('<h2>Heading {i}</h2>', part + 3);
+        append('<img alt="Image {i}">', part + 2);
+        append('<span id="dup-{i}"></span><span id="dup-{i}"></span>', part + 4);
+      }, size);
 
       const evidence = await collectDomEvidence(page, createPageId(37));
 
-      expect(evidence.headings).toHaveLength(DOM_LIMITS.maxHeadings);
-      expect(evidence.images).toHaveLength(DOM_LIMITS.maxImages);
-      expect(evidence.duplicateIds).toHaveLength(DOM_LIMITS.maxDuplicateIds);
-      expect(evidence.forms).toHaveLength(DOM_LIMITS.maxForms);
-      expect(evidence.forms[0]?.fields).toHaveLength(DOM_LIMITS.maxFieldsPerForm);
-      expect(evidence.forms[0]?.submitControls).toHaveLength(DOM_LIMITS.maxSubmitControlsPerForm);
-      expect(evidence.forms[0]).toMatchObject({ omittedFieldCount: 5, omittedSubmitControlCount: 6 });
-      expect(evidence.forms[1]).toMatchObject({ omittedFieldCount: 0, omittedSubmitControlCount: 0 });
+      expect(evidence.headings).toHaveLength(DOM_COLLECTION_PART_SIZE + 3);
+      expect(evidence.headings.at(-1)?.text).toBe(`Heading ${DOM_COLLECTION_PART_SIZE + 2}`);
+      expect(evidence.images).toHaveLength(DOM_COLLECTION_PART_SIZE + 2);
+      expect(evidence.duplicateIds).toHaveLength(DOM_COLLECTION_PART_SIZE + 4);
+      expect(evidence.forms).toHaveLength(DOM_COLLECTION_PART_SIZE + 1);
+      expect(evidence.forms[0]?.fields).toHaveLength(size.fields);
+      expect(evidence.forms[0]?.submitControls).toHaveLength(size.submits);
+      expect(evidence.forms[0]).toMatchObject({ omittedFieldCount: 0, omittedSubmitControlCount: 0 });
       expect(evidence.truncation).toEqual({
         documentFields: { title: false, metaDescription: false, canonicalUrl: false, lang: false },
-        omittedHeadingCount: 3,
-        omittedImageCount: 2,
-        omittedFormCount: 1,
+        omittedHeadingCount: 0,
+        omittedImageCount: 0,
+        omittedFormCount: 0,
         omittedUnassociatedFieldCount: 0,
-        omittedDuplicateIdCount: 4,
+        omittedDuplicateIdCount: 0,
       });
+      expect(evidence.collectedInParts).toBe(2);
       expect(Object.isFrozen(evidence.truncation)).toBe(true);
     } finally {
       await page.close();
     }
   });
 
-  it('truncates long document fields, headings, labels, attributes, and ids and marks them', async () => {
+  // LZ-3b: 前の値の長さの上限（文書の項目・見出し・alt・label・属性 1,024、id 256）より長い値も、切り詰めずに記録する。
+  it('records document fields, headings, alts, labels, attributes, and ids longer than the former limits without truncating them', async () => {
     const page = await browser.newPage();
     try {
-      await page.setContent('<html><head></head><body></body></html>');
-      await page.evaluate((limits) => {
-        const long = (length: number): string => 'x'.repeat(length + 10);
-        document.title = long(limits.maxDocumentTextLength);
+      await page.setContent('<html><head><meta name="description"></head><body></body></html>');
+      const long = 'x'.repeat(1_025);
+      await page.evaluate((value) => {
+        document.title = value;
+        document.querySelector('meta')?.setAttribute('content', value);
+        document.documentElement.lang = value;
         const heading = document.createElement('h1');
-        heading.textContent = long(limits.maxHeadingTextLength);
+        heading.textContent = value;
         const image = document.createElement('img');
-        image.alt = long(limits.maxAltLength);
+        image.alt = value;
         const form = document.createElement('form');
-        form.innerHTML = '<label for="long-field"></label><input id="long-field">';
-        (form.querySelector('label') as HTMLLabelElement).textContent = long(limits.maxLabelTextLength);
-        (form.querySelector('input') as HTMLInputElement).name = long(limits.maxAttributeLength);
+        form.innerHTML = '<label for="long-field"></label><input id="long-field"><button type="submit"></button>';
+        (form.querySelector('label') as HTMLLabelElement).textContent = value;
+        (form.querySelector('input') as HTMLInputElement).name = value;
+        (form.querySelector('button') as HTMLButtonElement).textContent = value;
         const first = document.createElement('span');
-        first.id = long(limits.maxIdLength);
+        first.id = value.slice(0, 257);
         const second = document.createElement('span');
         second.id = first.id;
         document.body.append(heading, image, form, first, second);
-      }, DOM_LIMITS);
+      }, long);
 
       const evidence = await collectDomEvidence(page, createPageId(38));
 
-      expect(evidence.title).toHaveLength(DOM_LIMITS.maxDocumentTextLength);
-      expect(evidence.truncation.documentFields).toEqual({ title: true, metaDescription: false, canonicalUrl: false, lang: false });
-      expect(evidence.headings[0]).toMatchObject({ truncated: true });
-      expect(evidence.headings[0]?.text).toHaveLength(DOM_LIMITS.maxHeadingTextLength);
-      expect(evidence.images[0]).toMatchObject({ truncated: true });
-      expect(evidence.images[0]?.alt).toHaveLength(DOM_LIMITS.maxAltLength);
-      expect(evidence.forms[0]?.fields[0]).toMatchObject({ truncated: true });
-      expect(evidence.forms[0]?.fields[0]?.name).toHaveLength(DOM_LIMITS.maxAttributeLength);
-      expect(evidence.forms[0]?.fields[0]?.labels[0]).toHaveLength(DOM_LIMITS.maxLabelTextLength);
-      expect(evidence.duplicateIds[0]).toMatchObject({ count: 2, truncated: true });
-      expect(evidence.duplicateIds[0]?.id).toHaveLength(DOM_LIMITS.maxIdLength);
+      expect(evidence).toMatchObject({ title: long, metaDescription: long, lang: long });
+      expect(evidence.truncation.documentFields).toEqual({ title: false, metaDescription: false, canonicalUrl: false, lang: false });
+      expect(evidence.headings[0]).toMatchObject({ text: long, truncated: false });
+      expect(evidence.images[0]).toMatchObject({ alt: long, truncated: false });
+      expect(evidence.forms[0]?.fields[0]).toMatchObject({ name: long, labels: [long], truncated: false });
+      expect(evidence.forms[0]?.submitControls[0]).toMatchObject({ text: long, truncated: false });
+      expect(evidence.duplicateIds[0]).toMatchObject({ id: long.slice(0, 257), count: 2, truncated: false });
     } finally {
       await page.close();
     }
   });
 
-  it('marks the truncation of a canonical URL longer than the URL limit on the canonical field only (R\'\'2 m4)', async () => {
+  // URL-LEN: 前の URL の上限（2,048）より長い canonical・画像の URL・form の action も、切り詰めずに記録する。
+  it('records the canonical URL, the image URLs and the form action longer than the former URL limit without truncating them', async () => {
     const page = await browser.newPage();
     try {
       await page.setContent('<html lang="ja"><head><title>Short</title><meta name="description" content="Short"></head><body></body></html>');
-      await page.evaluate((maxUrlLength) => {
+      const url = `https://canonical.test/${'c'.repeat(2_049)}`;
+      await page.evaluate((longUrl) => {
         const canonical = document.createElement('link');
         canonical.rel = 'canonical';
-        canonical.href = `https://canonical.test/${'c'.repeat(maxUrlLength)}`;
+        canonical.href = longUrl;
+        const image = document.createElement('img');
+        image.setAttribute('src', longUrl);
+        const form = document.createElement('form');
+        form.setAttribute('action', longUrl);
         document.head.append(canonical);
-      }, DOM_LIMITS.maxUrlLength);
+        document.body.append(image, form);
+      }, url);
 
       const evidence = await collectDomEvidence(page, createPageId(39));
 
-      expect(evidence.canonicalUrl).toHaveLength(DOM_LIMITS.maxUrlLength);
-      expect(evidence.truncation.documentFields).toEqual({
-        title: false,
-        metaDescription: false,
-        canonicalUrl: true,
-        lang: false,
-      });
-      expect(Object.isFrozen(evidence.truncation.documentFields)).toBe(true);
+      expect(evidence.canonicalUrl).toBe(url);
+      expect(evidence.images[0]).toMatchObject({ src: url, resolvedUrl: url, truncated: false });
+      expect(evidence.forms[0]).toMatchObject({ action: url, truncated: false });
+      expect(evidence.truncation.documentFields).toEqual({ title: false, metaDescription: false, canonicalUrl: false, lang: false });
     } finally {
       await page.close();
     }
   });
 
-  it.each([
-    ['title', 'maxDocumentTextLength'],
-    ['metaDescription', 'maxDocumentTextLength'],
-    ['canonicalUrl', 'maxUrlLength'],
-    ['lang', 'maxDocumentTextLength'],
-  ] as const)('marks the truncation of %s separately from the other document fields (R\'\'2 m4)', async (field, limitName) => {
-    const page = await browser.newPage();
-    try {
-      await page.setContent(`
-        <html lang="ja">
-          <head><title>Short</title><meta name="description" content="Short"><link rel="canonical" href="/short"></head>
-          <body></body>
-        </html>
-      `);
-      await page.evaluate(({ field: target, length }) => {
-        const value = 'v'.repeat(length + 10);
-        if (target === 'title') {
-          document.title = value;
-        } else if (target === 'metaDescription') {
-          document.querySelector('meta[name="description"]')?.setAttribute('content', value);
-        } else if (target === 'canonicalUrl') {
-          document.querySelector('link[rel="canonical"]')?.setAttribute('href', value);
-        } else {
-          document.documentElement.setAttribute('lang', value);
-        }
-      }, { field, length: DOM_LIMITS[limitName] });
-
-      const evidence = await collectDomEvidence(page, createPageId(40));
-
-      expect(evidence[field]).toHaveLength(DOM_LIMITS[limitName]);
-      expect(evidence.truncation.documentFields).toEqual({
-        title: field === 'title',
-        metaDescription: field === 'metaDescription',
-        canonicalUrl: field === 'canonicalUrl',
-        lang: field === 'lang',
-      });
-    } finally {
-      await page.close();
-    }
-  });
-
-  it('bounds visible text and region text and marks the truncation', async () => {
+  it('COV-6: records the whole visible text and region text, reading the text in parts', async () => {
     const page = await browser.newPage();
     try {
       await page.setContent('<html><body><header></header><div id="body-text"></div></body></html>');
-      await page.evaluate((limits) => {
-        (document.querySelector('header') as HTMLElement).textContent = 'h'.repeat(limits.maxRegionTextLength + 10);
-        (document.querySelector('#body-text') as HTMLElement).textContent = 'b'.repeat(limits.maxVisibleTextLength);
-      }, DOM_LIMITS);
+      const lengths = { header: 20_000, body: DOM_TEXT_PART_LENGTH + 10 };
+      await page.evaluate(({ header, body }) => {
+        (document.querySelector('header') as HTMLElement).textContent = 'h'.repeat(header);
+        (document.querySelector('#body-text') as HTMLElement).textContent = 'b'.repeat(body);
+      }, lengths);
 
       const evidence = await collectDomEvidence(page, createPageId(39));
 
-      expect(evidence.visibleText.truncated).toBe(true);
+      expect(evidence.visibleText.truncated).toBe(false);
       expect(evidence.visibleText.nodeLimitReached).toBe(false);
-      expect(evidence.visibleText.text.length).toBeLessThanOrEqual(DOM_LIMITS.maxVisibleTextLength);
-      expect(evidence.visibleText.regions[0]).toMatchObject({ kind: 'header', truncated: true });
-      expect(evidence.visibleText.regions[0]?.text).toHaveLength(DOM_LIMITS.maxRegionTextLength);
+      expect(evidence.visibleText.text).toBe(`${'h'.repeat(lengths.header)} ${'b'.repeat(lengths.body)}`);
+      expect(evidence.visibleText.regions[0]).toMatchObject({ kind: 'header', truncated: false });
+      expect(evidence.visibleText.regions[0]?.text).toHaveLength(lengths.header);
+      expect(evidence.collectedInParts).toBe(2);
     } finally {
       await page.close();
     }
   });
 
-  it('stops walking at the node budget and marks the visible text as truncated', async () => {
+  it('COV-6: walks every node (no node budget) and keeps the text after many empty nodes', async () => {
     const page = await browser.newPage();
     try {
       await page.setContent('<html><body><main id="root"></main><footer>Late footer text</footer></body></html>');
-      await page.evaluate((limits) => {
+      await page.evaluate(() => {
         const root = document.querySelector('#root') as HTMLElement;
         const fragment = document.createDocumentFragment();
-        for (let index = 0; index < limits.maxTextWalkNodes; index += 1) {
+        for (let index = 0; index < 100_000; index += 1) {
           fragment.append(document.createElement('span'));
         }
         root.append(fragment);
-      }, DOM_LIMITS);
+      });
 
       const evidence = await collectDomEvidence(page, createPageId(40));
 
-      // R4 の M2: ノード数の上限に達したことは、文字数による切り詰め（`truncated`）とは別の印で記録する。
-      expect(evidence.visibleText.nodeLimitReached).toBe(true);
+      expect(evidence.visibleText.nodeLimitReached).toBe(false);
       expect(evidence.visibleText.truncated).toBe(false);
-      expect(evidence.visibleText.text).not.toContain('Late footer text');
+      expect(evidence.visibleText.text).toContain('Late footer text');
     } finally {
       await page.close();
     }
   });
 
-  it('bounds the number of landmark regions and records the omitted count', async () => {
+  it('COV-6: records every landmark region (no count limit)', async () => {
     const page = await browser.newPage();
     try {
       await page.setContent('<html><body></body></html>');
-      await page.evaluate((limits) => {
-        document.body.innerHTML = Array.from(
-          { length: limits.maxRegions + 7 },
-          (_, index) => `<aside>Aside ${index}</aside>`,
-        ).join('');
-      }, DOM_LIMITS);
+      const count = 107;
+      await page.evaluate((regionCount) => {
+        document.body.innerHTML = Array.from({ length: regionCount }, (_, index) => `<aside>Aside ${index}</aside>`).join('');
+      }, count);
 
       const evidence = await collectDomEvidence(page, createPageId(41));
 
-      expect(evidence.visibleText.regions).toHaveLength(DOM_LIMITS.maxRegions);
-      expect(evidence.visibleText.omittedRegionCount).toBe(7);
+      expect(evidence.visibleText.regions).toHaveLength(count);
+      expect(evidence.visibleText.omittedRegionCount).toBe(0);
     } finally {
       await page.close();
     }
@@ -848,22 +810,22 @@ describe('collectDomEvidence fields outside forms (R4 N2)', () => {
     }
   });
 
-  it('bounds the fields outside forms and records the omitted count', async () => {
+  it('COV-6: records every field outside forms (no count limit)', async () => {
     const page = await browser.newPage();
     try {
       await page.setContent('<html><body></body></html>');
-      await page.evaluate((limits) => {
-        document.body.innerHTML = Array.from(
-          { length: limits.maxUnassociatedFields + 3 },
-          (_, index) => `<input name="loose-${index}">`,
-        ).join('');
-      }, DOM_LIMITS);
+      const count = DOM_COLLECTION_PART_SIZE + 3;
+      await page.evaluate((fieldCount) => {
+        document.body.innerHTML = Array.from({ length: fieldCount }, (_, index) => `<input name="loose-${index}">`).join('');
+      }, count);
 
       const evidence = await collectDomEvidence(page, createPageId(51));
 
-      expect(evidence.unassociatedFields).toHaveLength(DOM_LIMITS.maxUnassociatedFields);
+      expect(evidence.unassociatedFields).toHaveLength(count);
       expect(evidence.unassociatedFields[0]?.name).toBe('loose-0');
-      expect(evidence.truncation.omittedUnassociatedFieldCount).toBe(3);
+      expect(evidence.unassociatedFields.at(-1)?.name).toBe(`loose-${count - 1}`);
+      expect(evidence.truncation.omittedUnassociatedFieldCount).toBe(0);
+      expect(evidence.collectedInParts).toBe(2);
     } finally {
       await page.close();
     }
@@ -935,24 +897,23 @@ describe('collectDomEvidence fields in open shadow roots (R\'2 m4)', () => {
     }
   });
 
-  it('bounds the fields inside open shadow roots together with the other fields outside forms', async () => {
+  it('COV-6: records every field inside open shadow roots together with the other fields outside forms', async () => {
     const page = await browser.newPage();
     try {
       await page.setContent('<html><body><input name="light-0"><div id="host"></div></body></html>');
-      await page.evaluate((limits) => {
+      const shadowCount = 202;
+      await page.evaluate((count) => {
         const root = (document.querySelector('#host') as HTMLElement).attachShadow({ mode: 'open' });
-        root.innerHTML = Array.from(
-          { length: limits.maxUnassociatedFields + 2 },
-          (_, index) => `<input name="shadow-${index}">`,
-        ).join('');
-      }, DOM_LIMITS);
+        root.innerHTML = Array.from({ length: count }, (_, index) => `<input name="shadow-${index}">`).join('');
+      }, shadowCount);
 
       const evidence = await collectDomEvidence(page, createPageId(56));
 
-      expect(evidence.unassociatedFields).toHaveLength(DOM_LIMITS.maxUnassociatedFields);
+      expect(evidence.unassociatedFields).toHaveLength(shadowCount + 1);
       expect(evidence.unassociatedFields[0]?.name).toBe('light-0');
       expect(evidence.unassociatedFields[1]?.name).toBe('shadow-0');
-      expect(evidence.truncation.omittedUnassociatedFieldCount).toBe(3);
+      expect(evidence.unassociatedFields.at(-1)?.name).toBe(`shadow-${shadowCount - 1}`);
+      expect(evidence.truncation.omittedUnassociatedFieldCount).toBe(0);
     } finally {
       await page.close();
     }

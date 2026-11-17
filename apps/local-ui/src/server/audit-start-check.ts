@@ -106,7 +106,7 @@ export const auditStartCheckOf = (input: AuditStartCheckInput): AuditStartCheck 
   const jobKind = input.jobKind ?? WORKER_AUDIT_JOB_KIND;
   // T28b: 認証の設定が要るかは、その操作をそのモードで受けるときだけ（判定は `execution-policy.ts`。MI-5 から、書き込みのモードの監査も、認証つきの
   // 読み取りの監査と同じく要る）。
-  const authRequired = operationRequiresAuthSetup(jobKind, profile.mode);
+  const authRequired = operationRequiresAuthSetup(jobKind, profile.mode, profile.auth);
   const storedSetup = authRequired ? input.storedSetup : null;
   const validation = context === undefined ? null : validateSiteProfile(profile, context);
   const setupCheck = storedSetup !== null && storedSetup.freshness === CURRENT_AUTH_SETUP_FRESHNESS && validation !== null && validation.ok && context !== undefined

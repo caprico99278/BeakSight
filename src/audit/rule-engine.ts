@@ -1,4 +1,5 @@
 import {
+  CURRENT_FINDING_SCHEMA_VERSION,
   FINDING_CATEGORIES,
   SEVERITIES,
   type EvidenceId,
@@ -16,8 +17,8 @@ import {
   type FindingFingerprintIdentityField,
 } from '../core/ids.js';
 import { deepFreeze } from '../core/immutable.js';
-import { MAX_ERROR_MESSAGE_LENGTH } from '../core/limits.js';
 import { compareCodeUnits } from '../core/text.js';
+import { groupingKeysOf } from './finding-grouping-keys.js';
 import type { AuditRule, FindingDraft, PageRuleInput } from './rule.js';
 import { RULE_CATALOG, freezeCatalog, isFindingRuleIdOf } from './rule-catalog.js';
 import { distinctSorted } from './rule-helpers.js';
@@ -30,7 +31,7 @@ export interface RuleEvaluationFailure {
   readonly code: Extract<IncompleteReasonCode, 'RULE_EVALUATION_FAILED'>;
   /** 失敗した Rule の `AuditRule.ruleId`（下書きの ruleId ではない）。 */
   readonly ruleId: string;
-  /** 失敗の内容。`MAX_ERROR_MESSAGE_LENGTH` 以内。 */
+  /** 失敗の内容（切り詰めない）。 */
   readonly message: string;
 }
 
@@ -94,7 +95,7 @@ export interface RuleEngineOptions {
 /** fingerprint の同一性の要素のうち、ビューポートを表す予約名。下書きは、この名前の要素を持てない。 */
 const VIEWPORT_IDENTITY_FIELD_NAME = 'viewport';
 
-type FindingWithoutId = Omit<Finding, 'findingId'>;
+type FindingWithoutId = Omit<Finding, 'findingId'> & Required<Pick<Finding, 'groupingKeys'>>;
 
 /**
  * 文脈付きの下書きを検査し、fingerprint を付け、決定論的な順序に並べ、Finding ID を振って、凍結した Finding を返す（設計書 第6章）。
@@ -143,6 +144,7 @@ export const materializeFindingDrafts = (options: MaterializeFindingDraftsOption
         viewport: finding.viewport,
         message: finding.message,
         evidenceRefs: finding.evidenceRefs,
+        groupingKeys: finding.groupingKeys,
       }),
     );
 
@@ -218,7 +220,7 @@ const assertMaterializationOptions = (targetId: unknown, firstFindingSequence: u
 export const toRuleEvaluationFailure = (ruleId: string, error: unknown): RuleEvaluationFailure => ({
   code: 'RULE_EVALUATION_FAILED',
   ruleId,
-  message: safeErrorMessage(error, MAX_ERROR_MESSAGE_LENGTH),
+  message: safeErrorMessage(error),
 });
 
 /**
@@ -306,8 +308,12 @@ const validateDraft = (draft: unknown, owner: FindingDraftOwner, evidenceIds: Re
   };
 };
 
+/**
+ * 下書きを Finding にする。AUD-9a: `groupingKeys` は、同一性の要素から許可の一覧（`groupingKeysOf`）で選んだもの。fingerprint の入力は今のまま
+ * （同一性の要素の全部と、予約名 `viewport`）。
+ */
 const toFinding = (draft: FindingDraft, context: FindingDraftContext, targetId: string): FindingWithoutId => ({
-  schemaVersion: 'finding-schema/1.0',
+  schemaVersion: CURRENT_FINDING_SCHEMA_VERSION,
   fingerprint: createFindingFingerprint({
     targetId,
     ruleId: draft.ruleId,
@@ -327,6 +333,7 @@ const toFinding = (draft: FindingDraft, context: FindingDraftContext, targetId: 
   viewport: context.viewport,
   message: draft.message,
   evidenceRefs: draft.evidenceRefs,
+  groupingKeys: groupingKeysOf(draft.identityFields),
 });
 
 /**

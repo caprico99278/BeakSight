@@ -23,6 +23,7 @@
  *   1 秒以内に終える。
  */
 import { describe, expect, it } from 'vitest';
+import { NOTIFICATION_CLOSE_DESTRUCTIVE_OBJECT_WORDS, NOTIFICATION_CLOSE_OBJECT_WORDS } from '../../src/discovery/classification-words.js';
 import {
   EXTERNAL_DELIVERY_AUTOCOMPLETE_TOKENS,
   EXTERNAL_DELIVERY_NAME_WORDS,
@@ -145,13 +146,23 @@ const findTransitiveForbidden = (files: ReadonlyMap<string, ScannedSource>, star
 // (b) 定義の数は `source-scan.ts` の `countDefinitions`（PRE42-CC 組 G。`class name` の定義も数える、最も広い形）。
 
 /** (b)・(d) owner の外の違反（`パス: 名前` か `パス: [語, …]`）: owner の名前の定義と、一覧の語の文字列リテラルの書き写し。 */
+/**
+ * (b)・(d) の除外（閉じた一覧。ファイルごとの、意味の違う同じ綴りの語）。DEF-210（通知の枠の設計書 3.2.1 の 5）: 通知の枠の閉じる語の汎用の目的語
+ * （`NOTIFICATION_CLOSE_OBJECT_WORDS`。「お知らせを閉じる」の「お知らせ」など）は、外部到達の語や業務テンプレートの語と綴りが重なるが、意味が違う。
+ */
+const DIFFERENT_MEANING_WORDS: ReadonlyMap<string, ReadonlySet<string>> = new Map([
+  // fix round 3（設計書 3.2.2 の 3）: 壊す操作の目的語（`NOTIFICATION_CLOSE_DESTRUCTIVE_OBJECT_WORDS`。「アカウントを閉じる」の「アカウント」など）も、同じく意味が違う。
+  ['src/discovery/classification-words.ts', new Set<string>([...NOTIFICATION_CLOSE_OBJECT_WORDS, ...NOTIFICATION_CLOSE_DESTRUCTIVE_OBJECT_WORDS])],
+]);
+
 const copiedWordListsOf = (
   files: readonly (Pick<SourceFile, 'path'> & ScannedSource)[],
   wordOwner: WordListOwner,
 ): readonly string[] =>
   files.filter((file) => file.path !== wordOwner.owner).flatMap((file) => {
     const definitions = wordOwner.names.filter((name) => countDefinitions(file.bare, name) > 0).map((name) => `${file.path}: ${name}`);
-    const words = [...new Set(file.literals.filter((literal) => wordOwner.words.has(literal)))].sort();
+    const allowed = DIFFERENT_MEANING_WORDS.get(file.path) ?? new Set<string>();
+    const words = [...new Set(file.literals.filter((literal) => wordOwner.words.has(literal) && !allowed.has(literal)))].sort();
     return [...definitions, ...(words.length >= wordOwner.threshold ? [`${file.path}: ${JSON.stringify(words)}`] : [])];
   });
 

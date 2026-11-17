@@ -18,6 +18,15 @@
 //   指定の成否の条件と入力の誤りの条件は null で、ID の取り方は検証の指定の `recordId`（API の `recordId` があれば null でもよい）。
 // - T41b（Task 41 の設計書 3.2、8 章の設計者の判断 (2)）: API の更新は、許可の対象の ID を受け、`update: { targetRecordId }` と、台帳の画面の path の型に
 //   対象の ID を入れた書き込みの画面を持つ（`api` はシナリオの API の指定のまま、`values` は変える鍵だけ）。
+// - LU-8（設計書 `2026-11-02-beaksight-list-row-update-design.md` 5.5 の最後の段）: 台帳に一覧の行の選び方（`listRow`）のある API の更新は、書き込みの画面を
+//   一覧の画面の path のまま（番号を入れない）にし、`update.listRow`（行を選ぶ値と、前の値を後から入れる印）を足す。行を選ぶ値がない・行を選ぶ欄が台帳の登録の
+//   今の入力の規則で毎回違う欄でなければ作らない（送らずに止める）。
+// - LU-12・LU-12b（設計書 4.0 の D5、5.5。ユーザーの判断 2026-11-03「台帳との比べをフォームの形にも広げる」）: フォームの一覧の行の更新（形 B。`update.listRow`）は、
+//   書き込みの画面を一覧の画面の path、送信先を送信先の型に台帳の番号を入れた path にし、`update.listRow`（一覧の path・開き手の識別の digest・行を選ぶ値）と
+//   `update.knownKeptValues`（保つ欄ごとの台帳の最後の値）を足す。行を選ぶ値の決め方と、作らない条件は API の形と同じ部品（`listRowKeyValueOf`）。
+// - LU-7 fix round 2（設計書 5.5 の 7、K3）: 一覧の行の更新は、照合の READ に一覧の画面（`listRow.listPagePath`）の定義も使う。「毎回違う欄」の判定は、許可の
+//   発行と同じ唯一の判定 `readVerificationUniqueRejectionOf`（一覧の行の更新は行を選ぶ欄で判定する。LU-8 の確かめ直しも、これ 1 つ）。変える欄の新しい値が、
+//   台帳の最後に分かっている値と同じなら作らない（変わったことを一覧で確かめられないため。生成の決まりは前の値を避けない）。
 // 管理データ・ブラウザ・ワーカーに触れない。
 import type { ApprovalSummaryFacts } from '../actions/action-contracts.js';
 import { knownKeptValuesOf, type RecordValueWrite } from '../actions/write-result-facts.js';
@@ -27,16 +36,16 @@ import {
   UPDATE_SCENARIO_KIND,
   isFormRecordIdSpec,
   scenarioTransportOf,
+  type ScenarioListRow,
   type ScenarioRevision,
   type ScenarioTransport,
   type VerificationExpectation,
 } from '../approval/scenario-contracts.js';
 import type { SeedRecord } from '../data-rules/scenario-data.js';
-import { isListPageReadTarget } from '../data-rules/varying-values.js';
+import { isListPageReadTarget, readVerificationUniqueRejectionOf } from '../data-rules/varying-values.js';
 import { CREATE_SCENARIO_KIND } from '../../core/scenario-kind.js';
 import type { CandidateLocation, DiscoveryCandidate } from '../../discovery/candidate-contracts.js';
 import {
-  hasGeneratedValueExpectation,
   readListPagePathOf,
   isReadCheckPageTemplatePath,
   readCheckTargetKindOf,
@@ -47,7 +56,9 @@ import {
 import { baseDateOf } from '../../core/base-date.js';
 import { dateOfCompactUtcTimestamp } from '../../core/utc-timestamp.js';
 import { concretePathOfTemplate } from '../../discovery/fingerprint.js';
-import type { WorkerStartApiWrite, WorkerStartReadCheck, WorkerStartWrite } from '../worker-protocol.js';
+import type {
+  WorkerStartApiWrite, WorkerStartApiWriteFilterValue, WorkerStartApiWriteLedgerKeyValue, WorkerStartApiWriteListRow, WorkerStartReadCheck, WorkerStartWrite, WorkerStartWriteListRow,
+} from '../worker-protocol.js';
 import type { AuditJobStartRejectionReason } from './job-records.js';
 import type { ReadCheckView } from './read-check-store.js';
 
@@ -89,7 +100,78 @@ export interface WriteStartInputs {
    * 画面の照合の READ は、この欄と比べる期待があるときだけ作る（一覧には前の登録が並ぶため）。省けば空（一覧の画面の指定は作らない）。
    */
   readonly uniqueEachRunFieldNames?: readonly string[];
+  /**
+   * LU-8（設計書 `2026-11-02-beaksight-list-row-update-design.md` 5.5 の最後の段）: 一覧の行の更新の、台帳の登録のシナリオの今の入力の規則で、実行のたびに違う値に
+   * なる欄の名前（値の生成の持ち主の判定 `uniqueEachRunFieldNamesOf`。親が台帳の登録の入力の規則から求め直す）。行を選ぶ欄（`listRow.rowKeyField`）がこの中に
+   * なければ作らない（許可を出す時の確かめ直し）。省くか null なら、一覧の行の更新は作らない（fail-closed）。一覧の行のない更新・登録は見ない。
+   */
+  readonly ledgerUniqueEachRunFieldNames?: readonly string[] | null;
+  /**
+   * DEF-198（設計書 `2026-11-02-beaksight-list-row-update-design.md` 5.9 の 3）: 更新の対象のレコード（`targetRecordId`）を登録した、同じ点検の登録の書き込みの
+   * 成果物の、ページが決める鍵の値（親が締めで確かめた `action-run.json` の `api.pageKeyValues`。JSON の scalar を JSON の文字列にした形。親のメモリの中だけ）。
+   * API の指定にほかの filter の名前がある更新は、同じ名前の値から照らす値（`update.otherFilterValues`）を作る。省くか null なら、その更新は作らない（送らない）。
+   * DEF-203（5.10 の 1）: 台帳の登録の値と照らす鍵（`api.ledgerPageKeys`）の値（`update.ledgerKeyValues`）も、同じ値から作る。
+   */
+  readonly createPageKeyValues?: Readonly<Record<string, string | null>> | null;
 }
+
+/**
+ * DEF-198・DEF-203（設計書 5.9 の 3、5.10 の 1）: 登録の成果物のページが決める鍵の、名前ごとの値（JSON の文字列の形）を読んで JSON の値にする唯一の読み方（純粋）。
+ * 名前のどれかに値がない・伏せの印（null）・読めない・`accepts` が受けない値なら null（作らない。送らずに止める）。
+ */
+const createPageKeyValuesOf = <T>(
+  names: readonly string[],
+  createPageKeyValues: Readonly<Record<string, string | null>> | null | undefined,
+  accepts: (value: unknown) => value is T,
+): readonly { readonly key: string; readonly value: T }[] | null => {
+  if (names.length === 0) {
+    return Object.freeze([]);
+  }
+  if (createPageKeyValues === null || createPageKeyValues === undefined) {
+    return null;
+  }
+  const values: { readonly key: string; readonly value: T }[] = [];
+  for (const key of names) {
+    const text = Object.hasOwn(createPageKeyValues, key) ? createPageKeyValues[key] ?? null : null;
+    let value: unknown;
+    try {
+      value = text === null ? undefined : JSON.parse(text);
+    } catch {
+      return null;
+    }
+    if (!accepts(value)) {
+      return null;
+    }
+    values.push(Object.freeze({ key, value }));
+  }
+  return Object.freeze(values);
+};
+
+/** ほかの filter の照らす値に受ける値（空でない string か、有限の number）。 */
+const isFilterValue = (value: unknown): value is string | number =>
+  (typeof value === 'string' && value.length > 0) || (typeof value === 'number' && Number.isFinite(value));
+/** DEF-203: 台帳の登録の値と照らす鍵の値に受ける値（JSON の scalar。number は有限）。 */
+const isLedgerKeyValue = (value: unknown): value is WorkerStartApiWriteLedgerKeyValue['value'] =>
+  value === null || typeof value === 'string' || typeof value === 'boolean' || (typeof value === 'number' && Number.isFinite(value));
+
+/**
+ * DEF-198（設計書 5.9 の 3）: API の更新の、ほかの filter ごとの照らす値（純粋）。API の指定のほかの filter の名前（`otherFilterNames`）ごとに、登録の成果物の
+ * ページが決める鍵の同じ名前の値（JSON の文字列の形）を読み、空でない string か number の値にする。ほかの filter のない指定は空の一覧。値がない・伏せの印（null）・
+ * 読めない・string と number のほか・空の文字なら null（作らない。送らずに止める）。
+ */
+export const apiOtherFilterValuesOf = (
+  api: Pick<NonNullable<ScenarioRevision['api']>, 'otherFilterNames'>,
+  createPageKeyValues: Readonly<Record<string, string | null>> | null | undefined,
+): readonly WorkerStartApiWriteFilterValue[] | null => createPageKeyValuesOf(api.otherFilterNames ?? [], createPageKeyValues, isFilterValue);
+
+/**
+ * DEF-203（設計書 5.10 の 1）: API の更新の、台帳の登録の値と照らす鍵（`ledgerPageKeys`）ごとの値（純粋。ほかの filter と同じ出所と読み方）。値は JSON の型のまま
+ * （string・number・boolean・null）。照らす鍵のない指定は空の一覧。値がない・伏せの印（null）・読めない・scalar でなければ null（作らない。送らずに止める）。
+ */
+export const apiLedgerKeyValuesOf = (
+  api: Pick<NonNullable<ScenarioRevision['api']>, 'ledgerPageKeys'>,
+  createPageKeyValues: Readonly<Record<string, string | null>> | null | undefined,
+): readonly WorkerStartApiWriteLedgerKeyValue[] | null => createPageKeyValuesOf(api.ledgerPageKeys ?? [], createPageKeyValues, isLedgerKeyValue);
 
 /** 照合の READ の定義を使えない理由（T37d。設計者の判断 5。閉じた一覧。開始を拒む理由 `AUDIT_JOB_START_REJECTION_REASONS` の一部）。 */
 export const WRITE_READ_VERIFICATION_PAGE_TARGET = 'WRITE_READ_VERIFICATION_PAGE_TARGET' satisfies AuditJobStartRejectionReason;
@@ -116,17 +198,74 @@ export const readVerificationTargetRejectionOf = (
 
 /**
  * OP-R（設計書 `2026-10-27-beaksight-one-pass-flow-design.md` 4.1.9 の R1。T37d の判断 5 を改めた）: API の登録のシナリオの、照合の READ に使える一覧の画面の
- * path（登録の画面の 1 つ上。唯一の判定 `readListPagePathOf`）。API の登録でない・決められないときは null（一覧の画面の定義は使わない）。
+ * path（登録の画面の 1 つ上。唯一の判定 `readListPagePathOf`）。LU-7 fix round 2: API の一覧の行の更新は、承認した `ledger.listRow.listPagePath`（下書きの確かめが
+ * 候補の画面の path と同じことを確かめた）。ほか・決められないときは null（一覧の画面の定義は使わない）。LU-7 fix round 3 で、前の名前 `apiCreateReadListPagePathOf` から中身に合う名前に変えた。
  */
-export const apiCreateReadListPagePathOf = (
-  scenario: Pick<ScenarioRevision, 'kind' | 'transport'>,
+export const readListPagePathForWriteOf = (
+  scenario: Pick<ScenarioRevision, 'kind' | 'transport'> & { readonly api?: Pick<NonNullable<ScenarioRevision['api']>, 'ledger'> },
   evidence: Pick<DiscoveryCandidate, 'page'>,
-): string | null =>
-  (scenarioTransportOf(scenario) === API_SCENARIO_TRANSPORT && scenario.kind === CREATE_SCENARIO_KIND ? readListPagePathOf(evidence.page.path) : null);
+): string | null => {
+  if (scenarioTransportOf(scenario) !== API_SCENARIO_TRANSPORT) {
+    return null;
+  }
+  if (scenario.kind === CREATE_SCENARIO_KIND) {
+    return readListPagePathOf(evidence.page.path);
+  }
+  return scenario.kind === UPDATE_SCENARIO_KIND ? scenario.api?.ledger?.listRow?.listPagePath ?? null : null;
+};
 
 /** API のシナリオの照合の READ に使える画面の path か（`{id}` の型か、OP-R: API の登録の一覧の画面）。 */
 const isApiVerificationPagePath = (path: string, apiCreateListPagePath: string | null): boolean =>
   isReadCheckPageTemplatePath(path) || (apiCreateListPagePath !== null && path === apiCreateListPagePath);
+
+/**
+ * LU-8（設計書 5.5 の最後の段、4.0 の D4）: 一覧の行の更新の行の選び方の指定（作れなければ null。送らずに止める）。
+ * - 許可を出す時の確かめ直し（行を選ぶ欄が、台帳の登録の今の入力の規則で毎回違う欄か）は、LU-7 fix round 2 から唯一の判定 `readVerificationUniqueRejectionOf`
+ *   （`writeStartSpecOf` が先に呼ぶ）。
+ * - LU-7 fix round 2: 変える鍵の新しい値（`values`）が、台帳の、対象のレコードの最後に分かっている値と同じなら作らない（一覧で変わったことを確かめられない）。
+ * - 行を選ぶ値: 台帳の、対象のレコードの最後に分かっている値（`knownKeptValuesOf`。空は行を選べないので作らない）。値は IPC のメッセージにだけ入れる。
+ * - 前の値を後から入れる印: 保つ鍵の名前（承認した API の指定の `keptKeys` の順）。値は持たない（ワーカーが「編集」を押した後に読む）。
+ * 開き手の識別の digest と行を選ぶ欄の名前は、承認した API の指定の `ledger.listRow` のまま（ここで写し直さない）。
+ */
+const listRowStartOf = (
+  listRow: ScenarioListRow,
+  inputs: Pick<WriteStartInputs, 'ledgerWrites' | 'values'>,
+  targetRecordId: string,
+  keptKeyNames: readonly string[],
+): WorkerStartApiWriteListRow | null => {
+  const rowKeyValue = listRowKeyValueOf(listRow, inputs, targetRecordId);
+  return rowKeyValue === null ? null : { rowKeyValue, deferredPriorValues: { keptKeys: [...keptKeyNames] } };
+};
+
+/**
+ * LU-12b: API の形とフォームの形（形 B）の一覧の行の更新が共有する、行を選ぶ値（作れなければ null）。変える欄の新しい値が台帳の対象のレコードの最後に分かっている値と
+ * 同じなら作らない（一覧で変わったことを確かめられない）。行を選ぶ値は、台帳の対象のレコードの行を選ぶ欄の最後に分かっている値（空は行を選べないので作らない）。
+ */
+const listRowKeyValueOf = (
+  listRow: Pick<ScenarioListRow, 'rowKeyField'>,
+  inputs: Pick<WriteStartInputs, 'ledgerWrites' | 'values'>,
+  targetRecordId: string,
+): string | null => {
+  const changedKeys = Object.keys(inputs.values);
+  if (knownKeptValuesOf(inputs.ledgerWrites ?? [], targetRecordId, changedKeys).some(({ key, value }) => valueOf(inputs.values, key) === value)) {
+    return null;
+  }
+  const [known] = knownKeptValuesOf(inputs.ledgerWrites ?? [], targetRecordId, [listRow.rowKeyField]);
+  return known === undefined || known.value === '' ? null : known.value;
+};
+
+/**
+ * LU-12b（設計書 5.5 の最後の段）: フォームの一覧の行の更新の行の選び方の指定（作れなければ null）。一覧の画面の path と開き手の識別の digest は承認した
+ * `update.listRow` のまま、行を選ぶ値は API の形と同じ部品（`listRowKeyValueOf`）。
+ */
+const formListRowStartOf = (
+  listRow: ScenarioListRow,
+  inputs: Pick<WriteStartInputs, 'ledgerWrites' | 'values'>,
+  targetRecordId: string,
+): WorkerStartWriteListRow | null => {
+  const rowKeyValue = listRowKeyValueOf(listRow, inputs, targetRecordId);
+  return rowKeyValue === null ? null : { listPagePath: listRow.listPagePath, openerIdentityDigest: listRow.openerIdentityDigest, rowKeyValue };
+};
 
 /** 生成した値（送らない値と、ない値は null）。 */
 const valueOf = (values: Readonly<Record<string, string | null>>, fieldName: string): string | null =>
@@ -186,14 +325,23 @@ export const writeStartSpecOf = (inputs: WriteStartInputs): WorkerStartWrite | W
   const target = targetIdentityDigest !== undefined
     ? { targetIdentityDigest }
     : transport === API_SCENARIO_TRANSPORT && targetPagePath !== undefined
-      && isApiVerificationPagePath(targetPagePath, apiCreateReadListPagePathOf(scenario, evidence)) ? { targetPagePath } : null;
+      && isApiVerificationPagePath(targetPagePath, readListPagePathForWriteOf(scenario, evidence)) ? { targetPagePath } : null;
   if (target === null) {
     return null;
   }
-  // OP-REV6 の I-1: 一覧の画面は、実行のたびに違う値になる欄と比べる期待があるときだけ（判定は許可の発行と同じ部品の述語）。
-  const unique = new Set(inputs.uniqueEachRunFieldNames ?? []);
-  if (isListPageReadTarget(targetPagePath) && targetIdentityDigest === undefined
-    && !hasGeneratedValueExpectation(readVerification.expectations, (expectation) => 'fieldName' in expectation && unique.has(expectation.fieldName))) {
+  // OP-REV6 の I-1・LU-7 fix round 2: 一覧の画面は、実行のたびに違う値になる欄と比べる期待があるときだけ。一覧の行の更新は、行を選ぶ欄が台帳の登録の毎回違う欄の
+  // ときだけ（照合の READ の画面によらない）。判定は許可の発行と同じ唯一の判定。
+  // LU-12b: フォームの一覧の行の更新（形 B）も、行を選ぶ欄で判定する。
+  const listRowOfScenario = targetRecordId === null
+    ? null
+    : transport === API_SCENARIO_TRANSPORT ? scenario.api?.ledger?.listRow ?? null : scenario.update?.listRow ?? null;
+  if (readVerificationUniqueRejectionOf({
+    expectations: readVerification.expectations,
+    listPage: isListPageReadTarget(targetPagePath) && targetIdentityDigest === undefined,
+    uniqueEachRunFieldNames: inputs.uniqueEachRunFieldNames ?? [],
+    listRow: listRowOfScenario,
+    ledgerUniqueEachRunFieldNames: inputs.ledgerUniqueEachRunFieldNames,
+  }) !== null) {
     return null;
   }
   const bound: WorkerStartReadCheck = {
@@ -216,11 +364,19 @@ export const writeStartSpecOf = (inputs: WriteStartInputs): WorkerStartWrite | W
     if (api === undefined) {
       return null;
     }
+    // LU-8（設計書 5.5 の最後の段）: 一覧の行の更新は、書き込みの画面を一覧の画面の path のまま（番号を入れない）にし、行の選び方の指定を足す。
+    const listRow = targetRecordId === null ? undefined : api.ledger?.listRow;
     let formPath: string | null = evidence.page.path;
     if (targetRecordId !== null) {
-      formPath = api.ledger === null ? null : concretePathOfTemplate(api.ledger.formPathTemplate, targetRecordId);
+      formPath = api.ledger === null ? null : listRow !== undefined ? listRow.listPagePath : concretePathOfTemplate(api.ledger.formPathTemplate, targetRecordId);
     }
-    if (formPath === null) {
+    const keptKeyNames = (api.keptKeys ?? []).map(({ key }) => key);
+    const listRowStart = listRow === undefined || targetRecordId === null ? null : listRowStartOf(listRow, inputs, targetRecordId, keptKeyNames);
+    // DEF-198（設計書 5.9 の 3）: ほかの filter のある更新は、同じ点検の登録のページが決めた同じ名前の値を照らす値にする（取れなければ作らない。送らない）。
+    const otherFilterValues = targetRecordId === null ? [] : apiOtherFilterValuesOf(api, inputs.createPageKeyValues);
+    // DEF-203（設計書 5.10 の 1）: 台帳の登録の値と照らす鍵も、同じ出所の同じ名前の値にする（取れなければ作らない。送らない）。
+    const ledgerKeyValues = targetRecordId === null ? [] : apiLedgerKeyValuesOf(api, inputs.createPageKeyValues);
+    if (formPath === null || (listRow !== undefined && listRowStart === null) || otherFilterValues === null || ledgerKeyValues === null) {
       return null;
     }
     return {
@@ -246,7 +402,10 @@ export const writeStartSpecOf = (inputs: WriteStartInputs): WorkerStartWrite | W
       ...(targetRecordId === null ? {} : {
         update: {
           targetRecordId,
-          knownKeptValues: knownKeptValuesOf(inputs.ledgerWrites ?? [], targetRecordId, (api.keptKeys ?? []).map(({ key }) => key)),
+          knownKeptValues: knownKeptValuesOf(inputs.ledgerWrites ?? [], targetRecordId, keptKeyNames),
+          ...(listRowStart === null ? {} : { listRow: listRowStart }),
+          ...(otherFilterValues.length === 0 ? {} : { otherFilterValues: [...otherFilterValues] }),
+          ...(ledgerKeyValues.length === 0 ? {} : { ledgerKeyValues: [...ledgerKeyValues] }),
         },
       }),
     };
@@ -276,9 +435,13 @@ export const writeStartSpecOf = (inputs: WriteStartInputs): WorkerStartWrite | W
   }
   // T31f: UPDATE は、型に対象の ID を入れた具体的な path（CCX-28: 型の owner の `concretePathOfTemplate`）と、UPDATE の指定（値を持たない）。
   const { update } = scenario;
+  // LU-12b（設計書 5.5）: フォームの一覧の行の更新（形 B）は、書き込みの画面を一覧の画面の path のまま（番号を入れない）にし、送信先だけに台帳の番号を入れる。
+  // 行の選び方と、保つ欄ごとの台帳の最後の値（API の形の `knownKeptValues` と同じ考え方。ワーカーは、押した後に読んだ前の値がこれと同じときだけ送る）を足す。
+  const { listRow } = update;
   const actionPath = concretePathOfTemplate(update.actionPathTemplate, targetRecordId);
-  const formPath = concretePathOfTemplate(update.formPathTemplate, targetRecordId);
-  if (actionPath === null || formPath === null) {
+  const formPath = listRow === undefined ? concretePathOfTemplate(update.formPathTemplate, targetRecordId) : listRow.listPagePath;
+  const listRowStart = listRow === undefined ? null : formListRowStartOf(listRow, inputs, targetRecordId);
+  if (actionPath === null || formPath === null || (listRow !== undefined && (listRowStart === null || update.formPathTemplate !== listRow.listPagePath))) {
     return null;
   }
   return {
@@ -290,6 +453,10 @@ export const writeStartSpecOf = (inputs: WriteStartInputs): WorkerStartWrite | W
       templatedIdentityDigest: update.templatedIdentityDigest,
       changedFieldNames: [...scenario.fieldNames],
       keptFieldNames: [...update.keepFieldNames],
+      ...(listRowStart === null ? {} : {
+        knownKeptValues: knownKeptValuesOf(inputs.ledgerWrites ?? [], targetRecordId, update.keepFieldNames),
+        listRow: listRowStart,
+      }),
     },
   };
 };

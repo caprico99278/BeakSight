@@ -1,0 +1,11 @@
+{
+  "$id": "urn:beaksight:schema:control:ui-profile-display-name:1",
+  "description": "Local UI Server Function input (DN-1; profile display name design 2): save the name of a profile shown on the local UI screens. The profileId stays the identifier of the records, approvals and login settings. The rules of the name (1 to 80 characters after trimming, no line breaks or control characters) are owned by saveProfileDisplayName, which answers a rejection reason the screen explains.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["profileId", "displayName"],
+  "properties": {
+    "profileId": { "$ref": "urn:beaksight:schema:control:profile:1#/properties/profileId" },
+    "displayName": { "type": "string" }
+  }
+}

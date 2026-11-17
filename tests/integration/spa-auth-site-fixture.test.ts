@@ -1,5 +1,5 @@
 // T33b（Task 33 の設計書 3.2、6 章の G33 の 2）: スクリプトで送るログインの SPA の fixture（`tests/helpers/spa-auth-site-fixture.ts`）の振る舞いを、
-// Guard のない Playwright のブラウザ（テストの既定の headless と、CLI の起動の設定の Chromium の両方）で確かめる。BeakSight の部品は通さない（fixture
+// Guard のない Playwright のブラウザ（テストの既定の headless。TEST-SLIM）で確かめる。BeakSight の部品は通さない（fixture
 // そのものの確かめ。今の BeakSight の振る舞いは T33c）。
 // - ログイン（token の POST と、その事前確認がバックエンドに届く。ローカル ストレージに保存して `/admin` へ移る）、誤ったパスワードの誤りの表示、一覧、
 //   登録、更新（前の値の読み取り）、削除、論理削除、token の更新、RPC の読み取り、WebSocket、認証の Origin を分ける指定、敵対的なログインの要求の形、
@@ -7,7 +7,7 @@
 // fixture は 127.0.0.1 だけ。Chromium は headless だけ。値（資格情報・token・API の鍵）は出力しない。
 import type { Browser, BrowserContext, Page } from 'playwright';
 import { afterAll, afterEach, beforeAll, describe, expect, it } from 'vitest';
-import { launchCliChromium, launchHeadlessChromium } from '../helpers/chromium.js';
+import { DEFAULT_CHROMIUM_LAUNCHERS } from '../helpers/chromium.js';
 import {
   SPA_API_KEY_HEADER,
   SPA_APP_PATHS,
@@ -39,12 +39,6 @@ const EXISTING_NAME = '既存花子';
 const CREATED = Object.freeze({ name: '登録一郎', email: 'created0001@example.invalid', note: '登録の備考' });
 const UPDATED_NAME = '更新太郎';
 
-/** 確かめる 2 つの Chromium（テストの既定の headless と、CLI の起動の設定）。 */
-const BROWSERS: readonly (readonly [string, () => Promise<Browser>])[] = [
-  ['the default test Chromium', () => launchHeadlessChromium()],
-  ['the CLI Chromium', () => launchCliChromium()],
-];
-
 const passwordTokenPath = `${SPA_BACKEND_PATHS.token}?grant_type=${SPA_GRANT_TYPES.password}`;
 const refreshTokenPath = `${SPA_BACKEND_PATHS.token}?grant_type=${SPA_GRANT_TYPES.refresh}`;
 
@@ -60,7 +54,7 @@ const requestOf = (requests: readonly SpaAuthSiteRequest[], method: string, path
 const hasPreflight = (requests: readonly SpaAuthSiteRequest[], path: string): boolean =>
   requests.some((request) => request.preflight && request.method === 'OPTIONS' && request.path === path);
 
-describe.each(BROWSERS)('T33b: the SPA auth site fixture with %s (no Guard)', (_label, launch) => {
+describe.each(DEFAULT_CHROMIUM_LAUNCHERS)('T33b: the SPA auth site fixture with %s (no Guard)', (_label, launch) => {
   let browser: Browser | undefined;
   let context: BrowserContext | undefined;
   let site: SpaAuthSite | undefined;

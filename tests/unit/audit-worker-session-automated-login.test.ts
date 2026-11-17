@@ -11,7 +11,7 @@
 //   同じものを渡す（ワーカーの側では待たない。待つのは Run Coordinator の読み込みの前）。
 import { resolve } from 'node:path';
 import { afterEach, describe, expect, it } from 'vitest';
-import type { AuditRunDependencies, AuditRunOutcome } from '../../src/cli/audit-run.js';
+import type { AuditRunDependencies, AuditRunObserver, AuditRunOptions, AuditRunOutcome } from '../../src/cli/audit-run.js';
 import { CONFIG_ERROR_EXIT_CODE, EXIT_CODES, FAILURE_EXIT_CODE, INTERRUPTED_EXIT_CODE } from '../../src/cli/exit-codes.js';
 import { FORM_NAVIGATION_SETUP_ITEMS } from '../helpers/auth-setup-samples.js';
 import {AUTOMATED_LOGIN_MAX_LOGIN_ATTEMPTS, type AuthSetup } from '../../src/control/auth/auth-setup-contracts.js';
@@ -117,6 +117,7 @@ interface Run {
   readonly stageRequests: readonly WorkerAutomatedLoginStageRequest[];
   readonly manualCalls: number;
   readonly auditRuns: readonly AuditRunDependencies[];
+  readonly auditOptions: readonly AuditRunOptions[];
   /** 監査の中核が呼ばれた時刻（`Date.now()`）。 */
   readonly auditCalledAt: readonly number[];
   readonly discoveryRequests: readonly DiscoveryRunRequest[];
@@ -128,6 +129,12 @@ interface RunWorkerOptions {
   readonly minNavigationIntervalMs?: number;
   /** 発見の流れの偽物（`DISCOVERY` の `START` に使う）。 */
   readonly executeDiscovery?: (request: DiscoveryRunRequest) => Promise<DiscoveryRunOutcome>;
+  /** RB-6: 監査の中核の偽物（省略すると、すぐに `ranOutcome`）。`call` は 1 から。 */
+  readonly audit?: (call: number, observer: AuditRunObserver) => Promise<AuditRunOutcome>;
+  /** RB-6: ワーカーが送ったメッセージの受け手（親の返事を送る口を受ける）。 */
+  readonly onSent?: (message: WorkerToParentMessage, emit: (value: unknown) => void) => void;
+  /** RB-6: まとめて実行の段の流れ（READ の確かめ）を渡す（呼ばれない偽物）。 */
+  readonly chainFlows?: true;
 }
 
 const workers: AuditWorker[] = [];
@@ -149,6 +156,7 @@ async function runWorker(
   const channel: WorkerChannel = {
     send: (message) => {
       sent.push(message);
+      options.onSent?.(message, emit);
       return Promise.resolve(true);
     },
     onMessage: (listener) => {
@@ -159,6 +167,7 @@ async function runWorker(
   const stageRequests: WorkerAutomatedLoginStageRequest[] = [];
   const auditRuns: AuditRunDependencies[] = [];
   const auditCalledAt: number[] = [];
+  const auditOptions: AuditRunOptions[] = [];
   const discoveryRequests: DiscoveryRunRequest[] = [];
   let manualCalls = 0;
   const config = {
@@ -172,10 +181,11 @@ async function runWorker(
     exit: () => undefined,
     loadConfig: () => Promise.resolve(config),
     readTargetConfig: () => Promise.resolve(TARGET_CONFIG_BYTES),
-    executeAuditRun: (_config, dependencies) => {
+    executeAuditRun: (_config, dependencies, runOptions, observer) => {
       auditCalledAt.push(Date.now());
       auditRuns.push(dependencies);
-      return Promise.resolve(ranOutcome);
+      auditOptions.push(runOptions);
+      return options.audit?.(auditRuns.length, observer) ?? Promise.resolve(ranOutcome);
     },
     ...(executeDiscovery === undefined
       ? {}
@@ -185,6 +195,7 @@ async function runWorker(
           return executeDiscovery(request);
         },
       }),
+    ...(options.chainFlows === true ? { executeReadCheck: () => Promise.reject(new Error('not used')) } : {}),
     runDependencies: { launchBrowser: () => Promise.reject(new Error('not used')), clock: () => new Date(), now: () => Date.now() },
     runLoginStage: () => {
       manualCalls += 1;
@@ -200,7 +211,7 @@ async function runWorker(
   workers.push(worker);
   emit(start);
   const exitCode = await worker.exited;
-  return { sent, exitCode, stageRequests, manualCalls, auditRuns, auditCalledAt, discoveryRequests };
+  return { sent, exitCode, stageRequests, manualCalls, auditRuns, auditOptions, auditCalledAt, discoveryRequests };
 }
 
 const meaningful = (run: Run): WorkerToParentMessage[] => run.sent.filter(({ type }) => type !== 'HEARTBEAT' && type !== 'READY');
@@ -326,6 +337,46 @@ describe('audit worker session (DEF-099 fix round 1): the response after the log
       state: 'AUTOMATED_LOGIN_FAILED',
       automatedLogin: { result: 'AUTH_RESULT_UNKNOWN', submitted: 'YES', retryAfterUntil: null, formInvalidReason: null },
     }]);
+  });
+});
+
+// DEF-200（前の auth-jobs-fork の場面。RB-6）: まとめて実行の監査の段がセッションの切れで終わったら、親の `RELOGIN_STAGE` を受けて自動ログインをやり直し、同じ Run の
+// 続き（`startNew: false`）を、ログインし直した印と回数、新しい状態、ログインの段の pacer で始める。親の数え方と順は `control-stage-chain-relogin.test.ts`、印が
+// Run の実行の記録に入る形は契約の単体（`core-contracts`）。
+describe('audit worker session (DEF-200): signing in again in the chained audit', () => {
+  it('signs in again on RELOGIN_STAGE and continues the same Run with the mark, the count, the new state and the pacer of the login', async () => {
+    const relogged: AuthenticatedState = { ...STATE, origins: [] } as AuthenticatedState;
+    let finished = 0;
+    const run = await runWorker({ ...startOf('AUDIT'), chain: { stages: ['AUDIT', 'DISCOVERY', 'READ_CHECK'] } },
+      async () => ({ kind: 'AUTHENTICATED', state: finished === 0 ? STATE : relogged }), {
+        chainFlows: true,
+        executeDiscovery: () => Promise.reject(new Error('not used')),
+        audit: async (call, observer) => {
+          if (call === 1) {
+            observer.onNotice?.({ kind: 'AUTH_SESSION_LOST', url: `${ORIGIN}/admin/list` });
+          }
+          return { ...ranOutcome, summary: { incompleteReasons: [] } as unknown as RunSummaryView };
+        },
+        onSent: (message, emit) => {
+          if (message.type !== 'FINISHED') {
+            return;
+          }
+          finished += 1;
+          setImmediate(() => emit(finished === 1
+            ? { protocol: WORKER_PROTOCOL_VERSION, type: 'RELOGIN_STAGE', jobId: 'job-relogin', jobKind: 'AUDIT', count: 1 }
+            : { protocol: WORKER_PROTOCOL_VERSION, type: 'CHAIN_END' }));
+        },
+      });
+
+    expect(run.stageRequests).toHaveLength(2);
+    expect(run.manualCalls).toBe(0);
+    expect(run.auditOptions).toEqual([{ startNew: false }, { startNew: false, automaticRelogin: { count: 1 } }]);
+    expect(run.auditRuns[1]?.authentication?.initialState).toBe(relogged);
+    expect(run.auditRuns[1]?.navigationPacer).toBe(run.stageRequests[1]?.navigationPacer);
+    expect(meaningful(run).filter(({ type }) => type === 'AUTH_STATE').map((message) => (message.type === 'AUTH_STATE' ? message.state : null)))
+      .toEqual(['AUTHENTICATED', 'SESSION_LOST', 'AUTHENTICATED']);
+    expect(run.exitCode).toBe(EXIT_CODES.COMPLETE);
+    expect(run.sent.every((message) => validateWorkerToParentMessage(message).ok)).toBe(true);
   });
 });
 

@@ -45,7 +45,16 @@ const TEST_TIMEOUT_MS = 60_000;
 /** 開始の URL の path（ログインの画面の path と前方一致しない。今の案の成功の画面の path が残る形）。 */
 const START_PATH = '/dashboard';
 const CONTEXT: ProfileValidationContext = Object.freeze({ targetConfig: createTestConfig(TEST_ORIGIN, START_PATH) });
-const resolveContext: ProfileContextResolver = (path) => (path === TEST_TARGET_PATH ? CONTEXT : undefined);
+/** NL-3: このパソコンで動かすサイト（loopback）の対象の設定。 */
+const LOOPBACK_ORIGIN = 'http://127.0.0.1:4173';
+const LOOPBACK_TARGET_PATH = 'local/targets/example-loopback.json';
+const LOOPBACK_CONTEXT: ProfileValidationContext = Object.freeze({ targetConfig: createTestConfig(LOOPBACK_ORIGIN, START_PATH) });
+const resolveContext: ProfileContextResolver = (path) => {
+  if (path === TEST_TARGET_PATH) {
+    return CONTEXT;
+  }
+  return path === LOOPBACK_TARGET_PATH ? LOOPBACK_CONTEXT : undefined;
+};
 const OUTPUT_DIRECTORY_NAME = CONTEXT.targetConfig.output.directory;
 
 const documentFor = (overrides: Partial<EntryCheckDocument> = {}): EntryCheckDocument => ({
@@ -155,6 +164,7 @@ beforeEach(() => {
   workDirectory = mkdtempSync(join(tmpdir(), 'beaksight-control-entry-check-auth-setup-'));
   mkdirSync(dirname(join(workDirectory, TEST_TARGET_PATH)), { recursive: true });
   writeFileSync(join(workDirectory, TEST_TARGET_PATH), TARGET_CONFIG_TEXT, 'utf8');
+  writeFileSync(join(workDirectory, LOOPBACK_TARGET_PATH), TARGET_CONFIG_TEXT, 'utf8');
   database = openControlDatabase(resolveControlDatabasePath(workDirectory));
   forks.reset();
   expect(createProfile(database, testAuthProfile(PROFILE_ID, MIN_PROFILE_REVISION), { resolveContext }).ok).toBe(true);
@@ -399,5 +409,106 @@ describe('OP-1: the job manager starts the audit right after the entry check sta
     expect(jobManager.entryCheckFollowUpOf(started.job.jobId)).toBeNull();
     await jobManager.close();
     manager = undefined;
+  }, TEST_TIMEOUT_MS);
+});
+
+// NL-3（設計書 `2026-11-06-beaksight-no-login-test-site-design.md` 3.3 の 2）: 入口の確かめがログインの画面を見なかった、手動のログインで認証の設定のない
+// プロファイルは、ジョブの管理がプロファイルの次の改訂をログインなし（`NONE`）で保存し、続けて点検（まとめて実行）を始める。保存できるか（`approvedTestOrigins`
+// がすべて loopback か）は、プロファイルの検証が決める（loopback でなければ、今のとおり保存せず、点検も始めない。上の OP-1 の describe）。
+describe('NL-3: the job manager saves the profile without login after an entry check that did not see a login page', () => {
+  const LOOPBACK_PROFILE_ID = 'example-entry-loopback';
+  const notLoginPage = (): EntryCheckDocument => documentFor({
+    landing: { origin: LOOPBACK_ORIGIN, path: START_PATH, inAllowedOrigins: true },
+    facts: { ...(documentFor().facts as NonNullable<EntryCheckDocument['facts']>), loginPage: false },
+    proposal: null,
+  });
+  const createLoopbackProfile = (): void => {
+    expect(createProfile(database, {
+      ...testAuthProfile(LOOPBACK_PROFILE_ID, MIN_PROFILE_REVISION, LOOPBACK_ORIGIN),
+      targetConfigPath: LOOPBACK_TARGET_PATH,
+    }, { resolveContext }).ok).toBe(true);
+  };
+  const waitForSettled = async (jobManager: AuditJobManager, jobId: string): Promise<{ readonly state: string; readonly jobId?: string }> => {
+    const deadline = Date.now() + TEST_TIMEOUT_MS / 2;
+    for (;;) {
+      const followUp = jobManager.entryCheckFollowUpOf(jobId);
+      if (followUp !== null && followUp.state !== 'WAITING') {
+        return followUp;
+      }
+      if (Date.now() > deadline) {
+        throw new Error(`the follow up did not settle: ${JSON.stringify(followUp)}`);
+      }
+      await wait(FOLLOW_UP_POLL_MS);
+    }
+  };
+
+  it('saves the next revision with auth NONE on a loopback site and starts the chained audit', async () => {
+    createLoopbackProfile();
+    const jobManager = await managerWith(entryCheckWorker('no-login-loopback', notLoginPage()), 'no-login-loopback');
+    const started = await jobManager.startEntryCheck({ profileId: LOOPBACK_PROFILE_ID, expectedRevision: MIN_PROFILE_REVISION, thenStartAudit: true });
+    if (!started.ok) {
+      throw new Error(`the entry check job did not start: ${started.reason}`);
+    }
+    const followUp = await waitForSettled(jobManager, started.job.jobId);
+    expect(followUp.state).toBe('STARTED');
+    const stored = getProfile(database, LOOPBACK_PROFILE_ID)?.profile;
+    expect(stored).toMatchObject({ revision: MIN_PROFILE_REVISION + 1, auth: 'NONE', mode: 'TEST_AUTH_PASSIVE', approvedTestOrigins: [LOOPBACK_ORIGIN] });
+    expect(stored?.loginPreference).toBeUndefined();
+    expect(getAuthSetup(database, LOOPBACK_PROFILE_ID)).toBeNull();
+    expect(jobManager.getAuditJob(followUp.jobId ?? '')).toMatchObject({ jobKind: 'AUDIT', profileId: LOOPBACK_PROFILE_ID, profileRevision: MIN_PROFILE_REVISION + 1 });
+    expect(jobManager.getStageChainOfJob(followUp.jobId ?? '')?.chainId).toBe(followUp.jobId);
+    await jobManager.close();
+    manager = undefined;
+  }, TEST_TIMEOUT_MS);
+
+  it('keeps MANUAL_SESSION and does not start the audit on a site that is not loopback', async () => {
+    const jobManager = await managerWith(entryCheckWorker('no-login-remote', documentFor({
+      facts: { ...(documentFor().facts as NonNullable<EntryCheckDocument['facts']>), loginPage: false },
+      proposal: null,
+    })), 'no-login-remote');
+    const started = await jobManager.startEntryCheck({ profileId: PROFILE_ID, expectedRevision: MIN_PROFILE_REVISION, thenStartAudit: true });
+    if (!started.ok) {
+      throw new Error(`the entry check job did not start: ${started.reason}`);
+    }
+    expect(await waitForSettled(jobManager, started.job.jobId)).toEqual({ state: 'SKIPPED' });
+    expect(getProfile(database, PROFILE_ID)?.profile).toMatchObject({ revision: MIN_PROFILE_REVISION, auth: 'MANUAL_SESSION' });
+    expect(getAuthSetup(database, PROFILE_ID)).toBeNull();
+    await jobManager.close();
+    manager = undefined;
+  }, TEST_TIMEOUT_MS);
+
+  it('keeps MANUAL_SESSION and saves the auth setup proposal when a loopback site shows a login page', async () => {
+    createLoopbackProfile();
+    const document = documentFor({
+      landing: { origin: LOOPBACK_ORIGIN, path: '/login', inAllowedOrigins: true },
+      proposal: { ...documentFor().proposal!, loginStartUrl: `${LOOPBACK_ORIGIN}/login` },
+    });
+    const jobManager = await managerWith(entryCheckWorker('login-loopback', document), 'login-loopback');
+    const started = await jobManager.startEntryCheck({ profileId: LOOPBACK_PROFILE_ID, expectedRevision: MIN_PROFILE_REVISION });
+    if (!started.ok) {
+      throw new Error(`the entry check job did not start: ${started.reason}`);
+    }
+    await waitForJob(currentManager, started.job.jobId, isJobEnded);
+    await jobManager.close();
+    manager = undefined;
+    expect(getProfile(database, LOOPBACK_PROFILE_ID)?.profile).toMatchObject({ revision: MIN_PROFILE_REVISION, auth: 'MANUAL_SESSION' });
+    expect(getAuthSetup(database, LOOPBACK_PROFILE_ID)).not.toBeNull();
+  }, TEST_TIMEOUT_MS);
+
+  it('does not save when the user saved the profile while the job ran (the revision moved)', async () => {
+    createLoopbackProfile();
+    const jobManager = await managerWith(entryCheckWorker('no-login-moved', notLoginPage()), 'no-login-moved');
+    const started = await jobManager.startEntryCheck({ profileId: LOOPBACK_PROFILE_ID, expectedRevision: MIN_PROFILE_REVISION });
+    if (!started.ok) {
+      throw new Error(`the entry check job did not start: ${started.reason}`);
+    }
+    expect(updateProfile(database, {
+      profile: { ...testAuthProfile(LOOPBACK_PROFILE_ID, MIN_PROFILE_REVISION + 1, LOOPBACK_ORIGIN), targetConfigPath: LOOPBACK_TARGET_PATH },
+      expectedRevision: MIN_PROFILE_REVISION,
+    }, { resolveContext }).ok).toBe(true);
+    await waitForJob(currentManager, started.job.jobId, isJobEnded);
+    await jobManager.close();
+    manager = undefined;
+    expect(getProfile(database, LOOPBACK_PROFILE_ID)?.profile).toMatchObject({ revision: MIN_PROFILE_REVISION + 1, auth: 'MANUAL_SESSION' });
   }, TEST_TIMEOUT_MS);
 });

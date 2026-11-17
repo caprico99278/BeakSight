@@ -21,7 +21,7 @@ import { resolveControlDatabasePath } from '../../src/control/store/database-pat
 import { WORKER_PROTOCOL_VERSION, validateWorkerToParentMessage, type WorkerLoginObservation } from '../../src/control/worker-protocol.js';
 import { runLoginStage } from '../../src/worker/authenticated-login.js';
 import { runAutomatedLoginStage } from '../../src/worker/automated-login.js';
-import { launchCliChromium, launchHeadlessChromium } from '../helpers/chromium.js';
+import { BOTH_CHROMIUM_LAUNCHERS } from '../helpers/chromium.js';
 import { fastRunConfig } from '../helpers/run-harness.js';
 import {
   SPA_APP_PATHS,
@@ -36,10 +36,6 @@ import {
 } from '../helpers/spa-auth-site-fixture.js';
 import { createForkTestProfile } from '../helpers/worker-fork-support.js';
 
-const LAUNCHERS: readonly (readonly [string, () => Promise<Browser>])[] = [
-  ['the default test Chromium', () => launchHeadlessChromium()],
-  ['the CLI Chromium', () => launchCliChromium()],
-];
 const TEST_TIMEOUT_MS = 120_000;
 const UI_TIMEOUT_MS = 15_000;
 const LOGIN_TIMEOUT_MS = 30_000;
@@ -57,10 +53,12 @@ const EXPECTED_SHAPES = [
   { prefix: '', suffix: '.idToken' },
   { prefix: '', suffix: '.token' },
   { prefix: '', suffix: '/token' },
+  // LZ-3a: 鍵の名前の案の数の上限（前は 4）を撤廃したので、5 つ目の案も残す（名前を伏せた形だけ。利用者の名前は入らない）。
+  { prefix: '', suffix: ':token' },
 ];
-const EXPECTED_OMITTED = 3;
+const EXPECTED_OMITTED = 2;
 
-describe.each(LAUNCHERS)('T43R-fix C-1: the login observation keeps no user name (%s)', (_label, launch) => {
+describe.each(BOTH_CHROMIUM_LAUNCHERS)('T43R-fix C-1: the login observation keeps no user name (%s)', (_label, launch) => {
   let site: SpaAuthSite | undefined;
   let workDirectory: string | undefined;
   const browsers: Browser[] = [];

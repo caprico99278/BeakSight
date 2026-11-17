@@ -7,8 +7,7 @@
  *   ほかのファイルは、閉じたポートを作る補助を定義しない（名前が `closed`・`unused`・`free`・`unreachable` で始まり `Port`・`Origin` で終わる
  *   関数の定義）。サーバを閉じてそのポートを返す形（`.close(() => resolve(port))`）も数える。
  * - (b) CC-098: 初期化のスクリプトを 1 つだけ捨てる Browser の Proxy（`browserWithoutInitScript`）を呼ぶのは、テストの補助
- *   （`tests/helpers/browser-proxies.ts` の `browserWithoutWebRtcBlock`、`tests/helpers/chromium.ts` の
- *   `browserWithoutServiceWorkerRegistrationBlock`）だけ。テストは、その補助を import して使う（同じ Proxy の写しを止める）。
+ *   （`tests/helpers/chromium.ts` の `browserWithoutServiceWorkerRegistrationBlock`。RB-4b で WebRTC の補助は消した）だけ。テストは、その補助を import して使う（同じ Proxy の写しを止める）。
  * - (c) CC-067 の後半: ブラウザ自身の favicon の path（`/favicon.ico`）は、製品の `BROWSER_DEFAULT_FAVICON_PATH`
  *   （`src/safety/request-policy.ts`。テストは `tests/helpers/chromium.ts` から読める）を使う。テストとテストの補助に、ちょうど `/favicon.ico` の
  *   文字列リテラル（テンプレートは固定の部分ごと）を書かない。コメントと、ほかの文字を含む文字列（URL など）は数えない。
@@ -87,8 +86,6 @@ const filesWithInitScriptProxyText = (): readonly SourceFile[] => FILES
 const FAVICON_PATH_EXCEPTIONS: Readonly<Record<string, string>> = Object.freeze({
   'tests/helpers/automated-login-fixture.ts':
     'fixture のページが読み込む img の src（ブラウザ自身の要求と同じ形を作る。組 8 の範囲の fixture。組 S2 は触らない）。寄せたら消す',
-  'tests/integration/audit-send-worker-fork.test.ts':
-    'fork のテストのサイトの記録から除く path（組 6a の範囲の fork のテスト。組 S2 は触らない）。寄せたら消す',
 });
 
 const faviconPathLiteralsOf = (file: Pick<SourceFile, 'literals'>): readonly string[] =>
@@ -110,7 +107,6 @@ describe('Gate: the safety tests read the shared test helpers (PRE42-CC group S2
     const contentOf = (path: string): string => FILES.find((file) => file.path === path)?.content ?? '';
     expect(contentOf(CLOSED_PORT_OWNER)).toMatch(/^export async function closedLoopbackOrigin\(\): Promise<string> \{$/mu);
     expect(contentOf('tests/helpers/browser-proxies.ts')).toMatch(/^export function browserWithoutInitScript\(/mu);
-    expect(contentOf('tests/helpers/browser-proxies.ts')).toMatch(/^export const browserWithoutWebRtcBlock = /mu);
     expect(contentOf('tests/helpers/chromium.ts')).toMatch(/^export function browserWithoutServiceWorkerRegistrationBlock\(/mu);
     expect(contentOf('tests/helpers/chromium.ts')).toMatch(/^export \{ BROWSER_DEFAULT_FAVICON_PATH \} from '\.\.\/\.\.\/src\/safety\/request-policy\.js';$/mu);
   });

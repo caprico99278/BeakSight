@@ -1,0 +1,41 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <title>Inner scroll late heading fixture</title>
+  <style>
+    /* DEF-207: 文書は動かず、本文の入れ物（高さを決めた overflow:auto）だけが縦に動く。入れ物の下の方まで動かすと、見出しを遅れて描く。 */
+    html { height: 100%; overflow: hidden; }
+    body { height: 100%; margin: 0; overflow: hidden; font-family: sans-serif; }
+    #app-shell { box-sizing: border-box; height: 100%; overflow-y: auto; }
+    #app-shell > section { box-sizing: border-box; min-height: 900px; padding: 24px; }
+  </style>
+</head>
+<body>
+  <div id="app-shell">
+    <section><h1>Inner scroll late heading fixture</h1></section>
+    <section><p>Long content inside a main container that scrolls by itself.</p></section>
+  </div>
+  <script>
+    (() => {
+      const shell = document.querySelector('#app-shell');
+      let drawn = false;
+      const drawNearBottom = () => {
+        if (drawn) return;
+        const remaining = shell.scrollHeight - (shell.scrollTop + shell.clientHeight);
+        if (remaining > 180) return;
+        drawn = true;
+        setTimeout(() => {
+          const section = document.createElement('section');
+          section.dataset.lateSection = 'true';
+          const heading = document.createElement('h2');
+          heading.textContent = 'Late inner heading';
+          section.append(heading);
+          shell.append(section);
+        }, 10);
+      };
+      shell.addEventListener('scroll', drawNearBottom, { passive: true });
+    })();
+  </script>
+</body>
+</html>

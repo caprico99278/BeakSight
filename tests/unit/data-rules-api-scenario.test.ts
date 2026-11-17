@@ -17,7 +17,6 @@ import { generateScenarioData, type ScenarioDataInput } from '../../src/control/
 import { apiRequestShapeOf, type ApiRequestShape } from '../../src/core/api-request-shape.js';
 import type { DiscoveryCandidate } from '../../src/discovery/candidate-contracts.js';
 import { observedSubmissionProbeOf, type SubmissionProbeInputField } from '../../src/discovery/submission-probe-contracts.js';
-import { RULE_PROBLEM_DETAIL_DESCRIPTIONS } from '../../src/presentation/messages.js';
 import { ALL_CONFIRMED, PROFILE_ID, candidateOf, sampleScenario } from './approval-samples.js';
 import { BASE_DATE, ruleSetFor, seedInputFor } from './data-rule-scenario-samples.js';
 import { sampleFieldRule } from './data-rule-samples.js';
@@ -186,13 +185,10 @@ describe('T38e: the rules of an API scenario are looked up by the body key', () 
   });
 });
 
-describe('T38e: the two reasons are in the closed list, with the description and the action', () => {
-  it('lists PAGE_KEY_RULE_NOT_ALLOWED and JSON_VALUE_TYPE_MISMATCH under RULE_CONFLICT, and describes them', () => {
+describe('T38e: the two reasons are in the closed list', () => {
+  // SPEC-4: 規則の画面を外したので、細分ごとの説明の文言は捨てた（一覧の確かめだけを残す）。
+  it('lists PAGE_KEY_RULE_NOT_ALLOWED and JSON_VALUE_TYPE_MISMATCH under RULE_CONFLICT', () => {
     expect(RULE_CONFLICT_DETAILS).toEqual(expect.arrayContaining(['PAGE_KEY_RULE_NOT_ALLOWED', 'JSON_VALUE_TYPE_MISMATCH']));
-    for (const detail of ['PAGE_KEY_RULE_NOT_ALLOWED', 'JSON_VALUE_TYPE_MISMATCH'] as const) {
-      expect(RULE_PROBLEM_DETAIL_DESCRIPTIONS[detail].description.length).toBeGreaterThan(0);
-      expect(RULE_PROBLEM_DETAIL_DESCRIPTIONS[detail].action.length).toBeGreaterThan(0);
-    }
   });
 });
 

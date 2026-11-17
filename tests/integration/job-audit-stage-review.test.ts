@@ -1,5 +1,6 @@
 // T37R-fix-B（Task 37 の設計書 8 章の T37R の行。独立レビュー T37R の I-1・M-2・M-5）: 監査の段の口のある発見と READ の確かめのジョブ（本物の factory と
-// Guard）。自前の 127.0.0.1 のサーバ 2 つ（アプリと、承認したサービスの Origin）。Chromium はテストの既定の headless と、CLI の起動の設定の両方。
+// Guard）。自前の 127.0.0.1 のサーバ 2 つ（アプリと、承認したサービスの Origin）。Chromium はテストの既定の headless（probe の目印が届かない場面だけ、
+// CLI の起動の設定でも）。
 // - I-1: 送らずに観察する probe の押下でページが書き換えた localStorage（token を消す `tokenClear`、下書きを保存する `storageDraft`）を、次の Context へ
 //   受け継がない（閉じるときに渡す状態と鍵の消失の判定は、押す前に読んだ状態）。ジョブは COMPLETE のまま、probe の目印はサーバへ届かない。
 // - M-2: 登録した読み取りの手続きの呼び出しを回数の上限で止めた画面は、読み切れなかった画面（`SERVICE_READ_REFUSED`）になり、その候補は `MISSING` にならず、
@@ -25,20 +26,16 @@ import type { ReadEvidenceDocument } from '../../src/discovery/read-check-evalua
 import type { RunAuthentication } from '../../src/orchestration/authenticated-run.js';
 import { executeDiscoveryRun } from '../../src/worker/discovery-run.js';
 import { executeReadCheckRun } from '../../src/worker/read-check-run.js';
-import { launchCliChromium, launchHeadlessChromium } from '../helpers/chromium.js';
+import { BOTH_CHROMIUM_LAUNCHERS, DEFAULT_CHROMIUM_LAUNCHERS } from '../helpers/chromium.js';
 import { READ_METHODS } from '../helpers/leak-places.js';
-import { startLoopbackHttpServer, type LoopbackHttpServer } from '../helpers/loopback-server.js';
+import { settleLateDeliveries, startLoopbackHttpServer, type LoopbackHttpServer } from '../helpers/loopback-server.js';
 import { fastRunConfig } from '../helpers/run-harness.js';
+import { TEST_OBSERVATION_WINDOWS } from '../helpers/test-waits.js';
 
-const LAUNCHERS: readonly (readonly [string, () => Promise<Browser>])[] = [
-  ['the default test Chromium', () => launchHeadlessChromium()],
-  ['the CLI Chromium', () => launchCliChromium()],
-];
 const TEST_TIMEOUT_MS = 240_000;
 /** 各ジョブの後に、遅れて届く要求を待つ時間（ms）。 */
 const LATE_REQUEST_WAIT_MS = 1_000;
 const MAX_PAGES = 4;
-const LIMITS = Object.freeze({ perMinute: 120, perRun: 600 });
 /** ログインの状態の鍵の名前と値（匿名の仮の値）。 */
 const TOKEN_KEY = 'auth-token';
 const TOKEN_VALUE = 'token-value-example';
@@ -48,7 +45,7 @@ const LIST_RPC_PATH = '/rpc/list_members';
 /** I-2: 本文を遅らせる一覧の API と、その行（匿名の値）。 */
 const SLOW_LIST_API_PATH = '/members/slow';
 const SLOW_LIST_ROWS = Object.freeze([{ id: 1, name: '既存花子' }, { id: 2, name: '既存太郎' }]);
-/** I-2: 猶予（2 秒）の中の本文の遅れと、猶予を超える遅れ（ms）。 */
+/** I-2（DEF-265 で猶予を戻した）: 猶予（`DISCOVERY_RESPONSE_BODY_GRACE_MS`。2 秒）の中の本文の遅れと、猶予を超える遅れ（ms）。 */
 const BODY_DELAYS_WITHIN_GRACE: readonly number[] = [0, 400, 1_500];
 const BODY_DELAY_BEYOND_GRACE = 3_000;
 const HTTP_OK = 200;
@@ -60,6 +57,9 @@ const ON_CLICK: Readonly<Record<string, string>> = Object.freeze({
   tokenClear: `fetch(API + '/members', { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ name: input.value }) })
     .catch(() => localStorage.removeItem('${TOKEN_KEY}'));`,
   storageDraft: `localStorage.setItem('draft', input.value);
+    fetch(API + '/members', { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ name: input.value }) });`,
+  // DEF-233 fix round 1: 押下で、ログインの成功の鍵（token の鍵）の値を、欄の値（目印）を含む値に書き換える（A2 の重ねで、次の画面へ渡してはいけない）。
+  tokenOverwrite: `localStorage.setItem('${TOKEN_KEY}', 'tok-' + input.value);
     fetch(API + '/members', { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ name: input.value }) });`,
 });
 
@@ -75,7 +75,14 @@ const ON_LOAD: Readonly<Record<string, string>> = Object.freeze({
       .then((rows) => { document.getElementById('rows').innerHTML = rows.map((row) => '<tr><td>' + row.name + '</td></tr>').join(''); }).catch(() => 0);`,
   // 計測の送信（sendBeacon）だけ。
   beaconOnly: `navigator.sendBeacon(APP + '/rum', 'event=load');`,
+  // DEF-233 fix round 1: 読み込みのときに、token の鍵の値を API へ送る（次の画面へ渡った値がサーバに届くかを数える）。
+  tokenOverwrite: `fetch(API + '/members?token=' + encodeURIComponent(localStorage.getItem('${TOKEN_KEY}') ?? '')).catch(() => undefined);`,
 });
+/**
+ * DEF-239（DEF-208-4 の後の直し）: 2 画面目の path。1 画面目（`/s/<場面>/1/edit`）と同じ型にならない path にする（同じ型の画面は 1 つだけ読む決まりで、
+ * 2 画面目を読まなくなるため）。
+ */
+const secondPagePathOf = (scenario: string): string => `/s/${scenario}/next`;
 
 interface Logged {
   readonly server: 'app' | 'api';
@@ -84,7 +91,8 @@ interface Logged {
 }
 const noObserver = { onRunStarted: (): void => undefined, onSessionLost: (): void => undefined };
 
-describe.each(LAUNCHERS)('T37R-fix-B: the audit stage of the jobs (the review findings) with %s', (_label, launch) => {
+/** 場面の支度（2 つのサーバと作業のフォルダ）と、場面が使う道具（describe の中で呼ぶ）。 */
+const useReviewJobs = (launch: () => Promise<Browser>) => {
   let app: LoopbackHttpServer;
   let api: LoopbackHttpServer;
   let workDirectory = '';
@@ -94,7 +102,7 @@ describe.each(LAUNCHERS)('T37R-fix-B: the audit stage of the jobs (the review fi
   const pageHtml = (scenario: string, page: number): string => `<!doctype html><html lang="ja"><head><meta charset="utf-8"><title>編集</title></head><body>
 <main><h1>編集</h1><table><tbody id="rows"><tr><td>既存花子</td></tr></tbody></table>
 <div id="box"><label>名前 <input type="text" id="name" aria-label="名前"></label><button type="button" id="save">保存</button></div>
-${page === 1 ? `<a href="/s/${scenario}/2/edit">次</a>` : ''}</main>
+${page === 1 ? `<a href="${secondPagePathOf(scenario)}">次</a>` : ''}</main>
 <script>
 const API = ${JSON.stringify(api.origin)};
 const APP = ${JSON.stringify(app.origin)};
@@ -139,9 +147,9 @@ document.getElementById('save').addEventListener('click', () => { ${ON_CLICK[sce
       request.resume();
       log.push({ server: 'app', method: request.method ?? '', url: request.url ?? '' });
       const pathname = new URL(request.url ?? '/', 'http://x').pathname;
-      const match = /^\/s\/([A-Za-z]+)\/([12])\/edit$/u.exec(pathname);
+      const match = /^\/s\/([A-Za-z]+)\/(?:(1)\/edit|next)$/u.exec(pathname);
       if (match !== null && request.method === 'GET') {
-        response.writeHead(HTTP_OK, { 'content-type': 'text/html; charset=utf-8' }).end(pageHtml(match[1] ?? '', Number(match[2])));
+        response.writeHead(HTTP_OK, { 'content-type': 'text/html; charset=utf-8' }).end(pageHtml(match[1] ?? '', match[2] === '1' ? 1 : 2));
         return;
       }
       const slow = /^\/list\/([0-9]+)$/u.exec(pathname);
@@ -163,9 +171,7 @@ document.getElementById('save').addEventListener('click', () => { ${ON_CLICK[sce
     const auditStage: AuditStageServiceRequests = {
       approvedServiceOrigins: [api.origin],
       auditReadRequests: reads.map((path) => ({ origin: api.origin, path, method: 'POST', maxPerPageLoad: 1 })),
-      scriptLogin: { origin: api.origin, path: '/token', requiredQuery: [{ name: 'grant_type', value: 'password' }] },
-      serviceRequestLimits: LIMITS,
-    };
+      scriptLogin: { origin: api.origin, path: '/token', requiredQuery: [{ name: 'grant_type', value: 'password' }] },    };
     const authentication: RunAuthentication = {
       initialState: { cookies: [], origins: [{ origin: app.origin, localStorage: [{ name: TOKEN_KEY, value: TOKEN_VALUE }] }] },
       approvedTestOrigins: [app.origin],
@@ -174,6 +180,8 @@ document.getElementById('save').addEventListener('click', () => { ${ON_CLICK[sce
       filterState: filterAuthenticatedState,
       auditStage,
       sessionKeyPresent: (state) => state.origins.some((origin) => origin.localStorage.some((item) => item.name === TOKEN_KEY)),
+      // DEF-233: 成功の鍵の名前の判定（A2 の重ねを働かせる。ワーカーと同じく、鍵の形があるプロファイル）。
+      sessionKeyName: (_origin, name) => name === TOKEN_KEY,
     };
     const path = `/s/${scenario}/1/edit`;
     const base = fastRunConfig(app.origin, path, {
@@ -186,12 +194,14 @@ document.getElementById('save').addEventListener('click', () => { ${ON_CLICK[sce
     const { config, authentication } = setup(scenario, reads);
     const outcome = await executeDiscoveryRun({
       config, jobId: `job-discovery-${runCount}`, authentication, launchBrowser: launch, clock: () => new Date(), now: () => Date.now(),
-      stopSignal: new AbortController().signal,
+      // SLIM-2（X2）: probe の観察はテストの短い値（本番の値は `production-wait-values` と Gate (n)(p)）。
+      stopSignal: new AbortController().signal, observationWindows: TEST_OBSERVATION_WINDOWS,
     }, noObserver);
     if (outcome.kind !== 'RAN') {
       throw new Error(`the discovery did not run: ${outcome.kind}`);
     }
-    await wait(LATE_REQUEST_WAIT_MS);
+    // SLIM-2（X1）: 流れは Browser を閉じて終わる。閉じた後の待ちは、サーバが静まるまで。
+    await settleLateDeliveries(LATE_REQUEST_WAIT_MS, app, api);
     return JSON.parse(readFileSync(join(outcome.runDirectory, 'discovery.json'), 'utf8')) as DiscoveryDocument;
   };
 
@@ -211,7 +221,7 @@ document.getElementById('save').addEventListener('click', () => { ${ON_CLICK[sce
     if (outcome.kind !== 'RAN') {
       throw new Error(`the READ check did not run: ${outcome.kind}`);
     }
-    await wait(LATE_REQUEST_WAIT_MS);
+    await settleLateDeliveries(LATE_REQUEST_WAIT_MS, app, api);
     return JSON.parse(readFileSync(join(outcome.runDirectory, 'read-evidence.json'), 'utf8')) as ReadEvidenceDocument;
   };
 
@@ -238,6 +248,42 @@ document.getElementById('save').addEventListener('click', () => { ${ON_CLICK[sce
   const resultsOf = (document: ReadEvidenceDocument): readonly string[] =>
     document.checks.map((check) => (check.state === 'EXECUTED' ? check.result : check.state));
 
+  const readPaths = (document: DiscoveryDocument): readonly string[] =>
+    document.pages.flatMap((page) => (page.state === 'READ' ? [new URL(page.url).pathname] : []));
+  const reasonsOf = (document: DiscoveryDocument, path: string): readonly string[] => {
+    const page = document.pages.find((entry) => entry.state === 'READ' && new URL(entry.url).pathname === path);
+    return page?.state === 'READ' ? page.record.incompleteReasons : [];
+  };
+
+  return { log, discover, pageReadCheck, slowListReadCheck, resultsOf, readPaths, reasonsOf };
+};
+
+// TEST-SLIM M4: probe の押下で書いた目印と、読み取りでない要求がサーバに届かない場面は、2 つの Chromium で流す（安全の漏れの確かめ）。
+describe.each(BOTH_CHROMIUM_LAUNCHERS)('T37R-fix-B: the audit stage of the jobs (the probe press leaks nothing) with %s', (_label, launch) => {
+  const { log, discover, readPaths } = useReviewJobs(launch);
+
+  // DEF-233 fix round 1: `tokenOverwrite` は、押下で成功の鍵の値を目印を含む値に書き換える場面（A2 の重ねでも渡さない）。
+  it.each(['tokenClear', 'storageDraft', 'tokenOverwrite'])('does not carry over what the probe press wrote (%s): COMPLETE, no marker at the server', async (scenario) => {
+    const start = log.length;
+    const document = await discover(scenario);
+    expect(document.endReason).toBe('COMPLETED');
+    expect(document.endReasonDetail).toBeUndefined();
+    expect(readPaths(document)).toEqual([`/s/${scenario}/1/edit`, secondPagePathOf(scenario)]);
+    expect(document.runStatus).toBe('COMPLETE');
+    await wait(LATE_REQUEST_WAIT_MS);
+    const reached = log.slice(start);
+    expect(reached.filter(({ url }) => url.includes(PROBE_MARKER_PREFIX))).toEqual([]);
+    if (scenario === 'tokenOverwrite') {
+      // 2 画面目も、押す前の token の値で読んだ（1 画面目と 2 画面目の読み込みで、押す前の値がサーバに届いた）。
+      expect(reached.filter(({ url }) => url.includes(`token=${TOKEN_VALUE}`)).length).toBe(2);
+    }
+    expect(reached.filter(({ method }) => !READ_METHODS.has(method))).toEqual([]);
+  }, TEST_TIMEOUT_MS);
+});
+
+describe.each(DEFAULT_CHROMIUM_LAUNCHERS)('T37R-fix-B: the audit stage of the jobs (the review findings) with %s', (_label, launch) => {
+  const { discover, pageReadCheck, slowListReadCheck, resultsOf, reasonsOf } = useReviewJobs(launch);
+
   it.each(BODY_DELAYS_WITHIN_GRACE)('waits for a body %i ms late within the grace, and the page READ is MATCHED (I-2)', async (delayMs) => {
     const evidence = await slowListReadCheck(delayMs);
     expect(resultsOf(evidence)).toEqual(['MATCHED']);
@@ -249,46 +295,12 @@ document.getElementById('save').addEventListener('click', () => { ${ON_CLICK[sce
     expect(resultsOf(evidence)).toEqual(['NOT_MATCHED']);
   }, TEST_TIMEOUT_MS);
 
-  const readPaths = (document: DiscoveryDocument): readonly string[] =>
-    document.pages.flatMap((page) => (page.state === 'READ' ? [new URL(page.url).pathname] : []));
-  const reasonsOf = (document: DiscoveryDocument, path: string): readonly string[] => {
-    const page = document.pages.find((entry) => entry.state === 'READ' && new URL(entry.url).pathname === path);
-    return page?.state === 'READ' ? page.record.incompleteReasons : [];
-  };
-
-  it.each(['tokenClear', 'storageDraft'])('does not carry over what the probe press wrote (%s): COMPLETE, no marker at the server', async (scenario) => {
-    const start = log.length;
-    const document = await discover(scenario);
-    expect(document.endReason).toBe('COMPLETED');
-    expect(document.endReasonDetail).toBeUndefined();
-    expect(readPaths(document)).toEqual([`/s/${scenario}/1/edit`, `/s/${scenario}/2/edit`]);
-    expect(document.runStatus).toBe('COMPLETE');
-    await wait(LATE_REQUEST_WAIT_MS);
-    const reached = log.slice(start);
-    expect(reached.filter(({ url }) => url.includes(PROBE_MARKER_PREFIX))).toEqual([]);
-    expect(reached.filter(({ method }) => !READ_METHODS.has(method))).toEqual([]);
-  }, TEST_TIMEOUT_MS);
-
-  it('marks the page where the registered call was stopped over the limit as not read in full (M-2)', async () => {
+  // M-2 は、1 回の読み込みで登録した呼び出しの回数の上限を超えた画面の印だった。L11（設計書 `2026-11-09-beaksight-remove-limits-design.md` 4）で
+  // 読み込みあたりの回数を数えなくなったので、同じ読み込みの 2 回目の呼び出しも通り、その画面は読み切れたものとする。
+  it('passes the second registered call of the same load, and does not mark the page as not read in full (M-2 after L11)', async () => {
     const document = await discover('rpcTwice', [LIST_RPC_PATH]);
-    expect(reasonsOf(document, '/s/rpcTwice/1/edit')).toContain('SERVICE_READ_REFUSED');
-    expect(document.authentication?.registeredReadRequestsAllowed).toBeGreaterThan(0);
-    // 候補の READ: 候補が見つからなくても、その画面では消えたと言わない（`READ_CANDIDATE_DRIFTED` でなく `UNDETERMINED`）。
-    const { config, authentication } = setup('rpcTwice', [LIST_RPC_PATH]);
-    const outcome = await executeReadCheckRun({
-      config, jobId: `job-read-${runCount}`, authentication, launchBrowser: launch, clock: () => new Date(), now: () => Date.now(),
-      stopSignal: new AbortController().signal,
-      readChecks: [{
-        readCheckId: 'read-1', readCheckRevision: 1, targetPage: { origin: app.origin, path: '/s/rpcTwice/1/edit' },
-        definition: { targetIdentityDigest: `sha256:${'0'.repeat(64)}`, parameters: {}, expectations: [{ kind: 'ROW_COUNT_AT_LEAST', count: 1 }] },
-      }],
-    }, noObserver);
-    if (outcome.kind !== 'RAN') {
-      throw new Error(`the READ check did not run: ${outcome.kind}`);
-    }
-    const evidence = JSON.parse(readFileSync(join(outcome.runDirectory, 'read-evidence.json'), 'utf8')) as ReadEvidenceDocument;
-    expect(evidence.checks.map((check) => (check.state === 'EXECUTED' ? [check.result, check.detail] : [check.state])))
-      .toEqual([['UNDETERMINED', 'TARGET_PAGE_UNREADABLE']]);
+    expect(reasonsOf(document, '/s/rpcTwice/1/edit')).not.toContain('SERVICE_READ_REFUSED');
+    expect(document.authentication?.registeredReadRequestsAllowed).toBeGreaterThan(1);
   }, TEST_TIMEOUT_MS);
 
   // T37R-fix-B2（設計書 8 章の最後の行。M-5 の既定の取り下げ）: 許可 Origin への `fetch`・`xhr` の読み取りでない要求を止めた数は、成果物に残すが、

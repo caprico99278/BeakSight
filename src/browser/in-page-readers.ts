@@ -12,6 +12,30 @@
 //   書き換えて結果を偽れる（DEF-087。今までと同じ限界）。偽れないのは isolated world（`readInIsolatedWorld`）で動かした場合。
 // - `getOwnPropertyDescriptor` を書くのは、このファイルだけ（Gate `in-page-readers-ownership`）。
 // - このファイルは Playwright を読み込まない（型も使わない）。どの層からでも import できる。
+// - CC-128・CC-129（2026-11-06）: 枠の landmark の判定（`isLayoutLandmark`）と、要素が描く面の事実の読み方（`ownSurfaceFactsOf`）も、ここで 1 か所に持つ。
+//   部品は呼ばれた関数の中に本文として入るので、読み取りが main world か isolated world かは、呼ぶ側の今までのまま変わらない。
+
+import type { LoadingIndicatorEvidence } from '../core/evidence-types.js';
+import type { OwnSurfaceFacts } from '../core/own-surface.js';
+import type { DestructiveActionFacts } from '../discovery/destructive-action.js';
+import type { StateStructureField } from '../discovery/state-keys.js';
+
+/** DEF-208-4（A）・SLK-1: 共通の枠の目印の基準（目印にする要素の名前と role、本文の印にする要素の名前と role、区分の中では目印にしない要素と区分の selector）。 */
+export interface LayoutLandmarkCriteria {
+  readonly layoutNames: readonly string[];
+  readonly layoutRoles: readonly string[];
+  readonly bodyNames: readonly string[];
+  readonly bodyRoles: readonly string[];
+  readonly scopedNames: readonly string[];
+  readonly sectioningScopeSelector: string;
+}
+
+/** COV-1・SLK-1: 見える欄の読み取りの基準（見え方の確かめの指定、欄の selector、受ける input の型）。 */
+export interface StateFieldCriteria {
+  readonly visibilityOptions: CheckVisibilityOptions;
+  readonly fieldSelector: string;
+  readonly fieldTypes: readonly string[];
+}
 
 /**
  * ページの中で使う、標準の prototype の getter で読む部品。どれも、ページの中で `createStandardReadersInPage` が作る。
@@ -65,6 +89,71 @@ export interface StandardReaders {
    * 欄の読み取り（`src/worker/entry-check-page.ts`）と、ログインの段の観察（`src/worker/login-stage-observation.ts`）が共有する。
    */
   readonly isVisible: (element: Element) => boolean;
+  /**
+   * CC-128: 要素が、枠の landmark（`names` の要素の名前か `roles` の role）か。ARIA の決まり（HTML-AAM）で見る: 明示の `role` がある要素は `role` だけで
+   * 決める。`scopedNames` の要素（`header`・`footer`）は、親から上が区分の要素（`sectioningScopeSelector`）の中にないときだけ landmark にする。
+   * 通知の枠の見分け（`src/interaction/notification-overlay.ts`）と、操作さがしの共通の枠の目印（`src/interaction/submission-probe.ts`）が共有する。
+   * 祖先のたどり方は呼ぶ側が持つ（この部品は要素 1 つを見る）。
+   */
+  readonly isLayoutLandmark: (
+    element: Element,
+    names: readonly string[],
+    roles: readonly string[],
+    scopedNames: readonly string[],
+    sectioningScopeSelector: string,
+  ) => boolean;
+  /**
+   * DEF-208-4（A）・SLK-1: 要素の祖先の、共通の枠の目印（`criteria` の名前と role。判定は `isLayoutLandmark`。内から外の順に `名前[role]`）と、その最も外の
+   * 要素（共通の枠の部分）。祖先に本文の印（`criteria.bodyNames`・`bodyRoles`）があれば、目印なし（空と `null`）。操作さがしの共通の枠の目印の読み取りと、
+   * 枠の部分の事実の読み取りが共有する。
+   */
+  readonly layoutLandmarksOf: (element: Element, criteria: LayoutLandmarkCriteria) => { readonly landmarks: string[]; readonly frame: Element | null };
+  /**
+   * COV-1・SLK-1: `root`（文書か要素）の中の見える欄の事実（名前・型・必須・無効・選択肢の値。文字の値は読まない）。状態の構造の鍵の読み取りと、共通の枠の
+   * 部分の事実の読み取りが共有する。
+   */
+  readonly visibleStateFieldsIn: (root: Document | Element, input: StateFieldCriteria) => StateStructureField[];
+  /** COV-1・SLK-1: `root`（文書か要素）の中の見える見出し（h1〜h6）の段（文書の順）。 */
+  readonly visibleHeadingLevelsIn: (root: Document | Element, visibilityOptions: CheckVisibilityOptions) => number[];
+  /**
+   * CC-129: 要素そのものが描く面の事実（`OwnSurfaceFacts` の、`replacedContent` を除いた項目。判定は Node の側の `paintsOwnSurfaceOf`）。計算値は
+   * 呼ぶ側が取った `style`（その要素の `getComputedStyle`）から読む。自分の文字は、子のノードが `maxOwnTextNodeScan` を超えたら、あるものとして扱う。
+   * 固定の要素の収集（`src/evidence/layout-collector.ts`）と、通知の枠の読み取り（`src/interaction/notification-overlay.ts`）が共有する。
+   */
+  readonly ownSurfaceFactsOf: (element: Element, style: CSSStyleDeclaration, maxOwnTextNodeScan: number) => Omit<OwnSurfaceFacts, 'replacedContent'>;
+  /**
+   * SD-1（設計書 `2026-11-16-beaksight-action-based-delete-guard-design.md` 2.2）: 操作の前の判定（Node の側の `isDestructiveAction`）に渡す、要素の事実（名前・
+   * method・送り先・選ばれた選択肢・行・枠・確かめの枠の文）。知らせの枠の読み取り・Interaction の候補の読み取り・発見の押す前の確かめが共有する。配列の
+   * 反復子を使うので、isolated world の読み取り（ページの JS が配列の関数を書き換えられない）からだけ呼ぶ。
+   */
+  readonly destructiveActionFactsOf: (element: Element) => DestructiveActionFacts;
+  /**
+   * EV-1（設計書 `2026-11-16-beaksight-finding-evidence-design.md` 3.1）: 要素のスクロールの祖先（内から外の順）。`overflow-x` か `overflow-y` が `auto`・`scroll`・
+   * `overlay` で、その方向の内容が箱より大きい祖先。文書の根・body・`scrollingElement` は含めない（文書のスクロールは別に読む）。固定の枠の覆いの判定（layout の
+   * 読み取り）と、フォーカスの確かめの前と後の位置（フォーカスの確かめの読み取り）が共有する。
+   */
+  readonly scrollAncestorsOf: (element: Element) => Element[];
+  /**
+   * EV-1: 要素の selector（id があれば `#id`、なければ、文書の根の下からの `名前:nth-of-type(n)` の並び。段は `maxDepth` まで）。フォーカスの確かめの読み取りが使う
+   * （layout の読み取りは、番号を親ごとに覚える自分の書き方を使う）。
+   */
+  readonly selectorOf: (element: Element, maxDepth: number) => string;
+  /**
+   * EV-2（設計書 `2026-11-16-beaksight-finding-evidence-design.md` 3.2）: hit-test の点の作り方の 1 か所。矩形のビューポートの中の部分の中心と、内側へ `insetPx`
+   * （部分の幅・高さの 4 分の 1 まで）寄せた四隅。ビューポートの中に部分がなければ点なし。layout の読み取り（固定の要素の重なり）・フォーカスの確かめ・対象まで
+   * 動かして撮る部品が共有する。
+   */
+  readonly hitPointsOf: (
+    area: { readonly left: number; readonly top: number; readonly right: number; readonly bottom: number },
+    viewportWidth: number,
+    viewportHeight: number,
+    insetPx: number,
+  ) => (readonly [number, number])[];
+  /**
+   * EV-1・EV-3: 文書の中の、見えている読み込み中の表示の数（`LoadingIndicatorEvidence`。見えて、大きさが 0 でなく、文書の範囲に入るもの）。DOM の読み取り
+   * （その状態の記録）と、落ち着きの待ち（準備の状態）が共有する。
+   */
+  readonly loadingIndicatorsIn: (visibilityOptions: CheckVisibilityOptions) => LoadingIndicatorEvidence;
 }
 
 /**
@@ -190,9 +279,355 @@ function createStandardReadersInPage(): StandardReaders {
     const height: unknown = standardProperty(DOMRectReadOnly.prototype, 'height', rect);
     return typeof width === 'number' && typeof height === 'number' && width > 0 && height > 0;
   };
+  const isLayoutLandmark = (
+    element: Element,
+    names: readonly string[],
+    roles: readonly string[],
+    scopedNames: readonly string[],
+    sectioningScopeSelector: string,
+  ): boolean => {
+    const roleValue: unknown = Element.prototype.getAttribute.call(element, 'role');
+    const role = typeof roleValue === 'string' ? roleValue.trim().toLowerCase() : '';
+    if (role !== '') return roles.includes(role);
+    const name = standardGetter<string>(Element.prototype, 'localName')(element);
+    if (!names.includes(name)) return false;
+    if (!scopedNames.includes(name)) return true;
+    const parent = standardGetter<Element | null>(Node.prototype, 'parentElement')(element);
+    return parent === null || Element.prototype.closest.call(parent, sectioningScopeSelector) === null;
+  };
+  const layoutLandmarksOf = (element: Element, criteria: LayoutLandmarkCriteria): { landmarks: string[]; frame: Element | null } => {
+    const localNameOf = standardGetter<string>(Element.prototype, 'localName');
+    const parentOf = standardGetter<Element | null>(Node.prototype, 'parentElement');
+    const landmarks: string[] = [];
+    let frame: Element | null = null;
+    for (let node: Element | null = parentOf(element); node !== null; node = parentOf(node)) {
+      const name = localNameOf(node);
+      const roleValue: unknown = Element.prototype.getAttribute.call(node, 'role');
+      const role = typeof roleValue === 'string' ? roleValue.trim().toLowerCase() : '';
+      if (criteria.bodyNames.includes(name) || criteria.bodyRoles.includes(role)) return { landmarks: [], frame: null };
+      // NO-2（ARIA の決まり。通知の枠の見分け方と同じ）: 明示の role がある要素は role だけで決める。header・footer は、区分の要素の中では枠の目印にしない。
+      if (isLayoutLandmark(node, criteria.layoutNames, criteria.layoutRoles, criteria.scopedNames, criteria.sectioningScopeSelector)) {
+        landmarks.push(name + '[' + role + ']');
+        frame = node;
+      }
+    }
+    return { landmarks, frame };
+  };
+  const eachIn = (root: Document | Element, selector: string, visit: (element: Element) => void): void => {
+    const nodeListLengthOf = standardGetter<number>(NodeList.prototype, 'length');
+    const list = root instanceof Document ? Document.prototype.querySelectorAll.call(root, selector) : Element.prototype.querySelectorAll.call(root, selector);
+    const length = nodeListLengthOf(list);
+    for (let index = 0; index < length; index += 1) {
+      const item = NodeList.prototype.item.call(list, index);
+      if (item instanceof Element) visit(item);
+    }
+  };
+  const visibleStateFieldsIn = (root: Document | Element, input: StateFieldCriteria): StateStructureField[] => {
+    const localNameOf = standardGetter<string>(Element.prototype, 'localName');
+    const inputTypeOf = standardGetter<string>(HTMLInputElement.prototype, 'type');
+    const selectTypeOf = standardGetter<string>(HTMLSelectElement.prototype, 'type');
+    const selectOptionsOf = standardGetter<unknown>(HTMLSelectElement.prototype, 'options');
+    const collectionLengthOf = standardGetter<number>(HTMLCollection.prototype, 'length');
+    const optionValueOf = standardGetter<string>(HTMLOptionElement.prototype, 'value');
+    const attributeOf = (element: Element, name: string): string | null => {
+      const value: unknown = Element.prototype.getAttribute.call(element, name);
+      return typeof value === 'string' ? value : null;
+    };
+    const fields: StateStructureField[] = [];
+    eachIn(root, input.fieldSelector, (element) => {
+      if (!Element.prototype.checkVisibility.call(element, input.visibilityOptions)) return;
+      const name = localNameOf(element);
+      const type = name === 'input' ? inputTypeOf(element) : (name === 'textarea' ? 'textarea' : selectTypeOf(element));
+      if (name === 'input' && !input.fieldTypes.includes(type)) return;
+      let optionValues: string[] | null = null;
+      if (name === 'select') {
+        const options = selectOptionsOf(element);
+        const length = collectionLengthOf(options);
+        optionValues = [];
+        for (let index = 0; index < length; index += 1) {
+          const option = HTMLCollection.prototype.item.call(options as HTMLCollection, index);
+          if (option !== null) optionValues.push(optionValueOf(option));
+        }
+      } else if (type === 'radio' || type === 'checkbox') {
+        optionValues = [attributeOf(element, 'value') ?? 'on'];
+      }
+      fields.push({
+        name: attributeOf(element, 'name') ?? '',
+        type,
+        required: Element.prototype.hasAttribute.call(element, 'required'),
+        disabled: Element.prototype.matches.call(element, ':disabled'),
+        optionValues,
+      });
+    });
+    return fields;
+  };
+  const visibleHeadingLevelsIn = (root: Document | Element, visibilityOptions: CheckVisibilityOptions): number[] => {
+    const localNameOf = standardGetter<string>(Element.prototype, 'localName');
+    const levels: number[] = [];
+    eachIn(root, 'h1, h2, h3, h4, h5, h6', (element) => {
+      if (Element.prototype.checkVisibility.call(element, visibilityOptions)) levels.push(Number(localNameOf(element).slice(1)));
+    });
+    return levels;
+  };
+  const ownSurfaceFactsOf = (element: Element, style: CSSStyleDeclaration, maxOwnTextNodeScan: number): Omit<OwnSurfaceFacts, 'replacedContent'> => {
+    const childNodesOf = standardGetter<NodeList>(Node.prototype, 'childNodes');
+    const nodeListLengthOf = standardGetter<number>(NodeList.prototype, 'length');
+    const nodeTypeOf = standardGetter<number>(Node.prototype, 'nodeType');
+    const characterDataOf = standardGetter<string>(CharacterData.prototype, 'data');
+    const hasOwnTextOf = (): boolean => {
+      const children = childNodesOf(element);
+      const length = nodeListLengthOf(children);
+      if (length > maxOwnTextNodeScan) return true;
+      for (let index = 0; index < length; index += 1) {
+        const child = NodeList.prototype.item.call(children, index);
+        if (child !== null && nodeTypeOf(child) === Node.TEXT_NODE && characterDataOf(child).trim().length > 0) return true;
+      }
+      return false;
+    };
+    const hasPseudoContentOf = (): boolean => ['::before', '::after'].some((pseudo) => {
+      const content = window.getComputedStyle(element, pseudo).content;
+      return content !== 'none' && content !== 'normal' && content !== '';
+    });
+    return {
+      backgroundColor: style.backgroundColor,
+      backgroundImage: style.backgroundImage,
+      borderWidths: [style.borderTopWidth, style.borderRightWidth, style.borderBottomWidth, style.borderLeftWidth],
+      borderStyles: [style.borderTopStyle, style.borderRightStyle, style.borderBottomStyle, style.borderLeftStyle],
+      borderColors: [style.borderTopColor, style.borderRightColor, style.borderBottomColor, style.borderLeftColor],
+      outlineWidth: style.outlineWidth,
+      outlineStyle: style.outlineStyle,
+      outlineColor: style.outlineColor,
+      boxShadow: style.boxShadow,
+      backdropFilter: style.backdropFilter,
+      hasOwnText: hasOwnTextOf(),
+      hasPseudoContent: hasPseudoContentOf(),
+    };
+  };
+  const destructiveActionFactsOf = (element: Element): DestructiveActionFacts => {
+    // 行・枠・確かめの枠・押せる要素の selector（ページの中では外の値を読めないので、ここに書く。意味は `src/discovery/destructive-action.ts` の説明）。
+    const rowSelector = 'tr, li, [role="row"], [role="listitem"], article';
+    const frameSelector = '[role="dialog"], [role="alertdialog"], [aria-modal="true"], dialog[open], [role="region"], [popover]';
+    const confirmSelector = '[role="dialog"], [role="alertdialog"], [aria-modal="true"], dialog[open]';
+    const pressableSelector = 'button, [role="button"], a, input, select, textarea, option, label';
+    const urlAttributes = ['href', 'formaction', 'hx-get', 'hx-post', 'hx-put', 'hx-patch', 'hx-delete', 'data-hx-get', 'data-hx-post', 'data-hx-put',
+      'data-hx-patch', 'data-hx-delete', 'data-url', 'data-href', 'data-action'];
+    const innerTextOf = standardGetter<string>(HTMLElement.prototype, 'innerText');
+    const parentElementOf = standardGetter<Element | null>(Node.prototype, 'parentElement');
+    const characterDataOf = standardGetter<string>(CharacterData.prototype, 'data');
+    const squeezed = (value: string): string => value.replace(/\s+/gu, ' ').trim();
+    const attributeOf = (target: Element, name: string): string | null => {
+      const value: unknown = Element.prototype.getAttribute.call(target, name);
+      return typeof value === 'string' ? value : null;
+    };
+    const closestOf = (target: Element, selector: string): Element | null => {
+      try {
+        return Element.prototype.closest.call(target, selector);
+      } catch {
+        return null;
+      }
+    };
+    const textOf = (target: Element): string => (target instanceof HTMLElement ? squeezed(String(innerTextOf(target) ?? '')) : '');
+    const nodeListLengthOf = standardGetter<number>(NodeList.prototype, 'length');
+    const queryAll = (root: Element, selector: string): Element[] => {
+      const list = Element.prototype.querySelectorAll.call(root, selector);
+      const found: Element[] = [];
+      for (let index = 0; index < nodeListLengthOf(list); index += 1) {
+        const item = NodeList.prototype.item.call(list, index);
+        if (item instanceof Element) found.push(item);
+      }
+      return found;
+    };
+    const labelledTexts = (target: Element): string[] => (attributeOf(target, 'aria-labelledby') ?? '').split(/\s+/u).filter((id) => id !== '')
+      .map((id) => Document.prototype.getElementById.call(document, id))
+      .flatMap((labelled) => (labelled === null ? [] : [textOf(labelled)]));
+    const names = [textOf(element), attributeOf(element, 'aria-label') ?? '', ...labelledTexts(element), attributeOf(element, 'title') ?? '',
+      attributeOf(element, 'value') ?? '', attributeOf(element, 'alt') ?? '', ...queryAll(element, 'img[alt]').map((image) => attributeOf(image, 'alt') ?? '')]
+      .map(squeezed).filter((name) => name !== '');
+    const ownerForm = element instanceof HTMLButtonElement || element instanceof HTMLInputElement
+      ? standardProperty<HTMLFormElement | null>(element instanceof HTMLButtonElement ? HTMLButtonElement.prototype : HTMLInputElement.prototype, 'form', element)
+      : closestOf(element, 'form');
+    const methods: string[] = [];
+    const urls: string[] = [];
+    const chosenTexts: string[] = [];
+    const formMethod = attributeOf(element, 'formmethod');
+    if (formMethod !== null) methods.push(formMethod);
+    const dataMethodOwner = closestOf(element, '[data-method]');
+    if (dataMethodOwner !== null) methods.push(attributeOf(dataMethodOwner, 'data-method') ?? '');
+    // REV-SD の I-4 (c): 送り先の属性（`hx-*` を含む）は、要素と、その属性を持つ最も近い祖先と、属する form から読む（`href` の祖先はリンクで読む）。
+    const urlOwners = (name: string): Element[] => {
+      const owners: Element[] = [];
+      const own = name === 'href' || name === 'formaction' ? element : closestOf(element, `[${name}]`);
+      if (own !== null) owners.push(own);
+      if (ownerForm !== null && own !== ownerForm) owners.push(ownerForm);
+      return owners;
+    };
+    for (const name of urlAttributes) {
+      for (const owner of urlOwners(name)) {
+        const value = attributeOf(owner, name);
+        if (value !== null) urls.push(value);
+      }
+    }
+    const htmxDeleteSelector = '[hx-delete], [data-hx-delete]';
+    const htmxDelete = closestOf(element, htmxDeleteSelector) !== null || (ownerForm !== null && Element.prototype.matches.call(ownerForm, htmxDeleteSelector));
+    // 祖先のリンクの移る先（押すと移りうる。リンクの抽出ではない）。
+    const link = closestOf(element, 'a[href], area[href]');
+    if (link !== null && link !== element) urls.push(attributeOf(link, 'href') ?? '');
+    if (ownerForm !== null) {
+      const method = attributeOf(ownerForm, 'method');
+      if (method !== null) methods.push(method);
+      const action = attributeOf(ownerForm, 'action');
+      if (action !== null) urls.push(action);
+      for (const override of queryAll(ownerForm, 'input[name="_method"]')) methods.push(attributeOf(override, 'value') ?? '');
+    }
+    const row = closestOf(element, rowSelector);
+    const frameElement = closestOf(element, frameSelector);
+    const inRow = row !== null && (frameElement === null || (frameElement !== row && Node.prototype.contains.call(frameElement, row)));
+    // REV-SD の I-4 (b): 選んだ選択肢は、押す要素の範囲から読む（属する form。なければ同じ枠か、select・radio のある最も近い祖先の区画の、form に属さない欄）。
+    const choiceSelector = 'select, input[type="radio" i]';
+    const fieldFormOf = (field: Element): unknown => (field instanceof HTMLSelectElement
+      ? standardProperty<unknown>(HTMLSelectElement.prototype, 'form', field)
+      : standardProperty<unknown>(HTMLInputElement.prototype, 'form', field));
+    // REV-SD2 の I-1: 祖先をたどるのは、区画の境（section・main・article・body・landmark・table・form）までにする。境の要素そのものは見るが、その外へは
+    // 上がらない（同じ区画の選択肢だけを見て、画面の別の区画の select・radio で、関係のないボタンを削除と判定しない）。
+    const choiceBoundarySelector = 'section, main, article, body, nav, aside, header, footer, table, form, '
+      + '[role="region"], [role="navigation"], [role="main"], [role="banner"], [role="contentinfo"], [role="complementary"], [role="form"], [role="search"]';
+    let choiceScope: Element | null = ownerForm ?? frameElement;
+    for (let node: Element | null = element; choiceScope === null && node !== null; node = parentElementOf(node)) {
+      if (Element.prototype.querySelector.call(node, choiceSelector) !== null) choiceScope = node;
+      if (node !== element && Element.prototype.matches.call(node, choiceBoundarySelector)) break;
+    }
+    for (const field of choiceScope === null ? [] : queryAll(choiceScope, choiceSelector)) {
+      if (ownerForm === null && fieldFormOf(field) !== null) continue;
+      if (field instanceof HTMLSelectElement) {
+        for (const option of queryAll(field, 'option')) {
+          if (option instanceof HTMLOptionElement && standardProperty<boolean>(HTMLOptionElement.prototype, 'selected', option)) {
+            chosenTexts.push(standardProperty<string>(HTMLOptionElement.prototype, 'text', option), standardProperty<string>(HTMLOptionElement.prototype, 'value', option));
+          }
+        }
+      } else if (field instanceof HTMLInputElement && standardProperty<boolean>(HTMLInputElement.prototype, 'checked', field)) {
+        chosenTexts.push(attributeOf(field, 'value') ?? '');
+        const labels = standardProperty<NodeList | null>(HTMLInputElement.prototype, 'labels', field);
+        for (let index = 0; labels !== null && index < nodeListLengthOf(labels); index += 1) {
+          const label = NodeList.prototype.item.call(labels, index);
+          if (label instanceof Element) chosenTexts.push(textOf(label));
+        }
+      }
+    }
+    const frameNamesOf = (frame: Element): string[] => {
+      const heading = Element.prototype.querySelector.call(frame, 'h1, h2, h3, h4, h5, h6, [role="heading"]');
+      return [attributeOf(frame, 'aria-label') ?? '', ...labelledTexts(frame), heading === null ? '' : textOf(heading)].map(squeezed).filter((name) => name !== '');
+    };
+    // 枠の文（押せる要素と入力の欄の中の文字を除く）。確かめの枠の文と、枠の本文（REV-SD の I-2）に使う。
+    const bodyTextOf = (frame: Element): string => {
+      const parts: string[] = [];
+      const walker = Document.prototype.createTreeWalker.call(document, frame, NodeFilter.SHOW_TEXT);
+      for (let node = TreeWalker.prototype.nextNode.call(walker); node !== null; node = TreeWalker.prototype.nextNode.call(walker)) {
+        const parent = parentElementOf(node);
+        const pressable = parent === null ? null : closestOf(parent, pressableSelector);
+        if (pressable !== null && Node.prototype.contains.call(frame, pressable)) continue;
+        parts.push(characterDataOf(node as CharacterData));
+      }
+      return squeezed(parts.join(' '));
+    };
+    const confirmElement = closestOf(element, confirmSelector);
+    const confirmText = confirmElement === null ? null : bodyTextOf(confirmElement);
+    return {
+      names, methods, htmxDelete,
+      urls, baseUrl: documentProperty<string>('URL'), chosenTexts: chosenTexts.map(squeezed).filter((text) => text !== ''), inRow,
+      frame: frameElement !== null && !inRow ? { names: frameNamesOf(frameElement), text: bodyTextOf(frameElement) } : null, confirmText,
+    };
+  };
+  const scrollAncestorsOf = (element: Element): Element[] => {
+    const parentOf = standardGetter<Element | null>(Node.prototype, 'parentElement');
+    const scrollingElement = documentProperty<Element | null>('scrollingElement');
+    const root = documentProperty<Element | null>('documentElement');
+    const body = documentProperty<Element | null>('body');
+    const scrollable = ['auto', 'scroll', 'overlay'];
+    const ancestors: Element[] = [];
+    for (let node = parentOf(element); node !== null; node = parentOf(node)) {
+      if (node === root || node === body || node === scrollingElement) continue;
+      const style = window.getComputedStyle(node);
+      const vertical = scrollable.includes(style.overflowY)
+        && standardGetter<number>(Element.prototype, 'scrollHeight')(node) > standardGetter<number>(Element.prototype, 'clientHeight')(node);
+      const horizontal = scrollable.includes(style.overflowX)
+        && standardGetter<number>(Element.prototype, 'scrollWidth')(node) > standardGetter<number>(Element.prototype, 'clientWidth')(node);
+      if (vertical || horizontal) ancestors.push(node);
+    }
+    return ancestors;
+  };
+  const selectorOf = (element: Element, maxDepth: number): string => {
+    const parentOf = standardGetter<Element | null>(Node.prototype, 'parentElement');
+    const childrenOf = standardGetter<HTMLCollection>(Element.prototype, 'children');
+    const tagNameOf = standardGetter<string>(Element.prototype, 'tagName');
+    const id = standardGetter<string>(Element.prototype, 'id')(element);
+    if (id.length > 0) return `#${CSS.escape(id)}`;
+    const nthOfType = (node: Element): number => {
+      const parent = parentOf(node);
+      if (parent === null) return 1;
+      let index = 0;
+      for (const child of childrenOf(parent)) {
+        if (tagNameOf(child) === tagNameOf(node)) index += 1;
+        if (child === node) return index;
+      }
+      return 1;
+    };
+    const root = documentProperty<Element | null>('documentElement');
+    const segments: string[] = [];
+    for (let current: Element | null = element; current !== null && current !== root && segments.length < maxDepth; current = parentOf(current)) {
+      segments.unshift(`${tagNameOf(current).toLowerCase()}:nth-of-type(${nthOfType(current)})`);
+    }
+    return segments.join(' > ');
+  };
+  const hitPointsOf = (
+    area: { readonly left: number; readonly top: number; readonly right: number; readonly bottom: number },
+    viewportWidth: number,
+    viewportHeight: number,
+    insetPx: number,
+  ): (readonly [number, number])[] => {
+    const left = Math.max(area.left, 0);
+    const top = Math.max(area.top, 0);
+    const right = Math.min(area.right, viewportWidth);
+    const bottom = Math.min(area.bottom, viewportHeight);
+    if (right <= left || bottom <= top) return [];
+    const insetX = Math.min(insetPx, (right - left) / 4);
+    const insetY = Math.min(insetPx, (bottom - top) / 4);
+    return [
+      [(left + right) / 2, (top + bottom) / 2],
+      [left + insetX, top + insetY],
+      [right - insetX, top + insetY],
+      [left + insetX, bottom - insetY],
+      [right - insetX, bottom - insetY],
+    ];
+  };
+  const loadingIndicatorsIn = (visibilityOptions: CheckVisibilityOptions): LoadingIndicatorEvidence => {
+    // EV-3（REV-EV3 の M-3）: 見える（`checkVisibility`）うえに、大きさが 0 でなく、文書の範囲（スクロールで届く所）に入る表示だけを数える。
+    const root = documentProperty<Element>('documentElement');
+    const documentWidth = standardGetter<number>(Element.prototype, 'scrollWidth')(root);
+    const documentHeight = standardGetter<number>(Element.prototype, 'scrollHeight')(root);
+    const shown = (element: Element): boolean => {
+      if (!Element.prototype.checkVisibility.call(element, visibilityOptions)) return false;
+      const box = Element.prototype.getBoundingClientRect.call(element);
+      const left = box.left + window.scrollX;
+      const top = box.top + window.scrollY;
+      return box.width > 0 && box.height > 0 && left + box.width > 0 && top + box.height > 0 && left < documentWidth && top < documentHeight;
+    };
+    const visibleCountOf = (selector: string): number => {
+      let visibleCount = 0;
+      for (const element of Document.prototype.querySelectorAll.call(document, selector)) {
+        if (shown(element)) visibleCount += 1;
+      }
+      return visibleCount;
+    };
+    return {
+      ariaBusyCount: visibleCountOf('[aria-busy="true" i]'),
+      progressbarCount: visibleCountOf('[role="progressbar" i], progress'),
+      indeterminateProgressCount: visibleCountOf('progress:indeterminate, [role="progressbar" i]:not(progress):not([aria-valuenow])'),
+    };
+  };
   return {
     standardGetter, optionalStandardGetter, standardProperty, documentProperty, elementPathOf, elementAtPath, openRoots, optionalOpenRoots, queryAllInRoots,
-    hasLinkAncestor, isVisible,
+    hasLinkAncestor, isVisible, isLayoutLandmark, layoutLandmarksOf, visibleStateFieldsIn, visibleHeadingLevelsIn, ownSurfaceFactsOf, destructiveActionFactsOf,
+    scrollAncestorsOf, selectorOf, hitPointsOf, loadingIndicatorsIn,
   };
 }
 

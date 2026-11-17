@@ -3,6 +3,7 @@ import { formatPlainDateTime } from '../../../../../src/presentation/format.js';
 import { LOCAL_UI_AUDIT_TEXT, LOCAL_UI_JOB_SUMMARY_TEXT } from '../../../../../src/presentation/messages.js';
 import { PageFrame } from '../../components/PageFrame';
 import { auditJobKindDisplay, auditJobStateDisplay, runStatusDisplay, toneClass, type DisplayValue } from '../../display/labels';
+import { useSiteNameOf } from '../../display/site-name';
 import { listAuditJobsFn, type AuditJobRowView } from '../../server/audit-job-functions';
 
 export const Route = createFileRoute('/jobs/')({
@@ -24,6 +25,8 @@ function JobListPage() {
   const jobs = Route.useLoaderData();
   const text = LOCAL_UI_AUDIT_TEXT.jobs;
   const columns = LOCAL_UI_JOB_SUMMARY_TEXT.listColumns;
+  // DN-1: サイトは画面に出す名前（なければ見分けの印）。
+  const siteNameOf = useSiteNameOf();
   return (
     <PageFrame title={LOCAL_UI_AUDIT_TEXT.pages.jobs}>
       <section className="panel">
@@ -48,7 +51,7 @@ function JobListPage() {
                       <th scope="row" data-kind={job.jobKind}>
                         {auditJobKindDisplay(job.jobKind).label}
                         {' '}
-                        <span className="muted">{job.profileId}</span>
+                        <span className="muted">{siteNameOf(job.profileId)}</span>
                       </th>
                       <td className="nowrap">
                         <Link to="/jobs/$jobId" params={{ jobId: job.jobId }}>

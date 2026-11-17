@@ -315,7 +315,7 @@ function ReadChecksPage() {
       <AdvancedSettings testId="read-check-advanced">
       <section data-testid="read-check-definitions">
         <h3>{text.definitionsHeading}</h3>
-        <p className="muted">{text.definitionCount(formatCount(page.definitions.length), formatCount(page.form.maxDefinitions))}</p>
+        <p className="muted">{text.definitionCount(formatCount(page.definitions.length))}</p>
         <p className="muted">{text.valuesNote}</p>
         {page.editable ? (
           <p>

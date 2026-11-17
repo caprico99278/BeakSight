@@ -1,6 +1,6 @@
 // FM2d（設計書 `2026-10-19-beaksight-fewer-manual-steps-design.md` 3A.1、5 章の 2026-10-22 の FM2d の Blocker の行）: まとめて実行の、ジョブの管理の側の決まり
-// （`startStageChain` と段の進め方）を、偽のワーカー（`tests/helpers/fake-audit-worker.ts` の `chain`）を本物の `fork` で起動して確かめる（本物のワーカーと Chromium
-// での端から端は `stage-chain-fork-default.test.ts`・`stage-chain-fork-cli.test.ts`。中身は `stage-chain-fork-cases.ts`）。
+// （`startStageChain` と段の進め方）を、偽のワーカー（`tests/helpers/fake-audit-worker.ts` の `chain`）を本物の `fork` で起動して確かめる（ワーカーの段の進め方は
+// 単体の `audit-worker-session-chain.test.ts`・`chain-stage.test.ts`、画面からの端から端は `full-flow.test.ts`）。
 // - 段の並びはモードで決まる（`TEST_AUTH_PASSIVE` と、MI-5 から `TEST_APPROVED_WRITE`: 監査 → 発見 → READ、公開の監査: 拒む）。段ごとにジョブの行を作る。
 // - READ の段の対象の画面は、発見の段の索引を記録した後に決めて、`NEXT_STAGE` で渡す。定義が 0 件なら READ を行わない（失敗にしない）。
 // - 手動のログインの自動の登録（改訂を進める）は、連鎖の最後に 1 回だけ（記録は最初の段のジョブ）。途中の段のジョブの行は、始めた時の改訂のまま。

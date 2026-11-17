@@ -46,10 +46,9 @@
     "fieldNames": {
       "type": "array",
       "uniqueItems": true,
-      "maxItems": 200,
-      "items": { "type": "string", "minLength": 1, "maxLength": 256 }
+      "items": { "type": "string", "minLength": 1 }
     },
-    "readChecks": { "type": "array", "maxItems": 20, "items": { "$ref": "#/$defs/readCheckReference" } },
+    "readChecks": { "type": "array", "items": { "$ref": "#/$defs/readCheckReference" } },
     "sideEffectConfirmations": {
       "type": "object",
       "additionalProperties": false,
@@ -67,10 +66,18 @@
       "required": ["maxCreatesPerRun", "maxCumulativeCreates"],
       "properties": {
         "maxCreatesPerRun": { "type": "integer", "minimum": 1, "maximum": 1 },
-        "maxCumulativeCreates": { "type": "integer", "minimum": 1, "maximum": 20 }
+        "maxCumulativeCreates": {
+          "description": "LZ-3c: a remnant kept so that the approval digest version does not change; not used by any judgement (no upper bound).",
+          "type": "integer",
+          "minimum": 1
+        }
       }
     },
-    "approvalTtlDays": { "type": "integer", "minimum": 1, "maximum": 30 },
+    "approvalTtlDays": {
+      "description": "LZ-3c: a remnant kept so that the approval digest version does not change; not used by any judgement (no upper bound).",
+      "type": "integer",
+      "minimum": 1
+    },
     "verification": { "$ref": "#/$defs/verification" },
     "update": { "anyOf": [{ "$ref": "#/$defs/update" }, { "type": "null" }] },
     "inputRuleReference": { "anyOf": [{ "$ref": "#/$defs/inputRuleReference" }, { "type": "null" }] },
@@ -131,23 +138,26 @@
       "then": { "properties": { "update": { "$ref": "#/$defs/update" } } }
     },
     {
-      "description": "LG-3 (the test suite tiers design 3.7.2): an API UPDATE scenario has the contract of T41a (the kept keys, the templated identity digest and the ledger).",
+      "description": "LG-3 (the test suite tiers design 3.7.2): an API UPDATE scenario has the contract of T41a (the kept keys, the templated identity digest and the ledger). LU-6 (list row update design 5.4, fix round 1): an API UPDATE whose ledger has the list row has no templated identity digest (the list page path has no record id; the approval validity checks the candidate by its identity digest); every other API UPDATE has it, as before.",
       "if": { "properties": { "kind": { "const": "UPDATE" }, "transport": { "const": "API" } }, "required": ["kind", "transport"] },
       "then": {
         "properties": {
           "api": {
             "type": "object",
-            "required": ["keptKeys", "templatedIdentityDigest"],
-            "properties": { "keptKeys": true, "templatedIdentityDigest": true, "ledger": { "type": "object" } }
+            "required": ["keptKeys"],
+            "properties": { "keptKeys": true, "templatedIdentityDigest": true, "ledger": { "type": "object" } },
+            "if": { "properties": { "ledger": { "type": "object", "properties": { "listRow": true }, "required": ["listRow"] } }, "required": ["ledger"] },
+            "then": { "properties": { "templatedIdentityDigest": false } },
+            "else": { "required": ["templatedIdentityDigest"] }
           }
         }
       }
     }
   ],
   "$defs": {
-    "apiKey": { "type": "string", "minLength": 1, "maxLength": 64 },
+    "apiKey": { "type": "string", "minLength": 1 },
     "apiJsonType": { "enum": ["string", "number", "boolean", "null", "object", "array"] },
-    "apiFieldSelector": { "type": "string", "minLength": 1, "maxLength": 512 },
+    "apiFieldSelector": { "type": "string", "minLength": 1 },
     "apiFieldType": {
       "description": "T38R2-fix (Task 38 design 7, the last row; M-2): the input type of the field behind a key to send (SCENARIO_API_FIELD_TYPES of src/control/approval/scenario-contracts.ts).",
       "enum": ["text", "search", "email", "url", "tel", "date", "textarea", "number"]
@@ -158,10 +168,10 @@
       "required": ["method", "origin", "pathShape", "queryNames", "contentType", "prefer"],
       "properties": {
         "method": { "enum": ["POST", "PATCH"] },
-        "origin": { "type": "string", "minLength": 1, "maxLength": 2048 },
-        "pathShape": { "type": "string", "pattern": "^/", "minLength": 1, "maxLength": 1024 },
+        "origin": { "type": "string", "minLength": 1 },
+        "pathShape": { "type": "string", "pattern": "^/", "minLength": 1 },
         "queryNames": { "type": "array", "uniqueItems": true, "items": { "enum": ["select"] } },
-        "contentType": { "anyOf": [{ "type": "string", "minLength": 1, "maxLength": 100 }, { "type": "null" }] },
+        "contentType": { "anyOf": [{ "type": "string", "minLength": 1 }, { "type": "null" }] },
         "prefer": {
           "type": "array",
           "uniqueItems": true,
@@ -186,7 +196,7 @@
           "type": "object",
           "additionalProperties": false,
           "required": ["kind", "name"],
-          "properties": { "kind": { "const": "NAME" }, "name": { "type": "string", "minLength": 1, "maxLength": 256 } }
+          "properties": { "kind": { "const": "NAME" }, "name": { "type": "string", "minLength": 1 } }
         },
         {
           "type": "object",
@@ -204,7 +214,45 @@
         "key": { "$ref": "#/$defs/apiKey" },
         "type": { "$ref": "#/$defs/apiJsonType" },
         "field": { "$ref": "#/$defs/apiFieldIdentity" },
-        "fieldType": { "$ref": "#/$defs/apiFieldType" }
+        "fieldType": { "$ref": "#/$defs/apiFieldType" },
+        "positions": {
+          "description": "ARR-3 (DEF-234): only for a key whose value is an array of 2 or more elements. The role of each element in order: FIELD (the generated value of the field; exactly one) or an empty position (EMPTY_STRING for an empty text, EMPTY_NULL for null). A list of one element (the DEF-226 form) has no item. Never a value.",
+          "type": "array",
+          "minItems": 2,
+          "items": { "enum": ["FIELD", "EMPTY_STRING", "EMPTY_NULL"] }
+        },
+        "element": {
+          "description": "ARR-4 (DEF-234): only for the field at one position of an array with the values of two or more fields. The key of the array in the body and the position (the key of this item is the path key[i] of src/core/api-request-shape.ts). Never a value.",
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["key", "index"],
+          "properties": {
+            "key": { "$ref": "#/$defs/apiKey" },
+            "index": { "type": "integer", "minimum": 0 },
+            "name": {
+              "description": "ARR-5 (DEF-234): the inner key of an object row (the key of this item is the path key[i].name).",
+              "$ref": "#/$defs/apiKey"
+            }
+          }
+        },
+        "rows": {
+          "description": "ARR-5 (DEF-234): only for the field at an inner key of an object row. The role of each inner key of each row in order (inner keys in name order; no limit of the rows and the inner keys since L13 fix round 1): FIELD or an empty position. Never a value.",
+          "type": "array",
+          "minItems": 1,
+          "items": {
+            "type": "array",
+            "minItems": 1,
+            "items": {
+              "type": "object",
+              "additionalProperties": false,
+              "required": ["name", "role"],
+              "properties": {
+                "name": { "$ref": "#/$defs/apiKey" },
+                "role": { "enum": ["FIELD", "EMPTY_STRING", "EMPTY_NULL"] }
+              }
+            }
+          }
+        }
       }
     },
     "api": {
@@ -215,16 +263,14 @@
       "properties": {
         "shapeDigest": { "$ref": "#/$defs/fingerprint" },
         "request": { "$ref": "#/$defs/apiRequest" },
-        "keyFields": { "type": "array", "maxItems": 64, "items": { "$ref": "#/$defs/apiKeyField" } },
+        "keyFields": { "type": "array", "items": { "$ref": "#/$defs/apiKeyField" } },
         "keptKeys": {
           "description": "T41a (Task 41 design 3.1): the kept keys of an API UPDATE (the marked keys that are not changed; no generated value). Only an UPDATE has them.",
           "type": "array",
-          "maxItems": 64,
           "items": { "$ref": "#/$defs/apiKeyField" }
         },
         "pageKeys": {
           "type": "array",
-          "maxItems": 64,
           "items": {
             "type": "object",
             "additionalProperties": false,
@@ -235,6 +281,16 @@
               "field": {
                 "description": "T41a (Task 41 design 3.3, the user decision 2): the field of the update page for a key decided by the page of an API UPDATE.",
                 "$ref": "#/$defs/apiFieldIdentity"
+              },
+              "elements": {
+                "description": "ARR-2 (DEF-226): only for a key decided by the page of an API CREATE whose value is an array. The set of the JSON types of the elements (scalar only) and the count (no limit since L13 fix round 1). Never a value.",
+                "type": "object",
+                "additionalProperties": false,
+                "required": ["types", "count"],
+                "properties": {
+                  "types": { "type": "array", "uniqueItems": true, "maxItems": 4, "items": { "enum": ["string", "number", "boolean", "null"] } },
+                  "count": { "type": "integer", "minimum": 0 }
+                }
               }
             }
           }
@@ -243,8 +299,22 @@
           "description": "T41a (Task 41 design 3.1): the identity digest of the candidate with the last record id of the page path as {id} (an API UPDATE only).",
           "$ref": "#/$defs/fingerprint"
         },
-        "headerNames": { "type": "array", "maxItems": 64, "uniqueItems": true, "items": { "$ref": "#/$defs/apiKey" } },
+        "headerNames": { "type": "array", "uniqueItems": true, "items": { "$ref": "#/$defs/apiKey" } },
         "filterName": { "anyOf": [{ "$ref": "#/$defs/apiKey" }, { "type": "null" }] },
+        "otherFilterNames": {
+          "description": "DEF-198 (list row update design 5.9 2): the names of the other filters of an API UPDATE than the record id filter (a tenant filter and so on; in code unit order; one or more). Made from the probe shape by the draft check, never typed by a person. A spec without other filters has no item (no empty list). The values to compare are the values of the keys of the same names decided by the page at the registration of the same inspection (only in the write START; never in the scenario).",
+          "type": "array",
+          "minItems": 1,
+          "uniqueItems": true,
+          "items": { "$ref": "#/$defs/apiKey" }
+        },
+        "ledgerPageKeys": {
+          "description": "DEF-203 (list row update design 5.10 2): the names of the keys of the body of an API UPDATE that are not bound to a field of the update page (other than the keys of the filters) and are page keys of the ledger create too (in code unit order; one or more). Made from the probe shape and the ledger fact by the draft check, never typed by a person. A spec without such keys has no item (no empty list). The values to compare are the values of the keys of the same names decided by the page at the registration of the same inspection (only in the write START; never in the scenario).",
+          "type": "array",
+          "minItems": 1,
+          "uniqueItems": true,
+          "items": { "$ref": "#/$defs/apiKey" }
+        },
         "recordId": {
           "anyOf": [
             {
@@ -264,7 +334,8 @@
               "required": ["targetCreateScenarioId", "formPathTemplate"],
               "properties": {
                 "targetCreateScenarioId": { "type": "string", "pattern": "^[a-z0-9][a-z0-9-]{0,63}$" },
-                "formPathTemplate": { "type": "string", "pattern": "^/", "minLength": 1, "maxLength": 2048 }
+                "formPathTemplate": { "type": "string", "pattern": "^/", "minLength": 1 },
+                "listRow": { "$ref": "#/$defs/listRow" }
               }
             },
             { "type": "null" }
@@ -281,8 +352,8 @@
       "properties": {
         "formMethod": { "const": "POST" },
         "methodOverride": { "anyOf": [{ "enum": ["PUT", "PATCH"] }, { "type": "null" }] },
-        "origin": { "type": "string", "minLength": 1, "maxLength": 2048 },
-        "path": { "type": "string", "pattern": "^/", "maxLength": 2048 },
+        "origin": { "type": "string", "minLength": 1 },
+        "path": { "type": "string", "pattern": "^/" },
         "enctype": { "enum": ["application/x-www-form-urlencoded", "multipart/form-data", "text/plain"] }
       }
     },
@@ -311,15 +382,26 @@
       "required": ["targetCreateScenarioId", "formPathTemplate", "actionPathTemplate", "keepFieldNames", "templatedIdentityDigest"],
       "properties": {
         "targetCreateScenarioId": { "type": "string", "pattern": "^[a-z0-9][a-z0-9-]{0,63}$" },
-        "formPathTemplate": { "type": "string", "pattern": "^/", "minLength": 1, "maxLength": 2048 },
-        "actionPathTemplate": { "type": "string", "pattern": "^/", "minLength": 1, "maxLength": 2048 },
+        "formPathTemplate": { "type": "string", "pattern": "^/", "minLength": 1 },
+        "actionPathTemplate": { "type": "string", "pattern": "^/", "minLength": 1 },
         "keepFieldNames": {
           "type": "array",
           "uniqueItems": true,
-          "maxItems": 200,
-          "items": { "type": "string", "minLength": 1, "maxLength": 256 }
+          "items": { "type": "string", "minLength": 1 }
         },
-        "templatedIdentityDigest": { "$ref": "#/$defs/fingerprint" }
+        "templatedIdentityDigest": { "$ref": "#/$defs/fingerprint" },
+        "listRow": { "$ref": "#/$defs/listRow" }
+      }
+    },
+    "listRow": {
+      "description": "LU-6 (list row update design 5.4 the 1): the way to choose the row of a list row update (optional; absent for the update of an update page as before): the list page path (no {id}; the page path of the candidate), the identity digest of the named opener in the row (the opener of the submission probe record) and the name of the field that chooses the row (a field of the ledger scenario whose value differs each run). No value of the row. The rules are checked by src/control/approval/scenario-policy.ts.",
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["listPagePath", "openerIdentityDigest", "rowKeyField"],
+      "properties": {
+        "listPagePath": { "type": "string", "pattern": "^/[^{}?#]*$", "minLength": 1 },
+        "openerIdentityDigest": { "$ref": "#/$defs/fingerprint" },
+        "rowKeyField": { "type": "string", "minLength": 1 }
       }
     },
     "verification": {
@@ -340,8 +422,8 @@
       "additionalProperties": false,
       "required": ["pathPrefix", "selector"],
       "properties": {
-        "pathPrefix": { "type": "string", "pattern": "^/", "maxLength": 2048 },
-        "selector": { "anyOf": [{ "type": "string", "minLength": 1, "maxLength": 256 }, { "type": "null" }] }
+        "pathPrefix": { "type": "string", "pattern": "^/" },
+        "selector": { "anyOf": [{ "type": "string", "minLength": 1 }, { "type": "null" }] }
       }
     },
     "recordId": {
@@ -356,7 +438,7 @@
           "required": ["source", "pathPattern"],
           "properties": {
             "source": { "const": "URL_PATH_PATTERN" },
-            "pathPattern": { "type": "string", "pattern": "^/", "minLength": 1, "maxLength": 2048 }
+            "pathPattern": { "type": "string", "pattern": "^/", "minLength": 1 }
           }
         },
         {
@@ -365,13 +447,13 @@
           "required": ["source", "selector"],
           "properties": {
             "source": { "const": "ELEMENT" },
-            "selector": { "type": "string", "minLength": 1, "maxLength": 256 }
+            "selector": { "type": "string", "minLength": 1 }
           }
         }
       ]
     },
     "formRecordId": {
-      "description": "PL-6a (plain UI design 8.1): the record id way of a FORM scenario: the record id patterns (1 to MAX_FORM_RECORD_ID_PATTERNS, tried in order on the URL after sending).",
+      "description": "PL-6a (plain UI design 8.1): the record id way of a FORM scenario: the record id patterns (one or more, tried in order on the URL after sending; LZ-3c: no upper count).",
       "type": "object",
       "additionalProperties": false,
       "required": ["source", "pathPatterns"],
@@ -380,9 +462,8 @@
         "pathPatterns": {
           "type": "array",
           "minItems": 1,
-          "maxItems": 2,
           "uniqueItems": true,
-          "items": { "type": "string", "pattern": "^/", "minLength": 1, "maxLength": 2048 }
+          "items": { "type": "string", "pattern": "^/", "minLength": 1 }
         }
       }
     },
@@ -397,8 +478,8 @@
           "description": "PL-6a (the designer's decision (f)): true when the READ check definition is used only for the verification of this scenario (the READ check job does not read it). Absent means false.",
           "type": "boolean"
         },
-        "bindings": { "type": "array", "minItems": 0, "maxItems": 50, "items": { "$ref": "#/$defs/binding" } },
-        "expectations": { "type": "array", "minItems": 1, "maxItems": 10, "items": { "$ref": "#/$defs/verificationExpectation" } }
+        "bindings": { "type": "array", "minItems": 0, "items": { "$ref": "#/$defs/binding" } },
+        "expectations": { "type": "array", "minItems": 1, "items": { "$ref": "#/$defs/verificationExpectation" } }
       }
     },
     "binding": {
@@ -406,8 +487,8 @@
       "additionalProperties": false,
       "required": ["parameterName", "fieldName"],
       "properties": {
-        "parameterName": { "type": "string", "minLength": 1, "maxLength": 256 },
-        "fieldName": { "type": "string", "minLength": 1, "maxLength": 256 }
+        "parameterName": { "type": "string", "minLength": 1 },
+        "fieldName": { "type": "string", "minLength": 1 }
       }
     },
     "verificationExpectation": {
@@ -418,7 +499,7 @@
           "required": ["kind", "count"],
           "properties": {
             "kind": { "const": "ROW_COUNT_EQUALS" },
-            "count": { "type": "integer", "minimum": 1, "maximum": 100000 }
+            "count": { "type": "integer", "minimum": 1 }
           }
         },
         {
@@ -427,7 +508,7 @@
           "required": ["kind", "fieldName"],
           "properties": {
             "kind": { "const": "TEXT_CONTAINS" },
-            "fieldName": { "type": "string", "minLength": 1, "maxLength": 256 }
+            "fieldName": { "type": "string", "minLength": 1 }
           }
         },
         {
@@ -436,8 +517,8 @@
           "required": ["kind", "field", "fieldName"],
           "properties": {
             "kind": { "const": "DETAIL_FIELD_EQUALS" },
-            "field": { "type": "string", "minLength": 1, "maxLength": 256 },
-            "fieldName": { "type": "string", "minLength": 1, "maxLength": 256 }
+            "field": { "type": "string", "minLength": 1 },
+            "fieldName": { "type": "string", "minLength": 1 }
           }
         }
       ]

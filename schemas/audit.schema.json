@@ -1,14 +1,21 @@
 {
-  "$id": "urn:beaksight:schema:audit:1.0",
+  "$id": "urn:beaksight:schema:audit:2.0",
   "type": "object",
   "additionalProperties": false,
   "required": ["schemaVersion", "run", "pages", "findings"],
   "properties": {
-    "schemaVersion": { "const": "audit-schema/1.0" },
-    "run": { "$ref": "urn:beaksight:schema:run:1.0" },
-    "pages": { "type": "array", "items": { "$ref": "urn:beaksight:schema:page:1.0" } },
+    "schemaVersion": { "const": "audit-schema/2.0" },
+    "run": {
+      "description": "REC-2: the path of run.json from the run directory (the Run is not copied here).",
+      "const": "run.json"
+    },
+    "pages": {
+      "description": "REC-2: the paths of the page.json of the pages from the run directory, in the page order (the pages are not copied here).",
+      "type": "array",
+      "items": { "type": "string", "pattern": "^pages/[^/]+/page\\.json$" }
+    },
     "findings": {
-      "description": "T44f (Task 44 design P3-1 B): the Findings not in the findings of any page (the Findings of the Run rules, such as the cross-page rules; some have a page ID). The Findings of a page are in pages[].findings only. All the Findings of the Run are the page Findings (in the page order) followed by these. The version stays 1.0; documents of the earlier writers have all the Findings here.",
+      "description": "T44f (Task 44 design P3-1 B): the Findings not in the findings of any page (the Findings of the Run rules, such as the cross-page rules; some have a page ID). The Findings of a page are in the findings of its page.json only. All the Findings of the Run are the page Findings (in the page order) followed by these.",
       "type": "array",
       "items": { "$ref": "urn:beaksight:schema:finding:1.0" }
     }

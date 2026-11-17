@@ -3,7 +3,7 @@
 // 管理データでの部品の振る舞いをまとめた（前の版からの上げと前の版の文の固定は捨てた。CHECK の値の一覧が名前つきの一覧と等しいことは
 // `control-store-base-schema.test.ts`）。
 // - 承認に結ばれるプロファイルの文書と改訂とは別に持ち、切り替えてもプロファイルの改訂を変えない。行がなければ既定（ジョブのブラウザを表示する・
-//   監査の段は削除のほかを通す。OP-I の I1。設計書 `2026-10-27-beaksight-one-pass-flow-design.md` 4.1.5）。
+//   監査の段はサイトの通信を止めない。OP-I の I1。設計書 `2026-10-27-beaksight-one-pass-flow-design.md` 4.1.5）。
 // - OP-I: 表示だけの保存で行を作るときも、扱いは列の既定（`READ_ONLY`）に頼らず、サイトの既定（`PASS_EXCEPT_DELETE`）を明示して書く。
 // - 監査の段の送信の扱いの列（`audit_send_policy`）は、`AUDIT_SEND_POLICIES` の値だけ。保存の口は、扱いを渡さなければ今の値を変えない。
 // 一時のフォルダだけを使い、終わったら消す。
@@ -15,7 +15,9 @@ import {
   createProfile,
   DEFAULT_PROFILE_DISPLAY_SETTINGS,
   getProfile,
+  readProfileDisplayNames,
   readProfileDisplaySettings,
+  saveProfileDisplayName,
   saveProfileDisplaySettings,
 } from '../../src/control/store/profile-store.js';
 import { insertRow, useControlStoreWorkspace } from '../helpers/control-store-schema.js';
@@ -69,6 +71,43 @@ describe('Control store: the display settings of a profile', () => {
   });
 });
 
+// DN-1（設計書 `2026-11-16-beaksight-profile-display-name-design.md` 2・3 章）: 画面に出す名前。表示の設定の行に持ち、プロファイルの文書と改訂は変えない。
+describe('Control store: the display name of a profile (DN-1)', () => {
+  it('saves a trimmed name apart from the profile and the other settings, and reads it among the names', () => {
+    withDatabase((database) => {
+      expect(createProfile(database, publicProfile(PROFILE_ID, MIN_PROFILE_REVISION), { resolveContext: resolveTestContext }).ok).toBe(true);
+      expect(readProfileDisplayNames(database)).toEqual({});
+      expect(saveProfileDisplaySettings(database, PROFILE_ID, { showJobBrowser: false, auditSendPolicy: 'READ_ONLY' }).ok).toBe(true);
+      expect(saveProfileDisplayName(database, PROFILE_ID, '  テストの店  ')).toEqual({ ok: true, displayName: 'テストの店' });
+      expect(saveProfileDisplayName(database, PROFILE_ID, 'あ'.repeat(80))).toEqual({ ok: true, displayName: 'あ'.repeat(80) });
+      expect(readProfileDisplayNames(database)).toEqual({ [PROFILE_ID]: 'あ'.repeat(80) });
+      expect(readProfileDisplaySettings(database, PROFILE_ID)).toEqual({ showJobBrowser: false, auditSendPolicy: 'READ_ONLY' });
+      expect(saveProfileDisplaySettings(database, PROFILE_ID, { showJobBrowser: true }).ok).toBe(true);
+      expect(readProfileDisplayNames(database)).toEqual({ [PROFILE_ID]: 'あ'.repeat(80) });
+      expect(getProfile(database, PROFILE_ID)?.profile.revision).toBe(MIN_PROFILE_REVISION);
+    });
+  });
+
+  it('rejects an empty, too long or multi-line name and an unknown profile, without writing', () => {
+    withDatabase((database) => {
+      expect(saveProfileDisplayName(database, 'no-such-profile', 'テストの店')).toEqual({ ok: false, reason: 'PROFILE_NOT_FOUND' });
+      expect(createProfile(database, publicProfile(PROFILE_ID, MIN_PROFILE_REVISION), { resolveContext: resolveTestContext }).ok).toBe(true);
+      const cases: readonly (readonly [unknown, string])[] = [
+        ['', 'DISPLAY_NAME_EMPTY'],
+        [' 　 ', 'DISPLAY_NAME_EMPTY'],
+        [null, 'DISPLAY_NAME_EMPTY'],
+        ['あ'.repeat(81), 'DISPLAY_NAME_TOO_LONG'],
+        ['テスト\nの店', 'DISPLAY_NAME_CONTROL_CHARACTER'],
+        ['テスト\tの店', 'DISPLAY_NAME_CONTROL_CHARACTER'],
+      ];
+      for (const [name, reason] of cases) {
+        expect(saveProfileDisplayName(database, PROFILE_ID, name as string), JSON.stringify(name)).toEqual({ ok: false, reason });
+      }
+      expect(readProfileDisplayNames(database)).toEqual({});
+    });
+  });
+});
+
 describe('Control store: the audit send policy of a profile', () => {
   it('rejects a value outside the list in the column, and keeps READ_ONLY as the default of a row written without it', () => {
     const raw = workspace.latestConnection([PROFILE_ID]);
@@ -86,7 +125,7 @@ describe('Control store: the audit send policy of a profile', () => {
   it('reads PASS_EXCEPT_DELETE without a row, writes it explicitly when only the display is saved, keeps a stored value, and rejects another value', () => {
     workspace.latestConnection([PROFILE_ID]).close();
     withDatabase((database) => {
-      // OP-I（I1）: サイトの既定は、削除のほかを通す。
+      // OP-I（I1）: サイトの既定は、サイトの通信を止めない。
       expect(DEFAULT_PROFILE_DISPLAY_SETTINGS).toEqual({ showJobBrowser: true, auditSendPolicy: 'PASS_EXCEPT_DELETE' });
       expect(readProfileDisplaySettings(database, PROFILE_ID)).toEqual({ showJobBrowser: true, auditSendPolicy: 'PASS_EXCEPT_DELETE' });
       // 表示だけを保存して作った行も、扱いはサイトの既定（列の既定の `READ_ONLY` にしない）。

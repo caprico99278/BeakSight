@@ -2,7 +2,7 @@ import { useEffect, useId, useRef, type ReactNode } from 'react';
 
 /**
  * 確定のボタンの見た目（PL-V。設計書 `2026-10-26-beaksight-plain-ui-design.md` 13 章の 7）。
- * - `danger`: 取り返せない確定と、守りを緩める確定（書き込みの OK、書き込みを始める、削除、取り消し、削除のほかを通す など）。赤い縁。
+ * - `danger`: 取り返せない確定と、守りを緩める確定（削除、取り消し、サイトの通信を止めない など）。赤い縁。
  * - `primary`: 危険でない確定（自動ログインへの切り替え、書き込みも試す、設定の保存 など）。主のボタンの見た目。
  */
 export type ConfirmTone = 'danger' | 'primary';

@@ -11,7 +11,6 @@
 import { readFileSync } from 'node:fs';
 import { resolve } from 'node:path';
 import { describe, expect, it } from 'vitest';
-import { MAX_SUBMITTED_VALUE_LENGTH } from '../../src/control/actions/action-contracts.js';
 import { FORM_NAVIGATION_SETUP_ITEMS } from '../helpers/auth-setup-samples.js';
 import {type AuthSetup } from '../../src/control/auth/auth-setup-contracts.js';
 import {
@@ -126,6 +125,21 @@ describe('T40a: START of an API write job (the rejected shapes)', () => {
     expect(errorsOf(start(WORKER_WRITE_CREATE_JOB_KIND, apiWrite(), ['http://127.0.0.3:4175']))).not.toEqual([]);
   });
 
+  // DEF-220（設計書 `2026-11-08-beaksight-same-origin-api-and-spa-routes-design.md` 3.1）: テスト用のサイト自身の API（承認したテストの Origin）への書き込みも受ける
+  // （ログインのある形と、ログインのない形（`setup` が null））。正規の直列化でない Origin は今のとおり拒む。
+  it('DEF-220: accepts an API origin that is an approved test origin, with and without a login', () => {
+    const toTest = apiWrite({ api: apiRequest({ origin: ORIGIN }) });
+    expect(errorsOf(start(WORKER_WRITE_CREATE_JOB_KIND, toTest, []))).toEqual([]);
+    expect(errorsOf(start(WORKER_WRITE_CREATE_JOB_KIND, toTest))).toEqual([]);
+    const noLogin = start(WORKER_WRITE_CREATE_JOB_KIND, toTest, []);
+    const authentication = {
+      setup: null, approvedTestOrigins: [ORIGIN],
+      authenticationSha256: workerAuthenticationDigestOf(null, [ORIGIN], { jobKind: WORKER_WRITE_CREATE_JOB_KIND, automatedLogin: null, approvedServiceOrigins: [] }),
+    };
+    expect(errorsOf({ ...noLogin, authentication })).toEqual([]);
+    expect(errorsOf(start(WORKER_WRITE_CREATE_JOB_KIND, apiWrite({ api: apiRequest({ origin: `${ORIGIN}/` }) }), []))).not.toEqual([]);
+  });
+
   it.each<readonly [string, Record<string, unknown>]>([
     // 送り方と形の混ざり（form の項目は持てない。API の項目は form の書き込みの指定に持てない）。
     ['another transport', { transport: 'FORM' }],
@@ -148,7 +162,7 @@ describe('T40a: START of an API write job (the rejected shapes)', () => {
     ['no value to fill', { values: { email: null, name: null, score: null } }],
     ['a number value that is not in the canonical form', { values: { email: 'sample0001@example.invalid', name: 'x', score: '07' } }],
     ['a number value that is not a number', { values: { email: 'sample0001@example.invalid', name: 'x', score: 'seven' } }],
-    ['a too long value', { values: { email: 'sample0001@example.invalid', name: 'x'.repeat(MAX_SUBMITTED_VALUE_LENGTH + 1), score: '7' } }],
+    // L12b（設計書 `2026-11-09-beaksight-remove-limits-design.md` 6.2。S18）: 値の長さの上限（前は `MAX_SUBMITTED_VALUE_LENGTH`）を撤廃したので、長い値は拒まない。
     ['a duplicate key field', { api: api({ keyFields: [...(api({})['keyFields'] as unknown[]), { key: 'name', type: 'string', field: { kind: 'NAME', name: 'name2' }, fieldType: 'text' }] }) }],
     ['a key that is also a page key', { api: api({ pageKeys: [{ key: 'name', type: 'string' }] }) }],
     ['no key field', { api: api({ keyFields: [] }), values: {} }],
@@ -262,7 +276,7 @@ describe('T40a: START of an API write job (the rejected shapes)', () => {
 
   it('rejects an API origin that is not approved and a WRITE_UPDATE by the rules written by hand', () => {
     expect(errorsOf(start(WORKER_WRITE_CREATE_JOB_KIND, apiWrite(), ['http://127.0.0.3:4175']))).toEqual([
-      '/write/api/request/origin must be the canonical origin of an approved service origin of the authentication',
+      '/write/api/request/origin must be the canonical origin of an approved service origin or an approved test origin of the authentication',
     ]);
     // T41b: API の更新の書き込みのジョブは、API の更新の指定（`update`）を必ず持つ（受ける形は `api-update-grant-start.test.ts`）。
     expect(errorsOf(start('WRITE_UPDATE', apiWrite()))).toEqual(['/write/update is required for WRITE_UPDATE and allowed only for it']);
@@ -303,5 +317,38 @@ describe('T40a: the schema and the contract of the API write specification', () 
     const write = ((SCHEMA.$defs['start'] ?? {})['properties'] as Record<string, unknown>)['write'];
     expect(write).toEqual({ oneOf: [{ $ref: '#/$defs/startWrite' }, { $ref: '#/$defs/startApiWrite' }] });
     expect(((SCHEMA.$defs['startApiWrite'] ?? {})['properties'] as Record<string, unknown>)['transport']).toEqual({ const: 'API' });
+  });
+});
+
+// ARR-5 fix round 1（SREV-ARR2 の I1）: 行の中の鍵の欄（道 `key[i].name`）の契約。行の中の鍵の名前は、承認と同じ唯一の判定（`isApiRowKeyNameUsable`）で使える
+// 名前だけ（重ねの守り）。
+describe('ARR-5 fix round 1: the names of the inner keys of the rows in START', () => {
+  const rowsOf = (extra: string | null) => [[
+    { name: 'name', role: 'FIELD' },
+    ...(extra === null ? [] : [{ name: extra, role: 'EMPTY_STRING' }]),
+  ]].map((row) => [...row].sort((left, right) => (left.name < right.name ? -1 : left.name > right.name ? 1 : 0)));
+  const rowWrite = (extra: string | null): Record<string, unknown> => {
+    const base = apiWrite();
+    const baseApi = base['api'] as Record<string, unknown>;
+    return apiWrite({
+      api: {
+        ...baseApi,
+        keyFields: [
+          ...(baseApi['keyFields'] as readonly unknown[]),
+          { key: 'careers[0].name', type: 'array', field: { kind: 'NAME', name: 'cn-0' }, fieldType: 'text', element: { key: 'careers', index: 0, name: 'name' }, rows: rowsOf(extra) },
+        ],
+      },
+      values: { ...(base['values'] as Record<string, unknown>), 'careers[0].name': '名前 一' },
+    });
+  };
+
+  it('accepts rows of usable inner key names', () => {
+    expect(errorsOf(start(WORKER_WRITE_CREATE_JOB_KIND, rowWrite(null)))).toEqual([]);
+    expect(errorsOf(start(WORKER_WRITE_CREATE_JOB_KIND, rowWrite('year')))).toEqual([]);
+  });
+
+  it.each(['password', 'access_token', 'delflg', 'deleted', '_method', 'status', 'removed', 'trash', 'trashed', 'purged', 'discarded', 'erased', 'destroyed',
+    'delete', 'archive'])('rejects rows with the inner key %s', (name) => {
+    expect(errorsOf(start(WORKER_WRITE_CREATE_JOB_KIND, rowWrite(name)))).not.toEqual([]);
   });
 });

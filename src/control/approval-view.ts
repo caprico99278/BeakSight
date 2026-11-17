@@ -3,11 +3,11 @@
 // - 画面のコードは `src/control/approval/` を直接 import しない（`tests/architecture/local-ui-boundary.test.ts` の (j)）。画面は、ここから型と値を
 //   読む（書き写さない）。意味の owner は、それぞれの `src/control/approval/` のファイルのまま（ここは名前を公開し直すだけで、判断を持たない）。
 // - 公開しないもの（`tests/architecture/approval-ssot.test.ts` の (d)）: 承認の期限の 1 日の長さ（期限の計算は `approval-validity.ts` だけが使う。
-//   T28a の Gate (b)）、実行の許可の消費・確かめ直しと予約の状態の変更（ジョブの管理が書き込みのジョブの中で使う）、入力の規則の参照を付ける口
-//   （Task 29）。
-// - T30g（Task 30 の設計書 3 章、T30g の Blocker の判断（案 A））: 実行の許可の発行（`issueExecutionGrant`）と、連続の上限の予定
-//   （`writeScheduleOf`）を公開する。発行を呼べる画面のコードは、書き込みの開始の Server Function のファイル 1 つだけ（Gate `approval-ssot` の (e)）。
-//   検証の指定の閉じた一覧と未指定の項目の判定（`missingVerificationItemsOf`）も、画面の入力と表示のために公開する。
+//   T28a の Gate (b)）、実行の許可の発行・消費・確かめ直しと予約の状態の変更（ジョブの管理が書き込みの段の前と書き込みのジョブの中で使う）、入力の
+//   規則の参照を付ける口（Task 29）。
+// - T30g（Task 30 の設計書 3 章、T30g の Blocker の判断（案 A））で実行の許可の発行（`issueExecutionGrant`）を公開したが、SPEC-4 で書き込みの開始の
+//   画面を外したので、公開しない名前に戻した（Gate `approval-ssot` の (d)）。検証の指定の閉じた一覧と未指定の項目の判定
+//   （`missingVerificationItemsOf`）は、画面の入力と表示のために公開する。
 // - 値（関数と閉じた一覧）は、画面のサーバ（`apps/local-ui/src/server/`）だけが読む。ブラウザ側の画面のコードは、ここから型だけを import する
 //   （値はサーバの Server Function が返す。ここから読み込む部品は Node の部品を使う）。
 
@@ -28,9 +28,7 @@ export {
   UPDATE_SCENARIO_KIND,
   // FM2R の Minor 13: 下書きの状態の名前つきの定数。
   DRAFT_SCENARIO_STATE,
-  // T30g: 検証の指定の入力と表示、連続の上限の表示。
-  MAX_WRITES_PER_DAY,
-  MIN_WRITE_INTERVAL_MS,
+  // T30g: 検証の指定の入力と表示（連続の上限の表示は LZ-3c で捨てた）。
   RECORD_ID_SOURCES,
   SCENARIO_VERIFICATION_ITEMS,
   // T40R-fix-B（M-2）: 送り方の値の名前つきの定数（画面のサーバが使う）。
@@ -113,6 +111,8 @@ export {
   // OP-2: 規則 F で決めた更新の下書きを、自動の下書きが組み立てる。
   apiScenarioDraftInputOf,
   isUsableRecordIdSegment,
+  // LU-13 fix round 1（D3）: サイトの画面の一覧が、名前のない開き手だけの更新の画面を見分ける。
+  isUnnamedOpenerUpdateOf,
 } from './approval/api-scenario-draft.js';
 export type {
   ApiScenarioExistingScenario,
@@ -188,15 +188,13 @@ export {
   COUNTED_WRITE_RESERVATION_STATES,
   EXECUTION_GRANT_REJECTION_REASONS,
   usedCumulativeWrites,
-  writeScheduleOf,
 } from './approval/execution-grant.js';
-export type { ExecutionGrantRejectionReason, WriteSchedule } from './approval/execution-grant.js';
+export type { ExecutionGrantRejectionReason } from './approval/execution-grant.js';
 
 export {
   SCENARIO_STORE_REJECTION_REASONS,
   approveScenario,
   createScenario,
-  issueExecutionGrant,
   listScenarios,
   readApprovalReceipts,
   readScenario,
@@ -235,5 +233,9 @@ export {
   autoDraftScenarioFactsOf,
   draftUpdateForCreate,
   formUpdateAutoDraftOf,
+  humanRulesAttachedOf,
+  replaceHumanRules,
 } from './approval/update-autodraft.js';
+// LU-7 fix round 3: 一覧の行の更新の、台帳の登録の毎回違う欄（開始の画面が、許可の発行と同じ唯一の判定に渡す。LU-8 で公開した読み出し）。
+export { readLedgerUniqueEachRunFieldNames } from './approval/scenario-facts.js';
 export type { AutoDraftClock, InferredRulesAttachment, UpdateAutoDraftFacts, UpdateAutoDraftOutcome } from './approval/update-autodraft.js';

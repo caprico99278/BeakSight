@@ -40,9 +40,9 @@ import { FORM_NAVIGATION_SETUP_ITEMS } from '../../../tests/helpers/auth-setup-s
 import { launchHeadlessChromium } from '../../../tests/helpers/chromium.js';
 import { ENTRY_CHECK_SITE_PATHS, startEntryCheckSite, type EntryCheckSite } from '../../../tests/helpers/entry-check-site.js';
 import { READ_METHODS } from '../../../tests/helpers/leak-places.js';
-import { AUDIT_JOB_POLL_INTERVAL_MS } from '../src/display/job-polling';
 import { ISOLATION_UNVERIFIED_EVIDENCE_REF_PREFIX } from '../src/server/isolation-evidence-ref';
 import {
+  BUILT_SERVER_ENTRY,
   createTemporaryUiRoot,
   findFreePort,
   parseSetCookie,
@@ -196,7 +196,7 @@ const jobIdOfPage = (page: Page): string => new URL(page.url()).pathname.split('
 beforeAll(async () => {
   root = createTemporaryUiRoot('built');
   site = await startEntryCheckSite();
-  ids = readServerFunctionIds(`${root.root}/apps/local-ui/dist/server/server.js`);
+  ids = readServerFunctionIds(BUILT_SERVER_ENTRY);
   browser = await launchHeadlessChromium();
   server = await startLauncher(root, await findFreePort());
   context = await browser.newContext();
@@ -419,19 +419,19 @@ describe('T43b: creating a profile from the start URL only', () => {
     // OP-1 修正の 2 回目（設計者の判断。前はサイトの画面へ移り、保存の知らせを出した）: 保存に続けて下調べの作業の画面へ移る。
     const entryJobId = await settleCreatedJobs(page);
 
-    // ファイル: 中身は target.id・site・負荷と出力。負荷は最初の読み込みのための控えめな値（最大 3 ページ、間隔 10 秒。T43b fix round 2）で、
+    // ファイル: 中身は target.id・site・負荷と出力。負荷は最初の読み込みのための控えめな間隔（10 秒。T43b fix round 2）で、
     // ほかの負荷と出力は既定値。CLI の loadConfig で読める。一時のファイルは残らない。
     const path = generatedFileOf(PUBLIC_PROFILE);
     expect(JSON.parse(readFileSync(path, 'utf8'))).toEqual({
       target: { id: PUBLIC_PROFILE },
       site: { startUrl: PUBLIC_START_URL, allowedOrigins: [PUBLIC_ORIGIN] },
-      crawl: { ...DEFAULT_CONFIG.crawl, maxPages: GENERATED_TARGET_CRAWL_LIMITS.maxPages, minNavigationIntervalMs: GENERATED_TARGET_CRAWL_LIMITS.minNavigationIntervalMs },
+      // L14: 最初の読み込みの値だけを書く（隠れた既定の値・ページの上限を書き込まない。ほかは loadConfig が既定値を合わせる）。
+      crawl: { ...GENERATED_TARGET_CRAWL_LIMITS },
       output: DEFAULT_CONFIG.output,
     });
     const loaded = await loadConfig(path);
     expect(loaded.site).toEqual({ startUrl: PUBLIC_START_URL, allowedOrigins: [PUBLIC_ORIGIN] });
-    expect([loaded.crawl.maxPages, loaded.crawl.minNavigationIntervalMs])
-      .toEqual([GENERATED_TARGET_CRAWL_LIMITS.maxPages, GENERATED_TARGET_CRAWL_LIMITS.minNavigationIntervalMs]);
+    expect([loaded.crawl.maxPages, loaded.crawl.minNavigationIntervalMs]).toEqual([undefined, GENERATED_TARGET_CRAWL_LIMITS.minNavigationIntervalMs]);
     expect(leftoverTemporaryFiles()).toEqual([]);
 
     // プロファイルは作ったファイルを指す。
@@ -622,7 +622,7 @@ interface JobWithSummary {
   readonly summary: { readonly result: string; readonly advance: unknown };
 }
 
-describe('OP-1 fix round 2: one button for a public site, and a stopped audit stays on the job screen (the real worker)', () => {
+describe('OP-1 fix round 2: one button for a public site (the real worker)', () => {
   // 設計者の判断（OP 設計書 4.1.3 の 3）: ログインしなくても見られるサイトも、作成の画面のボタンは「点検を始める」1 つ。保存 → 下調べ → 点検（単独の点検）へ、ジョブの
   // 管理が進める。127.0.0.1 の fixture のサイト（届いた要求は読み取りだけ）。
   it('saves a public site, starts the entry check and then the single audit with the same press, and opens the audit job', async () => {
@@ -667,28 +667,7 @@ describe('OP-1 fix round 2: one button for a public site, and a stopped audit st
     expect(siteOf().requests.slice(requestsBefore).filter((request) => !READ_METHODS.has(request.method))).toEqual([]);
   });
 
-  // PL 設計書 14.1 の末尾の U1: 利用者が「止める」で止めた点検は、作業の画面に残す。ログインを待つ間に止めると、Run がまだなく、Run の終わりの記録がない。
-  // それでも、ジョブに残る止める要求の記録で、止めた点検と分かり、作業の画面に残る（前は、サイトの画面へ移っていた）。本物のワーカーの単独の点検（手でのログイン）。
-  it('keeps the job screen when the person stops a single audit while it waits for the manual login', async () => {
-    // 前の場面で、開始の URL だけで作ったログインが必要なサイト（下調べがログインの画面を見つけ、ログインの設定を案で保存した）。
-    const profileId = '127-0-0-1';
-    const { profile } = await valueOf<{ profile: { revision: number } }>('getProfileFn', 'GET', { profileId });
-    const start = await valueOf<{ ok: boolean; jobId: string }>('startAuditJobFn', 'POST', { profileId, expectedRevision: profile.revision, startNew: true });
-    expect(start).toMatchObject({ ok: true });
-    const page = await openPage(`/jobs/${start.jobId}`);
-    const read = (id: string): Promise<JobWithSummary> => valueOf<JobWithSummary>('getAuditJobFn', 'GET', { jobId: id });
-    await waitForJobViaServerFunctions(read, start.jobId, (job) => job.lastAuthState === 'AWAITING_LOGIN', { limitMs: JOB_TIMEOUT_MS, stepMs: JOB_POLL_MS });
-    expect(await valueOf('stopAuditJobFn', 'POST', { jobId: start.jobId, force: false })).toMatchObject({ ok: true });
-    const ended = await waitForJobViaServerFunctions(read, start.jobId, (job) => !job.active, { limitMs: JOB_TIMEOUT_MS, stepMs: JOB_POLL_MS });
-    // ログインを待つ間に止めたので、Run の終わりの記録はない。止める要求の記録は残る。サーバの判定は、移さない。本物のワーカーでは、この作業は中断（`INTERRUPTED`）で
-    // 終わるので、前の判定（Run の終わりの理由だけを見る）でも移さなかった。前の判定で移ったのは、Run の終わりの記録なしに終わった点検（偽のワーカー
-    // `manual-login-confirm-ui`）と、止めた下調べ（続けて始めるかの判定が先）のとき。ここでは、本物のワーカーで止める要求の記録が残ることを確かめる。
-    expect(ended).toMatchObject({ jobKind: 'AUDIT', stageChain: null, runEnd: null });
-    expect(ended.stopRequestedAt).not.toBeNull();
-    expect(ended.summary.advance).toBeNull();
-    // 画面は、終わった作業の要点を出したまま、作業の画面に残る。
-    // 作業の画面の読み直しの間隔の 2 回分を待つ（移すなら、その間に移る）。
-    await page.waitForTimeout(AUDIT_JOB_POLL_INTERVAL_MS * 2);
-    expect(new URL(page.url()).pathname).toBe(`/jobs/${start.jobId}`);
-  });
+  // SLIM-GROUP UI-7: 前の「手でのログインを待つ間に止めた点検は作業の画面に残る」場面は、止めた点検が作業の画面に残ることを `audit-ui-flows.test.ts`
+  // （止めるダイアログ → PARTIAL のまま残る）と `job-screens-ui.test.ts` の job-stop-ui の describe で確かめる。NL-3（ログインのないループバックのテスト用のサイトをログインなしで保存し直す）
+  // の判定と保存は `tests/integration/control-no-login-jobs.test.ts`（速い組）、ログインの語のない表示は `auth-display.test.ts`（速い組）で確かめる。
 });

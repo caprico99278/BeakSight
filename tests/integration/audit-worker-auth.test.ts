@@ -38,14 +38,10 @@ import {
   type AuthenticatedSite,
   type AuthenticatedSiteOptions,
 } from '../helpers/authenticated-site-fixture.js';
-import { launchCliChromium, launchHeadlessChromium } from '../helpers/chromium.js';
+import { DEFAULT_CHROMIUM_LAUNCHERS } from '../helpers/chromium.js';
 import { nonReadRequestsOf, READ_METHODS } from '../helpers/leak-places.js';
 import { cliTargetConfig } from '../helpers/run-harness.js';
 
-const LAUNCHERS = [
-  ['the default test Chromium', () => launchHeadlessChromium()],
-  ['the CLI launch settings', () => launchCliChromium()],
-] as const;
 /** テストのログインを待つ時間（ms。人の操作を待たない場面）。 */
 const SHORT_LOGIN_TIMEOUT_MS = 2_000;
 /** テストのログインを待つ時間（ms。テストの口が入力する場面。CPU の混雑に余裕をもつ）。 */
@@ -71,7 +67,7 @@ interface WorkerRun {
   readonly loginBrowserConnectedAtAuthenticated: boolean | null;
 }
 
-describe.each(LAUNCHERS)('T25d: the authenticated worker flow in process (%s)', (_name, launch) => {
+describe.each(DEFAULT_CHROMIUM_LAUNCHERS)('T25d: the authenticated worker flow in process (%s)', (_name, launch) => {
   let workDirectory: string;
   let site: AuthenticatedSite | undefined;
   const browsers: Browser[] = [];

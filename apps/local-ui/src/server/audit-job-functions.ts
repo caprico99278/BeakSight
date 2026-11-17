@@ -46,6 +46,7 @@ import {
 import type { AuditJobLoginConfirmResult, EntryCheckFollowUp } from '../../../../src/control/job/audit-job-manager.js';
 import { chainStagesOfMode, type StageChainView } from '../../../../src/control/job/stage-chain-policy.js';
 import { FINISHED_CHAIN_STATE, RUNNING_CHAIN_STAGE_STATE, RUNNING_CHAIN_STATE } from '../../../../src/core/stage-chain-states.js';
+import type { AuditPageScopeKind } from '../../../../src/core/audit-page-scope.js';
 import { WORKER_AWAITING_LOGIN_STATE } from '../../../../src/core/worker-auth-states.js';
 import { loginStageRegistrationOf } from '../../../../src/control/login-observation-draft.js';
 import { awaitsAutoRegistration } from '../display/job-polling';
@@ -81,7 +82,6 @@ import { lastRunExecutionOf } from '../../../../src/core/run-executions.js';
 import type {
   DiscoveryEndReason,
   DiscoveryExternalSchemeProbes,
-  DiscoveryPressLimitProbes,
   ReadCheckEndReason,
 } from '../../../../src/control/discovery-view.js';
 import type { SessionLossEvidence } from '../../../../src/core/evidence-types.js';
@@ -97,8 +97,7 @@ import { readProfileStart, type AuditAutoLoginSummaryView } from './start-check-
 import { approvedScenarioCountOf } from './scenario-facts';
 import { compactTimestampMs, isoTimestampOf, isoTimestampOrNull } from './timestamps';
 import { isWriteJobKind } from './write-kinds';
-import { writeResultSummaryOfJob, type WriteResultSummaryView } from './write-results';
-import { writeChainOfCreateJob, type WriteChainView } from './write-chain';
+import { writePrecheckDetailOfJob, writeResultSummaryOfJob, type WriteResultSummaryView } from './write-results';
 import { redraftCheckedScreensOnChainStart } from './write-screen-functions';
 import { loginSetupViewOf, type LoginSetupView } from './login-setup-view';
 
@@ -152,8 +151,6 @@ export interface AuditJobDetailView extends AuditJobRowView {
   readonly autoLogin: AuditJobAutoLoginView | null;
   /** 書き込みの結果（T30g。書き込みのジョブで、記録があるときだけ。ほかは `null`）。 */
   readonly write: WriteResultSummaryView | null;
-  /** T41g（Task 41 の設計書 3.5.1）: 登録のジョブの、続けて更新する予定と状態（「登録してから更新する」で始めた登録のジョブだけ。メモリの中）。 */
-  readonly writeChain: WriteChainView | null;
   /** FM2d: まとめて実行の段の一覧と状態（まとめて実行の段のジョブだけ。ジョブの管理のメモリの中。ほかは `null`）。 */
   readonly stageChain: StageChainView | null;
   /**
@@ -197,11 +194,6 @@ export interface AuditJobDetailView extends AuditJobRowView {
    * 画面の数（成果物 `discovery.json` が持つときだけ。ほかは `null`）。数だけ。
    */
   readonly externalSchemeProbes: DiscoveryExternalSchemeProbes | null;
-  /**
-   * T44c（Task 44 の設計書 P1-3）: 終わった発見のジョブの、押す数の上限で押せなかった登録・更新の語の候補の数（成果物 `discovery.json` が持つときだけ。ほかは
-   * `null`）。数だけ。
-   */
-  readonly pressLimitProbes: DiscoveryPressLimitProbes | null;
   /**
    * T44c（Task 44 の設計書 P1-4。設計者の判断）: 終わった監査のジョブの、ページの未完了の理由ごとのページ数（`run.json` の `pageIncompleteReasonCounts`。持つときだけ。
    * ほかは `null`）。数と理由のコードだけ。
@@ -320,12 +312,13 @@ export type JobSummaryAdvance =
   | { readonly kind: 'JOB'; readonly jobId: string };
 
 /**
- * PL-2（13 章の 11）: 点検を待つ間の進み具合と、終わるまでの上限の見積もり（`auditRemainingUpperBoundMs`）。点検の作業が動いている間で、上限を読めたときだけ。
+ * PL-2（13 章の 11。DEF-192: 2026-11-04 改）: 点検（DEF-195: 操作さがしも）を待つ間の進み具合と、終わるまでの見積もり（`progressRemainingMs`）。作業が動いている間で、
+ * 進み具合の知らせ（1 ページ以上読んだ）と時間の上限を読めたときだけ。`pagesTotal` は見つけたページの数（ページの上限まで。読み進めて増えれば増える）。
  */
 export interface JobProgressEstimateView {
   readonly pagesFinished: number;
-  readonly maxPages: number;
-  readonly remainingUpperBoundMs: number;
+  readonly pagesTotal: number;
+  readonly remainingMs: number;
 }
 
 /**
@@ -375,6 +368,8 @@ export interface AuditJobRunEndView {
   readonly partialPageCount: number;
   readonly failedPageCount: number;
   readonly skippedPageCount: number;
+  /** WSO: 「チェックした画面だけ」の点検の Run か（`run.json` の `pageScope`）。始め方の選び方（続きから）は、サイトの全部の画面の Run だけを見る。 */
+  readonly checkedScreensOnly: boolean;
 }
 
 /** T44e: 発見と READ の確かめのジョブの終わり方。 */
@@ -414,8 +409,9 @@ export type AuditJobStopView =
 /** 開始の画面の、ターゲット設定の要点（読むだけ）。 */
 export interface AuditTargetSummaryView {
   readonly startUrl: string;
-  readonly maxPages: number;
-  readonly maxRuntimeMs: number;
+  /** L14: ページの上限と時間の上限は、指定したときだけ（ないときは「指定なし」と出す）。 */
+  readonly maxPages: number | undefined;
+  readonly maxRuntimeMs: number | undefined;
   readonly minNavigationIntervalMs: number;
 }
 
@@ -544,6 +540,12 @@ const rowOf = (job: AuditJobView): AuditJobRowView => ({
   stopRequestedAt: isoTimestampOrNull(job.stopRequestedAt),
 });
 
+/**
+ * DEF-197: ジョブの一覧の 1 行（`listAuditJobsFn` と同じ形）。サイトの一覧の「前回の点検」を、「次にすること」と同じ事実から返すために、サイトの段の
+ * Server Function（`profile-onboarding-functions.ts`）が使う。サーバだけで使う。
+ */
+export const auditJobRowOf = createServerOnlyFn((job: AuditJobView): AuditJobRowView => rowOf(job));
+
 /** 止める要求から、名前つきの時間を過ぎても止まっていないか（サーバの時計で決める）。 */
 const isForceStopAvailable = (job: AuditJobView): boolean => {
   if (job.state !== STOPPING_AUDIT_JOB_STATE || job.stopRequestedAt === null) {
@@ -600,7 +602,6 @@ const detailWithoutSummaryOf = async (job: AuditJobView): Promise<Omit<AuditJobD
     },
   // T31h-2: 登録と更新の書き込みのジョブ（`write-kinds.ts`）。
   write: isWriteJobKind(job.jobKind) ? await writeResultSummaryOfJob(job.jobId) : null,
-  writeChain: writeChainOfCreateJob(job.jobId),
   stageChain: localUiAuditJobs().getStageChainOfJob(job.jobId),
   stageChainWriteKind: runningWriteStageKindOf(localUiAuditJobs().getStageChainOfJob(job.jobId)),
   inspectionWrite: await inspectionWriteOf(localUiAuditJobs().getStageChainOfJob(job.jobId)),
@@ -612,7 +613,6 @@ const detailWithoutSummaryOf = async (job: AuditJobView): Promise<Omit<AuditJobD
   auditStage: await auditStageOf(job),
   safetyViolation: await safetyViolationOf(job),
   externalSchemeProbes: await externalSchemeProbesOfJob(job),
-  pressLimitProbes: await pressLimitProbesOfJob(job),
   pageIncompleteReasons: await pageIncompleteReasonsOfJob(job),
   auditSend: await auditSendOf(job),
   currentProfile: currentProfileOf(job.profileId),
@@ -621,7 +621,7 @@ const detailWithoutSummaryOf = async (job: AuditJobView): Promise<Omit<AuditJobD
   entryCheckAuthSetup: await entryCheckAuthSetupOfJob(job),
   runEnd: await runEndOf(job),
   profileJobEnd: await profileJobEndOf(job),
-  writePrecheckDetail: await writePrecheckDetailOf(job),
+  writePrecheckDetail: await writePrecheckDetailOfJob(job),
   reportSummary: await reportSummaryOfJob(job),
 });
 
@@ -630,15 +630,6 @@ const entryCheckAuthSetupOfJob = async (job: AuditJobView): Promise<EntryCheckAu
   (job.jobKind === WORKER_ENTRY_CHECK_JOB_KIND && job.state === FINISHED_AUDIT_JOB_STATE
     ? entryCheckAuthSetupStateOf(job.profileId, await entryCheckResultOfJob(job))
     : null);
-
-/** T44e（P2-4）: 書き込みのジョブの `action-run.json` の、送らずに止めた具体的な理由（`PRECHECK_FAILED` のときだけ。なければ `null`）。 */
-const writePrecheckDetailOf = async (job: AuditJobView): Promise<PrecheckFailureDetail | null> => {
-  if (!isWriteJobKind(job.jobKind) || job.state !== AUDIT_STAGE_JOB_STATE) {
-    return null;
-  }
-  const document = await readJobResultDocument(job, 'action-run') as { readonly blockReason?: string | null; readonly precheckDetail?: PrecheckFailureDetail } | null;
-  return document?.blockReason === 'PRECHECK_FAILED' ? document.precheckDetail ?? null : null;
-};
 
 /**
  * PL-R: 終わった監査のジョブの、報告の小さなまとめ（`report-summary.json`）の件数（なければ `null`）。スキーマと Run の ID を確かめる読み出しで読み、項目を選んで写す。
@@ -726,15 +717,6 @@ const pageIncompleteReasonsOfJob = async (job: AuditJobView): Promise<readonly P
   return counts === undefined ? null : counts.map(({ code, pages }) => ({ code, pages }));
 };
 
-const pressLimitProbesOfJob = async (job: AuditJobView): Promise<DiscoveryPressLimitProbes | null> => {
-  if (job.jobKind !== WORKER_DISCOVERY_JOB_KIND || job.state !== AUDIT_STAGE_JOB_STATE) {
-    return null;
-  }
-  const document = await readJobResultDocument(job, 'discovery') as { readonly pressLimitProbes?: DiscoveryPressLimitProbes } | null;
-  const counts = document?.pressLimitProbes;
-  return counts === undefined ? null : { priorityNotPressed: counts.priorityNotPressed };
-};
-
 /**
  * T44e（Task 44 の設計書 P2-7）: 監査のジョブの `run.json`（スキーマと Run の ID を確かめる読み出し `readJobResultDocument`）から、終わり方と理由を読む。
  * 監査でないジョブ、記録がない・読めないときは `null`。項目を選んで写す（理由の `detail` は写さない）。
@@ -749,6 +731,7 @@ const runEndOf = async (job: AuditJobView): Promise<AuditJobRunEndView | null> =
     readonly partialPageCount?: number;
     readonly failedPageCount?: number;
     readonly skippedPageCount?: number;
+    readonly pageScope?: unknown;
   } | null;
   if (run === null) {
     return null;
@@ -759,6 +742,7 @@ const runEndOf = async (job: AuditJobView): Promise<AuditJobRunEndView | null> =
     partialPageCount: run.partialPageCount ?? 0,
     failedPageCount: run.failedPageCount ?? 0,
     skippedPageCount: run.skippedPageCount ?? 0,
+    checkedScreensOnly: run.pageScope !== undefined,
   };
 };
 
@@ -861,63 +845,62 @@ const currentProfileOf = (profileId: string): AuditJobDetailView['currentProfile
 /** 要点を求めるのに使う、ジョブの詳細（要点のほか）。 */
 type JobDetailFacts = Omit<AuditJobDetailView, 'summary'>;
 
-/** 点検が終わるまでの見積もりに使う上限（ターゲット設定の `crawl` の値）。 */
+/** 作業が終わるまでの見積もりに使う上限（ターゲット設定の `crawl` の値）。 */
 interface EstimateLimits {
-  readonly maxPages: number;
-  readonly maxRuntimeMs: number;
-  readonly minNavigationIntervalMs: number;
+  /** L14: 指定したときだけ（ないときは、時間の上限の残りで見積もりを縮めない）。 */
+  readonly maxRuntimeMs: number | undefined;
 }
 
-/**
- * PL-2（13 章の 11）: 点検が終わるまでの、長くてもの見積もり（ms。0 以上）。残りのページの数（ページの上限 − 読み終えたページ）× ページの読み込みの間隔と、
- * 時間の上限の残り（時間の上限 − 経過）の、小さい方。求め方はここだけ（画面は分に直して描くだけ）。サーバだけの関数。
- */
-export const auditRemainingUpperBoundMs = createServerOnlyFn((input: Readonly<{
-  pagesFinished: number;
-  maxPages: number;
-  elapsedMs: number;
-  minNavigationIntervalMs: number;
-  maxRuntimeMs: number;
-}>): number => Math.max(0, Math.min(
-  Math.max(0, input.maxPages - input.pagesFinished) * input.minNavigationIntervalMs,
-  input.maxRuntimeMs - input.elapsedMs,
-)));
+/** DEF-195: 進み具合と見積もりを出す作業の種類（点検と操作さがし。どちらも同じ進み具合の知らせ `PROGRESS` を送る）。 */
+const ESTIMATED_JOB_KINDS: ReadonlySet<string> = new Set([WORKER_AUDIT_JOB_KIND, WORKER_DISCOVERY_JOB_KIND]);
 
-/** 点検の作業が動いている間だけ、プロファイルのターゲット設定から見積もりの上限を読む（読めなければ `null`。例外を投げない）。 */
+/**
+ * PL-2（13 章の 11。DEF-192: 2026-11-04 改）: 作業が終わるまでの見積もり（ms。0 以上）。残りのページの数（`pagesTotal` − 読み終えたページ）× 1 ページにかかった
+ * 実際の時間（経過 ÷ 読み終えたページ）と、時間の上限の残り（時間の上限 − 経過）の、小さい方。読み終えたページがまだなければ `null`（求めない）。
+ * 求め方はここだけ（点検と操作さがしが共有する。画面は分に直して描くだけ）。サーバだけの関数。
+ */
+export const progressRemainingMs = createServerOnlyFn((input: Readonly<{
+  pagesFinished: number;
+  pagesTotal: number;
+  elapsedMs: number;
+  maxRuntimeMs: number | undefined;
+}>): number | null => {
+  if (input.pagesFinished <= 0) {
+    return null;
+  }
+  const pageMs = input.elapsedMs / input.pagesFinished;
+  const byPages = Math.max(0, input.pagesTotal - input.pagesFinished) * pageMs;
+  // L14: 時間の上限を指定していなければ、残りのページの時間だけで見積もる。
+  return Math.max(0, input.maxRuntimeMs === undefined ? byPages : Math.min(byPages, input.maxRuntimeMs - input.elapsedMs));
+});
+
+/** 点検・操作さがしの作業が動いている間だけ、プロファイルのターゲット設定から見積もりの上限を読む（読めなければ `null`。例外を投げない）。 */
 const estimateLimitsOf = async (detail: JobDetailFacts): Promise<EstimateLimits | null> => {
-  if (!detail.active || detail.jobKind !== WORKER_AUDIT_JOB_KIND) {
+  if (!detail.active || !ESTIMATED_JOB_KINDS.has(detail.jobKind)) {
     return null;
   }
   try {
     const crawl = (await readProfileStart(detail.profileId))?.context?.targetConfig.crawl;
-    return crawl === undefined
-      ? null
-      : { maxPages: crawl.maxPages, maxRuntimeMs: crawl.maxRuntimeMs, minNavigationIntervalMs: crawl.minNavigationIntervalMs };
+    return crawl === undefined ? null : { maxRuntimeMs: crawl.maxRuntimeMs };
   } catch {
     return null;
   }
 };
 
-/** 見積もり（減速の知らせがあれば、広げた間隔で求める）。 */
+/**
+ * 見積もり（DEF-192）。分母は見つけたページの数（ページの上限まで。読み終えたページを下回らない）。進み具合の知らせがまだない（1 ページも読んでいない）
+ * ときは出さない（見つけたページの数も 1 ページの時間も分からない）。
+ */
 const progressEstimateOf = (detail: JobDetailFacts, limits: EstimateLimits | null): JobProgressEstimateView | null => {
-  if (limits === null) {
+  const progress = detail.lastProgress;
+  if (limits === null || progress === null || !ESTIMATED_JOB_KINDS.has(detail.jobKind)) {
     return null;
   }
-  const progress = detail.lastProgress;
-  const slowedIntervalMs = detail.lastNotice?.kind === 'SITE_UNAVAILABLE_SLOWDOWN' ? detail.lastNotice.minIntervalMs : 0;
-  const pagesFinished = progress?.pagesFinished ?? 0;
-  const maxPages = progress?.maxPages ?? limits.maxPages;
-  return {
-    pagesFinished,
-    maxPages,
-    remainingUpperBoundMs: auditRemainingUpperBoundMs({
-      pagesFinished,
-      maxPages,
-      elapsedMs: progress?.elapsedMs ?? 0,
-      minNavigationIntervalMs: Math.max(limits.minNavigationIntervalMs, slowedIntervalMs),
-      maxRuntimeMs: limits.maxRuntimeMs,
-    }),
-  };
+  const { pagesFinished } = progress;
+  // L14: ページの上限を指定していなければ、見つけたページの数まで。
+  const pagesTotal = Math.max(pagesFinished, progress.maxPages === undefined ? progress.pagesDiscovered : Math.min(progress.pagesDiscovered, progress.maxPages));
+  const remainingMs = progressRemainingMs({ pagesFinished, pagesTotal, elapsedMs: progress.elapsedMs, maxRuntimeMs: limits.maxRuntimeMs });
+  return remainingMs === null ? null : { pagesFinished, pagesTotal, remainingMs };
 };
 
 /** 書き込みのジョブの結果の 1 行の種類。 */
@@ -1081,11 +1064,11 @@ const chainStageOf = (detail: JobDetailFacts): JobSummaryChainStage | null => {
 
 /**
  * 成功で終わったときに移す先（3 章の 5）。入口の確かめ → サイトの詳細、点検（手でのログイン・自動ログイン。一部のページを見られなかった点検も。14.1 の U1）→ サイトの詳細、まとめて実行 → 最後まで
- * 行ったらサイトの詳細（OP-G2: 動いている間は移さない）、書き込み → 続けて始めた更新の作業か、書き込みの手順の詳細。ほかの種類（ログインの確かめ・操作さがし・見るだけの確かめの単独の作業）は移さない。
- * 背後で書く結果（手でのログインからの自動の登録、続けて更新する予定）を待つ間は、まだ移さない。
+ * 行ったらサイトの詳細（OP-G2: 動いている間は移さない）、書き込み → 書き込みの手順の詳細。ほかの種類（ログインの確かめ・操作さがし・見るだけの確かめの単独の作業）は移さない。
+ * 背後で書く結果（手でのログインからの自動の登録）を待つ間は、まだ移さない。
  */
 const advanceOf = (detail: JobDetailFacts, result: JobSummaryResult, awaitingRegistration: boolean): JobSummaryAdvance | null => {
-  // OP-U: 移り先は、ページが出す送信の扱い（既定は削除のほかを通す）によらない。通した数と送り先は、成果物と報告に残す（作業の画面には出さない）。
+  // OP-U: 移り先は、ページが出す送信の扱い（既定はサイトの通信を止めない）によらない。通した数と送り先は、成果物と報告に残す（作業の画面には出さない）。
   if (detail.active || awaitingRegistration || stoppedByPersonOf(detail)) {
     return null;
   }
@@ -1111,13 +1094,8 @@ const advanceOf = (detail: JobDetailFacts, result: JobSummaryResult, awaitingReg
     case 'ENTRY_CHECK_LOGIN_PAGE':
     case 'ENTRY_CHECK_READ':
       return { kind: 'SITE' };
-    case 'WRITE_VERIFIED': {
-      const chain = detail.writeChain;
-      if (chain === null) {
-        return detail.write === null ? null : { kind: 'SCENARIO', scenarioId: detail.write.scenarioId };
-      }
-      return chain.updateJobId === null ? null : { kind: 'JOB', jobId: chain.updateJobId };
-    }
+    case 'WRITE_VERIFIED':
+      return detail.write === null ? null : { kind: 'SCENARIO', scenarioId: detail.write.scenarioId };
     default:
       return null;
   }
@@ -1150,10 +1128,9 @@ const loginStageRegistrationStateOf = (detail: JobDetailFacts, awaitingRegistrat
   return hasRegistrableLoginStageRow(stage) ? 'NEEDED' : 'NONE';
 };
 
-/** 確かめきれなかった所があるか（押す数の上限で押せなかった、サイトへの要求の上限に届いた、読みきれなかったページがある）。 */
+/** 確かめきれなかった所があるか（サイトへの要求の上限に届いた、読みきれなかったページがある。COV-1: 押す数の上限は外した）。 */
 const incompleteOf = (detail: JobDetailFacts): boolean =>
-  (detail.pressLimitProbes?.priorityNotPressed ?? 0) > 0
-  || detail.auditStage?.serviceRequestLimitReached === true
+  detail.auditStage?.serviceRequestLimitReached === true
   || (detail.pageIncompleteReasons ?? []).some(({ pages }) => pages > 0);
 
 /**
@@ -1188,6 +1165,8 @@ interface AuditJobStartRequest {
   readonly profileId: string;
   readonly expectedRevision: number;
   readonly startNew: boolean;
+  /** WSO: 点検の範囲（まとめて実行だけ。省略はサイトの全部の画面）。 */
+  readonly scope?: AuditPageScopeKind;
 }
 interface AuditJobStopRequest {
   readonly jobId: string;
@@ -1336,13 +1315,18 @@ export const auditStartSummaryFn = createServerFn({ method: 'GET' })
  */
 const resumeChoiceOfferedOf = async (profileId: string): Promise<boolean> => {
   // ジョブの一覧は新しい順（`listAuditJobs`）。
-  const latest = localUiAuditJobs().listAuditJobs()
-    .find((job) => job.profileId === profileId && job.jobKind === WORKER_AUDIT_JOB_KIND && !ACTIVE_STATES.has(job.state));
-  if (latest === undefined) {
-    return false;
+  const finished = localUiAuditJobs().listAuditJobs()
+    .filter((job) => job.profileId === profileId && job.jobKind === WORKER_AUDIT_JOB_KIND && !ACTIVE_STATES.has(job.state));
+  // WSO: 「チェックした画面だけ」の点検の Run は続きから始めないので、飛ばして、サイトの全部の画面の最後の点検を見る。
+  for (const job of finished) {
+    const runEnd = await runEndOf(job);
+    // REV-WSO の M-4: `run.json` を書く前に終わった点検も、連鎖の記録（画面のサーバのメモリの中）が「チェックした画面だけ」と言えば飛ばす。
+    if (runEnd?.checkedScreensOnly === true || (runEnd === null && (localUiAuditJobs().getStageChainOfJob(job.jobId)?.pageScope ?? null) !== null)) {
+      continue;
+    }
+    return runEnd === null || runEnd.lastExecutionEndReason !== COMPLETED_RUN_EXECUTION_END_REASON;
   }
-  const runEnd = await runEndOf(latest);
-  return runEnd === null || runEnd.lastExecutionEndReason !== COMPLETED_RUN_EXECUTION_END_REASON;
+  return false;
 };
 
 /**
@@ -1390,6 +1374,8 @@ export const startStageChainFn = createServerFn({ method: 'POST' })
       profileId: data.profileId,
       expectedRevision: data.expectedRevision,
       startNew: data.startNew,
+      // WSO: 「チェックした画面だけ」を選んだときだけ、範囲を渡す。
+      ...(data.scope === undefined ? {} : { scope: data.scope }),
     });
     return result.ok
       ? { ok: true, jobId: result.job.jobId }

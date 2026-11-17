@@ -7,12 +7,8 @@
 import { readdirSync, readFileSync } from 'node:fs';
 import { resolve } from 'node:path';
 import { beforeAll, describe, expect, it } from 'vitest';
-import {
-  MAX_NAVIGATION_DIAGNOSTICS_DOCUMENT_REQUESTS,
-  MAX_NAVIGATION_DIAGNOSTICS_EVENTS,
-} from '../../src/browser/navigation-diagnostics.js';
 import * as actionContracts from '../../src/control/actions/action-contracts.js';
-import { MAX_SAFE_RECORD_ID_LENGTH, SAFE_RECORD_ID_PATTERN } from '../../src/control/actions/action-outcome.js';
+import { SAFE_RECORD_ID_PATTERN } from '../../src/control/actions/action-outcome.js';
 import * as scenarioContracts from '../../src/control/approval/scenario-contracts.js';
 import * as authSetupContracts from '../../src/control/auth/auth-setup-contracts.js';
 import * as automatedLoginResults from '../../src/control/auth/automated-login-results.js';
@@ -24,18 +20,19 @@ import * as workerProtocol from '../../src/control/worker-protocol.js';
 import * as contracts from '../../src/core/contracts.js';
 import * as evidenceTypes from '../../src/core/evidence-types.js';
 import { createEvidenceId } from '../../src/core/ids.js';
-import { MAX_ERROR_MESSAGE_LENGTH, MAX_HTTP_METHOD_LENGTH, MAX_URL_LENGTH } from '../../src/core/limits.js';
 import * as apiRequestShape from '../../src/core/api-request-shape.js';
 import { AUDIT_SEND_POLICIES } from '../../src/core/audit-send-policy.js';
+import { AUDIT_PAGE_SCOPE_KINDS } from '../../src/core/audit-page-scope.js';
+import { JSON_SCALAR_VALUE_TYPES } from '../../src/core/json-value.js';
 import * as apiShapeClassification from '../../src/discovery/api-shape-classification.js';
 import * as discoveryCandidateContracts from '../../src/discovery/candidate-contracts.js';
 import * as submissionProbeContracts from '../../src/discovery/submission-probe-contracts.js';
 import * as discoveryClassificationWords from '../../src/discovery/classification-words.js';
 import * as loginObservation from '../../src/discovery/login-observation.js';
 import * as discoveryResult from '../../src/discovery/discovery-result.js';
+import * as coverageQueue from '../../src/discovery/coverage-queue.js';
 import * as readCheckContracts from '../../src/discovery/read-check-contracts.js';
 import * as readCheckEvaluation from '../../src/discovery/read-check-evaluation.js';
-import { INTERACTION_CANDIDATE_LIMITS } from '../../src/safety/interaction-policy.js';
 import { SUBMISSION_STAGE_BLOCK_REASONS } from '../../src/safety/request-policy.js';
 import { WRITE_STAGE_PAYLOAD_BLOCK_REASONS } from '../../src/safety/api-write-payload-policy.js';
 import { WRITE_STAGE_REQUEST_DESTINATIONS, WRITE_STAGE_REQUEST_TIMINGS } from '../../src/safety/write-stage-unexpected-requests.js';
@@ -48,13 +45,13 @@ type SchemaName =
   | 'checkpoint'
   | 'checkpoint-page'
   | 'discovery'
+  | 'discovery-checkpoint'
   | 'entry-check'
   | 'finding'
   | 'page'
   | 'read-evidence'
   | 'report-summary'
-  | 'run'
-  | 'site-unavailable-diagnostic';
+  | 'run';
 
 interface EnumMapping {
   readonly schema: SchemaName;
@@ -77,6 +74,8 @@ const ENUM_MAPPINGS: readonly EnumMapping[] = Object.freeze([
   mapping('finding', '/properties/category/enum', 'FINDING_CATEGORIES'),
   mapping('finding', '/properties/severity/enum', 'SEVERITIES'),
   mapping('finding', '/properties/viewport/enum', 'VIEWPORT_PROFILES', NULLABLE),
+  // AUD-9a: 読める Finding の版（1.1 で groupingKeys を足した）。
+  mapping('finding', '/properties/schemaVersion/enum', 'FINDING_SCHEMA_VERSIONS'),
   // run.schema.json
   mapping('run', '/properties/runStatus/enum', 'RUN_STATUSES'),
   mapping('run', '/$defs/incompleteReason/properties/code/enum', 'INCOMPLETE_REASON_CODES'),
@@ -94,6 +93,8 @@ const ENUM_MAPPINGS: readonly EnumMapping[] = Object.freeze([
   mapping('run', '/properties/effectiveConfig/properties/audit/properties/sendPolicy/enum', 'AUDIT_SEND_POLICIES'),
   // DEF-144: 発見と READ の確かめのジョブの違反の中身の段（`discovery.json`・`read-evidence.json`・IPC も同じ定義を参照する）。
   mapping('run', '/$defs/jobSafetyViolation/properties/stage/enum', 'JOB_SAFETY_VIOLATION_STAGES'),
+  // WSO: 点検の範囲（「チェックした画面だけ」。保存は run.json の定義を参照する）。
+  mapping('run', '/properties/pageScope/properties/kind/enum', 'AUDIT_PAGE_SCOPE_KINDS'),
   // checkpoint.schema.json（R2。中断した Run の再開の設計書 4.1、4.2）: 保存の状態、実行の終わり方（実行の途中は null）、
   // 巡回の記録の状態。checkpoint-page.schema.json は、page.schema.json の定義を参照するだけで、enum を持たない。
   mapping('checkpoint', '/properties/state/enum', 'RUN_CHECKPOINT_STATES'),
@@ -150,10 +151,55 @@ const ENUM_MAPPINGS: readonly EnumMapping[] = Object.freeze([
     '/$defs/layoutEvidence/properties/fixedElements/items/properties/position/enum',
     'FIXED_ELEMENT_POSITIONS',
   ),
+  // AUD-4a: 意図した省略の形の区分。
+  mapping(
+    'page',
+    '/$defs/layoutEvidence/properties/clippedText/items/properties/intendedClipping/anyOf/1/enum',
+    'INTENDED_CLIPPING_KINDS',
+  ),
+  // AUD-4b: AX を読めなかった理由。AUD-4d: フォーカスの確かめの状態。
+  mapping('page', '/$defs/accessibilityRule/properties/nodes/items/properties/nameContext/oneOf/1/properties/reason/enum', 'ACCESSIBILITY_AX_UNREADABLE_REASONS'),
+  mapping('page', '/$defs/focusCheckEvidence/properties/status/enum', 'FOCUS_CHECK_STATUSES'),
+  // EV-1: フォーカスの確かめの操作の方法。
+  mapping('page', '/$defs/focusCheckEvidence/properties/items/items/properties/operation/enum', 'FOCUS_CHECK_OPERATIONS'),
+  // EV-2: 対象まで動かして撮った画像の測り直しの記録（使う所・位置・画像に入ったか）。
+  mapping('page', '/$defs/revealCapture/properties/targets/items/properties/purpose/enum', 'REVEAL_PURPOSES'),
+  mapping('page', '/$defs/revealCapture/properties/targets/items/properties/position/enum', 'REVEAL_POSITIONS'),
+  mapping('page', '/$defs/revealCapture/properties/targets/items/properties/inclusion/enum', 'TARGET_IMAGE_INCLUSIONS'),
+  // EV-4: 横にスクロールする領域のキーボードの実操作の結果。
+  mapping('page', '/$defs/focusCheckEvidence/properties/scrollableRegions/items/properties/outcome/enum', 'SCROLLABLE_REGION_KEYBOARD_OUTCOMES'),
+  // AUD-7: 誤りの応答の本文の要旨（形・値の型・要旨なしの理由）と、画面の誤りの表示の手がかりの所。
+  mapping('page', '/$defs/responseErrorContext/properties/bodySummary/oneOf/0/properties/format/enum', 'RESPONSE_BODY_SUMMARY_FORMATS'),
+  mapping('page', '/$defs/responseErrorContext/properties/bodySummary/oneOf/0/properties/fields/items/properties/valueType/enum', 'RESPONSE_SUMMARY_VALUE_TYPES'),
+  mapping('page', '/$defs/responseErrorContext/properties/bodySummary/oneOf/1/properties/reason/enum', 'RESPONSE_BODY_SUMMARY_NONE_REASONS'),
+  mapping('page', '/$defs/errorDisplay/oneOf/0/properties/matches/items/properties/source/enum', 'ERROR_DISPLAY_SOURCES'),
+  // COV-4 の区切り 3: 操作で開いた状態の監査の結果。
+  mapping('page', '/$defs/interactionEvidence/properties/openedState/properties/status/enum', 'OPENED_STATE_STATUSES'),
+  // AUD-3d の続き: axe の要素の矩形を読めなかった理由。
+  mapping('page', '/$defs/accessibilityRule/properties/nodes/items/properties/region/oneOf/1/properties/reason/enum', 'ACCESSIBILITY_TARGET_REGION_REASONS'),
+  // AUD-3b: 固定要素の重なりの hit-test の事実。
+  mapping('page', '/$defs/overlapHitLayer/properties/relation/enum', 'OVERLAP_HIT_RELATIONS'),
+  mapping('page', '/$defs/overlapHitTest/properties/target/enum', 'OVERLAP_HIT_TARGETS'),
+  mapping('page', '/$defs/overlapHitTest/properties/points/items/properties/topRelation/enum', 'OVERLAP_HIT_RELATIONS', NULLABLE),
   mapping('page', '/$defs/layoutCollectionResult/oneOf/1/properties/reason/enum', 'LAYOUT_INCOMPLETE_REASONS'),
   mapping('page', '/$defs/stressLayoutEvidence/oneOf/1/properties/reason/enum', 'LAYOUT_INCOMPLETE_REASONS'),
   mapping('page', '/$defs/stressLayoutEvidence/oneOf/2/properties/stage/enum', 'STRESS_LAYOUT_FAILURE_STAGES'),
   mapping('page', '/$defs/stressLayoutEvidence/oneOf/2/properties/reason/enum', 'STRESS_LAYOUT_FAILURE_REASONS'),
+  // DEF-210（通知の枠の設計書 3.6）: 通知の枠の事実。
+  // AUD-2a: 集めた段（`PAGE_AUDIT_STAGES`）と、安定の判定の記録の状態・見張りが終えた理由。
+  mapping('page', '/$defs/evidenceCapture/properties/phase/enum', 'PAGE_AUDIT_STAGES'),
+  mapping('page', '/$defs/viewportAuditResult/properties/settling/properties/status/enum', 'VIEWPORT_SETTLING_STATUSES'),
+  mapping('page', '/$defs/viewportAuditResult/properties/settling/properties/watchEnd/enum', 'VIEWPORT_SETTLING_WATCH_ENDS', true),
+  // AUD-2d: 確かめ直しの状態・理由・印。
+  mapping('page', '/$defs/viewportAuditResult/properties/recheck/properties/status/enum', 'VIEWPORT_RECHECK_STATUSES'),
+  mapping('page', '/$defs/viewportAuditResult/properties/recheck/properties/reason/enum', 'RECHECK_SKIP_REASONS', true),
+  mapping('page', '/$defs/viewportAuditResult/properties/recheck/properties/findings/items/properties/state/enum', 'RECHECK_STATES'),
+  mapping('page', '/$defs/viewportAuditResult/properties/recheck/properties/headings/items/properties/state/enum', 'RECHECK_STATES'),
+  // AUD-2b: 読み込みの段。
+  mapping('page', '/$defs/viewportAuditResult/properties/settling/properties/loadPhases/items/properties/phase/enum', 'PAGE_LOAD_PHASES'),
+  mapping('page', '/$defs/notificationOverlayEvidence/properties/readStatus/enum', 'NOTIFICATION_OVERLAY_READ_STATUSES'),
+  mapping('page', '/$defs/notificationOverlayEvidence/properties/frames/items/properties/status/enum', 'NOTIFICATION_FRAME_STATUSES'),
+  mapping('page', '/$defs/notificationOverlayEvidence/properties/frames/items/properties/hiddenReason/enum', 'NOTIFICATION_FRAME_HIDDEN_REASONS', true),
   // page.schema.json: Color
   mapping(
     'page',
@@ -200,6 +246,21 @@ const ENUM_MAPPINGS: readonly EnumMapping[] = Object.freeze([
   mapping('page', '/$defs/accessibilityRule/properties/impact/enum', 'ACCESSIBILITY_IMPACTS', NULLABLE),
   mapping('page', '/$defs/accessibilityRule/properties/nodes/items/properties/impact/enum', 'ACCESSIBILITY_IMPACTS', NULLABLE),
   mapping('page', '/$defs/accessibilityEvidence/oneOf/1/properties/reason/enum', 'ACCESSIBILITY_INCOMPLETE_REASONS'),
+  // AUD-8: 支援技術に無効の数えの外し方と、確かめの組・結果。
+  mapping(
+    'page',
+    '/$defs/accessibilityRule/properties/nodes/items/properties/countExclusion/enum',
+    'ACCESSIBILITY_COUNT_EXCLUSIONS',
+    NULLABLE,
+  ),
+  mapping('page', '/$defs/accessibilityCheck/properties/group/enum', 'ACCESSIBILITY_CHECK_GROUPS'),
+  mapping('page', '/$defs/accessibilityCheck/properties/result/enum', 'ACCESSIBILITY_CHECK_RESULTS'),
+  mapping('page', '/$defs/accessibilityDisabledPlace/enum', 'ACCESSIBILITY_DISABLED_PLACES', NULLABLE),
+  mapping(
+    'page',
+    '/$defs/accessibilityDisabledFacts/oneOf/1/properties/status/enum',
+    'ACCESSIBILITY_DISABLED_FACTS_UNREAD_STATUSES',
+  ),
   // page.schema.json: Interaction
   mapping('page', '/$defs/interactionCandidate/properties/hrefKind/enum', 'INTERACTION_HREF_KINDS'),
   mapping('page', '/$defs/interactionChange/properties/identityStatus/enum', 'INTERACTION_IDENTITY_STATUSES'),
@@ -240,6 +301,9 @@ const ENUM_MAPPINGS: readonly EnumMapping[] = Object.freeze([
   mapping('page', '/$defs/scrollObservation/properties/scrollTarget/enum', 'SCROLL_TARGETS', NULLABLE),
   mapping('page', '/$defs/scrollRestoration/oneOf/1/properties/reason/enum', 'SCROLL_RESTORATION_FAILURE_REASONS'),
   mapping('page', '/$defs/scrollEvidence/oneOf/1/properties/reason/enum', 'SCROLL_INCOMPLETE_REASONS'),
+  // L9: COMPLETE の理由（伸び続ける画面の止め方を含む）と、内側の領域 1 つを止めた理由。
+  mapping('page', '/$defs/scrollEvidence/oneOf/0/properties/reason/enum', 'SCROLL_COMPLETE_REASONS'),
+  mapping('page', '/$defs/innerScrollContainer/properties/stopReason/enum', 'INNER_SCROLL_STOP_REASONS'),
   // page.schema.json: Metadata（R15a。Task 14〜17 の設計書 5.6.2）
   mapping('page', '/$defs/metadataEvidence/properties/kind/enum', 'SITE_METADATA_KINDS'),
   mapping('page', '/$defs/metadataEvidence/properties/outcome/enum', 'SITE_METADATA_OUTCOMES'),
@@ -256,7 +320,7 @@ const ENUM_MAPPINGS: readonly EnumMapping[] = Object.freeze([
   // DEF-039・DEF-040 の設計書 2.1.3: リクエストは出口の中継の理由を含む閉じた一覧、ナビゲーションは凍結の理由だけ。
   mapping('page', '/$defs/blockedInteractionRequestEvent/properties/reason/enum', 'BLOCKED_INTERACTION_REQUEST_REASONS'),
   mapping('page', '/$defs/blockedInteractionNavigationEvent/properties/reason/enum', 'INTERACTION_FROZEN_REASONS'),
-  mapping('page', '/$defs/blockedPopupEvent/properties/reason/enum', 'INTERACTION_FROZEN_REASONS'),
+  mapping('page', '/$defs/blockedPopupEvent/properties/reason/enum', 'BLOCKED_POPUP_REASONS'),
   mapping('page', '/$defs/blockedDownloadEvent/properties/reason/enum', 'BLOCKED_DOWNLOAD_REASONS'),
   // DEF-040（NP3）: 凍結の後の WebSocket は、Worker の中のもの（`WORKER_CONNECT_POLICY`）を含む閉じた一覧。
   mapping('page', '/$defs/blockedInteractionWebSocketEvent/properties/reason/enum', 'BLOCKED_INTERACTION_WEBSOCKET_REASONS'),
@@ -273,6 +337,12 @@ const ENUM_MAPPINGS: readonly EnumMapping[] = Object.freeze([
   mapping('discovery', '/properties/endReasonDetail/enum', 'JOB_END_REASON_DETAILS'),
   // T37a fix round 1: 読み手が受ける版（LG-4: 今の版だけ）。
   mapping('discovery', '/properties/schemaVersion/enum', 'DISCOVERY_ARTIFACT_READABLE_SCHEMA_VERSIONS'),
+  // COV-3（網羅の設計書 3.3）: 選択肢を選んだ欄の種類（値の一覧は `src/discovery/discovery-result.ts`）。
+  mapping('discovery', '/$defs/optionChoice/properties/field/properties/kind/enum', 'DISCOVERY_OPTION_FIELD_KINDS'),
+  // COV-2: 操作さがしの checkpoint の再帰の待ち行列の書き出し（値の一覧は `src/discovery/coverage-queue.ts`）。
+  mapping('discovery-checkpoint', '/$defs/edgeKind/enum', 'COVERAGE_EDGE_KINDS'),
+  mapping('discovery-checkpoint', '/$defs/state/properties/status/enum', 'COVERAGE_STATE_STATUSES'),
+  mapping('discovery-checkpoint', '/properties/coverage/properties/closedChains/items/properties/reason/enum', 'COVERAGE_CHAIN_CLOSE_REASONS'),
   mapping('read-evidence', '/properties/schemaVersion/enum', 'READ_EVIDENCE_ARTIFACT_READABLE_SCHEMA_VERSIONS'),
   // T27e（Task 27 の設計書 4.5）: READ の確かめの成果物 read-evidence.json。値の一覧は `src/discovery/read-check-evaluation.ts`（結果の一覧は
   // `src/discovery/read-check-contracts.ts`）。期待は `control/read-check-definition.schema.json` を参照する（enum を持たない）。
@@ -342,6 +412,7 @@ const coreExports: Readonly<Record<string, unknown>> = Object.freeze({
   ...contracts,
   ...evidenceTypes,
   ...discoveryResult,
+  ...coverageQueue,
   ...readCheckContracts,
   ...readCheckEvaluation,
   ...actionContracts,
@@ -360,6 +431,8 @@ const coreExports: Readonly<Record<string, unknown>> = Object.freeze({
   SCENARIO_RESULT_JUDGEMENTS: scenarioContracts.SCENARIO_RESULT_JUDGEMENTS,
   // AS-b: 監査の段の送信の扱い（owner は `src/core/audit-send-policy.ts`。名前を指定して足す）。
   AUDIT_SEND_POLICIES,
+  // WSO: 点検の範囲（owner は `src/core/audit-page-scope.ts`。名前を指定して足す）。
+  AUDIT_PAGE_SCOPE_KINDS,
 });
 
 const mappingKey =(schema: string, pointer: string): string => `${schema}.schema.json#${pointer}`;
@@ -413,9 +486,9 @@ beforeAll(() => {
 describe('F12: schema enums and the core value arrays', () => {
   it('reads every schema that the mapping table refers to', () => {
     expect([...schemas.keys()].sort()).toEqual([
-      'action-evidence', 'action-run', 'approval-summary', 'audit', 'checkpoint', 'checkpoint-page', 'discovery', 'entry-check', 'finding', 'page',
+      // DEF-200: 操作さがしの状態の保存（列挙は、ほかのスキーマの参照だけ）。
+      'action-evidence', 'action-run', 'approval-summary', 'audit', 'checkpoint', 'checkpoint-page', 'discovery', 'discovery-checkpoint', 'entry-check', 'finding', 'page',
       'read-evidence', 'report-summary', 'run',
-      'site-unavailable-diagnostic',
     ]);
   });
 
@@ -464,7 +537,9 @@ type ControlSchemaName =
   // T34a: 認証の設定の版 3。
   | 'auth-setup-v3'
   // AS-b: プロファイルの表示の設定の保存の入力（監査の段の送信の扱い）。
-  | 'ui-profile-display-settings';
+  | 'ui-profile-display-settings'
+  // WSO: 点検の開始の入力（点検の範囲）。
+  | 'ui-audit-job-start';
 
 interface ControlEnumMapping {
   readonly schema: ControlSchemaName;
@@ -532,10 +607,20 @@ const CONTROL_ENUM_MAPPINGS: readonly ControlEnumMapping[] = Object.freeze([
   // DEF-144: 実行できない理由に、probe だけの理由（`EXTERNAL_SCHEME`）を足した一覧。
   controlMapping('candidate', '/$defs/submissionProbe/allOf/0/then/properties/reason/enum', 'SUBMISSION_PROBE_NOT_EXECUTABLE_REASONS'),
   controlMapping('candidate', '/$defs/submissionProbe/allOf/1/then/properties/reason/enum', 'SUBMISSION_PROBE_NOT_OBSERVED_REASONS'),
+  // LU-4: 開き手の語（`src/discovery/classification-words.ts` の一覧そのもの）。
+  controlMapping('candidate', '/$defs/submissionProbe/properties/opener/properties/openerWords/items/enum', 'DISCOVERY_OPENER_WORDS'),
+  // COV-2c（SREV-COV の I-1）: 押下の鎖を閉じた理由。
+  controlMapping('candidate', '/$defs/submissionProbe/properties/chainEnd/enum', 'SUBMISSION_PROBE_CHAIN_ENDS'),
   controlMapping('candidate', '/$defs/apiRequestShape/properties/filters/items/properties/operator/enum', 'SUBMISSION_PROBE_FILTER_OPERATORS'),
   controlMapping('candidate', '/$defs/apiRequestShape/properties/prefer/items/enum', 'API_PREFER_SHAPES'),
   controlMapping('candidate', '/$defs/apiRequestBody/properties/kind/enum', 'API_REQUEST_BODY_KINDS'),
   controlMapping('candidate', '/$defs/apiRequestBody/properties/keys/items/properties/type/enum', 'API_JSON_VALUE_TYPES'),
+  // ARR-1: 一覧の鍵の要素の型の集合。
+  controlMapping('candidate', '/$defs/apiRequestBody/properties/keys/items/properties/elements/properties/types/items/enum', 'API_JSON_VALUE_TYPES'),
+  // ARR-3: 一覧の位置ごとの情報の、要素の型。
+  controlMapping('candidate', '/$defs/apiRequestBody/properties/keys/items/properties/elements/properties/positions/items/properties/type/enum', 'API_JSON_VALUE_TYPES'),
+  // ARR-5: object の行の中の鍵の、値の型。
+  controlMapping('candidate', '/$defs/apiRequestBody/properties/keys/items/properties/elements/properties/positions/items/properties/keys/items/properties/type/enum', 'API_JSON_VALUE_TYPES'),
   // T28a: シナリオと承認の記録（Task 28 の設計書 4.1）。値の一覧は `src/control/approval/scenario-contracts.ts`（enctype は候補の契約の一覧）。
   // 承認の記録の種類と承認者は分岐の const なので、`tests/unit/approval-schemas.test.ts` で確かめる。
   controlMapping('scenario', '/properties/kind/enum', 'SCENARIO_KINDS'),
@@ -552,6 +637,12 @@ const CONTROL_ENUM_MAPPINGS: readonly ControlEnumMapping[] = Object.freeze([
   controlMapping('scenario', '/$defs/apiRequest/properties/queryNames/items/enum', 'API_SELECTION_QUERY_NAMES'),
   controlMapping('scenario', '/$defs/apiRequest/properties/prefer/items/enum', 'API_PREFER_SHAPES'),
   controlMapping('scenario', '/$defs/api/properties/recordId/anyOf/0/properties/source/enum', 'SCENARIO_API_RECORD_ID_SOURCES'),
+  // ARR-2: ページが決める一覧の鍵の、承認した要素の型の集合（scalar の型）。
+  controlMapping('scenario', '/$defs/api/properties/pageKeys/items/properties/elements/properties/types/items/enum', 'JSON_SCALAR_VALUE_TYPES'),
+  // ARR-3: 欄の一覧の鍵の、位置ごとの役（owner は `src/core/api-request-shape.ts`）。
+  controlMapping('scenario', '/$defs/apiKeyField/properties/positions/items/enum', 'API_ARRAY_FIELD_POSITIONS'),
+  // ARR-5: object の行の中の鍵の欄の、行ごとの中の鍵の役。
+  controlMapping('scenario', '/$defs/apiKeyField/properties/rows/items/items/properties/role/enum', 'API_ARRAY_FIELD_POSITIONS'),
   controlMapping('approval-receipt', '/$defs/revocation/properties/reason/enum', 'REVOCATION_REASONS'),
   // T29a: 入力の規則の集まり（Task 29 の設計書 4.1）。値の一覧は `src/control/data-rules/rule-contracts.ts`。欄どうしの関係の種類は分岐の const
   // なので、`tests/unit/data-rule-contracts.test.ts` で確かめる。
@@ -577,9 +668,13 @@ const CONTROL_ENUM_MAPPINGS: readonly ControlEnumMapping[] = Object.freeze([
   // AS-b: 監査の段の送信の扱い（`START` の項目と、プロファイルの設定の保存の入力）。値の一覧は `src/core/audit-send-policy.ts`。
   controlMapping('worker-message', '/$defs/start/properties/auditSendPolicy/enum', 'AUDIT_SEND_POLICIES'),
   controlMapping('ui-profile-display-settings', '/properties/auditSendPolicy/enum', 'AUDIT_SEND_POLICIES'),
+  // WSO: 点検の開始の範囲（値の一覧は `src/core/audit-page-scope.ts`）。
+  controlMapping('ui-audit-job-start', '/properties/scope/enum', 'AUDIT_PAGE_SCOPE_KINDS'),
   // FM2d: まとめて実行の段の種類、次の段の種類、段の未完了の理由のコード（値の一覧は `src/control/worker-protocol.ts`。理由のコードは core の一覧の写し名）。
   controlMapping('worker-message', '/$defs/chainStageKind/enum', 'WORKER_CHAIN_STAGE_KINDS'),
   controlMapping('worker-message', '/$defs/nextStage/properties/jobKind/enum', 'WORKER_NEXT_STAGE_JOB_KINDS'),
+  // DEF-200: ログインし直す段の種類。
+  controlMapping('worker-message', '/$defs/reloginStage/properties/jobKind/enum', 'WORKER_RELOGIN_STAGE_JOB_KINDS'),
   controlMapping('worker-message', '/$defs/finished/properties/incompleteReasonCodes/items/enum', 'WORKER_INCOMPLETE_REASON_CODES'),
 ]);
 
@@ -601,6 +696,10 @@ const controlExports: Readonly<Record<string, unknown>> = Object.freeze({
   ...loginObservation,
   // AS-b: 監査の段の送信の扱い（owner は `src/core/audit-send-policy.ts`。名前を指定して足す）。
   AUDIT_SEND_POLICIES,
+  // ARR-2: ページが決める一覧の鍵の要素の型（scalar の型。owner は `src/core/json-value.ts`。名前を指定して足す）。
+  JSON_SCALAR_VALUE_TYPES,
+  // WSO: 点検の範囲（owner は `src/core/audit-page-scope.ts`。名前を指定して足す）。
+  AUDIT_PAGE_SCOPE_KINDS,
 });
 
 const controlMappingKey = (schema: string, pointer: string): string => mappingKey(`control/${schema}`, pointer);
@@ -655,8 +754,6 @@ describe('T22a: control schema enums and the src/control value arrays', () => {
       'ui-credential-change',
       'ui-credential-register',
       'ui-credential-replace',
-      // T29e: 画面の入力の規則の保存の Server Function の入力（Task 29 の設計書 4.4。enum は data-rule のスキーマの参照）。
-      'ui-data-rule-save',
       // T27f: 画面の操作の候補の発見と READ の確かめの Server Function の入力（Task 27 の設計書 4.7。enum を持たない）。
       'ui-discovery-start',
       // T43c: 画面の入口の確かめの開始の Server Function の入力（Task 43 の設計書 4.3。enum を持たない）。
@@ -666,6 +763,8 @@ describe('T22a: control schema enums and the src/control value arrays', () => {
       'ui-login-stage-row-key',
       'ui-login-stage-row-register',
       'ui-profile-create',
+      // DN-1: 画面のサイトの画面に出す名前の保存の Server Function の入力（プロファイルの表示名の設計書 2 章。enum を持たない）。
+      'ui-profile-display-name',
       // FM-1: 画面のプロファイルの表示の設定の保存の Server Function の入力（手動の操作を減らす設計書 2.2。enum を持たない）。
       'ui-profile-display-settings',
       'ui-profile-key',
@@ -675,26 +774,15 @@ describe('T22a: control schema enums and the src/control value arrays', () => {
       'ui-read-check-create',
       'ui-read-check-start',
       'ui-read-check-update',
-      // T28e: 画面のシナリオの Server Function の入力（Task 28 の設計書 4.6。enum を持たない）。
-      'ui-scenario-approve',
       // FM2b: 画面のシナリオの下書きをボタン 1 回で作る Server Function の入力（手を減らす段 2 の設計書 3A.2。enum を持たない）。
       'ui-scenario-auto-draft',
-      'ui-scenario-create',
-      'ui-scenario-form',
+      // T28e: 画面のシナリオの Server Function の入力（Task 28 の設計書 4.6。enum を持たない）。SPEC-4: 作成・変更・承認・撤回の入力は捨てた。
       'ui-scenario-key',
-      'ui-scenario-revoke',
-      'ui-scenario-update',
       'ui-target-config',
       // T44d: 画面のプロファイルの負荷の値（ページの上限・時間の上限・読み込みの間隔）の確かめと保存の Server Function の入力（enum を持たない）。
       'ui-target-crawl-limits',
-      // T41g-3: 画面の「登録してから更新する」の Server Function の入力（Task 41 の設計書 3.5.1。enum を持たない）。
-      'ui-write-chain-start',
       // OP-2: 画面の「登録・更新を試せる画面」の一覧のチェックの保存の Server Function の入力（enum を持たない）。
       'ui-write-screen-check',
-      // T30g fix round 1: 画面の書き込みの開始の Server Function の入力（Task 30 の設計書 3 章、10 章。enum を持たない）。
-      'ui-write-start',
-      // T31h-2: 画面の更新の書き込みの開始の Server Function の入力（Task 31 の設計書 3 章、10 章。enum を持たない）。
-      'ui-write-update-start',
       // T24d: IPC のメッセージ（Task 24 の設計書 4.3）。
       'worker-message',
     ]);
@@ -729,81 +817,6 @@ describe('T22a: control schema enums and the src/control value arrays', () => {
   });
 });
 
-// D2（サイトの不調で止めたときの診断の記録の設計書 2.3）: 診断の記録のスキーマは、enum を持たない。ページ本体の要求の観察の結果の状態は、
-// 分岐（`oneOf`）ごとの `const` で表すので、分岐の `const` の並びが core の一覧（`NAVIGATION_DIAGNOSTICS_STATUSES`）と一致することを確かめる。
-// 上限（`maxItems`、`maxLength`）は、観察の部品（`src/browser/navigation-diagnostics.ts`）の定数と `src/core/limits.ts` の定数と一致する
-// ことを、下の対応表で確かめる。対応表にない上限がスキーマにあれば、失敗する。
-const DIAGNOSTIC_SCHEMA: SchemaName = 'site-unavailable-diagnostic';
-/** ページ本体の要求の観察の結果の分岐（`OBSERVED`、`NOT_OBSERVED` の順）。 */
-const NAVIGATION_DIAGNOSTICS_BRANCHES_POINTER = '/$defs/navigationDiagnostics/oneOf';
-
-/** 診断の記録のスキーマの上限と、その定義元の定数の対応表。 */
-const DIAGNOSTIC_LIMIT_MAPPINGS: readonly (readonly [pointer: string, expected: number, constant: string])[] = Object.freeze([
-  // D3（設計書 2.2 の 2026-10-07 の改訂、2.3）: ビューポートごとの、幅の走査の幅ごとの観察の数の上限（設定の `stressWidths` に上限がないので、
-  // 記録の上限は `src/core/contracts.ts` の定数）と、Interaction の候補ごとの観察の数の上限（候補の数の上限 `INTERACTION_CANDIDATE_LIMITS.maxCandidates`）。
-  ['/$defs/viewportNavigationDiagnostics/properties/stressWidths/maxItems', contracts.MAX_STRESS_WIDTH_NAVIGATION_DIAGNOSTICS, 'MAX_STRESS_WIDTH_NAVIGATION_DIAGNOSTICS'],
-  ['/$defs/viewportNavigationDiagnostics/properties/interactionCandidates/maxItems', INTERACTION_CANDIDATE_LIMITS.maxCandidates, 'INTERACTION_CANDIDATE_LIMITS.maxCandidates'],
-  [`${NAVIGATION_DIAGNOSTICS_BRANCHES_POINTER}/0/properties/documentRequests/maxItems`, MAX_NAVIGATION_DIAGNOSTICS_DOCUMENT_REQUESTS, 'MAX_NAVIGATION_DIAGNOSTICS_DOCUMENT_REQUESTS'],
-  // 文書の要求の1回分（hop）は、それぞれ1件の事象（`Network.requestWillBeSent`）から作るので、1つの要求の回の数は、事象の上限を超えない。
-  ['/$defs/documentRequest/properties/hops/maxItems', MAX_NAVIGATION_DIAGNOSTICS_EVENTS, 'MAX_NAVIGATION_DIAGNOSTICS_EVENTS'],
-  ['/$defs/documentRequestHop/properties/url/maxLength', MAX_URL_LENGTH, 'MAX_URL_LENGTH'],
-  ['/$defs/documentRequestHop/properties/method/maxLength', MAX_HTTP_METHOD_LENGTH, 'MAX_HTTP_METHOD_LENGTH'],
-  ['/$defs/loadingFailure/properties/errorText/maxLength', MAX_ERROR_MESSAGE_LENGTH, 'MAX_ERROR_MESSAGE_LENGTH'],
-  [`${NAVIGATION_DIAGNOSTICS_BRANCHES_POINTER}/1/properties/reason/maxLength`, MAX_ERROR_MESSAGE_LENGTH, 'MAX_ERROR_MESSAGE_LENGTH'],
-] as const);
-
-/** スキーマを走査し、`maxItems` と `maxLength` のキーを持つすべての場所の JSON Pointer（値そのものを指す）を集める。 */
-function collectLimitPointers(node: unknown, pointer: string, found: string[]): void {
-  if (Array.isArray(node)) {
-    node.forEach((item, index) => collectLimitPointers(item, `${pointer}/${index}`, found));
-    return;
-  }
-  if (typeof node !== 'object' || node === null) {
-    return;
-  }
-  for (const [key, value] of Object.entries(node)) {
-    const childPointer = `${pointer}/${escapePointerToken(key)}`;
-    if (key === 'maxItems' || key === 'maxLength') {
-      found.push(childPointer);
-    } else {
-      collectLimitPointers(value, childPointer, found);
-    }
-  }
-}
-
-describe('D2: the statuses and the limits of the site-unavailable diagnostic schema, and the core and D1 constants', () => {
-  it('lists the statuses of the branches of the navigation diagnostics in the order of NAVIGATION_DIAGNOSTICS_STATUSES', () => {
-    const branches = resolvePointer(schemas.get(DIAGNOSTIC_SCHEMA), NAVIGATION_DIAGNOSTICS_BRANCHES_POINTER);
-
-    expect(Array.isArray(branches)).toBe(true);
-    expect(Object.isFrozen(contracts.NAVIGATION_DIAGNOSTICS_STATUSES)).toBe(true);
-    expect((branches as readonly unknown[]).map((branch) => resolvePointer(branch, '/properties/status/const')))
-      .toEqual([...contracts.NAVIGATION_DIAGNOSTICS_STATUSES]);
-  });
-
-  it('requires the navigation diagnostics of every viewport of VIEWPORT_PROFILES, and no other viewport', () => {
-    const schema = schemas.get(DIAGNOSTIC_SCHEMA);
-
-    expect(resolvePointer(schema, '/properties/navigationDiagnostics/required')).toEqual([...contracts.VIEWPORT_PROFILES]);
-    expect(Object.keys(resolvePointer(schema, '/properties/navigationDiagnostics/properties') as object)).toEqual([...contracts.VIEWPORT_PROFILES]);
-    expect(resolvePointer(schema, '/properties/navigationDiagnostics/additionalProperties')).toBe(false);
-  });
-
-  it.each(DIAGNOSTIC_LIMIT_MAPPINGS.map(([pointer, expected, constant]) => [`${pointer} = ${constant}`, pointer, expected] as const))(
-    'matches %s',
-    (_name, pointer, expected) => {
-      expect(resolvePointer(schemas.get(DIAGNOSTIC_SCHEMA), pointer)).toBe(expected);
-    },
-  );
-
-  it('maps every limit found in the schema (no limit outside the mapping table)', () => {
-    const found: string[] = [];
-    collectLimitPointers(schemas.get(DIAGNOSTIC_SCHEMA), '', found);
-
-    expect(found.sort()).toEqual(DIAGNOSTIC_LIMIT_MAPPINGS.map(([pointer]) => pointer).sort());
-  });
-});
-
 // Evidence の ID の接頭辞の owner は `src/core/ids.ts`（`createEvidenceId`）。スキーマの Evidence の各分岐（`oneOf`）の
 // `evidenceId` の pattern は、その種類の接頭辞に限る（R''2 の m2）。接頭辞は、実行時に `createEvidenceId` から読む。
 describe('F13 m2: evidenceId prefix of each Evidence branch and src/core/ids.ts', () => {
@@ -829,8 +842,8 @@ describe('F13 m2: evidenceId prefix of each Evidence branch and src/core/ids.ts'
   });
 });
 
-// CCX-28（T31f の共通化の候補 3）: 登録の ID として使える形（`src/control/actions/action-outcome.ts` の `SAFE_RECORD_ID_PATTERN` と
-// `MAX_SAFE_RECORD_ID_LENGTH`。`isUsableRecordId` の判定そのもの）と、スキーマの対象のレコードの ID の対応表。成果物のスキーマ（`schemas/`）と
+// CCX-28（T31f の共通化の候補 3）: 登録の ID として使える形（`src/control/actions/action-outcome.ts` の `SAFE_RECORD_ID_PATTERN`。L12b で長さの
+// 上限は撤廃した。`isUsableRecordId` の判定そのもの）と、スキーマの対象のレコードの ID の対応表。成果物のスキーマ（`schemas/`）と
 // Control のスキーマ（`schemas/control/`）の両方を見る。同じパターンの項目をスキーマに増やしたら、この表に 1 行を加える。対応表にない項目があれば、
 // このテストが失敗する。
 interface RecordIdShapeMapping {
@@ -845,8 +858,8 @@ const RECORD_ID_SHAPE_MAPPINGS: readonly RecordIdShapeMapping[] = Object.freeze(
   { file: 'action-run.schema.json', pointer: '/properties/update/properties/targetRecordId' },
   // T31f: `START` の書き込みの指定の、UPDATE の対象の ID。
   { file: 'control/worker-message.schema.json', pointer: '/$defs/startWrite/properties/update/properties/targetRecordId' },
-  // T31h-2: 画面の更新の書き込みの開始の入力の、画面が見せた予定のレコードの ID。
-  { file: 'control/ui-write-update-start.schema.json', pointer: '/properties/expectedTargetRecordId' },
+  // DEF-235: `START` の READ の確かめの定義の、型の画面の path に入れる番号。
+  { file: 'control/worker-message.schema.json', pointer: '/$defs/startReadCheck/properties/recordIds/items' },
 ]);
 
 /** スキーマの中の、`pattern` が登録の ID の形のパターンと同じ項目の JSON Pointer を集める。 */
@@ -880,12 +893,13 @@ const readRecordIdShapeSchemas = (): ReadonlyMap<string, unknown> => {
 
 describe('CCX-28: the record id shape in the schemas and the usable record id', () => {
   it.each(RECORD_ID_SHAPE_MAPPINGS.map((row) => [`${row.file}#${row.pointer}`, row] as const))(
-    'matches %s with SAFE_RECORD_ID_PATTERN and MAX_SAFE_RECORD_ID_LENGTH',
+    'matches %s with SAFE_RECORD_ID_PATTERN and no length limit',
     (_key, row) => {
       const node = resolvePointer(readRecordIdShapeSchemas().get(row.file), row.pointer) as Record<string, unknown> | undefined;
       expect(node?.['type']).toBe('string');
       expect(node?.['pattern']).toBe(SAFE_RECORD_ID_PATTERN.source);
-      expect(node?.['maxLength']).toBe(MAX_SAFE_RECORD_ID_LENGTH);
+      // L12b（設計書 `2026-11-09-beaksight-remove-limits-design.md` 6.2。設計者の判断 2）: 長さの上限（前は `MAX_SAFE_RECORD_ID_LENGTH`）は撤廃した。
+      expect(node?.['maxLength']).toBeUndefined();
       expect(node?.['minLength']).toBe(1);
     },
   );

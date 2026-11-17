@@ -468,3 +468,36 @@ describe('LoadMeter の入力の確かめ', () => {
     }
   });
 });
+
+// DEF-241（L11 の中で直す）: Guard が CDP の層で通した要求（承認したサービスへの fetch など）は、Playwright の `requestfinished` が出ず、`response` だけが出る。
+// 応答を受けた要求も数える（同じ要求は 1 回だけ。応答・終わり・失敗のどれが先でも）。
+describe('DEF-241: LoadMeter counts a request at its response, once', () => {
+  it('counts a request that only has a response', () => {
+    const clock = new FakeClock();
+    const meter = meterWith(clock);
+    meter.recordResponseReceived(requestKey(), ALLOWED_URL);
+    meter.recordResponseReceived(requestKey(), OTHER_URL);
+    expect(meter.snapshot()).toMatchObject({ allowedOrigins: { count: 1, peakPerMinute: 1 }, otherOrigins: { count: 1, peakPerMinute: 1 } });
+  });
+
+  it('counts the response and the end of the same request once, in either order', () => {
+    const clock = new FakeClock();
+    const meter = meterWith(clock);
+    const first = requestKey();
+    meter.recordResponseReceived(first, ALLOWED_URL);
+    meter.recordRequestFinished(first, ALLOWED_URL);
+    const second = requestKey();
+    meter.recordRequestFailed(second, ALLOWED_URL, 'net::ERR_CONNECTION_RESET');
+    meter.recordResponseReceived(second, ALLOWED_URL);
+    expect(meter.snapshot().allowedOrigins.count).toBe(2);
+  });
+
+  it('does not count the response of a request served from the Run cache', () => {
+    const clock = new FakeClock();
+    const meter = meterWith(clock);
+    const cached = requestKey();
+    meter.recordServedFromRunCache(cached);
+    meter.recordResponseReceived(cached, ALLOWED_URL);
+    expect(meter.snapshot()).toMatchObject({ allowedOrigins: { count: 0 }, servedFromCache: 1 });
+  });
+});

@@ -6,13 +6,12 @@
  * 出す（`JobSafetyViolation`）。押していたボタンの識別（digest）、違反の数と表（理由の種類・送り方・サイトのアドレス）は、たたんだ詳しい内容に入れる
  * （`JobSafetyViolationDetails`）。
  */
-import type { DiscoveryExternalSchemeProbes, DiscoveryPressLimitProbes } from '../../../../src/control/discovery-view.js';
+import type { DiscoveryExternalSchemeProbes } from '../../../../src/control/discovery-view.js';
 import type { JobSafetyViolation as JobSafetyViolationRecord } from '../../../../src/core/contracts.js';
 import { formatCount } from '../../../../src/presentation/format.js';
 import {
   JOB_SAFETY_VIOLATION_STAGE_LABELS,
   LOCAL_UI_EXTERNAL_SCHEME_PROBE_TEXT,
-  LOCAL_UI_PRESS_LIMIT_PROBE_TEXT,
   LOCAL_UI_SAFETY_VIOLATION_TEXT,
 } from '../../../../src/presentation/messages.js';
 import { httpMethodLabel, safetyViolationCodeLabel } from '../display/labels';
@@ -36,26 +35,6 @@ export function ExternalSchemeProbes({ counts }: Readonly<{ counts: DiscoveryExt
         <dd data-testid="job-external-scheme-not-pressed">{formatCount(counts.notPressed)}</dd>
         <dt>{probeText.reloadedPages}</dt>
         <dd data-testid="job-external-scheme-reloaded">{formatCount(counts.reloadedPages)}</dd>
-      </dl>
-    </section>
-  );
-}
-
-/**
- * T44c（Task 44 の設計書 P1-3）: 発見のジョブの、押す数の上限で押せなかった登録・更新の語のボタンの数（成果物にあるときだけ）。
- */
-export function PressLimitProbes({ counts }: Readonly<{ counts: DiscoveryPressLimitProbes | null }>) {
-  if (counts === null) {
-    return null;
-  }
-  const limitText = LOCAL_UI_PRESS_LIMIT_PROBE_TEXT;
-  return (
-    <section className="panel" data-testid="job-press-limit-probes">
-      <h2 className="panel-heading">{limitText.heading}</h2>
-      <p className="muted">{limitText.body}</p>
-      <dl className="facts">
-        <dt>{limitText.priorityNotPressed}</dt>
-        <dd data-testid="job-press-limit-priority-not-pressed">{formatCount(counts.priorityNotPressed)}</dd>
       </dl>
     </section>
   );

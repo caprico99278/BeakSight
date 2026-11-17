@@ -167,14 +167,3 @@ export async function evaluateInCandidateReadWorld<Arg, Result>(
     await session.detach();
   }
 }
-
-/** `page` の候補の読み取り（差し替えがなければ isolated world の読み取り）を、呼ばれた page によらず `page` で行う読み取り（包んだ page の準備に使う）。 */
-export function readsOnPage(page: Page): InteractionCandidateReads {
-  const reads = interactionCandidateReadsOf(page);
-  return {
-    discover: (_target, input, deadlineAtMs) => reads.discover(page, input, deadlineAtMs),
-    resolve: (_target, input, deadlineAtMs) => reads.resolve(page, input, deadlineAtMs),
-    handleOf: (_target, reference, deadlineAtMs) => reads.handleOf(page, reference, deadlineAtMs),
-    inspect: (_target, backendNodeId, input, deadlineAtMs) => reads.inspect(page, backendNodeId, input, deadlineAtMs),
-  };
-}

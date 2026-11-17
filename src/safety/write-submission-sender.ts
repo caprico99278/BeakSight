@@ -18,25 +18,22 @@
  *   （`requestKind: 'FETCH'`）は、ページのスクリプトの fetch の閉じた値（`Sec-Fetch-Mode: cors`・`Sec-Fetch-Dest: empty`、`Sec-Fetch-User` なし）で、
  *   `POST` と `PATCH` を送る（`WRITE_SUBMISSION_REQUEST_KINDS`）。`Authorization` などのヘッダは一時停止の要求のまま送り、記録しない。
  * - 応答: gzip・deflate・br を展開して返す（`Content-Encoding` と `Content-Length` と、ホップごとのヘッダを残さない。展開できない形は、そのままの
- *   本文で `Content-Encoding` を外す）。Set-Cookie などの重なるヘッダは、受けた順に保つ。本文と展開の上限は `WRITE_SUBMISSION_MAX_RESPONSE_BYTES`。
+ *   本文で `Content-Encoding` を外す）。Set-Cookie などの重なるヘッダは、受けた順に保つ。本文と展開の大きさの上限は置かない（L12b）。
  * - HTTP/1.1 の要求の bytes は自分で書き、応答は自分で読む（`HttpResponseReader`。status の行、ヘッダ、`Content-Length`・`chunked`・接続の閉じで
  *   区切る本文、1xx の読み飛ばし）。Node の `http` の要求の部品に、つないだ後の接続を渡すと、応答の後に届いた bytes で Node の中の確かめが落ちる
  *   ことがあったため（DEF-099 fix の確かめで見た）。
  * - 止める口（`signal`。DEF-099 fix round 1）: 止めたら接続を切り、書く前なら `NOT_WRITTEN`、書いた後なら `NO_RESPONSE`（`ABORTED`）。
  * - 値（本文、Cookie、CSRF のトークン）を記録しない。結果は閉じた一覧の語と、応答の中身だけ（呼び出し側がブラウザに返す）。例外を投げない。
  */
-import { connect as netConnect, isIP, type Socket } from 'node:net';
-import { connect as tlsConnect, getCACertificates, type TLSSocket } from 'node:tls';
+import { connect as netConnect, type Socket } from 'node:net';
+import type { TLSSocket } from 'node:tls';
 import { brotliDecompressSync, gunzipSync, inflateRawSync, inflateSync } from 'node:zlib';
 import { API_WRITE_METHODS } from '../core/api-request-shape.js';
+import { bareHostnameOf, connectTlsOverTunnel, requestProxyTunnel, tunnelAuthorityOf } from './proxy-tunnel.js';
 import { SUBMISSION_POST_METHOD as FORM_SUBMISSION_METHOD, hasAllowedOrigin } from './request-policy.js';
 
-/** 送ってから応答を受け終わるまでの上限（ms。中継への接続から数える。自動ログインの結果を待つ時間と同じ 30 秒）。 */
-export const WRITE_SUBMISSION_TIMEOUT_MS = 30_000;
-/** 応答の本文の上限（bytes。受けた bytes と、展開した bytes のそれぞれ）。 */
-export const WRITE_SUBMISSION_MAX_RESPONSE_BYTES = 16 * 1024 * 1024;
-/** 中継の `CONNECT` の応答のヘッダの上限（bytes）。 */
-const MAX_CONNECT_RESPONSE_HEADER_BYTES = 16 * 1024;
+// L12b（設計書 `2026-11-09-beaksight-remove-limits-design.md` 6.2。S19）: 送ってから応答を受け終わるまでの既定の期限（前は 30 秒）と、応答の本文の大きさの
+// 上限（前は 16MiB）は撤廃した（定数は LZ-1 で消した）。中継の `CONNECT` の応答のヘッダの上限は、トンネルの部品（`proxy-tunnel.ts`）が持つ。
 /** 応答のヘッダの塊の上限（bytes。status の行を含む）。 */
 const MAX_RESPONSE_HEADER_BYTES = 64 * 1024;
 /** `chunked` の大きさの行の上限（bytes）。 */
@@ -193,8 +190,6 @@ const DROPPED_RESPONSE_HEADERS: ReadonlySet<string> = new Set([
 const HTTP_PROTOCOL = 'http:';
 const HTTPS_PROTOCOL = 'https:';
 const DEFAULT_PORTS: Readonly<Record<string, number>> = Object.freeze({ [HTTP_PROTOCOL]: 80, [HTTPS_PROTOCOL]: 443 });
-const CONNECT_ESTABLISHED_STATUS = /^HTTP\/1\.[01] 2\d\d(?: |\r)/u;
-const HEADER_END = '\r\n\r\n';
 
 /** 送る要求のヘッダ（ファイルの先頭の説明）。 */
 function submissionHeadersOf(request: WriteSubmissionRequest, url: URL, acceptLanguage: string | null): Record<string, string> {
@@ -250,7 +245,8 @@ function decodedBodyOf(body: Buffer, contentEncoding: string | undefined): Buffe
   if (contentEncoding === undefined) {
     return body;
   }
-  const options = { maxOutputLength: WRITE_SUBMISSION_MAX_RESPONSE_BYTES };
+  // L12b（S19）: 展開の大きさの上限（前は 16MiB）は置かない（zlib の既定の上限 `buffer.constants.MAX_LENGTH` のまま）。
+  const options = {};
   let current = body;
   const codings = contentEncoding.split(',').map((coding) => coding.trim().toLowerCase()).filter((coding) => coding.length > 0).reverse();
   try {
@@ -375,9 +371,8 @@ class HttpResponseReader {
   #readHead(): boolean {
     const end = this.#buffer.indexOf('\r\n\r\n', 0, 'latin1');
     if (end < 0) {
-      if (this.#buffer.length > MAX_RESPONSE_HEADER_BYTES) {
-        this.#unreadable = true;
-      }
+      // L12b（S19）: 応答のヘッダの塊の大きさの上限（前は `MAX_RESPONSE_HEADER_BYTES` の 64KiB で読めない扱い）は置かない（ヘッダの終わりまで読む）。
+      void MAX_RESPONSE_HEADER_BYTES;
       return false;
     }
     const lines = this.#buffer.subarray(0, end).toString('latin1').split(CRLF);
@@ -427,10 +422,8 @@ class HttpResponseReader {
   /** 本文を足す（上限を超えたら `tooLarge`）。 */
   #append(data: Buffer): void {
     this.#bodySize += data.length;
-    if (this.#bodySize > WRITE_SUBMISSION_MAX_RESPONSE_BYTES) {
-      this.#tooLarge = true;
-      return;
-    }
+    // L12b（設計書 `2026-11-09-beaksight-remove-limits-design.md` 6.2。S19）: 本文の大きさの上限（前は 16MiB で `tooLarge`）は置かない
+    // （応答を最後まで読み、判定する）。
     this.#body.push(data);
   }
 
@@ -538,10 +531,6 @@ const responseOutcomeOf = (reader: HttpResponseReader): WriteSubmissionOutcome =
   return { kind: 'RESPONDED', status: reader.status ?? 0, headers: responseHeadersOf(rawHeaders), body: decoded ?? raw, decoded: decoded !== null };
 };
 
-/** 信頼する証明書（Node の同梱、OS の置き場所、テストだけ足すもの）。 */
-const trustedCertificatesOf = (additional: readonly string[] | undefined): string[] =>
-  [...getCACertificates('bundled'), ...getCACertificates('system'), ...(additional ?? [])];
-
 /**
  * 書き込みの POST を、中継を通して 1 回だけ送る（ファイルの先頭の説明）。例外を投げない。
  */
@@ -563,10 +552,13 @@ export function sendWriteSubmissionOnce(
     return Promise.resolve(Object.freeze({ kind: 'NOT_WRITTEN', reason: 'REQUEST_INVALID' }));
   }
   const tls = url.protocol === HTTPS_PROTOCOL;
-  const hostname = url.hostname.startsWith('[') ? url.hostname.slice(1, -1) : url.hostname;
+  const hostname = bareHostnameOf(url);
   const port = url.port === '' ? DEFAULT_PORTS[url.protocol] ?? 0 : Number(url.port);
   const headers = submissionHeadersOf(request, url, options.acceptLanguage);
-  const timeoutMs = options.timeoutMs ?? WRITE_SUBMISSION_TIMEOUT_MS;
+  // L12b（設計書 6.2。S19）: 送ってから応答を受け終わるまでの期限（前は既定で 30 秒）は、指定したとき
+  // （事前確認の送り手など）だけ当てる。書き込みの送信は期限なしで待ち、止めるのは Guard が閉じるときの口（`signal`）だけ（書き込みの流れは、応答を L0 の進みの
+  // 見張りで待ち、全く反応がなければ書き込みの段を閉じる）。
+  const timeoutMs = options.timeoutMs;
   const { signal } = options;
   if (signal?.aborted === true) {
     return Promise.resolve(Object.freeze({ kind: 'NOT_WRITTEN', reason: 'ABORTED' }));
@@ -602,9 +594,11 @@ export function sendWriteSubmissionOnce(
       : { kind: 'NOT_WRITTEN', reason: 'PROXY_UNAVAILABLE' }));
     const onAbort = (): void => finish(written ? { kind: 'NO_RESPONSE', reason: 'ABORTED' } : { kind: 'NOT_WRITTEN', reason: 'ABORTED' });
     signal?.addEventListener('abort', onAbort, { once: true });
-    const timer = setTimeout(() => finish(responded?.() ?? (written
-      ? { kind: 'NO_RESPONSE', reason: 'TIMED_OUT' }
-      : { kind: 'NOT_WRITTEN', reason: 'TIMED_OUT' })), timeoutMs);
+    const timer = timeoutMs === undefined
+      ? undefined
+      : setTimeout(() => finish(responded?.() ?? (written
+        ? { kind: 'NO_RESPONSE', reason: 'TIMED_OUT' }
+        : { kind: 'NOT_WRITTEN', reason: 'TIMED_OUT' })), timeoutMs);
 
     /** 接続（中継へのソケットか、その上の TLS）の上で要求を書き、応答を読む（`HttpResponseReader`）。 */
     const sendOver = (connection: Socket | TLSSocket, target: string): void => {
@@ -657,33 +651,11 @@ export function sendWriteSubmissionOnce(
         sendOver(proxySocket, url.href);
         return;
       }
-      // https: 中継に CONNECT を送り、確立の応答を受けてから TLS を張る（ここまでは、要求の bytes を書いていない）。
-      const authority = `${isIP(hostname) === 6 ? `[${hostname}]` : hostname}:${port}`;
-      let received = '';
-      const onData = (chunk: Buffer): void => {
-        received += chunk.toString('latin1');
-        const end = received.indexOf(HEADER_END);
-        if (end < 0) {
-          if (received.length > MAX_CONNECT_RESPONSE_HEADER_BYTES) {
-            finish({ kind: 'NOT_WRITTEN', reason: 'PROXY_REJECTED' });
-          }
-          return;
-        }
-        proxySocket.off('data', onData);
-        if (!CONNECT_ESTABLISHED_STATUS.test(received) || received.length > end + HEADER_END.length) {
-          finish({ kind: 'NOT_WRITTEN', reason: 'PROXY_REJECTED' });
-          return;
-        }
+      // https: 中継に CONNECT を送り、確立の応答を受けてから TLS を張る（ここまでは、要求の bytes を書いていない。部品は `proxy-tunnel.ts`）。
+      const onEstablished = (): void => {
         let secure: TLSSocket;
         try {
-          secure = tlsConnect({
-            socket: proxySocket,
-            host: hostname,
-            ...(isIP(hostname) === 0 ? { servername: hostname } : {}),
-            ca: trustedCertificatesOf(options.additionalTrustedCertificates),
-            rejectUnauthorized: true,
-            ALPNProtocols: ['http/1.1'],
-          });
+          secure = connectTlsOverTunnel(proxySocket, hostname, options.additionalTrustedCertificates);
         } catch {
           finish({ kind: 'NOT_WRITTEN', reason: 'TLS_FAILED' });
           return;
@@ -700,13 +672,15 @@ export function sendWriteSubmissionOnce(
           sendOver(secure, `${url.pathname}${url.search}`);
         });
       };
-      proxySocket.on('data', onData);
       proxySocket.once('close', () => {
         if (!written) {
           finish({ kind: 'NOT_WRITTEN', reason: 'PROXY_REJECTED' });
         }
       });
-      proxySocket.write(`CONNECT ${authority} HTTP/1.1\r\nHost: ${authority}\r\n\r\n`);
+      requestProxyTunnel(proxySocket, tunnelAuthorityOf(hostname, port), {
+        onEstablished,
+        onRejected: () => finish({ kind: 'NOT_WRITTEN', reason: 'PROXY_REJECTED' }),
+      });
     });
   });
 }

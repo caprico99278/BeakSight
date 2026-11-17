@@ -115,18 +115,10 @@ describe('T44R M-1: the manual stage reads of the approved service origins witho
     expect(classify(fetchOf('POST', RPC_URL), { authSetup: emptyStage(true) })).toEqual(PASSED_NON_READ('NON_READ_METHOD'));
   });
 
-  it('does not pass the service origin reads without the manual entry, or with the write stage or the audit stage entry (fail-closed)', () => {
+  it('does not pass the service origin reads without the manual entry', () => {
     const read = fetchOf('GET', `${SERVICE_ORIGIN}/rest/v1/members`);
     expect(classify(read, { authSetup: emptyStage(false) })).toMatchObject({ action: 'BLOCK', category: 'LOGIN_STAGE' });
     expect(classify(read, { authSetup: emptyStage(true, null) })).toMatchObject({ action: 'BLOCK', category: 'LOGIN_STAGE' });
-    const writeStage = { writeEndpoint: { origin: APP_ORIGIN, path: '/members' }, remainingPosts: 1 };
-    expect(classify(read, { authSetup: emptyStage(true), writeStage }).action).toBe('BLOCK');
-    const auditStage = {
-      approvedServiceOrigins: [],
-      auditReadRequests: [],
-      scriptLogin: { origin: SERVICE_ORIGIN, path: '/auth/v1/token', requiredQuery: [] },
-    };
-    expect(classify(read, { authSetup: emptyStage(true), auditStage }).action).toBe('BLOCK');
   });
 });
 
@@ -137,17 +129,6 @@ describe('ML-a: the other stages keep the current rules (regression)', () => {
       .toMatchObject({ action: 'BLOCK', category: 'LOGIN_STAGE' });
     expect(classify(fetchOf('POST', RPC_URL), { authSetup: scriptStage(false) }))
       .toEqual({ action: 'BLOCK', category: 'REQUEST', reason: 'NON_READ_METHOD', scriptLoginBlock: 'UNREGISTERED_NON_READ' });
-  });
-
-  it('does not pass anything with the write stage entry or the audit stage entry given together (fail-closed)', () => {
-    const writeStage = { writeEndpoint: { origin: APP_ORIGIN, path: '/members' }, remainingPosts: 1 };
-    expect(classify(fetchOf('POST', TOKEN_URL), { authSetup: formStage(true), writeStage }).action).toBe('BLOCK');
-    const auditStage = {
-      approvedServiceOrigins: [SERVICE_ORIGIN],
-      auditReadRequests: [],
-      scriptLogin: { origin: SERVICE_ORIGIN, path: '/auth/v1/token', requiredQuery: [] },
-    };
-    expect(classify(fetchOf('POST', RPC_URL), { authSetup: formStage(true), auditStage }).action).toBe('BLOCK');
   });
 
   it('keeps the public audit and the audit stage as read only', () => {

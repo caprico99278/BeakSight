@@ -1,5 +1,6 @@
 import { describe, expect, it } from 'vitest';
 import { ACCESSIBILITY_RULES } from '../../src/audit/accessibility-rules.js';
+import { FOCUS_RULES } from '../../src/audit/focus-rules.js';
 import { LAYOUT_RULES } from '../../src/audit/layout-rules.js';
 import { PERFORMANCE_RULES } from '../../src/audit/performance-rules.js';
 import type { AuditRule, FindingDraft, PageRuleInput } from '../../src/audit/rule.js';
@@ -15,7 +16,6 @@ import { TECHNICAL_RULES } from '../../src/audit/technical-rules.js';
 import type { EvidenceId, EvidenceRecord, Severity } from '../../src/core/contracts.js';
 import type { ConsoleEvidence, NormalizedHttpUrlEvidence } from '../../src/core/evidence-types.js';
 import { createEvidenceId, createFindingFingerprint, createFindingId, createPageId } from '../../src/core/ids.js';
-import { MAX_ERROR_MESSAGE_LENGTH } from '../../src/core/limits.js';
 
 const TARGET_ID = 'rule-engine-fixture-target';
 const PAGE_ID = createPageId(7);
@@ -173,11 +173,13 @@ describe('freezeCatalog と RULE_CATALOG', () => {
     expect(catalog.every((rule) => Object.isFrozen(rule))).toBe(true);
   });
 
-  it('RULE_CATALOG は、5つの Rule のファイルの配列を1つにまとめた、重複のない凍結した一覧である', () => {
+  it('RULE_CATALOG は、6つの Rule のファイルの配列を1つにまとめた、重複のない凍結した一覧である', () => {
     expect(RULE_CATALOG).toEqual([
       ...TECHNICAL_RULES,
       ...LAYOUT_RULES,
       ...ACCESSIBILITY_RULES,
+      // AUD-4d: フォーカスまで隠す要素の Rule。
+      ...FOCUS_RULES,
       ...PERFORMANCE_RULES,
       ...SAFETY_RULES,
     ]);
@@ -275,7 +277,8 @@ describe('RuleEngine', () => {
     const evidenceId = EVIDENCE[0]!.evidenceId;
     expect(desktop.findings).toEqual([
       {
-        schemaVersion: 'finding-schema/1.0',
+        // AUD-9a: 新しい Finding は 1.1 で、同一性の要素のうち許可した欄（selector）を groupingKeys に残す。fingerprint は今のまま。
+        schemaVersion: 'finding-schema/1.1',
         findingId: createFindingId(1),
         fingerprint: expectedFingerprint('FINGERPRINT_RULE', evidenceId),
         ruleId: 'FINGERPRINT_RULE',
@@ -287,14 +290,15 @@ describe('RuleEngine', () => {
         viewport: 'desktop',
         message: `FINGERPRINT_RULE の仮の Finding（${evidenceId}）`,
         evidenceRefs: [evidenceId],
+        groupingKeys: [{ name: 'selector', value: evidenceId }],
       },
     ]);
     expect(mobile.findings[0]?.fingerprint).toBe(expectedFingerprint('FINGERPRINT_RULE', evidenceId, 'mobile'));
     expect(mobile.findings[0]?.fingerprint).not.toBe(desktop.findings[0]?.fingerprint);
   });
 
-  it('Rule が例外を投げても、ほかの Rule の評価を続け、失敗を ruleId と上限付きの文字列で返す', () => {
-    const longMessage = 'x'.repeat(MAX_ERROR_MESSAGE_LENGTH + 100);
+  it('Rule が例外を投げても、ほかの Rule の評価を続け、失敗を ruleId と切り詰めない文字列で返す', () => {
+    const longMessage = 'x'.repeat(2_049);
     const engine = new RuleEngine({
       targetId: TARGET_ID,
       firstFindingSequence: 1,
@@ -321,7 +325,7 @@ describe('RuleEngine', () => {
     expect(result.findings.map((finding) => finding.ruleId)).toEqual(['HEALTHY_RULE', 'HEALTHY_RULE', 'HEALTHY_RULE']);
     expect(result.failures).toEqual([
       { code: 'RULE_EVALUATION_FAILED', ruleId: 'THROWING_NON_ERROR_RULE', message: 'plain failure' },
-      { code: 'RULE_EVALUATION_FAILED', ruleId: 'THROWING_RULE', message: longMessage.slice(0, MAX_ERROR_MESSAGE_LENGTH) },
+      { code: 'RULE_EVALUATION_FAILED', ruleId: 'THROWING_RULE', message: longMessage },
     ]);
     expect(result.nextFindingSequence).toBe(4);
   });
@@ -632,7 +636,8 @@ describe('materializeFindingDrafts', () => {
     expect(result).toEqual({
       findings: [
         {
-          schemaVersion: 'finding-schema/1.0',
+          // AUD-9a: 新しい Finding は 1.1（groupingKeys を足した）。
+          schemaVersion: 'finding-schema/1.1',
           findingId: createFindingId(42),
           fingerprint: createFindingFingerprint({
             targetId: TARGET_ID,
@@ -650,6 +655,7 @@ describe('materializeFindingDrafts', () => {
           viewport: null,
           message: 'MATERIALIZE_RULE の仮の Finding（cross-page）',
           evidenceRefs: [EVIDENCE[0]!.evidenceId],
+          groupingKeys: [{ name: 'selector', value: 'cross-page' }],
         },
       ],
       failures: [],
@@ -682,13 +688,13 @@ describe('materializeFindingDrafts', () => {
 });
 
 describe('toRuleEvaluationFailure', () => {
-  it('例外を、RULE_EVALUATION_FAILED の失敗と上限付きの文字列に変える（Page rule と Cross-page rule が共有する）', () => {
-    const longMessage = 'y'.repeat(MAX_ERROR_MESSAGE_LENGTH + 10);
+  it('例外を、RULE_EVALUATION_FAILED の失敗と切り詰めない文字列に変える（Page rule と Cross-page rule が共有する）', () => {
+    const longMessage = 'y'.repeat(2_049);
 
     expect(toRuleEvaluationFailure('SOME_RULE', new Error(longMessage))).toEqual({
       code: 'RULE_EVALUATION_FAILED',
       ruleId: 'SOME_RULE',
-      message: longMessage.slice(0, MAX_ERROR_MESSAGE_LENGTH),
+      message: longMessage,
     });
     expect(toRuleEvaluationFailure('OTHER_RULE', 'plain failure')).toMatchObject({
       code: 'RULE_EVALUATION_FAILED',

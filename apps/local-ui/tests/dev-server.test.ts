@@ -4,23 +4,32 @@
  *   ソースを写して起動する（リポジトリの `local-data/` を作らない）。
  * - `/@fs/` の確かめは、一時の root に置いた中身のないファイル（と、起動に要るために写したファイル）の名前と、存在しないファイルの名前を
  *   使う。リポジトリの `local/`、`artifacts/` は、存在しないファイルの名前だけを要求し、応答の状態だけを見る。
+ * - 束 S2（SLIM-GROUP の UI-2）: 開発のサーバの場面を、ここに寄せた（1 つの `combined` の一時の root。本番の起動の部品と同じ管理データ）。
+ *   前は single-instance.test.ts（開発のサーバとの組）と start-failures.test.ts（`--host` の拒否、preview を起動しない、開発のサーバの port の使用中、
+ *   リポジトリの Vite の cache）。本番の起動の部品だけの場面は S1（`server-guards.test.ts`）。開発のサーバを止めてから流す場面は、後ろの describe に置く。
  */
 import { mkdirSync, writeFileSync } from 'node:fs';
 import { request as httpRequest } from 'node:http';
-import { connect } from 'node:net';
+import { connect, createServer, type Server } from 'node:net';
 import type { Browser } from 'playwright';
 import { afterAll, beforeAll, describe, expect, it } from 'vitest';
-import { LOCAL_UI_AUDIT_TEXT, LOCAL_UI_TEXT } from '../../../src/presentation/messages.js';
+import { LOCAL_UI_AUDIT_TEXT, LOCAL_UI_START_FAILURE_TEXT, LOCAL_UI_TEXT } from '../../../src/presentation/messages.js';
 import { launchHeadlessChromium } from '../../../tests/helpers/chromium.js';
 import {
+  LOOPBACK_HOST,
   REPO_ROOT,
   createTemporaryUiRoot,
   snapshotRepositoryViteCache,
   findFreePort,
   parseSetCookie,
   rawRequest,
+  runDevServerUntilExit,
+  runLauncherUntilExit,
+  runPreviewUntilExit,
   startDevServer,
+  startLauncher,
   stopServer,
+  type ExitedProcess,
   type StartedServer,
   type TemporaryUiRoot,
 } from './helpers/local-server.ts';
@@ -93,7 +102,8 @@ const rootPath = (): string => {
 
 beforeAll(async () => {
   viteCacheBefore = snapshotRepositoryViteCache();
-  root = createTemporaryUiRoot('source');
+  // S2: 本番の起動の部品との組（同時に 1 つ）も同じ管理データで確かめるので、`combined`（開発のサーバのソースとビルドの出力の両方）。
+  root = createTemporaryUiRoot('combined');
   for (const file of PLACEHOLDER_FILES) {
     mkdirSync(`${root.root}/${file.slice(0, file.lastIndexOf('/'))}`, { recursive: true });
     writeFileSync(`${root.root}/${file}`, '');
@@ -266,6 +276,106 @@ describe('dev server: listening and the guard', () => {
       await context.close();
     }
   });
+});
+
+/** 起動できないときの終了コード。 */
+const START_FAILED_EXIT_CODE = 1;
+/** 本番と開発のサーバを起動するテストの上限（ms）。 */
+const TEST_TIMEOUT_MS = 240_000;
+const startFailureText = LOCAL_UI_START_FAILURE_TEXT;
+
+/** 起動の失敗の説明の確かめ（前は start-failures.test.ts）。 */
+const expectStopped = (result: ExitedProcess, description: string, action: string): void => {
+  expect(result.status, result.output).toBe(START_FAILED_EXIT_CODE);
+  expect(result.output).toContain(startFailureText.heading);
+  expect(result.output).toContain(description);
+  expect(result.output).toContain(action);
+  expect(result.output).not.toMatch(/token=/u);
+  expect(result.output).not.toMatch(/\n\s+at /u);
+};
+
+/** 2 つ目の画面のサーバが、1 つ目（`holder`）を示して、待ち受けずに止まった（前は single-instance.test.ts）。 */
+const expectRefused = (result: ExitedProcess, holder: StartedServer): void => {
+  expect(result.status, result.output).toBe(START_FAILED_EXIT_CODE);
+  expect(result.output).toContain(startFailureText.heading);
+  expect(result.output).toContain(startFailureText.alreadyRunning(holder.child.pid ?? 0, startFailureText.alreadyRunningPort(holder.port)));
+  expect(result.output).toContain(startFailureText.alreadyRunningAction);
+  expect(result.output).not.toMatch(/token=/u);
+  expect(result.output).not.toMatch(/\n\s+at /u);
+};
+
+/** 1 つ目は動き続けている（応答を返す）。 */
+const expectStillServing = async (holder: StartedServer): Promise<void> => {
+  expect(holder.child.exitCode).toBeNull();
+  const response = await rawRequest(holder.port, `${holder.tokenUrl.pathname}${holder.tokenUrl.search}`);
+  expect(response.status).toBeLessThan(500);
+};
+
+/** `combined` の一時の root。 */
+const combinedRoot = (): TemporaryUiRoot => {
+  if (root === undefined) {
+    throw new Error('一時の root がない');
+  }
+  return root;
+};
+
+describe('only one local UI server runs at a time (DEF-061): the dev server and the production launcher', () => {
+  it('refuses the launcher while the dev server runs', async () => {
+    expectRefused(runLauncherUntilExit(combinedRoot(), await findFreePort()), started());
+    await expectStillServing(started());
+  }, TEST_TIMEOUT_MS);
+});
+
+describe('dev server start failures (T23h I1・M2, T23i N1): run after the dev server of this file stops', () => {
+  /** 127.0.0.1 の port を、ほかのプログラムとして使っておく。 */
+  const occupyPort = async (): Promise<{ readonly port: number; readonly server: Server }> => {
+    const port = await findFreePort();
+    const occupier = createServer();
+    await new Promise<void>((resolveListen) => occupier.listen({ host: LOOPBACK_HOST, port }, () => resolveListen()));
+    return { port, server: occupier };
+  };
+
+  beforeAll(async () => {
+    // 開発のサーバ（同時に 1 つのロックの持ち主）を止めてから、起動を止める場面を流す。
+    await stopServer(server);
+  });
+
+  it.each([
+    [['--host'], startFailureText.allAddresses],
+    [['--host', '0.0.0.0'], '0.0.0.0'],
+    [['--host', '::'], '::'],
+    [['--host', 'localhost'], 'localhost'],
+  ] as const)('dev server: refuses to start with %j (the listen address is fixed to 127.0.0.1)', async (hostArguments, shownHost) => {
+    const result = runDevServerUntilExit(combinedRoot(), ['--port', String(await findFreePort()), ...hostArguments]);
+    expectStopped(result, startFailureText.hostNotAllowed(shownHost), startFailureText.hostNotAllowedAction);
+  });
+
+  // preview が読むビルドの出力は、`combined` の一時の root にある（なくても止まることの理由は変わらない）。
+  it.each([[[] as readonly string[]], [['--host', '0.0.0.0']]])('vite preview: refuses to start the preview server with %j', async (hostArguments) => {
+    const result = runPreviewUntilExit(combinedRoot(), ['--port', String(await findFreePort()), ...hostArguments]);
+    expectStopped(result, startFailureText.previewNotSupported, startFailureText.previewNotSupportedAction);
+    expect(result.output).not.toMatch(/Local:\s+http/u);
+  });
+
+  it('dev server: the port is in use', async () => {
+    const { port, server: occupier } = await occupyPort();
+    try {
+      const result = runDevServerUntilExit(combinedRoot(), ['--port', String(port)]);
+      expectStopped(result, startFailureText.portInUse(port), startFailureText.portInUseAction);
+    } finally {
+      occupier.close();
+    }
+  });
+
+  it('refuses the dev server while a production launcher runs (DEF-061)', async () => {
+    const launcher = await startLauncher(combinedRoot(), await findFreePort());
+    try {
+      expectRefused(runDevServerUntilExit(combinedRoot(), ['--port', String(await findFreePort())]), launcher);
+      await expectStillServing(launcher);
+    } finally {
+      await stopServer(launcher);
+    }
+  }, TEST_TIMEOUT_MS);
 });
 
 describe('dev server: the test does not write into the repository (T23h, M4)', () => {

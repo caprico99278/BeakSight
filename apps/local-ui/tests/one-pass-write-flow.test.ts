@@ -4,21 +4,25 @@
  * 行と点検の要点が、実際に行ったことと一致することを確かめる（UI-W3 の撮り直しで、画面の流れでは書き込みが通らなかった不具合の再現）。
  * - 部 A: スクリプトで token を取りに行く SPA（token は別の Origin）。会員の画面は form のない API の形（`memberScreenLayout: 'formless'`）で、詳細の画面がある。
  *   会員は 0 人。
- * - 部 B: フォームの形のサイト（`write-site-fixture`）。ログインはフォーム。会員は 0 人。更新の画面がある。
- * 前のテスト（`tests/integration/write-chain-stage-fork.test.ts`・`full-flow.test.ts`）との違い: 前のテストは、書き込みの手順（検証の指定・照合の READ）をテストの
+ * - TEST-TIME-B（案 8）: 前の部 B（フォームの形のサイト）は外した。フォームの形の書き込みは、親が作る書き込みの段の指定を
+ *   `tests/integration/control-write-jobs.test.ts`（偽のワーカー）が、その指定を本物の書き込みの段が使って送ることを
+ *   `tests/integration/write-stage-parent-spec.test.ts`（DEF-278）が、書き込みの流れの結果の種類を `tests/integration/write-create-run.test.ts` が確かめる。
+ *   データのないサイト・自動ログインの点検・間隔の間の主のボタン・作業の画面にとどまることは、部 A が確かめる。
+ * 前のテスト（RB-6 で消した書き込みの連鎖の fork と、`full-flow.test.ts`）との違い: 前のテストは、書き込みの手順（検証の指定・照合の READ）をテストの
  * 補助で直接作るか、データのあるサイトで、手でのログインを毎回行っていた。ここでは、チェックの保存（画面の操作）が作る手順だけを使い、データのないサイトで、
- * 自動ログインの点検を続ける（3 回目の前は、自動ログインの間隔の決まりの時間だけ、本当に待つ）。
+ * 自動ログインの点検を続ける（3 回目の前は、自動ログインの間隔の決まりの時間を待たずに、管理データの試し始めた時刻を前へずらす。
+ * `login-secret-markers.test.ts` と同じ `shiftAutoLoginAttemptsBack`）。
  * ワーカーは本物。手でのログイン（1 回目）だけは、テストだけの入口が受け渡しのサーバから資格情報を受けて入れる（人の操作の代わり）。サイトは 127.0.0.1 だけ。
- * 端末の負荷を上げないよう、サーバ・ワーカー・ブラウザは同時に 1 組だけ（部 A と部 B は順に流す）。
+ * 端末の負荷を上げないよう、サーバ・ワーカー・ブラウザは同時に 1 組だけ。
  */
 import type { Page } from 'playwright';
 import { afterAll, afterEach, beforeAll, describe, expect, it } from 'vitest';
-import { wait } from '../../../src/core/deadline.js';
 import { AUTO_LOGIN_MIN_INTERVAL_MS } from '../../../src/control/job/auto-login-limits.js';
 import { WORKER_ENTRY_CHECK_JOB_KIND } from '../../../src/control/worker-protocol.js';
 import { LOCAL_UI_AUDIT_TEXT, LOCAL_UI_WRITE_SCREENS_TEXT } from '../../../src/presentation/messages.js';
+import { shiftAutoLoginAttemptsBack } from '../../../tests/helpers/control-data-test-writes.js';
+import { settleLateDeliveries } from '../../../tests/helpers/loopback-server.js';
 import { SPA_APP_PATHS, SPA_LOGIN_FIELDS, startSpaAuthSite, type SpaAuthSite } from '../../../tests/helpers/spa-auth-site-fixture.js';
-import { WRITE_SITE_LOGIN_FIELDS, WRITE_SITE_PATHS, startWriteSite, type WriteSite } from '../../../tests/helpers/write-site-fixture.js';
 import { openAdvancedSettings } from './helpers/advanced-settings.ts';
 import { writeAuthTargetConfig } from './helpers/auth-worker.ts';
 import { createProfileOnScreen } from './helpers/profile-form.ts';
@@ -30,13 +34,10 @@ const PROFILE_ID = '127-0-0-1';
 /** 巡回の上限と、読み込みの最小の間隔（ms。ループバックの fixture）。 */
 const MAX_PAGES = 5;
 const NAVIGATION_INTERVAL_MS = 0;
-/** 1 つの部の上限（ms。3 回の点検と、自動ログインの間隔の待ちを含む）。 */
-const PART_TIMEOUT_MS = 1_500_000;
+/** 1 つの部の上限（ms。下調べと 3 回の点検を含む。自動ログインの間隔は時刻をずらすので待たない）。 */
+const PART_TIMEOUT_MS = 1_200_000;
 /** まとめて実行の終わりを読み直す間隔（ms）。 */
 const CHAIN_POLL_MS = 500;
-/** 自動ログインの間隔の待ちの間に、サイトの画面を読み直す間隔（ms）と、上限の余裕（ms）。 */
-const INTERVAL_POLL_MS = 15_000;
-const INTERVAL_MARGIN_MS = 120_000;
 /** 全部の後に、遅れて届く要求を待つ時間（ms）。 */
 const LATE_REQUEST_WAIT_MS = 2_000;
 
@@ -88,6 +89,8 @@ interface PartSite {
   readonly createRequests: () => readonly string[];
   readonly updateRequests: () => readonly string[];
   readonly members: () => number;
+  /** TEST-TIME-B: 受けている途中の要求が 0 になるまで待つ（`settleLateDeliveries` に渡す）。 */
+  readonly whenIdle: (limitMs?: number) => Promise<void>;
   readonly close: () => Promise<void>;
 }
 
@@ -242,7 +245,8 @@ const describePart = (label: string, startSite: () => Promise<PartSite>): void =
     const creates0 = siteOf().createRequests().length;
     const updates0 = siteOf().updateRequests().length;
     const second = await inspectOnScreen();
-    await wait(LATE_REQUEST_WAIT_MS);
+    // TEST-TIME-B（案 9）: 点検のワーカー（と Browser）は終わった後なので、受けている途中の要求が 0 になってから短い余白だけ待つ（上限は前の固定の待ち）。
+    await settleLateDeliveries(LATE_REQUEST_WAIT_MS, siteOf());
     expect(second.chain).toMatchObject({ state: 'FINISHED', stopReason: null });
     expect(second.writes.map(({ jobKind, write }) => [jobKind, write?.result ?? null])).toEqual([['WRITE_CREATE', 'VERIFIED']]);
     expect(siteOf().createRequests().length - creates0).toBe(1);
@@ -256,30 +260,23 @@ const describePart = (label: string, startSite: () => Promise<PartSite>): void =
     expect(second.primaryActions).toEqual(['AUDIT_RESULT']);
     await flow.closePages();
 
-    // 4. 自動ログインの間隔の決まりの間は、サイトの画面の主のボタンは「結果を見る」。間隔が過ぎたら「点検を始める」が出る（画面を読み直して待つ）。
+    // 4. 自動ログインの間隔の決まりの間は、サイトの画面の主のボタンは「結果を見る」。間隔が過ぎたら「点検を始める」が出る（ジョブが動いていない間に、
+    // 試し始めた時刻を間隔の分だけ前へずらしてから、画面を読み直す）。
     const waiting = await flow.openPage(`/profiles/${PROFILE_ID}`);
     await waiting.getByTestId('profile-summary').waitFor({ timeout: UI_TIMEOUT_MS });
     expect(await waiting.locator('main .button--primary').count()).toBe(1);
     expect(await waiting.getByTestId('profile-summary').locator('.button--primary[data-action="AUDIT_RESULT"]').count()).toBe(1);
-    const deadline = Date.now() + AUTO_LOGIN_MIN_INTERVAL_MS + INTERVAL_MARGIN_MS;
-    for (;;) {
-      await waiting.reload();
-      await waiting.getByTestId('profile-summary').waitFor({ timeout: UI_TIMEOUT_MS });
-      if (await waiting.getByTestId('profile-summary').locator('[data-action="AUDIT_START"]').count() > 0) {
-        break;
-      }
-      if (Date.now() > deadline) {
-        throw new Error('the automated login interval did not pass');
-      }
-      await wait(INTERVAL_POLL_MS);
-    }
+    expect(shiftAutoLoginAttemptsBack(flow.databasePath(), PROFILE_ID, AUTO_LOGIN_MIN_INTERVAL_MS)).toBeGreaterThan(0);
+    await waiting.reload();
+    await waiting.getByTestId('profile-summary').waitFor({ timeout: UI_TIMEOUT_MS });
+    expect(await waiting.getByTestId('profile-summary').locator('[data-action="AUDIT_START"]').count()).toBeGreaterThan(0);
     await flow.closePages();
 
     // 5. 3 回目の点検（自動ログイン）: 操作さがしが作ったデータの更新の画面を見つけるので、同じ点検で登録 → 更新。どちらも確かめられ、行と要点が一致する。
     const creates1 = siteOf().createRequests().length;
     const updates1 = siteOf().updateRequests().length;
     const third = await inspectOnScreen();
-    await wait(LATE_REQUEST_WAIT_MS);
+    await settleLateDeliveries(LATE_REQUEST_WAIT_MS, siteOf());
     expect(third.chain).toMatchObject({ state: 'FINISHED', stopReason: null });
     expect(third.writes.map(({ jobKind, write }) => [jobKind, write?.result ?? null])).toEqual([['WRITE_CREATE', 'VERIFIED'], ['WRITE_UPDATE', 'VERIFIED']]);
     expect(siteOf().createRequests().length - creates1).toBe(1);
@@ -326,38 +323,8 @@ describe('OP-G part A: the SPA with the API-shaped member screens, on the screen
       createRequests: () => writes('POST'),
       updateRequests: () => writes('PATCH'),
       members: () => spa.memberCount,
+      whenIdle: (limitMs) => spa.whenIdle(limitMs),
       close: () => spa.close(),
     };
   });
 });
-
-describe('OP-G part B: the form-shaped site, on the screen only', () => {
-  describePart('B', async () => {
-    const form: WriteSite = await startWriteSite();
-    form.enableUpdatePages();
-    const posts = (update: boolean): readonly string[] => nonLoginPostsOf(form)
-      .filter((path) => (path === WRITE_SITE_PATHS.create) !== update)
-      .map((path) => `POST ${path}`);
-    return {
-      origin: form.origin,
-      startPath: WRITE_SITE_PATHS.list,
-      secretValues: () => form.secretValues(),
-      credentials: async () => {
-        const fields: (readonly [string, string])[] = [];
-        await form.fillCredentials(async (selector, value) => {
-          fields.push([selector, value]);
-        });
-        return { fields, submit: WRITE_SITE_LOGIN_FIELDS.submit };
-      },
-      createRequests: () => posts(false),
-      updateRequests: () => posts(true),
-      members: () => form.members,
-      close: () => form.close(),
-    };
-  });
-});
-
-/** フォームの形のサイトに届いた、ログインでない POST の path。 */
-const nonLoginPostsOf = (form: WriteSite): readonly string[] => form.requests
-  .filter(({ method, path }) => method === 'POST' && path.split('?')[0] !== WRITE_SITE_PATHS.login)
-  .map(({ path }) => path.split('?')[0] ?? path);

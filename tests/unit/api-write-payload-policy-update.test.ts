@@ -8,10 +8,14 @@
 // - 結果に、生成した値・前の値・ヘッダの値を残さない。どの入力でも投げない。
 import { describe, expect, it } from 'vitest';
 import {
+  apiWriteCheckPathOf,
+  apiWriteExpectationWithPriorValues,
+  apiWritePriorValuesCopyOf,
   checkApiWritePayload,
   type ApiWritePayloadExpectation,
   type ApiWritePriorValue,
   type ApiWriteRequestFacts,
+  type ApiWriteSuppliedPriorValues,
 } from '../../src/safety/api-write-payload-policy.js';
 
 const API_ORIGIN = 'https://api.example.test';
@@ -191,5 +195,242 @@ describe('T41c: the API UPDATE check blocks with a closed reason and no value', 
     for (const query of [`id=eq%2E${RECORD_ID}&select=*`, `%69d=eq.${RECORD_ID}&select=*`, `select=*&id=eq.${RECORD_ID}`]) {
       expect(checkApiWritePayload(updateExpectation(), updateFacts(FULL_BODY, `${API_ORIGIN}${API_PATH}?${query}`)).decision).toBe('ALLOW');
     }
+  });
+});
+
+// LU-5（設計書 `2026-11-02-beaksight-list-row-update-design.md` 4.0 の D1、5.3 の 1・3）: path に番号が入る形の更新（filter のない UPDATE）。期待の path の
+// 型の最後の区切りが `{id}`（ちょうど 1 つ）のときだけ受け、`{id}` を台帳の番号にした具体的な path で完全一致を行う。query の名前の集合と本文の照合は今のまま。
+describe('LU-5: the API UPDATE check of the path shape that ends with the record id', () => {
+  const PATH_TEMPLATE = '/api/items/{id}';
+  const PATH_RECORD_ID = '4';
+  const pathExpectation = (overrides: Partial<ApiWritePayloadExpectation> = {}, pathShape = PATH_TEMPLATE, queryNames: readonly string[] = []): ApiWritePayloadExpectation => {
+    const base = updateExpectation();
+    return {
+      ...base,
+      spec: { ...base.spec, request: { ...base.spec.request, pathShape, queryNames }, filterName: null },
+      recordId: PATH_RECORD_ID,
+      ...overrides,
+    };
+  };
+  const pathFacts = (path: string, body: Record<string, unknown> = FULL_BODY, method = 'PATCH'): ApiWriteRequestFacts => ({
+    method,
+    url: `${API_ORIGIN}${path}`,
+    headers: HEADERS,
+    body: bytesOf(JSON.stringify(body)),
+  });
+
+  it('admits the PATCH to the concrete path of the record id and returns no prior value', () => {
+    const result = checkApiWritePayload(pathExpectation(), pathFacts('/api/items/4'));
+    expect(result).toEqual({ decision: 'ALLOW', pageKeyValues: {} });
+    expectNoLeak(result);
+  });
+
+  it('admits the approved select query on the path shape', () => {
+    expect(checkApiWritePayload(pathExpectation({}, PATH_TEMPLATE, ['select']), pathFacts('/api/items/4?select=*')).decision).toBe('ALLOW');
+  });
+
+  const PATH_BLOCKED: readonly (readonly [string, ApiWritePayloadExpectation, ApiWriteRequestFacts, string])[] = [
+    ['another record id', pathExpectation(), pathFacts('/api/items/5'), 'ENDPOINT_MISMATCH'],
+    ['a path under the record', pathExpectation(), pathFacts('/api/items/4/x'), 'ENDPOINT_MISMATCH'],
+    ['the collection path', pathExpectation(), pathFacts('/api/items'), 'ENDPOINT_MISMATCH'],
+    ['the record id with a leading zero', pathExpectation(), pathFacts('/api/items/04'), 'ENDPOINT_MISMATCH'],
+    ['the literal template', pathExpectation(), pathFacts('/api/items/%7Bid%7D'), 'ENDPOINT_MISMATCH'],
+    ['a filter query on the path shape', pathExpectation(), pathFacts('/api/items/4?id=eq.4'), 'QUERY_MISMATCH'],
+    ['a missing approved query', pathExpectation({}, PATH_TEMPLATE, ['select']), pathFacts('/api/items/4'), 'QUERY_MISMATCH'],
+    ['another method', pathExpectation(), pathFacts('/api/items/4', FULL_BODY, 'DELETE'), 'METHOD_MISMATCH'],
+    ['a changed kept value', pathExpectation(), pathFacts('/api/items/4', { ...FULL_BODY, email: 'other@example.test' }), 'BODY_VALUE_MISMATCH'],
+    ['a changed page key value', pathExpectation(), pathFacts('/api/items/4', { ...FULL_BODY, plan: 'other' }), 'BODY_VALUE_MISMATCH'],
+    ['another changed value', pathExpectation(), pathFacts('/api/items/4', { ...FULL_BODY, name: 'other' }), 'BODY_VALUE_MISMATCH'],
+    ['a key outside the approval', pathExpectation(), pathFacts('/api/items/4', { ...FULL_BODY, role: 'admin' }), 'BODY_KEY_UNEXPECTED'],
+    // 期待の誤り（fail-closed。5.3 の 1）
+    ['both the filter and the record id segment', pathExpectation({ spec: { ...pathExpectation().spec, filterName: 'id' } }), pathFacts('/api/items/4?id=eq.4'), 'EXPECTATION_INVALID'],
+    ['two record id segments', pathExpectation({}, '/api/{id}/items/{id}'), pathFacts('/api/4/items/4'), 'EXPECTATION_INVALID'],
+    ['a record id segment that is not the last', pathExpectation({}, '/api/items/{id}/edit'), pathFacts('/api/items/4/edit'), 'EXPECTATION_INVALID'],
+    ['a record id inside a segment', pathExpectation({}, '/api/items/x{id}'), pathFacts('/api/items/x4'), 'EXPECTATION_INVALID'],
+    ['neither the filter nor the record id segment', pathExpectation({}, '/api/items'), pathFacts('/api/items'), 'EXPECTATION_INVALID'],
+    ['no record id', pathExpectation({ recordId: null }), pathFacts('/api/items/4'), 'EXPECTATION_INVALID'],
+    ['an empty record id', pathExpectation({ recordId: '' }), pathFacts('/api/items/'), 'EXPECTATION_INVALID'],
+    // L12b（設計書 `2026-11-09-beaksight-remove-limits-design.md` 6.2。設計者の判断 1・2）: 登録の ID の長さの上限は撤廃したので、長すぎる例は外した
+    // （使える文字の決まりだけで止める）。
+    ...(['4/x', '4?x=1', '4#x', '%34', '.', '..', '4.5', '4~5', '4 5', '4;x', 'あ'] as const).map((recordId) =>
+      [`a record id that is not one path segment (${recordId})`, pathExpectation({ recordId }), pathFacts('/api/items/4'), 'EXPECTATION_INVALID'] as const),
+  ];
+
+  it.each(PATH_BLOCKED)('blocks %s', (_label, expectation, facts, reason) => {
+    const result = checkApiWritePayload(expectation, facts);
+    expect(result).toEqual({ decision: reason });
+    expectNoLeak(result);
+  });
+
+  it('admits a record id of the usable shape (letters, digits, underscore, hyphen, up to 64 characters)', () => {
+    for (const recordId of ['a_B-9', '9'.repeat(64)]) {
+      expect(checkApiWritePayload(pathExpectation({ recordId }), pathFacts(`/api/items/${recordId}`)).decision).toBe('ALLOW');
+    }
+  });
+
+  // fix round 1（案 A）: 照合へ回す要求の path の唯一の部品。path の形の更新は具体的な path、ほかは型のまま。作れない期待は null。
+  it('gives the path that the request decision compares with (apiWriteCheckPathOf)', () => {
+    expect(apiWriteCheckPathOf(pathExpectation())).toBe('/api/items/4');
+    expect(apiWriteCheckPathOf(updateExpectation())).toBe(API_PATH);
+    expect(apiWriteCheckPathOf(createExpectation())).toBe(API_PATH);
+    expect(apiWriteCheckPathOf(pathExpectation({}, '/api/items/{id}/edit'))).toBeNull();
+    expect(apiWriteCheckPathOf(pathExpectation({ recordId: '4/x' }))).toBeNull();
+    expect(apiWriteCheckPathOf(pathExpectation({ spec: { ...pathExpectation().spec, filterName: 'id' } }))).toBeNull();
+    expect(apiWriteCheckPathOf(null as unknown as ApiWritePayloadExpectation)).toBeNull();
+  });
+
+  it('keeps the filter UPDATE unchanged (a filter UPDATE on a path without the record id segment)', () => {
+    expect(checkApiWritePayload(updateExpectation(), updateFacts()).decision).toBe('ALLOW');
+    expect(checkApiWritePayload(updateExpectation(), updateFacts(FULL_BODY, `${API_ORIGIN}${API_PATH}/${RECORD_ID}?id=eq.${RECORD_ID}&select=*`)).decision)
+      .toBe('ENDPOINT_MISMATCH');
+  });
+});
+
+// LU-9（設計書 `2026-11-02-beaksight-list-row-update-design.md` 4.0.1 の K1、5.3 の 2）: 前の値を後から入れる印（`deferredPriorValues`）のある期待。印の
+// ある期待は、前の値を入れるまで照合が `EXPECTATION_INVALID` で止める（fail-closed）。入れられるのは値だけで、鍵の集合（保つ鍵は印の名前、ページが決める鍵は
+// 承認の鍵）は期待を作る時に決まっている。値の形は、今の `keptKeys`・`pageKeyPriorValues` と同じ決まり（`acceptedExpectationOf`）で確かめる。
+describe('LU-9: the API UPDATE expectation whose prior values are supplied later', () => {
+  const deferredExpectation = (overrides: Partial<ApiWritePayloadExpectation> = {}): ApiWritePayloadExpectation => updateExpectation({
+    keptKeys: undefined,
+    pageKeyPriorValues: undefined,
+    deferredPriorValues: { keptKeys: KEPT.map(({ key }) => key) },
+    ...overrides,
+  });
+  const SUPPLIED: ApiWriteSuppliedPriorValues = Object.freeze({ keptKeys: KEPT, pageKeyPriorValues: PAGE_PRIORS });
+
+  it('blocks every request with EXPECTATION_INVALID before the prior values are supplied (fail-closed)', () => {
+    for (const facts of [updateFacts(), updateFacts({ name: NEW_NAME, plan: PRIOR_PLAN })]) {
+      expect(checkApiWritePayload(deferredExpectation(), facts)).toEqual({ decision: 'EXPECTATION_INVALID' });
+    }
+  });
+
+  it('admits the body that matches the supplied prior values, and blocks a changed kept value with the current reason', () => {
+    const supplied = apiWriteExpectationWithPriorValues(deferredExpectation(), SUPPLIED);
+    expect(supplied).not.toBeNull();
+    if (supplied === null) return;
+    expect(supplied.deferredPriorValues).toBeUndefined();
+    const result = checkApiWritePayload(supplied, updateFacts());
+    expect(result).toEqual({ decision: 'ALLOW', pageKeyValues: {} });
+    expectNoLeak(result);
+    expect(checkApiWritePayload(supplied, updateFacts({ ...FULL_BODY, email: 'other@example.test' }))).toEqual({ decision: 'BODY_VALUE_MISMATCH' });
+    expect(checkApiWritePayload(supplied, updateFacts({ ...FULL_BODY, plan: 'platinum' }))).toEqual({ decision: 'BODY_VALUE_MISMATCH' });
+    expect(checkApiWritePayload(supplied, updateFacts({ ...FULL_BODY, age: '42' }))).toEqual({ decision: 'BODY_VALUE_TYPE_MISMATCH' });
+    // 元の期待は変わらない（印のまま。純粋）。
+    expect(checkApiWritePayload(deferredExpectation(), updateFacts())).toEqual({ decision: 'EXPECTATION_INVALID' });
+  });
+
+  it('admits the supplied kept keys in another order', () => {
+    const supplied = apiWriteExpectationWithPriorValues(deferredExpectation(), { ...SUPPLIED, keptKeys: [...KEPT].reverse() });
+    expect(supplied === null ? null : checkApiWritePayload(supplied, updateFacts()).decision).toBe('ALLOW');
+  });
+
+  it('admits an empty kept key set and no page key when the approval has none', () => {
+    const expectation = deferredExpectation({ spec: { ...updateExpectation().spec, pageKeys: [] }, deferredPriorValues: { keptKeys: [] } });
+    const supplied = apiWriteExpectationWithPriorValues(expectation, { keptKeys: [], pageKeyPriorValues: [] });
+    expect(supplied === null ? null : checkApiWritePayload(supplied, updateFacts({ name: NEW_NAME })).decision).toBe('ALLOW');
+  });
+
+  const REJECTED: readonly (readonly [string, ApiWritePayloadExpectation, unknown])[] = [
+    // 鍵の集合（足す・減らす・違う集合）
+    ['a kept key added', deferredExpectation(), { ...SUPPLIED, keptKeys: [...KEPT, { key: 'role', value: 'x' }] }],
+    ['a kept key removed', deferredExpectation(), { ...SUPPLIED, keptKeys: KEPT.slice(1) }],
+    ['another kept key set', deferredExpectation(), { ...SUPPLIED, keptKeys: [...KEPT.slice(1), { key: 'role', value: PRIOR_EMAIL }] }],
+    ['a kept key twice', deferredExpectation(), { ...SUPPLIED, keptKeys: [...KEPT, KEPT[0]] }],
+    ['a page key prior value added', deferredExpectation(), { ...SUPPLIED, pageKeyPriorValues: [...PAGE_PRIORS, { key: 'tier', value: 'x' }] }],
+    ['a page key prior value removed', deferredExpectation(), { ...SUPPLIED, pageKeyPriorValues: [] }],
+    ['another page key', deferredExpectation(), { ...SUPPLIED, pageKeyPriorValues: [{ key: 'tier', value: PRIOR_PLAN }] }],
+    // 値の形（今の決まりと同じ）
+    ['a kept value that is an object', deferredExpectation(), { ...SUPPLIED, keptKeys: [{ key: 'email', value: { a: 1 } }, ...KEPT.slice(1)] }],
+    ['a kept value that is not finite', deferredExpectation(), { ...SUPPLIED, keptKeys: [...KEPT.slice(0, 1), { key: 'age', value: Number.NaN }, ...KEPT.slice(2)] }],
+    ['a kept entry without the value', deferredExpectation(), { ...SUPPLIED, keptKeys: [{ key: 'email' }, ...KEPT.slice(1)] }],
+    ['a page key prior value of another type', deferredExpectation(), { ...SUPPLIED, pageKeyPriorValues: [{ key: 'plan', value: 1 }] }],
+    ['kept keys that are not a list', deferredExpectation(), { ...SUPPLIED, keptKeys: { email: PRIOR_EMAIL } }],
+    ['page key prior values that are missing', deferredExpectation(), { keptKeys: KEPT }],
+    ['not an object', deferredExpectation(), null],
+    // 印と期待
+    ['an expectation without the mark', updateExpectation({ keptKeys: undefined, pageKeyPriorValues: undefined }), SUPPLIED],
+    ['an expectation with the mark and kept prior values already', deferredExpectation({ keptKeys: KEPT }), SUPPLIED],
+    ['an expectation with the mark and page prior values already', deferredExpectation({ pageKeyPriorValues: PAGE_PRIORS }), SUPPLIED],
+    ['a mark whose kept key names are not a list', deferredExpectation({ deferredPriorValues: { keptKeys: 'email' as unknown as string[] } }), SUPPLIED],
+    ['a mark with a kept key name twice', deferredExpectation({ deferredPriorValues: { keptKeys: [...KEPT.map(({ key }) => key), 'email'] } }), SUPPLIED],
+    ['a mark with an empty kept key name', deferredExpectation({ deferredPriorValues: { keptKeys: [''] } }), { ...SUPPLIED, keptKeys: [{ key: '', value: 'x' }] }],
+    ['a mark on a CREATE', createExpectation({ deferredPriorValues: { keptKeys: [] } }), { keptKeys: [], pageKeyPriorValues: [] }],
+    ['a kept key that is also a changed key', deferredExpectation({ deferredPriorValues: { keptKeys: ['name'] } }), { ...SUPPLIED, keptKeys: [{ key: 'name', value: 'x' }] }],
+  ];
+
+  it.each(REJECTED)('rejects %s, and the expectation stays blocked', (_label, expectation, supplied) => {
+    expect(apiWriteExpectationWithPriorValues(expectation, supplied as ApiWriteSuppliedPriorValues)).toBeNull();
+    if (expectation.deferredPriorValues !== undefined) {
+      expect(checkApiWritePayload(expectation, updateFacts()).decision).toBe('EXPECTATION_INVALID');
+    }
+  });
+
+  it('does not throw on any input', () => {
+    const hostile = new Proxy({}, { get: () => { throw new Error('leak-marker-hostile'); } });
+    expect(apiWriteExpectationWithPriorValues(deferredExpectation(), hostile as ApiWriteSuppliedPriorValues)).toBeNull();
+    expect(apiWriteExpectationWithPriorValues(hostile as ApiWritePayloadExpectation, SUPPLIED)).toBeNull();
+    expect(apiWriteExpectationWithPriorValues(null as unknown as ApiWritePayloadExpectation, SUPPLIED)).toBeNull();
+  });
+
+  // LU-SFIX1（LU-SREV1 の Minor-2）: 受けた前の値は、確かめる前に写して凍らせる（getter で後から値が変わっても、確かめた値と照らす値は同じ）。
+  it('copies and freezes the supplied prior values before the check, so a getter that changes later does not change the check', () => {
+    let reads = 0;
+    const flipping = { key: 'email', get value(): string { reads += 1; return reads === 1 ? PRIOR_EMAIL : 'leak-marker-evil@example.test'; } };
+    const supplied = apiWriteExpectationWithPriorValues(deferredExpectation(), { ...SUPPLIED, keptKeys: [flipping, ...KEPT.slice(1)] });
+    expect(supplied).not.toBeNull();
+    if (supplied === null) return;
+    expect(reads).toBe(1);
+    expect(Object.isFrozen(supplied.keptKeys)).toBe(true);
+    expect(supplied.keptKeys?.every((entry) => Object.isFrozen(entry))).toBe(true);
+    expect(checkApiWritePayload(supplied, updateFacts()).decision).toBe('ALLOW');
+    expect(checkApiWritePayload(supplied, updateFacts({ ...FULL_BODY, email: 'leak-marker-evil@example.test' })).decision).toBe('BODY_VALUE_MISMATCH');
+    expect(reads).toBe(1);
+  });
+
+  // LU-SFIX1（LU-SREV1 の Minor-1・2）: 一覧の `map` を差し替えた Proxy でも、写しは添字の繰り返しで作る（`map` の返す一覧で鍵の集合の確かめを外せない）。
+  it('does not call the map of the supplied list (a Proxy that replaces map cannot hide an extra kept key)', () => {
+    const real = [...KEPT, { key: 'role', value: 'admin' }];
+    let mapCalls = 0;
+    const hijacked = new Proxy(real, {
+      get(target, property, receiver) {
+        if (property === 'map') {
+          // 鍵の名前の確かめに使われれば、印の名前だけ（`role` を隠す）を返す。
+          return (copyEntry: (entry: unknown) => unknown) => { mapCalls += 1; return KEPT.map((entry) => copyEntry(entry)); };
+        }
+        return Reflect.get(target, property, receiver) as unknown;
+      },
+    });
+    expect(apiWriteExpectationWithPriorValues(deferredExpectation(), { ...SUPPLIED, keptKeys: hijacked })).toBeNull();
+    expect(mapCalls).toBe(0);
+  });
+});
+
+// LU-SFIX1（LU-SREV1 の Minor-1）: 前の値の一覧の唯一の写し方（Guard の期待の写しと前の値の口が使う）。`map` を呼ばず、項目の `key`・`value` は 1 回だけ読む。
+describe('LU-SFIX1: the copy of the prior value list', () => {
+  it('copies by index without calling map, reads each value once, and freezes the copy', () => {
+    let reads = 0;
+    const entry = { key: 'note', get value(): string { reads += 1; return reads === 1 ? 'old' : 'leak-marker-evil'; } };
+    let mapCalls = 0;
+    const hijacked = new Proxy([entry], {
+      get(target, property, receiver) {
+        if (property === 'map') {
+          return () => { mapCalls += 1; return [{ key: 'note', value: 'leak-marker-evil' }]; };
+        }
+        return Reflect.get(target, property, receiver) as unknown;
+      },
+    });
+    const copy = apiWritePriorValuesCopyOf(hijacked);
+    expect(copy).toEqual([{ key: 'note', value: 'old' }]);
+    expect(mapCalls).toBe(0);
+    expect(reads).toBe(1);
+    expect(Object.isFrozen(copy)).toBe(true);
+    expect((copy as readonly object[]).every((item) => Object.isFrozen(item))).toBe(true);
+  });
+
+  it('keeps the shapes the check rejects (not a list, a non-scalar value, an entry without the value)', () => {
+    expect(apiWritePriorValuesCopyOf({ note: 'old' })).toEqual({});
+    expect(apiWritePriorValuesCopyOf([{ key: 'note', value: { a: 1 } }])).toEqual([{ key: 'note', value: {} }]);
+    expect(apiWritePriorValuesCopyOf([{ key: 'note' }])).toEqual([{ key: 'note' }]);
+    expect(apiWritePriorValuesCopyOf([{ key: 1, value: 'x' }, 'raw'])).toEqual([{ key: null, value: 'x' }, 'raw']);
   });
 });

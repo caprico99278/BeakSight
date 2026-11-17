@@ -25,7 +25,7 @@ import { createPageId } from '../../src/core/ids.js';
 import { ConsoleCollector } from '../../src/evidence/console-collector.js';
 import { collectDomEvidence } from '../../src/evidence/dom-collector.js';
 import { NetworkCollector } from '../../src/evidence/network-collector.js';
-import { launchCliChromium, launchHeadlessChromium } from '../helpers/chromium.js';
+import { BOTH_CHROMIUM_LAUNCHERS } from '../helpers/chromium.js';
 import {
   createGateFactory,
   expectedWorkerWebSocketState,
@@ -80,25 +80,13 @@ const CONNECT_POLICY_CONTROL_RESULTS = Object.freeze({
   ping: 'clicked',
 } as const);
 
-/** Chromium の起動の仕方（名前と、起動する関数）。 */
-interface ChromiumLaunch {
-  readonly name: string;
-  launch(): Promise<Browser>;
-}
-
-const CHROMIUM_LAUNCHES: readonly ChromiumLaunch[] = [
-  { name: 'the headless shell (test default)', launch: () => launchHeadlessChromium() },
-  // EL-12: 本番と同じ起動の部品（`launchCliChromium`）で起動する。
-  { name: 'the CLI Chromium (chromiumLaunchOptions, headless)', launch: () => launchCliChromium() },
-];
-
 /** `CONNECT_POLICY_CONTROLS_PAGE` が html 要素に残した、接続の結果（名前ごと）。 */
 const readConnectPolicyControlResults = (page: Page): Promise<Record<string, string | undefined>> => page.evaluate(
   (names) => Object.fromEntries(names.map((name) => [name, document.documentElement.dataset[name]])),
   Object.keys(CONNECT_POLICY_CONTROL_RESULTS),
 );
 
-describe.each(CHROMIUM_LAUNCHES)('DEF-040: WebSockets opened inside Workers are stopped by the Guard, with $name', ({ name, launch }) => {
+describe.each(BOTH_CHROMIUM_LAUNCHERS)('DEF-040: WebSockets opened inside Workers are stopped by the Guard, with %s', (name, launch) => {
   let server: FixtureServer;
   let browser: Browser;
   let factory: BrowserContextFactory;
@@ -156,7 +144,7 @@ describe.each(CHROMIUM_LAUNCHES)('DEF-040: WebSockets opened inside Workers are 
       const networkHandle = NetworkCollector.attach(session.page);
       await session.page.goto(urlOf(workerWebSocketPassivePath(kind)), { waitUntil: 'load' });
       await expect.poll(() => readWorkerWebSocketState(session.page)).toBe('started');
-      await expect.poll(() => session.ledger.snapshot().blockedWebSockets.length).toBeGreaterThan(0);
+      // RB-4b: Passive の Context では、Worker の中の WebSocket を止めない（記録もない）。ここでは、CSP の差し込みが監査の Evidence に写らないことだけを確かめる。
       await wait(QUIET_PERIOD_MS);
 
       const liveMetaCount = await session.page.evaluate(() => document.querySelectorAll('meta[http-equiv]').length);

@@ -1,15 +1,10 @@
 import type { ConsoleMessage, Page } from 'playwright';
 import { describe, expect, it } from 'vitest';
-import {
-  MAX_CONSOLE_MESSAGES,
-  MAX_CONSOLE_TEXT_LENGTH,
-  MAX_ERROR_MESSAGE_LENGTH,
-  MAX_ERROR_NAME_LENGTH,
-  MAX_PAGE_ERRORS,
-  MAX_STACK_LENGTH,
-  MAX_URL_LENGTH,
-} from '../../src/core/limits.js';
 import { ConsoleCollector } from '../../src/evidence/console-collector.js';
+
+/** L2 の前の件数の上限（console 1,000・pageerror 200。定数は LZ-1 で消した）。 */
+const MAX_CONSOLE_MESSAGES = 1_000;
+const MAX_PAGE_ERRORS = 200;
 
 type Listener = (...arguments_: readonly unknown[]) => void;
 
@@ -55,7 +50,7 @@ function pageError(name: string, message: string, stack: string | undefined): Er
 }
 
 describe('ConsoleCollector limits', () => {
-  it('bounds the number of console messages and records how many were omitted', async () => {
+  it('L2: records every console message beyond the former limit and omits none', async () => {
     const page = new FakePage();
     const handle = ConsoleCollector.attach(page as unknown as Page);
 
@@ -65,13 +60,14 @@ describe('ConsoleCollector limits', () => {
     page.emit('console', consoleMessage('log', 'ignored log'));
 
     const evidence = await handle.snapshot();
-    expect(evidence.consoleMessages).toHaveLength(MAX_CONSOLE_MESSAGES);
+    expect(evidence.consoleMessages).toHaveLength(MAX_CONSOLE_MESSAGES + 25);
     expect(evidence.consoleMessages[0]?.text).toBe('message 0');
-    expect(evidence.omittedConsoleMessageCount).toBe(25);
+    expect(evidence.consoleMessages.at(-1)?.text).toBe(`message ${MAX_CONSOLE_MESSAGES + 24}`);
+    expect(evidence.omittedConsoleMessageCount).toBe(0);
     expect(evidence.omittedPageErrorCount).toBe(0);
   });
 
-  it('bounds the number of page errors and records how many were omitted', async () => {
+  it('L2: records every page error beyond the former limit and omits none', async () => {
     const page = new FakePage();
     const handle = ConsoleCollector.attach(page as unknown as Page);
 
@@ -80,48 +76,37 @@ describe('ConsoleCollector limits', () => {
     }
 
     const evidence = await handle.snapshot();
-    expect(evidence.pageErrors).toHaveLength(MAX_PAGE_ERRORS);
-    expect(evidence.pageErrors[0]?.message).toBe('failure 0');
-    expect(evidence.omittedPageErrorCount).toBe(3);
+    expect(evidence.pageErrors).toHaveLength(MAX_PAGE_ERRORS + 3);
+    expect(evidence.pageErrors.at(-1)?.message).toBe(`failure ${MAX_PAGE_ERRORS + 2}`);
+    expect(evidence.omittedPageErrorCount).toBe(0);
     expect(evidence.omittedConsoleMessageCount).toBe(0);
   });
 
-  it('bounds console text and location URL and marks the truncated message', async () => {
+  // URL-LEN・LZ-2: 場所の URL も文も、前の上限より長くても切り詰めない。
+  it('keeps the whole console text and the whole location URL', async () => {
     const page = new FakePage();
     const handle = ConsoleCollector.attach(page as unknown as Page);
+    const longUrl = `https://fixture.test/${'u'.repeat(2_049)}`;
+    const longText = 't'.repeat(2_049);
 
-    page.emit('console', consoleMessage(
-      'error',
-      't'.repeat(MAX_CONSOLE_TEXT_LENGTH + 100),
-      `https://fixture.test/${'u'.repeat(MAX_URL_LENGTH)}`,
-    ));
-    page.emit('console', consoleMessage('warning', 'short warning'));
+    page.emit('console', consoleMessage('error', longText, longUrl));
 
     const evidence = await handle.snapshot();
-    expect(evidence.consoleMessages[0]?.text).toBe('t'.repeat(MAX_CONSOLE_TEXT_LENGTH));
-    expect(evidence.consoleMessages[0]?.location.url).toHaveLength(MAX_URL_LENGTH);
-    expect(evidence.consoleMessages[0]?.truncated).toBe(true);
-    expect(evidence.consoleMessages[1]).toMatchObject({ text: 'short warning', truncated: false });
+    expect(evidence.consoleMessages[0]).toMatchObject({ text: longText, location: { url: longUrl }, truncated: false });
   });
 
-  it('bounds page error name, message, and stack and marks the truncated error', async () => {
+  it('keeps the whole page error name, message, and stack', async () => {
     const page = new FakePage();
     const handle = ConsoleCollector.attach(page as unknown as Page);
+    const name = 'N'.repeat(257);
+    const message = 'm'.repeat(2_049);
+    const stack = 's'.repeat(8_193);
 
-    page.emit('pageerror', pageError(
-      'N'.repeat(MAX_ERROR_NAME_LENGTH + 10),
-      'm'.repeat(MAX_ERROR_MESSAGE_LENGTH + 10),
-      's'.repeat(MAX_STACK_LENGTH + 10),
-    ));
+    page.emit('pageerror', pageError(name, message, stack));
     page.emit('pageerror', pageError('TypeError', 'small', undefined));
 
     const evidence = await handle.snapshot();
-    expect(evidence.pageErrors[0]).toEqual({
-      name: 'N'.repeat(MAX_ERROR_NAME_LENGTH),
-      message: 'm'.repeat(MAX_ERROR_MESSAGE_LENGTH),
-      stack: 's'.repeat(MAX_STACK_LENGTH),
-      truncated: true,
-    });
+    expect(evidence.pageErrors[0]).toEqual({ name, message, stack, truncated: false });
     expect(evidence.pageErrors[1]).toEqual({
       name: 'TypeError',
       message: 'small',

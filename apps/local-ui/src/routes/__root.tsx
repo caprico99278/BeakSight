@@ -6,6 +6,7 @@ import { LOCAL_UI_AUDIT_TEXT, LOCAL_UI_FRAME_TEXT, LOCAL_UI_TEXT } from '../../.
 import { PageFrame } from '../components/PageFrame';
 import { UiPresence } from '../components/UiPresence';
 import type { CredentialEnvironmentState } from '../server/credential-runtime';
+import { siteNamesFn } from '../server/display-settings-functions';
 import { environmentStatusFn, type EnvironmentStatusView } from '../server/profile-functions';
 import appCssUrl from '../styles/app.css?url';
 import tokensCssUrl from '../styles/tokens.css?url';
@@ -22,6 +23,8 @@ export const Route = createRootRoute({
       { rel: 'stylesheet', href: appCssUrl },
     ],
   }),
+  // DN-1（設計書 `2026-11-16-beaksight-profile-display-name-design.md` 2 章）: サイトの画面に出す名前の組（どの画面も `useSiteNameOf` で使う）。
+  loader: () => siteNamesFn(),
   shellComponent: RootDocument,
   component: Outlet,
   notFoundComponent: NotFoundPage,

@@ -8,7 +8,14 @@ import { AUTH_SETUP_VALIDATION_ERROR_CODES } from '../../../src/control/auth/aut
 import { AUDIT_JOB_START_REJECTION_REASONS } from '../../../src/control/job/job-records.js';
 import { AUTH_SETUP_FRESHNESS_VALUES, AUTH_SETUP_STORE_REJECTION_REASONS } from '../../../src/control/store/auth-setup-store.js';
 import { WORKER_AUTH_STATES } from '../../../src/control/worker-protocol.js';
-import { AUDIT_JOB_AUTH_STATE_CATALOG, AUTH_SETUP_FRESHNESS_CATALOG, DISPLAY_TONES } from '../../../src/presentation/catalog.js';
+import {
+  AUDIT_JOB_AUTH_STATE_CATALOG,
+  AUDIT_MODE_CATALOG,
+  AUDIT_MODE_NO_LOGIN_CATALOG,
+  AUTH_SETUP_FRESHNESS_CATALOG,
+  DISPLAY_TONES,
+} from '../../../src/presentation/catalog.js';
+import { auditModeDisplay } from '../src/display/labels';
 import {
   AUDIT_JOB_START_REJECTION_DESCRIPTIONS,
   AUTH_SETUP_STORE_REJECTION_DESCRIPTIONS,
@@ -70,5 +77,23 @@ describe('T25e: the display catalogs and texts of the authenticated audit', () =
 
   it('guides the login on the start screen with the agreed sentence', () => {
     expect(LOCAL_UI_AUTH_TEXT.start.guidance).toBe('BeakSight が開くブラウザでログインしてください。ログインが済むと、自動で作業が進みます。');
+  });
+});
+
+// NL-3 の続き（設計書 `doc/design/2026-11-06-beaksight-no-login-test-site-design.md` 3.3 の 4）: 点検のしかたの表示は、モードと方式の組から 1 か所
+// （`labels.ts` の `auditModeDisplay`）で決める。ログインのないテスト用のサイト（テストのモード × `NONE`）では、ログインの語を出さない。
+describe('NL-3: the audit mode display of a test site without login has no login word', () => {
+  const LOGIN_WORD = 'ログイン';
+  it('uses the no-login labels for the test modes with NONE, and the usual labels otherwise', () => {
+    for (const mode of ['TEST_AUTH_PASSIVE', 'TEST_APPROVED_WRITE'] as const) {
+      const display = auditModeDisplay(mode, 'NONE');
+      expect(display.label).not.toContain(LOGIN_WORD);
+      expect(display.description ?? '').not.toContain(LOGIN_WORD);
+      expect(display.label).toBe(AUDIT_MODE_NO_LOGIN_CATALOG[mode].label);
+      expect(auditModeDisplay(mode, 'MANUAL_SESSION')).toEqual(AUDIT_MODE_CATALOG[mode]);
+      expect(auditModeDisplay(mode, 'AUTOMATED_LOGIN')).toEqual(AUDIT_MODE_CATALOG[mode]);
+    }
+    expect(auditModeDisplay('TEST_AUTH_PASSIVE', 'NONE').label).not.toBe(auditModeDisplay('TEST_APPROVED_WRITE', 'NONE').label);
+    expect(auditModeDisplay('PUBLIC_PASSIVE', 'NONE')).toEqual(AUDIT_MODE_CATALOG.PUBLIC_PASSIVE);
   });
 });

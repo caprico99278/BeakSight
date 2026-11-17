@@ -18,7 +18,6 @@ import {
   ACTION_EVIDENCE_SCHEMA_VERSION,
   ACTION_OUTCOME_REASONS,
   ACTION_RUN_SCHEMA_VERSION,
-  MAX_SUBMITTED_VALUE_LENGTH,
   RESPONSE_JUDGEMENTS,
   type ActionEvidenceDocument,
   type ActionRunDocument,
@@ -162,7 +161,7 @@ describe('T40c: the version 1.1 of the write record and report (contracts and sc
     ['a blocked FORM run of the previous version 1.0', version10Of(blockedDocuments().actionRun, 'action-run-schema/1.0')],
     ['a run of the current shape with the version 1.0', formRun({ schemaVersion: 'action-run-schema/1.0' as never })],
     ['a blocked API run with page key values', { ...blockedApiDocuments().actionRun, api: sampleApiSummary() }],
-    ['a too long page key value', apiRun({ api: sampleApiSummary({ pageKeyValues: { tenant_id: 'x'.repeat(MAX_SUBMITTED_VALUE_LENGTH + 1) } }) })],
+    // L12b（設計書 `2026-11-09-beaksight-remove-limits-design.md` 6.2。S18）: ページが決める鍵の値の長さの上限を撤廃したので、長い値は拒まない。
     ['a page key value that is not a string', apiRun({ api: sampleApiSummary({ pageKeyValues: { tenant_id: 1 as never } }) })],
     ['an API summary with a header value', apiRun({ api: { ...sampleApiSummary(), authorization: HEADER_VALUE_MARKER } as never })],
     ['an API summary with the response body', apiRun({ api: { ...sampleApiSummary(), responseBody: RESPONSE_BODY_MARKER } as never })],
@@ -211,9 +210,9 @@ describe('T40c: the API summary (actionApiSummaryOf)', () => {
     ['a number', 7, '7'],
     ['a boolean', true, 'true'],
     ['null', null, 'null'],
-    ['a string of the longest JSON text', 'x'.repeat(MAX_SUBMITTED_VALUE_LENGTH - 2), `"${'x'.repeat(MAX_SUBMITTED_VALUE_LENGTH - 2)}"`],
-    ['a string one longer (cut: no value, the mark null)', 'x'.repeat(MAX_SUBMITTED_VALUE_LENGTH - 1), null],
-  ])('keeps a page key value of %s within the limit, and cuts a longer one', (_label, value, expected) => {
+    // L12b（S18）: 前の上限（8,192）より長い値も切らずに残す（前は null の印）。
+    ['a string longer than the former limit (L12b: kept)', 'x'.repeat(8_191), `"${'x'.repeat(8_191)}"`],
+  ])('keeps a page key value of %s', (_label, value, expected) => {
     expect(actionApiSummaryOf(API_SPEC, { tenant_id: value }).pageKeyValues).toEqual({ tenant_id: expected });
   });
 

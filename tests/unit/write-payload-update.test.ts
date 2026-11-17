@@ -12,9 +12,11 @@ import { describe, expect, it } from 'vitest';
 import {
   WRITE_PAYLOAD_DECISIONS,
   checkWritePayload,
+  writeExpectationWithPriorValues,
   type WritePayloadDecision,
   type WritePayloadExpectation,
   type WriteRequestFacts,
+  type WriteSuppliedPriorValues,
 } from '../../src/safety/write-payload-policy.js';
 
 const ORIGIN = 'https://example.com';
@@ -280,5 +282,156 @@ describe('T31c: the values do not appear in the decision', () => {
         expect(JSON.stringify(decision)).not.toContain(CSRF_MARKER);
       }
     }
+  });
+});
+
+// LU-12a（設計書 `2026-11-02-beaksight-list-row-update-design.md` 4.0.1 の K1、5.3 の 2・5.5。LU-9 の API の形と同じ約束）: 前の値を後から入れる印
+// （`deferredPriorValues`）のあるフォームの期待。印のある期待は、前の値を入れるまで照合が `EXPECTATION_INVALID` で止める（fail-closed）。入れられるのは値だけで、
+// 鍵の集合（保つ見える欄・値を照らす hidden・組の名前）は期待を作る時に決まる。値の形は、今の期待の確かめ（`isValidExpectation`）で確かめる。
+describe.each(ENCTYPES)('LU-12a: the form expectation whose prior values are supplied later, %s', (enctype) => {
+  /** 前の値に頼る欄（保つ `memo`、状態の hidden `status`、組 `published`）を持たない、印のある期待。 */
+  const deferredOf = (extra: Partial<WritePayloadExpectation> = {}): WritePayloadExpectation => expectationOf(enctype, {
+    submittedFields: [{ name: 'customer_name', value: NEW_NAME }],
+    checkedPassthroughFields: undefined,
+    checkboxPairs: undefined,
+    deferredPriorValues: { keptFieldNames: ['memo'], checkedPassthroughNames: ['status'], keptCheckboxPairNames: ['published'], changedCheckboxPairs: [], nullableFieldNames: [] },
+    ...extra,
+  });
+  const markOf = (mark: Partial<NonNullable<WritePayloadExpectation['deferredPriorValues']>>): NonNullable<WritePayloadExpectation['deferredPriorValues']> => ({
+    keptFieldNames: ['memo'], checkedPassthroughNames: ['status'], keptCheckboxPairNames: ['published'], changedCheckboxPairs: [], nullableFieldNames: [], ...mark,
+  });
+  const SUPPLIED: WriteSuppliedPriorValues = Object.freeze({
+    keptFields: [{ name: 'memo', value: KEPT_MEMO }],
+    checkedPassthroughFields: [{ name: 'status', value: 'active' }],
+    checkboxPairs: [{ name: 'published', offValue: '0', checkedValue: '1' }],
+  });
+  const supplied = (expectation: WritePayloadExpectation = deferredOf(), prior: unknown = SUPPLIED): WritePayloadExpectation | null =>
+    writeExpectationWithPriorValues(expectation, prior as WriteSuppliedPriorValues);
+
+  it('blocks the approved body with EXPECTATION_INVALID before the prior values are supplied (fail-closed)', () => {
+    expect(check(deferredOf(), bodyFacts(enctype, VALID_PAIRS))).toBe('EXPECTATION_INVALID');
+  });
+
+  it('allows the approved body after the prior values are supplied, and blocks a changed prior value with the current reason', () => {
+    const expectation = supplied();
+    expect(expectation).not.toBeNull();
+    if (expectation === null) return;
+    expect(expectation.deferredPriorValues).toBeUndefined();
+    expect(check(expectation, bodyFacts(enctype, VALID_PAIRS))).toBe('ALLOW');
+    expect(check(expectation, bodyFacts(enctype, withValue(VALID_PAIRS, 'memo', '書き換え')))).toBe('VALUE_MISMATCH');
+    expect(check(expectation, bodyFacts(enctype, withValue(VALID_PAIRS, 'status', 'deleted')))).toBe('PASSTHROUGH_VALUE_MISMATCH');
+    expect(check(expectation, bodyFacts(enctype, withPair(VALID_PAIRS, ['false', '1'])))).toBe('CHECKBOX_PAIR_MISMATCH');
+    expect(check(expectation, bodyFacts(enctype, withPair(VALID_PAIRS, ['0'])))).toBe('CHECKBOX_PAIR_MISMATCH');
+    expect(check(expectation, bodyFacts(enctype, [...VALID_PAIRS, ['notify', '1']]))).toBe('UNEXPECTED_FIELD_PRESENT');
+    // 元の期待は変わらない（印のまま。純粋）。
+    expect(check(deferredOf(), bodyFacts(enctype, VALID_PAIRS))).toBe('EXPECTATION_INVALID');
+  });
+
+  it('expects a prior value of null not to be sent for the fields that the mark allows null (a checkbox, a radio or a select that the browser does not send)', () => {
+    const nullable = deferredOf({ deferredPriorValues: markOf({ nullableFieldNames: ['memo', 'status'] }) });
+    const expectation = supplied(nullable, { ...SUPPLIED, keptFields: [{ name: 'memo', value: null }], checkedPassthroughFields: [{ name: 'status', value: null }] });
+    if (expectation === null) throw new Error('not supplied');
+    const sent = without(without(VALID_PAIRS, 'memo'), 'status');
+    expect(check(expectation, bodyFacts(enctype, sent))).toBe('ALLOW');
+    expect(check(expectation, bodyFacts(enctype, VALID_PAIRS))).toBe('UNEXPECTED_FIELD_PRESENT');
+  });
+
+  // fix round 1（設計者の判断 (b)）: null を許すのは、印の `nullableFieldNames`（承認の時の欄の種類から作る。checkbox・radio・select だけ）の欄だけ。text の
+  // 欄などに null を入れる入力は拒む（ページがその欄を外して送る本文を通さない）。
+  it.each<[string, Partial<WriteSuppliedPriorValues>]>([
+    ['a kept text field', { keptFields: [{ name: 'memo', value: null }] }],
+    ['a checked hidden field', { checkedPassthroughFields: [{ name: 'status', value: null }] }],
+  ])('rejects a null prior value for %s that the mark does not allow null', (_label, override) => {
+    expect(supplied(deferredOf(), { ...SUPPLIED, ...override })).toBeNull();
+    // 許す欄が別の一覧の欄でも拒む（名前ごと）。
+    expect(supplied(deferredOf({ deferredPriorValues: markOf({ nullableFieldNames: ['customer_name'] }) }), { ...SUPPLIED, ...override })).toBeNull();
+  });
+
+  it.each<[string, readonly unknown[]]>([
+    ['a name that is not a kept field or a checked hidden', ['notify']],
+    ['a pair name', ['published']],
+    ['a name twice', ['memo', 'memo']],
+    ['an empty name', ['']],
+  ])('rejects a mark whose null-allowed names have %s', (_label, names) => {
+    expect(supplied(deferredOf({ deferredPriorValues: markOf({ nullableFieldNames: names as string[] }) }))).toBeNull();
+  });
+
+  it('rejects a mark without the null-allowed names (fail-closed)', () => {
+    const { nullableFieldNames: _names, ...withoutNames } = markOf({});
+    expect(supplied(deferredOf({ deferredPriorValues: withoutNames as NonNullable<WritePayloadExpectation['deferredPriorValues']> }))).toBeNull();
+  });
+
+  it('takes the changed pair checked value from the expectation and only the off value from the supplied prior values', () => {
+    const changed = deferredOf({ deferredPriorValues: markOf({ keptCheckboxPairNames: [], changedCheckboxPairs: [{ name: 'published', checkedValue: '1' }] }) });
+    const expectation = supplied(changed);
+    expect(expectation === null ? null : check(expectation, bodyFacts(enctype, VALID_PAIRS))).toBe('ALLOW');
+    // 変える組の checkbox の値が期待の値と違えば拒む（前の値で変える値を書き換えられない）。
+    expect(supplied(changed, { ...SUPPLIED, checkboxPairs: [{ name: 'published', offValue: '0', checkedValue: null }] })).toBeNull();
+  });
+
+  const REJECTED: readonly (readonly [string, () => WritePayloadExpectation, unknown])[] = [
+    // 鍵の集合（足す・減らす・違う集合）
+    ['a kept field added', () => deferredOf(), { ...SUPPLIED, keptFields: [...SUPPLIED.keptFields, { name: 'role', value: 'admin' }] }],
+    ['a kept field removed', () => deferredOf(), { ...SUPPLIED, keptFields: [] }],
+    ['another kept field', () => deferredOf(), { ...SUPPLIED, keptFields: [{ name: 'role', value: KEPT_MEMO }] }],
+    ['a kept field twice', () => deferredOf(), { ...SUPPLIED, keptFields: [...SUPPLIED.keptFields, ...SUPPLIED.keptFields] }],
+    ['a checked hidden added', () => deferredOf(), { ...SUPPLIED, checkedPassthroughFields: [...SUPPLIED.checkedPassthroughFields, { name: 'deleted', value: '1' }] }],
+    ['a checked hidden removed', () => deferredOf(), { ...SUPPLIED, checkedPassthroughFields: [] }],
+    ['another checked hidden', () => deferredOf(), { ...SUPPLIED, checkedPassthroughFields: [{ name: 'deleted', value: 'active' }] }],
+    ['a pair added', () => deferredOf(), { ...SUPPLIED, checkboxPairs: [...SUPPLIED.checkboxPairs, { name: 'archived', offValue: '0', checkedValue: null }] }],
+    ['a pair removed', () => deferredOf(), { ...SUPPLIED, checkboxPairs: [] }],
+    ['a kept field moved to the checked hidden', () => deferredOf(), { ...SUPPLIED, keptFields: [], checkedPassthroughFields: [...SUPPLIED.checkedPassthroughFields, { name: 'memo', value: KEPT_MEMO }] }],
+    // 値の形（今の決まりと同じ）
+    ['a kept value that is a number', () => deferredOf(), { ...SUPPLIED, keptFields: [{ name: 'memo', value: 1 }] }],
+    ['a kept value with a lone surrogate', () => deferredOf(), { ...SUPPLIED, keptFields: [{ name: 'memo', value: String.fromCharCode(0xd800) }] }],
+    ['a checked hidden value that is an object', () => deferredOf(), { ...SUPPLIED, checkedPassthroughFields: [{ name: 'status', value: { a: 1 } }] }],
+    ['a pair off value that is null', () => deferredOf(), { ...SUPPLIED, checkboxPairs: [{ name: 'published', offValue: null, checkedValue: '1' }] }],
+    ['a kept field without the value', () => deferredOf(), { ...SUPPLIED, keptFields: [{ name: 'memo' }] }],
+    ['kept fields that are not a list', () => deferredOf(), { ...SUPPLIED, keptFields: { memo: KEPT_MEMO } }],
+    ['pairs that are missing', () => deferredOf(), { keptFields: SUPPLIED.keptFields, checkedPassthroughFields: SUPPLIED.checkedPassthroughFields }],
+    ['not an object', () => deferredOf(), null],
+    // 印と期待
+    ['an expectation without the mark', () => expectationOf(enctype, { submittedFields: [{ name: 'customer_name', value: NEW_NAME }], checkedPassthroughFields: undefined, checkboxPairs: undefined }), SUPPLIED],
+    ['a mark with checked hidden fields already', () => deferredOf({ checkedPassthroughFields: [{ name: 'status', value: 'active' }] }), SUPPLIED],
+    ['a mark with pairs already', () => deferredOf({ checkboxPairs: [{ name: 'published', offValue: '0', checkedValue: '1' }] }), SUPPLIED],
+    ['a mark whose names are not a list', () => deferredOf({ deferredPriorValues: markOf({ keptFieldNames: 'memo' as unknown as string[] }) }), SUPPLIED],
+    ['a mark with a name twice across the lists', () => deferredOf({ deferredPriorValues: markOf({ checkedPassthroughNames: ['status', 'memo'] }) }), SUPPLIED],
+    ['a mark with an empty name', () => deferredOf({ deferredPriorValues: markOf({ keptFieldNames: [''] }) }), { ...SUPPLIED, keptFields: [{ name: '', value: 'x' }] }],
+    ['a mark with a changed field name as a kept field', () => deferredOf({ deferredPriorValues: markOf({ keptFieldNames: ['customer_name'] }) }), { ...SUPPLIED, keptFields: [{ name: 'customer_name', value: 'x' }] }],
+    ['a mark with the method override name', () => deferredOf({ deferredPriorValues: markOf({ checkedPassthroughNames: ['_method'] }) }), { ...SUPPLIED, checkedPassthroughFields: [{ name: '_method', value: 'DELETE' }] }],
+  ];
+
+  it.each(REJECTED)('rejects %s, and the expectation stays blocked', (_label, expectationOfRow, prior) => {
+    const expectation = expectationOfRow();
+    expect(supplied(expectation, prior)).toBeNull();
+    if (expectation.deferredPriorValues !== undefined) {
+      expect(check(expectation, bodyFacts(enctype, VALID_PAIRS))).toBe('EXPECTATION_INVALID');
+    }
+  });
+
+  it('copies the supplied values by index, once each (the original changed later, a replaced map and a getter do not change the result)', () => {
+    const keptFields = [{ name: 'memo', value: KEPT_MEMO }];
+    const expectation = supplied(deferredOf(), { ...SUPPLIED, keptFields });
+    if (expectation === null) throw new Error('not supplied');
+    keptFields[0] = { name: 'memo', value: '書き換え' };
+    expect(check(expectation, bodyFacts(enctype, VALID_PAIRS))).toBe('ALLOW');
+    // `map` を差し替えた一覧（Proxy）と、読むたびに変わる値の getter。
+    const proxied = new Proxy([{ name: 'memo', value: KEPT_MEMO }], {
+      get: (target, key, receiver) => (key === 'map' ? () => [{ name: 'memo', value: '書き換え' }] : Reflect.get(target, key, receiver)),
+    });
+    let reads = 0;
+    const getter = { name: 'status', get value(): string { reads += 1; return reads === 1 ? 'active' : 'deleted'; } };
+    const tricky = supplied(deferredOf(), { ...SUPPLIED, keptFields: proxied, checkedPassthroughFields: [getter] });
+    if (tricky === null) throw new Error('not supplied');
+    expect(reads).toBe(1);
+    expect(check(tricky, bodyFacts(enctype, VALID_PAIRS))).toBe('ALLOW');
+    expect(Object.isFrozen(tricky.submittedFields)).toBe(true);
+  });
+
+  it('does not throw on any input', () => {
+    const hostile = new Proxy({}, { get: () => { throw new Error('hostile'); } });
+    expect(supplied(deferredOf(), hostile)).toBeNull();
+    expect(supplied(hostile as WritePayloadExpectation)).toBeNull();
+    expect(supplied(null as unknown as WritePayloadExpectation)).toBeNull();
   });
 });

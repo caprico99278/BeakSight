@@ -6,7 +6,6 @@ import { describe, expect, it } from 'vitest';
 import {
   MAX_SIMPLE_PATTERN_LENGTH,
   MAX_SIMPLE_PATTERN_REPEAT,
-  MAX_SIMPLE_PATTERN_VALUE_LENGTH,
   MAX_SIMPLE_PATTERN_VARIABLE_QUANTIFIERS,
   SIMPLE_PATTERN_CLASS_ITEMS,
   matchesSimplePattern,
@@ -110,15 +109,15 @@ describe('simple pattern: the limits of the work (T29R-fix-1: M-3)', () => {
     expect(parseSimplePattern(`${String.raw`\d{3}-`.repeat(MAX_SIMPLE_PATTERN_VARIABLE_QUANTIFIERS)}${DIGITS_ONE_OR_MORE}`)).not.toBeNull();
   });
 
-  it('does not match a value longer than MAX_SIMPLE_PATTERN_VALUE_LENGTH', () => {
-    expect(matches('[0-9]+', '1'.repeat(MAX_SIMPLE_PATTERN_VALUE_LENGTH))).toBe(true);
-    expect(matches('[0-9]+', '1'.repeat(MAX_SIMPLE_PATTERN_VALUE_LENGTH + 1))).toBe(false);
+  // LZ-2: 当てる値の長さの上限（前は 256）は撤廃した。長い値も当てる。
+  it('matches a value longer than the former limit', () => {
+    expect(matches('[0-9]+', '1'.repeat(257))).toBe(true);
   });
 
-  it('matches the worst case (the most variable quantifiers and the longest value) within the time limit', () => {
+  it('matches the worst case (the most variable quantifiers and a long value) within the time limit', () => {
     const parsed = parseSimplePattern(`${DIGITS_ONE_OR_MORE.repeat(MAX_SIMPLE_PATTERN_VARIABLE_QUANTIFIERS)}[a-z]`);
     expect(parsed).not.toBeNull();
-    const value = '1'.repeat(MAX_SIMPLE_PATTERN_VALUE_LENGTH);
+    const value = '1'.repeat(256);
     // 速さは CPU の時間で測る（TS-d）。
     const stopwatch = startCpuStopwatch();
     for (let run = 0; run < WORST_CASE_RUNS; run += 1) {

@@ -5,6 +5,8 @@
  *   通れば確認のダイアログに、変える前と後の値（変えた項目だけ）、承認が外れるシナリオの数、途中の Run があれば再開されない旨を出す。
  * - 確定すると保存し（画面が見た中身のときだけ置き換える）、画面を読み直す。文言はカタログ。
  * - 欄が空のとき（数でない値。スキーマが数を求めるので送れない）だけは、送らずに欄に出す（値の範囲の確かめは、サーバだけが行う）。
+ * - L14（設計書 `2026-11-09-beaksight-remove-limits-design.md` 6.1）: ページの上限と時間の上限は、空なら「指定なし」（上限なし）として送らない
+ *   （サーバがファイルから除く）。値は「指定なし」と出す。読み込みの間隔は空にできない（サイトへの負荷の守り）。
  */
 import { useRouter } from '@tanstack/react-router';
 import { useServerFn } from '@tanstack/react-start';
@@ -22,6 +24,7 @@ import {
   LOCAL_UI_CRAWL_LIMITS_TEXT,
   TARGET_CRAWL_LIMIT_PROBLEM_DESCRIPTIONS,
   TARGET_CRAWL_LIMITS_CHANGE_FAILURE_DESCRIPTIONS,
+  specifiedLimitText,
 } from '../../../../src/presentation/messages.js';
 import { closedListReason, settleServerFunction } from '../display/server-function-outcome';
 import {
@@ -50,12 +53,13 @@ const ITEM_LABEL: Readonly<Record<TargetCrawlLimitField, string>> = Object.freez
   minNavigationIntervalMs: LOCAL_UI_AUDIT_TEXT.start.minNavigationInterval,
 });
 
-/** 欄が空のとき（送れない）に出す誤り（範囲の確かめはサーバ）。 */
-const EMPTY_FIELD_PROBLEM: Readonly<Record<TargetCrawlLimitField, TargetCrawlLimitProblemCode>> = Object.freeze({
-  maxPages: 'NOT_POSITIVE_INTEGER',
-  maxRuntimeMs: 'NOT_POSITIVE_INTEGER',
+/** 欄が空のとき（送れない）に出す誤り（範囲の確かめはサーバ）。L14: ページの上限と時間の上限は、空なら「指定なし」（誤りにしない）。 */
+const EMPTY_FIELD_PROBLEM: Readonly<Partial<Record<TargetCrawlLimitField, TargetCrawlLimitProblemCode>>> = Object.freeze({
   minNavigationIntervalMs: 'NOT_NON_NEGATIVE_INTEGER',
 });
+
+/** 値の書式（ないときは「指定なし」）。 */
+const valueTextOf = (field: TargetCrawlLimitField, limits: TargetCrawlLimits): string => specifiedLimitText(limits[field], VALUE_TEXT[field]);
 
 const isFailureReason = closedListReason(TARGET_CRAWL_LIMITS_CHANGE_FAILURE_DESCRIPTIONS);
 
@@ -65,8 +69,8 @@ type Failure = { readonly kind: 'REJECTED'; readonly reason: TargetCrawlLimitsCh
 type Preview = Extract<CrawlLimitsPreviewView, { ok: true }>;
 
 const fieldValuesOf = (limits: TargetCrawlLimits): FieldValues => ({
-  maxPages: String(limits.maxPages),
-  maxRuntimeMs: String(limits.maxRuntimeMs),
+  maxPages: limits.maxPages === undefined ? '' : String(limits.maxPages),
+  maxRuntimeMs: limits.maxRuntimeMs === undefined ? '' : String(limits.maxRuntimeMs),
   minNavigationIntervalMs: String(limits.minNavigationIntervalMs),
 });
 
@@ -107,7 +111,7 @@ export function CrawlLimitsPanel({ view }: Readonly<{ view: CrawlLimitsPanelView
           {limits === null ? null : TARGET_CRAWL_LIMIT_FIELDS.map((field) => (
             <Fragment key={field}>
               <dt>{ITEM_LABEL[field]}</dt>
-              <dd>{VALUE_TEXT[field](limits[field])}</dd>
+              <dd>{valueTextOf(field, limits)}</dd>
             </Fragment>
           ))}
         </dl>
@@ -126,18 +130,22 @@ export function CrawlLimitsPanel({ view }: Readonly<{ view: CrawlLimitsPanelView
     setFailure(null);
     const empty: FieldProblems = {};
     for (const field of TARGET_CRAWL_LIMIT_FIELDS) {
-      const number = Number(values[field].trim());
-      if (values[field].trim() === '' || !Number.isFinite(number)) {
-        empty[field] = EMPTY_FIELD_PROBLEM[field];
+      const value = values[field].trim();
+      const problem = EMPTY_FIELD_PROBLEM[field];
+      if (problem !== undefined && (value === '' || !Number.isFinite(Number(value)))) {
+        empty[field] = problem;
       }
     }
     if (Object.keys(empty).length > 0) {
       setProblems(empty);
       return;
     }
-    const entered = {
-      maxPages: Number(values.maxPages.trim()),
-      maxRuntimeMs: Number(values.maxRuntimeMs.trim()),
+    /** L14: 空の欄（ページの上限と時間の上限）は送らない（指定なし）。 */
+    const optional = (field: 'maxPages' | 'maxRuntimeMs'): Partial<Record<typeof field, number>> =>
+      (values[field].trim() === '' ? {} : { [field]: Number(values[field].trim()) });
+    const entered: TargetCrawlLimits = {
+      ...optional('maxPages'),
+      ...optional('maxRuntimeMs'),
       minNavigationIntervalMs: Number(values.minNavigationIntervalMs.trim()),
     };
     setBusy(true);
@@ -155,8 +163,11 @@ export function CrawlLimitsPanel({ view }: Readonly<{ view: CrawlLimitsPanelView
   };
 
   const hintOf = (field: TargetCrawlLimitField): string => {
-    const current = text.currentValue(VALUE_TEXT[field](limits[field]));
-    return field === 'minNavigationIntervalMs' && floorMs > 0 ? `${current} ${text.intervalFloor(formatDuration(floorMs))}` : current;
+    const current = text.currentValue(valueTextOf(field, limits));
+    if (field !== 'minNavigationIntervalMs') {
+      return `${current} ${text.emptyMeansNoLimit}`;
+    }
+    return floorMs > 0 ? `${current} ${text.intervalFloor(formatDuration(floorMs))}` : current;
   };
 
   return (
@@ -250,8 +261,8 @@ export function CrawlLimitsPanel({ view }: Readonly<{ view: CrawlLimitsPanelView
                 {TARGET_CRAWL_LIMIT_FIELDS.filter((field) => pending.before[field] !== pending.after[field]).map((field) => (
                   <tr key={field} data-testid="crawl-limits-change-row" data-field={field}>
                     <th scope="row">{ITEM_LABEL[field]}</th>
-                    <td>{VALUE_TEXT[field](pending.before[field])}</td>
-                    <td>{VALUE_TEXT[field](pending.after[field])}</td>
+                    <td>{valueTextOf(field, pending.before)}</td>
+                    <td>{valueTextOf(field, pending.after)}</td>
                   </tr>
                 ))}
               </tbody>

@@ -45,6 +45,7 @@ import {
 } from '../browser/login-form-submitter.js';
 import type { AuditConfig } from '../config/types.js';
 import { SUCCESS_HTTP_STATUS_RANGE, isHttpStatusInRange } from '../core/http-status.js';
+import { PRODUCTION_OBSERVATION_WINDOWS } from '../core/observation-windows.js';
 import {
   AUTOMATED_LOGIN_FAILURE_CONDITION_KINDS,
   AUTOMATED_LOGIN_MAX_LOGIN_ATTEMPTS,
@@ -97,6 +98,7 @@ import {
   loginAttemptsExceeded,
   loginBrowserLaunchRefusalOf,
   loginStageBlockedRequestsOf,
+  loginStagePassedRequestsOf,
   type LoginBrowserLaunchRefusal,
   loginStageGuardOf,
   loginStageLocator,
@@ -109,14 +111,14 @@ import {
 } from './login-stage-checks.js';
 import { observeLoginPageStart, observeLoginStageEnd } from './login-stage-observation.js';
 
-/** 結果を確かめる間隔（ms）。ページの中の読み取り（URL と要素の有無）だけで、サイトへの要求を増やさない。 */
-export const AUTOMATED_LOGIN_POLL_INTERVAL_MS = 250;
+/** 結果を確かめる間隔（ms）。ページの中の読み取り（URL と要素の有無）だけで、サイトへの要求を増やさない。RB-2: 観察の窓の一式の `login`。 */
+export const AUTOMATED_LOGIN_POLL_INTERVAL_MS = PRODUCTION_OBSERVATION_WINDOWS.login.automatedPollIntervalMs;
 
 /**
  * 値を入れた後、押す前に待つ時間（ms。T26g-1）。ページの JS が値の入力の事象で出そうとした要求を、Guard が送信の窓の中で止めて数えるのを
- * 待つ（止めた要求があれば、押さずに終える）。
+ * 待つ（止めた要求があれば、押さずに終える）。RB-2: 観察の窓の一式の `login`。
  */
-export const SUBMISSION_WINDOW_SETTLE_MS = 300;
+export const SUBMISSION_WINDOW_SETTLE_MS = PRODUCTION_OBSERVATION_WINDOWS.login.submissionWindowSettleMs;
 
 /** 送信の窓の中で要求を止めたときの結果（T26g-1）。 */
 const UNEXPECTED_LOGIN_REQUEST_RESULT = 'UNEXPECTED_LOGIN_REQUEST' satisfies AutomatedLoginFailureResult;
@@ -149,6 +151,11 @@ export interface AutomatedLoginStageCounts {
    * ときだけ（最後に読んだもの）。
    */
   readonly stateNames?: LoginStateNameRecord;
+  /**
+   * DEF-194（設計書 `2026-11-04-beaksight-login-session-design.md` 3.3 の 3）: スクリプトで送るログインの自動ログインの段で、サイトが自動で送る通信として通した
+   * 読み取りでない要求の一覧（形だけ。行の理由は `AUTOMATED_LOGIN_PASSED`）。通した要求がなければ持たない。
+   */
+  readonly passedRequests?: WorkerLoginStageBlockedRequests;
 }
 
 /** ログインの段の記録の受け取り（段の本体が書き、呼び出し側が結果に添える）。 */
@@ -250,32 +257,6 @@ const formInvalid = (formInvalidReason: LoginFormInvalidReason): AutomatedLoginS
 
 const stopped = (submitted: AutomatedLoginSubmission): AutomatedLoginStageOutcome => ({ kind: 'STOPPED', submitted });
 
-/**
- * T36c（Task 36 の設計書 3.4 の表）: token の送信の応答の状態から決まる結果。2xx は `SUCCESS_STATUS`（成功の確かめに進む）、まだ応答がない（token の送信を
- * 通していないか、待っている）は `PENDING`。T36R-fix（T36R の M-5）: 400・401・423・429・5xx・ほかの状態の対応は、form の文書の応答と同じ 1 つの表
- * （`loginHttpStatusResultOf`。`automated-login-results.ts`）。
- */
-const tokenResponseOutcome = (
-  observation: TokenResponseObservation | undefined,
-  submitted: AutomatedLoginSubmission,
-): AutomatedLoginStageOutcome | 'SUCCESS_STATUS' | 'PENDING' => {
-  if (observation === undefined || observation.state === 'PENDING') {
-    return 'PENDING';
-  }
-  const { status } = observation;
-  if (observation.state === 'FAILED' || status === null) {
-    return failed(AUTOMATED_LOGIN_UNKNOWN_RESULT, submitted);
-  }
-  if (isHttpStatusInRange(status, SUCCESS_HTTP_STATUS_RANGE)) {
-    return 'SUCCESS_STATUS';
-  }
-  // 表にない状態と 5xx は、結果が分からない（止める）。
-  const result = loginHttpStatusResultOf(status, 'TOKEN_RESPONSE') ?? AUTOMATED_LOGIN_UNKNOWN_RESULT;
-  return result === AUTOMATED_LOGIN_RATE_LIMITED_RESULT
-    ? failed(result, submitted, retryAfterUntilDateOf(observation.retryAfter, new Date()))
-    : failed(result, submitted);
-};
-
 /** main frame のナビゲーションの要求か（frame を読めない要求は、違うとみなす）。 */
 const isMainFrameNavigation = (request: Request): boolean => {
   try {
@@ -306,7 +287,7 @@ const statusOutcome = async (response: Response | null, submitted: AutomatedLogi
 type FailureConditionResult = (typeof FAILURE_CONDITION_RESULTS)[AutomatedLoginFailureConditionKind];
 
 /** 結果の条件の一覧（成功の条件と、null でない失敗の条件）。 */
-const resultConditionsOf = (setup: AuthSetup, automated: AutomatedLoginSetup):
+export const resultConditionsOf = (setup: Pick<AuthSetup, 'successCondition'>, automated: Pick<AutomatedLoginSetup, 'failureConditions'>):
   readonly (readonly [typeof AUTOMATED_LOGIN_SUCCEEDED | FailureConditionResult, LoginResultCondition])[] => [
   [AUTOMATED_LOGIN_SUCCEEDED, setup.successCondition],
   ...AUTOMATED_LOGIN_FAILURE_CONDITION_KINDS.flatMap((kind) => {
@@ -314,6 +295,153 @@ const resultConditionsOf = (setup: AuthSetup, automated: AutomatedLoginSetup):
     return condition === null ? [] : [[FAILURE_CONDITION_RESULTS[kind], condition] as const];
   }),
 ];
+
+/** 今の画面に当たった結果の条件（成功か、失敗の条件の結果）。 */
+export type LoginResultMatch = typeof AUTOMATED_LOGIN_SUCCEEDED | FailureConditionResult;
+
+/**
+ * RB-12（plan の 2 章の 13）: 送信の後の結果の輪の、1 回の観察の記録（値・URL を持たない）。form の送信だけで使う項目と、スクリプトで送るログインだけで
+ * 使う項目がある。`documentRetryAfter`・`page`・`state` は、次の一手が求めたときだけ読んで足す（読まないうちは持たない）。
+ */
+export interface LoginResultObservation {
+  /** 止める印。 */
+  readonly stopped: boolean;
+  /** Guard が Context を閉じた・Browser が切れた・page が閉じた。 */
+  readonly closed: boolean;
+  /** form: 送信の窓の中で、許した POST のほかに止めた要求の数。 */
+  readonly unexpectedRequestCount: number;
+  /** スクリプト: 資格情報を含むので止めた要求の数。 */
+  readonly credentialRequestsBlocked: number;
+  /** スクリプト: 回数の上限を超えて止めた token の送信の数。 */
+  readonly tokenRequestsBlockedOverLimit: number;
+  /** スクリプト: 最後の token の送信の応答。 */
+  readonly tokenResponse: TokenResponseObservation | undefined;
+  /** form: 送信先への main frame のナビゲーションの POST を見た。 */
+  readonly loginPostObserved: boolean;
+  /** form: 送信先への POST を Guard が止めたことがある（`loginAttemptsExceeded`）。 */
+  readonly attemptsExceeded: boolean;
+  /** form: 送信の後に main frame が新しい文書を開いた。 */
+  readonly documentCommittedAfterPost: boolean;
+  /** form: 送信の後の main frame の最後の文書の応答の状態（なければ null）。 */
+  readonly documentStatus: number | null;
+  /** form: その応答の `Retry-After`（`READ_RETRY_AFTER` の後だけ）。 */
+  readonly documentRetryAfter?: string | null;
+  /** 当たった条件の一覧（`READ_PAGE` の後だけ。文書を読み終えていなければ null）。 */
+  readonly page?: readonly LoginResultMatch[] | null;
+  /** スクリプト: 取り出した状態（`READ_STATE` の後だけ）。成功の状態の側の条件を満たすか、パスワードを含むか、読んだ後に止めた資格情報の要求の数。 */
+  readonly state?: { readonly accepted: boolean; readonly carriesCredential: boolean; readonly credentialRequestsBlocked: number };
+}
+
+/** 結果の輪の次の一手。 */
+export type LoginResultStep =
+  | { readonly kind: 'STOPPED' }
+  | { readonly kind: 'FAILED'; readonly result: LoginResultFailure; readonly retryAfter: string | null }
+  | { readonly kind: 'SUCCEEDED' }
+  | { readonly kind: 'READ_RETRY_AFTER' }
+  | { readonly kind: 'READ_PAGE' }
+  | { readonly kind: 'READ_STATE' }
+  | { readonly kind: 'WAIT' };
+
+/** 結果の輪で決まる、成功以外の結果（フォームの確かめは輪の前に終わる）。 */
+type LoginResultFailure = Exclude<AutomatedLoginFailureResult, typeof LOGIN_FORM_INVALID_KIND>;
+
+const stepFailed = (result: LoginResultFailure, retryAfter: string | null = null): LoginResultStep =>
+  Object.freeze({ kind: 'FAILED', result, retryAfter });
+
+/**
+ * RB-12: 結果の輪の次の一手（純粋。判定の順は前の `check`・`checkScript` と同じ）。止める印 → 窓の中で止めた要求（スクリプトは資格情報を含む要求。成功の
+ * 条件より先）→ 閉じ（スクリプトは token の送信の超過も）→ form は送信を観測した後だけ試しの超過 → 応答の状態（form は文書の 429・5xx、スクリプトは
+ * token の応答の表。T36R-fix の M-5: どちらも `loginHttpStatusResultOf`）→ 画面の条件がちょうど 1 つ（スクリプトの成功は、状態を読んで確かめ直す）→ 期限。
+ */
+export const loginResultStepOf = (
+  observation: LoginResultObservation,
+  timing: { readonly nowMs: number; readonly deadlineMs: number; readonly script: boolean },
+): LoginResultStep => {
+  if (observation.stopped) {
+    return { kind: 'STOPPED' };
+  }
+  const { script } = timing;
+  if (script ? observation.credentialRequestsBlocked > 0 : observation.unexpectedRequestCount > 0) {
+    return stepFailed(script ? AUTOMATED_LOGIN_UNKNOWN_RESULT : UNEXPECTED_LOGIN_REQUEST_RESULT);
+  }
+  if (observation.closed || (script && observation.tokenRequestsBlockedOverLimit > 0)) {
+    return stepFailed(AUTOMATED_LOGIN_UNKNOWN_RESULT);
+  }
+  // 送信先への POST を、BeakSight の送信のほかに Guard が止めた（2 回目の送信、サブ frame からの送信など）。BeakSight の送信を観測してから数える
+  // （観測の前に決めると、送信が分からないまま終わるため）。
+  if (!script && observation.loginPostObserved && observation.attemptsExceeded) {
+    return stepFailed(AUTOMATED_LOGIN_UNKNOWN_RESULT);
+  }
+  const byStatus = script ? tokenResponseStepOf(observation.tokenResponse) : documentStatusStepOf(observation);
+  if (byStatus !== null) {
+    return byStatus;
+  }
+  const readable = script ? isSuccessTokenResponse(observation.tokenResponse) : observation.loginPostObserved && observation.documentCommittedAfterPost;
+  if (readable) {
+    if (observation.page === undefined) {
+      return { kind: 'READ_PAGE' };
+    }
+    const [only, ...rest] = observation.page ?? [];
+    if (only !== undefined && rest.length === 0) {
+      const decided = matchedStepOf(only, observation, script);
+      if (decided !== null) {
+        return decided;
+      }
+    }
+  }
+  return timing.nowMs >= timing.deadlineMs ? stepFailed(AUTOMATED_LOGIN_UNKNOWN_RESULT) : { kind: 'WAIT' };
+};
+
+/** 当たった条件がちょうど 1 つのときの一手（スクリプトの成功は、状態を読み、条件を満たし、資格情報を含まないときだけ）。決まらなければ null。 */
+const matchedStepOf = (only: LoginResultMatch, observation: LoginResultObservation, script: boolean): LoginResultStep | null => {
+  if (only !== AUTOMATED_LOGIN_SUCCEEDED) {
+    return stepFailed(only);
+  }
+  if (!script) {
+    return { kind: 'SUCCEEDED' };
+  }
+  const { state } = observation;
+  if (state === undefined) {
+    return { kind: 'READ_STATE' };
+  }
+  if (!state.accepted) {
+    return null;
+  }
+  // 返す直前にも、資格情報を含む要求を止めていないことを確かめる（設計者の判断 3）。T36R-fix（T36R の C-4）: 引き継ぐ状態にパスワードが含まれていれば止める。
+  return state.credentialRequestsBlocked > 0 || state.carriesCredential ? stepFailed(AUTOMATED_LOGIN_UNKNOWN_RESULT) : { kind: 'SUCCEEDED' };
+};
+
+/** form: 送信の後の文書の応答の状態から決まる一手（429 は `Retry-After` を読んでから）。決まらなければ null（2xx は画面の条件へ）。 */
+const documentStatusStepOf = (observation: LoginResultObservation): LoginResultStep | null => {
+  if (observation.documentStatus === null) {
+    return null;
+  }
+  const result = loginHttpStatusResultOf(observation.documentStatus, 'DOCUMENT_RESPONSE');
+  if (result !== AUTOMATED_LOGIN_RATE_LIMITED_RESULT) {
+    return result === null ? null : stepFailed(result);
+  }
+  return observation.documentRetryAfter === undefined ? { kind: 'READ_RETRY_AFTER' } : stepFailed(result, observation.documentRetryAfter);
+};
+
+/** スクリプト: token の送信の応答が 2xx か（成功の確かめに進む）。 */
+const isSuccessTokenResponse = (observation: TokenResponseObservation | undefined): boolean =>
+  observation?.state === 'RESPONDED' && observation.status !== null && isHttpStatusInRange(observation.status, SUCCESS_HTTP_STATUS_RANGE);
+
+/**
+ * T36c（Task 36 の設計書 3.4 の表）: token の送信の応答から決まる一手。まだ応答がない（token の送信を通していないか、待っている）と 2xx は null（期限か、
+ * 成功の確かめに進む）。表にない状態と 5xx は、結果が分からない（止める）。
+ */
+const tokenResponseStepOf = (observation: TokenResponseObservation | undefined): LoginResultStep | null => {
+  if (observation === undefined || observation.state === 'PENDING' || isSuccessTokenResponse(observation)) {
+    return null;
+  }
+  const { status } = observation;
+  if (observation.state === 'FAILED' || status === null) {
+    return stepFailed(AUTOMATED_LOGIN_UNKNOWN_RESULT);
+  }
+  const result = loginHttpStatusResultOf(status, 'TOKEN_RESPONSE') ?? AUTOMATED_LOGIN_UNKNOWN_RESULT;
+  return stepFailed(result, result === AUTOMATED_LOGIN_RATE_LIMITED_RESULT ? observation.retryAfter : null);
+};
 
 /**
  * 自動ログインの段を行う（流れはファイルの先頭）。例外を投げない（呼ぶ側の誤りを除く）。どの終わり方でも、ログイン用の Context と Browser を
@@ -331,10 +459,13 @@ export async function runAutomatedLoginStage(
   // T36c: スクリプトで送るログインでは、ログインの段の数と止めた一覧を添える（ログインの段を開いた場合だけ）。
   const scriptLogin = recorder.monitor === null ? undefined : scriptLoginCountsOf(recorder.monitor, request.setup);
   const blockedRequests = recorder.monitor === null || scriptLogin === undefined ? undefined : loginStageBlockedRequestsOf(recorder.monitor);
+  // DEF-194: 通した送信の一覧（手動の段と同じ部品で写す）。
+  const passedRequests = recorder.monitor === null || scriptLogin === undefined ? undefined : loginStagePassedRequestsOf(recorder.monitor);
   const result: AutomatedLoginStageResult = {
     ...outcome,
     ...(scriptLogin === undefined ? {} : { scriptLogin }),
     ...(blockedRequests === undefined ? {} : { blockedRequests }),
+    ...(passedRequests === undefined ? {} : { passedRequests }),
     // T43d: 結果を待った後の観察（成功の鍵の名前の案と、成功のときの成功の画面のセレクタの案。ログインの送り方によらない）。
     ...(recorder.observation === undefined ? {} : { loginObservation: recorder.observation }),
     // DEF-139: 状態の名前の記録（状態を読んだときだけ）。
@@ -566,8 +697,8 @@ async function runAutomatedLoginStageWith(
     // 6. 結果を待つ。
     const conditions = resultConditionsOf(setup, automated);
     /** 成功の条件と失敗の条件のうち、今の画面に当たるもの。 */
-    const matchedConditions = async (): Promise<readonly (typeof AUTOMATED_LOGIN_SUCCEEDED | FailureConditionResult)[]> => {
-      const matched: (typeof AUTOMATED_LOGIN_SUCCEEDED | FailureConditionResult)[] = [];
+    const matchedConditions = async (): Promise<readonly LoginResultMatch[]> => {
+      const matched: LoginResultMatch[] = [];
       for (const [kind, condition] of conditions) {
         if (await isLoginResultConditionPage(page, condition, approvedTestOrigins)) {
           matched.push(kind);
@@ -575,92 +706,53 @@ async function runAutomatedLoginStageWith(
       }
       return matched;
     };
-    /**
-     * T36c: スクリプトで送るログインの結果の確かめ（ファイルの先頭の T36c の結果）。成功なら、取り出した状態を返す（成功の状態の側の条件
-     * `meetsSuccessStateCondition` を満たすときだけ）。
-     */
-    const checkScript = async (): Promise<AutomatedLoginStageOutcome | null> => {
-      if (signal.aborted) {
-        return stopped(submission());
-      }
-      if (monitor.credentialRequestsBlocked() > 0) {
-        return failed(AUTOMATED_LOGIN_UNKNOWN_RESULT, submission());
-      }
-      if (isPassiveRequestGuardClosed(context) || !browser.isConnected() || page.isClosed() || monitor.tokenRequestsBlockedOverLimit() > 0) {
-        return failed(AUTOMATED_LOGIN_UNKNOWN_RESULT, submission());
-      }
-      const byResponse = tokenResponseOutcome(monitor.tokenResponses().at(-1), submission());
-      if (typeof byResponse === 'object') {
-        return byResponse;
-      }
-      if (byResponse === 'SUCCESS_STATUS' && await isDocumentParsed(page, pollIntervalMs)) {
-        const matched = await matchedConditions();
-        const [only] = matched;
-        if (matched.length === 1 && only !== undefined && only !== AUTOMATED_LOGIN_SUCCEEDED) {
-          return failed(only, submission());
-        }
-        if (matched.length === 1 && only === AUTOMATED_LOGIN_SUCCEEDED) {
-          const reading = await readAuthenticatedState(context, approvedTestOrigins, approvedServiceOrigins);
-          // DEF-139: 最後に読んだ状態の名前の記録（値を持たない）を残す。
-          recorder.stateNames = reading.names;
-          const { state } = reading;
-          if (state !== null && meetsSuccessStateCondition(state, setup, monitor)) {
-            // 返す直前にも、資格情報を含む要求を止めていないことを確かめる（設計者の判断 3）。T36R-fix（T36R の C-4）: 引き継ぐ状態（Cookie の名前と値、
-            // ローカル ストレージの鍵と値）にパスワードが含まれていれば、状態を返さずに止める（比べは資格情報の守りの部品の口。監査の段に持ち越さない）。
-            const carried = credentialGuard === undefined || carriesLoginCredentialInState(credentialGuard, state);
-            return monitor.credentialRequestsBlocked() > 0 || carried
-              ? failed(AUTOMATED_LOGIN_UNKNOWN_RESULT, submission())
-              : { kind: 'AUTHENTICATED', state };
-          }
-        }
-      }
-      return performance.now() >= deadline ? failed(AUTOMATED_LOGIN_UNKNOWN_RESULT, submission()) : null;
-    };
-    if (script) {
-      let scriptOutcome = await checkScript();
-      while (scriptOutcome === null) {
+    // RB-12: 1 回の観察の記録を作り、次の一手は `loginResultStepOf` が決める（判定の順は前と同じ）。読みが要る項目は、一手が求めたときだけ読んで足す。
+    const observe = (): LoginResultObservation => ({
+      stopped: signal.aborted,
+      closed: isPassiveRequestGuardClosed(context) || !browser.isConnected() || page.isClosed(),
+      unexpectedRequestCount: script ? 0 : monitor.unexpectedRequestCount(),
+      credentialRequestsBlocked: script ? monitor.credentialRequestsBlocked() : 0,
+      tokenRequestsBlockedOverLimit: script ? monitor.tokenRequestsBlockedOverLimit() : 0,
+      tokenResponse: script ? monitor.tokenResponses().at(-1) : undefined,
+      loginPostObserved: watch.loginPostObserved,
+      attemptsExceeded: !script && loginAttemptsExceeded(ledger, allowedOrigins, setup),
+      documentCommittedAfterPost: watch.documentCommittedAfterPost,
+      documentStatus: watch.lastDocumentResponse?.status() ?? null,
+    });
+    let observation = observe();
+    let authenticated: AuthenticatedState | null = null;
+    for (let step = loginResultStepOf(observation, { nowMs: performance.now(), deadlineMs: deadline, script }); ;
+      step = loginResultStepOf(observation, { nowMs: performance.now(), deadlineMs: deadline, script })) {
+      if (step.kind === 'WAIT') {
         await waitOrAbort(Math.max(0, Math.min(pollIntervalMs, deadline - performance.now())), signal);
-        scriptOutcome = await checkScript();
-      }
-      // `finally` で閉じる前に観察を終える（`await` してから返す）。
-      return await observed(scriptOutcome);
-    }
-    const check = async (): Promise<AutomatedLoginStageOutcome | typeof AUTOMATED_LOGIN_SUCCEEDED | null> => {
-      if (signal.aborted) {
+        observation = observe();
+      } else if (step.kind === 'READ_RETRY_AFTER') {
+        // Playwright の `headerValue` は、名前の大文字と小文字を区別しない。
+        const documentRetryAfter = await watch.lastDocumentResponse?.headerValue(RETRY_AFTER_HEADER).catch(() => null) ?? null;
+        observation = { ...observation, documentRetryAfter };
+      } else if (step.kind === 'READ_PAGE') {
+        observation = { ...observation, page: await isDocumentParsed(page, pollIntervalMs) ? await matchedConditions() : null };
+      } else if (step.kind === 'READ_STATE') {
+        const reading = await readAuthenticatedState(context, approvedTestOrigins, approvedServiceOrigins);
+        // DEF-139: 最後に読んだ状態の名前の記録（値を持たない）を残す。
+        recorder.stateNames = reading.names;
+        const { state } = reading;
+        authenticated = state;
+        const accepted = state !== null && meetsSuccessStateCondition(state, setup, monitor);
+        // T36R-fix（T36R の C-4）: 引き継ぐ状態（Cookie の名前と値、ローカル ストレージの鍵と値）にパスワードが含まれるか（比べは資格情報の守りの部品の口）。
+        const carriesCredential = state !== null && accepted && (credentialGuard === undefined || carriesLoginCredentialInState(credentialGuard, state));
+        observation = { ...observation, state: { accepted, carriesCredential, credentialRequestsBlocked: monitor.credentialRequestsBlocked() } };
+      } else if (step.kind === 'STOPPED') {
         return stopped(submission());
+      } else if (step.kind === 'FAILED') {
+        const retryAfterUntil = step.result === AUTOMATED_LOGIN_RATE_LIMITED_RESULT ? retryAfterUntilDateOf(step.retryAfter, new Date()) : null;
+        // `finally` で閉じる前に観察を終える（`await` してから返す）。
+        return await observed(failed(step.result, submission(), retryAfterUntil));
+      } else if (script && authenticated !== null) {
+        return await observed({ kind: 'AUTHENTICATED', state: authenticated });
+      } else {
+        break;
       }
-      // T26g-1: 送信の窓の中で、許した POST のほかの要求を止めた（ページが入力の値を別の要求で送ろうとした）。成功の条件より先に決める。
-      if (monitor.unexpectedRequestCount() > 0) {
-        return failed(UNEXPECTED_LOGIN_REQUEST_RESULT, submission());
-      }
-      if (isPassiveRequestGuardClosed(context) || !browser.isConnected() || page.isClosed()) {
-        return failed(AUTOMATED_LOGIN_UNKNOWN_RESULT, submission());
-      }
-      // 送信先への POST を、BeakSight の送信のほかに Guard が止めた（2 回目の送信、サブ frame からの送信など）。BeakSight の送信を観測してから
-      // 数える（観測の前に決めると、送信が分からないまま終わるため）。
-      if (watch.loginPostObserved && loginAttemptsExceeded(ledger, allowedOrigins, setup)) {
-        return failed(AUTOMATED_LOGIN_UNKNOWN_RESULT, submission());
-      }
-      const byStatus = await statusOutcome(watch.lastDocumentResponse, submission());
-      if (byStatus !== null) {
-        return byStatus;
-      }
-      if (watch.loginPostObserved && watch.documentCommittedAfterPost && await isDocumentParsed(page, pollIntervalMs)) {
-        const matched = await matchedConditions();
-        const [only] = matched;
-        if (matched.length === 1 && only !== undefined) {
-          return only === AUTOMATED_LOGIN_SUCCEEDED ? only : failed(only, submission());
-        }
-      }
-      return performance.now() >= deadline ? failed(AUTOMATED_LOGIN_UNKNOWN_RESULT, submission()) : null;
-    };
-    let outcome = await check();
-    while (outcome === null) {
-      await waitOrAbort(Math.max(0, Math.min(pollIntervalMs, deadline - performance.now())), signal);
-      outcome = await check();
-    }
-    if (outcome !== AUTOMATED_LOGIN_SUCCEEDED) {
-      return await observed(outcome);
     }
 
     // 7. 成功: 状態をメモリに取り、許可 Origin だけに絞る（ファイルに書かない）。返す直前にも、窓の中で止めた要求がないことを確かめる。

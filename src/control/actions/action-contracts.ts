@@ -83,6 +83,8 @@ export type SubmissionState = (typeof SUBMISSION_STATES)[number];
  */
 export const ACTION_BLOCK_REASONS = Object.freeze(['PAYLOAD_MISMATCH', 'PRECHECK_FAILED'] as const);
 export type ActionBlockReason = (typeof ACTION_BLOCK_REASONS)[number];
+/** LU-13 fix round 1: 送る前の確かめで止めた理由の名前つきの定数（ワーカー・承認の store・画面のサーバが使う 1 か所）。 */
+export const PRECHECK_FAILED_BLOCK_REASON = 'PRECHECK_FAILED' satisfies ActionBlockReason;
 
 /**
  * 送信の後の画面の結果の判定（閉じた一覧。Task 26 の結果の判定の作り）。
@@ -113,7 +115,7 @@ export type ResponseJudgement = (typeof RESPONSE_JUDGEMENTS)[number];
  * - `NO_RESPONSE`: 送った後に応答がない、または送ったか分からない（接続の断、ワーカーの異常終了）。
  * - `RECORD_ID_NOT_FOUND`: 成功の条件に当たったが、登録の ID が取れない。
  * - `RECORD_ID_UNSAFE`（T30f。設計書 11 章）: 成功の条件に当たり、登録の ID らしい値は取れたが、path の 1 区切りに入れて安全な閉じた形（英数字・`_`・
- *   `-`、1〜`MAX_SAFE_RECORD_ID_LENGTH` 文字。`action-outcome.ts` の `isUsableRecordId`）でない。ID なしとして扱う（`PARTIAL`）。
+ *   `-`、1 文字以上。L12b で長さの上限は撤廃した。`action-outcome.ts` の `isUsableRecordId`）でない。ID なしとして扱う（`PARTIAL`）。
  * - `READ_VERIFICATION_MATCHED`・`READ_VERIFICATION_NOT_MATCHED`: 照合の READ が一致した・一致しなかった。
  * - `READ_VERIFICATION_UNDETERMINED`: 照合の READ を判定できない（読めない、止められた、候補が変わった、実行できなかった）。
  * - `RECORD_ID_MISMATCH`（T31e fix round 1。Task 31 の設計書 3 章の「結果の判定」）: UPDATE で、成功の後に取れた ID が対象のレコードの ID と違う
@@ -179,11 +181,7 @@ export type SettledReservationState = (typeof SETTLED_RESERVATION_STATES)[number
 export const MIN_HTTP_STATUS = 100;
 export const MAX_HTTP_STATUS = 599;
 
-/**
- * 送った値 1 つの最大長（UTF-16 のコード単位。`action-run.json` の `submittedValues`）。生成の部品（Task 29）が作る値（辞書、固定の値、単純な
- * pattern）より十分大きい値にした（推測で決めた上限。超える値を生成したら、記録を書く前の確かめで止まる）。
- */
-export const MAX_SUBMITTED_VALUE_LENGTH = 8_192;
+// L12b・LZ-2: 送った値 1 つの長さの上限（前は `MAX_SUBMITTED_VALUE_LENGTH` 8,192）は撤廃した（定数は LZ-2 で消した）。
 
 /** `ActionResult` を決める入力（送信の状態で分かれる閉じた形）。 */
 export type ActionOutcomeInput =
@@ -252,7 +250,7 @@ export interface ActionRunResultConditions {
  * - `httpFieldNames`: 許すヘッダの名前（ページが付ける名前だけ。小文字の順。値は持たない。成果物の項目の名前に秘密の語を使わないので、HTTP の
  *   field の名前と呼ぶ）。`recordIdKey`: 登録の ID を取る応答の本文の鍵（なければ null）。
  * - `pageKeyValues`: ページが決める鍵の値（Task 38 の判断 (1) で残す値。鍵ごとに、JSON の scalar を JSON の文字列にした形。例 `"tenant-1"`・`7`・
- *   `true`・`null`）。長さが `MAX_SUBMITTED_VALUE_LENGTH` を超えた値は、値を残さずに null の印にする（JSON の null は文字列の `null`）。照合まで
+ *   `true`・`null`。ARR-2: ページが決める一覧の鍵は、scalar の一覧の JSON の文字列。例 `["u-1"]`）。L12b: 長さでは null の印にしない（JSON の null は文字列の `null`）。照合まで
  *   進まなかった（送らなかった、読めていない）ときは、項目の全体が null。持つときの鍵は `pageKeyNames` とちょうど同じ。
  */
 export interface ActionApiSummary {
@@ -335,6 +333,13 @@ export interface ActionRunDocument {
  *   READ を読んだら、値がもう見えていた（照合に使えないので、送らない）。
  * - `VERIFICATION_READ_UNAVAILABLE`（PL-6a）: form の登録を送る前の答え合わせの READ を判定できなかった（読めない、候補が変わった、止められた）。送った後の
  *   照合にも使えないので、送らない。
+ * LU-10（設計書 `2026-11-02-beaksight-list-row-update-design.md` 4.0 の D3・D4、5.3 の 2、5.5。一覧の行から開く更新）:
+ * - `ROW_NOT_UNIQUE`: 一覧の最初の画面に、行を選ぶ値を含む行がちょうど 1 つなかった（0 か 2 以上。読み切れなかった）。ページ送り・検索はしない。
+ * - `OPENER_NOT_FOUND`: 選んだ行の中に、承認した開き手（識別の digest が同じもの）がちょうど 1 つなかった。押していない。
+ * - `OPENER_UNNAMED`: 同じ識別の開き手に名前（文字・`aria-label`・`title`）がない（アイコンだけ）。押していない。
+ * - `OPENER_DELETE_LIKE`: 同じ識別の開き手に削除の語があった。押していない。
+ * - `PRIOR_VALUES_NOT_ACCEPTED`: 開き手を押した後に読んだ前の値を、Guard が受けなかった（`supplyApiPriorValues` が偽）。送信の窓を開いていない。
+ * - `TARGET_RECORD_UNUSABLE`: 台帳の番号から、照合へ回す送信先を作れなかった（`apiWriteCheckPathOf` が null）。書き込みの段を開いていない。
  */
 export const PRECHECK_FAILURE_DETAILS = Object.freeze([
   'STOPPED',
@@ -352,8 +357,23 @@ export const PRECHECK_FAILURE_DETAILS = Object.freeze([
   'PREFLIGHT_FAILED',
   'VALUE_ALREADY_PRESENT',
   'VERIFICATION_READ_UNAVAILABLE',
+  'ROW_NOT_UNIQUE',
+  'OPENER_NOT_FOUND',
+  'OPENER_UNNAMED',
+  'OPENER_DELETE_LIKE',
+  'PRIOR_VALUES_NOT_ACCEPTED',
+  'TARGET_RECORD_UNUSABLE',
 ] as const);
 export type PrecheckFailureDetail = (typeof PRECHECK_FAILURE_DETAILS)[number];
+
+/**
+ * LU-13 fix round 1: 書き込みの記録（`action-run.json`。形はスキーマで確かめた後のもの）の、送らずに止めた具体的な理由（`PRECHECK_FAILED` のときだけ。なければ
+ * null）。ジョブの画面とサイトの画面の一覧が読む 1 か所。
+ */
+export const actionRunPrecheckDetailOf = (
+  document: { readonly blockReason?: string | null; readonly precheckDetail?: PrecheckFailureDetail } | null,
+): PrecheckFailureDetail | null =>
+  (document?.blockReason === PRECHECK_FAILED_BLOCK_REASON ? document.precheckDetail ?? null : null);
 
 /**
  * PL-6a（設計書 `2026-10-26-beaksight-plain-ui-design.md` 8.1 の「判定の順」）: form の更新の、更新の後の照合の分け方（閉じた一覧。判定

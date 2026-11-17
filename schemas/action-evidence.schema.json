@@ -169,7 +169,7 @@
             "SECRET_LIKE_PASSTHROUGH_FIELD"
           ]
         },
-        "fieldPosition": { "anyOf": [{ "type": "integer", "minimum": 0, "maximum": 1000 }, { "type": "null" }] },
+        "fieldPosition": { "anyOf": [{ "type": "integer", "minimum": 0 }, { "type": "null" }] },
         "fieldType": { "anyOf": [{ "$ref": "urn:beaksight:schema:control:candidate:1#/$defs/field/properties/type" }, { "type": "null" }] },
         "fieldAttributes": {
           "anyOf": [
@@ -187,9 +187,9 @@
       "required": ["reason", "pageCandidateCount", "sameIdentityCount", "fieldPosition"],
       "properties": {
         "reason": { "enum": ["IDENTITY_NOT_FOUND", "IDENTITY_AMBIGUOUS", "RULE_DIGEST_CHANGED", "RECORD_ID_NOT_IN_PATH", "SPEC_INVALID", "PAGE_UNREADABLE", "FIELD_NOT_FOUND", "FIELD_AMBIGUOUS", "FIELD_TYPE_NOT_SUPPORTED", "FIELD_NOT_VISIBLE", "FIELD_NOT_EDITABLE", "SUBMITTER_NOT_FOUND", "SUBMITTER_AMBIGUOUS", "SUBMITTER_INSIDE_LINK"] },
-        "pageCandidateCount": { "anyOf": [{ "type": "integer", "minimum": 0, "maximum": 100000 }, { "type": "null" }] },
-        "sameIdentityCount": { "anyOf": [{ "type": "integer", "minimum": 0, "maximum": 100000 }, { "type": "null" }] },
-        "fieldPosition": { "anyOf": [{ "type": "integer", "minimum": 0, "maximum": 1000 }, { "type": "null" }] }
+        "pageCandidateCount": { "anyOf": [{ "type": "integer", "minimum": 0 }, { "type": "null" }] },
+        "sameIdentityCount": { "anyOf": [{ "type": "integer", "minimum": 0 }, { "type": "null" }] },
+        "fieldPosition": { "anyOf": [{ "type": "integer", "minimum": 0 }, { "type": "null" }] }
       }
     },
     "submission": {
@@ -300,9 +300,8 @@
       }
     },
     "unexpectedRequests": {
-      "description": "OP-M (optional): the requests other than the approved send that the request guard blocked in the write stage (src/safety/write-stage-unexpected-requests.ts). No origin name, query, body or value.",
+      "description": "OP-M (optional): the requests other than the approved send that the request guard blocked in the write stage (src/safety/write-stage-unexpected-requests.ts). No origin name, query, body or value. L12a: one row per request shape, no limit on the number of rows.",
       "type": "array",
-          "maxItems": 20,
           "items": {
             "type": "object",
             "additionalProperties": false,
@@ -310,8 +309,8 @@
             "properties": {
               "method": { "type": "string", "pattern": "^(?:[A-Z]+|\\[REDACTED\\])$", "maxLength": 32 },
               "destination": { "enum": ["TEST_ORIGIN", "APPROVED_SERVICE_ORIGIN", "OUTSIDE_ALLOWED_ORIGINS"] },
-              "pathShape": { "type": "string", "minLength": 1, "maxLength": 1024 },
-              "resourceType": { "type": "string", "pattern": "^[a-z]+$", "maxLength": 64 },
+              "pathShape": { "type": "string", "minLength": 1 },
+              "resourceType": { "type": "string", "pattern": "^[a-z]+$" },
               "timing": { "enum": ["BEFORE_FILL", "AFTER_FILL", "AFTER_PRESS"] },
               "reason": { "type": "string", "pattern": "^[A-Z][A-Z0-9_]*$", "maxLength": 64 },
               "markerInBody": { "type": "boolean" },

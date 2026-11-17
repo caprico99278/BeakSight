@@ -37,7 +37,6 @@ import {
   WEBRTC_BLOCKED_MESSAGE,
 } from '../../src/core/guard-page-exceptions.js';
 import { createEvidenceId, createPageId } from '../../src/core/ids.js';
-import { MAX_ERROR_MESSAGE_LENGTH, MAX_STACK_LENGTH } from '../../src/core/limits.js';
 
 const TARGET_ID = 'technical-rules-fixture-target';
 const PAGE_ID = createPageId(3);
@@ -312,7 +311,7 @@ const EXPECTED_RULES: readonly (readonly [string, FindingCategory, Severity])[] 
   ['REDIRECT_LOOP', 'HTTP', 'ERROR'],
   ['EMPTY_HTTP_RESPONSE', 'HTTP', 'ERROR'],
   ['INVALID_INTERNAL_URL', 'LINK', 'WARN'],
-  ['UNSUPPORTED_URL_SCHEME', 'LINK', 'INFO'],
+  // AUD-4c: `UNSUPPORTED_URL_SCHEME` は指摘にしない（件数と事実はバンドルの `specialSchemeLinks` にだけ出す）。
   ['RESOURCE_4XX', 'RESOURCE', 'ERROR'],
   ['RESOURCE_5XX', 'RESOURCE', 'ERROR'],
   ['SCRIPT_LOAD_FAILED', 'RESOURCE', 'ERROR'],
@@ -568,25 +567,14 @@ describe('INVALID_INTERNAL_URL', () => {
   });
 });
 
-describe('UNSUPPORTED_URL_SCHEME', () => {
-  it('http・https 以外の scheme のリンクを、事実の記録として INFO にする', () => {
+describe('UNSUPPORTED_URL_SCHEME（AUD-4c で指摘にしない）', () => {
+  it('http・https 以外の scheme のリンクは、不具合として数えない（指摘を作らない）', () => {
     const findings = evaluate([
       linkRecord([
         specialSchemeLink('tel:0120000000', 'tel'),
         specialSchemeLink('mailto:info@example.invalid', 'mailto'),
-        specialSchemeLink('tel:0120000000', 'tel'),
       ]),
     ]);
-    const special = findingsOf(findings, 'UNSUPPORTED_URL_SCHEME');
-    expect(special).toHaveLength(2);
-    expect(special[0]).toMatchObject({ category: 'LINK', severity: 'INFO' });
-    const messages = special.map((finding) => finding.message).join('\n');
-    expect(messages).toContain('tel:0120000000');
-    expect(messages).toContain('mailto');
-  });
-
-  it('http・https のリンクでは作らない', () => {
-    const findings = evaluate([linkRecord([internalLink('会社概要', '/about'), externalLink('https://external.test/')])]);
     expect(findingsOf(findings, 'UNSUPPORTED_URL_SCHEME')).toEqual([]);
   });
 });
@@ -757,14 +745,12 @@ describe('PAGE_ERROR', () => {
     const findings = evaluate([
       consoleRecord({
         pageErrors: [
-          // 守りの例外: Service Worker の登録の拒否（切り詰めた文言は、上限の内の区切りまでで見分ける）と、WebRTC の構築子の例外。
+          // 守りの例外: Service Worker の登録の拒否（LZ-2: 長い文言も切り詰めずに全部で見分ける）と、WebRTC の構築子の例外。
           pageError({ name: SERVICE_WORKER_REGISTRATION_BLOCKED_ERROR_NAME, message: blockedServiceWorker, stack: '' }),
           pageError({
             name: SERVICE_WORKER_REGISTRATION_BLOCKED_ERROR_NAME,
-            message: serviceWorkerRegistrationBlockedMessageOf(`${ORIGIN}/`, `${ORIGIN}/sw.js?pad=${'p'.repeat(MAX_ERROR_MESSAGE_LENGTH)}`)
-              .slice(0, MAX_ERROR_MESSAGE_LENGTH),
+            message: serviceWorkerRegistrationBlockedMessageOf(`${ORIGIN}/`, `${ORIGIN}/sw.js?pad=${'p'.repeat(2_049)}`),
             stack: '',
-            truncated: true,
           }),
           pageError({ name: WEBRTC_BLOCKED_ERROR_NAME, message: WEBRTC_BLOCKED_MESSAGE, stack: '' }),
           // ページ自身の例外: 名前が同じで文言が違う、文言が同じで名前が違う、形が途中まで同じ。
@@ -787,46 +773,25 @@ describe('PAGE_ERROR', () => {
     expect(messages.some((message) => message.includes('something else'))).toBe(true);
   });
 
-  it('T44R3 の M-4: 上限を超えた長い文言は、上限の内に scope と script の区切りがあるときだけ守りの例外とみなす（なければ Finding に残す）', () => {
-    const { beforeScope, beforeScript } = SERVICE_WORKER_REGISTRATION_BLOCKED_MESSAGE_PARTS;
-    const longScript = serviceWorkerRegistrationBlockedMessageOf(`${ORIGIN}/`, `${ORIGIN}/sw.js?pad=${'p'.repeat(MAX_ERROR_MESSAGE_LENGTH)}`);
-    const longScope = serviceWorkerRegistrationBlockedMessageOf(`${ORIGIN}/?pad=${'q'.repeat(MAX_ERROR_MESSAGE_LENGTH)}`, `${ORIGIN}/sw.js`);
-    const mimic = `${beforeScope}${'PAGE-OWN-BUG '.repeat(MAX_ERROR_MESSAGE_LENGTH)}`;
-    const truncatedOf = (message: string): PageErrorEvidence => pageError({
-      name: SERVICE_WORKER_REGISTRATION_BLOCKED_ERROR_NAME,
-      message: message.slice(0, MAX_ERROR_MESSAGE_LENGTH),
-      stack: '',
-      truncated: true,
-    });
-    // 前提: 区切りが上限の内にあるのは、script の長い文言だけ。
-    expect(longScript.slice(0, MAX_ERROR_MESSAGE_LENGTH).includes(beforeScript)).toBe(true);
-    expect(longScope.slice(0, MAX_ERROR_MESSAGE_LENGTH).includes(beforeScript)).toBe(false);
-
+  it('LZ-2: 終わりのない文言（前の版で切り詰めた文言・始まりだけを真似たページ自身の例外）は、守りの例外とみなさず Finding に残す', () => {
+    const { beforeScope } = SERVICE_WORKER_REGISTRATION_BLOCKED_MESSAGE_PARTS;
+    const oldTruncated = serviceWorkerRegistrationBlockedMessageOf(`${ORIGIN}/`, `${ORIGIN}/sw.js?pad=${'p'.repeat(2_048)}`).slice(0, 2_048);
+    const mimic = `${beforeScope}${'PAGE-OWN-BUG '.repeat(200)}`;
     const findings = evaluate([
-      consoleRecord({ pageErrors: [truncatedOf(longScript), truncatedOf(longScope), truncatedOf(mimic)] }),
+      consoleRecord({
+        pageErrors: [oldTruncated, mimic].map((message) => pageError({ name: SERVICE_WORKER_REGISTRATION_BLOCKED_ERROR_NAME, message, stack: '' })),
+      }),
     ]);
-    const messages = findingsOf(findings, 'PAGE_ERROR').map((finding) => finding.message);
-    // script の長い守りの例外は Finding にしない。区切りが上限の外の長い scope と、始まりだけを真似たページ自身の例外は、Finding に残す。
-    expect(messages).toHaveLength(2);
-    expect(messages.some((message) => message.includes('PAGE-OWN-BUG'))).toBe(true);
-    expect(messages.some((message) => message.includes('qqqq'))).toBe(true);
-    expect(messages.some((message) => message.includes('pppp'))).toBe(false);
+    expect(findingsOf(findings, 'PAGE_ERROR')).toHaveLength(2);
   });
 
-  it('T44R4 の M-1: stack だけが切り詰められた例外は、文言の終わりで比べる（終わりの違うページ自身の例外は Finding に残す）', () => {
+  it('T44R4 の M-1: 終わりの違うページ自身の例外は Finding に残す', () => {
     const { beforeScope, beforeScript } = SERVICE_WORKER_REGISTRATION_BLOCKED_MESSAGE_PARTS;
-    // 再レビューの再現（guardex4.exp.ts）の形: 文言は切り詰めず、終わりだけが違う。stack が上限を超え、Evidence の truncated は真になる。
+    // 再レビューの再現（guardex4.exp.ts）の形: 終わりだけが違う。
     const message = `${beforeScope}a${beforeScript}b'): PAGE-OWN-REASON`;
     const findings = evaluate([
       consoleRecord({
-        pageErrors: [
-          pageError({
-            name: SERVICE_WORKER_REGISTRATION_BLOCKED_ERROR_NAME,
-            message,
-            stack: 'x'.repeat(MAX_STACK_LENGTH),
-            truncated: true,
-          }),
-        ],
+        pageErrors: [pageError({ name: SERVICE_WORKER_REGISTRATION_BLOCKED_ERROR_NAME, message, stack: '' })],
       }),
     ]);
     const messages = findingsOf(findings, 'PAGE_ERROR').map((finding) => finding.message);
@@ -1150,5 +1115,17 @@ describe('fingerprint の安定性', () => {
     const backward = evaluate([...evidence].reverse());
     expect(backward).toEqual(forward);
     expect(forward.length).toBeGreaterThan(0);
+  });
+});
+
+describe('AUD-9a: technical の Finding の groupingKeys', () => {
+  it('DUPLICATE_ELEMENT_ID は id を残し、PAGE_ERROR は例外の文言と stack を残さない', () => {
+    const findings = evaluate([
+      domRecord({ duplicateIds: [{ id: 'menu', count: 3, truncated: false }] }),
+      consoleRecord({ pageErrors: [pageError()] }),
+    ]);
+    expect(findingsOf(findings, 'DUPLICATE_ELEMENT_ID').map((finding) => [finding.schemaVersion, finding.groupingKeys]))
+      .toEqual([['finding-schema/1.1', [{ name: 'elementId', value: 'menu' }]]]);
+    expect(findingsOf(findings, 'PAGE_ERROR').map((finding) => finding.groupingKeys)).toEqual([[]]);
   });
 });

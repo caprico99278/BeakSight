@@ -283,21 +283,17 @@ describe('Local UI boundary detectors', () => {
     }
   });
 
-  it('(g) follows runtime imports through apps/local-ui and src/, and skips type-only imports', () => {
+  // たどり方そのもの（型だけの import を飛ばす、循環で止まる）は、`module-references.test.ts` の共通の補助の自己検査が確かめる。ここは禁止の一覧だけ。
+  it('(g) follows runtime imports through apps/local-ui and src/ to the forbidden engine directories', () => {
     const files = new Map<string, ScannedSource>([
-      ['apps/local-ui/src/routes/a.tsx', scanSource("import { b } from '../server/b';\nimport type { T } from '../../../../src/config/types.js';")],
+      ['apps/local-ui/src/routes/a.tsx', scanSource("import { b } from '../server/b';")],
       ['apps/local-ui/src/server/b.ts', scanSource("import { c } from '../../../../src/config/load-config.js';")],
       ['src/config/load-config.ts', scanSource("import { v } from './validate-config.js';")],
       ['src/config/validate-config.ts', scanSource("import { g } from '../safety/guard.js';")],
-      ['src/config/types.ts', scanSource("import { chromium } from 'playwright';")],
-      ['apps/local-ui/src/routes/clean.tsx', scanSource([
-        "import { f } from '../../../../src/presentation/format.js';",
-        "import type { T } from '../../../../src/config/types.js';",
-      ].join('\n'))],
-      ['src/presentation/format.ts', scanSource("import { m } from './messages.js';\nimport type { R } from '../core/contracts.js';")],
+      ['apps/local-ui/src/routes/clean.tsx', scanSource("import { f } from '../../../../src/presentation/format.js';")],
+      ['src/presentation/format.ts', scanSource("import { m } from './messages.js';")],
       ['src/presentation/messages.ts', scanSource("import { deepFreeze } from '../core/immutable.js';")],
       ['src/core/immutable.ts', scanSource('export const deepFreeze = 1;')],
-      ['src/core/contracts.ts', scanSource("import { x } from '../browser/x.js';")],
       ['apps/local-ui/launcher/serve.ts', scanSource("import { g } from './request-guard.ts';")],
       ['apps/local-ui/launcher/request-guard.ts', scanSource("import { s } from '../../../src/report/x.js';")],
     ]);
@@ -508,7 +504,7 @@ describe('Local UI boundary (Task 23 design 4.2, 4.4)', () => {
   });
 
   it('(k) detects direct imports of src/control/data-rules/ from the UI code, and allows the screen re-export (T29e)', () => {
-    const path = 'apps/local-ui/src/server/data-rule-functions.ts';
+    const path = 'apps/local-ui/src/server/data-rule-facts.ts';
     for (const line of [
       "import { saveRuleSetAndAttach } from '../../../../src/control/data-rules/rule-store.js';",
       "import type { FieldRule } from '../../../../src/control/data-rules/rule-contracts.js';",

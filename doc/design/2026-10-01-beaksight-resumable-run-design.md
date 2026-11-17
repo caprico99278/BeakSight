@@ -29,7 +29,7 @@
 
 - ページの監査が1つ終わるたびに、続きから再開するために必要な状態を、Run のディレクトリに保存する。
 - 中断した Run は、同じ設定で起動し直すと、自動で続きから監査する。終わったページは監査し直さない。
-- 端末（PC）の再起動、停電、端末のウィンドウを閉じた場合の中断にも対応する。保存は電源が切れても壊れにくい書き方にし、古いロックを確実に見分ける。
+- 端末（PC）の再起動、停電、端末のウィンドウを閉じた場合の中断にも対応する。保存は電源が切れても壊れにくい書き方にし、途中で終わった起動の監査中の印が残らないようにする（4.4）。
 - 再開した Run の最終の出力は、中断しなかった場合と同じになる（時刻と、実行の記録を除く）。
 - Ctrl+C などで止めた場合は、今のページを終えてから止まり、その時点の結果をレポートとして書き出す。
 
@@ -43,7 +43,7 @@
 
 - 従う文書: `2026-08-27-beaksight-implementation-tasks.md`、`2026-08-27-beaksight-implementation-plan.md`、`2026-08-27-beaksight-web-audit-design.md`、`2026-09-23-beaksight-task-14-17-pipeline-report-cli-design.md`（5.6 Run の流れ、DEF-009 の追補）、`2026-09-23-beaksight-ui-ssot-design.md`、`2026-10-01-beaksight-site-load-control-design.md`。
 - この設計書が拡張・置き換える箇所:
-  - Task 14〜17 の設計書 5.6 の「Run のディレクトリを排他的に作る」は、新しい Run では今のまま守る。再開のときは、既存のディレクトリを、ロックのファイル（4.4）で排他的に使う。
+  - Task 14〜17 の設計書 5.6 の「Run のディレクトリを排他的に作る」は、新しい Run では今のまま守る。再開のときは、既存のディレクトリを、出力先の監査中の印（4.4）で排他的に使う。
   - `crawl.maxRuntimeMs` の意味を、「Run 全体の実行時間の上限」から「1回の実行（起動）ごとの上限」に変える（4.6）。
   - CLI の終了コードの表（`src/cli/exit-codes.ts`）に、5（中断。最後の処理をしていない）を加える（4.7）。
   - スキーマの名前の閉じた一覧に、`checkpoint` を加える（4.2）。
@@ -105,7 +105,6 @@
 | `checkpoint/state.json` | 下の「Run の状態」 | robots/sitemap の取得の後と、ページの監査が1つ終わるたびに、置き換える |
 | `checkpoint/state.prev.json` | 1つ前の `state.json` | `state.json` を置き換える前に、今の `state.json` をこの名前に移す |
 | `checkpoint/pages/<pageId>.json` | そのページの結果（最終の試行の結果と、再試行の前の試行の Evidence の対応） | そのページの監査が終わったときに1回だけ |
-| `checkpoint/run.lock` | ロック（4.4） | Run の開始と再開のとき。1分ごとに時刻を更新する |
 
 Run の状態（`state.json`）:
 
@@ -141,7 +140,7 @@ Run の状態（`state.json`）:
   - `IdAllocator`（`src/orchestration/id-allocator.ts`）: 3つの連番の取り出しと、作り直し。作り直しは、新しい採番器を作るときにだけ行える（使っている採番器の連番を戻す口は作らない）。
   - Safety Ledger: Ledger は作り直さない。保存した snapshot を、最後の処理の Safety の集計に、生きている Ledger の snapshot と同じ形で渡す（`RunProgress` の Ledger の一覧を、「Ledger か、保存した snapshot」の一覧にする）。
 - 書き出し: `ArtifactWriter` に、保存の書き出し（一時ファイルに書いてから名前を変える。今の書き出しと同じ方法）を加える。ARCH08 の例外は増やさない。
-- UI Gate は `src/report/**` から `src/orchestration/**` への import（型だけのものも）を禁じているので、`ArtifactWriter` は `run-checkpoint.ts` を import しない。保存とロックの型は `run-checkpoint.ts` に残す（型の一部が orchestration・crawl・safety の型でできていて、core に移すと依存の向きが逆になるため。R3 の Blocker）。`ArtifactWriter` の保存の読み書きの関数は総称にし、保存の中身について知るのは、core の型だけで書ける最小の形（`state.json` の `completedPageIds`、ページの保存の `pageId`）だけにする。中身の検証はスキーマで行い、整合の確かめの関数は、呼び出し側（Run Coordinator）が読み込みの引数で渡す。ロックの中身も、呼び出し側が作って渡す。
+- UI Gate は `src/report/**` から `src/orchestration/**` への import（型だけのものも）を禁じているので、`ArtifactWriter` は `run-checkpoint.ts` を import しない。保存とロックの型は `run-checkpoint.ts` に残す（型の一部が orchestration・crawl・safety の型でできていて、core に移すと依存の向きが逆になるため。R3 の Blocker）。`ArtifactWriter` の保存の読み書きの関数は総称にし、保存の中身について知るのは、core の型だけで書ける最小の形（`state.json` の `completedPageIds`、ページの保存の `pageId`）だけにする。中身の検証はスキーマで行い、整合の確かめの関数は、呼び出し側（Run Coordinator）が読み込みの引数で渡す。
 
 ### 4.3 保存の時期と書き方
 
@@ -157,17 +156,16 @@ Run の状態（`state.json`）:
 
 ### 4.3.1 保存のセッション（`RunCheckpointSession`）と、保存の状態を終わりにする時期
 
-- 保存、ロック、ハートビートは、1つの部品にまとめる（置き場所は `src/orchestration/run-checkpoint-session.ts`。新設）。Run Coordinator が Run の初めに作り、ページの後などで保存を頼む。ファイルの読み書きは、注入された保存の書き手（`ArtifactWriter` が形の上で満たす interface。`run-checkpoint.ts` に置く）に任せる。
-- 保存の状態は、CLI が最後の出力（`run.json`、`report.html`、バンドル）を書き終えるまで `IN_PROGRESS` のままにする。Run Coordinator は、最後の状態（`FINISHED` か `STOPPED`）を書かずに、セッションを Run の結果と一緒に返す。CLI は、最後の出力を書き終えた後に、セッションに最後の状態を書かせ、ロックを外させる。
+- 保存と再開の後始末は、1つの部品にまとめる（置き場所は `src/orchestration/run-checkpoint-session.ts`。新設）。Run Coordinator が Run の初めに作り、ページの後などで保存を頼む。ファイルの読み書きは、注入された保存の書き手（`ArtifactWriter` が形の上で満たす interface。`run-checkpoint.ts` に置く）に任せる。セッションはロックを持たない（4.4。2026-11-14 の SPEC-2）。
+- 保存の状態は、CLI が最後の出力（`run.json`、`report.html`、バンドル）を書き終えるまで `IN_PROGRESS` のままにする。Run Coordinator は、最後の状態（`FINISHED` か `STOPPED`）を書かずに、セッションを Run の結果と一緒に返す。CLI は、最後の出力を書き終えた後に、セッションに最後の状態を書かせる。
 - こうすると、最後の出力を書く前にプロセスが終わった場合も、保存の状態は `IN_PROGRESS` で、すべてのページが終わっている。再開すると、新しいページを始めずに最後の処理だけを行い、出力を作る（3.2 の `IN_PROGRESS` の行のとおり）。
-- ハートビートのタイマーは、セッションが持つ。時刻とタイマーは注入する（テストのため）。タイマーは、プロセスの終わりを妨げない（`unref`）。ハートビートの書き出しの失敗は、Run を止めない（次の回で書き直す）。
 
 ### 4.3.2 保存の終わり方（R4b の設計。2026-10-01）
 
 - Run Coordinator は、`run()` が終わった後に、CLI が行う保存の終わり方を返す（`checkpointConclusion()`）。閉じた一覧は次の3つとする。
   - `FINISH`: 最後の状態の保存（`RunCheckpoint`）を持つ。CLI は、最後の出力を書き終えた後に、セッションの `finish` にそれを渡す。
-  - `ABANDON`: 保存の状態を変えない。CLI は、最後の出力を書き終えた後に、セッションの `abandon` を呼ぶ（ロックは、プロセスが終われば古いと判定される）。
-  - `NONE`: セッションを渡されていない、またはセッションを始めなかった（Run のディレクトリを作れなかった、ロックがすでにあった）。CLI は何もしない。
+  - `ABANDON`: 保存の状態を変えない。CLI は、最後の出力を書き終えた後に、セッションの `abandon` を呼ぶ。
+  - `NONE`: セッションを渡されていない、またはセッションを始めなかった（Run のディレクトリを作れなかった、監査中の印を持てたかを決められなかった）。CLI は何もしない。
 - `run()` が終わる前に呼ぶと、例外を投げる（呼び出し側の誤り）。
 - 終わり方と保存の状態は、次の表の上から順に、最初に当てはまる行で決める。
 
@@ -185,24 +183,22 @@ Run の状態（`state.json`）:
 - 巡回を始めなかった場合（新しい Run の PREFLIGHT の失敗など）は、巡回の記録と終わったページの一覧を空にし、採番器を初めの値にした保存を書く（`FINISHED`。次の起動で、壊れた保存として知らせないため）。
 - 最後の状態の保存の、この実行の記録の終わりの時刻は、`run.json` の `finishedAt` と同じ値にする。保存の時刻（`savedAt`）も同じ値にする。
 
-### 4.4 二重の起動を防ぐ（ロック）
+### 4.4 二重の起動を防ぐ（監査中の印。2026-11-15 の SPEC-2 fix round 2 で、OS が放す排他にした）
 
-- 新しい Run は、今のとおり Run のディレクトリを排他的に作る（DEF-009）。その直後に、ロックのファイル `<Run のディレクトリ>/checkpoint/run.lock` を排他的に作る（`wx`）。
-- ロックの中身: プロセスの ID、OS の起動の時刻（`Date.now() - os.uptime() * 1000`）、ロックを取った時刻、最後に更新した時刻（ハートビート）。
-- ハートビート: Run の間、1分ごとに、ロックの「最後に更新した時刻」を書き換える（タイマーで行う。ページの監査の長さに関係なく更新する）。
-- ロックが「動いている Run のもの」とみなすのは、次のすべてを満たす場合だけとする。
-  - OS の起動の時刻が、今の OS の起動の時刻と同じ（誤差 120秒以内）。端末を再起動した後は、ここで「古い」と分かる（プロセスの ID が別のプロセスに使い回されていても、誤らない）。
-  - そのプロセスの ID が動いている（`process.kill(pid, 0)` が成功する）。
-  - 最後に更新した時刻が、5分以内である。
-- 再開のときは、ロックのファイルを確かめる。
-  - ない場合: 排他的に作る。
-  - 動いている Run のものなら、「別のプロセスが、この Run を実行しています」と示して終える（終了コード 4）。同じ対象の Run を2つ同時に動かすと、サイトへの負荷が倍になるためである。
-  - 動いている Run のものでなければ、前の回が途中で終わった印とみなし、ロックを作り直す。
-  - 作り直した後に、ロックを読み直す。中身が自分のもの（プロセスの ID とロックを取った時刻）でなければ、別のプロセスが同時に作り直したとみなし、再開しない（終了コード 4）。2つのプロセスが同時に古いロックと判定した場合に、両方が動かないようにするためである（R3 の報告）。
-- 制約（R4a2a の報告）: 2つのプロセスを、同じ Run に対してほぼ同時に起動し、どちらも古いロックと判定した場合は、書き換えと読み直しの順によっては、両方が「自分のもの」と判断して進みうる。同じ Run を同時に2回起動しないことを、README に書く。完全に防ぐには、ロックの作り直しの仕組みが大きく複雑になるので、行わない（ふつうの使い方では起きない）。
-- 再開のときの後始末（4.5）は、ロックを取った後、ハートビートのタイマーと保存の書き出しを始める前に行う（後始末は、書き出しの途中の一時ファイルを消すため。R3 の報告）。
-- 再開のときに、セッションを始められなかった場合（動いている Run がある、別のプロセスが同時に作り直した、書けなかった）は、Run Coordinator は PREFLIGHT も Browser の起動もせず、出力も作らずに、専用の例外で reject する。Run のディレクトリを作れなかった場合（DEF-009）と同じ扱いで、CLI は文言と終了コード 4 を示す（R5）。
-- Run の終わりに、ロックのファイルを消す。ロックの作成、更新、削除は `ArtifactWriter` が行う。ロックの判定（上の3つの条件）は `run-checkpoint.ts` が行う。
+- 監査中の印は、出力先ごとの 1 つの排他とする。OS が、持ち主の process の終わり（強制終了を含む）と同時に必ず放すものを使い、ファイルを作らない。古さを推し量らない（PID・時刻・端末の起動の時刻を見ない）。部品は `src/core/run-exclusion.ts` の `acquireRunExclusion`。
+  - Windows: 名前つきのパイプ `\\.\pipe\beaksight-run-<digest>` に listen する。
+  - Linux: 抽象の名前空間の Unix socket（名前の先頭が `\0`。ファイルを残さない）に listen する。
+  - macOS: 一時のフォルダの Unix socket に listen する。強制終了の後に socket のファイルが残ると、持たれているとみなす（止まる側。macOS は対象の外）。
+  - 出力先がなければ作ってから取る。`<digest>` は、出力先のディレクトリの `dev` と `ino`（`outputDirectoryIdentity`。`stat` の `bigint`）の SHA-256 の先頭 32 桁。パスの綴り（大文字と小文字、`\\?\`、リンク、8.3 の名前など）によらず、同じディレクトリは同じ排他になる。`dev` か `ino` が 0 のファイルシステムでは使えない（止まる側）。取った後に読み直し、ディレクトリが作り直されていれば、離して持たれているとみなす。
+  - 取るために作った出力先は、Run を始めずに終われば、空のときだけ消してから離す（DEF-081）。
+  - `node:net` は `createServer` と `listen` だけを使う（送る口を使わない。`write-stage-boundary.test.ts` の (e)）。つないできた相手は、すぐに切る。server は process を生かし続けない（`unref`）。
+- 結果は 3 つ。取れた（server を持ち続ける）・持たれている（`EADDRINUSE`）・使えない（ほかの誤り。止まる側）。
+- CLI の監査とワーカーの Run は、開始の段（再開する Run を選ぶ前）に取り、Run の終わり（出力と保存の終わり方の後）まで持つ。例外の経路と、Run を始めずに終わる経路でも、必ず離す（server を閉じる）。離さずに process が終わっても、OS が放す（2 回目の Ctrl+C の `process.exit` を含む）。CLI の監査（`src/cli/audit-run.ts`）とワーカーの Run の始め方（`src/worker/worker-run-session.ts`、`src/worker/discovery-run.ts`）が、`acquireRunExclusion` を直に呼ぶ。
+- ほかの起動が持っていれば、再開も新しい Run もせずに終える（`RUN_ACTIVE`。終了コード 4。`--new` でも同じ）。同じ出力先で Run を2つ同時に動かすと、サイトへの負荷が倍になるためである。印には Run の ID がないので、知らせに Run の ID を出さない。
+- 使えない（出力先を作れない、listen のほかの誤り）ときは、今までどおり Run のディレクトリを作れるかを確かめ（出力先がファイルなら `RUN_DIRECTORY_UNAVAILABLE`）、作れても、保存のセッションを始めずに止める（印なしで、サイトを読まない）。
+- 前の版との同時の実行は対象の外（配る前のため）。前の版のロックのファイルは読まない。
+- 限界: 同じ名前のパイプを BeakSight の外の process が先に listen すると、閉じるまで始められない（止まる側）。
+- 以前の形（ファイルのロックと古さの判定）は、死んだロックの取り直しで 2 つが持てる（DEF-269）・時計の飛びで生きている持ち主のロックを取る（DEF-270）・SYSTEM の PID の使い回しで止まり続ける（DEF-271）の穴があったので、やめた（`2026-11-14-beaksight-slim-and-simplify-design.md` 5.2）。
 
 ### 4.5 再開のときの後始末
 
@@ -232,11 +228,11 @@ Run の状態（`state.json`）:
   - 実効の設定が、今回の実効の設定と完全に同じである（`--headed`・`--headless` による上書きを含む）。ただし、出力先（`output.directory`。`--output` の上書きを含む）は比べない。出力先は途中の Run を探す場所そのものなので、書き方が違っても（例: 相対のパスと、同じ場所の絶対のパス）、同じ出力先の途中の Run を再開できるようにする（R5b の報告）。比べない項目の一覧は、保存の owner（`run-checkpoint.ts`）の名前付きの定数に置く。
   - 再開できる（3.2 の `IN_PROGRESS` か、再開できる `STOPPED`）。
 - 見つかった場合（複数なら、最初の実行の開始が最も新しいもの）:
-  - ロック（4.4）が動いている Run のものなら、「同じ対象の Run が実行中です」と示して終える（終了コード 4）。新しい Run も始めない（同時に2つ動かすと、サイトへの負荷が倍になるため）。
+  - 出力先の監査中の印（4.4）をほかの起動が持っていれば、「同じ出力先で、別の Run が実行中です」と示して終える（終了コード 4）。新しい Run も始めない（同時に2つ動かすと、サイトへの負荷が倍になるため）。
   - BeakSight、Playwright、Chromium の版が、保存したものと違う場合は、再開しない。「版が違うので再開できません。最初から始めるには --new を付けてください」と示して終える（終了コード 4）。結果の比べ方が崩れるためである。
   - それ以外なら、「途中の Run（<Run の ID>、監査済み <n> ページ）を、続きから再開します。最初から始めるには --new を付けてください。」と示して、再開する。
 - 見つからない場合は、新しい Run を始める。設定が違うために再開の対象にならなかった途中の Run があれば、その旨を1行で知らせる（どの項目が違うかを示す）。
-- `run` に、値を取らないオプション `--new` を加える。付けると、途中の Run を探さずに、新しい Run を始める。ただし、同じ対象の Run が実行中（ロックが動いている Run のもの）なら、新しい Run も始めない（終了コード 4）。
+- `run` に、値を取らないオプション `--new` を加える。付けると、途中の Run を探さずに、新しい Run を始める。ただし、同じ出力先で Run が実行中（出力先の監査中の印をほかの起動が持っている）なら、新しい Run も始めない（終了コード 4）。
 - 保存が壊れていて（`state.json` と `state.prev.json` の両方が使えない）再開できない Run は、再開の対象にしない。その旨を1行で知らせ、新しい Run を始める。
 - シグナル:
   - Playwright の既定のシグナルの処理を止める（`chromium.launch` の `handleSIGINT`、`handleSIGTERM`、`handleSIGHUP` を `false` にする）。
@@ -247,9 +243,9 @@ Run の状態（`state.json`）:
 
 ### 4.7.1 CLI の詳細（R5 の設計。2026-10-01）
 
-- **実行中の Run の確かめ**: 起動したら、まず、出力先のすべての Run のディレクトリ（名前が Run の ID の形のもの）のロックを読み、どれかが動いている Run のもの（4.4 の判定）なら、再開も新しい Run もせずに終える（終了コード 4）。`--new` を付けても同じ。
-  - ロックには対象の ID がないので、対象を問わない。同じ出力先では、同時に1つの Run だけを動かす（README に書く）。
-  - 最初の保存（robots.txt と sitemap.xml の取得の後）の前の Run も、ロックはあるので、この確かめで見つかる。2つを短い間に起動した場合に、両方が動かないようにするためである。
+- **実行中の Run の確かめ**: 起動したら、まず、出力先の監査中の印（4.4）を取る。ほかの起動が持っていれば、再開も新しい Run もせずに終える（終了コード 4）。`--new` を付けても同じ。
+  - 印には対象の ID がないので、対象を問わない。同じ出力先では、同時に1つの Run だけを動かす。
+  - 印は再開する Run を選ぶ前に取り、Run の終わりまで持つので、確かめと Run の始めの間に隙がない（DEF-057）。
 - **途中の Run を探す読み方**: 各 Run の `state.json`（読めなければ `state.prev.json`）だけを読み、スキーマで確かめて、対象・再開できるか（`decideRunResumption`）・設定で絞り込む。ページの保存まで読むのは、再開すると決めた Run だけとする（終わった Run が出力先に増えても、起動が遅くならないようにするため）。ページの保存まで読んで使えなかった場合は、壊れた保存として知らせ、新しい Run を始める。
 - **選び方**: 同じ対象の Run（`state.json` を読めたもの。終わった Run も含む）のうち、最初の実行の開始が最も新しいもの1つだけを候補にする。それが再開でき（`decideRunResumption` が `RESUME` か `FINALIZE_ONLY`）、実効の設定が同じなら、再開する。設定が違えば、知らせて新しい Run を始める。終わっていれば、何も示さずに新しい Run を始める。選び方は、保存の owner（`run-checkpoint.ts`）の関数で行い、CLI は読んだ値を渡すだけにする。
   - 最も新しいものだけにするのは、古い途中の Run を、後で思いがけず再開しないためである（例: 1日目の Run を止め、2日目に `--new` で最後まで監査した後、3日目に起動すると、1日目の Run を再開してしまう）。
@@ -259,7 +255,7 @@ Run の状態（`state.json`）:
 - **Run の後**: 出力（`finishAuditRun`）を書き終えた後に、Run Coordinator の `checkpointConclusion()` に従う。`FINISH` ならセッションの `finish` に最後の状態を渡し、`ABANDON` なら `abandon` を呼び、`NONE` なら何もしない。
   - 最後の状態が `FINISHED` なら、`finish` の後に、ページの保存（`checkpoint/pages/`）と `state.prev.json` を消し、`state.json` だけを残す（`ArtifactWriter` が行う。Run のディレクトリの外に及ばない）。ページの保存は出力の `page.json` とほぼ同じ中身で、終わった Run では使わないため、ディスクを2倍使わないようにする。`state.json` は、上の「選び方」で、同じ対象の最も新しい Run を知るために残す。消せなかった場合は、警告の1行を示す（終了コードは変えない）。出力の書き出しが失敗した場合は、`abandon` を呼んでから、今のとおり失敗として扱う。`finish` が失敗した場合は、警告の1行（次の起動で最後の処理をやり直すこと）を示し、終了コードは Run Status のとおりにする。
 - **再開を始められなかった場合**（`RunResumeUnavailableError`）は、理由ごとの文言を示し、出力を作らずに終える（終了コード 4）。
-- **終了コード**: 4 に「Run を始められない（実行中の Run がある、版が違う、ロックを同時に作り直された、保存を始められない）」を加える（結果の名前を `RUN_UNAVAILABLE` とし、値は 4）。5 は「中断（2回目のシグナル。最後の処理をしていない）」（結果の名前を `INTERRUPTED` とする）。
+- **終了コード**: 4 に「Run を始められない（実行中の Run がある、版が違う、保存を始められない）」を加える（結果の名前を `RUN_UNAVAILABLE` とし、値は 4）。5 は「中断（2回目のシグナル。最後の処理をしていない）」（結果の名前を `INTERRUPTED` とする）。
 
 ### 4.8 実行の記録（`run.json` の `executions`）
 
@@ -326,7 +322,7 @@ RR（独立レビュー。作業記録置き場の `RR-review-result.md`）の�
 | IDs | `src/core/ids.ts`、`src/orchestration/id-allocator.ts` | 拡張（連番の取り出しと、新しい採番器の作り直し） |
 | Final Run status | `src/core/status.ts` | 利用のみ（新しい SKIPPED の理由 `RUN_INTERRUPTED`、`CHECKPOINT_WRITE_FAILED` は、既存の SKIPPED と同じく PARTIAL にする。理由の一覧の owner に加える） |
 | JSON Schema validation | `src/core/schema-validator.ts` | 拡張（`checkpoint`） |
-| Final artifact serialization | `src/report/artifact-writer.ts` | 拡張（保存、ロック、後始末） |
+| Final artifact serialization | `src/report/artifact-writer.ts` | 拡張（保存、後始末） |
 | 保存の作成と読み込み、再開の判定 | `src/orchestration/run-checkpoint.ts`（新設） | 新設。Owner Matrix に加える。Run の状態から保存の内容を作り、保存の内容から再開の状態を作る。ファイルは書かない（書くのは ArtifactWriter） |
 | Safety Ledger | `src/safety/safety-ledger.ts` | 変更なし（snapshot を使うだけ） |
 
@@ -351,7 +347,7 @@ RR（独立レビュー。作業記録置き場の `RR-review-result.md`）の�
 
 - 状態の取り出しと作り直し（単体）: frontier、待ち行列、採番器のそれぞれで、取り出した状態から作り直したものが、元と同じ振る舞いをする。SKIPPED（`RUN_INTERRUPTED`、`MAX_RUNTIME_REACHED`）と `AUDITING` が `QUEUED` に戻り、元の順に並ぶ。
 - 保存の形式（単体）: スキーマの検証。壊れた保存を拒む。
-- ロック（単体と結合）: 動いている Run のロックがあれば、再開も新しい Run もしない。次のどれかなら古いロックとみなし、作り直して再開する: OS の起動の時刻が違う（端末の再起動を模す。プロセスの ID が動いているプロセスと同じでも古いとみなす）、プロセスの ID が動いていない、ハートビートが5分より前。ハートビートが1分ごとに更新される（時刻とタイマーを注入して確かめる）。
+- 監査中の印（単体と結合。SPEC-2 fix round 2）: 本物のパイプで、生きている持ち主がいれば取れない・持ち主を強制終了したら取れる・死んだ持ち主の後に 3 つが同時に始めても 1 つだけが取れる（node の子 process）。ほかの起動が持っていれば、再開も新しい Run もしない。同じディレクトリの別の綴り（大文字、`\\?\`）は同じ排他。取るために作った出力先は、Run を始めずに終われば残さない。2 つの CLI の process が同時に再開しても、1 つだけが再開する。
 - 電源断への備え（単体と結合）: `state.json` が壊れている（途中で切れた JSON、スキーマに合わない、載っているページのファイルがない）場合に、`state.prev.json` から再開する。両方が壊れていれば再開せず、新しい Run を始め、その旨を知らせる。書き出しで `fsync` を呼ぶ（注入した書き出しの部品で確かめる）。
 - **中断しなかった場合と同じ（結合。中核の受け入れ条件）**: ローカルの fixture のサイト（`fixtures/site/full-crawl/` など、数ページ）で、次の2つを比べる。
   - A: 中断しない Run。
@@ -375,7 +371,7 @@ RR（独立レビュー。作業記録置き場の `RR-review-result.md`）の�
 | `src/crawl/crawl-queue.ts`、`src/orchestration/crawl-frontier.ts` | 状態の取り出しと作り直し | 変更 |
 | `src/orchestration/id-allocator.ts` | 連番の取り出しと作り直し | 変更 |
 | `src/orchestration/run-coordinator.ts` | 保存の時期、再開の流れ、止める印、1回の実行ごとの時間の上限、`executions` | 変更 |
-| `src/report/artifact-writer.ts`、`src/core/artifact-layout.ts` | 保存の書き出し、ロック、後始末、残った古いファイルの削除 | 変更 |
+| `src/report/artifact-writer.ts`、`src/core/artifact-layout.ts` | 保存の書き出し、後始末、残った古いファイルの削除 | 変更 |
 | `src/core/contracts.ts`、`schemas/run.schema.json` | 新しい理由のコード、`executions` | 変更 |
 | `src/cli/arguments.ts`、`src/cli/main.ts`、`src/cli/run-command.ts`、`src/cli/exit-codes.ts`、`src/cli/index.ts` | 自動の再開、`--new`、シグナル、終了コード 5、途中の Run の知らせ | 変更 |
 | Browser の起動の箇所（`src/cli/run-command.ts` など） | Playwright の既定のシグナルの処理を止める | 変更 |
@@ -396,7 +392,7 @@ RR（独立レビュー。作業記録置き場の `RR-review-result.md`）の�
 - [ ] 第7章のテストが、RED を確かめた後に PASS する。とくに「中断しなかった場合と同じ」の結合テスト。
 - [ ] `npm run verify` が PASS する。
 - [ ] `npx vitest run tests/integration/safety-gates.test.ts tests/integration/auditor-gates.test.ts tests/architecture` が PASS する。
-- [ ] ローカルの fixture のサイトで、CLI の Run を Ctrl+C で止め、同じコマンドで自動で再開し、最後まで終えられる。端末の再起動を模したロック（OS の起動の時刻が違う）でも再開できる（設計者が手で確かめる）。
+- [ ] ローカルの fixture のサイトで、CLI の Run を Ctrl+C で止め、同じコマンドで自動で再開し、最後まで終えられる。前の起動を強制終了した直後でも再開できる（設計者が手で確かめる）。
 - [ ] 独立レビューで、Critical 0件、Important 0件。
 
 ## 11. 設計変更履歴
@@ -423,3 +419,6 @@ RR（独立レビュー。作業記録置き場の `RR-review-result.md`）の�
 | 2026-10-02 | RR の指摘と、設計者の手での確かめ（本物の CLI で、1回目の Ctrl+C で headless の Chromium が終わり、監査の途中のページが FAILED のまま保存されることを再現した） | 4.10 を加えた（Chromium を `channel: 'chromium'` で起動する、違反のある Run の出力の失敗でも `finish` を行う、違反を保存に載せる前の終わりを残る制約とする、DEF-022 の直し方、名前の変更のやり直し、README の追記）。4.9 に、再開した実行の最後の読み込みの時刻の決め方を加えた。5章に残る制約を加えた | R7a、R7b、R7c |
 | 2026-10-02 | R7c の報告の発見事項3と、ユーザーの判断（安全側に揃える） | 4.10 に、外部スキームへの移動を headless でも違反にすること、違反のコードの改名、Guard が `headed` を受け取らないことを加えた（Task 19 の前の整理の設計書の DEF-012 の、headless は記録だけとする判断を置き換える） | R7d、README |
 | 2026-10-08 | ユーザーの指示（起動 9 が実行時間の上限で止まったが、コンソールに理由が出なかった） | 4.8 に、CLI の結果の「この起動の終わり方」の1行と、表示用モデルの `RunExecutionsView.lastEndReason` を加えた | R9、README |
+| 2026-11-14 | SPEC-2（`2026-11-14-beaksight-slim-and-simplify-design.md` 5.1） | 4.3.1・4.3.2・4.4・4.7・4.7.1 を書き換えた。監査中の印を出力先の 1 つのロックにし、ハートビート・5 分の古さ・取り直す前の猶予・取り直しの札・持ち主の読み直し・ロックを失った Run の止め方を消した。古いのは、持ち主が動いていない・端末の再起動の後・PID の使い回しのときだけ | SPEC-2 |
+| 2026-11-15 | SPEC-2 fix round 2（REV-SPEC2 の DEF-269〜271、I-2、M-1。`2026-11-14-beaksight-slim-and-simplify-design.md` 5.2） | 4.1・4.3.2・4.4・4.7・4.7.1・テストの節を書き換えた。監査中の印を、ファイルのロックから、OS が持ち主の終わりと同時に放す排他（Windows は名前つきのパイプ、Linux は抽象の名前空間の socket）に替えた。古さの判定・取り直し・process の起動の時刻の読み取り（M-1 の Windows の記述を含む）を消した。前の版のロックの持ち主が動いていれば始めない守り（読み取りだけ）を加えた | SPEC-2 |
+| 2026-11-15 | SPEC-2 fix round 3（REV-SPEC2 第 2 回の C-3・I-3・M-6、ユーザーの「要件に対して過剰でないか」の指摘） | 4.4: 排他の名前の元を、パスの正規化から出力先のディレクトリの `dev`・`ino` に替えた（出力先を作ってから取る。DEF-081 の後始末を戻した）。前の版のロックを読む守りを消し、前の版との同時の実行を対象の外にした | SPEC-2 |

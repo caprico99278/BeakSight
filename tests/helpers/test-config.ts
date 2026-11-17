@@ -1,5 +1,6 @@
 import type { BrowserContextFactoryOptions } from '../../src/browser/context-factory.js';
 import { DEFAULT_CONFIG } from '../../src/config/defaults.js';
+import { AUDIT_SEND_READ_ONLY } from '../../src/core/audit-send-policy.js';
 import type { AuditConfig } from '../../src/config/types.js';
 import type { EgressUpstreamPolicy } from '../../src/safety/egress-proxy.js';
 
@@ -20,6 +21,9 @@ export const LOOPBACK_EGRESS_UPSTREAM_POLICY: EgressUpstreamPolicy = (host) => L
 export const TEST_FACTORY_OPTIONS: BrowserContextFactoryOptions = Object.freeze({
   egressUpstreamPolicy: LOOPBACK_EGRESS_UPSTREAM_POLICY,
 });
+
+/** DEF-276: 操作さがしの Run と同じく、凍結の後に押す factory の指定（`submissionProbeRun`）。probe を押すテストと、最初から凍結の口のテストが使う。 */
+export const PROBE_FACTORY_OPTIONS: BrowserContextFactoryOptions = Object.freeze({ ...TEST_FACTORY_OPTIONS, submissionProbeRun: true });
 
 /** `site` 以外の各セクションを、項目単位で上書きする指定。上書きの値はそのまま使う（複製しない）。 */
 export type TestConfigOverrides = {
@@ -51,7 +55,9 @@ export function createTestConfig(
     crawl: { ...base.crawl, minNavigationIntervalMs: 0, ...overrides.crawl },
     browser: { ...base.browser, headed: false, ...overrides.browser },
     viewports: { ...base.viewports, ...overrides.viewports },
-    audit: { ...base.audit, ...overrides.audit },
+    // L14: 設定ファイルの既定の送信の扱いは `PASS_EXCEPT_DELETE` になった。テストの設定は、書かれたときの前提（読み取りだけ）のまま `READ_ONLY` にする
+    // （`overrides.audit` で上書きできる）。
+    audit: { ...base.audit, sendPolicy: AUDIT_SEND_READ_ONLY, ...overrides.audit },
     output: { ...base.output, ...overrides.output },
   };
 }

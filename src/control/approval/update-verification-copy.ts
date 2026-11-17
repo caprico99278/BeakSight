@@ -2,18 +2,20 @@
 // `2026-10-26-beaksight-plain-ui-design.md` 8.1 の「更新の検証」。MI-7 の一般化）。純粋な部品（管理データ・ファイル・画面に依らない。core と契約の値と型
 // だけを使う）。API の形とフォームの形の両方で使う。
 // - API の形: 台帳の照合の READ の `{id}` の型の定義（唯一の判定 `apiUpdateLedgerReadVerificationOf`）を写す。結び付けは 0 件（`{id}` に台帳の ID が入る）。
-//   登録の ID の取り方は写さない（API の書き換えは求めない）。
+//   登録の ID の取り方は写さない（API の書き換えは求めない）。LU-7 fix round 2（一覧の行の更新の設計書 5.5 の 7、K3）: 一覧の行の更新（`listRow`）は、台帳の
+//   照合の READ が一覧の画面（`listPagePath` と同じ画面）の定義なら、それを写し、照合の専用の印を付ける（行の選び方は `api.ledger.listRow` から取るので、照合の
+//   READ の型に項目は足さない）。
 // - フォームの形: 台帳の登録の ID の型と照合の READ（候補の定義。取り消していないもの）を写し、結び付けを変える欄に結び直す（変える欄でない欄に結んだ
 //   結び付けは、最初の変える文字の欄へ）。照合の専用の印も写す。変える欄に文字の欄がなければ `CHANGED_FIELD_NOT_TEXT`（書き換えの後の照合はできる）。
 // - 期待（両方）: 台帳の期待のうち、行の数の期待と、比べる欄が変える欄のもの。比べる欄の期待が残らなければ、最初の変える欄の「本文が含む」を足す
 //   （書き換えで値が変わるのは変える欄だけなので、保つ欄とは比べない）。
 // - 形の確かめと照合の READ の確かめは、今の保存の口（下書きの確かめ）と許可の発行。
-// MI-C の設計者の判断のとおり、作成の画面のブラウザ側（`ScenarioApiFields.tsx` の `apiUpdateReadFillOf`）は、ここを import できない（`approval-view.ts` から
-// 型だけ）。ブラウザ側の写しの扱いは、PL-6b の報告で設計者に諮った。
+// SPEC-4 で、作成の画面のブラウザ側の写しは画面ごと外したので、写しの決まりはここだけ。
 import { ROW_COUNT_EQUALS_EXPECTATION_KIND, TEXT_CONTAINS_EXPECTATION_KIND } from '../../core/read-check-expectation-kinds.js';
 import { API_SCENARIO_TRANSPORT } from '../../core/scenario-transport.js';
 import { apiUpdateLedgerReadVerificationOf, type ApiScenarioReadCheckFact } from './api-scenario-draft.js';
 import type {
+  ScenarioListRow,
   ScenarioReadVerification,
   ScenarioTransport,
   ScenarioVerificationRecordId,
@@ -50,6 +52,8 @@ export interface UpdateVerificationCopyInput {
   readonly changedFieldNames: readonly string[];
   /** フォームの形で、変える欄のうち文字の欄（欄の順）。API の形は見ない。 */
   readonly changedTextFieldNames?: readonly string[];
+  /** LU-7 fix round 2: API の一覧の行の更新の行の選び方（一覧の画面の path。一覧の行の更新でなければ省く）。 */
+  readonly listRow?: Pick<ScenarioListRow, 'listPagePath'> | null;
 }
 
 /** 台帳の期待のうち、行の数と変える欄の期待。比べる欄の期待が残らなければ、最初の変える欄の「本文が含む」を足す。 */
@@ -57,6 +61,35 @@ const copiedExpectationsOf = (expectations: readonly VerificationExpectation[], 
   const kept = expectations.filter((expectation) => expectation.kind === ROW_COUNT_EQUALS_EXPECTATION_KIND || changed.includes(expectation.fieldName));
   const compared = kept.some((expectation) => expectation.kind !== ROW_COUNT_EQUALS_EXPECTATION_KIND);
   return compared ? kept.map((expectation) => ({ ...expectation })) : [...kept.map((expectation) => ({ ...expectation })), { kind: TEXT_CONTAINS_EXPECTATION_KIND, fieldName: first }];
+};
+
+/**
+ * LU-7 fix round 2: API の一覧の行の更新の、台帳の一覧の画面の照合の READ の写し（取り消していない、一覧の画面の path が `listPagePath` と同じ定義で、結び付けの
+ * ないもの。ほかは null で、今の `{id}` の型の写しに回す）。期待は変える欄（行の数と、比べる欄が変える欄のもの。なければ最初の変える欄の「本文が含む」）。
+ */
+const listRowCopyOf = (
+  input: UpdateVerificationCopyInput,
+  ledgerRead: ScenarioReadVerification | null,
+  firstChanged: string,
+): Extract<UpdateVerificationCopy, { readonly kind: 'FILLED' }> | null => {
+  const listPagePath = input.listRow?.listPagePath ?? null;
+  const definition = ledgerRead === null || listPagePath === null
+    ? undefined
+    : input.readChecks.find(({ readCheckId }) => readCheckId === ledgerRead.readCheckId);
+  if (ledgerRead === null || definition === undefined || definition.targetPagePath !== listPagePath || ledgerRead.bindings.length > 0) {
+    return null;
+  }
+  return {
+    kind: 'FILLED',
+    recordId: null,
+    readVerification: {
+      readCheckId: definition.readCheckId,
+      revision: definition.revision,
+      bindings: [],
+      expectations: copiedExpectationsOf(ledgerRead.expectations, input.changedFieldNames, firstChanged),
+      verificationOnly: true,
+    },
+  };
 };
 
 /** 書き換えの検証の指定を、台帳から写す（両方の形の唯一の決まり）。 */
@@ -67,6 +100,10 @@ export const updateVerificationCopyOf = (input: UpdateVerificationCopyInput): Up
   }
   const ledgerRead = input.ledger?.readVerification ?? null;
   if (input.transport === API_SCENARIO_TRANSPORT) {
+    const listCopy = listRowCopyOf(input, ledgerRead, firstChanged);
+    if (listCopy !== null) {
+      return listCopy;
+    }
     const seed = apiUpdateLedgerReadVerificationOf(ledgerRead, input.readChecks);
     return seed.status === 'UNAVAILABLE'
       ? { kind: 'UNAVAILABLE', reason: seed.reason }

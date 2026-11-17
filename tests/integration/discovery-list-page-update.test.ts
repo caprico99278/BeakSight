@@ -1,8 +1,8 @@
 // OP-R（設計書 `doc/design/2026-10-27-beaksight-one-pass-flow-design.md` 4.1.9 の R2）: 一覧の画面の「編集」から開くモーダルの入力で更新する SPA の形で、操作さがしの
 // 押して確かめる道（送らずに観察する probe）が、更新の候補（PATCH を `?id=eq.<番号>` で送る形）をどう扱うかを確かめる（OP-R の調べ。今の事実を固定する）。
-// - 今の事実: probe は「編集」を押してモーダルを開き（`NO_REQUEST`）、続けてモーダルの「保存」を押して PATCH の型を観察する（サーバへは送らない）。ただし、
-//   filter の値（`id`）が画面の path の値でないので、`NOT_EXECUTABLE`・`FILTER_NOT_PAGE_VALUE` に分類し、更新の候補（`API_UPDATE`）にしない。更新の候補として
-//   扱うには、行の番号を filter の値と結ぶ分類と、書き込みの段で対象の行の「編集」を押してから入れる道が要る（OP-R の報告の Blocker。設計者の判断を待つ）。
+// - 今の事実: probe は「編集」を押してモーダルを開き（`NO_REQUEST`）、続けてモーダルの「保存」を押して PATCH の型を観察する（サーバへは送らない）。
+//   LU-11 fix round 2（一覧の行の更新の設計書 5.2 の 4。LU-2・LU-4 の後）: filter の値（`id`）は画面の path の値でないが、開き手から開いた窓の保存で値が番号の
+//   形なので、更新の候補（`API_UPDATE`。A_FILTER）に分類し、記録に開き手（`opener`）を持つ（前の OP-R の調べでは `FILTER_NOT_PAGE_VALUE` だった）。
 // - fixture: 会員の一覧の画面（`startSpaAuthSite` の `memberListPage`）。各行に「編集」があり、押すとモーダルが開き、「保存」で PATCH を送る。データは 1 件以上。
 // - 発見は本物の流れ（`executeDiscoveryRun`。認証つきの factory と Guard、probe）。入口は一覧の画面。サーバへは読み取りでない要求が届かない（probe は送らない）。
 // - 読む先と押す道の確かめなので、テストの既定の Chromium だけで確かめる。サーバは 127.0.0.1 だけで待ち受ける。出力先は一時のフォルダだけ。
@@ -17,6 +17,7 @@ import { spaApiWriteConfigOf, spaRunAuthenticationOf } from '../helpers/api-writ
 import { launchHeadlessChromium } from '../helpers/chromium.js';
 import { READ_METHODS } from '../helpers/leak-places.js';
 import { SPA_MEMBER_LIST_PATH, startSpaAuthSite, type SpaAuthSite } from '../helpers/spa-auth-site-fixture.js';
+import { probeQuietWindowsOf } from '../helpers/test-waits.js';
 
 const TEST_TIMEOUT_MS = 180_000;
 /** 押した後に静まるまで待つ時間（ms。テストの値。fixture はすぐに送る）。 */
@@ -40,7 +41,7 @@ describe('OP-R (R2): the update candidate of the edit dialog on the list page', 
     if (directory !== '') await rm(directory, { recursive: true, force: true });
   }, TEST_TIMEOUT_MS);
 
-  it('observes the PATCH of the dialog opened by the edit button without sending it, but does not take it as an update candidate yet', async () => {
+  it('observes the PATCH of the dialog opened by the edit button without sending it, and takes it as an update candidate with the opener (LU-2, LU-4)', async () => {
     expect(site.memberCount).toBeGreaterThan(0);
     // 監査の送信の扱いは既定の `PASS_EXCEPT_DELETE`（一覧の手続きの呼び出しが通り、行が描かれる）。
     const base = spaApiWriteConfigOf(site, join(directory, 'output'), { crawl: { maxPages: MAX_PAGES }, audit: { sendPolicy: 'PASS_EXCEPT_DELETE' } });
@@ -50,7 +51,7 @@ describe('OP-R (R2): the update candidate of the edit dialog on the list page', 
       jobId: 'job-discovery-list-update',
       authentication: spaRunAuthenticationOf(site),
       launchBrowser: () => launchHeadlessChromium(),
-      clock: () => new Date(), now: () => Date.now(), stopSignal: new AbortController().signal, submissionProbeQuietWaitMs: SHORT_QUIET_WAIT_MS,
+      clock: () => new Date(), now: () => Date.now(), stopSignal: new AbortController().signal, observationWindows: probeQuietWindowsOf(SHORT_QUIET_WAIT_MS),
     }, { onRunStarted: () => undefined, onSessionLost: () => undefined });
     if (outcome.kind !== 'RAN') throw new Error(`the discovery did not run: ${outcome.kind}`);
     const document = JSON.parse(readFileSync(join(outcome.runDirectory, 'discovery.json'), 'utf8')) as DiscoveryDocument;
@@ -59,14 +60,24 @@ describe('OP-R (R2): the update candidate of the edit dialog on the list page', 
     // probe は送らない（サーバへ届いた読み取りでない要求は、一覧の手続きの呼び出し（読み取りの手続き。送信の扱いで通す）のほかにない）。
     const nonReads = site.requests.slice(since).filter((request) => request.preflight || !READ_METHODS.has(request.method));
     expect(nonReads.filter((request) => request.method === 'PATCH')).toEqual([]);
-    // 「編集」はモーダルを開くだけ（何も送らない）。モーダルの「保存」で PATCH の型を観察した（filter は `id`。値は画面の path にない）。
-    expect(probes).toEqual(expect.arrayContaining([{ words: ['編集'], result: 'NO_REQUEST' }, { words: ['保存'], result: 'NOT_EXECUTABLE' }]));
+    // 「編集」はモーダルを開くだけ（何も送らない）。モーダルの「保存」で PATCH の型を観察した（filter は `id`。値は画面の path にないが、番号の形）。
+    // LU-11 fix round 2（一覧の行の更新の設計書 5.2 の 4、LU-2・LU-4 の後の意図した変化）: 開き手から開いた窓の保存（probe の記録に開き手）で、filter が 1 つの
+    // `eq` で値が番号の形なら、更新の候補（`API_UPDATE`。A_FILTER）にする（前の OP-R の調べでは `FILTER_NOT_PAGE_VALUE` だった）。
+    expect(probes).toEqual(expect.arrayContaining([{ words: ['編集'], result: 'NO_REQUEST' }, { words: ['保存'], result: 'API_UPDATE' }]));
+    const editor = onList.find((candidate) => candidate.submitterWords.includes('編集'));
     const save = onList.find((candidate) => candidate.submitterWords.includes('保存'));
     expect(save?.submissionProbe).toMatchObject({
-      reason: 'FILTER_NOT_PAGE_VALUE',
-      shape: { method: 'PATCH', filters: [{ name: 'id', operator: 'eq', valueMatchesPagePath: false }] },
+      result: 'API_UPDATE',
+      reason: null,
+      nonReadRequestCount: 1,
+      shape: {
+        method: 'PATCH',
+        pathShape: '/rest/v1/members',
+        filters: [{ name: 'id', operator: 'eq', valueMatchesPagePath: false, valueIsRecordIdLike: true }],
+      },
+      opener: { identityDigest: editor?.identityDigest, hasName: true, openerWords: ['編集'] },
     });
-    // 更新の候補にはしない（今の分類。OP-R の Blocker）。
-    expect(probes.filter(({ result }) => result === 'API_UPDATE')).toEqual([]);
+    // 更新の候補は窓の保存の 1 つだけ（「編集」は更新の候補にしない）。
+    expect(probes.filter(({ result }) => result === 'API_UPDATE')).toEqual([{ words: ['保存'], result: 'API_UPDATE' }]);
   }, TEST_TIMEOUT_MS);
 });

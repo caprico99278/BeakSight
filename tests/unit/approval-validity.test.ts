@@ -37,14 +37,14 @@ const FACTS: ApprovalCurrentFacts = Object.freeze<ApprovalCurrentFacts>({
   profile: { profileId: PROFILE_ID, revision: 4, status: 'ACTIVE', mode: 'TEST_APPROVED_WRITE', approvedServiceOrigins: [] },
   authSetupDigest: AUTH_SETUP_DIGEST,
   targetConfigDigest: TARGET_CONFIG_DIGEST,
-  candidate: { identityDigest: CREATE_CANDIDATE.identityDigest, ruleDigest: CREATE_CANDIDATE.ruleDigest, classification: 'CREATE', drift: 'UNCHANGED' },
+  candidate: { identityDigest: CREATE_CANDIDATE.identityDigest, ruleDigest: CREATE_CANDIDATE.ruleDigest, classification: 'CREATE', drift: 'SEEN' },
   // T31b: 型にした識別の digest の一覧（UPDATE だけが使う。CREATE の判定は見ない）。
   templatedCandidates: null,
   // T38c: 候補の型の digest の一覧（API のシナリオだけが使う。FORM の判定は見ない）。
   candidateShapeDigests: null,
   // T38R-fix: 鍵と欄の対応の digest の一覧、型の Origin の番号、最新の発見の改訂（API のシナリオだけが使う）。
   candidateKeyFieldDigests: null,
-  apiShapeOriginIndex: null,
+  apiShapeOrigin: null,
   latestDiscoveryProfileRevision: null,
   inputRuleReference: INPUT_RULES,
   readChecks: READ_CHECK_FACTS,
@@ -112,14 +112,9 @@ describe('approval validity (T28a)', () => {
     expect(Object.isFrozen(validity)).toBe(true);
   });
 
-  // T28a fix round 1（発見事項 1）: 候補は、承認に固定した 2 つの digest と、最後の発見の索引の今の digest で比べる（ドリフトの印 `CHANGED` だけでは
-  // 再承認にしない。承認の後にもう一度発見しなくても使える。意図した変化）。
-  it('stays approved for a CHANGED drift whose rule digest is still the approved one', () => {
-    expect(evaluateApprovalValidity(input(withCandidate({ drift: 'CHANGED' })))).toEqual({ approved: true, receiptId: 'receipt-1', expiresAt: '20261111020000' });
-  });
-
-  it('accepts a candidate first seen in the latest discovery (NEW), and an older revocation of another receipt', () => {
-    expect(evaluateApprovalValidity(input(withCandidate({ drift: 'NEW' }))).approved).toBe(true);
+  // T28a fix round 1（発見事項 1）: 候補は、承認に固定した 2 つの digest と、最後の発見の索引の今の digest で比べる。SPEC-1: ドリフトは 3 通りになり、
+  // 前の `CHANGED`・`NEW` の場面は消した（見えた候補 `SEEN` は、上の既定の事実で受ける）。
+  it('accepts an older revocation of another receipt', () => {
     expect(evaluateApprovalValidity(input({ lastRevocation: sampleRevocation({ targetReceiptId: 'receipt-0' }) })).approved).toBe(true);
   });
 
@@ -137,7 +132,7 @@ describe('approval validity (T28a)', () => {
     ['an identity digest other than the bound one of the receipt', {
       lastApproval: sampleApproval(digestOf(), { bound: { ...APPROVAL.bound, candidateIdentityDigest: UPDATE_CANDIDATE.identityDigest } }),
     }, ['CANDIDATE_MISSING']],
-    ['a CHANGED candidate with another rule digest', withCandidate({ drift: 'CHANGED', ruleDigest: UPDATE_CANDIDATE.ruleDigest }), ['CANDIDATE_CHANGED']],
+    ['a candidate with another rule digest', withCandidate({ ruleDigest: UPDATE_CANDIDATE.ruleDigest }), ['CANDIDATE_CHANGED']],
     ['another rule digest', withCandidate({ ruleDigest: UPDATE_CANDIDATE.ruleDigest }), ['CANDIDATE_CHANGED']],
     ['another classification', withCandidate({ classification: 'UPDATE' }), ['CANDIDATE_CHANGED']],
     ['a candidate classified as not executable', withCandidate({ classification: 'NOT_EXECUTABLE' }), ['CANDIDATE_CHANGED']],
@@ -214,17 +209,15 @@ describe('approval validity (T28a)', () => {
     const expiresAt = dateOfCompactUtcTimestamp(APPROVAL.expiresAt).getTime();
     const SECOND_MS = 1_000;
 
+    // L12b（設計書 `2026-11-09-beaksight-remove-limits-design.md` 6.2。S16）: 承認の有効期間を撤廃した（前は期限の時刻から `EXPIRED`）。保存済みの `expiresAt` は
+    // 読むときに見ない。承認は、digest が変わるか撤回するまで有効。
     it.each([
-      ['one second before the expiry', expiresAt - SECOND_MS, []],
-      ['exactly at the expiry', expiresAt, ['EXPIRED']],
-      ['one second after the expiry', expiresAt + SECOND_MS, ['EXPIRED']],
-    ] as const)('%s', (_label, time, reasons) => {
-      expect(reasonsOf(evaluateApprovalValidity(input({ now: new Date(time) })))).toEqual(reasons);
-    });
-
-    it('uses the earlier of the stored expiry and the expiry from the TTL of the approved revision (fail-closed)', () => {
-      const longer = sampleApproval(digestOf(), { expiresAt: '20271012020000' });
-      expect(reasonsOf(evaluateApprovalValidity(input({ lastApproval: longer, now: new Date(expiresAt) })))).toEqual(['EXPIRED']);
+      ['one second before the stored expiry', expiresAt - SECOND_MS],
+      ['exactly at the stored expiry', expiresAt],
+      ['one second after the stored expiry', expiresAt + SECOND_MS],
+      ['a year after the stored expiry', expiresAt + 365 * 24 * 3_600 * SECOND_MS],
+    ] as const)('stays approved %s (L12b)', (_label, time) => {
+      expect(reasonsOf(evaluateApprovalValidity(input({ now: new Date(time) })))).toEqual([]);
     });
 
     it('computes the expiry from the approval time and the TTL in days (UTC, 14 digits)', () => {
@@ -243,11 +236,11 @@ describe('approval validity (T28a)', () => {
         profile: { profileId: PROFILE_ID, revision: 5, status: 'RETIRED', mode: 'TEST_AUTH_PASSIVE', approvedServiceOrigins: [] },
         authSetupDigest: null,
         targetConfigDigest: '8888888888888888888888888888888888888888888888888888888888888888',
-        candidate: { ...(FACTS.candidate ?? CREATE_CANDIDATE), drift: 'CHANGED', ruleDigest: UPDATE_CANDIDATE.ruleDigest } as ApprovalCurrentFacts['candidate'],
+        candidate: { ...(FACTS.candidate ?? CREATE_CANDIDATE), drift: 'SEEN', ruleDigest: UPDATE_CANDIDATE.ruleDigest } as ApprovalCurrentFacts['candidate'],
         templatedCandidates: null,
         candidateShapeDigests: null,
         candidateKeyFieldDigests: null,
-        apiShapeOriginIndex: null,
+        apiShapeOrigin: null,
         latestDiscoveryProfileRevision: null,
         inputRuleReference: null,
         readChecks: [],
@@ -263,7 +256,7 @@ describe('approval validity (T28a)', () => {
       'CANDIDATE_CHANGED',
       'INPUT_RULES_CHANGED',
       'READ_CHECK_CHANGED',
-      'EXPIRED',
+      // L12b: 期限の理由 `EXPIRED` は出さない（有効期間の撤廃）。
       'REVOKED',
       'PROFILE_RETIRED',
       'MODE_NOT_WRITE',

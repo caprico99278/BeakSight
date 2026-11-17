@@ -20,6 +20,7 @@ import { getAuthSetup, saveAuthSetup } from '../../../src/control/store/auth-set
 import { closeControlDatabase, openControlDatabase, type ControlDatabase } from '../../../src/control/store/control-database.js';
 import { resolveControlDatabasePath } from '../../../src/control/store/database-path.js';
 import { createProfile, getProfile, retireProfile, updateProfile } from '../../../src/control/store/profile-store.js';
+import { createTestConfig } from '../../../tests/helpers/test-config.js';
 import {
   TEST_ORIGIN,
   TEST_TARGET_PATH,
@@ -299,5 +300,55 @@ describe('MI-C (CC-115): the reason of a rejected save of the profile and the au
       expect(WRITE_MODE_SWITCH_REJECTION_REASONS, reason).toContain(reason);
       expect(AUTOMATED_LOGIN_SETUP_REJECTION_REASONS, reason).toContain(reason);
     }
+  });
+});
+
+// NL-3（設計書 `doc/design/2026-11-06-beaksight-no-login-test-site-design.md` 3.3 の 3）: ログインのないテスト用のサイト（`auth: NONE`。loopback だけ）は、
+// 認証の設定を求めず、プロファイルの次の改訂（モードだけを書き込みのモードにする）だけを保存する。認証の設定は作らない。
+describe('NL-3: the switch of a test site without login saves only the profile', () => {
+  const NO_LOGIN_PROFILE_ID = 'nl3-no-login';
+  const LOOPBACK_ORIGIN = 'http://127.0.0.1:4173';
+  const LOOPBACK_TARGET_PATH = 'local/targets/example-loopback.json';
+  const loopbackContext = { targetConfig: createTestConfig(LOOPBACK_ORIGIN) };
+  const resolveLoopback = (path: string) => (path === LOOPBACK_TARGET_PATH ? loopbackContext : undefined);
+  const noLoginProfile: SiteProfile = {
+    ...testAuthProfile(NO_LOGIN_PROFILE_ID, MIN_PROFILE_REVISION, LOOPBACK_ORIGIN),
+    targetConfigPath: LOOPBACK_TARGET_PATH,
+    auth: 'NONE',
+  };
+
+  beforeEach(() => {
+    expect(createProfile(database, noLoginProfile, { resolveContext: resolveLoopback }).ok).toBe(true);
+  });
+
+  it('offers the switch without an auth setup', async () => {
+    expect(await writeModeSwitchProposalOf(deps(), NO_LOGIN_PROFILE_ID)).toEqual({
+      profileRevision: MIN_PROFILE_REVISION,
+      nextProfileRevision: MIN_PROFILE_REVISION + 1,
+      authSetupCurrent: true,
+      environmentEvidenceRef: noLoginProfile.environmentEvidenceRef,
+      isolationUnverified: false,
+      approvedScenarioCount: APPROVED_SCENARIOS,
+    });
+  });
+
+  it('saves the next revision in the write mode, without making an auth setup', () => {
+    const result = switchToWriteMode(deps(), { profileId: NO_LOGIN_PROFILE_ID, expectedRevision: MIN_PROFILE_REVISION }, { resolveContext: resolveLoopback });
+    expect(result).toEqual({ ok: true, profileRevision: MIN_PROFILE_REVISION + 1 });
+    expect(getProfile(database, NO_LOGIN_PROFILE_ID)?.profile).toEqual({
+      ...noLoginProfile,
+      revision: MIN_PROFILE_REVISION + 1,
+      mode: 'TEST_APPROVED_WRITE',
+      environmentEvidenceRef: UNVERIFIED_REF,
+    });
+    expect(getAuthSetup(database, NO_LOGIN_PROFILE_ID)).toBeNull();
+  });
+
+  it('rejects a revision conflict and an unreadable target configuration, and writes nothing', () => {
+    expect(switchToWriteMode(deps(), { profileId: NO_LOGIN_PROFILE_ID, expectedRevision: MIN_PROFILE_REVISION + 1 }, { resolveContext: resolveLoopback }))
+      .toMatchObject({ ok: false, reason: 'PROFILE_REVISION_CONFLICT' });
+    expect(switchToWriteMode(deps(), { profileId: NO_LOGIN_PROFILE_ID, expectedRevision: MIN_PROFILE_REVISION }, { resolveContext: () => undefined }))
+      .toMatchObject({ ok: false, reason: 'TARGET_CONFIG_UNAVAILABLE' });
+    expect(getProfile(database, NO_LOGIN_PROFILE_ID)?.profile).toEqual(noLoginProfile);
   });
 });

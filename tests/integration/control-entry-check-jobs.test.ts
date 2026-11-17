@@ -1,6 +1,6 @@
 // T43c（Task 43 の設計書 4.3）: 入口の確かめのジョブ（`ENTRY_CHECK`）の、ジョブの管理（`createAuditJobManager` の `startEntryCheck` と、ジョブの終わりの
 // 照らし合わせ）を、偽のワーカー（`tests/helpers/fake-audit-worker.ts` の `entry-check` の動き）を本物の `fork` で起動して確かめる（本物のワーカーと
-// Chromium での流れは `entry-check-run.test.ts`、子 process の端から端は `entry-check-job-fork.test.ts`）。
+// Chromium での流れは `entry-check-run.test.ts`、画面からの端から端は `full-flow.test.ts`）。
 // - 開始の確かめは監査と同じ（プロファイル、改訂、モード、ターゲット設定、同時に 1 つ）。公開のプロファイルでも、認証の設定のないテストのプロファイル
 //   でも始められる（ログインはしない）。`START` は `ENTRY_CHECK` の種類で、認証の指定を持たない。
 // - ジョブの終わり: 親が `entry-check.json` を読み、スキーマ・ジョブの ID・Run の ID・Run Status・件数の要約で確かめてから、ジョブを `FINISHED` にする。

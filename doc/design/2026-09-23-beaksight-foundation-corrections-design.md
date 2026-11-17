@@ -34,7 +34,7 @@ Critical はなかった。一方、Important には安全不変条件の違反�
 | CC-004 許可Originの正規化 | 今回（F02c） | URLの意味のowner `src/crawl/normalize-url.ts` に `canonicalizeAllowedOrigins` を置き、admission-policy と request-policy はそれを使う。2つの実装が同じ結果を返すことは、レビューで確認済み |
 | CC-005 http/https の判定 | 今回（F02c） | `src/crawl/normalize-url.ts` に `isHttpProtocol` を置き、Node側の9か所をそれに置き換える。ブラウザ内の判定はそのまま（第3.1節） |
 | CC-006 採番とハッシュの書式 | 今回（F02c） | `REQ-` の採番と `sha256:` の書式を `src/core/ids.ts` に移す |
-| CC-007 上限値 | 今回（F01・F02・C7） | `src/core/limits.ts` に、複数のownerで同じ意味を持つ上限（URLの最大長、エラーメッセージの最大長、HTTPメソッドの最大長、selectorの長さと深さ）と、複数の collector で共有する Evidence の収集の上限（console・network・Resource Timing の件数や長さ）を置く。1つの collector だけが使う収集の上限（`DOM_LIMITS`、`LAYOUT_THRESHOLDS` など）と、特定のownerが意味を決める上限（Interaction 候補の上限など）は、そのownerに置く（2026-09-23 C7・C6 の報告を受けて改訂） |
+| CC-007 上限値 | 今回（F01・F02・C7） | `src/core/limits.ts` に、複数のownerで同じ意味を持つ上限（URLの最大長、エラーメッセージの最大長、HTTPメソッドの最大長、selectorの長さと深さ）と、複数の collector で共有する Evidence の収集の上限（console・network・Resource Timing の件数や長さ）を置く。1つの collector だけが使う収集の上限（`DOM_LIMITS`、`LAYOUT_THRESHOLDS` など）と、特定のownerが意味を決める上限（Interaction 候補の上限など）は、そのownerに置く（2026-09-23 C7・C6 の報告を受けて改訂）。2026-11-09〜11-13 の上限の撤廃（`2026-11-09-beaksight-remove-limits-design.md`）で、URL・エラーの文・collector の文の長さの上限と `DOM_LIMITS` はなくなった。残るのは selector の深さなど、構造や守りに結び付く値だけ |
 | CC-008 ブラウザ内のDOM走査と可視判定 | 可視判定は今回（C5）。`discover-candidates.ts` の中の複製の整理は Task 18 の後、Task 19 の前 | 第5.5節 |
 | CC-009 状態と理由のコード | 今回（F02・C8） | 部分失敗の理由と観測状態を `src/core/contracts.ts` で1回だけ定義する。型とスキーマの整備（C8）で `incompleteReasons` を構造化する |
 | CC-010 利用者向けの文言 | Task 16・17 | UI追補設計書のとおり `src/presentation/messages.ts` に集める |
@@ -95,7 +95,15 @@ cleanup deadline の修正には、実装時の report とREDの記録がない�
 
 ### 4.4 click と関係のない変化で VERIFIED にしない（Q2、R2-N1、R'1-N1'、R''1）
 
-この節は、2026-09-23 に4回改訂した。経緯は第10章の設計変更履歴にある。現在の設計は次のとおりである。
+> **SPEC-5（2026-11-14 の設計書 `2026-11-14-beaksight-slim-and-simplify-design.md` 5.1）で、4.4.1〜4.4.4 と 4.5・4.8 を置き換えた。** 今の決まりは次のとおり。下の本文は経緯として残す。
+> - 流れ: 凍結の前の下準備（探索 → 同じ要素かの観測 1 回 → スクロール → hover → 描画 2 回 → 観測 1 回 → handle の破棄）→ 凍結 → 探し直し → 同じ候補か → 受け入れの判定（拒む候補は Ledger）→ 押す → 落ち着き（`waitForPageSettled`。期限を指定したときも待つ）→ 凍結の確かめ → 観測 1 回 → 凍結の確かめ。focus・安定の窓・持続の窓・形とスクロールの比べ・DOM の作業量の差し引きはしない。「凍結の後にスクロールする方式は採らない」は変えない。
+> - 根拠: ARIA の状態・`aria-controls` の先の見え方・文字・無効・見え方・親の details の開閉・対象の属性のうち ARIA の状態（`aria-expanded`・`aria-pressed`・`aria-checked`・`aria-selected`）と `open`・class の名前の増減（名前に focus か hover を含む名前は除く）。前はタブだけに当てた決まりを、全部の候補に当てる。style・data-*・tabindex などのほかの属性と、位置と大きさは根拠にしない。
+> - 理由のコード: 今の版が書くコードと、前の版だけが書いた読むだけのコード（`INTERACTION_LEGACY_NOT_VERIFIABLE_REASON_CODES`）の和をスキーマに残す（page-schema は 1.1 のまま）。
+> - 4.2 の最後の項（DOM 作業量の上限を 1 回の auditInteraction で共有する）と、4.3 の 2 段落目（style の切り詰め）は、名残なので効力を失った。
+> - 既知の判定の変化（ユーザーの判断「判定の細かさは下がる」の範囲。REV-SPEC5 で実機で確かめた）: (1) タイマーで状態が変わる部品が「効いた」になりうる。(2) 押したときに付く、名前に focus も hover も含まない class が「効いた」になりうる。(3) focus で開く部品が、押して開けば「効いた」になる。(4) 押した後に 1 秒ほどだけ付く一時の印（class・ARIA の状態）が「効いた」になる（持続の窓をやめたため。押したこと自体は本当）。(5) focus で送信する部品は、前の「効いた」から「安全のため止めた」に変わる（安全の向き）。(6) style と位置だけを変える部品は「効いた」にならない。
+> - 期限を指定したとき（CLI だけ。画面の監査はいつも期限なし）は、期限まで落ち着かないと観測しない（`DEADLINE_DURING_POST_CONDITION_OBSERVATION`）。データの遅いページでは、`interactionTimeoutMs` を 6 秒以上にする。約 600ms 未満の期限では確かめられない。
+
+この節は、2026-09-23 に4回改訂した。経緯は第10章の設計変更履歴にある。現在の設計は次のとおりである（SPEC-5 で置き換え。上の注を参照）。
 
 #### 4.4.1 VERIFIED の根拠（2026-09-23 R''' を受けた最終の方針）
 
@@ -397,3 +405,4 @@ C8 の実装中に見つかった（不具合台帳 `defects.md` の DEF-001）�
 | 2026-09-23 | C7 の報告（発見事項1） | 3章の CC-007 の方針を改訂し、Evidence の収集の上限も `limits.ts` に置くことにした | F04 |
 | 2026-09-23 | F02b の報告（発見事項4） | 3.2 に、CC-001 の3か所を共通化しない例外を追加 | なし |
 | 2026-09-23 | F01 の報告（発見事項1、2） | 3.2 に、isolated-auditor の振る舞いの変化と、代替文言を場所ごとに保つ方針を追加 | F02b |
+| 2026-11-14 | SPEC-5（ユーザーの判断 2026-11-13、設計書 2026-11-14 5.1） | 4.4 の冒頭に、4.4.1〜4.4.4・4.5・4.8 と 4.2 の最後の項・4.3 の 2 段落目を置き換えた注を加えた（押した後の確かめを 1 回の観察で決める） | SPEC-5 |

@@ -20,13 +20,6 @@ import { createServerFn } from '@tanstack/react-start';
 import type { ConfigErrorKind } from '../../../../src/config/config-error.js';
 import { RECORD_ID_PLACEHOLDER } from '../../../../src/control/approval-view.js';
 import {
-  MAX_READ_CHECK_DEFINITIONS_PER_PROFILE,
-  MAX_READ_CHECK_DETAIL_FIELD_LENGTH,
-  MAX_READ_CHECK_EXPECTATIONS,
-  MAX_READ_CHECK_EXPECTED_TEXT_LENGTH,
-  MAX_READ_CHECK_PARAMETER_VALUE_LENGTH,
-  MAX_READ_CHECK_ROW_COUNT,
-  MAX_READ_CHECK_PAGE_PATH_LENGTH,
   READ_CHECK_EXPECTATION_KINDS,
   READ_CHECK_TARGET_KINDS,
   readCheckTargetKindOf,
@@ -181,15 +174,10 @@ export interface ReadCheckJobResultsView {
 /** 定義のフォームの決まり（契約の閉じた一覧と上限。画面の入力の欄の上限と選択肢に使う）。 */
 export interface ReadCheckFormView {
   readonly expectationKinds: readonly ReadCheckExpectationKind[];
-  readonly maxParameterValueLength: number;
-  readonly maxExpectations: number;
-  readonly maxRowCount: number;
-  readonly maxExpectedTextLength: number;
-  readonly maxDetailFieldLength: number;
-  readonly maxDefinitions: number;
-  /** T37d: 定義の対象の種類（表示の順）と、画面の path の最大長。 */
+  // L4（COV-7）: 定義の数と期待の数の上限は持たない（画面に上限を出さない・止めない）。LZ-2: 送る値・期待の文・項目の名前の長さの上限も持たない。
+  // LZ-3a: 期待の行の数の上限（前は `maxRowCount` 100,000）も持たない。
+  /** T37d: 定義の対象の種類（表示の順）。URL-LEN: 画面の path の長さの上限は撤廃した。 */
   readonly targetKinds: readonly ReadCheckTargetKind[];
-  readonly maxPagePathLength: number;
   /** T38f: 画面の path の型のレコードの ID の区切りの印（契約の値。`{id}` つきの型の案内に使う）。 */
   readonly pageTemplatePlaceholder: string;
 }
@@ -236,14 +224,7 @@ export type ReadCheckCancelView = { readonly ok: true } | { readonly ok: false; 
 
 const FORM_VIEW: ReadCheckFormView = Object.freeze({
   expectationKinds: READ_CHECK_EXPECTATION_KINDS,
-  maxParameterValueLength: MAX_READ_CHECK_PARAMETER_VALUE_LENGTH,
-  maxExpectations: MAX_READ_CHECK_EXPECTATIONS,
-  maxRowCount: MAX_READ_CHECK_ROW_COUNT,
-  maxExpectedTextLength: MAX_READ_CHECK_EXPECTED_TEXT_LENGTH,
-  maxDetailFieldLength: MAX_READ_CHECK_DETAIL_FIELD_LENGTH,
-  maxDefinitions: MAX_READ_CHECK_DEFINITIONS_PER_PROFILE,
   targetKinds: READ_CHECK_TARGET_KINDS,
-  maxPagePathLength: MAX_READ_CHECK_PAGE_PATH_LENGTH,
   pageTemplatePlaceholder: RECORD_ID_PLACEHOLDER,
 });
 

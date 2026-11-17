@@ -36,9 +36,18 @@ import {
   type Finding,
   type PageAuditResult,
   type PageId,
+  type RunSummary,
   type ViewportProfile,
 } from '../core/contracts.js';
-import { BLOCKED_EVENT_PHASES, type BlockedEventPhase, type SafetyEventsEvidence, type SafetyEvidenceLoad } from '../core/evidence-types.js';
+import {
+  BLOCKED_EVENT_PHASES,
+  type BlockedEventPhase,
+  type ImageDomEvidence,
+  type NetworkFailureEvidence,
+  type PageErrorEvidence,
+  type SafetyEventsEvidence,
+  type SafetyEvidenceLoad,
+} from '../core/evidence-types.js';
 import { isBeakSightDisabledFeaturePageError, isFetchFailurePageError, isGuardBlockedPageError } from '../core/guard-page-exceptions.js';
 import { REPORT_BEAKSIGHT_BLOCK_REFERENCE_COUNT } from '../core/limits.js';
 import { ruleBlockSensitivityOf, type RuleBlockTarget, type SafetyPhaseEvents } from '../audit/rule-block-sensitivity.js';
@@ -81,13 +90,38 @@ export interface BeakSightBlockRelationView {
   readonly blockCount: number;
 }
 
-/** Evidence の ID から引く、最終の試行の Evidence と、それがあるページ。 */
+/**
+ * Evidence の ID から引く、最終の試行の Evidence の、判定に使う項目だけ（MEM-4。記録そのものは持たない）と、それがあるページ。種類に合わない項目は空
+ * （`safetyPhases` は `null`）。
+ */
 interface IndexedEvidence {
-  readonly record: EvidenceRecord;
   readonly pageId: PageId;
+  readonly type: EvidenceRecord['type'];
+  readonly viewport: ViewportProfile | null;
+  readonly observedAt: string;
+  /** layout: 幅の走査の幅（`stressSweep` の順）。 */
+  readonly stressWidths: readonly number[];
+  /** network: 失敗（判定に使う項目だけ。記録の順）。 */
+  readonly failures: readonly Pick<NetworkFailureEvidence, 'resourceType' | 'url' | 'method' | 'blockedByBeakSight'>[];
+  /** network: 承認したサービスの Origin からの 401 の応答があるか（DEF-206）。 */
+  readonly approvedServiceUnauthorized: boolean;
+  /** dom: 解決済みの URL のある画像（判定に使う項目だけ。記録の順）。 */
+  readonly images: readonly (Pick<ImageDomEvidence, 'complete' | 'naturalWidth'> & { readonly resolvedUrl: string })[];
+  /** console: 捕まえない例外（記録の順）。 */
+  readonly pageErrors: readonly PageErrorEvidence[];
+  /** safety: Rule が数える止めた事象の時点（一覧ごと。記録の順）。 */
+  readonly safetyPhases: Readonly<Record<SafetyPhaseEvents, readonly BlockedEventPhase[]>> | null;
 }
 
-/** 判定のための、Run の索引（`indexBeakSightBlocks` で 1 回だけ作る）。 */
+/** 行き先の移動の判定に使う、ページの事実（MEM-4。ページそのものは持たない）。 */
+interface IndexedPage {
+  readonly pageId: PageId;
+  readonly pageUrl: string;
+  /** 行き先の移動が BeakSight の遮断で失敗したビューポート（ページの `viewports` の項目の順）。 */
+  readonly blockedNavigationViewports: readonly ViewportProfile[];
+}
+
+/** 判定のための、Run の索引（`createBeakSightBlockIndexBuilder` で、ページを 1 つずつ足して 1 回だけ作る）。 */
 export interface BeakSightBlockIndex {
   readonly evidence: ReadonlyMap<EvidenceId, IndexedEvidence>;
   /** 読み込みの鍵（`loadKeyOf`）ごとの遮断（記録の順。重なりを含む）。 */
@@ -97,7 +131,7 @@ export interface BeakSightBlockIndex {
    * その読み込みで止めた main frame の移動の行き先と等しいときの、その Evidence の `observedAt`）。分からない読み込みは持たない。
    */
   readonly errorPageSinceByLoad: ReadonlyMap<string, string>;
-  readonly pages: readonly PageAuditResult[];
+  readonly pages: readonly IndexedPage[];
 }
 
 // ---------------------------------------------------------------------------------------------------------------
@@ -215,32 +249,104 @@ function reconcileBlocks(blocks: readonly RecordedBlock[]): readonly BeakSightBl
   });
 }
 
-/** 確定した Run から、判定のための索引を作る（最終の試行の Evidence だけ）。 */
-export function indexBeakSightBlocks(result: Pick<AuditRunResult, 'run' | 'pages'>): BeakSightBlockIndex {
+/** 最終の試行の Evidence の、判定に使う項目（`IndexedEvidence`）。 */
+const indexedEvidenceOf = (record: EvidenceRecord, pageId: PageId): IndexedEvidence => ({
+  pageId,
+  type: record.type,
+  viewport: record.viewport,
+  observedAt: record.observedAt,
+  stressWidths: record.type === 'layout' ? (record.payload.stressSweep ?? []).map(({ width }) => width) : [],
+  failures: record.type === 'network'
+    ? record.payload.failures.map(({ resourceType, url, method, blockedByBeakSight }) => ({ resourceType, url, method, blockedByBeakSight }))
+    : [],
+  approvedServiceUnauthorized: record.type === 'network'
+    && record.payload.responses.some((response) => response.status === UNAUTHORIZED_STATUS && response.errorContext?.approvedService === true),
+  images: record.type === 'dom'
+    ? record.payload.images.flatMap(({ resolvedUrl, complete, naturalWidth }) => (resolvedUrl === null ? [] : [{ resolvedUrl, complete, naturalWidth }]))
+    : [],
+  pageErrors: record.type === 'console' ? [...record.payload.pageErrors] : [],
+  safetyPhases: record.type === 'safety'
+    ? {
+        NON_READ_REQUESTS: SAFETY_PHASE_EVENT_READERS.NON_READ_REQUESTS(record.payload),
+        NAVIGATIONS: SAFETY_PHASE_EVENT_READERS.NAVIGATIONS(record.payload),
+        WEBSOCKETS: SAFETY_PHASE_EVENT_READERS.WEBSOCKETS(record.payload),
+      }
+    : null,
+});
+
+/** ページの、行き先の移動の判定に使う事実（`IndexedPage`）。 */
+const indexedPageOf = (page: PageAuditResult): IndexedPage => ({
+  pageId: page.pageId,
+  pageUrl: page.pageUrl,
+  blockedNavigationViewports: (Object.entries(page.viewports) as [ViewportProfile, PageAuditResult['viewports'][ViewportProfile]][])
+    .filter(([, state]) => state.incompleteReasons.some(({ code, detail }) => code === 'NAVIGATION_FAILED' && isBlockedNavigationDetail(detail)))
+    .map(([viewport]) => viewport),
+});
+
+/** MEM-4: 判定のための索引を、ページを 1 つずつ足して作るもの（ページを持たない）。 */
+export interface BeakSightBlockIndexBuilder {
+  /** ページを足す（URL の発見の順に）。 */
+  readonly addPage: (page: PageAuditResult) => void;
+  /** 足したページから、索引を作る。 */
+  readonly finish: () => BeakSightBlockIndex;
+}
+
+/**
+ * 確定した Run の索引を、ページを 1 つずつ足して作る（最終の試行の Evidence だけ。同じ ID が 2 か所にある不正な Run では、先にあるもの）。
+ * MEM-4: Evidence は判定に使う項目だけを持つ。`keptEvidenceIds` を渡すと、その ID の Evidence だけを持つ（判定が引くのは、指摘が参照する Evidence だけ）。
+ * 遮断の記録とエラーの画面の時刻は、渡さない ID の Evidence からも集める。
+ */
+export function createBeakSightBlockIndexBuilder(
+  run: Pick<RunSummary, 'retries'>,
+  keptEvidenceIds: ReadonlySet<EvidenceId> | null = null,
+): BeakSightBlockIndexBuilder {
+  const seen = new Set<EvidenceId>();
   const evidence = new Map<EvidenceId, IndexedEvidence>();
   const recorded = new Map<string, RecordedBlock[]>();
+  const pages: IndexedPage[] = [];
+  /** パフォーマンスの Evidence の、エラーの画面の時刻を決める事実（ビューポートと URL のあるもの）。 */
+  const measurements: { readonly key: string; readonly url: string; readonly observedAt: string }[] = [];
   const add = (key: string, blocks: readonly RecordedBlock[]): void => {
     recorded.set(key, [...(recorded.get(key) ?? []), ...blocks]);
   };
-  for (const page of result.pages) {
-    const earlier = earlierAttemptEvidenceIds(result.run, page);
-    for (const record of page.evidence) {
-      if (earlier.has(record.evidenceId) || evidence.has(record.evidenceId)) {
-        continue;
-      }
-      evidence.set(record.evidenceId, { record, pageId: page.pageId });
-      if (record.type === 'safety') {
-        const key = loadKeyOfSafety(record);
-        if (key !== null) {
-          add(key, blocksOfSafety(record));
+  return {
+    addPage: (page) => {
+      pages.push(indexedPageOf(page));
+      const earlier = earlierAttemptEvidenceIds(run, page);
+      for (const record of page.evidence) {
+        if (earlier.has(record.evidenceId) || seen.has(record.evidenceId)) {
+          continue;
         }
-      } else if (record.type === 'network') {
-        add(pageAuditLoadKey(record.pageId, record.viewport), blocksOfNetwork(record));
+        seen.add(record.evidenceId);
+        if (keptEvidenceIds === null || keptEvidenceIds.has(record.evidenceId)) {
+          evidence.set(record.evidenceId, indexedEvidenceOf(record, page.pageId));
+        }
+        if (record.type === 'safety') {
+          const key = loadKeyOfSafety(record);
+          if (key !== null) {
+            add(key, blocksOfSafety(record));
+          }
+        } else if (record.type === 'network') {
+          add(pageAuditLoadKey(record.pageId, record.viewport), blocksOfNetwork(record));
+        } else if (record.type === 'performance' && record.viewport !== null && record.payload.navigationTiming?.url !== undefined) {
+          measurements.push({ key: pageAuditLoadKey(page.pageId, record.viewport), url: record.payload.navigationTiming.url, observedAt: record.observedAt });
+        }
       }
-    }
+    },
+    finish: () => {
+      const blocksByLoad = new Map([...recorded].map(([key, blocks]) => [key, reconcileBlocks(blocks)] as const));
+      return { evidence, blocksByLoad, errorPageSinceByLoad: errorPageSinceOf(measurements, blocksByLoad), pages };
+    },
+  };
+}
+
+/** 確定した Run から、判定のための索引を作る（`createBeakSightBlockIndexBuilder` に全部のページを足したもの）。 */
+export function indexBeakSightBlocks(result: Pick<AuditRunResult, 'run' | 'pages'>): BeakSightBlockIndex {
+  const builder = createBeakSightBlockIndexBuilder(result.run);
+  for (const page of result.pages) {
+    builder.addPage(page);
   }
-  const blocksByLoad = new Map([...recorded].map(([key, blocks]) => [key, reconcileBlocks(blocks)] as const));
-  return { evidence, blocksByLoad, errorPageSinceByLoad: errorPageSinceOf(evidence, blocksByLoad), pages: result.pages };
+  return builder.finish();
 }
 
 /**
@@ -249,23 +355,18 @@ export function indexBeakSightBlocks(result: Pick<AuditRunResult, 'run' | 'pages
  * Evidence の `observedAt` から後は、エラーの画面を測った（エラーの画面からは、元の画面に戻らない）。URL は、どちらも伏せた後の値で比べる。
  */
 function errorPageSinceOf(
-  evidence: ReadonlyMap<EvidenceId, IndexedEvidence>,
+  measurements: readonly { readonly key: string; readonly url: string; readonly observedAt: string }[],
   blocksByLoad: ReadonlyMap<string, readonly BeakSightBlockRefView[]>,
 ): ReadonlyMap<string, string> {
   const since = new Map<string, string>();
-  for (const { record, pageId } of evidence.values()) {
-    if (record.type !== 'performance' || record.viewport === null) {
-      continue;
-    }
-    const key = pageAuditLoadKey(pageId, record.viewport);
-    const measuredUrl = record.payload.navigationTiming?.url ?? null;
+  for (const { key, url, observedAt } of measurements) {
     const blockedUrls = (blocksByLoad.get(key) ?? []).filter((ref) => ref.mainFrameNavigation && ref.phase === 'LOAD').map((ref) => ref.url);
-    if (measuredUrl === null || !blockedUrls.includes(measuredUrl)) {
+    if (!blockedUrls.includes(url)) {
       continue;
     }
     const known = since.get(key);
-    if (known === undefined || record.observedAt < known) {
-      since.set(key, record.observedAt);
+    if (known === undefined || observedAt < known) {
+      since.set(key, observedAt);
     }
   }
   return since;
@@ -345,18 +446,14 @@ const referencedEvidence = (index: BeakSightBlockIndex, finding: Finding): reado
   });
 
 /** 幅の走査の layout の指摘なら、その幅（文の頭が、その幅の `stressWidthFindingMessageText` の形）。そうでなければ `null`。 */
-const stressWidthOf = (record: EvidenceRecord, message: string): number | null => {
-  if (record.type !== 'layout') {
-    return null;
-  }
-  const width = (record.payload.stressSweep ?? []).find((result) => message.startsWith(stressWidthFindingMessageText(formatPixels(result.width), '')));
-  return width === undefined ? null : width.width;
-};
+const stressWidthOf = (record: IndexedEvidence, message: string): number | null =>
+  record.stressWidths.find((width) => message.startsWith(stressWidthFindingMessageText(formatPixels(width), ''))) ?? null;
 
 /** 指摘に結び付く読み込みの鍵（重なりなし。参照の順）。 */
 function linkedLoadKeys(index: BeakSightBlockIndex, finding: Finding): readonly string[] {
   const keys = new Set<string>();
-  for (const { record, pageId } of referencedEvidence(index, finding)) {
+  for (const record of referencedEvidence(index, finding)) {
+    const { pageId } = record;
     const width = stressWidthOf(record, finding.message);
     if (width !== null) {
       keys.add(stressLoadKey(pageId, width));
@@ -377,7 +474,8 @@ function linkedLoadKeys(index: BeakSightBlockIndex, finding: Finding): readonly 
  * と分かる時刻（`errorPageSinceByLoad`）と同じか後に記録した Evidence）。幅の走査の指摘は、ページの監査の読み込みの記録では分からないので、偽。
  */
 const measuredErrorPage = (index: BeakSightBlockIndex, finding: Finding): boolean =>
-  referencedEvidence(index, finding).some(({ record, pageId }) => {
+  referencedEvidence(index, finding).some((record) => {
+    const { pageId } = record;
     if (!POINT_MEASUREMENT_EVIDENCE_TYPES.has(record.type) || record.viewport === null || stressWidthOf(record, finding.message) !== null) {
       return false;
     }
@@ -413,9 +511,9 @@ function loadFailureRelation(
   };
   const unblockedUrls = new Set<string>();
   const domFailureUrls = new Set<string>();
-  for (const { record } of referencedEvidence(index, finding)) {
+  for (const record of referencedEvidence(index, finding)) {
     if (record.type === 'network') {
-      for (const failure of record.payload.failures) {
+      for (const failure of record.failures) {
         if (failure.resourceType === target.resourceType && containsUrlToken(finding.message, failure.url)) {
           addTarget(failure.url, failure.method);
           if (!failure.blockedByBeakSight) {
@@ -424,8 +522,8 @@ function loadFailureRelation(
         }
       }
     } else if (record.type === 'dom' && target.domImages) {
-      for (const image of record.payload.images) {
-        if (image.resolvedUrl !== null && containsUrlToken(finding.message, image.resolvedUrl)) {
+      for (const image of record.images) {
+        if (containsUrlToken(finding.message, image.resolvedUrl)) {
           addTarget(image.resolvedUrl, IMAGE_REQUEST_METHOD);
           if (image.complete && image.naturalWidth === FAILED_IMAGE_NATURAL_WIDTH) {
             domFailureUrls.add(image.resolvedUrl);
@@ -474,19 +572,17 @@ function targetNavigationRelation(index: BeakSightBlockIndex, finding: Finding):
     if (target.pageId === finding.pageId || !containsUrlToken(finding.message, target.pageUrl)) {
       continue;
     }
-    for (const [viewport, state] of Object.entries(target.viewports) as [ViewportProfile, PageAuditResult['viewports'][ViewportProfile]][]) {
-      if (state.incompleteReasons.some(({ code, detail }) => code === 'NAVIGATION_FAILED' && isBlockedNavigationDetail(detail))) {
-        refs.push({
-          pageId: target.pageId,
-          viewport,
-          load: PAGE_AUDIT_LOAD,
-          requestKind: 'DOCUMENT',
-          phase: 'LOAD',
-          method: null,
-          url: target.pageUrl,
-          mainFrameNavigation: true,
-        });
-      }
+    for (const viewport of target.blockedNavigationViewports) {
+      refs.push({
+        pageId: target.pageId,
+        viewport,
+        load: PAGE_AUDIT_LOAD,
+        requestKind: 'DOCUMENT',
+        phase: 'LOAD',
+        method: null,
+        url: target.pageUrl,
+        mainFrameNavigation: true,
+      });
     }
   }
   return refs.length === 0 ? null : relationOf('TARGET_NAVIGATION_BLOCKED', refs);
@@ -494,9 +590,9 @@ function targetNavigationRelation(index: BeakSightBlockIndex, finding: Finding):
 
 /** 捕まえない例外の指摘（`PAGE_ERROR`）。指摘の文に名前と文言が現れる例外（参照する console の Evidence の）で判定する。 */
 function pageErrorRelation(index: BeakSightBlockIndex, finding: Finding): BeakSightBlockRelationView | null {
-  const errors = referencedEvidence(index, finding).flatMap(({ record }) =>
+  const errors = referencedEvidence(index, finding).flatMap((record) =>
     record.type === 'console'
-      ? record.payload.pageErrors.filter((error) => !isGuardBlockedPageError(error) && finding.message.includes(error.name.length > 0 ? `${error.name}: ${error.message}` : error.message))
+      ? record.pageErrors.filter((error) => !isGuardBlockedPageError(error) && finding.message.includes(error.name.length > 0 ? `${error.name}: ${error.message}` : error.message))
       : []);
   if (errors.some(isBeakSightDisabledFeaturePageError)) {
     return relationOf('DISABLED_FEATURE');
@@ -543,15 +639,25 @@ export function safetyBlockPhaseCountsOf(index: BeakSightBlockIndex, finding: Fi
     return null;
   }
   const counts = Object.fromEntries(BLOCKED_EVENT_PHASES.map((phase) => [phase, 0])) as Record<BlockedEventPhase, number>;
-  for (const { record } of referencedEvidence(index, finding)) {
-    if (record.type === 'safety') {
-      for (const phase of SAFETY_PHASE_EVENT_READERS[events](record.payload)) {
-        counts[phase] += 1;
-      }
+  for (const record of referencedEvidence(index, finding)) {
+    for (const phase of record.safetyPhases?.[events] ?? []) {
+      counts[phase] += 1;
     }
   }
   return counts;
 }
+
+/** DEF-206: 承認したサービスの Origin の 401 で `POSSIBLE` にする Rule（資源の誤り）。 */
+const APPROVED_SERVICE_UNAUTHORIZED_RULE_ID = 'RESOURCE_4XX';
+/** DEF-206: 承認したサービスの Origin の、ログインが要るという応答の状態の番号。 */
+const UNAUTHORIZED_STATUS = 401;
+
+/**
+ * DEF-206（ユーザーの判断 2026-11-06: 外す範囲は同じ読み込みの中だけ）: 指摘が参照する network の Evidence（指摘の読み込み）に、承認したサービスの Origin からの 401
+ * の応答があるか（応答の文脈 `errorContext.approvedService` で見る。前の版の記録にはない）。
+ */
+const hasApprovedServiceUnauthorized = (index: BeakSightBlockIndex, finding: Finding): boolean =>
+  referencedEvidence(index, finding).some((record) => record.approvedServiceUnauthorized);
 
 // ---------------------------------------------------------------------------------------------------------------
 // 判定
@@ -564,6 +670,7 @@ export function safetyBlockPhaseCountsOf(index: BeakSightBlockIndex, finding: Fi
  *    分かるときは `CAUSED`（`MAIN_FRAME_NAVIGATION_BLOCKED`）、分からないときは `POSSIBLE`（`MAIN_FRAME_NAVIGATION_BLOCKED_UNCONFIRMED`）。BN-R1 の I-1・N-1。
  * 3. 1 の判定が `POSSIBLE`（対象の一部の遮断・無効にした機能・`Failed to fetch`）なら、それ。
  * 4. 結び付く読み込みの、時点 `LOAD` の見える種類の遮断のうち、Rule の結果を変えうる種類があれば `POSSIBLE`。
+ * 4'. DEF-206: `RESOURCE_4XX` の指摘の読み込みに、承認したサービスの Origin からの 401 があれば `POSSIBLE`（`APPROVED_SERVICE_UNAUTHORIZED`）。
  * 5. 遮断はあるが変えうる種類でなければ `NONE`（`RULE_NOT_SENSITIVE`）、遮断がなければ `NONE`（`NO_BLOCK_IN_LOAD`）。
  */
 export function beaksightBlockRelationOf(index: BeakSightBlockIndex, finding: Finding): BeakSightBlockRelationView {
@@ -586,6 +693,10 @@ export function beaksightBlockRelationOf(index: BeakSightBlockIndex, finding: Fi
   const sensitive = blocks.filter((ref) => isSensitiveKind(sensitivity.kinds, ref.requestKind));
   if (sensitive.length > 0) {
     return relationOf('SENSITIVE_KIND_BLOCKED', sensitive);
+  }
+  // DEF-206・AUD-7: 同じ読み込みに、承認したサービスの Origin からの 401 があれば、その読み込みの資源の誤りは BeakSight の側のログインの事情の見込み。
+  if (finding.ruleId === APPROVED_SERVICE_UNAUTHORIZED_RULE_ID && hasApprovedServiceUnauthorized(index, finding)) {
+    return relationOf('APPROVED_SERVICE_UNAUTHORIZED');
   }
   return relationOf(blocks.length > 0 ? 'RULE_NOT_SENSITIVE' : 'NO_BLOCK_IN_LOAD');
 }

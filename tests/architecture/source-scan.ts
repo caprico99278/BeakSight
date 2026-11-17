@@ -925,9 +925,10 @@ export const judgeWithFileExceptions = <T extends { readonly path: string }>(
 
 // 読み込み --------------------------------------------------------------------------------------------------------
 
-/** テストの Gate が見るフォルダ（結合のテスト、部品のテスト、単体のテスト、テストの補助、画面のテスト）。 */
+/** テストの Gate が見るフォルダ（結合のテスト、ずれの確かめ（RB-3）、部品のテスト、単体のテスト、テストの補助、画面のテスト）。 */
 export const TEST_SOURCE_DIRECTORIES: readonly string[] = Object.freeze([
   'tests/integration',
+  'tests/contract',
   'tests/component',
   'tests/unit',
   'tests/helpers',

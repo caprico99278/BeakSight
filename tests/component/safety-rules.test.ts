@@ -3,7 +3,7 @@ import type { AuditRule, FindingDraft, PageRuleInput } from '../../src/audit/rul
 import { RuleEngine } from '../../src/audit/rule-engine.js';
 import { SAFETY_RULES } from '../../src/audit/safety-rules.js';
 import type { EvidenceRecord, ViewportProfile } from '../../src/core/contracts.js';
-import type { NormalizedHttpUrlEvidence, SafetyEvidenceScope } from '../../src/core/evidence-types.js';
+import type { NormalizedHttpUrlEvidence, SafetyEventsEvidence, SafetyEvidenceScope } from '../../src/core/evidence-types.js';
 import { createEvidenceId, createPageId } from '../../src/core/ids.js';
 import { SafetyLedger, safetyEventsEvidenceFromSnapshot } from '../../src/safety/safety-ledger.js';
 
@@ -44,6 +44,14 @@ const safetyRecord = (
     ),
   };
 };
+
+/**
+ * LZ-3a: Ledger の事象の数の上限（前は 256）は撤廃した。前の記録（上限に達して切り詰めた Evidence）を読む場面のために、記録の上限に達した印を付けた写し
+ * を作る（`category` は上限に達した分類）。
+ */
+const asFormerTruncatedRecord = (record: EvidenceRecord, category: string): EvidenceRecord => (record.type === 'safety'
+  ? { ...record, payload: { ...record.payload, recordLimits: { ...record.payload.recordLimits, truncated: true, droppedEventCount: 44, reachedCategories: [category] } } } as EvidenceRecord
+  : record);
 
 const input = (evidence: readonly EvidenceRecord[], viewport: ViewportProfile = 'desktop'): PageRuleInput => ({
   pageId: PAGE_ID,
@@ -162,6 +170,28 @@ describe('SAFETY_RULES', () => {
       expect(draft.message).toContain('DELETE');
       expect(draft.message).not.toContain('frozen-get');
       expect(draft.message).not.toContain('frozen-head');
+    });
+
+    // DEF-215: 中継が CONNECT の受け入れで拒んだ要求の前の接続（`preRequestConnection`）は、送信の遮断ではないので数えない。印のない CONNECT の拒否は今どおり数える。
+    it('中継が拒んだ要求の前の接続（preRequestConnection）は数えず、印のない CONNECT の拒否は今どおり数える', () => {
+      const connectionOnly = safetyRecord((ledger) => {
+        ledger.recordBlockedInteractionRequest({ method: 'CONNECT', url: '127.0.0.1:443', reason: 'GUARD_BYPASS_EGRESS', preRequestConnection: true });
+      });
+      for (const drafts of draftsByRule([connectionOnly]).values()) {
+        expect(drafts).toEqual([]);
+      }
+      // 記録そのものは残る（拒否の動きと記録は変えない）。
+      expect((connectionOnly.payload as SafetyEventsEvidence).blockedInteractionRequests).toEqual([
+        { method: 'CONNECT', url: '127.0.0.1:443', reason: 'GUARD_BYPASS_EGRESS', preRequestConnection: true },
+      ]);
+      const mixed = safetyRecord((ledger) => {
+        ledger.recordBlockedInteractionRequest({ method: 'CONNECT', url: '127.0.0.1:443', reason: 'GUARD_BYPASS_EGRESS', preRequestConnection: true });
+        ledger.recordBlockedInteractionRequest({ method: 'CONNECT', url: '127.0.0.1:8443', reason: 'INTERACTION_FROZEN_EGRESS' });
+      }, { scope: 'INTERACTION' });
+      const draft = onlyDraftOf('SAFETY_NON_READ_REQUEST_BLOCKED', [mixed]);
+      expect(draft.message).toContain('1 件');
+      expect(draft.message).toContain('127.0.0.1:8443');
+      expect(draft.message).not.toContain('127.0.0.1:443）');
     });
 
     it('凍結中に遮断した GET・HEAD のリクエストと遷移だけなら、どの Rule も Finding を作らない', () => {
@@ -351,8 +381,8 @@ describe('SAFETY_RULES', () => {
     });
 
     it('記録の上限に達した Evidence からは、実際の件数がより多い可能性を文言に書く', () => {
-      const record = safetyRecord((ledger) => {
-        for (let index = 0; index < 300; index += 1) {
+      const record = asFormerTruncatedRecord(safetyRecord((ledger) => {
+        for (let index = 0; index < 256; index += 1) {
           ledger.recordExternalSchemeNavigation({
             url: `beaksight-test-app:probe-${index}`,
             scheme: 'beaksight-test-app',
@@ -361,7 +391,7 @@ describe('SAFETY_RULES', () => {
             reason: 'EXTERNAL_SCHEME_NAVIGATION',
           });
         }
-      });
+      }), 'externalSchemeNavigations');
       const draft = onlyDraftOf('SAFETY_EXTERNAL_SCHEME_NAVIGATION_ATTEMPTED', [record]);
       expect(draft.message).toContain('256 件');
       expect(draft.message).toContain(TRUNCATION_NOTE);
@@ -437,11 +467,11 @@ describe('SAFETY_RULES', () => {
   });
 
   it('記録の上限に達した Evidence から作る Finding は、実際の件数がより多い可能性を文言に書く', () => {
-    const record = safetyRecord((ledger) => {
-      for (let index = 0; index < 300; index += 1) {
+    const record = asFormerTruncatedRecord(safetyRecord((ledger) => {
+      for (let index = 0; index < 256; index += 1) {
         ledger.recordBlockedPopup({ url: `${ORIGIN}/popup/${index}`, reason: 'INTERACTION_FROZEN' });
       }
-    }, { scope: 'INTERACTION' });
+    }, { scope: 'INTERACTION' }), 'blockedPopups');
     expect(record.type === 'safety' && record.payload.recordLimits.truncated).toBe(true);
     const draft = onlyDraftOf('SAFETY_POPUP_BLOCKED', [record]);
     expect(draft.message).toContain('256 件');

@@ -6,6 +6,7 @@ import { WORKER_AUDIT_JOB_KIND, WORKER_ENTRY_CHECK_JOB_KIND } from '../../../../
 import { formatCount, formatPlainDateTime } from '../../../../../src/presentation/format.js';
 import {
   AUDIT_JOB_START_REJECTION_DESCRIPTIONS,
+  LOCAL_UI_AUDIT_TEXT,
   LOCAL_UI_AUTH_SETUP_PROPOSAL_TEXT,
   LOCAL_UI_CREDENTIAL_TEXT,
   LOCAL_UI_DISCOVERY_TEXT,
@@ -37,6 +38,7 @@ import {
   usesReadCheck,
   usesScenarios,
 } from '../../display/labels';
+import { bundlePartLabelOf } from '../../display/bundle-part-label';
 import { finishedJobResultTextOf, profileStageAfterAuditArrivalOf, type ProfileAction, type ProfileStageKind } from '../../display/next-steps';
 import {
   getProfileFn,
@@ -51,6 +53,8 @@ import { writeScreensFn } from '../../server/write-screen-functions';
 import { getAuditJobFn, listAuditJobsFn, type AuditJobDetailView, type AuditJobRowView } from '../../server/audit-job-functions';
 import { profileOnboardingFn, type ProfileOnboardingView } from '../../server/profile-onboarding-functions';
 import { DisplaySettingsPanel } from '../../components/DisplaySettingsPanel';
+import { SiteNamePanel } from '../../components/SiteNamePanel';
+import { useSiteNameOf } from '../../display/site-name';
 import { profileDisplaySettingsFn } from '../../server/display-settings-functions';
 import { CrawlLimitsPanel } from '../../components/CrawlLimitsPanel';
 import { crawlLimitsPanelFn } from '../../server/crawl-limits-functions';
@@ -296,6 +300,7 @@ function ProfilePage() {
   const [retiring, setRetiring] = useState(false);
   const [retireRejection, setRetireRejection] = useState<Extract<ProfileChangeView, { ok: false }> | null>(null);
   const { profile } = detail;
+  const siteNameOf = useSiteNameOf();
   // PL-U（14.1 の U2）: 点検を終えたばかりで移ってきたときは、「結果を見る」を主のボタンにする（決め方は `next-steps.ts` の部品）。
   const stage = arrival?.fromAudit === true && onboarding.latestReportHref !== null
     ? profileStageAfterAuditArrivalOf(onboarding.stage)
@@ -319,6 +324,13 @@ function ProfilePage() {
     revision: profile.revision,
     reportHref: onboarding.latestReportHref,
   };
+  /**
+   * DEF-202: 要点のボタンの列の下に置く、最新の点検のまとめファイル（ZIP）を保存するリンクの行き先（要点に「結果を見る」があり、ZIP があるときだけ。
+   * ほかは `null`）。
+   */
+  const summaryBundles = onboarding.latestReportHref !== null && (stage.primary === 'AUDIT_RESULT' || stage.secondary === 'AUDIT_RESULT')
+    ? onboarding.latestBundles
+    : [];
   /** 要点のパネルのボタン（詳しい内容に同じ行き先を重ねて出さない）。 */
   const summaryActions = new Set<ProfileAction>([stage.primary, stage.secondary].filter((action): action is ProfileAction => action !== null));
   /** 詳しい内容の、ほかの画面への入口（要点のパネルにない行き先だけ。取り消したサイトでは、記録を見る画面だけ）。 */
@@ -335,7 +347,8 @@ function ProfilePage() {
 
   return (
     // PL-V（設計書 `2026-10-26-beaksight-plain-ui-design.md` 13 章の 4）: 題はサイトの名前。h1 の上の 1 行から一覧へ戻る。
-    <PageFrame title={profile.profileId} trail={[{ kind: 'sites' }]}>
+    // DN-1: 題は画面に出す名前（なければ見分けの印。決め方は `siteNameOf`）。
+    <PageFrame title={siteNameOf(profile.profileId)} trail={[{ kind: 'sites' }]}>
       {/* 3 章の 1: 要点のパネル（今の様子の文と理由、主のボタン 1 つ＋二次のボタン。知らせと安全の印もこの中。13 章の 6）。 */}
       <section className="panel" id={NEXT_STEPS_ANCHOR} data-testid="profile-summary" data-stage={stage.stage}>
         <h2 className="panel-heading">{LOCAL_UI_NEXT_STEP_TEXT.summaryHeading}</h2>
@@ -398,7 +411,7 @@ function ProfilePage() {
         )}
         {/* OP-2（設計書 4.1 の D6）: 本番からの切り離しは、聞かない・出さない（前の「まだ確かめていない」の印は外した）。 */}
         <StageReason onboarding={onboarding} />
-        {/* OP-I（I1。設計書 `2026-10-27-beaksight-one-pass-flow-design.md` 4.1.5）: 「削除のほかを通す」はサイトの既定なので、要点に守りを緩めている印は出さない
+        {/* OP-I（I1。設計書 `2026-10-27-beaksight-one-pass-flow-design.md` 4.1.5。SD-3）: 「サイトの通信を止めない」はサイトの既定なので、要点に守りを緩めている印は出さない
             （切り替えと確認のダイアログは、詳しい内容の表示の設定に残す。作業の画面の知らせは残す）。 */}
         {stage.primary === null && stage.secondary === null ? null : (
           <div className="button-row" data-testid="profile-summary-actions">
@@ -406,6 +419,15 @@ function ProfilePage() {
             {stage.secondary === null ? null : <ProfileActionButton action={stage.secondary} primary={false} {...actionProps} />}
           </div>
         )}
+        {/* DEF-202: ボタンの列（主のボタンと二次のボタンだけ）の下の、独立した 1 行のふつうのリンク（作業の画面の「できたファイル」と同じ文言）。 */}
+        {/* AUD-1d: まとめファイルを分けたときは、全部の部のリンク（全部の数と番号を添える）。 */}
+        {summaryBundles.map((bundle) => (
+          <p key={bundle.href}>
+            <a href={bundle.href} download data-testid="profile-bundle-download">
+              {bundle.part === undefined ? LOCAL_UI_AUDIT_TEXT.job.downloadBundle : bundlePartLabelOf(bundle.part)}
+            </a>
+          </p>
+        ))}
       </section>
 
       {/* OP-2（D7'）: 「登録・更新を試せる画面」の一覧（チェックの欄。変えたら、その場で保存する）。 */}
@@ -416,7 +438,7 @@ function ProfilePage() {
         <AdvancedSettings testId="profile-edit-advanced-settings">
           <dl className="facts" data-testid="profile-facts">
             <dt>{LOCAL_UI_TEXT.profileList.columns.mode}</dt>
-            <dd>{auditModeDisplay(profile.mode).label}</dd>
+            <dd>{auditModeDisplay(profile.mode, profile.auth).label}</dd>
             <dt>{LOCAL_UI_TEXT.profileList.columns.auth}</dt>
             <dd>{authStrategyDisplay(profile.auth).label}</dd>
           </dl>
@@ -444,7 +466,10 @@ function ProfilePage() {
             ) : null}
           </div>
 
-          {/* FM-1（手動の操作を減らす設計書 2.2）: 表示の設定（ジョブのブラウザを表示する。「削除のほかを通す」の確認のダイアログもこの中）。 */}
+          {/* DN-1（プロファイルの表示名の設計書 2 章）: 画面に出す名前（見分けの印とは別。保存で変える）。 */}
+          <SiteNamePanel profileId={profile.profileId} editable={!retired} />
+
+          {/* FM-1（手動の操作を減らす設計書 2.2）: 表示の設定（ジョブのブラウザを表示する。「サイトの通信を止めない」の確認のダイアログもこの中）。 */}
           <DisplaySettingsPanel profileId={profile.profileId} settings={displaySettings} editable={!retired} />
 
           {/* T44d（Task 44 の設計書 P2-1）: 監査の負荷（取り消したプロファイルには出さない）。 */}

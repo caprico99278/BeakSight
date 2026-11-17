@@ -34,9 +34,12 @@
 // - T41a（Task 41 の設計書 3.1）: API の UPDATE は、画面の path を型にした識別の digest（`api.templatedIdentityDigest`）が最新の索引の型にした digest の
 //   一覧にあることで候補を確かめる（form の UPDATE と同じ。`apiUpdateCandidateReasonsOf`）。当たった候補の行の型の digest と鍵と欄の対応の digest
 //   （目印の付いた欄の鍵の全体 `scenarioApiMarkedKeyFieldsOf`。変える鍵と保つ鍵）を照らす。Origin と最新の発見の改訂は登録と同じ。
+// - LU-6（設計書 `2026-11-02-beaksight-list-row-update-design.md` 5.4、fix round 1 の判断 1）: 一覧の行の更新（台帳に `listRow`）は型にした識別の digest を
+//   持たない（スキーマの決まり）。候補は一覧の画面そのものなので、API の登録と同じく候補の識別の digest で確かめる（`apiCreateCandidateReasonsOf`）。
 // - 呼び出し側の誤り（別のプロファイルの事実、別のシナリオ・プロファイルの記録、不正な時刻）は `RangeError`。
 import { dateOfCompactUtcTimestamp, formatCompactUtcTimestamp } from '../../core/utc-timestamp.js';
 import { isOriginInAllowedOrigins } from '../../crawl/normalize-url.js';
+import { apiShapeApprovedOriginOf, type ApiRequestOriginShape } from '../../core/api-request-shape.js';
 import type { AuditMode } from '../contracts.js';
 import type { DiscoveryCandidateIndexView } from '../job/discovery-index-store.js';
 import type { CandidateClassification } from '../../discovery/candidate-contracts.js';
@@ -86,6 +89,8 @@ export interface ApprovalProfileFact {
   readonly mode: AuditMode;
   /** T38R-fix の C-2: 今の承認したサービスの Origin（プロファイルの一覧の順）。 */
   readonly approvedServiceOrigins: readonly string[];
+  /** DEF-220: 今の承認したテストの Origin（プロファイルの一覧の順。省けば空。テスト用のサイト自身の API のシナリオの Origin を、型の番号の位置で確かめる）。 */
+  readonly approvedTestOrigins?: readonly string[];
 }
 
 /** 最後の発見の索引の、シナリオの候補の識別の digest の行（`readDiscoveryIndex` の候補 1 件から、要る項目だけ）。 */
@@ -130,8 +135,11 @@ export interface ApprovalCurrentFacts {
    * なら null。
    */
   readonly candidateKeyFieldDigests: readonly string[] | null;
-  /** シナリオの版の発見の根拠の、型の Origin の番号（T38R-fix の C-2。API のシナリオだけが使う。分からなければ null）。 */
-  readonly apiShapeOriginIndex: number | null;
+  /**
+   * シナリオの版の発見の根拠の、型の Origin の区分と番号（T38R-fix の C-2。API のシナリオだけが使う。承認した Origin の区分でないか、分からなければ null）。
+   * DEF-220: 区分（承認したサービスの Origin の `APPROVED_API` か、承認したテストの Origin の `APPROVED_TEST`）ごとの一覧の番号。
+   */
+  readonly apiShapeOrigin: ApiRequestOriginShape | null;
   /** 索引を書いた最新の発見のジョブのプロファイルの改訂（T38R-fix の C-2。API のシナリオだけが使う。分からなければ null）。 */
   readonly latestDiscoveryProfileRevision: number | null;
   /**
@@ -183,9 +191,6 @@ const effectiveExpiresAtOf = (approval: ApprovalReceipt, scenario: ScenarioRevis
   return dateOfCompactUtcTimestamp(approval.expiresAt).getTime() <= dateOfCompactUtcTimestamp(computed).getTime() ? approval.expiresAt : computed;
 };
 
-/** 期限切れか（ちょうど期限の時刻は期限切れ）。 */
-const isExpired = (approval: ApprovalReceipt, scenario: ScenarioRevision, now: Date): boolean =>
-  now.getTime() >= dateOfCompactUtcTimestamp(effectiveExpiresAtOf(approval, scenario)).getTime();
 
 // ---------------------------------------------------------------------------------------------------------------
 // 判定
@@ -265,15 +270,18 @@ const apiCandidateReasonsOf = (
   facts: ApprovalCurrentFacts,
   approval: ApprovalReceipt | null,
 ): readonly ApprovalInvalidityReason[] => {
-  const found = scenario.kind === 'UPDATE' ? apiUpdateCandidateReasonsOf(scenario, facts.templatedCandidates, approval) : apiCreateCandidateReasonsOf(scenario, facts, approval);
+  // LU-6（一覧の行の更新の設計書 5.4、fix round 1 の判断 1）: 一覧の行の更新（台帳に `listRow`）は、候補が一覧の画面そのもの（画面の path に ID がない）
+  // なので、API の登録と同じ道（候補の識別の digest）で確かめる。`listRow` のない更新は、画面の path を型にした識別の digest（今のまま）。
+  const byTemplate = scenario.kind === 'UPDATE' && scenario.api?.ledger?.listRow === undefined;
+  const found = byTemplate ? apiUpdateCandidateReasonsOf(scenario, facts.templatedCandidates, approval) : apiCreateCandidateReasonsOf(scenario, facts, approval);
   if (!found.ok) {
     return found.reasons;
   }
   const { api } = scenario;
-  const { apiShapeOriginIndex, latestDiscoveryProfileRevision, latestDiscoverySwitchOnlySinceDiscovery, profile } = facts;
+  const { apiShapeOrigin, latestDiscoveryProfileRevision, latestDiscoverySwitchOnlySinceDiscovery, profile } = facts;
   // T38R-fix の C-2: 型の Origin の番号の位置に、シナリオの Origin が今もあること。索引を書いた発見の改訂が今の改訂であること。
-  // Origin の比べ方は、URL の意味の owner（`src/crawl/normalize-url.ts`）の部品に任せる（GATE-ARCH04）。
-  const approvedAtIndex = apiShapeOriginIndex === null ? undefined : profile.approvedServiceOrigins[apiShapeOriginIndex];
+  // Origin の比べ方は、URL の意味の owner（`src/crawl/normalize-url.ts`）の部品に任せる（GATE-ARCH04）。DEF-220: 番号は区分ごとの一覧で解く（契約の 1 か所）。
+  const approvedAtIndex = apiShapeOrigin === null ? undefined : apiShapeApprovedOriginOf(apiShapeOrigin, profile);
   const originApproved = api !== undefined && approvedAtIndex !== undefined && isOriginInAllowedOrigins([approvedAtIndex], api.request.origin);
   return [
     ...found.reasons,
@@ -390,7 +398,7 @@ const scenarioReasonsOf = (
 
 /** 承認の記録の理由。 */
 const approvalReasonsOf = (input: ApprovalValidityInput, approval: ApprovalReceipt): readonly ApprovalInvalidityReason[] => {
-  const { scenario, facts, lastRevocation, now } = input;
+  const { scenario, facts, lastRevocation } = input;
   const { bound } = approval;
   const bindingReasons: ApprovalInvalidityReason[] = [
     ...(approval.scenarioRevision === scenario.revision ? [] : ['SCENARIO_REVISION_CHANGED' as const]),
@@ -410,7 +418,8 @@ const approvalReasonsOf = (input: ApprovalValidityInput, approval: ApprovalRecei
   return [
     ...bindingReasons,
     ...tampered,
-    ...(isExpired(approval, scenario, now) ? [EXPIRED_INVALIDITY_REASON] as const : []),
+    // L12b（設計書 `2026-11-09-beaksight-remove-limits-design.md` 6.2。S16）: 承認の有効期間（保存済みの `expiresAt`・`approvalTtlDays`）は読むときに見ない。承認は、型の
+    // digest が変わる（上の理由）か、利用者がチェックを外す（撤回）まで有効。
     ...(lastRevocation !== null && lastRevocation.targetReceiptId === approval.receiptId ? [REVOKED_INVALIDITY_REASON] as const : []),
   ];
 };

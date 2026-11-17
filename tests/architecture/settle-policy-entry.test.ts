@@ -5,7 +5,7 @@
  * - (a) `src/` で `settlePolicy` の名前を書くのは、閉じた一覧（`SETTLE_POLICY_FILES`）のファイルだけ。一覧のファイルは、どれも今も書く（使われなく
  *   なった一覧の行は誤り）。ワーカーの入口や IPC の受け取り（`src/worker/audit-worker-session.ts` など）は、一覧にない。
  * - (b) `settlePolicy:` の値は、既定の定数（`…SETTLE_POLICY` の名前）、`request.settlePolicy`・`options.settlePolicy` の受け渡し、条件で既定の定数か
- *   `undefined` のどちらかを選ぶ式、だけ。型の注釈（`DiscoverySettlePolicy`、`| undefined`）と、既定の定数を既定の値にした引数は、値の決まりの外。
+ *   `undefined` のどちらかを選ぶ式、依頼のテストだけの口（観察の窓の一式）から作る `discoverySettlePolicyOf(request.observationWindows)`、書き込みの画面の落ち着きの覚えが持つ一式から作る `settlePolicyOfWindows(quiet.windows, …)`（RB-11）、だけ。型の注釈（`DiscoverySettlePolicy`、`| undefined`）と、既定の定数を既定の値にした引数は、値の決まりの外。
  *   `settlePolicy` という名前の変数を宣言しない（省略の形 `{ settlePolicy }` で、作った値を渡さない）。
  * - (c) 落ち着きの待ちの指定の値（`DiscoverySettlePolicy = Object.freeze(`）を作るのは、モジュールの先頭の、大文字の名前の定数だけ。
  * - (d) IPC の契約（`src/control/worker-protocol.ts`）と、ワーカーの IPC の Schema（`schemas/control/worker-message.schema.json`）に、落ち着きの待ちの
@@ -22,6 +22,8 @@ const SOURCE_FILES = loadSourceFiles();
 const SETTLE_POLICY_FILES: readonly string[] = Object.freeze([
   'src/discovery/discover-page.ts',
   'src/discovery/read-executor.ts',
+  // NO-2（通知の枠の設計書 3.2）: 操作さがしの画面で、通知の枠を閉じる前の落ち着きの待ち（発見の指定を受け渡すだけ）。
+  'src/interaction/notification-overlay.ts',
   'src/worker/discovery-run.ts',
   'src/worker/entry-check-page.ts',
   'src/worker/entry-check-run.ts',
@@ -42,6 +44,10 @@ const VALUE_FORMS: readonly RegExp[] = [
   /^[A-Z][A-Z0-9_]*SETTLE_POLICY$/u,
   /^(?:request|options)\.settlePolicy$/u,
   /^[\w$.]+\s*\?\s*[A-Z][A-Z0-9_]*SETTLE_POLICY\s*:\s*undefined$/u,
+  // RB-fix-456: 依頼のテストだけの口（観察の窓の一式）から作る形（`)` の前まで）。本番の入口が一式を渡さないことは `worker-login-hooks` の (n)・(p)。
+  /^discoverySettlePolicyOf\(request\.observationWindows$/u,
+  // RB-11: 書き込みの画面の落ち着きの覚え（`ApiUpdateQuietMemory`）が持つ一式（`writeStageWatchOf` の一式。テストだけが差し込む）から作る形（`,` の前まで）。
+  /^settlePolicyOfWindows\(quiet\.windows$/u,
 ];
 /** (b) `settlePolicy` という名前の変数の宣言。 */
 const SETTLE_POLICY_DECLARATION = /\b(?:const|let|var)\s+settlePolicy\b/gu;
@@ -84,11 +90,13 @@ describe('settle policy entry detectors (SR-1-F)', () => {
     const built = asFile('src/worker/discovery-run.ts', [
       'await readCandidatePage(page, { requestCounter: counter, settlePolicy: { ...DISCOVERY_SETTLE_POLICY, timeoutMs: 1 } });',
       'const settlePolicy = Object.freeze({ timeoutMs: 1 });',
+      'await readCandidatePage(page, { requestCounter: counter, settlePolicy: discoverySettlePolicyOf(message.observationWindows) });',
       'const quick: DiscoverySettlePolicy = Object.freeze({ ...DISCOVERY_SETTLE_POLICY, timeoutMs: 1 });',
       'function read(policy: DiscoverySettlePolicy = Object.freeze({ ...DISCOVERY_SETTLE_POLICY })) {}',
     ].join('\n'));
     expect(memberViolations([built])).toEqual([
       'src/worker/discovery-run.ts: settlePolicy: { ...DISCOVERY_SETTLE_POLICY',
+      'src/worker/discovery-run.ts: settlePolicy: discoverySettlePolicyOf(message.observationWindows',
       'src/worker/discovery-run.ts: a variable named settlePolicy',
     ]);
     expect(constructionViolations([built])).toEqual(['src/worker/discovery-run.ts: 2']);
@@ -102,6 +110,7 @@ describe('settle policy entry detectors (SR-1-F)', () => {
       'await read(page, { requestCounter: counter, settlePolicy: options.settlePolicy });',
       'await read(page, { settlePolicy: quiet.quietTimedOut ? BUSY_PAGE_CANDIDATE_SETTLE_POLICY : undefined });',
       'await read(page, { settlePolicy: DISCOVERY_SETTLE_POLICY });',
+      'await read(page, { settlePolicy: discoverySettlePolicyOf(request.observationWindows) });',
       'const BUSY_SETTLE_POLICY: DiscoverySettlePolicy = Object.freeze({ ...DISCOVERY_SETTLE_POLICY, timeoutMs: 1 });',
       '// settlePolicy: message.settlePolicy',
       "const text = 'settlePolicy: { timeoutMs: 1 }';",
@@ -120,10 +129,10 @@ describe('settle policy entry (SR-1-F)', () => {
   it('(b) gives settlePolicy only a default constant or the value of the request, and (c) builds settle policies only as named constants', () => {
     expect(memberViolations(SOURCE_FILES)).toEqual([]);
     expect(constructionViolations(SOURCE_FILES)).toEqual([]);
-    // 走査が空でない（受け渡しと、既定の定数を選ぶ式がある）。
+    // 走査が空でない（受け渡しと、書き込みの画面の覚えの一式から作る式がある。RB-11 で、既定の定数か undefined を選ぶ式は、この式に替わった）。
     const members = SETTLE_POLICY_FILES.flatMap((path) => [...sourceFileAt(SOURCE_FILES, path).bare.matchAll(SETTLE_POLICY_MEMBER)]);
     expect(members.some(([, value = '']) => value.trim() === 'request.settlePolicy')).toBe(true);
-    expect(members.some(([, value = '']) => VALUE_FORMS[2]?.test(value.trim()) === true)).toBe(true);
+    expect(members.some(([, value = '']) => VALUE_FORMS.at(-1)?.test(value.trim()) === true)).toBe(true);
   });
 
   it('(d) the IPC contract and the worker message schema have no settle item', () => {

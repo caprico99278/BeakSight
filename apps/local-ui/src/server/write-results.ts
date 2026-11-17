@@ -9,14 +9,18 @@
  * - T32g（Task 32 の設計書 4.1 の「親の確かめと画面の配布」）: 書き込みの報告（親の確かめの結果と、配るときだけ報告の HTML と書き込みのバンドルの
  *   URL のパス）を足した。配るかと URL は、成果物の一覧（`artifact-files.ts` の `listJobArtifacts`。親の確かめが `VALID` のジョブだけ）から決める。
  * - T40d（Task 40 の設計書 3.5）: 送り方と API の型の要約（台帳の版 14 の `WriteResultView.transport`・`api`。値を持たない）を足した。
+ * - LU-13 fix round 1: 書き込みのジョブの `action-run.json` の、送らずに止めた具体的な理由（`writePrecheckDetailOfJob`。ジョブの詳細とサイトの画面の一覧が
+ *   読む 1 か所）を足した。
  */
-import type {
-  ActionBlockReason,
-  ActionOutcomeReason,
-  ActionResult,
-  ResponseJudgement,
-  SettledReservationState,
-  SubmissionState,
+import {
+  actionRunPrecheckDetailOf,
+  type ActionBlockReason,
+  type ActionOutcomeReason,
+  type ActionResult,
+  type PrecheckFailureDetail,
+  type ResponseJudgement,
+  type SettledReservationState,
+  type SubmissionState,
 } from '../../../../src/control/actions/action-contracts.js';
 import {
   readWriteResult,
@@ -27,11 +31,14 @@ import {
 import type { ScenarioKind, ScenarioTransport } from '../../../../src/control/approval-view.js';
 import type { ReadCheckResult } from '../../../../src/control/discovery-view.js';
 import type { WriteReportCheck } from '../../../../src/control/job/job-records.js';
+import type { AuditJobView } from '../../../../src/control/job/job-store.js';
+import { FINISHED_AUDIT_JOB_STATE } from '../../../../src/core/audit-job-values.js';
 import { compareCodeUnits } from '../../../../src/core/text.js';
-import { listJobArtifacts } from './artifact-files';
+import { listJobArtifacts, readJobResultDocument } from './artifact-files';
 import { localUiAuditJobs } from './audit-jobs';
 import { localUiStore } from './control-store';
 import { isoTimestampOf, isoTimestampOrNull } from './timestamps';
+import { isWriteJobKind } from './write-kinds';
 
 /**
  * 書き込みの報告（T32g）。親の確かめの結果（締める前・結果の前にワーカーが終わったときは null）と、配るときだけ、報告の HTML と書き込みの
@@ -178,3 +185,16 @@ export const writeResultSummaryOfJob = async (jobId: string): Promise<WriteResul
 /** シナリオの書き込みの履歴（新しい順）。 */
 export const writeResultSummariesOfScenario = async (scenarioId: string): Promise<readonly WriteResultSummaryView[]> =>
   (await Promise.all(readWriteResults(localUiStore(), scenarioId).map(summaryOf))).reverse();
+
+/**
+ * T44e（P2-4）・LU-13 fix round 1（共通の部品）: 終わった書き込みのジョブの `action-run.json` の、送らずに止めた具体的な理由（`PRECHECK_FAILED` のときだけ。
+ * ほかのジョブ・終わっていないジョブ・読めない記録は null）。記録はスキーマとジョブの ID を確かめる読み出し（`readJobResultDocument`）で読む。
+ */
+export const writePrecheckDetailOfJob = async (job: AuditJobView): Promise<PrecheckFailureDetail | null> => {
+  if (!isWriteJobKind(job.jobKind) || job.state !== FINISHED_AUDIT_JOB_STATE) {
+    return null;
+  }
+  return actionRunPrecheckDetailOf(
+    await readJobResultDocument(job, 'action-run') as { readonly blockReason?: string | null; readonly precheckDetail?: PrecheckFailureDetail } | null,
+  );
+};

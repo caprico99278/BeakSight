@@ -2,7 +2,7 @@
 // （`classifyPassiveRequest`）の書き込みの段の口（`writeStage`）。
 // - 書き込みの段では、承認の要求の形（Origin と path。query と fragment なし）に完全に一致する main frame のナビゲーションの POST だけを、
 //   残りの回数が 1 のときに ALLOW する（送る中身の照合は、その後に Guard が行う）。
-// - 許可 Origin の外の読み取りの要求と、送信の窓の中のすべての読み取りの要求を `WRITE_STAGE` で止める（ログインの段と同じ考え方）。
+// - RB-4b: 読み取りは止めない。送信の窓の中の、承認した送信先への読み取り（フォームが GET に変えられた送信）だけを `WRITE_STAGE` で止める。
 // - ログインの段・公開監査・認証つきの監査の判定は変わらない（固定の表。作成の時点の値をそのまま期待値として書いた golden）。
 // 例の値は、匿名の値（`example.com`、`example.invalid`）だけを使う。
 import { describe, expect, it } from 'vitest';
@@ -46,7 +46,6 @@ const ALLOW_DIRECT: PassiveRequestDecision = { action: 'ALLOW', delivery: 'DIREC
 const NON_READ: PassiveRequestDecision = { action: 'BLOCK', category: 'REQUEST', reason: 'NON_READ_METHOD' };
 const EXTERNAL_NAVIGATION: PassiveRequestDecision = { action: 'BLOCK', category: 'NAVIGATION', reason: 'EXTERNAL_MAIN_FRAME_NAVIGATION' };
 const WEBSOCKET: PassiveRequestDecision = { action: 'BLOCK', category: 'WEBSOCKET', reason: 'PASSIVE_WEBSOCKET' };
-const EXCLUDED: PassiveRequestDecision = { action: 'BLOCK', category: 'AUDIT_EXCLUSION', reason: 'AUDIT_EXCLUDED_URL' };
 const writeStageBlock = (reason: (typeof WRITE_STAGE_BLOCK_REASONS)[number]): PassiveRequestDecision =>
   ({ action: 'BLOCK', category: 'WRITE_STAGE', reason });
 const loginStageBlock = (reason: (typeof LOGIN_STAGE_BLOCK_REASONS)[number]): PassiveRequestDecision =>
@@ -84,15 +83,12 @@ describe('T30b: the write stage table', () => {
     ['a GET of the approved URL (window closed)', mainFrame('GET', WRITE_URL), WRITE_CLOSED, ALLOW_INSPECT],
     ['a GET of the approved URL (window open: a form switched to GET)', mainFrame('GET', `${WRITE_URL}?name=marker`), WRITE_OPEN, writeStageBlock('SUBMISSION_WINDOW')],
     ['a same origin image (window closed)', subresource('GET', SAME_ORIGIN_URL), WRITE_CLOSED, ALLOW_DIRECT],
-    ['a same origin image (window open)', subresource('GET', SAME_ORIGIN_URL), WRITE_OPEN, writeStageBlock('SUBMISSION_WINDOW')],
-    ['a same origin sub frame (window open)', subFrame('GET', SAME_ORIGIN_URL), WRITE_OPEN, writeStageBlock('SUBMISSION_WINDOW')],
-    ['the plain browser favicon (window open)', subresource('GET', 'https://example.com/favicon.ico'), WRITE_OPEN, writeStageBlock('SUBMISSION_WINDOW_BROWSER_FAVICON')],
-    ['an outside image (window closed)', subresource('GET', OUTSIDE_URL), WRITE_CLOSED, writeStageBlock('OUTSIDE_ALLOWED_ORIGINS')],
-    ['an outside sub frame (window closed)', subFrame('GET', OUTSIDE_URL), WRITE_CLOSED, writeStageBlock('OUTSIDE_ALLOWED_ORIGINS')],
-    ['an outside HEAD (window closed)', subresource('HEAD', OUTSIDE_URL), WRITE_CLOSED, writeStageBlock('OUTSIDE_ALLOWED_ORIGINS')],
-    ['an unparsable URL', subresource('GET', 'not a url'), WRITE_CLOSED, writeStageBlock('OUTSIDE_ALLOWED_ORIGINS')],
-    ['an outside main frame (window closed)', mainFrame('GET', OUTSIDE_URL), WRITE_CLOSED, EXTERNAL_NAVIGATION],
-    ['an outside main frame (window open)', mainFrame('GET', OUTSIDE_URL), WRITE_OPEN, EXTERNAL_NAVIGATION],
+    // RB-4b: 書き込みの最中も、サイトの読み取りは止めない（送信の窓の中も、許可 Origin の外も）。
+    ['a same origin image (window open)', subresource('GET', SAME_ORIGIN_URL), WRITE_OPEN, ALLOW_DIRECT],
+    ['an outside image (window closed)', subresource('GET', OUTSIDE_URL), WRITE_CLOSED, ALLOW_DIRECT],
+    // SD-2（設計書 `2026-11-16-beaksight-action-based-delete-guard-design.md` 2.4）: 許可 Origin の外への main frame の移動も止めない。
+    ['an outside main frame (window closed)', mainFrame('GET', OUTSIDE_URL), WRITE_CLOSED, ALLOW_INSPECT],
+    ['an outside main frame (window open)', mainFrame('GET', OUTSIDE_URL), WRITE_OPEN, ALLOW_INSPECT],
     ['a same origin POST sub resource (window open)', subresource('POST', SAME_ORIGIN_URL), WRITE_OPEN, NON_READ],
   ])('%s', (_name, facts, writeStage, expected) => {
     expect(classifyPassiveRequest(facts, ALLOWED_ORIGINS, { writeStage })).toEqual(expected);
@@ -106,17 +102,11 @@ describe('T30b: the write stage table', () => {
     expect(classifyPassiveRequest(mainFrame('POST', WRITE_URL), new Set(['https://example.invalid']), { writeStage: WRITE_CLOSED })).toEqual(NON_READ);
   });
 
-  it('applies the audit exclusions to the reads of the write stage, after the approved POST', () => {
+  // SD-2: 監査の段の除外は、要求の判定では当てない（書き込みの段でも）。承認した POST は今どおり。
+  it('does not apply the audit exclusions to the reads of the write stage, and keeps the approved POST', () => {
     const policy: PassiveRequestPolicyOptions = { writeStage: WRITE_CLOSED, auditExclusions: AUDIT_EXCLUSIONS };
-    expect(classifyPassiveRequest(mainFrame('GET', 'https://example.com/logout'), ALLOWED_ORIGINS, policy)).toEqual(EXCLUDED);
+    expect(classifyPassiveRequest(mainFrame('GET', 'https://example.com/logout'), ALLOWED_ORIGINS, policy)).toEqual(ALLOW_INSPECT);
     expect(classifyPassiveRequest(mainFrame('POST', WRITE_URL), ALLOWED_ORIGINS, policy)).toEqual(ALLOW_INSPECT);
-  });
-
-  it('allows neither POST when both the login stage and the write stage are given (fail closed)', () => {
-    const both: PassiveRequestPolicyOptions = { authSetup: LOGIN_STAGE, writeStage: WRITE_CLOSED };
-    expect(classifyPassiveRequest(mainFrame('POST', WRITE_URL), ALLOWED_ORIGINS, both)).toEqual(NON_READ);
-    expect(classifyPassiveRequest(mainFrame('POST', 'https://example.com/login'), ALLOWED_ORIGINS, both)).toEqual(NON_READ);
-    expect(classifyPassiveRequest(subresource('GET', OUTSIDE_URL), ALLOWED_ORIGINS, both)).toEqual(loginStageBlock('OUTSIDE_ALLOWED_ORIGINS'));
   });
 
   it('compares the write endpoint URL in the same way (isWriteEndpointUrl)', () => {
@@ -140,11 +130,11 @@ describe('T30b: the decisions of the login stage, the public audit and the authe
     ['public: approved-looking POST', mainFrame('POST', WRITE_URL), undefined, NON_READ],
     ['public: same origin GET', mainFrame('GET', WRITE_URL), undefined, ALLOW_INSPECT],
     ['public: outside image', subresource('GET', OUTSIDE_URL), undefined, ALLOW_DIRECT],
-    ['public: outside main frame', mainFrame('GET', OUTSIDE_URL), undefined, EXTERNAL_NAVIGATION],
+    ['public: outside main frame', mainFrame('GET', OUTSIDE_URL), undefined, ALLOW_INSPECT],
     ['public: same origin POST sub resource', subresource('POST', SAME_ORIGIN_URL), {}, NON_READ],
     ['audit: POST', mainFrame('POST', WRITE_URL), { auditExclusions: AUDIT_EXCLUSIONS }, NON_READ],
-    ['audit: excluded GET', mainFrame('GET', 'https://example.com/logout'), { auditExclusions: AUDIT_EXCLUSIONS }, EXCLUDED],
-    ['audit: dangerous term', subresource('GET', 'https://example.com/items/1/delete'), { auditExclusions: AUDIT_EXCLUSIONS }, EXCLUDED],
+    ['audit: excluded GET', mainFrame('GET', 'https://example.com/logout'), { auditExclusions: AUDIT_EXCLUSIONS }, ALLOW_INSPECT],
+    ['audit: dangerous term', mainFrame('GET', 'https://example.com/items/1/delete'), { auditExclusions: AUDIT_EXCLUSIONS }, ALLOW_INSPECT],
     ['audit: outside image', subresource('GET', OUTSIDE_URL), { auditExclusions: AUDIT_EXCLUSIONS }, ALLOW_DIRECT],
     ['audit: same origin GET', subresource('GET', SAME_ORIGIN_URL), { auditExclusions: AUDIT_EXCLUSIONS }, ALLOW_DIRECT],
     ['login: login POST', mainFrame('POST', 'https://example.com/login'), { authSetup: LOGIN_STAGE }, ALLOW_INSPECT],
@@ -152,6 +142,8 @@ describe('T30b: the decisions of the login stage, the public audit and the authe
     ['login: login POST spent', mainFrame('POST', 'https://example.com/login'), { authSetup: { ...LOGIN_STAGE, remainingPosts: 0 } }, NON_READ],
     ['login: other POST', mainFrame('POST', WRITE_URL), { authSetup: LOGIN_STAGE }, NON_READ],
     ['login: outside image', subresource('GET', OUTSIDE_URL), { authSetup: LOGIN_STAGE }, loginStageBlock('OUTSIDE_ALLOWED_ORIGINS')],
+    // SD-2: ログインの段だけは、許可 Origin の外への main frame の移動を今どおり止める。
+    ['login: outside main frame', mainFrame('GET', OUTSIDE_URL), { authSetup: LOGIN_STAGE }, EXTERNAL_NAVIGATION],
     ['login: same origin image in the window', subresource('GET', SAME_ORIGIN_URL), { authSetup: LOGIN_OPEN }, loginStageBlock('SUBMISSION_WINDOW')],
     ['login: favicon in the window', subresource('GET', 'https://example.com/favicon.ico'), { authSetup: LOGIN_OPEN }, loginStageBlock('SUBMISSION_WINDOW_BROWSER_FAVICON')],
     ['login: same origin image outside the window', subresource('GET', SAME_ORIGIN_URL), { authSetup: LOGIN_STAGE }, ALLOW_DIRECT],

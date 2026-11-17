@@ -16,6 +16,7 @@ import type { FindingFingerprintIdentityField } from '../core/ids.js';
 import { compareCodeUnits, normalizeWhitespace } from '../core/text.js';
 import { normalizeUrl } from '../crawl/normalize-url.js';
 import { listText } from '../presentation/messages.js';
+import { classifiedHttpErrorsOf, errorDisplayOfRecords } from './http-error-classes.js';
 import type { AuditRule, FindingDraft, PageRuleInput, RulePlainMessageOwner } from './rule.js';
 import {
   CLIENT_ERROR_HTTP_STATUS_RANGE,
@@ -120,6 +121,15 @@ const formatStatus = (response: NetworkResponseEvidence): string =>
 // HTTP
 // ---------------------------------------------------------------------------------------------------------------
 
+/**
+ * AUD-7: 区分が `EXPECTED_BRANCH`（正常の分岐）の応答（Finding にしない。数と事実は表示用モデルが同じ決め方で数える）。区分の決め方は
+ * `http-error-classes.ts` の 1 か所。画面の誤りの表示は、同じ読み込み（ページ・ビューポート）の DOM の記録から読む。
+ */
+const expectedBranchResponsesOf = (input: PageRuleInput, network: NetworkEvidence): ReadonlySet<NetworkResponseEvidence> =>
+  new Set(classifiedHttpErrorsOf(network, errorDisplayOfRecords(input.evidence))
+    .filter(({ errorClass }) => errorClass === 'EXPECTED_BRANCH')
+    .map(({ response }) => response));
+
 /** メインフレームのナビゲーション応答のうち、ステータスが範囲にあるものを、URL ごとに1件にまとめる。 */
 const detectMainFrameStatus = (
   input: PageRuleInput,
@@ -127,8 +137,9 @@ const detectMainFrameStatus = (
 ): readonly Detection[] => {
   const groups = new DetectionGroups<string>();
   for (const record of evidenceOfType(input, 'network')) {
+    const expected = expectedBranchResponsesOf(input, record.payload);
     for (const response of record.payload.responses) {
-      if (isMainFrameNavigation(response) && isHttpStatusInRange(response.status, range)) {
+      if (isMainFrameNavigation(response) && isHttpStatusInRange(response.status, range) && !expected.has(response)) {
         groups.add(response.url, record.evidenceId, formatStatus(response));
       }
     }
@@ -285,29 +296,6 @@ const INVALID_INTERNAL_URL = defineRule({
   },
 });
 
-const UNSUPPORTED_URL_SCHEME = defineRule({
-  ruleId: 'UNSUPPORTED_URL_SCHEME',
-  category: 'LINK',
-  severity: 'INFO',
-  plainMessage: 'ふつうのページではないもの（ほかのアプリなど）を開くリンクがあります。見る人の環境によっては、押しても何も起きないことがあります。',
-  detect: (input) => {
-    const groups = new DetectionGroups<string>();
-    for (const record of evidenceOfType(input, 'link')) {
-      for (const link of record.payload.links) {
-        const { admission } = link;
-        if (admission.kind === 'SPECIAL_SCHEME_RECORD_ONLY') {
-          groups.add(admission.rawUrl, record.evidenceId, admission.scheme);
-        }
-      }
-    }
-    return groups.toDetections((rawUrl, schemes) => ({
-      message: `http・https 以外の scheme（${listText(distinctSorted(schemes))}）のリンクがあります（href: ${rawUrl}、`
-        + `${schemes.length} 件）。事実の記録で、リンク先は開いていません。`,
-      identityFields: [{ name: 'href', value: rawUrl }],
-    }));
-  },
-});
-
 // ---------------------------------------------------------------------------------------------------------------
 // RESOURCE
 // ---------------------------------------------------------------------------------------------------------------
@@ -322,8 +310,9 @@ const detectResourceStatus = (
     const resourceTypes = new Map(
       record.payload.requests.map((request) => [request.requestId, request.resourceType]),
     );
+    const expected = expectedBranchResponsesOf(input, record.payload);
     for (const response of record.payload.responses) {
-      if (!isMainFrameNavigation(response) && isHttpStatusInRange(response.status, range)) {
+      if (!isMainFrameNavigation(response) && isHttpStatusInRange(response.status, range) && !expected.has(response)) {
         groups.add(response.url, record.evidenceId, {
           status: formatStatus(response),
           resourceType: resourceTypes.get(response.requestId) ?? null,
@@ -655,7 +644,7 @@ export const TECHNICAL_RULES: readonly AuditRule[] = Object.freeze([
   REDIRECT_LOOP,
   EMPTY_HTTP_RESPONSE,
   INVALID_INTERNAL_URL,
-  UNSUPPORTED_URL_SCHEME,
+  // AUD-4c: http・https 以外の scheme のリンクは、不具合として数えない（Rule を外した。件数と事実はバンドルの `specialSchemeLinks`）。
   RESOURCE_4XX,
   RESOURCE_5XX,
   SCRIPT_LOAD_FAILED,

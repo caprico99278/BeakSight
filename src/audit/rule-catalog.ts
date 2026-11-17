@@ -1,5 +1,6 @@
 import { isPositiveSafeInteger } from '../core/guards.js';
 import { ACCESSIBILITY_RULES } from './accessibility-rules.js';
+import { FOCUS_RULES } from './focus-rules.js';
 import { LAYOUT_RULES } from './layout-rules.js';
 import { PERFORMANCE_RULES } from './performance-rules.js';
 import type { AuditRule } from './rule.js';
@@ -94,6 +95,8 @@ export const RULE_CATALOG: readonly AuditRule[] = freezeCatalog([
   ...TECHNICAL_RULES,
   ...LAYOUT_RULES,
   ...ACCESSIBILITY_RULES,
+  // AUD-4d: フォーカスまで隠す要素。
+  ...FOCUS_RULES,
   ...PERFORMANCE_RULES,
   ...SAFETY_RULES,
 ]);

@@ -8,7 +8,6 @@ import { summarizeRunSafety } from '../../src/orchestration/run-aggregation.js';
 import { pointsToExternalScheme } from '../../src/interaction/submission-probe.js';
 import {
   JOB_SAFETY_VIOLATION_STAGES,
-  MAX_JOB_SAFETY_VIOLATION_ENTRIES,
   probeViolationContinuationOf,
   jobSafetyViolationOf,
 } from '../../src/safety/job-safety-violation.js';
@@ -79,14 +78,31 @@ describe('DEF-144: the safety violation of a discovery or READ check job (jobSaf
     expect(JOB_SAFETY_VIOLATION_STAGES).toEqual(['CONTEXT_OPEN', 'PAGE_LOAD', 'SUBMISSION_PROBE', 'CONTEXT_CLOSE']);
   });
 
-  it('lists at most the named number of violations and keeps the total count', () => {
+  it('LZ-2: keeps a long message, method and path whole in the Ledger and in the job violation', () => {
     const ledger = new SafetyLedger();
-    for (let index = 0; index < MAX_JOB_SAFETY_VIOLATION_ENTRIES + 3; index += 1) {
+    const message = 'm'.repeat(2_049);
+    const method = 'X'.repeat(33);
+    const path = `/${'p'.repeat(2_049)}`;
+    ledger.recordInvariantViolation({ code: 'C', message, request: { method, url: `${ORIGIN}${path}` } });
+    expect(ledger.snapshot().invariantViolations[0]).toEqual({ code: 'C', message, request: { method, origin: ORIGIN, path } });
+    const violation = jobSafetyViolationOf({ url: `${ORIGIN}/a`, snapshot: ledger.snapshot(), stage: 'PAGE_LOAD', press: null });
+    expect(violation.invariantViolations[0]?.message).toBe(message);
+  });
+
+  // LZ-3a: 違反の一覧の数の上限（前は 16）は撤廃した。前の上限を超える違反も、残らず一覧に入れ、記録の schema が受ける。
+  it('lists every violation beyond the former limit, and the record is accepted by the schema', async () => {
+    const ledger = new SafetyLedger();
+    for (let index = 0; index < 17; index += 1) {
       ledger.recordInvariantViolation({ code: `CODE_${String(index)}`, message: 'm' });
     }
     const violation = jobSafetyViolationOf({ url: `${ORIGIN}/a`, snapshot: ledger.snapshot(), stage: 'PAGE_LOAD', press: null });
-    expect(violation.invariantViolations).toHaveLength(MAX_JOB_SAFETY_VIOLATION_ENTRIES);
-    expect(violation.invariantViolationCount).toBe(MAX_JOB_SAFETY_VIOLATION_ENTRIES + 3);
+    expect(violation.invariantViolations).toHaveLength(17);
+    expect(violation.invariantViolationCount).toBe(17);
+    const readEvidence = await validateArtifact('read-evidence', {
+      schemaVersion: 'read-evidence-schema/1.2', jobId: 'job-lz3a', runId: 'RUN-20261113010101', startedAt: '20261113010101', finishedAt: '20261113010102',
+      runStatus: 'ABORTED_BY_SAFETY', endReason: 'SAFETY_VIOLATION', checks: [], safetyViolation: violation,
+    });
+    expect(readEvidence.ok ? [] : readEvidence.errors).toEqual([]);
   });
 
   // DEF-144 の後半（設計書 `2026-10-20-beaksight-probe-external-scheme-design.md` 2.2）: 発見を続けてよい違反は、probe の段の、外部スキームへの移動
@@ -112,8 +128,8 @@ describe('DEF-144: the safety violation of a discovery or READ check job (jobSaf
     expect(continuationOf(['EXTERNAL_SCHEME_NAVIGATION_ATTEMPTED', 'SHARED_WORKER_OBSERVED'])).toBeNull();
     expect(continuationOf(['SHARED_WORKER_OBSERVED'])).toBeNull();
     expect(continuationOf(['EXTERNAL_SCHEME_NAVIGATION_ATTEMPTED'], 'PAGE_LOAD')).toBeNull();
-    // 一覧に載せきれなかった（数と一覧が違う）ときは続けない。
-    expect(continuationOf(Array.from({ length: 17 }, () => 'EXTERNAL_SCHEME_NAVIGATION_ATTEMPTED'))).toBeNull();
+    // LZ-3a: 一覧の数の上限（前は 16）はないので、前の上限を超える数の違反も一覧に載り、続けてよいかを判定できる。
+    expect(continuationOf(Array.from({ length: 17 }, () => 'EXTERNAL_SCHEME_NAVIGATION_ATTEMPTED'))).toBe('EXTERNAL_SCHEME');
     // DEF-145: 読み取りの main frame の移動の配送の失敗。
     expect(continuationOf([{ code: DELIVERY, method: 'GET' }])).toBe('READ_NAVIGATION_CANCELED');
     expect(continuationOf([{ code: DELIVERY, method: 'head' }])).toBe('READ_NAVIGATION_CANCELED');
@@ -142,7 +158,10 @@ describe('DEF-144: the safety violation of a discovery or READ check job (jobSaf
     const ledger = new SafetyLedger();
     ledger.recordInvariantViolation({ code: 'SHARED_WORKER_OBSERVED', message: 'Shared Worker target observed' });
     // 押した候補つき（probe の段）でも、スキーマに通る（識別の digest は候補と同じ形）。
-    const safetyViolation = jobSafetyViolationOf({ url: `${ORIGIN}/admin`, snapshot: ledger.snapshot(), stage: 'SUBMISSION_PROBE', press });
+    // URL-LEN: 前の URL の上限（2,048）より長い画面の path も、切り詰めずに記録し、スキーマに通る。
+    const longPath = `/admin/${'p'.repeat(2_049)}`;
+    const safetyViolation = jobSafetyViolationOf({ url: `${ORIGIN}${longPath}`, snapshot: ledger.snapshot(), stage: 'SUBMISSION_PROBE', press });
+    expect(safetyViolation.pagePath).toBe(longPath);
     const common = { jobId: 'job-def144', runId: 'RUN-20261020010101', startedAt: '20261020010101', finishedAt: '20261020010102', runStatus: 'ABORTED_BY_SAFETY' };
     const discovery = await validateArtifact('discovery', {
       schemaVersion: 'discovery-schema/1.1', ...common, endReason: 'SAFETY_VIOLATION', maxPages: 1,

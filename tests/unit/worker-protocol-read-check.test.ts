@@ -1,5 +1,5 @@
 // T27e（Task 27 の設計書 4.5、4.6）: IPC の契約（`src/control/worker-protocol.ts`）の、READ の確かめのジョブ（`READ_CHECK`）の部分。
-// - `START`: `READ_CHECK` は、認証の指定と、定義の一覧（1〜`MAX_WORKER_READ_CHECKS` 件）を必ず持つ。ほかの種類は定義の一覧を持たない。定義の ID の
+// - `START`: `READ_CHECK` は、認証の指定と、定義の一覧（1 件以上。L4: 件数の上限なし）を必ず持つ。ほかの種類は定義の一覧を持たない。定義の ID の
 //   形と重複、対象の画面の Origin と path、定義の中身（`read-check-definition` のスキーマを参照）を確かめる。秘密に見える名前の送る値は拒む
 //   （誤りの文に名前と値を書かない）。
 // - `FINISHED`: 件数の要約（`readCheck`）は、Run を実行した結果だけ、発見の件数の要約と同時には持たない、確かめた数は定義の数以下。
@@ -10,7 +10,6 @@ import { describe, expect, it } from 'vitest';
 import { FORM_NAVIGATION_SETUP_ITEMS } from '../helpers/auth-setup-samples.js';
 import {type AuthSetup } from '../../src/control/auth/auth-setup-contracts.js';
 import {
-  MAX_WORKER_READ_CHECKS,
   WORKER_PROTOCOL_VERSION,
   WORKER_READ_CHECK_JOB_KIND,
   targetConfigDigestOf,
@@ -19,7 +18,6 @@ import {
   workerAuthenticationDigestOf,
   type WorkerJobKind,
 } from '../../src/control/worker-protocol.js';
-import { MAX_READ_CHECKS_PER_JOB } from '../../src/discovery/read-check-contracts.js';
 
 const ORIGIN = 'http://127.0.0.1:4173';
 const DIGEST = `sha256:${'b'.repeat(64)}`;
@@ -70,19 +68,17 @@ const errorsOf = (value: unknown): readonly string[] => {
 };
 
 describe('T27e: START of a READ check job', () => {
-  it('accepts READ_CHECK with the authentication and 1 to MAX_WORKER_READ_CHECKS definitions, a null target page included', () => {
-    expect(MAX_WORKER_READ_CHECKS).toBe(MAX_READ_CHECKS_PER_JOB);
+  it('accepts READ_CHECK with the authentication and definitions, a null target page included', () => {
     expect(errorsOf(start(WORKER_READ_CHECK_JOB_KIND, { readChecks: [readCheck(1)] }))).toEqual([]);
     expect(errorsOf(start(WORKER_READ_CHECK_JOB_KIND, { readChecks: [readCheck(1, { targetPage: null })] }))).toEqual([]);
-    const most = Array.from({ length: MAX_WORKER_READ_CHECKS }, (_, index) => readCheck(index));
-    expect(errorsOf(start(WORKER_READ_CHECK_JOB_KIND, { readChecks: most }))).toEqual([]);
   });
 
-  it('rejects READ_CHECK without definitions, with no or too many definitions, and without the authentication', () => {
+  it('rejects READ_CHECK without definitions and without the authentication, and accepts many definitions (L4)', () => {
     expect(errorsOf(start(WORKER_READ_CHECK_JOB_KIND))).toContain('/readChecks is required for READ_CHECK');
     expect(errorsOf(start(WORKER_READ_CHECK_JOB_KIND, { readChecks: [] })).length).toBeGreaterThan(0);
-    const tooMany = Array.from({ length: MAX_WORKER_READ_CHECKS + 1 }, (_, index) => readCheck(index));
-    expect(errorsOf(start(WORKER_READ_CHECK_JOB_KIND, { readChecks: tooMany })).length).toBeGreaterThan(0);
+    // L4（COV-7）: 定義の数の上限はない（前の上限 20 を超えても受ける）。
+    const many = Array.from({ length: 25 },(_, index) => readCheck(index));
+    expect(errorsOf(start(WORKER_READ_CHECK_JOB_KIND, { readChecks: many }))).toEqual([]);
     const { authentication: _authentication, ...unauthenticated } = start(WORKER_READ_CHECK_JOB_KIND, { readChecks: [readCheck(1)] });
     expect(errorsOf(unauthenticated)).toContain('/authentication is required for READ_CHECK');
   });
@@ -133,16 +129,17 @@ describe('T27e: START of a READ check job', () => {
     ]);
   });
 
-  it('keeps the schema limits equal to the named constants', () => {
+  // L4（COV-7）: 定義の数と件数の要約に、READ の確かめの上限を置かない（件数の要約は安全な整数の範囲だけ）。
+  it('has no count limit of the READ checks in the schema (L4)', () => {
     const schema = JSON.parse(readFileSync(resolve(process.cwd(), 'schemas', 'control', 'worker-message.schema.json'), 'utf8')) as {
       readonly $defs: {
-        readonly start: { readonly properties: { readonly readChecks: { readonly maxItems: number } } };
+        readonly start: { readonly properties: { readonly readChecks: { readonly maxItems?: number } } };
         readonly readCheckSummary: { readonly properties: { readonly checks: { readonly maximum: number }; readonly executed: { readonly maximum: number } } };
       };
     };
-    expect(schema.$defs.start.properties.readChecks.maxItems).toBe(MAX_WORKER_READ_CHECKS);
-    expect(schema.$defs.readCheckSummary.properties.checks.maximum).toBe(MAX_WORKER_READ_CHECKS);
-    expect(schema.$defs.readCheckSummary.properties.executed.maximum).toBe(MAX_WORKER_READ_CHECKS);
+    expect(schema.$defs.start.properties.readChecks.maxItems).toBeUndefined();
+    expect(schema.$defs.readCheckSummary.properties.checks.maximum).toBe(Number.MAX_SAFE_INTEGER);
+    expect(schema.$defs.readCheckSummary.properties.executed.maximum).toBe(Number.MAX_SAFE_INTEGER);
   });
 
   // T37d（Task 37 の設計書 3.5）: 画面の path の定義は、送る値を持たず、対象の画面（親が開始の URL の Origin と、その path で入れる）が定義の path と同じ。
@@ -182,6 +179,7 @@ describe('T27e: FINISHED of a READ check job', () => {
       readCheck: { checks: 1, executed: 0 },
     }).length).toBeGreaterThan(0);
     expect(finishedErrors(finished({ readCheck: { checks: 1, executed: 1, results: ['MATCHED'] } })).length).toBeGreaterThan(0);
-    expect(finishedErrors(finished({ readCheck: { checks: MAX_WORKER_READ_CHECKS + 1, executed: 0 } })).length).toBeGreaterThan(0);
+    // L4: 前の上限 20 を超える数も受ける。
+    expect(finishedErrors(finished({ readCheck: { checks: 21, executed: 0 } }))).toEqual([]);
   });
 });

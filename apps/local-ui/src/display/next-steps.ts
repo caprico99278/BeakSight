@@ -28,7 +28,7 @@ import { LOCAL_UI_JOB_SUMMARY_TEXT } from '../../../../src/presentation/messages
 import type { JobSummaryFinishedResult } from '../server/audit-job-functions';
 import type { AutoDraftPreviewView } from '../server/scenario-autodraft-functions';
 import type { AuditStartBlocker } from '../server/audit-start-check';
-import { isExecutableProfile, usesAuthSetup, usesAutomatedLogin, usesScenarios } from './labels';
+import { isExecutableProfile, usesAuthSetup, usesAutomatedLogin, usesDiscovery, usesScenarios } from './labels';
 
 /** 保存の後の次の手順（閉じた一覧。並べる順）。 */
 export const PROFILE_NEXT_STEPS = Object.freeze(['AUTH_SETUP', 'CREDENTIAL', 'LOGIN_CHECK', 'AUDIT_START'] as const);
@@ -61,7 +61,7 @@ export const nextStepAfter = (step: ProfileNextStep, mode: AuditMode, auth: Auth
  * - `AUTH_SETUP_FIX`: 認証の設定が古いか誤り。`CREDENTIAL_FIX`: 自動ログインの ID とパスワードがないか、今のログインの画面と合わない。
  * - `AUTO_LOGIN_WAIT`: 自動ログインの間隔の中。`AUTO_LOGIN_HELD`: 自動ログインを止めている。`BLOCKED`: ほかの理由で始められない。
  * - `AUDIT_PUBLIC`・`AUDIT_MANUAL_LOGIN`・`AUDIT_AUTOMATED_LOGIN`: 点検を始める（公開の画面・手でログイン・自動ログインの最初の点検）。`AUDIT_AGAIN`: 進む段が
- *   もうなく、点検を繰り返す。
+ *   もうなく、点検を繰り返す。`AUDIT_NO_LOGIN`（NL-3）: ログインのないテスト用のサイトの最初の点検。`AUDIT_RUNNING`（DEF-197）: 点検（まとめて実行の連鎖のどれかの段）が動いている。
  * - `WRITE_MODE_SWITCH`: 書き込みも試す。`SCENARIOS`: 書き込みの手順へ。OP-1（設計書 `2026-10-27-beaksight-one-pass-flow-design.md` 4.1 の D5）: 「次から自動で
  *   ログインする」（`AUTOMATED_LOGIN_SETUP`）は、ふだんの流れから外した（1 回目の点検の手でのログインの後に、BeakSight が自動ログインへ切り替える）。
  */
@@ -77,7 +77,11 @@ export const PROFILE_STAGES = Object.freeze([
   'AUDIT_PUBLIC',
   'AUDIT_MANUAL_LOGIN',
   'AUDIT_AUTOMATED_LOGIN',
+  // NL-3: ログインのないテスト用のサイトの最初の点検（ログインの語を出さない）。
+  'AUDIT_NO_LOGIN',
   'AUDIT_AGAIN',
+  // DEF-197: 点検（まとめて実行の連鎖のどれかの段）が動いている。押すものはない（一覧の行にも「続ける」を出さない）。
+  'AUDIT_RUNNING',
 ] as const);
 export type ProfileStageKind = (typeof PROFILE_STAGES)[number];
 
@@ -123,6 +127,11 @@ export interface ProfileStageFacts {
    * プロファイルでも、手でログインするサイトと同じ段で進む。省けば偽。
    */
   readonly manualLoginEveryTime?: boolean;
+  /**
+   * DEF-197: このサイトの点検が動いているか（まとめて実行の連鎖の途中を含む。決めるのは画面のサーバの 1 か所 `profile-onboarding-functions.ts`）。
+   * 省けば偽。
+   */
+  readonly running?: boolean;
 }
 
 /** サイトの画面の段と、ボタン。 */
@@ -178,7 +187,12 @@ const readyStageOf = (facts: ProfileStageFacts): Omit<ProfileStage, 'laterOffers
     if (automated) {
       return stageOf('AUDIT_AUTOMATED_LOGIN', 'AUDIT_START');
     }
-    return stageOf(usesAuthSetup(mode, auth) ? 'AUDIT_MANUAL_LOGIN' : 'AUDIT_PUBLIC', 'AUDIT_START');
+    if (usesAuthSetup(mode, auth)) {
+      return stageOf('AUDIT_MANUAL_LOGIN', 'AUDIT_START');
+    }
+    // NL-3（設計書 `2026-11-06-beaksight-no-login-test-site-design.md` 3.3 の 4）: ログインのないテスト用のサイト（ログインの設定を使わず、操作さがしを使う
+    // プロファイル。判定は `execution-policy.ts` の行）は、公開の画面の段と分ける（ログインの語を出さない）。
+    return stageOf(usesDiscovery(mode, auth) ? 'AUDIT_NO_LOGIN' : 'AUDIT_PUBLIC', 'AUDIT_START');
   }
   // PL-U（14.1 の U2）: 進む段がもうないときは、最新の点検の結果を主のボタンにする（報告がなければ、今どおり点検を繰り返す）。
   return lastAudit.report ? stageOf('AUDIT_AGAIN', 'AUDIT_RESULT', 'AUDIT_START') : stageOf('AUDIT_AGAIN', 'AUDIT_START');
@@ -188,6 +202,10 @@ const readyStageOf = (facts: ProfileStageFacts): Omit<ProfileStage, 'laterOffers
 export const profileStageOf = (facts: ProfileStageFacts): ProfileStage => {
   if (facts.status !== ACTIVE_PROFILE_STATUS) {
     return { stage: 'SITE_RETIRED', primary: null, secondary: null, laterOffers: [] };
+  }
+  // DEF-197: 動いている間は、終わった段の操作（結果を見る・点検を始める）も、始められない理由も出さず、動いていることだけを言う。
+  if (facts.running === true) {
+    return { stage: 'AUDIT_RUNNING', primary: null, secondary: null, laterOffers: [] };
   }
   const chosen = blockedStageOf(facts) ?? readyStageOf(facts);
   // OP-2: 「書き込みも試す」はなくした（書き込みのモードへの切り替えは、一覧のチェックの保存が行う）。
@@ -201,13 +219,20 @@ export const profileStageOf = (facts: ProfileStageFacts): ProfileStage => {
  * 主のボタンの段は、そのまま。呼ぶのは、最新の点検の報告があるときだけ（画面が、移ってきた印と報告の有無を見て呼ぶ）。
  */
 export const profileStageAfterAuditArrivalOf = (stage: ProfileStage): ProfileStage => {
-  if (stage.stage === 'SITE_RETIRED' || stage.primary === 'AUDIT_RESULT') {
+  // DEF-197: 動いている間は、移ってきても「結果を見る」を出さない。
+  if (stage.stage === 'SITE_RETIRED' || stage.stage === 'AUDIT_RUNNING' || stage.primary === 'AUDIT_RESULT') {
     return stage;
   }
   const secondary = stage.primary ?? stage.secondary;
   const displaced = stage.primary !== null && stage.secondary !== null ? [stage.secondary] : [];
   return { stage: stage.stage, primary: 'AUDIT_RESULT', secondary, laterOffers: [...stage.laterOffers, ...displaced] };
 };
+
+/** DEF-197: サイトの一覧の行に「続ける」を出さない段（取り消した・点検が動いている）。 */
+const STAGES_WITHOUT_CONTINUE: ReadonlySet<ProfileStageKind> = new Set<ProfileStageKind>(['SITE_RETIRED', 'AUDIT_RUNNING']);
+
+/** サイトの一覧の行に「続ける」（サイトの画面へ進むボタン）を出すか。 */
+export const profileStageShowsContinue = (stage: ProfileStage): boolean => !STAGES_WITHOUT_CONTINUE.has(stage.stage);
 
 /**
  * 終わった作業の結果の 1 行（作業の画面の要点と、移ってきたサイトの画面の要点の 1 行目が共用する。PL-U で作業の画面から移した）。点検が最後まで終わり、

@@ -7,12 +7,14 @@ import type {
   Page,
   Request,
   Route,
+  WebSocketRoute,
 } from 'playwright';
 import { isInvalidInterceptionIdFailure } from '../browser/playwright-errors.js';
 import type { ResourceDeliveryDecision, ResourceDeliveryRequestFacts } from '../browser/resource-delivery.js';
 import { AUDIT_SEND_PASS_EXCEPT_DELETE } from '../core/audit-send-policy.js';
 import { BLOCKED_BY_CLIENT_DOCUMENT_FAILURE_TEXT } from '../core/blocked-by-client-failures.js';
 import { awaitBeforeDeadline } from '../core/deadline.js';
+import { PROGRESS_WATCH_QUIET_LIMIT_MS, watchProgress } from '../core/progress-watch.js';
 import { safeErrorMessage } from '../core/errors.js';
 import {
   CHROMIUM_EXTENSION_PROTOCOL,
@@ -28,13 +30,8 @@ import {
   WEBRTC_BLOCKED_MESSAGE,
 } from '../core/guard-page-exceptions.js';
 import { isRecord } from '../core/guards.js';
+import { deepFreeze } from '../core/immutable.js';
 import { ERROR_HTTP_STATUS_RANGE, isHttpStatusInRange, REDIRECTION_HTTP_STATUS_RANGE } from '../core/http-status.js';
-import {
-  MAX_ERROR_MESSAGE_LENGTH,
-  MAX_HTTP_METHOD_LENGTH,
-  MAX_PENDING_GUARD_REQUEST_TASKS,
-  MAX_URL_LENGTH,
-} from '../core/limits.js';
 import { saturatingAdd, saturatingIncrement } from '../core/saturating-count.js';
 // T40R2-fix（Task 40 の設計書 7 章の「T40R2」の行の M-3）: 書き込みの段の送り方は、シナリオの送り方と同じ値（core の名前つきの定数）。
 import { API_SCENARIO_TRANSPORT, FORM_SCENARIO_TRANSPORT } from '../core/scenario-transport.js';
@@ -70,12 +67,19 @@ import {
   AUDIT_STAGE_BLOCK_REASONS,
   SCRIPT_LOGIN_BLOCK_REASONS,
   canonicalPassiveAllowedOrigins,
+  NOTIFICATION_DISMISSAL_BLOCK_REASON,
+  SCROLL_KEY_PRESS_BLOCK_REASON,
+  SUBMISSION_POST_METHOD,
   classifyPassiveRequest,
   hasAllowedOrigin,
   isApiWriteCheckTarget,
   isAuditSendDangerousWebSocket,
+  isFrozenReadAdmissible,
+  isFrozenTokenRefreshAdmissible,
   isReadMethod,
   isSpeculativeRequestHeaders,
+  isTokenRefreshRequest,
+  recordPathShapeOf,
   requestResourceTypeOf,
   requestResourceTypeOfRequest,
   type AuditExclusionPolicy,
@@ -86,6 +90,8 @@ import {
   type LoginPostEndpoint,
   type LoginStageAdmission,
   type ManualLoginPassThroughReason,
+  type HttpRequestFacts,
+  type NotificationPressMode,
   type PassiveRequestDecision,
   type PassiveRequestPolicyOptions,
   type RequestResourceType,
@@ -97,10 +103,15 @@ import {
   type SubmissionStageBlockReason,
 } from './request-policy.js';
 import type { InvariantViolationInput, SafetyLedger } from './safety-ledger.js';
+import type { FrozenRefreshReference } from '../core/session-key-values.js';
 import { observeCreatedWebSockets, type ObservedWebSocket } from './audit-send-websocket-observer.js';
+import { openRelayedWebSocket, relayHandshakeHeadersOf, type RelayedWebSocket } from './websocket-relay.js';
 import {
   attachSubmissionObservation,
+  frozenReadCarriesObservedMarker,
+  frozenRequestCarriesObservedMarker,
   observationAdmitsFrozenPreflight,
+  observationPressesAfterFreeze,
   recordObservedFrozenPreflight,
   recordObservedFrozenRequest,
   type SubmissionObservation,
@@ -108,14 +119,22 @@ import {
 import {
   checkWritePayload,
   formMethodOverrideValuesOf,
+  indexedListCopyOf,
+  writeDeferredPriorValuesCopyOf,
+  writeExpectationWithPriorValues,
   type WritePayloadExpectation,
+  type WriteSuppliedPriorValues,
 } from './write-payload-policy.js';
 import {
   WRITE_STAGE_PAYLOAD_BLOCK_REASONS,
+  apiWriteCheckPathOf,
+  apiWriteExpectationWithPriorValues,
+  apiWritePriorValuesCopyOf,
   checkApiWritePayload,
-  type ApiJsonScalarValue,
+  type ApiWritePageKeyValue,
   type ApiWritePayloadBlockReason,
   type ApiWritePayloadExpectation,
+  type ApiWriteSuppliedPriorValues,
   type WriteStagePayloadBlockReason,
 } from './api-write-payload-policy.js';
 import {
@@ -145,20 +164,15 @@ export type GuardPhase =
   | 'CLOSED';
 type PageGuardStatus = 'INSTALLING' | 'READY' | 'FAILED';
 const OWNER_PAGE_CLOSE_MARKER_RETENTION_MS = 100;
-const EXPECTED_CDP_FAILURE_RETENTION_MS = 1_000;
-/**
- * リダイレクトの対応付けの登録を保持する時間（ms。C18h）。リクエストの段階の登録は、リクエストの開始から数える。リダイレクトの
- * 応答（3xx）を受けたときは、その時点から数え直す。3xx を返すまでのサーバの時間は、数えない（DEF-013）。
+/*
+ * L10（設計書 `2026-11-09-beaksight-remove-limits-design.md` 4。INV-LIMITS の T29 と設計者の判断 E）: 証拠と対応付けの記録は、時間で捨てない。期限を持たず、
+ * 使ったとき（1 回だけ使う）か、持ち主（page・session・Context）を閉じたときに捨てる（番兵の値の期限は使わない。設計書 6.1）。前は、Guard の命令の失敗の
+ * 予期 1 秒、リダイレクトの前の要求 1 秒、文書の取り消しの証拠 5 秒、止めたダウンロード 5 秒、応答を待つ main frame の文書 10 分で捨てていた
+ * （捨てた後に届いた事象を違反にしていた）。
  */
-const REDIRECT_PREDECESSOR_RETENTION_MS = 1_000;
 const GUARD_PENDING_TASK_DRAIN_TIMEOUT_MS = 1_000;
 const GUARD_PENDING_TASK_DRAIN_TIMEOUT_MESSAGE =
   'Guard-owned listener tasks did not settle before cleanup deadline';
-const MAX_PENDING_GUARD_TASKS = 256;
-export const MAX_GUARD_PAGE_LISTENER_GROUPS = 64;
-const MAX_EXPECTED_CDP_FAILURES = 64;
-const MAX_REDIRECT_PREDECESSORS = 64;
-const MAX_REDIRECT_REQUEST_ID_LENGTH = 256;
 /**
  * 1つの page の中で、同時に横取りを付けておく、別のプロセスの iframe（OOPIF）の session の数の上限（入れ子を含む。C18i）。
  * 超えた OOPIF は、一時停止のまま進めず、`OOPIF_GUARD_ATTACH_FAILED` の違反にして Context を閉じる（fail-closed）。
@@ -175,14 +189,6 @@ const MAX_GUARD_OOPIF_SESSIONS = 64;
  */
 export const MAX_CANCELED_DOCUMENT_EVIDENCE = 256;
 /**
- * 文書の要求の取り消しの証拠を覚えておく時間（ms。DEF-026）。証拠を受けた時点から数える。証拠は、一時停止の通知の数十 ms 前に届き、
- * 一時停止から命令の失敗の応答までは、ふつうは数 ms である。Node の事象の処理が遅れた場合と、証拠を待つ時間
- * （`CANCELED_DOCUMENT_EVIDENCE_WAIT_MS`）を足しても余る長さにする。過ぎた証拠は捨て、その要求への命令が失敗したら違反にする。
- * DEF-027: main frame の文書の要求の記録も、その要求の `Network.loadingFailed` を受けた後は、この時間で捨てる（Playwright の
- * `requestfailed` と対応付けるのに、同じ長さで足りる）。
- */
-export const CANCELED_DOCUMENT_EVIDENCE_RETENTION_MS = 5_000;
-/**
  * Guard の命令が、一時停止の ID が無効な形で失敗したのに、その要求の取り消しの証拠をまだ受けていないときに、証拠を待つ時間（ms。DEF-026）。
  * 実験では、証拠は、いつも一時停止の通知より先に届いた。この時間は、届く順が入れ替わる場合に備えた余裕で、ブラウザの中の事象の遅れ
  * （数 ms から数十 ms）より十分に長く、Guard の作業を長く止めない長さにする。待っても届かなければ、違反にする。
@@ -191,6 +197,13 @@ export const CANCELED_DOCUMENT_EVIDENCE_RETENTION_MS = 5_000;
  * （`requestfailed` と、Guard の page の session の事象の順は決まっていない。調査では 1ms ほどの差だった）。
  */
 export const CANCELED_DOCUMENT_EVIDENCE_WAIT_MS = 500;
+/**
+ * DEF-225: 凍結の前に、main frame の読み取り（GET・HEAD）の移動が、応答（ヘッダ）を受けた後に `net::ERR_ABORTED` で失敗したときに、同じ page・同じ URL の、
+ * Guard が止めたダウンロード（`PASSIVE_DOWNLOAD`）の記録を待つ時間（ms）。実機（2026-11-08、テストの既定と CLI の 2 つの Chromium、goto と押下の各 3〜5 回）では、
+ * いつも `requestfailed` が先に来て、`download`（CDP の `Page.downloadWillBegin` の後）は 0.3〜4ms 後だった。この時間は、その遅れより十分に長く、Guard の作業を
+ * 長く止めない長さにする（DEF-027 の待ちと同じ値。閉じる処理の作業の待ちより短い）。待っても届かなければ、今までどおり違反にする。
+ */
+export const PASSIVE_DOWNLOAD_EVIDENCE_WAIT_MS = CANCELED_DOCUMENT_EVIDENCE_WAIT_MS;
 /**
  * DEF-052（設計書 `2026-10-09-beaksight-def-052-guard-evidence-wait-design.md` 2.1）: 証拠の待ち（`CANCELED_DOCUMENT_EVIDENCE_WAIT_MS`）の
  * タイマーが切れた後に、Node がすでに受け取っている CDP の事象を処理するために `setImmediate` で譲る回数の上限。譲るたびに証拠を見て、
@@ -202,8 +215,8 @@ export const CANCELED_DOCUMENT_EVIDENCE_WAIT_MS = 500;
 export const CANCELED_DOCUMENT_EVIDENCE_RECEIVED_EVENT_YIELDS = 16;
 /**
  * DEF-052（設計書 2.2）: 1つの session で、取り消しの証拠を上限（`MAX_CANCELED_DOCUMENT_EVIDENCE`）のために覚えなかった要求の ID を
- * 覚えておく数の上限。診断（`evidence-dropped-at-capacity`）だけに使い、違反にするかの判定には使わない。覚えておく時間は
- * `CANCELED_DOCUMENT_EVIDENCE_RETENTION_MS`。覚えきれない ID の診断は `evidence-not-received` になる（数の累計には数える）。
+ * 覚えておく数の上限。診断（`evidence-dropped-at-capacity`）だけに使い、違反にするかの判定には使わない。L10: 時間では捨てない（session を閉じても
+ * 消さない）。覚えきれない ID の診断は `evidence-not-received` になる（数の累計には数える）。
  */
 export const MAX_DROPPED_CANCELED_DOCUMENT_IDS = 256;
 /**
@@ -225,15 +238,6 @@ export type CanceledDocumentEvidenceMissingReason =
   typeof CANCELED_DOCUMENT_EVIDENCE_MISSING_REASON[keyof typeof CANCELED_DOCUMENT_EVIDENCE_MISSING_REASON];
 /** DEF-052（設計書 2.2）: 違反の文の後ろに付ける診断の見出しの語。 */
 const CANCELED_DOCUMENT_EVIDENCE_DIAGNOSTIC_LABEL = 'canceled-document-evidence';
-/**
- * Guard が Request の段階で一時停止した main frame の文書の要求の記録（DEF-027。`MainFrameDocumentRecord`）を、その要求が終わる前に
- * 覚えておく時間（ms）。一時停止の通知を受けた時点から数える。要求が終わったら、記録を消す（`Network.loadingFinished`）か、
- * `CANCELED_DOCUMENT_EVIDENCE_RETENTION_MS` に縮める（`Network.loadingFailed`）。
- * 応答を待つ main frame の読み込みは、ページを開いている間（読み込みの期限は設定の `crawl.navigationTimeoutMs`、既定 30秒。ページの期限は
- * `crawl.overallPageTimeoutMs`、既定 60秒）、利用者がタブを閉じるなどで、いつでも取り消されうる。Guard はこれらの設定を受け取らないので、
- * 既定のページの期限の10倍にする。過ぎた記録は捨て、その要求がその後に取り消されたら、違反のまま（fail-closed）。
- */
-export const PENDING_MAIN_FRAME_DOCUMENT_RETENTION_MS = 600_000;
 /**
  * ブラウザが文書の要求を取り消したときの失敗の理由（Playwright の `requestfailed` の `errorText` と、CDP の `Network.loadingFailed` の
  * `errorText`）。Guard や page を閉じる途中の取り消しと、DEF-027 の取り消しの証拠で使う。
@@ -301,11 +305,25 @@ export interface PassiveRequestGuardOptions {
   readonly auditStage?: GuardAuditStage | undefined;
   /**
    * AS-a（設計書 `2026-10-19-beaksight-audit-send-policy-design.md` 2.2・2.3）: 監査の段の送信の扱い `PASS_EXCEPT_DELETE` の指定（`GuardAuditSend`）。ある場合だけ、
-   * ページが自分で出す読み取りでない要求のうち、削除・危険な語・ほかの Origin・文書のナビゲーションでないものを、この Context（読み込み）の上限の数まで通し、
-   * Safety Ledger の通した要求の記録に残す（判定は `classifyPassiveRequest` の `auditSend` の口。数えるのは CDP の層だけ）。形が違う、ログインの段と書き込みの段の
+   * ページが自分で出す読み取りでない要求のうち、削除・削除の上書き・危険な語・許可 Origin の外への main frame の移動でないもの（RB-4b から form の送信も）を通し、
+   * Safety Ledger の通した要求の記録に残す（判定は `classifyPassiveRequest` の `auditSend` の口。数えない）。形が違う、ログインの段と書き込みの段の
    * 指定と一緒、は `TypeError`。スクリプトで送るログインの監査の段の指定（`auditStage`）とは一緒に受ける。省略した場合は、今と同じ（読み取りだけ）。
    */
   readonly auditSend?: GuardAuditSend | undefined;
+  /**
+   * RB-4b（設計書 `2026-11-15-beaksight-test-rebuild-design.md` 3.2）: リアルタイムの通信（WebSocket）を止めない指定。factory が、凍結しない Context（Passive と
+   * 書き込みの段）だけに渡す（Interaction と、ログインの段には渡さない）。ある場合は、送信の扱いによらず（READ_ONLY でも）、WebSocket の接続を通し（SD-2:
+   * 危険な語の接続も）、Worker の中の WebSocket を止める CSP も当てない（`AUDIT_SEND_CONNECT_POLICY`）。RB-4 fix: 凍結の後に押しうる Guard（Isolated Interaction
+   * Context と、押す観察の口のある Guard。DEF-276 で、凍結の後に押さない口 `freezeOnlyForReading` を除いた）は、この指定があっても Worker の中の WebSocket を止める
+   * （`WORKER_CONNECT_POLICY`）。
+   */
+  readonly realtimePassThrough?: true | undefined;
+  /**
+   * DEF-276-relay: 文書の WebSocket を Node の側で中継する口（`websocket-relay.ts`。Context の出口の中継の待ち受けと、テストだけ足す証明書）。factory が、凍結の後に
+   * 押す観察の口のある Context（操作さがしの PRIMARY）だけに渡す。ある場合、文書の CSP が ws を止める Context（`WORKER_CONNECT_POLICY`）で、route が通した文書の
+   * WebSocket を、ページの中の接続でなく中継でつなぐ（凍結の前だけ。凍結と閉じでは、中継した接続を切る）。ほかの Context は今のまま（`connectToServer`）。
+   */
+  readonly webSocketRelay?: GuardWebSocketRelay | undefined;
   /**
    * 監査の段の除外の指定（Task 25 の設計書 4.2。T25b round 1）。ある場合だけ、許可 Origin への GET と HEAD でも、除外に当たる要求を
    * 止め、Safety Ledger の `blockedAuditExclusions` に記録する（判定は `classifyPassiveRequest` の `auditExclusions` の口）。route の層、
@@ -329,8 +347,16 @@ export interface PassiveRequestGuardOptions {
    * 省略した場合は、今と同じ。
    * BN-R0 fix round 1（I-1）: `decideGuardRequest` の `ALLOW` の知らせでは、要求の method も渡す（中継が、Guard が通したページの文書でない読み取りだけを、
    * 監査の段の除外に当たる URL でも通すため）。ほかの知らせ（事前確認の送り、WebSocket）では、method を渡さない。
+   * DEF-208-1（設計書 `2026-11-05-beaksight-discovery-coverage-design.md` 3.1 の設計者の判断 (b)）: 凍結の段で通した読み取り（`frozenRead` の `ALLOW`）の知らせでは、
+   * 3 つ目に真を渡す（中継は、凍結の後でも、その写しに当たる読み取りだけを通す）。ほかの知らせでは渡さない。
+   * SREV-SAFE の M-2: 凍結の段の知らせでは、4 つ目に知らせた層を渡す（1 つの要求を CDP の層と route の層の両方が知らせるので、中継の写しは CDP の層だけを数える）。
    */
-  readonly onEgressDestinationAdmitted?: ((url: string, method?: string) => void) | undefined;
+  readonly onEgressDestinationAdmitted?: ((url: string, method?: string, frozenRead?: boolean, layer?: GuardRequestLayer) => void) | undefined;
+  /**
+   * SREV-SAFE の N-1: route の層が要求を止めたときに、その method と URL を知らせる口（route の層に来るのは CDP の層が許した要求なので、CDP の層の知らせで数えた
+   * 中継の写しを 1 つ戻す）。口の例外は違反 `GUARD_EGRESS_ADMISSION_FAILED` に記録し、投げない。省略した場合は、何もしない。
+   */
+  readonly onEgressDestinationWithdrawn?: ((url: string, method: string) => void) | undefined;
   /**
    * main frame の文書の要求を送った時刻の記録の口（DEF-100 fix。手順書 `doc/spec/site-load.md`）。ある場合だけ、次の時点で、同期で呼ぶ。factory は、
    * Run（監査・発見・READ の確かめ・書き込み）で 1 つの読み込みの間隔の部品（`NavigationPacer.recordDocumentRequestSent`）を渡す。pacer は、次の
@@ -353,11 +379,51 @@ export interface PassiveRequestGuardOptions {
    */
   readonly submissionObservation?: SubmissionObservation | undefined;
   /**
+   * L10 の後の安全の側の設計の変更（設計者の判断）: 凍結の段（`FROZEN_ACTIVE`）で、凍結の読み取りの判定（`isFrozenReadAdmissible`）に当たる読み取りを、監査の段と同じ
+   * 判定にかけて通すか。factory が Isolated Interaction Context の Guard に真を渡す（押した後に fetch でデータが届いて開く部品を確かめるため）。観察の口
+   * （`submissionObservation`）のある Guard は、この印がなくても通す（DEF-208-1）。書き込み・削除・資格情報・main frame の移動は、今どおり凍結で止める
+   * （判定の部品は同じ）。token の更新と事前確認は、観察の口のある Guard だけが通す（この印では通さない）。ログインの段と書き込みの段の指定とは、一緒に受けない。
+   */
+  readonly admitFrozenReads?: true | undefined;
+  /**
+   * DEF-233 fix round 3（SREV-233 の確かめ直しの N-1）: 凍結の段で通すサイトの token の更新の比べの相手（凍結の前に通して確かめた更新の本文の形と header、今の鍵の値。
+   * factory が作る）。観察の口のある Guard だけが使う。省略・null・例外は、凍結の段の更新を通さない。
+   */
+  readonly frozenTokenRefreshReference?: (() => FrozenRefreshReference | null) | undefined;
+  /**
+   * DEF-233 fix round 2（SREV-233 の M-3）・fix round 3: Guard が token の更新の形の要求を通した知らせ（CDP の層。`frozen` は凍結の段に通したもの。`request` は
+   * その要求の header と本文の文字列）。factory が、その応答だけを比べの相手として覚え、凍結の前の更新は、応答で成功の鍵が更新されたと確かめてから、本文の形・header・
+   * 必須の query の値を Run の中で覚える。口の例外は違反に記録し、投げない。
+   */
+  readonly onTokenRefreshAdmitted?: ((
+    url: string,
+    frozen: boolean,
+    request: { readonly headers: Readonly<Record<string, string>>; readonly body: string | null },
+  ) => void) | undefined;
+  /**
+   * DEF-233 fix round 2: 同じ Run の中で凍結の前に通した token の更新の、必須の query の名前と値（factory が Run の中で覚える）。凍結の段で通す更新の必須の query の値は、
+   * OAuth の標準の更新の値か、これだけ。省略・例外は空。
+   */
+  readonly frozenTokenRefreshQueryValues?: (() => ReadonlyMap<string, ReadonlySet<string>>) | undefined;
+  /**
    * DEF-129: ページが始めた文書の読み込みの回数に、frame ごとの上限（`PAGE_INITIATED_NAVIGATION_LIMIT_PER_FRAME`。T37R2-fix で子の frame も）を置くか。factory が、Passive の Context
    * （ログインの段と書き込みの段を除く）に真を渡す。BeakSight 自身の読み込みは、`announceOwnMainFrameNavigation` で知らせてから始める。省略は、今どおり
    * 数えない（Guard を直接付けるテストなど）。ログインの段と書き込みの段の指定とは、一緒に受けない（数えない）。
    */
   readonly pageNavigationLimit?: boolean | undefined;
+  /**
+   * DEF-245: 閉じるときに Guard の作業の終わりを待つ見張り（`drainGuardTasks`）の、反応なしの長さ（ms。正の安全な整数）。省略すると本番の
+   * `PROGRESS_WATCH_QUIET_LIMIT_MS`。factory が、Run の見張りの長さ（`progressWatchQuietLimitMs`）の指定を渡す（テストが短くする口）。
+   */
+  readonly drainQuietLimitMs?: number | undefined;
+}
+
+/**
+ * 凍結の段で、凍結の読み取りの判定に当たる読み取りを通す Guard か（唯一の判定）。観察の口のある Guard（操作さがしの PRIMARY の Passive の Context。DEF-208-1）と、
+ * 印 `admitFrozenReads` のある Guard（Isolated Interaction Context）だけ。ほかの Guard は、凍結の段ですべて止める。
+ */
+export function admitsFrozenReads(options: Pick<PassiveRequestGuardOptions, 'submissionObservation' | 'admitFrozenReads'>): boolean {
+  return options.submissionObservation !== undefined || options.admitFrozenReads === true;
 }
 
 /**
@@ -374,8 +440,6 @@ function snapshotAuditExclusions(policy: AuditExclusionPolicy): AuditExclusionPo
     excludedPathPrefixes: copy(policy.excludedPathPrefixes),
     auditPathPrefixes: copy(policy.auditPathPrefixes),
     dangerousTerms: copy(policy.dangerousTerms),
-    // BN-0: ページが出す文書でない読み取りにも当てる印（Isolated Interaction Context だけ）も写す。
-    ...(policy.applyToPageSubresourceReads === true ? { applyToPageSubresourceReads: true as const } : {}),
   });
 }
 
@@ -395,13 +459,22 @@ function requestPolicyOf(
   if (stage === undefined && auditExclusions === undefined && auditStage === undefined && auditSend === undefined) {
     return undefined;
   }
+  // RB-14b（X1）: ログインの段の口は、監査の段と送信の扱いの口と一緒に作らない（Guard の取り付けが拒む組み合わせ）。
+  if (stage?.authSetup !== undefined) {
+    return { authSetup: stage.authSetup, auditExclusions };
+  }
   return {
-    ...stage,
+    ...(stage?.writeStage === undefined ? {} : { writeStage: stage.writeStage }),
     auditExclusions,
     ...(auditStage === undefined ? {} : { auditStage }),
     // AS-a: 監査の段の送信の扱いの口（ある場合だけ）。
     ...(auditSend === undefined ? {} : { auditSend }),
   };
+}
+
+/** RB-4b・RB-14b: 判定の口に、リアルタイムの通信を止めない口を足す（ログインの段の口とは一緒に取り付けないので、ログインの段の口はそのまま）。 */
+function withRealtimePassThrough(policy: PassiveRequestPolicyOptions | undefined): PassiveRequestPolicyOptions | undefined {
+  return policy?.authSetup !== undefined ? policy : { ...policy, realtimePassThrough: true };
 }
 
 /**
@@ -411,22 +484,32 @@ function requestPolicyOf(
 export { AUDIT_SEND_PASS_EXCEPT_DELETE };
 
 /**
- * AS-a（設計書 2.2・2.4）: 監査の段の送信の扱い `PASS_EXCEPT_DELETE` で、1 つの読み込み（Context）で通す読み取りでない要求の数の上限（名前つきの定数）。
- * ページが送信を繰り返す作りで、サイトに負荷をかけ続けないため。超えた要求は止めて記録する（Safety Ledger の止めた要求 `AUDIT_SEND_OVER_LIMIT`）。
- */
-export const AUDIT_SEND_MAX_PASSED_PER_CONTEXT = 60;
-
-/**
- * AS-c（設計書 5 章の「ユーザーの言葉と選択（AS-c）」の行）: 監査の段の送信の扱い `PASS_EXCEPT_DELETE` で、1 つの読み込み（Context）で通す WebSocket の接続の数の
- * 上限（名前つきの定数。HTTP の要求の上限とは別に数える）。超えた接続は止めて記録する（Safety Ledger の止めた WebSocket `AUDIT_SEND_OVER_LIMIT`）。
- */
-export const AUDIT_SEND_MAX_WEBSOCKETS_PER_CONTEXT = 10;
-
-/**
  * AS-c fix round 1（I-1。設計書 5 章の「AS-c fix round 1 の Blocker」の行）: Guard がほかの Origin へ送る CORS の事前確認の、送ってから応答を受け終わるまでの
  * 上限（ms。中継への接続から数える）。過ぎたら、ブラウザの事前確認を拒む応答で満たす。
  */
 export const AUDIT_SEND_PREFLIGHT_TIMEOUT_MS = 10_000;
+
+/**
+ * DEF-276-relay: 文書の WebSocket の中継の、握手（中継への接続から 101 まで）と、こちらから閉じるときの上限（ms）。過ぎたら、ページには失敗として閉じる。
+ */
+export const WEBSOCKET_RELAY_HANDSHAKE_TIMEOUT_MS = 10_000;
+
+/**
+ * DEF-276-relay（REV-DEF276 の M-2）: 文書の WebSocket の中継の、送りの列（まだサーバへ書き出していない bytes）の上限（16MiB）。超える送りでは、接続を切って
+ * 止めた WebSocket として記録する。
+ */
+export const WEBSOCKET_RELAY_MAX_SEND_QUEUE_BYTES = 16 * 1024 * 1024;
+
+/** DEF-276-relay: 文書の WebSocket の中継の口（`PassiveRequestGuardOptions.webSocketRelay`）。 */
+export interface GuardWebSocketRelay {
+  /** Context の出口の中継の待ち受け（中継が接続するのはここだけ）。 */
+  readonly proxy: { readonly host: string; readonly port: number };
+  /** テストだけ: 信頼する証明書を足す（PEM）。 */
+  readonly additionalTrustedCertificates?: readonly string[] | undefined;
+}
+
+/** WebSocket の close の code: 接続できなかった・切れた（ページに失敗として知らせる）。 */
+const WEBSOCKET_ABNORMAL_CLOSE_CODE = 1006;
 
 /**
  * AS-c fix round 2（I-C。設計書 5 章の「AS-R2」の行）: Guard の route が通して `connectToServer()` を呼んだ接続と、ブラウザが開いた接続の観察を照らし合わせる
@@ -434,9 +517,6 @@ export const AUDIT_SEND_PREFLIGHT_TIMEOUT_MS = 10_000;
  * 遅れると、route を通った接続も route の外と数えることがある（数えすぎの側。検知は最善の努力の範囲）。
  */
 export const AUDIT_SEND_WEBSOCKET_MATCH_WINDOW_MS = 500;
-
-/** AS-c fix round 3: リダイレクトの先の段を見分けるために覚える、進めた要求の Network の要求の ID の数の上限（1 つの Context。古いものから捨てる）。 */
-const MAX_AUDIT_SEND_NETWORK_IDS = 256;
 
 /** AS-c fix round 1（I-1）: 事前確認の応答がない・時間切れのときに、ブラウザの事前確認に返す拒む応答の状態（CORS のヘッダは付けない）。 */
 const AUDIT_SEND_PREFLIGHT_REJECT_CODE = 403;
@@ -446,15 +526,12 @@ const AUDIT_SEND_PREFLIGHT_REJECT_CODE = 403;
  * - `policy`: `AUDIT_SEND_PASS_EXCEPT_DELETE` だけ。
  * - `approvedServiceOrigins`: 承認したサービスの Origin（許可 Origin と合わせて、通してよい送り先）。
  * - `dangerousTerms`: path か query に含まれていたら通さない語（呼び出し側が既定の危険な語を渡す。`src/safety/` は認証の設定の契約を読まない）。
- * - `maxPassedPerContext`: この Context で通す数の上限（1 以上 `AUDIT_SEND_MAX_PASSED_PER_CONTEXT` 以下の整数。省略は `AUDIT_SEND_MAX_PASSED_PER_CONTEXT`）。
+ * L10・SPEC-1: 1 つの Context で通す数の上限の指定（前の `maxPassedPerContext`・`maxWebSocketsPerContext`）は撤廃した。
  */
 export interface GuardAuditSend {
   readonly policy: typeof AUDIT_SEND_PASS_EXCEPT_DELETE;
   readonly approvedServiceOrigins: readonly string[];
   readonly dangerousTerms: readonly string[];
-  readonly maxPassedPerContext?: number | undefined;
-  /** AS-c: この Context で通す WebSocket の接続の数の上限（1 以上 `AUDIT_SEND_MAX_WEBSOCKETS_PER_CONTEXT` 以下の整数。省略は `AUDIT_SEND_MAX_WEBSOCKETS_PER_CONTEXT`）。 */
-  readonly maxWebSocketsPerContext?: number | undefined;
   /**
    * OP-Q（設計書 `2026-10-27-beaksight-one-pass-flow-design.md` 4.1.8 の Q1）: 書き込みの作業の中の Passive の Context（送る前の確かめと照合の READ）の印（その作業の
    * 承認した送信の送信先）。ある場合は、判定の口に写し（要求の判定の owner が、書き込みの段の値を入れる前と同じ決まりを加える）、WebSocket を通さず、ほかの Origin
@@ -469,16 +546,12 @@ export function isGuardAuditSend(value: unknown): value is GuardAuditSend {
     return false;
   }
   const isStrings = (items: unknown): boolean => Array.isArray(items) && items.every((item) => typeof item === 'string');
-  const isLimit = (limit: unknown, max: number): boolean =>
-    limit === undefined || (Number.isSafeInteger(limit) && (limit as number) >= 1 && (limit as number) <= max);
   // OP-Q（Q1）: 書き込みの作業の印は、省略か、Origin と path の文字列の組だけ。
   const { writeJobEndpoint } = value;
   const isEndpoint = writeJobEndpoint === undefined
     || (isRecord(writeJobEndpoint) && isStrings([writeJobEndpoint['origin'], writeJobEndpoint['path']]));
   return isStrings(value.approvedServiceOrigins)
     && isStrings(value.dangerousTerms)
-    && isLimit(value.maxPassedPerContext, AUDIT_SEND_MAX_PASSED_PER_CONTEXT)
-    && isLimit(value.maxWebSocketsPerContext, AUDIT_SEND_MAX_WEBSOCKETS_PER_CONTEXT)
     && isEndpoint;
 }
 
@@ -639,6 +712,13 @@ export interface GuardLoginStage {
    * 使う（ほかは使わない。fail-closed）。
    */
   readonly manualServiceReadOrigins?: readonly string[] | undefined;
+  /**
+   * DEF-193（設計書 `2026-11-04-beaksight-login-session-design.md` 3.2）: 自動ログインの段の指定の印（作るのは factory の `createLoginStageContext`。監査の段の送信の
+   * 扱いが `PASS_EXCEPT_DELETE` のとき）。`scriptRequest` と `credentialGuard` があり、`manualPassThrough` がないときだけ働く（判定の口の
+   * `authSetup.automatedPassThrough`）。今の決まりで止める、ページの登録のない読み取りでない要求と token の更新を通し（SD-2: 削除と危険な語も）、回数に数えず、
+   * 形を通した送信の一覧に記録する。資格情報を含む要求は、今どおり止める（`credentialCheckedDecision`）。
+   */
+  readonly automatedPassThrough?: true | undefined;
 }
 
 /**
@@ -679,6 +759,13 @@ export interface GuardFormWriteStage {
   readonly transport?: typeof FORM_SCENARIO_TRANSPORT;
   readonly expectation: WritePayloadExpectation;
   readonly monitor: WriteStageMonitor;
+  /**
+   * LU-SFIX3-B（LU-SREV3 の Important-2）: フォームの更新で、送信先の最後の区切りが対象の番号のとき、窓の前（N2）に守る送信先の path の型（最後の区切りを
+   * `{id}` にした形。作り方は `recordPathShapeOf` の 1 か所）。守るのは、この型と表の path（`guardedWriteEndpointPathsOf`）。承認の POST の照らしは、今のとおり
+   * 具体的な path（`expectation.request.path`）。省略は今のまま（具体的な path とその下だけを守る。登録）。LU-SFIX4: 前の値を後から入れる印のある期待（一覧の
+   * 行から開くフォームの更新）では必須（省くと受けない）。
+   */
+  readonly guardedPathShape?: string | undefined;
 }
 
 /**
@@ -690,7 +777,7 @@ export interface AdmittedApiWriteRequest {
   readonly url: string;
   readonly headers: Readonly<Record<string, string>>;
   readonly body: Buffer;
-  readonly pageKeyValues: Readonly<Record<string, ApiJsonScalarValue>>;
+  readonly pageKeyValues: Readonly<Record<string, ApiWritePageKeyValue>>;
 }
 
 /**
@@ -1013,7 +1100,7 @@ export interface WriteStageMonitorSnapshot extends SubmissionStageMonitorSnapsho
 interface WriteStageState {
   readonly blockedByPayloadReason: Record<WriteStagePayloadBlockReason, number>;
   /** T39b: API の書き込みで、照合に一致して送り手の口に渡した要求の、ページが決める鍵の値（渡す前は null。書き込みの結果の記録に残すもの）。 */
-  apiPageKeyValues: Readonly<Record<string, ApiJsonScalarValue>> | null;
+  apiPageKeyValues: Readonly<Record<string, ApiWritePageKeyValue>> | null;
   /** T39c: API の書き込みの応答の本文から取り出した、使える形の登録の ID（取り出す口がない・取れない・応答がない場合は null）。 */
   apiRecordId: string | null;
   /**
@@ -1036,6 +1123,64 @@ interface WriteStageState {
   destinationOf: ((url: string) => WriteStageRequestDestination) | undefined;
   /** OP-N（N2）: 送信の扱いの口で通した要求の一覧（取り付けの時点で、止めた一覧と同じ目印で作り直す）。 */
   passedRequests: WriteStageUnexpectedRequestList;
+  /**
+   * LU-9・LU-12a（設計書 `2026-11-02-beaksight-list-row-update-design.md` 5.3 の 2）: 前の値を後から入れる口の、送り方ごとの入れ物（取り付けの時点で、
+   * 印のある期待のときだけ付ける。印のない期待・Guard に付けていない部品は undefined で、前の値の口は常に拒む）。
+   */
+  deferredPrior: DeferredPriorSlot | undefined;
+}
+
+/**
+ * LU-9・LU-12a: 前の値を後から入れる口の入れ物（送り方で分かれる。API とフォームの 2 つの口が共有する）。`deferred` は印のある期待の写し、`supplied` は
+ * 前の値を入れた期待（写して凍らせたもの。入れる前は null）。Guard の照合は、`supplied` があればそれで、なければ印のある期待（必ず止まる）で照らす。
+ */
+type DeferredPriorSlot =
+  | { readonly transport: typeof API_SCENARIO_TRANSPORT; readonly deferred: ApiWritePayloadExpectation; supplied: ApiWritePayloadExpectation | null }
+  | { readonly transport: typeof FORM_SCENARIO_TRANSPORT; readonly deferred: WritePayloadExpectation; supplied: WritePayloadExpectation | null };
+/** 送り方を確かめた後の入れ物（期待の型で読む形）。 */
+interface TypedDeferredPriorSlot<E> {
+  readonly deferred: E;
+  supplied: E | null;
+}
+
+/**
+ * LU-12a（2 つの口の共通の部分。ユーザーの方針の共通化）: 前の値を後から入れる口の決まり。入れたら真。次のときは偽を返し、Guard の状態を変えない。
+ * - 送信の窓を一度でも開いた後（開いている、または承認の送信を通して閉じた）。
+ * - 送り方の違う段、印のない期待、Guard に付けていない部品（入れ物がない）。
+ * - すでに入れた後（同じ値でも 2 回目は拒む）。
+ * - `merge`（照合の側の、前の値を入れた期待の作り手。受けた値を添字で写してから確かめる）が null を返すか、投げる。
+ * 入れた期待は凍らせて持つ（呼び手が後で元の object を変えても、照合は変わらない）。前の値は記録・例外の文に残さない。
+ */
+function supplyDeferredPriorValues<E>(
+  monitor: WriteStageMonitor,
+  transport: DeferredPriorSlot['transport'],
+  merge: (deferred: E) => E | null,
+): boolean {
+  const slot = writeStageStateOf(monitor).deferredPrior;
+  if (monitor.hasSubmissionWindowOpened() || slot === undefined || slot.transport !== transport || slot.supplied !== null) {
+    return false;
+  }
+  const typed = slot as unknown as TypedDeferredPriorSlot<E>;
+  let supplied: E | null;
+  try {
+    supplied = merge(typed.deferred);
+  } catch {
+    return false;
+  }
+  if (supplied === null) {
+    return false;
+  }
+  typed.supplied = deepFreeze(supplied);
+  return true;
+}
+
+/** LU-9・LU-12a: 照合に使う、前の値を入れた期待（送り方が同じ入れ物で、入れた後だけ。ほかは null で、呼び出し側は段の期待で照らす）。 */
+function suppliedPriorExpectationOf<E>(
+  monitor: WriteStageMonitor,
+  transport: DeferredPriorSlot['transport'],
+): E | null {
+  const slot = writeStageStateOf(monitor).deferredPrior;
+  return slot !== undefined && slot.transport === transport ? (slot as unknown as TypedDeferredPriorSlot<E>).supplied : null;
 }
 
 const writeStageStates = new WeakMap<WriteStageMonitor, WriteStageState>();
@@ -1059,6 +1204,8 @@ function writeStageStateOf(monitor: WriteStageMonitor): WriteStageState {
  *   `openSubmissionPhase()` で送信の段を開き、Guard が照合にかけて 1 回を通すのは送信の段の中だけ。
  * - 記録: 送る中身の照合で止めた理由の数（`blockedByPayloadReason`）。値・名前・URL を持たない。
  * - 送信の報告（`submissionReport`）: Guard が承認の POST を通したか、通した POST の応答を受けたか。
+ * - LU-9: 前の値を後から入れる印のある API の期待では、窓を一度も開いていない間に 1 回だけ、前の値を入れる（`supplyApiPriorValues`）。入れていなければ、
+ *   窓の中の送信は照合で止まる。窓の前（N2）の守りは変えない。
  * 状態を書くのは Guard だけ（`writeStageStates`）。
  */
 export class WriteStageMonitor extends SubmissionStageMonitor {
@@ -1081,7 +1228,33 @@ export class WriteStageMonitor extends SubmissionStageMonitor {
       unexpectedRequests: new WriteStageUnexpectedRequestList([]),
       destinationOf: undefined,
       passedRequests: new WriteStageUnexpectedRequestList([]),
+      deferredPrior: undefined,
     });
+  }
+
+  /**
+   * LU-9（設計書 `2026-11-02-beaksight-list-row-update-design.md` 4.0.1 の K1、5.3 の 2）: 前の値を後から入れる印のある API の期待に、前の値（保つ鍵と
+   * ページが決める鍵の値）を 1 回だけ入れる。入れたら真。次のときは偽を返し、Guard の状態を変えない。
+   * - 送信の窓を一度でも開いた後（開いている、または承認の送信を通して閉じた）。
+   * - すでに入れた後（同じ値でも 2 回目は拒む）。
+   * - 印のない期待（今の更新・登録）、form の書き込みの段、Guard に付けていない部品。
+   * - 鍵の集合が期待を作る時の集合と違う、値の形が今の前の値の決まりに合わない（照合の側の `apiWriteExpectationWithPriorValues`）、読めない入力。
+   * 入れた値は写して凍らせて持つ（呼び手が後で元の object を変えても、照合は変わらない）。前の値は記録・例外の文に残さない。
+   * LU-12a: 窓の前・1 回だけ・状態を変えない・凍らせて持つ決まりは、フォームの口と共通の `supplyDeferredPriorValues`。受けた値の写しは照合の側
+   * （`apiWriteExpectationWithPriorValues` が `apiWritePriorValuesCopyOf` で、確かめる前に添字で写す）。
+   */
+  supplyApiPriorValues(prior: ApiWriteSuppliedPriorValues): boolean {
+    return supplyDeferredPriorValues<ApiWritePayloadExpectation>(this, API_SCENARIO_TRANSPORT, (deferred) => apiWriteExpectationWithPriorValues(deferred, prior));
+  }
+
+  /**
+   * LU-12a（設計書 `2026-11-02-beaksight-list-row-update-design.md` 4.0.1 の K1、5.3 の 2・5.5）: 前の値を後から入れる印のあるフォームの期待に、前の値
+   * （保つ見える欄・値を照らす hidden・組の値）を 1 回だけ入れる。約束は `supplyApiPriorValues` と同じ（共通の `supplyDeferredPriorValues`）: 窓を一度でも
+   * 開いた後・2 回目・印のない期待・API の段・Guard に付けていない部品・鍵の集合が違う・値の形が今のフォームの期待の決まりに合わない（照合の側の
+   * `writeExpectationWithPriorValues`）・読めない入力では偽を返し、Guard の状態を変えない。受けた値は照合の側が添字で写して凍らせる。
+   */
+  supplyFormPriorValues(prior: WriteSuppliedPriorValues): boolean {
+    return supplyDeferredPriorValues<WritePayloadExpectation>(this, FORM_SCENARIO_TRANSPORT, (deferred) => writeExpectationWithPriorValues(deferred, prior));
   }
 
   /**
@@ -1117,7 +1290,7 @@ export class WriteStageMonitor extends SubmissionStageMonitor {
    * T39b: API の書き込みで、Guard が照合に一致して送り手の口に渡した要求の、ページが決める鍵の値（鍵ごとの JSON の値。渡す前は null）。Task 38 の
    * 判断 (1) の、書き込みの結果の記録に残す値（ほかの値は持たない）。
    */
-  apiWritePageKeyValues(): Readonly<Record<string, ApiJsonScalarValue>> | null {
+  apiWritePageKeyValues(): Readonly<Record<string, ApiWritePageKeyValue>> | null {
     return writeStageStateOf(this).apiPageKeyValues;
   }
 
@@ -1208,6 +1381,13 @@ type SubmissionStageKind = 'LOGIN_STAGE' | 'WRITE_STAGE';
 /** 回数の上限の指定を、許す回数にする（0 以上の安全な整数でなければ 0。fail-closed）。 */
 const postLimitOf = (maxPosts: number): number => (Number.isSafeInteger(maxPosts) && maxPosts > 0 ? maxPosts : 0);
 
+/**
+ * L11（設計書 `2026-11-09-beaksight-remove-limits-design.md` 4。設計者の判断 (b)）: 登録した送信先（ログインに伴う送信 `loginSideRequests`、監査の段の読み取りの
+ * 手続きの呼び出し `auditReadRequests`）は、回数を数えずに何回でも通す。判定の口には、項目ごとに、いつもこの残り（1）を渡し、通しても減らさない
+ * （`maxPerLoginStage`・`maxPerPageLoad` は使わない。名前の削除は LZ）。登録していない送信の扱い、資格情報の守り、削除の止めは変えない。
+ */
+const REGISTERED_REQUEST_ALWAYS_ADMITTED = 1;
+
 /** スクリプトで送るログインの指定の写し（T34b。取り付けの後に呼び出し側が書き換えても、判定は変わらない）。 */
 interface ScriptLoginSnapshot {
   readonly scriptLogin: ScriptRequestLoginPolicy['scriptLogin'];
@@ -1268,10 +1448,24 @@ class SubmissionPostAdmission {
   readonly #routeTickets = new RouteTicketBook();
   /** T39b: API の書き込みの段の、承認した API の Origin（form の書き込みの段とログインの段は undefined）。 */
   readonly #apiOrigin: string | undefined;
+  /**
+   * LU-5（fix round 1 の案 A）: API の書き込みの段の、照合へ回す要求の path（照合の側の `apiWriteCheckPathOf`。作れない期待は空の文字で、どの要求にも
+   * 当たらない。fail-closed）。form の書き込みの段とログインの段は undefined。
+   */
+  readonly #apiWritePath: string | undefined;
+  /** LU-SFIX3-B: フォームの書き込みの段の、窓の前（N2）に守る送信先の path の型（フォームの更新で送信先の最後の区切りが対象の番号のときだけ。ほかは undefined）。 */
+  readonly #guardedPathShape: string | undefined;
   /** ML-a: 手動のログインの段（判定の口に `manualPassThrough` を渡す）。ログインの段だけ。 */
   readonly #manualPassThrough: boolean;
   /** T44R の M-1: 手動のログインの段の、スクリプトの口がないときの承認したサービスの Origin（写し。ほかは undefined）。 */
   readonly #manualServiceReadOrigins: readonly string[] | undefined;
+  /** DEF-193: 自動ログインの段の通し方の印（スクリプトで送るログインの段で、手動の段でないときだけ真）。 */
+  readonly #automatedPassThrough: boolean;
+  /**
+   * L12a（設計書 `2026-11-09-beaksight-remove-limits-design.md`、L12 の判断）: 書き込みの段の押した後の扱いを使うか（送信の扱いが `PASS_EXCEPT_DELETE` の書き込みの
+   * 段だけ真。偽なら、押した後も今の書き込みの段の決まりで止める）。
+   */
+  readonly #afterPress: boolean;
 
   constructor(
     kind: SubmissionStageKind,
@@ -1282,19 +1476,28 @@ class SubmissionPostAdmission {
     apiOrigin?: string,
     manualPassThrough = false,
     manualServiceReadOrigins?: readonly string[],
+    apiWritePath?: string,
+    guardedPathShape?: string,
+    automatedPassThrough = false,
+    afterPress = false,
   ) {
     this.kind = kind;
+    this.#afterPress = kind === 'WRITE_STAGE' && afterPress;
     this.#manualPassThrough = kind === 'LOGIN_STAGE' && manualPassThrough === true;
+    this.#automatedPassThrough = kind === 'LOGIN_STAGE' && !this.#manualPassThrough && script !== undefined && automatedPassThrough;
     this.#manualServiceReadOrigins = this.#manualPassThrough && script === undefined && manualServiceReadOrigins !== undefined
       ? Object.freeze(manualServiceReadOrigins.map((origin) => String(origin)))
       : undefined;
     this.#apiOrigin = kind === 'WRITE_STAGE' && apiOrigin !== undefined ? String(apiOrigin) : undefined;
+    this.#apiWritePath = this.#apiOrigin !== undefined && apiWritePath !== undefined ? String(apiWritePath) : undefined;
+    this.#guardedPathShape = kind === 'WRITE_STAGE' && this.#apiOrigin === undefined && guardedPathShape !== undefined ? String(guardedPathShape) : undefined;
     this.#endpoints = Object.freeze(endpoints.map((endpoint) =>
       Object.freeze({ origin: String(endpoint.origin), path: String(endpoint.path) })));
     this.#remainingPosts = postLimitOf(maxPosts);
     this.monitor = monitor;
     this.#script = kind === 'LOGIN_STAGE' && script !== undefined ? snapshotScriptLogin(script) : undefined;
-    this.#sideRemaining = this.#script?.limits.map(postLimitOf) ?? [];
+    // L11: 登録したログインに伴う送信は、回数を数えずに通す（`REGISTERED_REQUEST_ALWAYS_ADMITTED`）。
+    this.#sideRemaining = this.#script?.limits.map(() => REGISTERED_REQUEST_ALWAYS_ADMITTED) ?? [];
     if (this.#script !== undefined && monitor instanceof LoginStageMonitor) {
       // 項目ごとの数を、登録した項目の数だけ用意する（同じ部品を、もう一度付けた場合も、項目の数に合わせ直す。数は 0 から）。
       loginStageStateOf(monitor).sideRequestsAllowed = this.#script.limits.map(() => 0);
@@ -1315,6 +1518,8 @@ class SubmissionPostAdmission {
           ...(script === undefined ? {} : { scriptRequest: scriptRequestPolicyOf(script, sideRemaining) }),
           ...(this.#manualPassThrough ? { manualPassThrough: true as const } : {}),
           ...(this.#manualServiceReadOrigins === undefined ? {} : { manualServiceReadOrigins: this.#manualServiceReadOrigins }),
+          // DEF-193: 自動ログインの段の通し方の印（CDP の層と route の層の両方の判定に同じに渡す）。
+          ...(this.#automatedPassThrough ? { automatedPassThrough: true as const } : {}),
         },
       };
     }
@@ -1324,12 +1529,21 @@ class SubmissionPostAdmission {
     // 送信も通さない（残りの回数 0 として判定する。照合にかけず、送り手にも渡さない）。窓の観察の段（値を入れる間）に出た読み取りでない要求は、今の判定で
     // 止まり、窓の中の止めた要求として数える（`unexpectedRequestCount`）。
     const admittable = this.monitor instanceof WriteStageMonitor && writeStageStateOf(this.monitor).submissionPhaseOpen ? remainingPosts : 0;
-    const apiOrigin = this.#apiOrigin === undefined ? {} : { apiOrigin: this.#apiOrigin };
+    const apiOrigin = this.#apiOrigin === undefined
+      ? {}
+      : { apiOrigin: this.#apiOrigin, ...(this.#apiWritePath === undefined ? {} : { apiWritePath: this.#apiWritePath }) };
     // OP-N（N2）: 送信の窓を一度でも開いたか（値を入れ始めた後）。開いた後は、監査の段の送信の扱いの口を使わない（OP-REV3 の C-2）。
     const valuesEntered = this.monitor.hasSubmissionWindowOpened();
+    // LU-SFIX3-B: フォームの更新の、窓の前（N2）に守る送信先の path の型（承認の POST の照らしは `writeEndpoint` の具体的な path のまま）。
+    const guarded = this.#guardedPathShape === undefined ? {} : { guardedPathShape: this.#guardedPathShape };
+    // L12a: 送信の段を開いた後（押した後）は、押した後の扱いの口を渡す（送信の扱いが `PASS_EXCEPT_DELETE` の段だけ）。承認した送信の応答を受けるまでは、
+    // 承認の送信先とその下への読み取りでない要求を通さない（`approvedWriteResponded`）。
+    const afterPress = this.#afterPress && this.monitor instanceof WriteStageMonitor && writeStageStateOf(this.monitor).submissionPhaseOpen
+      ? { afterPress: Object.freeze({ approvedWriteResponded: writeStageStateOf(this.monitor).responseReceived }) }
+      : {};
     return writeEndpoint === undefined
       ? { writeStage: { writeEndpoint: { origin: '', path: '' }, remainingPosts: 0, submissionWindowOpen, valuesEntered, ...apiOrigin } }
-      : { writeStage: { writeEndpoint, remainingPosts: admittable, submissionWindowOpen, valuesEntered, ...apiOrigin } };
+      : { writeStage: { writeEndpoint, remainingPosts: admittable, submissionWindowOpen, valuesEntered, ...apiOrigin, ...guarded, ...afterPress } };
   }
 
   /** CDP の層の判定の口（残りの回数そのもの）。 */
@@ -1347,7 +1561,7 @@ class SubmissionPostAdmission {
     if (this.#script !== undefined && this.monitor instanceof LoginStageMonitor) {
       const state = loginStageStateOf(this.monitor);
       if (admission?.kind === 'LOGIN_SIDE_REQUEST' && admission.index < this.#sideRemaining.length) {
-        this.#sideRemaining[admission.index] = Math.max(0, (this.#sideRemaining[admission.index] ?? 0) - 1);
+        // L11: 残りは減らさない（何回でも通す）。通した数だけを記録する。
         state.sideRequestsAllowed[admission.index] = saturatingIncrement(state.sideRequestsAllowed[admission.index] ?? 0);
       } else {
         this.#remainingPosts = Math.max(0, this.#remainingPosts - 1);
@@ -1378,6 +1592,16 @@ class SubmissionPostAdmission {
       if (tokenShaped) {
         state.tokenSeen = true;
       }
+    }
+  }
+
+  /**
+   * DEF-194: 自動ログインの段の口（DEF-193）が通した読み取りでない要求の形を、通した一覧に、登録の対象でない理由（`AUTOMATED_LOGIN_PASSED`）で記録する
+   * （回数は減らさない。token の送信より前の印は付けない。手動の段の自動の登録だけが使う印のため）。
+   */
+  recordAutomatedPass(url: string, resourceType: RequestResourceType): void {
+    if (this.monitor instanceof LoginStageMonitor) {
+      loginStageStateOf(this.monitor).passedRequests.record(url, resourceType, 'AUTOMATED_LOGIN_PASSED', false);
     }
   }
 
@@ -1457,7 +1681,9 @@ class AuditReadAdmission {
       // T35R-fix（T35R の C-1）: 最初の読み込みでない Context（幅の走査と Interaction）は、サービスの Origin へ送らない（真でなければ送らない。fail-closed）。
       serviceOriginRequestsWithheld: stage.readRequestsAllowed !== true,
     });
-    this.#remaining = stage.auditReadRequests.map(({ maxPerPageLoad }) => (stage.readRequestsAllowed === true ? postLimitOf(maxPerPageLoad) : 0));
+    // L11: 登録した読み取りの手続きの呼び出しは、最初の読み込みの Context では回数を数えずに通す（`REGISTERED_REQUEST_ALWAYS_ADMITTED`）。幅の走査と
+    // Interaction の Context は、今どおり通さない（0）。
+    this.#remaining = stage.auditReadRequests.map(() => (stage.readRequestsAllowed === true ? REGISTERED_REQUEST_ALWAYS_ADMITTED : 0));
     this.monitor = stage.monitor instanceof AuditStageMonitor ? stage.monitor : undefined;
   }
 
@@ -1480,10 +1706,8 @@ class AuditReadAdmission {
   }
 
   /** CDP の層で、登録した読み取りの手続きの呼び出しを ALLOW した（続ける前に呼ぶ）。その項目の残りを 1 減らして数え、route の層への印を置く。 */
-  admitAtCdp(method: string, url: string, admission: Extract<AuditStageAdmission, { readonly kind: 'AUDIT_READ_REQUEST' }>): void {
-    if (admission.index < this.#remaining.length) {
-      this.#remaining[admission.index] = Math.max(0, (this.#remaining[admission.index] ?? 0) - 1);
-    }
+  admitAtCdp(method: string, url: string, _admission: Extract<AuditStageAdmission, { readonly kind: 'AUDIT_READ_REQUEST' }>): void {
+    // L11: 残りは減らさない（何回でも通す）。通した数だけを記録する。
     if (this.monitor !== undefined) {
       const state = auditStageStateOf(this.monitor);
       state.registeredReadRequestsAllowed = saturatingIncrement(state.registeredReadRequestsAllowed);
@@ -1498,98 +1722,50 @@ class AuditReadAdmission {
 }
 
 /**
- * AS-a（設計書 `2026-10-19-beaksight-audit-send-policy-design.md` 2.2）: 監査の段の送信の扱い `PASS_EXCEPT_DELETE` の、通した数の数え方（1 つの Context の Guard に
- * 1 つ）。送信の段と監査の段の読み取りの手続きの呼び出しの数え方と同じく、CDP の層で残りの数そのものを渡して判定し、通したら残りを 1 減らして route の層への
- * 印（`RouteTicketBook`）を置く。route の層では、印があれば残り 1 の口を、なければ口を渡さない（CDP の層が通していない要求は、今の決まりで止まる。
- * fail-closed）。1 つの要求を両方の層で二重に数えない。
+ * AS-a（設計書 `2026-10-19-beaksight-audit-send-policy-design.md` 2.2）: 監査の段の送信の扱い `PASS_EXCEPT_DELETE` の口（1 つの Context の Guard に 1 つ）。
+ * RB-4a（X2。設計書 `2026-11-15-beaksight-test-rebuild-design.md` 3.2）: 数の上限の名残（残りの数、route の層への印、「あと 1 つ」）は外した。数えないので、
+ * CDP の層と route の層は、同じ口で同じ判定をする（同じ要求を両方の層で判定しても答えは同じ）。CDP の層を通らずに route の層に来た要求（CDP の付く前の
+ * ポップアップの要求など）も、同じ決まり（削除・削除の上書き・危険な語は止める）で判定する。
  */
 class AuditSendAdmission {
-  readonly #approvedServiceOrigins: readonly string[];
-  readonly #dangerousTerms: readonly string[];
-  #remainingPasses: number;
-  /** AS-c: この Context で、あと何本の WebSocket の接続を通すか（WebSocket の route の判定だけで使う）。 */
-  #remainingWebSockets: number;
   /** AS-c: 許可 Origin と承認したサービスの Origin（正規の形。通した要求がほかの Origin へのものかを見分けるため）。 */
   readonly #knownOrigins: ReadonlySet<string>;
-  readonly #routeTickets = new RouteTicketBook();
-  /** OP-Q（Q1）: 書き込みの作業の中の Passive の Context の印の写し（承認した送信の送信先。なければ `undefined`）。 */
-  readonly #writeJobEndpoint: { readonly origin: string; readonly path: string } | undefined;
+  /** 判定の口（取り付けの時点の写し）。 */
+  readonly #policy: AuditSendPolicy;
+  /** AS-c: WebSocket の route の判定の口（`webSockets` の印つき）。 */
+  readonly #webSocketPolicy: AuditSendPolicy;
+  /** OP-Q（Q1）: 書き込みの作業の中の Passive の Context の口か。 */
+  readonly forWriteJob: boolean;
 
   constructor(send: GuardAuditSend, allowedOrigins: ReadonlySet<string>) {
-    this.#approvedServiceOrigins = Object.freeze(send.approvedServiceOrigins.map((origin) => String(origin)));
-    this.#dangerousTerms = Object.freeze(send.dangerousTerms.map((term) => String(term)));
-    this.#writeJobEndpoint = send.writeJobEndpoint === undefined
+    const approvedServiceOrigins = Object.freeze(send.approvedServiceOrigins.map((origin) => String(origin)));
+    // OP-Q（Q1）: 書き込みの作業の中の Passive の Context の印の写し（承認した送信の送信先）。
+    const writeJobEndpoint = send.writeJobEndpoint === undefined
       ? undefined
       : Object.freeze({ origin: String(send.writeJobEndpoint.origin), path: String(send.writeJobEndpoint.path) });
-    this.#remainingPasses = send.maxPassedPerContext ?? AUDIT_SEND_MAX_PASSED_PER_CONTEXT;
-    this.#remainingWebSockets = send.maxWebSocketsPerContext ?? AUDIT_SEND_MAX_WEBSOCKETS_PER_CONTEXT;
-    this.#knownOrigins = canonicalPassiveAllowedOrigins(new Set([...allowedOrigins, ...this.#approvedServiceOrigins]));
+    this.forWriteJob = writeJobEndpoint !== undefined;
+    this.#policy = Object.freeze({
+      approvedServiceOrigins,
+      dangerousTerms: Object.freeze(send.dangerousTerms.map((term) => String(term))),
+      ...(writeJobEndpoint === undefined ? {} : { writeJobEndpoint }),
+    });
+    this.#webSocketPolicy = Object.freeze({ ...this.#policy, webSockets: true });
+    this.#knownOrigins = canonicalPassiveAllowedOrigins(new Set([...allowedOrigins, ...approvedServiceOrigins]));
   }
 
-  /** AS-c: WebSocket の route の判定の口（WebSocket の残りの数つき。HTTP の残りは 0 にする）。 */
+  /** CDP の層・route の層・`requestfailed` の判定の口。 */
+  policy(): AuditSendPolicy {
+    return this.#policy;
+  }
+
+  /** AS-c: WebSocket の route の判定の口。 */
   webSocketPolicy(): AuditSendPolicy {
-    return Object.freeze({ ...this.#policyWith(0), remainingWebSockets: this.#remainingWebSockets });
-  }
-
-  /** AS-c: WebSocket の route の層で、この口が通した接続をつなぐ前に呼ぶ。残りを 1 減らす。 */
-  admitWebSocket(): void {
-    this.#remainingWebSockets = Math.max(0, this.#remainingWebSockets - 1);
+    return this.#webSocketPolicy;
   }
 
   /** AS-c: 通した要求の送り先が、許可 Origin と承認したサービスの Origin のほか（ほかの Origin）か。 */
   isOtherOrigin(url: string): boolean {
     return !hasAllowedOrigin(url, this.#knownOrigins);
-  }
-
-  /** OP-Q（Q1）: 書き込みの作業の中の Passive の Context の口か（WebSocket と、ほかの Origin への事前確認の送り手を使わない）。 */
-  get forWriteJob(): boolean {
-    return this.#writeJobEndpoint !== undefined;
-  }
-
-  #policyWith(remainingPasses: number): AuditSendPolicy {
-    return Object.freeze({
-      approvedServiceOrigins: this.#approvedServiceOrigins,
-      dangerousTerms: this.#dangerousTerms,
-      remainingPasses,
-      ...(this.#writeJobEndpoint === undefined ? {} : { writeJobEndpoint: this.#writeJobEndpoint }),
-    });
-  }
-
-  /** CDP の層の判定の口（残りの数そのもの）。 */
-  cdpPolicy(): AuditSendPolicy {
-    return this.#policyWith(this.#remainingPasses);
-  }
-
-  /** route の層の判定の口（CDP の層が通した同じ要求の印があれば残り 1。なければ口を渡さない）。 */
-  routePolicy(method: string, url: string): AuditSendPolicy | undefined {
-    return this.#routeTickets.has(method, url) ? this.#policyWith(1) : undefined;
-  }
-
-  /**
-   * `requestfailed` の判定の口（数えない。この口が通すのはナビゲーションでない要求だけで、`requestfailed` の判定が使うのは main frame のナビゲーションの
-   * 判定だけなので、残りの数によらず同じ判定になる）。
-   */
-  requestFailedPolicy(): AuditSendPolicy {
-    return this.#policyWith(1);
-  }
-
-  /**
-   * route の層を通らない送信を、送る前に数える。残りを 1 減らす（印は置かない）。AS-c fix round 1（I-1）: Guard がほかの Origin へ送る事前確認。AS-c fix
-   * round 2（I-D）: リダイレクトの先の要求（Playwright が route を呼ばない段）。
-   */
-  admitWithoutRoute(): void {
-    this.#remainingPasses = Math.max(0, this.#remainingPasses - 1);
-  }
-
-  /** CDP の層で、この口が通した要求を続ける前に呼ぶ。残りを 1 減らし、route の層への印を置く。 */
-  admitAtCdp(method: string, url: string): void {
-    this.#remainingPasses = Math.max(0, this.#remainingPasses - 1);
-    this.#routeTickets.place(method, url);
-  }
-
-  /** route の層で、この口が通した要求を ALLOW した。印を 1 つ使う。 */
-  consumeAtRoute(method: string, url: string): void {
-    this.#routeTickets.consume(method, url);
   }
 }
 
@@ -1617,36 +1793,40 @@ const isCountedServiceRequest = (admission: AuditStageAdmission | undefined): bo
 
 /** 書き込みの段の指定の写し（取り付けの後に呼び出し側が配列を書き換えても、照合は変わらない。T30b）。 */
 function snapshotWriteExpectation(expectation: WritePayloadExpectation): WritePayloadExpectation {
-  const copy = (values: readonly string[]): readonly string[] => Object.freeze([...values]);
+  // LU-SFIX1（LU-SREV1 の Minor-1 と同じ形）: 一覧の `map`・`Symbol.iterator` を呼ばず、添字の繰り返しで写す（`indexedListCopyOf`）。一覧でなければ、今と
+  // 同じく投げる（取り付けの前の `TypeError`）。
+  const listCopy = <T>(list: unknown, copyEntry: (entry: never) => T): readonly T[] => {
+    const copied = indexedListCopyOf(list, copyEntry as (entry: unknown) => T);
+    if (copied === null) {
+      throw new TypeError('Write stage expectation is malformed');
+    }
+    return copied;
+  };
+  const copy = (values: readonly string[]): readonly string[] => listCopy(values, (value: string) => value);
+  type Field = WritePayloadExpectation['submittedFields'][number];
+  type Pair = NonNullable<WritePayloadExpectation['checkboxPairs']>[number];
   return Object.freeze({
     request: Object.freeze({ ...expectation.request }),
-    submittedFields: Object.freeze(expectation.submittedFields.map((field) => Object.freeze({ name: field.name, value: field.value }))),
+    submittedFields: listCopy(expectation.submittedFields, (field: Field) => Object.freeze({ name: field.name, value: field.value })),
     passthroughFieldNames: copy(expectation.passthroughFieldNames),
     emptyFileFieldNames: copy(expectation.emptyFileFieldNames),
     // T30b fix round 1: 値を照らす method の上書きの期待（省略は null）。
     methodOverride: expectation.methodOverride ?? null,
     // T31c: 値を照らす hidden の欄、同じ名前の hidden と checkbox の組、送らないことを期待する欄（省略は空の一覧。照合は省略と同じに扱う）。
-    checkedPassthroughFields: Object.freeze((expectation.checkedPassthroughFields ?? [])
-      .map((field) => Object.freeze({ name: field.name, value: field.value }))),
-    checkboxPairs: Object.freeze((expectation.checkboxPairs ?? [])
-      .map((pair) => Object.freeze({ name: pair.name, offValue: pair.offValue, checkedValue: pair.checkedValue }))),
+    checkedPassthroughFields: listCopy(expectation.checkedPassthroughFields ?? [], (field: Field) => Object.freeze({ name: field.name, value: field.value })),
+    checkboxPairs: listCopy(expectation.checkboxPairs ?? [],
+      (pair: Pair) => Object.freeze({ name: pair.name, offValue: pair.offValue, checkedValue: pair.checkedValue })),
     absentFieldNames: copy(expectation.absentFieldNames ?? []),
+    // LU-12a: 前の値を後から入れる印も写す（照合の側の唯一の写し方。形が違えば、照合と前の値の口が必ず拒む形に置き換える。印は残す。fail-closed）。
+    ...(expectation.deferredPriorValues === undefined ? {} : { deferredPriorValues: writeDeferredPriorValuesCopyOf(expectation.deferredPriorValues) as WritePayloadExpectation['deferredPriorValues'] }),
   });
 }
 
-/** T41c: 更新の前の値の一覧の写し（項目ごと。値は scalar だけを残し、ほかは照合が拒む空の object にする）。 */
-function priorValuesCopyOf(list: unknown): unknown {
-  if (!Array.isArray(list)) {
-    return {};
-  }
-  return (list as readonly unknown[]).map((entry) => {
-    if (typeof entry !== 'object' || entry === null) {
-      return entry;
-    }
-    const { key, value } = entry as { readonly key?: unknown; readonly value?: unknown };
-    const scalar = value === null || typeof value === 'string' || typeof value === 'number' || typeof value === 'boolean' || value === undefined;
-    return Object.hasOwn(entry, 'value') ? { key: typeof key === 'string' ? key : null, value: scalar ? value : {} } : { key: typeof key === 'string' ? key : null };
-  });
+/** LU-9: 前の値を後から入れる印の写し（保つ鍵の名前は文字だけを残し、ほかは拒む形の null にする。一覧でなければ空の object）。 */
+function deferredPriorValuesCopyOf(mark: unknown): unknown {
+  // LU-SFIX1（LU-SREV1 の Minor-1）: 一覧の `map` を呼ばず、添字の繰り返しで写す（`indexedListCopyOf`）。
+  const names = indexedListCopyOf(isRecord(mark) ? mark['keptKeys'] : undefined, (name) => (typeof name === 'string' ? name : null));
+  return names === null ? {} : { keptKeys: names };
 }
 
 /**
@@ -1659,8 +1839,14 @@ function snapshotApiWriteExpectation(expectation: ApiWritePayloadExpectation): A
   // scalar でない値・一覧でない形は、照合が必ず拒む形（空の object）に置き換える（呼び出し側の object を凍らせない）。
   const copy = {
     ...(json as object),
-    ...(expectation.keptKeys === undefined ? {} : { keptKeys: priorValuesCopyOf(expectation.keptKeys) }),
-    ...(expectation.pageKeyPriorValues === undefined ? {} : { pageKeyPriorValues: priorValuesCopyOf(expectation.pageKeyPriorValues) }),
+    ...(expectation.keptKeys === undefined ? {} : { keptKeys: apiWritePriorValuesCopyOf(expectation.keptKeys) }),
+    ...(expectation.pageKeyPriorValues === undefined ? {} : { pageKeyPriorValues: apiWritePriorValuesCopyOf(expectation.pageKeyPriorValues) }),
+    // DEF-198: ほかの filter の照らす値も、前の値と同じ写し方で写す（写さなければ照合が期待の誤りで止める）。
+    ...(expectation.otherFilterValues === undefined ? {} : { otherFilterValues: apiWritePriorValuesCopyOf(expectation.otherFilterValues) }),
+    // DEF-203: 台帳の登録の値と照らす鍵の値も、同じ写し方で写す（写さなければ照合が期待の誤りで止める）。
+    ...(expectation.ledgerKeyValues === undefined ? {} : { ledgerKeyValues: apiWritePriorValuesCopyOf(expectation.ledgerKeyValues) }),
+    // LU-9: 前の値を後から入れる印（保つ鍵の名前の一覧）も写す。形が違えば、照合と前の値の口が必ず拒む形（空の object）に置き換える（印は残す。fail-closed）。
+    ...(expectation.deferredPriorValues === undefined ? {} : { deferredPriorValues: deferredPriorValuesCopyOf(expectation.deferredPriorValues) }),
   };
   const freeze = (value: unknown): void => {
     if (typeof value === 'object' && value !== null) {
@@ -1674,7 +1860,12 @@ function snapshotApiWriteExpectation(expectation: ApiWritePayloadExpectation): A
 
 /** 確かめて写した書き込みの段の指定（送り方で分かれる。T39b）。 */
 type AcceptedWriteStage =
-  | { readonly transport: typeof FORM_SCENARIO_TRANSPORT; readonly expectation: WritePayloadExpectation; readonly monitor: WriteStageMonitor }
+  | {
+    readonly transport: typeof FORM_SCENARIO_TRANSPORT;
+    readonly expectation: WritePayloadExpectation;
+    readonly monitor: WriteStageMonitor;
+    readonly guardedPathShape?: string | undefined;
+  }
   | {
     readonly transport: typeof API_SCENARIO_TRANSPORT;
     readonly expectation: ApiWritePayloadExpectation;
@@ -1729,19 +1920,33 @@ function acceptWriteStage(writeStage: GuardWriteStage): AcceptedWriteStage {
   if (typeof origin !== 'string' || typeof path !== 'string') {
     throw new TypeError('Write stage expectation is malformed');
   }
-  return { transport: FORM_SCENARIO_TRANSPORT, expectation, monitor: writeStage.monitor };
+  // LU-SFIX3-B: 守る送信先の型は、送信先の path の最後の区切りを `{id}` にした形だけ（作り方の唯一の部品 `recordPathShapeOf` と同じ値）。
+  const { guardedPathShape } = writeStage;
+  if (guardedPathShape !== undefined
+    && (typeof guardedPathShape !== 'string' || recordPathShapeOf(path, path.split('/').at(-1) ?? '') !== guardedPathShape)) {
+    throw new TypeError('Write stage guarded path shape must be the request path with the last segment as the record id');
+  }
+  // LU-SFIX4（LU-REV の Minor-1。設計書 5.5 の 6）: 一覧の行から開くフォームの更新（前の値を後から入れる印のある期待）は、窓の前（N2）に開き手を押すので、守る型を
+  // 必須にする（渡し忘れた呼び手で、同じ表のほかの行・表の path への要求が N2 で届かないように。受けなければ Context を作らず、窓を開かない。fail closed）。
+  if (expectation.deferredPriorValues !== undefined && guardedPathShape === undefined) {
+    throw new TypeError('Write stage of a deferred prior values expectation requires the guarded path shape');
+  }
+  return {
+    transport: FORM_SCENARIO_TRANSPORT, expectation, monitor: writeStage.monitor, ...(guardedPathShape === undefined ? {} : { guardedPathShape: String(guardedPathShape) }),
+  };
 }
 
 /**
- * 書き込みの段の指定として受け付けられるか（T30b。factory が Context を作る前に確かめる口。Guard の取り付けと同じ確かめ `acceptWriteStage`）。
- * `WriteStageMonitor` の部品で、まだどの Guard にも付いておらず、指定の写しが取れて、送信先の Origin と path が文字列のときだけ真。
+ * 書き込みの段の指定を、受け付けられるなら写す（T30b。factory が Context を作る前に確かめる口。`WriteStageMonitor` の部品で、まだどの Guard にも付いておらず、
+ * 指定の写しが取れて、送信先の Origin と path が文字列のとき）。LU-SFIX1（LU-SREV1 の Minor-5）: Guard の取り付けと同じ確かめと写し（`acceptWriteStage`。期待は
+ * 写して凍らせ、部品と口はそのまま。前の `isAcceptableGuardWriteStage` を置き換えた）。受け付けられなければ null。factory は、この写しを Guard と中継の両方に渡す（中継の送信先と予算の path を、Guard と同じ写しから作る）。写しをもう一度
+ * 写しても同じ値になる。
  */
-export function isAcceptableGuardWriteStage(value: unknown): value is GuardWriteStage {
+export function guardWriteStageCopyOf(value: unknown): GuardWriteStage | null {
   try {
-    acceptWriteStage(value as GuardWriteStage);
-    return true;
+    return acceptWriteStage(value as GuardWriteStage);
   } catch {
-    return false;
+    return null;
   }
 }
 
@@ -1756,11 +1961,7 @@ function mainFrameIdOfPageEvent(event: unknown): string | null {
 const WRITE_STAGE_CHARSET_WORLD_NAME = '__beaksight_write_stage_charset__';
 /** 文書の文字コードを読む式（isolated world で評価する。ページの JS の書き換えの影響を受けない）。 */
 const DOCUMENT_CHARSET_EXPRESSION = 'document.characterSet';
-/**
- * 文書の文字コードを読む CDP の命令（`Page.enable`、`Page.createIsolatedWorld`、`Runtime.evaluate`）の全体の期限（ms）。ブラウザは、main frame の
- * ナビゲーションの途中の文書に命令を届けない（T30b の実験。応答が返らない）ので、期限で打ち切って、読めなかったものとする（承認の POST は止まる）。
- */
-export const WRITE_STAGE_CHARSET_READ_TIMEOUT_MS = 2_000;
+// L12b: 文書の文字コードを読む CDP の命令の全体の期限（前は 2 秒）は撤廃した（今は L0 の反応なしの長さで見放す。下の送り手の側）。定数は LZ-1 で消した。
 
 /** DEF-144: 外部スキームへの移動の試みの違反のコード（Guard の記録と、probe の段で発見を続ける判定 `isProbeExternalSchemeViolation` が共有する）。 */
 export const EXTERNAL_SCHEME_NAVIGATION_VIOLATION_CODE = 'EXTERNAL_SCHEME_NAVIGATION_ATTEMPTED';
@@ -1770,6 +1971,13 @@ export const EXTERNAL_SCHEME_NAVIGATION_VIOLATION_CODE = 'EXTERNAL_SCHEME_NAVIGA
  */
 export const externalSchemeNavigationViolationMessage = (scheme: string): string =>
   `The page tried to navigate to the external scheme ${scheme}; the browser blocked it and did not pass it to an external application`;
+/**
+ * Guard の page の文書の横取りの session が、持ち主の閉じ方（`closePassiveGuardedPage`・Context の閉じ）を通らずに外れたときの違反（`CDP_SESSION_DETACHED`）の文。
+ * L10（Guard の持ち主の調べ）: 前の文「page remained active」は、ブラウザが page を自分で閉じた場合（印のない閉じ。DEF-038 のとおり漏れの疑い）と合わない
+ * ので、実態に合わせた（判定は変えない）。
+ */
+export const CDP_SESSION_DETACHED_MESSAGE =
+  'Document interception session detached without the owner closing the page (an unmarked page close or a detach while the page was open)';
 /** DEF-144: frame の判定の失敗の違反のコード（`window.open` の外部スキームの移動で、あわせて記録される）。 */
 export const FRAME_CLASSIFICATION_FAILED_VIOLATION_CODE = 'FRAME_CLASSIFICATION_FAILED';
 /**
@@ -1777,6 +1985,25 @@ export const FRAME_CLASSIFICATION_FAILED_VIOLATION_CODE = 'FRAME_CLASSIFICATION_
  * 続ける判定が共有する）。違反は失敗した要求（`request`）を持つ。
  */
 export const HTTP_MAIN_FRAME_DELIVERY_FAILED_VIOLATION_CODE = 'HTTP_MAIN_FRAME_DELIVERY_FAILED';
+
+/**
+ * DEF-213: ネットワークへ出ない文書のスキーム（`blob:` はブラウザの中の blob の登録から、`data:` は URL の中身から読む。サーバへ要求を出さない）。
+ * `NON_EXTERNAL_NAVIGATION_SCHEMES` の部分の閉じた一覧。
+ */
+const NETWORK_FREE_DOCUMENT_SCHEMES: ReadonlySet<string> = new Set(['blob:', 'data:'] satisfies (typeof NON_EXTERNAL_NAVIGATION_SCHEMES)[number][]);
+
+/**
+ * DEF-213: 失敗した main frame の移動が、ネットワークへ出なかったと分かるか。行き先のスキームが `blob:`・`data:` で、サーバのリダイレクトの続きでない
+ * （`redirectedFrom()` がない。リダイレクトの元の http(s) の要求は届いているので、今の判定のまま）ものだけ。解析できない URL・事実を読めない要求は偽
+ * （今の判定のまま。fail-closed）。
+ */
+function isNetworkFreeMainFrameNavigationFailure(request: Pick<Request, 'url' | 'redirectedFrom'>): boolean {
+  try {
+    return NETWORK_FREE_DOCUMENT_SCHEMES.has(new URL(request.url()).protocol) && request.redirectedFrom() === null;
+  } catch {
+    return false;
+  }
+}
 
 /**
  * navigation の URL が外部スキーム（`NON_EXTERNAL_NAVIGATION_SCHEMES` にないスキーム）なら、そのスキーム（末尾の `:` を除いた形）を返す。
@@ -1831,10 +2058,9 @@ export class ExternalNavigationDetections {
       same.sources.add(source);
       return false;
     }
+    // L10（INV-LIMITS の N22）: 覚える数の上限（前は `MAX_EXTERNAL_NAVIGATION_DETECTIONS` 64 で、古いものから捨てた）は撤廃した（同じ移動とみなす時間の
+    // 窓を過ぎた検出だけを捨てる）。
     this.#entries.push({ url, expiresAt: now + EXTERNAL_NAVIGATION_DUPLICATE_WINDOW_MS, sources: new Set([source]) });
-    if (this.#entries.length > MAX_EXTERNAL_NAVIGATION_DETECTIONS) {
-      this.#entries.shift();
-    }
     return true;
   }
 }
@@ -1887,7 +2113,6 @@ interface ExpectedCdpFailure {
   readonly method: string;
   readonly url: string;
   readonly errorText: string;
-  readonly expiresAt: number;
 }
 
 interface CorrelationRequest {
@@ -1986,11 +2211,6 @@ function redirectLocations(event: PausedDocumentEvent): string[] {
   return (event.responseHeaders ?? [])
     .filter((header) => header.name.toLowerCase() === 'location')
     .flatMap((header) => header.value.split('\n'));
-}
-
-interface RedirectPredecessor {
-  readonly request: CorrelationRequest;
-  readonly expiresAt: number;
 }
 
 type RedirectPredecessorLookup =
@@ -2242,12 +2462,13 @@ interface GuardState {
   phase: GuardPhase;
   readonly context: BrowserContext;
   readonly ledger: SafetyLedger;
+  /** DEF-245: 閉じるときの作業の待ちの見張りの反応なしの長さ（`PassiveRequestGuardOptions.drainQuietLimitMs`。省略は本番の長さ）。 */
+  readonly drainQuietLimitMs: number | undefined;
   readonly allowedOrigins: ReadonlySet<string>;
   readonly pageGuards: WeakMap<Page, PageGuardRecord>;
   readonly pendingTasks: Set<Promise<void>>;
   /**
-   * `pendingTasks` のうち、要求の横取りの作業（`handlePausedRequest`。DEF-042 の設計書 2.4）の数。この作業は
-   * `MAX_PENDING_GUARD_REQUEST_TASKS` で数え、ほかの作業の上限（`MAX_PENDING_GUARD_TASKS`）には数えない。
+   * `pendingTasks` のうち、要求の横取りの作業（`handlePausedRequest`。DEF-042 の設計書 2.4）の数（L10 で作業の数の上限は撤廃した。数えるだけ）。
    */
   pendingRequestTaskCount: number;
   readonly listenerCleanups: ListenerCleanupOwnership;
@@ -2263,8 +2484,39 @@ interface GuardState {
   drainTimeoutReported: boolean;
   /** 出口の中継の凍結の口（DEF-085。`PassiveRequestGuardOptions.egressFreeze`）。なければ `undefined`。 */
   readonly egressFreeze: ((cause: EgressFreezeCause) => void) | undefined;
+  /** SAFE-2 の 1: ログインの段か書き込みの段の指定を受けた Guard か（読み込む前の凍結の口 `activateInteractionFreezeBeforeLoad` が拒む）。 */
+  readonly submissionStage: boolean;
   /** DEF-099 fix round 1: 書き込みの段の送信中の送り手を止める口（書き込みの段だけ。閉じ始めるときに呼ぶ）。なければ `undefined`。 */
   readonly abortWriteSubmission: (() => void) | undefined;
+  /** DEF-276-relay: 中継している文書の WebSocket（握手の途中を含む）を切る口。凍結と閉じ（`freezeEgress`）で、すべて呼ぶ。 */
+  readonly webSocketRelayCuts: Set<() => void>;
+  /**
+   * DEF-210（通知の枠の設計書 3.2.1）: 通知の枠の閉じる押下の期間の扱い（押す期間でなければ `null`）。`beginNotificationPress` が入れ、`endNotificationPress` と
+   * 凍結（`activateInteractionFreeze`）が外す。判定の口（CDP の層と route の層）に、`notificationPress` として渡す。
+   */
+  notificationPress: NotificationPressMode | null;
+  /**
+   * fix round 3（設計書 3.2.2 の 4）: 押す期間の main frame の移動（`AUDIT` は止めずに数える。RB-14a）と、押す期間に開いたポップアップの数
+   * （`notificationPressNavigationsOf` で読む）。呼ぶ側は、1 以上のビューポート（幅）を測らない。
+   */
+  notificationPressNavigations: number;
+  /**
+   * RB-14a（X11）: 見るだけの点検の押す期間に、止めずに数えた main frame の移動の行き先（`notificationPressNavigationTargetsOf` で読む。記録には書かない）。
+   * 呼ぶ側は、セッションの切れの判定に使う（前は、止めた移動の記録の行き先で見た）。
+   */
+  notificationPressNavigationTargets: string[];
+  /**
+   * REV-EV4（設計書 `2026-11-16-beaksight-finding-evidence-design.md` 3.4）: 横にスクロールする領域のキーの押下の期間か（`beginScrollKeyPress` が入れ、
+   * `endScrollKeyPress` と凍結が外す）。判定の口に `scrollKeyPress` として渡し、その期間の main frame の移動とポップアップを止める（違反にしない）。
+   */
+  scrollKeyPress: boolean;
+  /** REV-EV4: キーの押下の期間に止めた main frame の移動とポップアップの数（`scrollKeyPressGuardOf` の `blocked` で読む）。 */
+  scrollKeyPressBlocks: number;
+  /**
+   * COV-2c（SREV-COV の C-1）: 凍結の段で、1 回だけ通してよい main frame の文書の移動の行き先（fragment を外した URL。`admitFrozenMainFrameDocument` が入れ、
+   * 返した口が外す）。なければ `null`（今どおり凍結の段の main frame の移動はすべて止める）。
+   */
+  frozenMainFrameDocument: FrozenMainFrameDocumentAdmission | null;
   ensurePageGuard(page: Page): PageGuardRecord;
 }
 
@@ -2280,7 +2532,9 @@ function blockedEventPhaseOf(phase: GuardPhase | null, page: Page | null): Block
   if (phase !== null && isClosingOrInvalidatingPhase(phase)) {
     return 'CLOSING';
   }
-  return page !== null && (ownerClosingPages.has(page) || mainFrameNavigationStates.get(page)?.leaving === true) ? 'CLOSING' : 'LOAD';
+  // DEF-236: 見せたままの待ちの印（`announcePacingWait`）の後も `CLOSING`（証拠を集め終え、閉じる前に待つ間）。
+  const navigationState = page === null ? undefined : mainFrameNavigationStates.get(page);
+  return page !== null && (ownerClosingPages.has(page) || navigationState?.leaving === true || navigationState?.pacingWait === true) ? 'CLOSING' : 'LOAD';
 }
 
 /** BN-a: route の要求の page（記録の時点の印だけに使う。Service Worker の要求など、page を引けなければ `null`。投げない）。 */
@@ -2356,7 +2610,7 @@ function invalidatingPhase(phase: GuardPhase): GuardPhase {
 }
 
 function errorMessage(error: unknown): string {
-  return safeErrorMessage(error, MAX_ERROR_MESSAGE_LENGTH, GUARD_ERROR_NORMALIZATION_FALLBACK);
+  return safeErrorMessage(error, GUARD_ERROR_NORMALIZATION_FALLBACK);
 }
 
 class GuardTaskDrainTimeoutError extends Error {
@@ -2366,48 +2620,35 @@ class GuardTaskDrainTimeoutError extends Error {
   }
 }
 
+/**
+ * 対応付けに使う要求（method は大文字）。L10（設計書 `2026-11-09-beaksight-remove-limits-design.md` 4。INV-LIMITS の N23 の Guard の分）: method と URL の長さの
+ * 上限（前は `MAX_HTTP_METHOD_LENGTH`・`MAX_URL_LENGTH` を超えたら null で、要求を止めて違反にした）は撤廃した。いつも対応付ける（null を返さない。呼び出し側の形は
+ * 名前の削除と一緒に LZ で整える）。
+ */
 function boundedCorrelationRequest(method: string, url: string): CorrelationRequest | null {
-  if (method.length > MAX_HTTP_METHOD_LENGTH || url.length > MAX_URL_LENGTH) {
-    return null;
-  }
-  return { method: method.slice(0, MAX_HTTP_METHOD_LENGTH).toUpperCase(), url };
+  return { method: method.toUpperCase(), url };
 }
 
-class ExpectedCdpFailureRegistry {
+/**
+ * Guard が自分で失敗させた文書の要求の、命令の失敗の予期（page ごと）。L10（T29）: 期限を持たず、使ったとき（`consume`・`remove`）か、page の session を
+ * 閉じたとき（`clear`）に捨てる。単体テストが、時間が経っても捨てないことと、閉じたら捨てることを確かめるために公開する（Guard の外では使わない）。
+ */
+export class ExpectedCdpFailureRegistry {
   readonly #entries = new WeakMap<Page, ExpectedCdpFailure[]>();
-  readonly #identityReported = new WeakSet<Page>();
-  readonly #limitReported = new WeakSet<Page>();
-  readonly #ledger: SafetyLedger;
 
-  constructor(ledger: SafetyLedger) {
-    this.#ledger = ledger;
+  constructor(_ledger: SafetyLedger) {
+    // L10: 違反を記録する場面（上限・長さ）がなくなったので、Ledger は使わない（呼び出し側の形は変えない）。
   }
 
-  register(page: Page, request: CorrelationRequest, now: number): ExpectedCdpFailure | null {
-    if (
-      request.method.length > MAX_HTTP_METHOD_LENGTH
-      || request.url.length > MAX_URL_LENGTH
-    ) {
-      this.#recordIdentityRejected(page);
-      return null;
-    }
-    const live = (this.#entries.get(page) ?? []).filter((entry) => entry.expiresAt >= now);
-    if (live.length >= MAX_EXPECTED_CDP_FAILURES) {
-      if (!this.#limitReported.has(page)) {
-        this.#limitReported.add(page);
-        this.#ledger.recordInvariantViolation({
-          code: 'EXPECTED_CDP_FAILURE_LIMIT_REACHED',
-          message: 'Expected CDP failure correlation limit reached',
-        });
-      }
-      this.#entries.set(page, live);
-      return null;
-    }
+  register(page: Page, request: CorrelationRequest, _now: number, errorText = BLOCKED_BY_CLIENT_DOCUMENT_FAILURE_TEXT): ExpectedCdpFailure | null {
+    // L10（INV-LIMITS の N22・N23 と設計者の判断 E）: 登録の数の上限（前は `MAX_EXPECTED_CDP_FAILURES` 64 で `EXPECTED_CDP_FAILURE_LIMIT_REACHED`）と、method・URL
+    // の長さの上限（前は `CDP_CORRELATION_IDENTITY_REJECTED`）は撤廃した。登録は、使うか page を閉じるまで持つ（時間で捨てない）。
+    // SREV-SAFE の I-1: 予期する失敗の文言は、止め方で決める（`blockedMainFrameNavigationFailureTextOf`。省略は `ERR_BLOCKED_BY_CLIENT`）。
+    const live = [...(this.#entries.get(page) ?? [])];
     const expected = {
-      method: request.method.slice(0, MAX_HTTP_METHOD_LENGTH).toUpperCase(),
+      method: request.method.toUpperCase(),
       url: request.url,
-      errorText: BLOCKED_BY_CLIENT_DOCUMENT_FAILURE_TEXT,
-      expiresAt: now + EXPECTED_CDP_FAILURE_RETENTION_MS,
+      errorText,
     } satisfies ExpectedCdpFailure;
     live.push(expected);
     this.#entries.set(page, live);
@@ -2423,14 +2664,10 @@ class ExpectedCdpFailureRegistry {
   consume(
     page: Page,
     request: CorrelationRequest & { readonly errorText: string },
-    now: number,
+    _now: number,
   ): boolean {
-    if (
-      request.method.length > MAX_HTTP_METHOD_LENGTH
-      || request.url.length > MAX_URL_LENGTH
-    ) return false;
-    const method = request.method.slice(0, MAX_HTTP_METHOD_LENGTH).toUpperCase();
-    const live = (this.#entries.get(page) ?? []).filter((entry) => entry.expiresAt >= now);
+    const method = request.method.toUpperCase();
+    const live = [...(this.#entries.get(page) ?? [])];
     const index = live.findIndex((entry) => entry.method === method
       && entry.url === request.url
       && entry.errorText === request.errorText);
@@ -2447,18 +2684,83 @@ class ExpectedCdpFailureRegistry {
 
   clear(page: Page): void {
     this.#entries.delete(page);
-    this.#identityReported.delete(page);
-    this.#limitReported.delete(page);
+  }
+}
+
+/**
+ * DEF-052・DEF-225: 待ちのタイマーが切れた後、Node がすでに受け取っている事象を処理するため、決まる（`isDecided`）まで `setImmediate` で最大
+ * `CANCELED_DOCUMENT_EVIDENCE_RECEIVED_EVENT_YIELDS` 回譲ってから `settle` を呼ぶ（時間の長さでは決めない）。
+ */
+function settleAfterReceivedEvents(isDecided: () => boolean, settle: () => void): void {
+  let remainingYields = CANCELED_DOCUMENT_EVIDENCE_RECEIVED_EVENT_YIELDS;
+  const readReceivedEvents = (): void => {
+    if (remainingYields <= 0 || isDecided()) {
+      settle();
+      return;
+    }
+    remainingYields -= 1;
+    setImmediate(readReceivedEvents);
+  };
+  readReceivedEvents();
+}
+
+/**
+ * DEF-225: Guard が凍結の前に止めたダウンロード（`PASSIVE_DOWNLOAD`）の記録（page ごと、URL だけ）と、同じ page の main frame の読み取りの移動の失敗との
+ * 1 対 1 の対応付け。
+ * - 記録（`record`）: `download` の事象で、URL を覚える（L10: 数と長さの上限なし）。
+ * - 対応付け（`awaitAndConsume`）: 同じ page・同じ URL の記録を 1 つ消して真。なければ `waitMs` まで待つ（記録が来たらその場で確かめ直す）。
+ *   ほかの URL の記録は使わない。1 つの記録は 1 回だけ使う。
+ * - 閉じる（`clear`）: page の session を閉じたときに、その page の記録を捨てる。L10（T29）: 記録は期限を持たない（時間では捨てない）。
+ * 単体テストが、時間が経っても捨てないことと、閉じたら捨てることを確かめるために公開する（Guard の外では使わない）。
+ */
+export class PassiveDownloadRegistry {
+  readonly #entries = new WeakMap<Page, { readonly url: string }[]>();
+  readonly #waiters = new WeakMap<Page, Set<() => void>>();
+
+  record(page: Page, url: string, _now: number): void {
+    const live = [...(this.#entries.get(page) ?? [])];
+    // L10（INV-LIMITS の N22・N23）: 覚える数の上限（前は `MAX_PASSIVE_DOWNLOAD_EVIDENCE_PER_PAGE` 16）と URL の長さの上限（`MAX_URL_LENGTH`）は撤廃した
+    // （超えた記録を覚えず、その失敗を違反にしていた）。page の寿命まで持つ（設計者の判断 E。時間で捨てない）。
+    live.push({ url });
+    this.#entries.set(page, live);
+    for (const wake of [...(this.#waiters.get(page) ?? [])]) wake();
   }
 
-  #recordIdentityRejected(page: Page): void {
-    if (!this.#identityReported.has(page)) {
-      this.#identityReported.add(page);
-      this.#ledger.recordInvariantViolation({
-        code: 'CDP_CORRELATION_IDENTITY_REJECTED',
-        message: 'Expected CDP failure identity exceeded its bound',
-      });
-    }
+  awaitAndConsume(page: Page, url: string, waitMs: number): Promise<boolean> {
+    if (this.#consume(page, url)) return Promise.resolve(true);
+    if (waitMs <= 0) return Promise.resolve(false);
+    return new Promise<boolean>((resolve) => {
+      const waiters = this.#waiters.get(page) ?? new Set<() => void>();
+      this.#waiters.set(page, waiters);
+      let timer: ReturnType<typeof setTimeout> | undefined;
+      let settled = false;
+      const finish = (consumed: boolean): void => {
+        if (settled) return;
+        settled = true;
+        clearTimeout(timer);
+        waiters.delete(check);
+        resolve(consumed);
+      };
+      const check = (): void => {
+        if (!settled && this.#consume(page, url)) finish(true);
+      };
+      waiters.add(check);
+      timer = setTimeout(() => settleAfterReceivedEvents(() => settled, () => finish(this.#consume(page, url))), waitMs);
+    });
+  }
+
+  /** page の session を閉じたときに、その page の記録を捨てる（L10。持ち主を閉じたら捨てる）。待っている対応付けは、それぞれの待ちの時間で終わる。 */
+  clear(page: Page): void {
+    this.#entries.delete(page);
+  }
+
+  #consume(page: Page, url: string): boolean {
+    const live = [...(this.#entries.get(page) ?? [])];
+    const index = live.findIndex((entry) => entry.url === url);
+    if (index >= 0) live.splice(index, 1);
+    if (live.length === 0) this.#entries.delete(page);
+    else this.#entries.set(page, live);
+    return index >= 0;
   }
 }
 
@@ -2468,43 +2770,20 @@ class ExpectedCdpFailureRegistry {
  * - 登録: リクエストの段階（`remember`）。応答の段階では、まず登録を消し（`forget`。元のリクエストが終わった）、リダイレクトの
  *   応答（3xx で `Location` を持つ）なら登録し直して、期限をその時点から数える。
  * - 消去: リダイレクトの後のリクエストで使われたとき（`take`）、元のリクエストが終わったとき（`forget`。応答を受けたとき、
- *   Guard がリクエストを失敗させたとき）、期限が切れたとき、Context や page が閉じたとき（`clear`）。
- * - 件数は `MAX_REDIRECT_PREDECESSORS` までとし、超える登録は違反を記録して `false` を返す（呼び出し側が fail-closed にする）。
+ *   Guard がリクエストを失敗させたとき）、Context や page が閉じたとき（`clear`）。
+ * - L10（設計書 `2026-11-09-beaksight-remove-limits-design.md` 4。INV-LIMITS の N22・N23・T29 と設計者の判断 E）: 件数の上限（前は `MAX_REDIRECT_PREDECESSORS`
+ *   64 で、超える登録は `REDIRECT_PREDECESSOR_LIMIT_REACHED` の違反）、要求の ID・method・URL の長さの上限（前は `CDP_CORRELATION_IDENTITY_REJECTED` の違反）、
+ *   時間で捨てる決まり（前は `REDIRECT_PREDECESSOR_RETENTION_MS` 1 秒）は撤廃した。登録は持ち主（Context・page）の寿命まで持つ。
  */
 class RedirectPredecessorRegistry {
-  readonly #entries = new Map<string, RedirectPredecessor>();
-  readonly #ledger: SafetyLedger;
-  #identityReported = false;
-  #limitReported = false;
+  readonly #entries = new Map<string, CorrelationRequest>();
 
-  constructor(ledger: SafetyLedger) {
-    this.#ledger = ledger;
+  constructor(_ledger: SafetyLedger) {
+    // L10: 違反を記録する場面（上限・長さ）がなくなったので、Ledger は使わない（呼び出し側の形は変えない）。
   }
 
-  remember(requestId: string, request: CorrelationRequest, now: number): boolean {
-    this.#purge(now);
-    if (
-      requestId.length > MAX_REDIRECT_REQUEST_ID_LENGTH
-      || request.method.length > MAX_HTTP_METHOD_LENGTH
-      || request.url.length > MAX_URL_LENGTH
-    ) {
-      this.#recordIdentityRejected();
-      return false;
-    }
-    if (this.#entries.size >= MAX_REDIRECT_PREDECESSORS) {
-      if (!this.#limitReported) {
-        this.#limitReported = true;
-        this.#ledger.recordInvariantViolation({
-          code: 'REDIRECT_PREDECESSOR_LIMIT_REACHED',
-          message: 'Redirect predecessor correlation limit reached',
-        });
-      }
-      return false;
-    }
-    this.#entries.set(requestId, {
-      request: { method: request.method.slice(0, MAX_HTTP_METHOD_LENGTH).toUpperCase(), url: request.url },
-      expiresAt: now + REDIRECT_PREDECESSOR_RETENTION_MS,
-    });
+  remember(requestId: string, request: CorrelationRequest, _now: number): boolean {
+    this.#entries.set(requestId, { method: request.method.toUpperCase(), url: request.url });
     return true;
   }
 
@@ -2513,37 +2792,14 @@ class RedirectPredecessorRegistry {
     this.#entries.delete(requestId);
   }
 
-  take(requestId: string, now: number): RedirectPredecessorLookup {
-    if (requestId.length > MAX_REDIRECT_REQUEST_ID_LENGTH) {
-      this.#recordIdentityRejected();
-      return { kind: 'INVALID' };
-    }
-    this.#purge(now);
+  take(requestId: string, _now: number): RedirectPredecessorLookup {
     const entry = this.#entries.get(requestId);
     this.#entries.delete(requestId);
-    return entry === undefined ? { kind: 'MISSING' } : { kind: 'FOUND', request: entry.request };
+    return entry === undefined ? { kind: 'MISSING' } : { kind: 'FOUND', request: entry };
   }
 
   clear(): void {
     this.#entries.clear();
-    this.#identityReported = false;
-    this.#limitReported = false;
-  }
-
-  #purge(now: number): void {
-    for (const [requestId, entry] of this.#entries) {
-      if (entry.expiresAt < now) this.#entries.delete(requestId);
-    }
-  }
-
-  #recordIdentityRejected(): void {
-    if (!this.#identityReported) {
-      this.#identityReported = true;
-      this.#ledger.recordInvariantViolation({
-        code: 'CDP_CORRELATION_IDENTITY_REJECTED',
-        message: 'Redirect predecessor identity exceeded its bound',
-      });
-    }
   }
 }
 
@@ -2552,8 +2808,6 @@ const CANCELED_DOCUMENT_RESOURCE_TYPE = 'Document';
 
 /** 文書の要求の、ブラウザによる取り消しの証拠（DEF-026。同じ session の `Network.loadingFailed`）。 */
 interface CanceledDocumentEvidence {
-  /** 期限（ms）。 */
-  readonly expiresAt: number;
   /** `Network.loadingFailed` の `errorText`（文字列でなければ `null`）。DEF-027 の対応付けで、`net::ERR_ABORTED` かを確かめる。 */
   readonly errorText: string | null;
 }
@@ -2569,8 +2823,6 @@ interface MainFrameDocumentRecord {
   continued: boolean;
   /** 応答を1つでも受けたか（Response の段階の一時停止、`Network.responseReceived`、リダイレクト）。一度真になったら戻らない。 */
   responded: boolean;
-  /** 期限（ms）。 */
-  expiresAt: number;
 }
 
 /** main frame の文書の要求の取り消しを、証拠で確かめた結果（DEF-027）。まだ決められなければ `PENDING`。 */
@@ -2586,7 +2838,7 @@ function eventRequestId(event: unknown): string | null {
  * 1つの CDP の session で受けた、文書の要求の、ブラウザによる取り消しの証拠を覚え、Guard の命令の失敗と対応付ける（DEF-026。設計書 2章）。
  * - 証拠（`recordLoadingFailed`）: 同じ session の `Network.loadingFailed` で、`canceled` が真で、`type` が `Document` のもの。`requestId` で
  *   覚える。証拠は、一時停止の通知より先に届くので、一時停止の有無によらず覚える。数の上限（`MAX_CANCELED_DOCUMENT_EVIDENCE`）を超える
- *   証拠は覚えない（その要求への命令の失敗は、違反のまま）。覚えておく時間は `CANCELED_DOCUMENT_EVIDENCE_RETENTION_MS` で、過ぎたら捨てる。
+ *   証拠は覚えない（その要求への命令の失敗は、違反のまま）。L10（T29）: 証拠は期限を持たず、使ったときか session を閉じたときに捨てる。
  * - 対応付け（`awaitCancellation`）: 命令が失敗した要求の、一時停止の通知の `networkId` の証拠があるか。なければ、決めた時間だけ待つ。
  * - 閉じる（`clear`）: session を閉じたときに、すべての証拠を消し、証拠を待っている扱いを、証拠なしで終わらせる（違反にする）。
  *   その後は、証拠を受けず、待たない。
@@ -2602,15 +2854,15 @@ function eventRequestId(event: unknown): string | null {
  * - 記録（`recordMainFramePaused`・`recordMainFrameContinued`・`recordResponseReceived`・`recordRequestWillBeSent`）: Request の段階の
  *   一時停止で記録を作り、Guard が許可して進めた（命令が成功した。(a)）こと、応答を受けたこと（Response の段階の一時停止、
  *   `Network.responseReceived`、`Network.requestWillBeSent` の `redirectResponse`、リダイレクトの先の一時停止）を記録する。
- *   数の上限は `MAX_CANCELED_DOCUMENT_EVIDENCE`（超えた要求は覚えない）、時間の上限は `PENDING_MAIN_FRAME_DOCUMENT_RETENTION_MS`。
- *   要求が終わったら、記録を消す（`recordLoadingFinished`）か、`CANCELED_DOCUMENT_EVIDENCE_RETENTION_MS` に縮める（`recordLoadingFailed`）。
+ *   L10（N22・T29）: 数の上限と時間の上限は撤廃した。要求が読み込みを終えたら記録を消し（`recordLoadingFinished`）、取り消されたら、確かめで使うか
+ *   session を閉じるまで残す（`recordLoadingFailed`）。
  * - 確かめ（`awaitMainFrameCancellation`）: Playwright の要求（method と URL）と、記録を1対1に対応付け、(a) 許可して進めた、(b) 取り消しの
  *   証拠がある、(c) 応答がページに渡っていないことの証拠がある、のすべてを満たすときだけ真。使った記録と証拠は消す（1回だけ使う）。
  *   Guard が進める前に取り消された要求（例: 0〜5ms の間隔の `location.replace` の連続）は、(a) を満たさないので、違反のまま残る
  *   （設計書 2.1.1 の限界）。
  */
-class CanceledDocumentRegistry {
-  /** 証拠の `requestId` と、その期限と `errorText`。 */
+export class CanceledDocumentRegistry {
+  /** 証拠の `requestId` と、その `errorText`。 */
   readonly #evidence = new Map<string, CanceledDocumentEvidence>();
   /** 証拠を待っている扱い（`requestId` ごと。証拠を受けたとき、session を閉じたときに呼ぶ）。 */
   readonly #waiters = new Map<string, Set<() => void>>();
@@ -2619,16 +2871,16 @@ class CanceledDocumentRegistry {
   /** main frame の取り消しの確かめを待っている扱い（DEF-027。記録や証拠が変わったとき、session を閉じたときに呼ぶ）。 */
   readonly #mainFrameWaiters = new Set<() => void>();
   /**
-   * DEF-052（設計書 2.2）: 上限のために覚えなかった証拠の要求の ID と、その期限（診断だけに使う。`MAX_DROPPED_CANCELED_DOCUMENT_IDS` 件まで）。
-   * session を閉じても消さない（閉じた後の失敗の診断にも使うため。数の上限があるので増え続けない）。
+   * DEF-052（設計書 2.2）: 上限のために覚えなかった証拠の要求の ID（診断だけに使う。`MAX_DROPPED_CANCELED_DOCUMENT_IDS` 件まで）。
+   * session を閉じても消さない（閉じた後の失敗の診断にも使うため。数の上限があるので増え続けない）。L10: 時間では捨てない。
    */
-  readonly #droppedAtCapacity = new Map<string, number>();
+  readonly #droppedAtCapacity = new Set<string>();
   /** DEF-052（設計書 2.2）: 上限のために覚えなかった証拠の数の累計（ID を覚えきれなかったものも数える）。 */
   #droppedAtCapacityCount = 0;
   #cleared = false;
 
   /** 同じ session の `Network.loadingFailed` を受けたとき。文書の要求の取り消しなら覚え、その要求の証拠を待っている扱いを起こす。 */
-  recordLoadingFailed(event: unknown, now: number): void {
+  recordLoadingFailed(event: unknown, _now: number): void {
     const { requestId, canceled, type, errorText } = (typeof event === 'object' && event !== null ? event : {}) as {
       readonly requestId?: unknown;
       readonly canceled?: unknown;
@@ -2638,24 +2890,14 @@ class CanceledDocumentRegistry {
     if (this.#cleared || typeof requestId !== 'string' || requestId.length === 0) {
       return;
     }
-    // DEF-027: main frame の文書の要求が終わった。Playwright の要求と対応付けるのに要る時間だけ、記録を残す。
-    const record = this.#mainFrameDocuments.get(requestId);
-    if (record !== undefined) {
-      record.expiresAt = Math.min(record.expiresAt, now + CANCELED_DOCUMENT_EVIDENCE_RETENTION_MS);
-    }
+    // DEF-027: main frame の文書の要求が終わった。L10（T29）: その記録は、Playwright の要求との対応付けで使うか、session を閉じるまで残す（時間で縮めない）。
     if (canceled !== true || type !== CANCELED_DOCUMENT_RESOURCE_TYPE) {
       this.#wakeMainFrameWaiters();
       return;
     }
-    this.#purge(now);
-    // 同じ要求の証拠をもう一度受けた場合は、期限を数え直す（数は増えない）。
-    if (!this.#evidence.has(requestId) && this.#evidence.size >= MAX_CANCELED_DOCUMENT_EVIDENCE) {
-      this.#recordDroppedAtCapacity(requestId, now);
-      this.#wakeMainFrameWaiters();
-      return;
-    }
+    // L10（INV-LIMITS の N22）: 覚える数の上限（前は `MAX_CANCELED_DOCUMENT_EVIDENCE` 256。超えた証拠は覚えず、その要求への命令の失敗を違反にした）は撤廃した。
+    // 同じ要求の証拠をもう一度受けた場合は、上書きする（数は増えない）。
     this.#evidence.set(requestId, {
-      expiresAt: now + CANCELED_DOCUMENT_EVIDENCE_RETENTION_MS,
       errorText: typeof errorText === 'string' ? errorText : null,
     });
     for (const wake of [...(this.#waiters.get(requestId) ?? [])]) wake();
@@ -2687,19 +2929,10 @@ class CanceledDocumentRegistry {
         resolve(this.#hasEvidence(networkId));
       };
       waiters.add(settle);
-      timer = setTimeout(() => {
-        let remainingYields = CANCELED_DOCUMENT_EVIDENCE_RECEIVED_EVENT_YIELDS;
-        const readReceivedEvents = (): void => {
-          if (settled) return;
-          if (remainingYields <= 0 || this.#cleared || this.#hasEvidence(networkId)) {
-            settle();
-            return;
-          }
-          remainingYields -= 1;
-          setImmediate(readReceivedEvents);
-        };
-        readReceivedEvents();
-      }, waitMs);
+      timer = setTimeout(
+        () => settleAfterReceivedEvents(() => settled || this.#cleared || this.#hasEvidence(networkId), settle),
+        waitMs,
+      );
     });
   }
 
@@ -2708,9 +2941,8 @@ class CanceledDocumentRegistry {
    * 時間）。上限のために覚えなかった ID なら `EVIDENCE_DROPPED_AT_CAPACITY`、session を閉じた後なら `SESSION_CLEARED`、待たなかったなら
    * `CLOSING_NOT_WAITED`、それ以外は `EVIDENCE_NOT_RECEIVED`。診断だけに使う。
    */
-  missingEvidenceReason(networkId: string, waitMs: number, now: number): CanceledDocumentEvidenceMissingReason {
-    const droppedUntil = this.#droppedAtCapacity.get(networkId);
-    if (droppedUntil !== undefined && droppedUntil >= now) return CANCELED_DOCUMENT_EVIDENCE_MISSING_REASON.EVIDENCE_DROPPED_AT_CAPACITY;
+  missingEvidenceReason(networkId: string, waitMs: number, _now: number): CanceledDocumentEvidenceMissingReason {
+    if (this.#droppedAtCapacity.has(networkId)) return CANCELED_DOCUMENT_EVIDENCE_MISSING_REASON.EVIDENCE_DROPPED_AT_CAPACITY;
     if (this.#cleared) return CANCELED_DOCUMENT_EVIDENCE_MISSING_REASON.SESSION_CLEARED;
     if (waitMs <= 0) return CANCELED_DOCUMENT_EVIDENCE_MISSING_REASON.CLOSING_NOT_WAITED;
     return CANCELED_DOCUMENT_EVIDENCE_MISSING_REASON.EVIDENCE_NOT_RECEIVED;
@@ -2728,12 +2960,11 @@ class CanceledDocumentRegistry {
    *   達している場合は、覚えない（その要求の取り消しは、違反のまま）。
    * - Response の段階: 応答を受けたことを記録する。
    */
-  recordMainFramePaused(event: PausedDocumentEvent, now: number): void {
+  recordMainFramePaused(event: PausedDocumentEvent, _now: number): void {
     const networkId = typeof event.networkId === 'string' && event.networkId.length > 0 ? event.networkId : null;
     if (this.#cleared || networkId === null) {
       return;
     }
-    this.#purgeMainFrameDocuments(now);
     const record = this.#mainFrameDocuments.get(networkId);
     if (isPausedResponse(event)) {
       if (record !== undefined) record.responded = true;
@@ -2753,15 +2984,15 @@ class CanceledDocumentRegistry {
       this.#wakeMainFrameWaiters();
       return;
     }
-    if (request === null || this.#mainFrameDocuments.size >= MAX_CANCELED_DOCUMENT_EVIDENCE) {
+    // L10（INV-LIMITS の N22）: 記録の数の上限（前は `MAX_CANCELED_DOCUMENT_EVIDENCE` 256。超えた要求は覚えず、その取り消しを違反にした）は撤廃した。
+    if (request === null) {
       return;
     }
-    // 取り消しの証拠が一時停止の通知より先に届いていた（一時停止の間に取り消された）場合は、その証拠と同じ期限にする。
+    // L10（T29）: 記録は期限を持たない（使うか、読み込みを終えるか、session を閉じるまで持つ）。
     this.#mainFrameDocuments.set(networkId, {
       request,
       continued: false,
       responded: redirected,
-      expiresAt: this.#evidence.get(networkId)?.expiresAt ?? now + PENDING_MAIN_FRAME_DOCUMENT_RETENTION_MS,
     });
     this.#wakeMainFrameWaiters();
   }
@@ -2836,30 +3067,14 @@ class CanceledDocumentRegistry {
   }
 
   #hasEvidence(networkId: string): boolean {
-    const evidence = this.#evidence.get(networkId);
-    return evidence !== undefined && evidence.expiresAt >= Date.now();
-  }
-
-  #purge(now: number): void {
-    for (const [requestId, evidence] of this.#evidence) {
-      if (evidence.expiresAt < now) this.#evidence.delete(requestId);
-    }
+    return this.#evidence.has(networkId);
   }
 
   /** DEF-052（設計書 2.2）: 上限のために覚えなかった証拠を数え、その ID を上限つきで覚える（覚えきれなければ数えるだけ）。 */
-  #recordDroppedAtCapacity(requestId: string, now: number): void {
+  #recordDroppedAtCapacity(requestId: string, _now: number): void {
     this.#droppedAtCapacityCount = saturatingIncrement(this.#droppedAtCapacityCount);
-    for (const [droppedId, expiresAt] of this.#droppedAtCapacity) {
-      if (expiresAt < now) this.#droppedAtCapacity.delete(droppedId);
-    }
     if (this.#droppedAtCapacity.has(requestId) || this.#droppedAtCapacity.size < MAX_DROPPED_CANCELED_DOCUMENT_IDS) {
-      this.#droppedAtCapacity.set(requestId, now + CANCELED_DOCUMENT_EVIDENCE_RETENTION_MS);
-    }
-  }
-
-  #purgeMainFrameDocuments(now: number): void {
-    for (const [networkId, record] of this.#mainFrameDocuments) {
-      if (record.expiresAt < now) this.#mainFrameDocuments.delete(networkId);
+      this.#droppedAtCapacity.add(requestId);
     }
   }
 
@@ -2889,9 +3104,6 @@ class CanceledDocumentRegistry {
     if (this.#cleared) {
       return 'REJECTED';
     }
-    const now = Date.now();
-    this.#purge(now);
-    this.#purgeMainFrameDocuments(now);
     const candidates = [...this.#mainFrameDocuments].filter(([, record]) => record.request.method === request.method
       && record.request.url === request.url);
     if (candidates.length > 1) {
@@ -2922,6 +3134,52 @@ class CanceledDocumentRegistry {
 interface PausedDocumentCommands {
   continueRequest(): Promise<void>;
   failRequest(): Promise<void>;
+  /**
+   * SAFE-2 の 2（DEF-242）: 止めた要求に、204（No Content）で応える（サーバへは届けない。main frame の移動なら、今の文書が残る）。page の session の命令だけが
+   * 持つ（ほかの session は省略）。
+   */
+  fulfillNoContent?(): Promise<void>;
+}
+
+/** SAFE-2 の 2（DEF-242）: 止めた main frame の移動への応え方を決めるための事実（`blockedMainFrameNavigationResponseOf` が読む）。 */
+export interface BlockedMainFrameNavigationFacts {
+  readonly phase: GuardPhase;
+  /** 止めた文書の要求が、page の main frame の移動か。 */
+  readonly mainFrame: boolean;
+  /** BeakSight 自身の読み込み（`announceOwnMainFrameNavigation` で知らせた次の要求）か。 */
+  readonly ownNavigation: boolean;
+  /** 観察の口のある Context（操作さがし）の Guard か。 */
+  readonly observing: boolean;
+  /** REV-EV4: 横にスクロールする領域のキーの押下の期間に止めた移動か（省略は偽）。 */
+  readonly scrollKeyPress?: boolean;
+}
+
+/** SAFE-2 の 2（DEF-242）: 止めた main frame の移動の応え方（`NO_CONTENT` は 204 で応えて今の文書を残す。`BLOCKED_BY_CLIENT` は今どおり失敗にする）。 */
+export type BlockedMainFrameNavigationResponse = 'NO_CONTENT' | 'BLOCKED_BY_CLIENT';
+
+/** 止めた main frame の移動に応える status（No Content。Chromium は移動をやめ、今の文書を残す）。 */
+const NO_CONTENT_STATUS = 204;
+
+/**
+ * SAFE-2 の 2（DEF-242。設計者の判断）: 止めた main frame の移動への応え方（唯一の判定）。ページが始めた main frame の移動を、凍結の段（`FROZEN_ACTIVE`）で、観察の口の
+ * ある Context（操作さがし）で止めたときだけ、204 で応えて今の文書を残す（誤りの画面に替わって候補を読めなくなるのを防ぐ）。ほか（監査の段・閉じる途中・子の frame・
+ * BeakSight 自身の読み込み・Isolated Interaction Context）は、今どおり `ERR_BLOCKED_BY_CLIENT`（BN の遮断の結び付き・network の collector・load-meter・
+ * site-availability の前提を変えない）。どちらでも、止めた記録（理由と URL）は今どおり残す。
+ * REV-EV4: 監査の段の、横にスクロールする領域のキーの押下の期間に止めた、ページが始めた main frame の移動も、204 で応えて今の文書を残す（その画面の点検を続ける）。
+ */
+export function blockedMainFrameNavigationResponseOf(facts: BlockedMainFrameNavigationFacts): BlockedMainFrameNavigationResponse {
+  if (facts.phase === 'PASSIVE_ACTIVE' && facts.mainFrame && !facts.ownNavigation && facts.scrollKeyPress === true) {
+    return 'NO_CONTENT';
+  }
+  return facts.phase === 'FROZEN_ACTIVE' && facts.mainFrame && !facts.ownNavigation && facts.observing ? 'NO_CONTENT' : 'BLOCKED_BY_CLIENT';
+}
+
+/**
+ * SREV-SAFE の I-1: 止めた main frame の移動の後に、ブラウザが出す失敗の文言（Guard が予期した失敗として登録する値）。204 で応えた移動は、Chromium が
+ * `net::ERR_ABORTED` で終える（止めた記録は残すので、読み取りの失敗の記録にはしない）。ほかは `net::ERR_BLOCKED_BY_CLIENT`。
+ */
+export function blockedMainFrameNavigationFailureTextOf(response: BlockedMainFrameNavigationResponse): string {
+  return response === 'NO_CONTENT' ? NAVIGATION_ABORTED_ERROR_TEXT : BLOCKED_BY_CLIENT_DOCUMENT_FAILURE_TEXT;
 }
 
 /** DEF-099 fix: 書き込みの段の承認の POST の、送り手の応答をブラウザに返す命令と、応答のない失敗を伝える命令（Request の段階の事象だけ）。 */
@@ -3044,8 +3302,7 @@ interface CanceledEvidenceDiagnostic {
 /**
  * DEF-052（設計書 2.2）: 違反の文。元の文言（`isInvalidInterceptionIdFailure` の閉じた一覧のどれか）を先頭にそのまま残し、その後ろに
  * `[canceled-document-evidence: reason=<理由>; waited-ms=<整数>; elapsed-ms=<整数>; dropped-at-capacity=<整数>]` を付ける。
- * 元の文言は閉じた一覧のどれかで、値は安全な整数と閉じた一覧の語だけなので、文の長さは `MAX_ERROR_MESSAGE_LENGTH` と Safety Ledger の
- * 文の上限に収まる（切り詰められて診断が欠けることはない）。
+ * LZ-2: 文は切り詰めないので、診断が欠けることはない。
  */
 function canceledEvidenceDiagnosticMessage(original: string, diagnostic: CanceledEvidenceDiagnostic): string {
   return `${original} [${CANCELED_DOCUMENT_EVIDENCE_DIAGNOSTIC_LABEL}: reason=${diagnostic.reason}; waited-ms=${diagnostic.waitedMs}; `
@@ -3082,6 +3339,26 @@ const CLOSED_TARGET_FAILURE_TEXTS: ReadonlySet<string> = new Set([
   OOPIF_SESSION_CLOSED_MESSAGE,
 ]);
 
+/**
+ * DEF-225: ダウンロードの取り消し（`download.cancel()`）が、Context が消えたために失敗したときの文言の形（閉じた一覧。Playwright 1.64.1・CLI の Chromium で実際に
+ * 起きた失敗から取った）。
+ * - Playwright の client が Context を閉じたと知った後: `download.cancel: Target page, context or browser has been closed`。
+ * - Chromium が Context を消した後で、client がまだ知らない間: `download.cancel: Protocol error (Browser.cancelDownload): Failed to find browser context for id <32 桁の 16 進>`。
+ * どちらも文全体の一致で比べる（部分一致にしない。一覧にない文言は違反にする側に倒す）。
+ * 根拠（2026-11-08 の実機。CLI の Chromium、`acceptDownloads: false` の Context、小さい本文と 1.3MB をゆっくり送る本文の各 3 回）: 取り消しを呼ばなくても、Chromium は
+ * ダウンロードを始めた直後に自分で取り消し（CDP の `Page.downloadProgress` が `inProgress:0` の次に `canceled:0`）、Playwright の `download.failure()` は受け付けない
+ * 設定の文を返し、`downloadsPath` にファイルはできなかった。Context を閉じた後の取り消しも同じで、ファイルはできなかった。
+ */
+const DOWNLOAD_CANCEL_CONTEXT_GONE_FAILURE_FORMS: readonly RegExp[] = Object.freeze([
+  /^download\.cancel: Target page, context or browser has been closed$/u,
+  /^download\.cancel: Protocol error \(Browser\.cancelDownload\): Failed to find browser context for id [0-9A-F]{32}$/u,
+]);
+
+/** DEF-225: 取り消しの失敗の文言が、Context が消えた形（`DOWNLOAD_CANCEL_CONTEXT_GONE_FAILURE_FORMS`）か。 */
+function isDownloadCancelAfterContextGoneFailure(message: string): boolean {
+  return DOWNLOAD_CANCEL_CONTEXT_GONE_FAILURE_FORMS.some((form) => form.test(message));
+}
+
 /** 命令の失敗の文言が、session か target が閉じた形（`CLOSED_TARGET_FAILURE_TEXTS` のどれか）と完全に一致するか。 */
 function isClosedTargetFailure(message: string): boolean {
   return CLOSED_TARGET_FAILURE_TEXTS.has(message);
@@ -3101,10 +3378,10 @@ const MAX_PREFLIGHT_INITIATORS = 256;
  * CORS の事前確認の判定の第一の根拠）。
  */
 class PreflightInitiatorRegistry {
-  readonly #entries = new Map<string, number>();
+  readonly #entries = new Set<string>();
 
   /** `Network.requestWillBeSent` を受けたとき。事前確認の要求なら、その `requestId` を覚える。 */
-  record(event: unknown, now: number): void {
+  record(event: unknown, _now: number): void {
     const { requestId, initiator } = (typeof event === 'object' && event !== null ? event : {}) as {
       readonly requestId?: unknown;
       readonly initiator?: { readonly type?: unknown };
@@ -3112,27 +3389,18 @@ class PreflightInitiatorRegistry {
     if (typeof requestId !== 'string' || requestId.length === 0 || initiator?.type !== 'preflight') {
       return;
     }
-    this.#purge(now);
-    if (this.#entries.size >= MAX_PREFLIGHT_INITIATORS) {
-      return;
-    }
-    this.#entries.set(requestId, now + PREFLIGHT_INITIATOR_RETENTION_MS);
+    // L10（設計者の判断 E と INV-LIMITS の N22）: 覚える数の上限（前は `MAX_PREFLIGHT_INITIATORS` 256）と、時間で捨てる決まり（前は
+    // `PREFLIGHT_INITIATOR_RETENTION_MS` 1 秒）は撤廃した。使うか、session を閉じる（`clear`）まで持つ。
+    this.#entries.add(requestId);
   }
 
   /** `networkId` の要求が事前確認として覚えられているか。あれば、その記録を消して真を返す。 */
-  take(networkId: string, now: number): boolean {
-    this.#purge(now);
+  take(networkId: string, _now: number): boolean {
     return this.#entries.delete(networkId);
   }
 
   clear(): void {
     this.#entries.clear();
-  }
-
-  #purge(now: number): void {
-    for (const [requestId, expiresAt] of this.#entries) {
-      if (expiresAt <= now) this.#entries.delete(requestId);
-    }
   }
 }
 
@@ -3155,11 +3423,16 @@ const SCRIPT_INITIATOR_WAIT_MS = 1_000;
  * page の session には届かない（T39b の実験。両方の Chromium）。
  */
 class ScriptInitiatorRegistry {
-  readonly #entries = new Map<string, { readonly frameId: string; readonly expiresAt: number }>();
+  /**
+   * 要求の ID → 始めた frame。L10（設計者の判断 D・E と INV-LIMITS の N22）: 覚える数の上限（前は `MAX_SCRIPT_INITIATORS` 256。超えた要求は覚えず、確かめられ
+   * ない要求として止めた）と、時間で捨てる決まり（前は `SCRIPT_INITIATOR_RETENTION_MS` 30 秒）は撤廃した。使うか、session を閉じる（`clear`）まで持つ。発信元を
+   * 確かめられない書き込みを止める決まり（S7）は今のまま。
+   */
+  readonly #entries = new Map<string, string>();
   readonly #waiters = new Map<string, Set<() => void>>();
 
   /** `Network.requestWillBeSent` を受けたとき。スクリプトが始めた要求なら、その `requestId` と frame を覚える。 */
-  record(event: unknown, now: number): void {
+  record(event: unknown, _now: number): void {
     const { requestId, frameId, initiator } = (typeof event === 'object' && event !== null ? event : {}) as {
       readonly requestId?: unknown;
       readonly frameId?: unknown;
@@ -3168,10 +3441,7 @@ class ScriptInitiatorRegistry {
     if (typeof requestId !== 'string' || requestId.length === 0 || typeof frameId !== 'string' || initiator?.type !== 'script') {
       return;
     }
-    this.#purge(now);
-    if (this.#entries.size < MAX_SCRIPT_INITIATORS) {
-      this.#entries.set(requestId, { frameId, expiresAt: now + SCRIPT_INITIATOR_RETENTION_MS });
-    }
+    this.#entries.set(requestId, frameId);
     const waiters = this.#waiters.get(requestId);
     if (waiters !== undefined) {
       this.#waiters.delete(requestId);
@@ -3195,9 +3465,9 @@ class ScriptInitiatorRegistry {
         waiters.add(wake);
       });
     }
-    const entry = this.#entries.get(networkId);
+    const frameId = this.#entries.get(networkId);
     this.#entries.delete(networkId);
-    return entry === undefined || entry.expiresAt <= Date.now() ? null : entry.frameId;
+    return frameId ?? null;
   }
 
   clear(): void {
@@ -3206,12 +3476,6 @@ class ScriptInitiatorRegistry {
       for (const wake of waiters) wake();
     }
     this.#waiters.clear();
-  }
-
-  #purge(now: number): void {
-    for (const [requestId, { expiresAt }] of this.#entries) {
-      if (expiresAt <= now) this.#entries.delete(requestId);
-    }
   }
 }
 
@@ -3284,7 +3548,8 @@ export const WORKER_CONNECT_POLICY = 'connect-src http: https: data: blob:';
  * Context だけに当てる policy（`WORKER_CONNECT_POLICY` に `ws:`・`wss:` を足したもの）。ページ（文書）の WebSocket は、Guard の `routeWebSocket` が判定・記録・
  * 上限を当ててからつなぐ（`connectToServer` はページの中で本物の WebSocket を作るので、文書の policy が `ws:`・`wss:` を許す必要がある）。http(s) の script の
  * Worker の応答のヘッダも、同じ policy にそろえる。限界: Worker（blob・data の Worker と、http(s) の script の Worker）の WebSocket は、Guard の route を通らず、
- * 記録されずに通る（ユーザーの方針「ページが自分で出す送信は問題ない」により受け入れた）。`READ_ONLY` と Interaction の Context は `WORKER_CONNECT_POLICY` のまま。
+ * 記録されずに通る（ユーザーの方針「ページが自分で出す送信は問題ない」により受け入れた）。凍結の後に押しうる Context（Interaction と操作さがしの PRIMARY）は
+ * `WORKER_CONNECT_POLICY` のまま（RB-4 fix。DEF-276 で、凍結の後に押さない PRIMARY を除いた）。
  */
 export const AUDIT_SEND_CONNECT_POLICY = 'connect-src http: https: data: blob: ws: wss:';
 
@@ -3424,8 +3689,7 @@ export const WEBRTC_BLOCKED_GLOBAL_NAMES = Object.freeze(['RTCPeerConnection', '
  * 固定する（ページは `delete` も定義し直しもできない。`RTCPeerConnection.prototype.constructor` も置き換えた関数になる）。元の関数は、ページから
  * 届く所に残らない。Context の初期化のスクリプトは、すべての frame（同じ Origin・別の Origin の iframe、about:blank・srcdoc・data・blob の
  * iframe、`document.write` で書き直した文書、SVG の文書、ポップアップ）の文書に付く（DEF-124-fix の実験で、別の realm から借りる経路を含めて
- * すべて止まることを確かめた）。WebRTC が使われたことを factory が知る CDP の事象はないので、自己検査はない（起動の引数
- * `CHROMIUM_WEBRTC_NON_PROXIED_UDP_DISABLED_ARGS` が、UDP について守りを重ねる）。
+ * すべて止まることを確かめた）。WebRTC が使われたことを factory が知る CDP の事象はないので、自己検査はない。RB-4b: 付けるのは、凍結しうる Context だけ。
  */
 export const WEBRTC_BLOCK_INIT_SCRIPT = `(() => {
   const DOMExceptionConstructor = globalThis.DOMException;
@@ -3529,40 +3793,40 @@ function recordGuardTaskDrainTimeoutOnce(guardState: GuardState): void {
   });
 }
 
+/**
+ * 閉じるときに、Guard の作業が終わるのを待つ。L10（設計書 `2026-11-09-beaksight-remove-limits-design.md` 4。INV-LIMITS の T30 と設計者の判断 E）: 待ちの期限
+ * （前は `GUARD_PENDING_TASK_DRAIN_TIMEOUT_MS` 1 秒）は置かず、L0 の見張り（`watchProgress`）で終える。作業が 1 つ終わるたびに進みの印を付け、作業が終わらない
+ * まま反応なしの長さ（`PROGRESS_WATCH_QUIET_LIMIT_MS`）が過ぎたら、今どおり「状態が分からない」の違反（`GUARD_PENDING_TASK_DRAIN_TIMEOUT`）にする。
+ */
 async function drainGuardTasks(
   guardState: GuardState,
   onDrained: () => void,
 ): Promise<'DRAINED' | 'TIMED_OUT'> {
-  const deadlineAt = Date.now() + GUARD_PENDING_TASK_DRAIN_TIMEOUT_MS;
-  while (guardState.pendingTasks.size > 0) {
-    const remainingMs = deadlineAt - Date.now();
-    if (remainingMs <= 0) {
-      recordGuardTaskDrainTimeoutOnce(guardState);
-      return 'TIMED_OUT';
-    }
-    const stableTasks = Array.from(guardState.pendingTasks);
-    let timer: ReturnType<typeof setTimeout> | undefined;
-    try {
-      const settled = await Promise.race([
-        Promise.allSettled(stableTasks).then(() => true),
-        new Promise<false>((resolveTimeout) => {
-          timer = setTimeout(() => resolveTimeout(false), remainingMs);
-        }),
-      ]);
-      if (!settled) {
-        recordGuardTaskDrainTimeoutOnce(guardState);
-        return 'TIMED_OUT';
+  const outcome = await watchProgress(async (signals) => {
+    const stopped = new Promise<void>((resolveStopped) => {
+      if (signals.signal.aborted) resolveStopped();
+      else signals.signal.addEventListener('abort', () => resolveStopped(), { once: true });
+    });
+    for (;;) {
+      if (signals.signal.aborted) return false;
+      if (guardState.pendingTasks.size === 0) {
+        // 終端状態への遷移と、最終的な空集合の観測は1つの同期境界を成す。
+        // その間にプロトコルコールバックが割り込むことはできない。
+        onDrained();
+        return true;
       }
-    } finally {
-      if (timer !== undefined) {
-        clearTimeout(timer);
+      const stableTasks = Array.from(guardState.pendingTasks);
+      for (const task of stableTasks) {
+        void task.then(() => signals.mark('BROWSER_RESPONSE'), () => signals.mark('BROWSER_RESPONSE'));
       }
+      await Promise.race([Promise.allSettled(stableTasks), stopped]);
     }
+  }, { quietLimitMs: guardState.drainQuietLimitMs });
+  if (outcome.status === 'FULFILLED' && outcome.value) {
+    return 'DRAINED';
   }
-  // 終端状態への遷移と、最終的な空集合の観測は1つの同期境界を成す。
-  // その間にプロトコルコールバックが割り込むことはできない。
-  onDrained();
-  return 'DRAINED';
+  recordGuardTaskDrainTimeoutOnce(guardState);
+  return 'TIMED_OUT';
 }
 
 function runListenerCleanups(guardState: GuardState, cleanups: readonly (() => void)[]): void {
@@ -3615,17 +3879,18 @@ function requestSentContentOf(request: Request): RequestSentContent {
   return { headers, formMethodOverrides: () => formMethodOverrideValuesOf(headers, () => requestBodyTextOfBuffer(request.postDataBuffer())) };
 }
 
-function classifyMainFrame(request: Request, ledger: SafetyLedger): boolean | undefined {
+/**
+ * Playwright の要求が main frame の移動か（ナビゲーションでなければ偽）。frame を引けなければ `undefined` を返し、`onFailure` を呼ぶ。SAFE-2 の 4（違反の区分の (3)）:
+ * 前は違反 `FRAME_CLASSIFICATION_FAILED` を記録したが、今は呼ぶ側が frame の判定の失敗の記録（`frameClassificationFailures`）に残す（違反にしない）。
+ */
+function classifyMainFrame(request: Request, onFailure: () => void): boolean | undefined {
   if (!request.isNavigationRequest()) {
     return false;
   }
   try {
     return request.frame().parentFrame() === null;
-  } catch (error) {
-    ledger.recordInvariantViolation({
-      code: FRAME_CLASSIFICATION_FAILED_VIOLATION_CODE,
-      message: errorMessage(error),
-    });
+  } catch {
+    onFailure();
     return undefined;
   }
 }
@@ -3636,6 +3901,9 @@ function classifyMainFrame(request: Request, ledger: SafetyLedger): boolean | un
  * もよい）。
  */
 function freezeEgress(guardState: GuardState, cause: EgressFreezeCause): void {
+  // DEF-276-relay: 中継している文書の WebSocket を先に切る（凍結の後と閉じる途中に、ページの送りをサーバへ渡さない。中継のトンネルも凍結で切れる）。
+  for (const cut of [...guardState.webSocketRelayCuts]) cut();
+  guardState.webSocketRelayCuts.clear();
   if (guardState.egressFreeze === undefined) return;
   try {
     guardState.egressFreeze(cause);
@@ -3747,47 +4015,19 @@ function initiateInvalidation(context: BrowserContext, ledger: SafetyLedger): Pr
   return containInvalidationFailure(invalidateContext(context, ledger), ledger);
 }
 
-function beginOverflowInvalidationOnce(guardState: GuardState): void {
-  if (guardState.overflowInvalidation !== undefined || guardState.phase === 'CLOSED') {
-    return;
-  }
-  const reservedInvalidation = invalidateContext(guardState.context, guardState.ledger).finally(() => {
-    guardState.overflowInvalidation = undefined;
-  });
-  guardState.overflowInvalidation = reservedInvalidation;
-  void reservedInvalidation.catch(() => undefined);
-}
-
 /**
- * Guard の作業の種類（DEF-042 の設計書 2.4）。`REQUEST` は要求の横取りの作業（`handlePausedRequest`）で、上限は
- * `MAX_PENDING_GUARD_REQUEST_TASKS`。`GENERAL` はそれ以外の作業で、上限は `MAX_PENDING_GUARD_TASKS`（要求の横取りの作業は数えない）。
+ * Guard の作業の種類（DEF-042 の設計書 2.4）。`REQUEST` は要求の横取りの作業（`handlePausedRequest`）、`GENERAL` はそれ以外の作業。L10: 数の上限は撤廃した
+ * （SPEC-1 で受ける・受けないの口も消した。作業はいつも受ける）。`REQUEST` の作業の数（`pendingRequestTaskCount`）は、今どおり数える。
  */
 type GuardTaskKind = 'GENERAL' | 'REQUEST';
 
-function admitGuardTask(guardState: GuardState, purpose: string, kind: GuardTaskKind): boolean {
-  const pending = kind === 'REQUEST'
-    ? guardState.pendingRequestTaskCount
-    : guardState.pendingTasks.size - guardState.pendingRequestTaskCount;
-  const limit = kind === 'REQUEST' ? MAX_PENDING_GUARD_REQUEST_TASKS : MAX_PENDING_GUARD_TASKS;
-  if (pending >= limit) {
-    if (!guardState.taskLimitReported) {
-      guardState.taskLimitReported = true;
-      guardState.ledger.recordInvariantViolation({ code: 'GUARD_TASK_LIMIT_REACHED', message: purpose });
-    }
-    beginOverflowInvalidationOnce(guardState);
-    return false;
-  }
-  return true;
-}
-
 function trackGuardTask(
   guardState: GuardState,
-  purpose: string,
+  _purpose: string,
   rejectionCode: string,
   factory: () => Promise<unknown>,
   kind: GuardTaskKind = 'GENERAL',
 ): boolean {
-  if (!admitGuardTask(guardState, purpose, kind)) return false;
   let owned!: Promise<void>;
   owned = Promise.resolve().then(factory).then(
     () => undefined,
@@ -3816,7 +4056,6 @@ function runGuardProtocolTask(
   if (guardState.phase === 'CLOSED') {
     return Promise.resolve();
   }
-  if (!admitGuardTask(guardState, purpose, 'GENERAL')) return Promise.resolve();
   let invalidationRequested = false;
   let invalidation: Promise<void> | undefined;
   let failed = false;
@@ -3892,6 +4131,13 @@ export interface GuardRequestInput {
    */
   readonly frozenPreflight?: ((request: GuardRequestIdentity) => boolean) | undefined;
   /**
+   * DEF-208-1（設計書 `2026-11-05-beaksight-discovery-coverage-design.md` 3.1 と設計者の判断）: 凍結の段で、この要求を監査の段と同じ判定（`evaluate`）にかけて
+   * よいか（凍結の読み取りの判定 `isFrozenReadAdmissible`）。観察の口のある Guard（操作さがしの PRIMARY の Passive の Context）の 3 つの層が渡す。段階が
+   * `FROZEN_ACTIVE` で、持ち主が閉じ始めた page でなく、要求の事実があり、事前確認でないときだけ、その要求で 1 回だけ呼ぶ。真なら `evaluate` の判定に従い、
+   * ALLOW なら通す（`frozenRead` の印つきの `ALLOW`。上限の口も今どおり当てる）。偽と省略、判定が止めるものは、今どおり凍結で止める。
+   */
+  readonly frozenRead?: ((request: GuardRequestIdentity) => boolean) | undefined;
+  /**
    * DEF-129（ページ自身の読み込み直しの上限）: この要求が、ページが始めた文書の読み込みで、その frame の数が上限（`PAGE_INITIATED_NAVIGATION_LIMIT_PER_FRAME`）
    * の中か（数える）。CDP の文書の層だけが、Passive の段（ログインの段と書き込みの段でない）の文書の要求（リダイレクトの続きでない。main frame と、
    * T37R2-fix で子の frame）で渡す。
@@ -3900,40 +4146,54 @@ export interface GuardRequestInput {
    * （`PAGE_LEAVE_REQUEST_LIMIT_REACHED`）を返し、その判定で止める。
    */
   readonly admitPageNavigation?: (() => PageLimitAdmission) | undefined;
-  /**
-   * DEF-130-fix（ページが出す文書でない要求の数の上限）: この要求を数え、1 画面の読み込みあたりの数が上限（`PAGE_SUBRESOURCE_REQUEST_LIMIT`）の中か。
-   * CDP の要求の層だけが、Passive の段（ログインの段と書き込みの段でない）の要求で渡す。呼ぶ条件は `admitPageNavigation` と同じ（判定が通した後に
-   * 1 回だけ）。偽なら、上限で止める（`PAGE_SUBRESOURCE_LIMIT_REACHED`）。省略は、今どおり数えない。T44R の I-1: ページを離れた後は、離れた後の上限
-   * （`PAGE_LEAVE_REQUEST_LIMIT`）で数え、超えたら判定（`PAGE_LEAVE_REQUEST_LIMIT_REACHED`）を返す。
-   */
-  readonly admitSubresourceRequest?: (() => PageLimitAdmission) | undefined;
+  // DEF-130-fix の文書でない要求の数の上限の口（`admitSubresourceRequest`）は、L10 で上限を撤廃した後はいつも通したので、SPEC-1 で消した。
 }
 
-/**
- * DEF-129: Context の 1 つの page で、frame ごとに、ページが始めた文書の読み込み（JS の `location.reload()`・`location.href`、meta の転送、親からの
- * `frames[0].location.href` など）を通す回数の上限（名前つきの定数。JS や meta の転送を 2 回まで許す）。main frame は BeakSight 自身の読み込みの後から、
- * 子の frame（T37R2-fix。T37R2 の I-1）はその frame の最初の文書の後から数える。超えた読み込みは Guard が止めて記録する（Safety Ledger の止めた要求
- * `PAGE_NAVIGATION_LIMIT_REACHED`）。サーバのリダイレクト（同じ読み込みの続き）は数えない。
- */
-export const PAGE_INITIATED_NAVIGATION_LIMIT_PER_FRAME = 2;
+// DEF-129 の、frame ごとのページが始めた文書の読み込みの回数の上限（前は 2 回）は、L10（S4）で撤廃した（同じ移りのくり返しで止める。
+// `admitFrameNavigationTransition`）。SPEC-1 で名前も消した。
+
+// DEF-130-fix の 1 画面の読み込みあたりの、ページが出す文書でない要求の数の上限（前は 1,000。超えたら `PAGE_SUBRESOURCE_LIMIT_REACHED`）は、L10（S5）で
+// 撤廃した（数えるだけ）。定数は LZ-1 で消した。
+
+// T44R の I-1 の、ページを離れ始めた後の文書でない要求の数の上限（前は 1 回の離れ方あたり 30。超えたら `PAGE_LEAVE_REQUEST_LIMIT_REACHED`）は、L10（S6）で
+// 撤廃した。定数は LZ-1 で消した。
 
 /**
- * DEF-130-fix（ユーザーの判断）: Context の 1 つの page で、1 画面の読み込みあたり、ページが出す文書でない要求（画像・`fetch`・`xhr`・CSS・script・
- * font など。判定が通したもの）を通す数の上限（名前つきの定数。ユーザーが決めた値）。数え始めは、BeakSight 自身の読み込みか、その Context の最初の
- * 文書（DEF-129 の区切りと同じ）。超えた要求は Guard が止めて記録する（Safety Ledger の止めた要求 `PAGE_SUBRESOURCE_LIMIT_REACHED`）。
+ * L10 の S4（設計者の判断。2026-11-12）: 1 つの frame の、この読み込み（数え始め）の後の移りの記録。輪の判定（`admitFrameNavigationTransition`）だけが書く。
  */
-export const PAGE_SUBRESOURCE_REQUEST_LIMIT = 1_000;
+export interface FrameNavigationRecord {
+  /** 今の文書の URL（fragment を外した形。数え始めの文書か、最後に通したページが始めた読み込み）。 */
+  current: string;
+  /** 通した移り（前の URL → 次の URL の組）。 */
+  readonly transitions: Set<string>;
+}
+
+/** L10 の S4: 数え始めの文書の URL から、移りの記録を作る。 */
+export const startFrameNavigationRecord = (url: string): FrameNavigationRecord => ({ current: frameDocumentKeyOf(url), transitions: new Set() });
+
+/** L10 の S4: 記録を、数え始めの文書の URL から数え直す（同じ記録の物を使い続ける main frame の口）。 */
+const restartFrameNavigationRecord = (record: FrameNavigationRecord, url: string): void => {
+  record.current = frameDocumentKeyOf(url);
+  record.transitions.clear();
+};
 
 /**
- * T44R の I-1（Task 44 の設計書の履歴の「T44R …と設計者の判断」の行）: BeakSight が閉じる前にページを離れ始めた後（`announcePageLeave`）に、その page が出す
- * 文書でない要求を通す数の上限（1 回の離れ方あたり。名前つきの小さな定数）。離れるときの計測の送信（数件から十数件）を通しつつ、ページが離れるときに要求を
- * 繰り返す作りで、サイトに負荷をかけ続けないため。超えた要求は止めて記録する（Safety Ledger の止めた要求 `PAGE_LEAVE_REQUEST_LIMIT_REACHED`）。離れた後の
- * 要求は、そのページの読み取りの判定の数（DEF-130）には入れない。
+ * L10 の S4（設計者の判断。2026-11-12）: ページが始めた読み込みの輪の判定（Guard のただ 1 か所）。同じ移り（前の URL → 次の URL の組）が、この読み込みの中で
+ * 2 回目に出たら輪とみなして偽（止める）。1 回目の自分への読み込み直し（A→A）や A→B→A は通す。回数の上限ではなく、同じ移りのくり返しという事実で決める。
  */
-export const PAGE_LEAVE_REQUEST_LIMIT = 30;
+export function admitFrameNavigationTransition(record: FrameNavigationRecord, url: string): boolean {
+  const next = frameDocumentKeyOf(url);
+  const transition = JSON.stringify([record.current, next]);
+  if (record.transitions.has(transition)) {
+    return false;
+  }
+  record.transitions.add(transition);
+  record.current = next;
+  return true;
+}
 
 /** DEF-129・T37R2-fix: 1 つの frame の、ページが始めた読み込みの数。 */
-interface FrameNavigationCount {
+interface FrameNavigationCount extends FrameNavigationRecord {
   /** 数え始めの後に、ページが始めた読み込みの数。 */
   pageInitiated: number;
 }
@@ -3946,26 +4206,27 @@ interface MainFrameNavigationState extends FrameNavigationCount {
   firstDocumentSeen: boolean;
   /** ページが始めた読み込み（main frame か子の frame）を、上限で止めたことがある。 */
   limitReached: boolean;
-  /** Guard が通した（サーバへ送った）main frame の文書の要求の数（BeakSight 自身の読み込み、リダイレクトの続きを含む）。 */
-  documentRequests: number;
   /** T37R2-fix: 子の frame（frame の ID）ごとの、最初の文書の後の、ページが始めた読み込みの数。BeakSight 自身の読み込みで空にする。 */
   readonly childFrames: Map<string, FrameNavigationCount>;
-  /** T37R2-fix: Guard が通した（サーバへ送った）子の frame の文書の要求の数（最初の文書、リダイレクトの続きを含む）。 */
-  childFrameDocumentRequests: number;
-  /** DEF-130-fix: 数え始め（BeakSight 自身の読み込みか最初の文書）の後に、判定が通した文書でない要求の数（上限と比べる数）。 */
-  subresourcesSinceLoad: number;
-  /** DEF-130-fix: 文書でない要求を、上限で止めたことがある。 */
-  subresourceLimitReached: boolean;
-  /** DEF-130-fix: Guard が通した（サーバへ送った）文書でない要求の数（成果物に残す数。数え始めで戻さない）。 */
-  subresourceRequests: number;
   /**
    * T44b（Task 44 の設計の変更の履歴の「T44b の報告」の行の、設計者の判断の (2)）: BeakSight が閉じる前にページを離れ始めた（`announcePageLeave`）。真の後の
-   * 文書でない要求は、そのページの読み取りの判定の数（`subresourcesSinceLoad`・`subresourceRequests`）に入れず、その上限でも止めない（読み取りの判定は、
-   * ページを離れる前に終わっている）。通した送信の記録と、サービスへの要求の上限の数には、今どおり数える。
+   * ページが始めた文書の読み込みは止める（`PAGE_LEAVE_LIMIT_DECISION`）。
    */
   leaving: boolean;
-  /** T44R の I-1: 離れ始めた後に数えた文書でない要求の数（`PAGE_LEAVE_REQUEST_LIMIT` と比べる。`announcePageLeave` で 0 に戻す）。 */
-  leaveRequests: number;
+  /**
+   * DEF-236（設計書 `2026-11-09-beaksight-visible-pacing-wait-design.md` 3.1 の 2）: BeakSight が、証拠を集め終えた後に、この page を見せたまま読み込みの間隔を
+   * 待ち始めた（`announcePacingWait`）。真の後の文書の読み込みは、その画面の数（DEF-129 の輪の判定）に入れない。判定（DELETE・危険な語・
+   * 資格情報などの止め）、通した送信の記録、サービスへの要求の上限の数は変えない。止めた事象の時点の印は `CLOSING`。
+   */
+  pacingWait: boolean;
+  /** DEF-208-1: 凍結の段で Guard が通した（サーバへ送った）読み取りの数（文書でない要求と子の frame の文書。CDP の層で数える。値と URL は持たない）。 */
+  frozenReadRequests: number;
+  /** DEF-208-1（設計者の判断 (a)）: そのうち、観察の間の目印（欄に入れた値）を URL に運んだものの数。 */
+  frozenMarkerReadRequests: number;
+  /** DEF-233: 凍結の段で Guard が通した（サーバへ送った）サイトの token の更新の数（`isFrozenTokenRefreshAdmissible`。CDP の層で数える。値と URL は持たない）。 */
+  frozenTokenRefreshRequests: number;
+  /** DEF-225: Guard が止めたダウンロードと対応付けた、main frame の読み取りの移動の失敗があった（凍結の前。違反にしなかったもの）。 */
+  mainFrameDownloadBlocked: boolean;
 }
 
 const mainFrameNavigationStates = new WeakMap<Page, MainFrameNavigationState>();
@@ -3980,15 +4241,16 @@ const mainFrameNavigationStateOf = (page: Page): MainFrameNavigationState => {
     ownNavigationPending: false,
     firstDocumentSeen: false,
     pageInitiated: 0,
+    current: '',
+    transitions: new Set(),
     limitReached: false,
-    documentRequests: 0,
     childFrames: new Map(),
-    childFrameDocumentRequests: 0,
-    subresourcesSinceLoad: 0,
-    subresourceLimitReached: false,
-    subresourceRequests: 0,
     leaving: false,
-    leaveRequests: 0,
+    pacingWait: false,
+    frozenReadRequests: 0,
+    frozenMarkerReadRequests: 0,
+    frozenTokenRefreshRequests: 0,
+    mainFrameDownloadBlocked: false,
   };
   mainFrameNavigationStates.set(page, created);
   return created;
@@ -3996,14 +4258,28 @@ const mainFrameNavigationStateOf = (page: Page): MainFrameNavigationState => {
 
 /**
  * T44b（Task 44 の設計の変更の履歴の「T44b の報告」の行の、設計者の判断の (2)）: BeakSight が、閉じる前にこの page を離れ始める（factory が about:blank への
- * 移動の直前に呼ぶ）。この後の文書でない要求（ページを離れるときの送信など）は、そのページの読み取りの判定の数（DEF-130 の文書でない要求の数と上限）に入れない。
+ * 移動の直前に呼ぶ）。この後にページが始めた文書の読み込みは止める（`PAGE_LEAVE_LIMIT_DECISION`）。
  * 判定（`classifyPassiveRequest`）、通した送信の記録、サービスへの要求の上限の数は変えない。戻す口は持たない（離れた page は、そのまま Context と閉じる）。
  */
 export function announcePageLeave(page: Page): void {
   const state = mainFrameNavigationStateOf(page);
   state.leaving = true;
-  // T44R の I-1: 離れた後の要求は、1 回の離れ方あたりの上限（`PAGE_LEAVE_REQUEST_LIMIT`）で数え直す。
-  state.leaveRequests = 0;
+}
+
+/**
+ * DEF-236（設計書 `2026-11-09-beaksight-visible-pacing-wait-design.md` 3.1 の 2）: BeakSight が、証拠を集め終えた後に、この page を閉じずに見せたまま、読み込みの
+ * 間隔を待ち始める（Page Auditor と 1 画面の読み込みが、待ちの直前に呼ぶ）。この後の文書の読み込みは、その画面の数（DEF-129 の輪の判定）に入れない。
+ * `announcePageLeave` とは別の口である（移動の止めは当てない。
+ * サイトが自然に出す通信と移動は、判定が通すものを通す）。判定（`classifyPassiveRequest`。DELETE・危険な語・資格情報などの止め）、通した送信の記録、サービスへの
+ * 要求の上限の数は変えない。止めた事象の時点の印は `CLOSING`（`blockedEventPhaseOf`）。戻す口は持たない（待ちの後、page は Context と閉じる）。
+ */
+export function announcePacingWait(page: Page): void {
+  mainFrameNavigationStateOf(page).pacingWait = true;
+}
+
+/** DEF-236: この page で、読み込みの間隔の待ちを始めたか（`announcePacingWait`。読むだけ）。 */
+export function isPacingWaitAnnounced(page: Page): boolean {
+  return mainFrameNavigationStates.get(page)?.pacingWait === true;
 }
 
 /**
@@ -4017,119 +4293,106 @@ export function announceOwnMainFrameNavigation(page: Page): void {
 }
 
 /**
- * DEF-129: ページが始めた main frame の読み込みを、1 つ数える（数えてよいか、上限で止めるか）。BeakSight 自身の読み込み（知らされた次の要求）と、最初の
- * main frame の文書の要求は数えない（真）。ほかは数え、上限を超えたら偽（止めた印を残す）。
+ * DEF-129: ページが始めた main frame の読み込みを、1 つ数える（数えてよいか、止めるか）。BeakSight 自身の読み込み（知らされた次の要求）と、最初の
+ * main frame の文書の要求は数えない（真。数え始める）。L10 の S4: ほかは数え、この読み込みの中で同じ移りがくり返されたら（輪）偽（止めた印を残す）。
  */
-const admitMainFrameNavigation = (page: Page): PageLimitAdmission => {
+const admitMainFrameNavigation = (page: Page, url: string): PageLimitAdmission => {
   const state = mainFrameNavigationStateOf(page);
   // T44R の I-1: ページを離れ始めた後の文書の読み込みは止める（読み取りの判定の印は付けない）。
   if (state.leaving) {
     return PAGE_LEAVE_LIMIT_DECISION;
   }
+  // DEF-236: 見せたままの待ちの間に画面が始めた読み込みは、その画面の数と上限に入れない（判定が通したものは通す）。
+  if (state.pacingWait) {
+    return true;
+  }
   if (state.ownNavigationPending || !state.firstDocumentSeen) {
     state.ownNavigationPending = false;
     state.firstDocumentSeen = true;
     state.pageInitiated = 0;
+    // L10 の S4: 移りの記録も、この読み込みから数え直す（数え始めの文書から）。
+    restartFrameNavigationRecord(state, url);
     // T37R2-fix: 前の文書の子の frame の数は使わない（新しい文書の子の frame は、別の ID）。
     state.childFrames.clear();
-    // DEF-130-fix: 文書でない要求の数も、ここから数え直す（1 画面の読み込みあたりの上限）。
-    state.subresourcesSinceLoad = 0;
     return true;
   }
-  return admitPageInitiatedNavigation(state, state);
-};
-
-/**
- * DEF-130-fix: ページが出す文書でない要求を、1 つ数える（判定が通した後）。数え始めの後の数が上限（`PAGE_SUBRESOURCE_REQUEST_LIMIT`）を超えたら偽
- * （止めた印を page に残す）。
- */
-const admitSubresourceRequest = (page: Page): PageLimitAdmission => {
-  const state = mainFrameNavigationStateOf(page);
-  // T44b: ページを離れ始めた後の要求は、読み取りの判定の数に入れない（`announcePageLeave`）。T44R の I-1: 代わりに、1 回の離れ方あたりの名前つきの上限
-  // （`PAGE_LEAVE_REQUEST_LIMIT`）で数え、超えたら止める。
-  if (state.leaving) {
-    state.leaveRequests = saturatingIncrement(state.leaveRequests);
-    return state.leaveRequests > PAGE_LEAVE_REQUEST_LIMIT ? PAGE_LEAVE_LIMIT_DECISION : true;
-  }
-  state.subresourcesSinceLoad = saturatingIncrement(state.subresourcesSinceLoad);
-  if (state.subresourcesSinceLoad > PAGE_SUBRESOURCE_REQUEST_LIMIT) {
-    state.subresourceLimitReached = true;
-    return false;
-  }
-  return true;
+  return admitPageInitiatedNavigation(state, state, url);
 };
 
 /**
  * T37R2-fix（T37R2 の I-1）: ページが始めた子の frame の文書の読み込みを、1 つ数える。その frame の最初の文書の要求は数えない（真。数え始める）。
- * ほかは main frame と同じく数え、上限を超えたら偽（止めた印を page に残す）。
+ * ほかは main frame と同じく数え、L10 の S4: その frame で同じ移りがくり返されたら（輪）偽（止めた印を page に残す）。
  */
-const admitChildFrameNavigation = (page: Page, frameId: string): PageLimitAdmission => {
+const admitChildFrameNavigation = (page: Page, frameId: string, url: string): PageLimitAdmission => {
   const state = mainFrameNavigationStateOf(page);
   // T44R の I-1: ページを離れ始めた後の子の frame の文書の読み込みも止める（読み取りの判定の印は付けない）。
   if (state.leaving) {
     return PAGE_LEAVE_LIMIT_DECISION;
   }
-  const count = state.childFrames.get(frameId);
-  if (count === undefined) {
-    state.childFrames.set(frameId, { pageInitiated: 0 });
+  // DEF-236: 見せたままの待ちの間の子の frame の読み込みも、数と上限に入れない。
+  if (state.pacingWait) {
     return true;
   }
-  return admitPageInitiatedNavigation(state, count);
+  const count = state.childFrames.get(frameId);
+  if (count === undefined) {
+    state.childFrames.set(frameId, { pageInitiated: 0, ...startFrameNavigationRecord(url) });
+    return true;
+  }
+  return admitPageInitiatedNavigation(state, count, url);
 };
 
-/** DEF-129・T37R2-fix: frame の、ページが始めた読み込みを 1 つ数え、上限を超えたら偽（page に止めた印を残す）。main frame と子の frame が共有する。 */
-const admitPageInitiatedNavigation = (state: MainFrameNavigationState, count: FrameNavigationCount): boolean => {
+/**
+ * DEF-129・T37R2-fix: frame の、ページが始めた読み込みを 1 つ数える。main frame と子の frame が共有する。
+ * L10（設計書 `2026-11-09-beaksight-remove-limits-design.md` 4。INV-LIMITS の S4 と設計者の判断）: 回数の上限（前は `PAGE_INITIATED_NAVIGATION_LIMIT_PER_FRAME`
+ * 2 回）は撤廃し、回数でなく事実で終える。同じ frame で同じ移りがくり返されたら（`admitFrameNavigationTransition`）、輪とみなして偽（page に止めた印を残す。止めた
+ * 記録の理由は前と同じ `PAGE_NAVIGATION_LIMIT_REACHED`）。輪にならない移動の続きは、通して L0 の見張りで終える。
+ */
+const admitPageInitiatedNavigation = (state: MainFrameNavigationState, count: FrameNavigationCount, url: string): boolean => {
   count.pageInitiated = saturatingIncrement(count.pageInitiated);
-  if (count.pageInitiated > PAGE_INITIATED_NAVIGATION_LIMIT_PER_FRAME) {
+  if (!admitFrameNavigationTransition(count, url)) {
     state.limitReached = true;
     return false;
   }
   return true;
 };
 
-/** DEF-129・T37R2-fix・DEF-130-fix: page の読み込みの事実（`pageLoadFactsOf`）。 */
-export interface PageLoadFacts extends PageRequestCounts {
+/**
+ * DEF-129・T37R2-fix: page の読み込みの事実（`pageLoadFactsOf`）。SPEC-1: 文書でない要求の上限の印（DEF-130-fix の `subresourceLimitReached`）と、成果物に残した
+ * 要求の数（`documentRequests`・`childFrameDocumentRequests`・`subresourceRequests`。どの表示も読まなかった）は消した。
+ */
+export interface PageLoadFacts {
   /** ページが始めた読み込み（main frame か子の frame）を、上限で止めたか。 */
   readonly limitReached: boolean;
-  /** DEF-130-fix: ページが出す文書でない要求を、上限で止めたか。 */
-  readonly subresourceLimitReached: boolean;
+  /** DEF-208-1: 凍結の段で Guard が通した読み取りの数（操作さがしの記録に残す。値と URL は持たない）。`pageLoadFactsOf` は必ず書く。 */
+  readonly frozenReadRequests?: number;
+  /** DEF-208-1: そのうち、観察の間の目印を URL に運んだものの数。`pageLoadFactsOf` は必ず書く。 */
+  readonly frozenMarkerReadRequests?: number;
+  /** DEF-233: 凍結の段で Guard が通したサイトの token の更新の数（読み取りの数には入れない）。`pageLoadFactsOf` は必ず書く。 */
+  readonly frozenTokenRefreshRequests?: number;
+  /**
+   * DEF-225: 凍結の前に、main frame の読み取りの移動が、Guard が止めたダウンロード（同じ page・同じ URL）のために失敗した（その画面はファイルのダウンロードに
+   * なる。違反にしていない）。`pageLoadFactsOf` は必ず書く。
+   */
+  readonly mainFrameDownloadBlocked?: boolean;
 }
 
-/** T37R2-fix・DEF-130-fix: 成果物に残す要求の数（入口の確かめ・発見・READ・監査の 1 画面が共有する形）。 */
-export interface PageRequestCounts {
-  /** Guard が通した main frame の文書の要求の数。 */
-  readonly documentRequests: number;
-  /** T37R2-fix: Guard が通した子の frame の文書の要求の数（別の数）。 */
-  readonly childFrameDocumentRequests: number;
-  /** DEF-130-fix: Guard が通した文書でない要求の数（別の数）。 */
-  readonly subresourceRequests: number;
-}
-
-/** DEF-129・DEF-130-fix: Guard が、ページの読み込み（文書）か文書でない要求を上限で止めたか（その画面は読み切れない。各段の唯一の判定）。 */
-export const isPageLoadLimitReached = (facts: PageLoadFacts): boolean => facts.limitReached || facts.subresourceLimitReached;
-
-/** T37R2-fix・DEF-130-fix: 事実から、成果物に残す要求の数を取り出す（唯一の写し方）。 */
-export const pageRequestCountsOf = (facts: PageLoadFacts): PageRequestCounts => Object.freeze({
-  documentRequests: facts.documentRequests,
-  childFrameDocumentRequests: facts.childFrameDocumentRequests,
-  subresourceRequests: facts.subresourceRequests,
-});
+/** DEF-129: Guard が、ページが始めた読み込み（文書）を上限で止めたか（その画面は読み切れない。各段の唯一の判定）。 */
+export const isPageLoadLimitReached = (facts: PageLoadFacts): boolean => facts.limitReached;
 
 /**
  * DEF-129: page の読み込みの事実（読むだけ）。main frame の文書の要求を受けていない page は `null`。1 画面を読む流れ
- * （`src/worker/worker-run-session.ts` の `visitGuardedPage`、監査の 1 画面）が、Context を閉じた後に読み、成果物に数を残し、止めた画面を読み切れない
- * 画面にする。
+ * （`src/worker/worker-run-session.ts` の `visitGuardedPage`、監査の 1 画面）が、Context を閉じた後に読み、止めた画面を読み切れない画面にする。
  */
 export function pageLoadFactsOf(page: Page): PageLoadFacts | null {
   const state = mainFrameNavigationStates.get(page);
   return state === undefined || !state.firstDocumentSeen
     ? null
     : Object.freeze({
-      documentRequests: state.documentRequests,
-      childFrameDocumentRequests: state.childFrameDocumentRequests,
-      subresourceRequests: state.subresourceRequests,
       limitReached: state.limitReached,
-      subresourceLimitReached: state.subresourceLimitReached,
+      frozenReadRequests: state.frozenReadRequests,
+      frozenMarkerReadRequests: state.frozenMarkerReadRequests,
+      frozenTokenRefreshRequests: state.frozenTokenRefreshRequests,
+      mainFrameDownloadBlocked: state.mainFrameDownloadBlocked,
     });
 }
 
@@ -4140,17 +4403,10 @@ const PAGE_NAVIGATION_LIMIT_DECISION: Extract<PassiveRequestDecision, { readonly
   reason: 'PAGE_NAVIGATION_LIMIT_REACHED',
 });
 
-/** DEF-130-fix: 上限で止めた、ページが出す文書でない要求の判定（Safety Ledger の止めた要求の理由）。 */
-const PAGE_SUBRESOURCE_LIMIT_DECISION: Extract<PassiveRequestDecision, { readonly action: 'BLOCK' }> = Object.freeze({
-  action: 'BLOCK',
-  category: 'REQUEST',
-  reason: 'PAGE_SUBRESOURCE_LIMIT_REACHED',
-});
-
 /**
  * T44R の I-1: ページを離れ始めた後（`announcePageLeave`）に止めた要求の判定（Safety Ledger の止めた要求の理由）。離れた後の文書でない要求のうち
- * `PAGE_LEAVE_REQUEST_LIMIT` を超えたものと、離れた後の文書の読み込み（ページが始めた移動、ポップアップが opener を戻す移動。BeakSight の about:blank への
- * 移動はサイトへの要求ではないので、ここに来ない）。そのページの読み取りの判定の印（`limitReached`・`subresourceLimitReached`）は付けない。
+ * 上限（前は 30。L10 で撤廃した）を超えたものと、離れた後の文書の読み込み（ページが始めた移動、ポップアップが opener を戻す移動。BeakSight の about:blank への
+ * 移動はサイトへの要求ではないので、ここに来ない）。そのページの読み取りの判定の印（`limitReached`）は付けない。
  */
 const PAGE_LEAVE_LIMIT_DECISION: Extract<PassiveRequestDecision, { readonly action: 'BLOCK' }> = Object.freeze({
   action: 'BLOCK',
@@ -4187,6 +4443,8 @@ export type GuardRequestVerdict =
     readonly kind: 'ALLOW';
     readonly request: GuardRequestIdentity;
     readonly decision: Extract<PassiveRequestDecision, { readonly action: 'ALLOW' }>;
+    /** DEF-208-1: 凍結の段で、凍結の読み取りの判定で通した読み取り（数えて、中継に凍結の後の写しとして知らせる）。 */
+    readonly frozenRead?: true;
   };
 
 /** 段階の誤りの違反のコードと、その文の書き出し（層ごと。今までの文のまま）。 */
@@ -4205,6 +4463,8 @@ export const UNGUARDED_PAGE_REQUEST_VIOLATION_CODE = 'PASSIVE_GUARD_PAGE_NOT_REA
  * `classifyPassiveRequest` の 1 か所のまま、`evaluate` の中で呼ぶ）。順は次のとおり（今までの 3 か所の順と同じ）。
  * 1. 凍結の段（閉じる途中・無効化の凍結の段を含む）: 止めて `INTERACTION_FROZEN` で記録する。T37b: ただし `FROZEN_ACTIVE` で、持ち主が閉じ始めた
  *    page でなく、要求の事実があり、観察の口が認めた（`frozenPreflight` が真の）CORS の事前確認は、Guard が満たす（`FULFILL_PREFLIGHT`。記録しない）。
+ *    DEF-208-1: 同じ条件で、凍結の読み取りの判定（`frozenRead`。観察の口のある Guard だけが渡す）が真の読み取りは、`evaluate` の判定にかけ、ALLOW なら上限の
+ *    口を当てて通す（`frozenRead` の印つきの `ALLOW`）。判定が止めるものは、今どおり凍結で止める。
  * 2. 閉じる途中・無効化の段（`CLOSED` を含む）と、持ち主が閉じ始めた page（CDP の層だけ）: 止める。記録しない。
  * 3. `PASSIVE_ACTIVE` でない段（取り付けの途中）: 段階の誤りの違反を記録し、止めて無効にする。
  * 4. 要求の事実（method と URL）がない（CDP の層）: 違反 `CDP_REQUEST_FACTS_INVALID` を記録し、止めて無効にする。
@@ -4224,6 +4484,22 @@ export function decideGuardRequest(input: GuardRequestInput): GuardRequestVerdic
       && input.frozenPreflight(input.request)
     ) {
       return { kind: 'FULFILL_PREFLIGHT' };
+    }
+    // DEF-208-1: 凍結の読み取りの判定に当たる読み取りは、監査の段と同じ判定にかけ、通すものは通す（止めるものは今どおり凍結で止める）。
+    if (
+      phase === 'FROZEN_ACTIVE'
+      && !input.ownerClosingPage
+      && input.request !== null
+      && input.frozenRead !== undefined
+      && input.frozenRead(input.request)
+    ) {
+      const { request } = input;
+      const outcome = input.evaluate(request);
+      if (outcome.kind === 'UNAVAILABLE') return { kind: 'BLOCK_UNAVAILABLE' };
+      if (outcome.kind === 'DECISION' && outcome.decision.action === 'ALLOW') {
+        const admitted = admittedVerdictOf(input, request, outcome.decision);
+        return admitted.kind === 'ALLOW' ? { ...admitted, frozenRead: true } : admitted;
+      }
     }
     return { kind: 'BLOCK_FROZEN', request: input.request, navigation: input.navigation };
   }
@@ -4250,16 +4526,29 @@ export function decideGuardRequest(input: GuardRequestInput): GuardRequestVerdic
   if (decision.action === 'BLOCK') {
     return { kind: 'BLOCK_POLICY', request, decision };
   }
+  return admittedVerdictOf(input, request, decision);
+}
+
+/** DEF-208-1: 凍結の段で通した子の frame の文書の URL を覚える数の上限。 */
+const MAX_FROZEN_FRAME_DOCUMENTS = 256;
+
+/** fix round 2: Run の中で覚えた更新の必須の query の値がないとき。 */
+const NO_LEARNED_QUERY_VALUES: ReadonlyMap<string, ReadonlySet<string>> = new Map();
+
+/** DEF-208-1: 子の frame の文書の URL の比べる形（fragment を外す）。 */
+const frameDocumentKeyOf = (url: string): string => url.split('#', 1)[0] ?? url;
+
+/** 判定が通す要求に、上限の口（DEF-129・T44R の I-1）を当てる（`decideGuardRequest` の通常の段と、DEF-208-1 の凍結の読み取りが共有する）。 */
+function admittedVerdictOf(
+  input: GuardRequestInput,
+  request: GuardRequestIdentity,
+  decision: Extract<PassiveRequestDecision, { readonly action: 'ALLOW' }>,
+): GuardRequestVerdict {
   // DEF-129: 判定が通す（サーバへ送る）ページが始めた文書の読み込みだけを数え、上限を超えたら止める（判定が止める読み込みは数えない）。
   // T44R の I-1: 口が判定を返したら（ページを離れた後）、その判定で止める。
   const navigationAdmission = input.admitPageNavigation?.() ?? true;
   if (navigationAdmission !== true) {
     return { kind: 'BLOCK_POLICY', request, decision: navigationAdmission === false ? PAGE_NAVIGATION_LIMIT_DECISION : navigationAdmission };
-  }
-  // DEF-130-fix: 判定が通すページの文書でない要求だけを数え、1 画面の読み込みあたりの上限を超えたら止める。
-  const subresourceAdmission = input.admitSubresourceRequest?.() ?? true;
-  if (subresourceAdmission !== true) {
-    return { kind: 'BLOCK_POLICY', request, decision: subresourceAdmission === false ? PAGE_SUBRESOURCE_LIMIT_DECISION : subresourceAdmission };
   }
   return { kind: 'ALLOW', request, decision };
 }
@@ -4493,9 +4782,8 @@ function recordBlockedDecision(
     const state = loginStageStateOf(stage.monitor);
     state.blockedByScriptReason[decision.scriptLoginBlock] = saturatingIncrement(state.blockedByScriptReason[decision.scriptLoginBlock]);
   }
-  const rowReason = decision.category === 'REQUEST' && decision.reason === 'NON_READ_METHOD'
-    ? decision.scriptLoginBlock ?? decision.reason
-    : undefined;
+  // SD-2: 自動ログインの段の口の決まりで止めた行（前の DEF-194 の `AUTOMATED_LOGIN_RULE_BLOCKED`）は作らない（判定がその印を返さない）。
+  const rowReason = decision.category === 'REQUEST' && decision.reason === 'NON_READ_METHOD' ? decision.scriptLoginBlock ?? decision.reason : undefined;
   if (rowReason !== undefined && isLoginStageBlockedRequestReason(rowReason) && stage?.monitor instanceof LoginStageMonitor) {
     // T34e: ログインの段で止めた読み取りでない要求を、一覧に載せる（Origin と path と種類と理由だけ。ログインの送り方によらない）。理由は、スクリプトで
     // 送るログインの詳しい理由か、フォームの送信のログインの `NON_READ_METHOD`。T36R-fix（T36R の M-2）: 資格情報を含む要求の理由は行にしない（数だけ）。
@@ -4681,6 +4969,95 @@ function requireActiveGuardState(context: BrowserContext, allowed: readonly Guar
   return requireGuardState(context, allowed);
 }
 
+/**
+ * DEF-210（通知の枠の設計書 3.2.1 の 1）: 通知の枠の閉じる押下の期間を始める（`mode` の扱いで判定する）。Guard が付いて Passive の段（`PASSIVE_ACTIVE`）の page
+ * でなければ始めず、偽を返す（呼ぶ側は押さない。守れないときは押さない）。例外を投げない。
+ */
+export function beginNotificationPress(page: Page, mode: NotificationPressMode): boolean {
+  try {
+    const guardState = requireActiveGuardState(page.context(), ['PASSIVE_ACTIVE']);
+    if (guardState.pageGuards.get(page)?.status !== 'READY') {
+      return false;
+    }
+    guardState.notificationPress = mode;
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * fix round 3（設計書 3.2.2 の 4）: 押す期間の main frame の移動と、押す期間に開いたポップアップの数（Context を閉じた後も読める）。Guard がなければ 0。
+ */
+export function notificationPressNavigationsOf(page: Page): number {
+  return guardStates.get(page.context())?.notificationPressNavigations ?? 0;
+}
+
+/** RB-14a（X11）: 見るだけの点検の押す期間に、止めずに数えた main frame の移動の行き先（Context を閉じた後も読める）。Guard がなければ空。 */
+export function notificationPressNavigationTargetsOf(page: Page): readonly string[] {
+  return [...(guardStates.get(page.context())?.notificationPressNavigationTargets ?? [])];
+}
+
+/** DEF-210: 通知の枠の閉じる押下の期間を終える（見るだけの点検。操作さがしは凍結で終わる）。Guard がなければ何もしない。例外を投げない。 */
+export function endNotificationPress(page: Page): void {
+  const guardState = guardStates.get(page.context());
+  if (guardState !== undefined) {
+    guardState.notificationPress = null;
+  }
+}
+
+/**
+ * REV-EV4（設計書 `2026-11-16-beaksight-finding-evidence-design.md` 3.4）: 横にスクロールする領域のキーの押下の期間の口（`begin` は Guard が付いて Passive の段の
+ * 準備のできた page でなければ始めず偽を返す。呼ぶ側は押さない。`blocked` は、その期間に止めた main frame の移動とポップアップの数）。例外を投げない。
+ */
+export function scrollKeyPressGuardOf(page: Page): { readonly begin: () => boolean; readonly end: () => void; readonly blocked: () => number } {
+  return {
+    begin: () => {
+      try {
+        const guardState = requireActiveGuardState(page.context(), ['PASSIVE_ACTIVE']);
+        if (guardState.pageGuards.get(page)?.status !== 'READY') {
+          return false;
+        }
+        guardState.scrollKeyPress = true;
+        return true;
+      } catch {
+        return false;
+      }
+    },
+    end: () => {
+      const guardState = guardStates.get(page.context());
+      if (guardState !== undefined) {
+        guardState.scrollKeyPress = false;
+      }
+    },
+    blocked: () => guardStates.get(page.context())?.scrollKeyPressBlocks ?? 0,
+  };
+}
+
+/** DEF-210: 押した値の移りうる先のうち、ページの JS を動かすだけで移らないスキーム（押してよい。DEF-144 の操作さがしの扱いと同じ）。 */
+const PRESSABLE_SCRIPT_SCHEME = 'javascript:';
+
+/**
+ * DEF-144（設計書 `2026-10-20-beaksight-probe-external-scheme-design.md` 2.1）: 移りうる先（属性の書かれたままの値）のどれかが、外部スキーム（`externalNavigationScheme`。
+ * http(s)・about・data・blob のほか）を指すか。値は画面の URL を基準に解く（相対の URL は今の扱いのまま）。`javascript:` と、解けない値は、今の扱いのまま（押す）。
+ * DEF-210（通知の枠の設計書 3.2.1 の 5）: 操作さがしの押す部品から、この部品へ移した（通知の枠の閉じるボタンの見分けも使う）。
+ */
+export const pointsToExternalScheme = (targets: readonly string[], baseUrl: string): boolean => targets.some((raw) => {
+  const value = raw.trim();
+  if (value === '' || !URL.canParse(value, baseUrl)) {
+    return false;
+  }
+  const url = new URL(value, baseUrl);
+  if (url.protocol === PRESSABLE_SCRIPT_SCHEME) {
+    return false;
+  }
+  try {
+    return externalNavigationScheme(url.href) !== null;
+  } catch {
+    return false;
+  }
+});
+
 export function assertPassiveRequestGuardActive(context: BrowserContext): void {
   requireActiveGuardState(context, ['PASSIVE_ACTIVE', 'FROZEN_ACTIVE']);
 }
@@ -4726,10 +5103,122 @@ export async function activateInteractionFreeze(page: Page): Promise<void> {
   if (!isHttpProtocol(currentUrl.protocol)) {
     return failClosed('Interaction freeze requires a completed initial HTTP(S) load');
   }
+  enterInteractionFreeze(guardState);
+}
+
+/** Guard を凍結の段に入れる（凍結の 2 つの入口が共用する。条件は呼ぶ側が確かめる）。 */
+function enterInteractionFreeze(guardState: GuardState): void {
   guardState.phase = 'FROZEN_ACTIVE';
+  // DEF-210（通知の枠の設計書 3.2.1 の 3）: 操作さがしの閉じる押下の期間は、凍結で終わる（凍結の後は、凍結の決まりで扱う）。
+  guardState.notificationPress = null;
+  // REV-EV4: 領域のキーの押下の期間も、凍結で終わる。
+  guardState.scrollKeyPress = false;
   // DEF-085 fix round 3（I2）: Guard が凍結の段に入った直後に、出口の中継も凍結する（発見の凍結を含む。Guard の凍結の前に中継を凍結すると、
   // まだ正当な要求を中継が拒むので、この順にする）。
   freezeEgress(guardState, 'INTERACTION_FREEZE');
+}
+
+/** SAFE-2 の 1: 読み込む前の凍結の条件を判定するための事実（`freezeBeforeLoadRefusalOf` が読む）。 */
+export interface FreezeBeforeLoadFacts {
+  readonly phase: GuardPhase;
+  /** page の Guard の準備ができているか（`pageGuards` の `READY`）で、page が閉じていないか。 */
+  readonly pageReady: boolean;
+  /** その page が、Context の開いたただ 1 つの page か。 */
+  readonly onlyOwnerPage: boolean;
+  /** page の今の URL。 */
+  readonly url: string;
+  /** ログインの段か書き込みの段の Guard か。 */
+  readonly submissionStage: boolean;
+}
+
+/** まだ何も読み込んでいない page の URL（Context の最初の page）。 */
+const NOT_YET_LOADED_PAGE_URL = 'about:blank';
+
+/**
+ * SAFE-2 の 1（COV-2c の M-1）: 読み込む前の凍結（`activateInteractionFreezeBeforeLoad`）を拒む理由（拒まないなら `null`。条件の唯一の判定）。Guard が
+ * `PASSIVE_ACTIVE` で、ログインの段・書き込みの段の Guard でなく、準備のできた page がただ 1 つで、その page がまだ読み込んでいない（`about:blank`）ときだけ通す。
+ */
+export function freezeBeforeLoadRefusalOf(facts: FreezeBeforeLoadFacts): string | null {
+  if (facts.phase !== 'PASSIVE_ACTIVE') {
+    return `Interaction freeze before the load is invalid from ${facts.phase}`;
+  }
+  if (facts.submissionStage) {
+    return 'Interaction freeze before the load is not available for the login stage or the write stage';
+  }
+  if (!facts.pageReady) {
+    return 'Interaction freeze before the load requires the current guarded page to be ready';
+  }
+  if (!facts.onlyOwnerPage) {
+    return 'Interaction freeze before the load requires exactly one current owner page';
+  }
+  if (facts.url !== NOT_YET_LOADED_PAGE_URL) {
+    return 'Interaction freeze before the load requires a page that has not loaded a document';
+  }
+  return null;
+}
+
+/**
+ * SAFE-2 の 1（COV-2c の M-1）: まだ読み込んでいない page（`about:blank`）の Guard を、凍結の段にする（不可逆）。読み込みの最初から凍結した Context で、操作さがしの
+ * 祖先の画面を読み込むため（`BrowserContextFactory.openFrozenObservationContext` だけが使う）。凍結の決まりで止める範囲と、凍結の後の読み取りの決まりは、
+ * `activateInteractionFreeze` の凍結と同じ。出口の中継も、同じ順（Guard の凍結の直後）で凍結する。条件（`freezeBeforeLoadRefusalOf`）に合わなければ、違反
+ * `INTERACTION_FREEZE_ACTIVATION_FAILED` を記録して Context を無効にし、`Error` を投げる（`activateInteractionFreeze` と同じ fail-closed）。
+ */
+export async function activateInteractionFreezeBeforeLoad(page: Page): Promise<void> {
+  const context = page.context();
+  const guardState = requireActiveGuardState(context, ['PASSIVE_ACTIVE', 'FROZEN_ACTIVE']);
+  const activePages = context.pages().filter((candidate) => !candidate.isClosed());
+  const refusal = freezeBeforeLoadRefusalOf({
+    phase: guardState.phase,
+    pageReady: !page.isClosed() && guardState.pageGuards.get(page)?.status === 'READY',
+    onlyOwnerPage: activePages.length === 1 && activePages[0] === page,
+    url: page.url(),
+    submissionStage: guardState.submissionStage,
+  });
+  if (refusal !== null) {
+    guardState.ledger.recordInvariantViolation({ code: 'INTERACTION_FREEZE_ACTIVATION_FAILED', message: refusal });
+    await invalidateContext(context, guardState.ledger);
+    throw new Error(refusal);
+  }
+  enterInteractionFreeze(guardState);
+}
+
+/**
+ * COV-2c（SREV-COV の C-1。網羅の設計書）: 凍結の段（`FROZEN_ACTIVE`）の Context で、指定した行き先（http(s) の URL。fragment は比べない）への main frame の文書の
+ * 移動（GET）を、凍結の読み取りと同じ判定（`isFrozenReadAdmissible` と監査の段の判定）で通す口を開け、閉じる口を返す。操作さがしの押下から生まれた移り先を、読み込みの
+ * 最初から凍結した Context で読むために、factory だけが使う（`BrowserContextFactory.loadFrozenDocument`）。通した要求のリダイレクトの先は、口の行き先を移して同じ判定に
+ * かける（ログインの画面への転送を見分けるため）。ほかの行き先と、読み取りでない移動は、今どおり凍結で止める。移った後の文書の JS の送信も、凍結の決まりのまま（読み取りでない送信は観察の口が受けて止める）。凍結の段でない・page がただ 1 つの
+ * 準備のできた page でない・行き先が http(s) でないときは、何もせずに `Error`。開いている口があれば、新しい行き先に替える。
+ */
+export function admitFrozenMainFrameDocument(page: Page, url: string): () => void {
+  const guardState = requireActiveGuardState(page.context(), ['FROZEN_ACTIVE']);
+  if (page.isClosed() || guardState.pageGuards.get(page)?.status !== 'READY') {
+    throw new Error('A frozen document load requires the current guarded page to be ready');
+  }
+  const activePages = page.context().pages().filter((candidate) => !candidate.isClosed());
+  if (activePages.length !== 1 || activePages[0] !== page) {
+    throw new Error('A frozen document load requires exactly one current owner page');
+  }
+  let target: URL;
+  try {
+    target = new URL(url);
+  } catch {
+    throw new Error('A frozen document load requires an HTTP(S) URL');
+  }
+  if (!isHttpProtocol(target.protocol)) {
+    throw new Error('A frozen document load requires an HTTP(S) URL');
+  }
+  const admitted: FrozenMainFrameDocumentAdmission = { url: frameDocumentKeyOf(target.href) };
+  guardState.frozenMainFrameDocument = admitted;
+  return () => {
+    if (guardState.frozenMainFrameDocument === admitted) {
+      guardState.frozenMainFrameDocument = null;
+    }
+  };
+}
+
+/** COV-2c（C-1）: 凍結の段で通す main frame の文書の移動の口（行き先は、リダイレクトの続きで移る）。 */
+interface FrozenMainFrameDocumentAdmission {
+  url: string;
 }
 
 /**
@@ -4801,6 +5290,12 @@ export async function installPassiveRequestGuard(
   if (options.egressFreeze !== undefined && typeof options.egressFreeze !== 'function') {
     throw new TypeError('Passive request guard egress freeze must be a function');
   }
+  // DEF-276-relay: 中継の口は、出口の中継の待ち受けを持ち、凍結の口と一緒に受ける（凍結と閉じで切るため）。ログインの段と書き込みの段には渡さない。
+  const relay = options.webSocketRelay;
+  if (relay !== undefined && (!isRecord(relay) || !isRecord(relay.proxy) || typeof relay.proxy.host !== 'string'
+    || !Number.isSafeInteger(relay.proxy.port) || options.egressFreeze === undefined || options.loginStage !== undefined || options.writeStage !== undefined)) {
+    throw new TypeError('Passive request guard WebSocket relay is malformed');
+  }
   if (options.onMainFrameDocumentSent !== undefined && typeof options.onMainFrameDocumentSent !== 'function') {
     throw new TypeError('Passive request guard main frame document sent hook must be a function');
   }
@@ -4820,11 +5315,30 @@ export async function installPassiveRequestGuard(
   // DEF-125: Guard が通した要求（`decideGuardRequest` の `ALLOW`）の宛先を、出口の中継に知らせる口（取り付けの時点の写し）。3 つの層の判定の直後に、
   // 命令を送る前に呼ぶ（中継に来る CONNECT より先に知らせる）。口の例外は違反に記録し、投げない。
   const egressDestinationHook = options.onEgressDestinationAdmitted;
-  const admitEgressDestinationOf = (verdict: GuardRequestVerdict): void => {
+  const admitEgressDestinationOf = (verdict: GuardRequestVerdict, layer: GuardRequestLayer): void => {
     if (verdict.kind !== 'ALLOW' || egressDestinationHook === undefined) return;
     try {
       // BN-R0 fix round 1（I-1）: method も渡す（中継が、Guard が通したページの文書でない読み取りを見分ける）。
-      egressDestinationHook(verdict.request.url, verdict.request.method);
+      // DEF-208-1: 凍結の段で通した読み取りは、印を渡す（中継が、凍結の後でもその写しに当たる読み取りだけを通す）。
+      // SREV-SAFE の M-2: 知らせた層も渡す（1 つの要求を CDP の層と route の層の両方が知らせるので、中継の写しは CDP の層の知らせだけを数える）。
+      if (verdict.frozenRead === true) {
+        egressDestinationHook(verdict.request.url, verdict.request.method, true, layer);
+      } else {
+        egressDestinationHook(verdict.request.url, verdict.request.method);
+      }
+    } catch (error) {
+      ledger.recordInvariantViolation({ code: 'GUARD_EGRESS_ADMISSION_FAILED', message: errorMessage(error) });
+    }
+  };
+  if (options.onEgressDestinationWithdrawn !== undefined && typeof options.onEgressDestinationWithdrawn !== 'function') {
+    throw new TypeError('Passive request guard egress withdrawal hook must be a function');
+  }
+  // SREV-SAFE の N-1: route の層が止めた要求を、中継に知らせる（CDP の層の知らせで数えた写しを 1 つ戻す）。口の例外は違反に記録し、投げない。
+  const egressWithdrawalHook = options.onEgressDestinationWithdrawn;
+  const withdrawEgressDestinationOf = (verdict: GuardRequestVerdict): void => {
+    if (verdict.kind === 'ALLOW' || egressWithdrawalHook === undefined || !('request' in verdict) || verdict.request === null) return;
+    try {
+      egressWithdrawalHook(verdict.request.url, verdict.request.method);
     } catch (error) {
       ledger.recordInvariantViolation({ code: 'GUARD_EGRESS_ADMISSION_FAILED', message: errorMessage(error) });
     }
@@ -4848,6 +5362,14 @@ export async function installPassiveRequestGuard(
   if (options.auditSend !== undefined && options.loginStage !== undefined) {
     throw new TypeError('Passive request guard cannot combine the audit send policy with the login stage');
   }
+  // RB-4b: リアルタイムの通信を止めない指定は、Isolated Interaction Context（凍結の読み取りの印 `admitFrozenReads`）とログインの段とは一緒に受けない
+  // （fail-closed）。PRIMARY の Passive の Context（送らずに観察する probe の口）は、`PASS_EXCEPT_DELETE` と同じく受ける。
+  if (
+    options.realtimePassThrough !== undefined
+    && (options.realtimePassThrough !== true || options.loginStage !== undefined || options.admitFrozenReads === true)
+  ) {
+    throw new TypeError('Passive request guard realtime pass-through is malformed or combined with a freezable Context or the login stage');
+  }
   if (options.auditSendPreflight !== undefined && options.writeStage !== undefined) {
     throw new TypeError('Passive request guard cannot combine the audit send preflight with the write stage');
   }
@@ -4860,6 +5382,11 @@ export async function installPassiveRequestGuard(
   if (options.submissionObservation !== undefined && (options.loginStage !== undefined || options.writeStage !== undefined)) {
     throw new TypeError('Passive request guard cannot combine the submission observation with the login stage or the write stage');
   }
+  // 凍結の読み取りを通す印（Isolated Interaction Context）も、ログインの段と書き込みの段の指定と一緒には受けない。
+  if (options.admitFrozenReads !== undefined && (options.admitFrozenReads !== true || options.loginStage !== undefined || options.writeStage !== undefined)) {
+    throw new TypeError('Passive request guard cannot combine the frozen read admission with the login stage or the write stage');
+  }
+  const frozenReadsAdmitted = admitsFrozenReads(options);
   // T30b: 書き込みの段の指定は、取り付けの前に確かめて写す（形が違う、部品がすでに別の Guard に付いている、は `TypeError`）。
   const writeStage = options.writeStage === undefined ? undefined : acceptWriteStage(options.writeStage);
   // T37b: 観察の口を付ける（口でない、すでに別の Guard に付いている、は `TypeError`）。
@@ -4883,6 +5410,160 @@ export async function installPassiveRequestGuard(
       headers: event.request.headers,
       body: () => requestBodyTextOf(event.request.hasPostData, event.request.postDataEntries),
     });
+  };
+  /**
+   * DEF-208-1: 凍結の段の、凍結の読み取りの判定の口（凍結の読み取りを通す Guard だけ。`admitsFrozenReads`: 観察の口のある Guard と、Isolated Interaction Context
+   * の Guard。ほかの Guard は省略して、今どおり凍結の段ですべて止める）。判定は `isFrozenReadAdmissible` の 1 か所。token の更新は観察の口のある Guard だけ
+   * （`frozenTokenRefreshAdmitted` が口を見る）。
+   */
+  const frozenReadOf = (
+    facts: Omit<HttpRequestFacts, 'kind'>,
+    policy: () => PassiveRequestPolicyOptions | undefined,
+    body: () => RequestBodyText = () => NO_BODY_TEXT,
+    headers: Readonly<Record<string, string>> | undefined = undefined,
+  ): ((request: GuardRequestIdentity) => boolean) | undefined =>
+    (!frozenReadsAdmitted
+      ? undefined
+      : (): boolean => {
+        const current = policy();
+        return (isFrozenReadAdmissible({ kind: 'HTTP', ...facts }, authoritySnapshot, current) && frozenNonReadAllowedHere(facts.method, facts.url, body))
+          || frozenTokenRefreshAdmitted(facts, current, body, headers)
+          || frozenMainFrameDocumentAdmitted(facts, current);
+      });
+  /**
+   * SAFE-2 の 3: 凍結の読み取りの判定に当たった要求のうち、読み取りでないもの（登録した読み取りの手続きの呼び出し）を、この Guard で通してよいか。観察の口のある
+   * Guard（操作さがし）だけで、本文と URL に観察の目印を含まないときだけ通す（目印を含む呼び出しは、押下で出た送信として、今どおり凍結で止めて観察の口に渡す）。
+   * Isolated Interaction Context の Guard（観察の口がない）は、押下で出た送信を見分けられないので、読み取りでない要求を通さない。読み取りは、いつも真。
+   */
+  const frozenNonReadAllowedHere = (method: string, url: string, body: () => RequestBodyText): boolean =>
+    isReadMethod(method)
+    || (submissionObservation !== undefined && !frozenRequestCarriesObservedMarker(submissionObservation, url, body));
+  /**
+   * COV-2c（SREV-COV の C-1。網羅の設計書）: 凍結の段で、呼ぶ側が指定した行き先（`admitFrozenMainFrameDocument`）への main frame の文書の移動（GET）か。判定は
+   * 凍結の読み取りの判定（`isFrozenReadAdmissible`）を共用する（main frame の移動でない読み取りと同じ条件を当てる。別の比べ方を作らない）。真なら、Guard が監査の段の
+   * 判定にかけて通す（`frozenRead` の印つき）。指定がない・行き先が違う・読み取りでない・判定に当たらないときは偽（今どおり凍結で止める）。
+   */
+  const frozenMainFrameDocumentAdmitted = (facts: Omit<HttpRequestFacts, 'kind'>, policy: PassiveRequestPolicyOptions | undefined): boolean => {
+    const admitted = guardState.frozenMainFrameDocument;
+    return admitted !== null && facts.isNavigationRequest && facts.isMainFrame && facts.method === 'GET'
+      && frameDocumentKeyOf(facts.url) === admitted.url
+      && isFrozenReadAdmissible({ kind: 'HTTP', ...facts, isMainFrame: false }, authoritySnapshot, policy);
+  };
+  /**
+   * COV-2c（C-1）: 通した行き先の main frame の文書の要求がリダイレクトされたら、口の行き先を、そのリダイレクトの先に移す（1 つの読み込みの続きだけを追う。
+   * ログインの画面への転送でセッションの切れを見分けられるように）。先も、上の判定（凍結の読み取りと同じ判定）にかける。リダイレクトでない・前の要求が口の行き先で
+   * ないときは何もしない。
+   */
+  const followFrozenMainFrameDocumentRedirect = (predecessorUrl: string | undefined, url: string, isMainFrame: boolean): void => {
+    const admitted = guardState.frozenMainFrameDocument;
+    if (admitted !== null && isMainFrame && predecessorUrl !== undefined && frameDocumentKeyOf(predecessorUrl) === admitted.url) {
+      admitted.url = frameDocumentKeyOf(url);
+    }
+  };
+  /** fix round 3（N-1）: 凍結の段で通す更新の比べの相手（factory の口。なければ・例外は null で、凍結の段の更新を通さない）。 */
+  const frozenTokenRefreshReferenceOf = (): FrozenRefreshReference | null => {
+    try {
+      return options.frozenTokenRefreshReference?.() ?? null;
+    } catch {
+      return null;
+    }
+  };
+  /**
+   * DEF-233（設計書 `2026-11-09-beaksight-discovery-token-refresh-design.md` 2.1）: 凍結の段で通してよいサイトの token の更新か（観察の口のある Guard だけ。
+   * 判定は `isFrozenTokenRefreshAdmissible` の 1 か所。目印は、その口で始めた観察のすべての目印で、URL と本文を照らす）。fix round 3（N-1）: 本文と header は、
+   * 凍結の前に確かめた更新と同じ形で、本文の値は今の鍵の値だけ（押下の観察の間も同じ判定。Blocker 1 の後の設計者の判断 (a)）。
+   */
+  const frozenTokenRefreshAdmitted = (
+    facts: Omit<HttpRequestFacts, 'kind'>,
+    policy: PassiveRequestPolicyOptions | undefined,
+    body: () => RequestBodyText,
+    headers: Readonly<Record<string, string>> | undefined,
+  ): boolean => {
+    const observation = submissionObservation;
+    return observation !== undefined && policy !== undefined
+      && isFrozenTokenRefreshAdmissible({ kind: 'HTTP', ...facts }, policy, {
+        body,
+        headers,
+        reference: frozenTokenRefreshReferenceOf(),
+        carriesMarker: () => frozenRequestCarriesObservedMarker(observation, facts.url, body),
+      }, frozenTokenRefreshQueryValuesOf());
+  };
+  /** fix round 2: Run の中で凍結の前に通した更新の必須の query の値（factory の口。なければ・例外は空）。 */
+  const frozenTokenRefreshQueryValuesOf = (): ReadonlyMap<string, ReadonlySet<string>> => {
+    try {
+      return options.frozenTokenRefreshQueryValues?.() ?? NO_LEARNED_QUERY_VALUES;
+    } catch {
+      return NO_LEARNED_QUERY_VALUES;
+    }
+  };
+  /**
+   * fix round 2（SREV-233 の C-1）: 凍結の段の、token の更新の事前確認を Guard が満たしてよいか（本文がないので、URL と方針の判定と、URL の目印だけを見る。
+   * 本番の要求は、満たした後に中身で判定する。事前確認はサーバへ送らない）。
+   */
+  const frozenTokenRefreshPreflightAdmitted = (facts: Omit<HttpRequestFacts, 'kind'>, policy: PassiveRequestPolicyOptions | undefined): boolean => {
+    const observation = submissionObservation;
+    return observation !== undefined && policy !== undefined
+      && isFrozenTokenRefreshAdmissible({ kind: 'HTTP', ...facts }, policy, null, frozenTokenRefreshQueryValuesOf())
+      && !frozenRequestCarriesObservedMarker(observation, facts.url, () => NO_BODY_TEXT);
+  };
+  /**
+   * fix round 2（SREV-233 の M-3）・fix round 3: token の更新の形の要求を通したことを、要求の header と本文とともに factory に知らせる（CDP の層だけ）。口の例外は
+   * 違反に記録する。
+   */
+  const notifyTokenRefreshAdmitted = (
+    verdict: GuardRequestVerdict,
+    policy: PassiveRequestPolicyOptions | undefined,
+    headers: Readonly<Record<string, string>> | undefined,
+    body: () => RequestBodyText,
+  ): void => {
+    const hook = options.onTokenRefreshAdmitted;
+    if (hook === undefined || verdict.kind !== 'ALLOW' || policy === undefined || !isTokenRefreshRequest(verdict.request, policy)) return;
+    try {
+      const text = body();
+      hook(verdict.request.url, verdict.frozenRead === true, { headers: { ...(headers ?? {}) }, body: text.kind === 'TEXT' ? text.text : null });
+    } catch (error) {
+      ledger.recordInvariantViolation({ code: 'GUARD_TOKEN_REFRESH_NOTICE_FAILED', message: errorMessage(error) });
+    }
+  };
+  /**
+   * DEF-233（設計書 2.1 の 3）: 凍結で止めた要求が token の更新の形なら、監査の段の記録の `TOKEN_REFRESH` に数える（`tokenRefreshBlocked`。止め方と Safety Ledger の
+   * 記録は変えない）。監査の段の口がない Guard は数えない。
+   */
+  const countFrozenTokenRefreshBlocked = (request: GuardRequestIdentity | null, policy: PassiveRequestPolicyOptions | undefined): void => {
+    if (request === null || policy === undefined || auditMonitor === undefined || !isTokenRefreshRequest(request, policy)) return;
+    const state = auditStageStateOf(auditMonitor);
+    state.blockedByReason.TOKEN_REFRESH = saturatingIncrement(state.blockedByReason.TOKEN_REFRESH);
+  };
+  /**
+   * DEF-208-1: 凍結の段で通した読み取りを、page の数に数える（CDP の層だけが呼ぶ。目印を運んだものは別にも数える）。DEF-233: 通した token の更新（読み取りで
+   * ない）は、読み取りの数に入れず、別に数える。
+   */
+  const countFrozenRead = (page: Page, verdict: GuardRequestVerdict, policy: PassiveRequestPolicyOptions | undefined = undefined): void => {
+    if (verdict.kind !== 'ALLOW' || verdict.frozenRead !== true) return;
+    const state = mainFrameNavigationStateOf(page);
+    // SAFE-2 の 3: 登録した読み取りの手続きの呼び出し（読み取りでないが、token の更新の形でない）は、読み取りの数に入れる。
+    if (!isReadMethod(verdict.request.method) && (policy === undefined || isTokenRefreshRequest(verdict.request, policy))) {
+      state.frozenTokenRefreshRequests = saturatingIncrement(state.frozenTokenRefreshRequests);
+      return;
+    }
+    state.frozenReadRequests = saturatingIncrement(state.frozenReadRequests);
+    if (submissionObservation !== undefined && frozenReadCarriesObservedMarker(submissionObservation, verdict.request.url)) {
+      state.frozenMarkerReadRequests = saturatingIncrement(state.frozenMarkerReadRequests);
+    }
+  };
+  /**
+   * DEF-208-1: 凍結の段で通した子の frame の文書の URL（fragment を外した形。止めた移動の記録と見分ける）。L10（INV-LIMITS の N22）: 数の上限（前は
+   * `MAX_FROZEN_FRAME_DOCUMENTS` 256 で、古いものから捨てた）は撤廃した。Context の寿命まで持つ。
+   */
+  const frozenFrameDocuments = new Set<string>();
+  /**
+   * SREV-SAFE の I-4: page ごとの、main frame の文書の替わり（page の session の CDP の `Page.frameNavigated`）の受け口。page の session の準備で付ける外部スキームの
+   * 検出の listener（`EXTERNAL_NAVIGATION_CDP_EVENTS`）から呼ぶ（同じ事象に listener を重ねない）。
+   */
+  const mainFrameDocumentObservers = new WeakMap<Page, (params: unknown, rootFrameId: string) => void>();
+  const rememberFrozenFrameDocument = (verdict: GuardRequestVerdict): void => {
+    if (verdict.kind !== 'ALLOW' || verdict.frozenRead !== true) return;
+    frozenFrameDocuments.add(frameDocumentKeyOf(verdict.request.url));
   };
   // DEF-099 fix: 書き込みの段は、送り手の指定が必ず要る（ないなら、ブラウザに送らせないために取り付けない）。
   const acceptedWriteSubmission = writeStage === undefined ? undefined : acceptWriteSubmission(options.writeSubmission);
@@ -4917,6 +5598,10 @@ export async function installPassiveRequestGuard(
       options.loginStage.manualPassThrough === true && options.loginStage.credentialGuard === undefined,
       // T44R の M-1: 手動のログインの段の、token の送信先がまだない設定の承認したサービスの Origin（スクリプトの口があれば使わない）。
       options.loginStage.manualServiceReadOrigins,
+      undefined,
+      undefined,
+      // DEF-193: 自動ログインの段の通し方の印（資格情報の部品のある、スクリプトで送るログインの段だけ。資格情報の守りなしには通さない）。
+      options.loginStage.credentialGuard !== undefined && options.loginStage.automatedPassThrough === true,
     )
     : writeStage === undefined
       ? undefined
@@ -4929,12 +5614,30 @@ export async function installPassiveRequestGuard(
           writeStage.monitor,
           undefined,
           writeStage.expectation.spec.request.origin,
+          false,
+          undefined,
+          // LU-5（fix round 1 の案 A）: 照合へ回す要求の path（照合の側の唯一の部品。窓の前の守りは、上の送信先の path の型のまま）。
+          apiWriteCheckPathOf(writeStage.expectation) ?? '',
+          undefined,
+          false,
+          // L12a: 押した後の扱い（送信の扱いの口があるときだけ）。
+          options.auditSend !== undefined,
         )
         : new SubmissionPostAdmission(
           'WRITE_STAGE',
           [{ origin: writeStage.expectation.request.origin, path: writeStage.expectation.request.path }],
           WRITE_STAGE_MAX_POSTS,
           writeStage.monitor,
+          undefined,
+          undefined,
+          false,
+          undefined,
+          undefined,
+          // LU-SFIX3-B: 窓の前（N2）に守る送信先の path の型（フォームの更新で、送信先の最後の区切りが対象の番号のときだけ）。
+          writeStage.guardedPathShape,
+          false,
+          // L12a: 押した後の扱い（送信の扱いの口があるときだけ）。
+          options.auditSend !== undefined,
         );
   // T36b（Task 36 の設計書 3.3・3.4）: 自動ログインの資格情報の部品（スクリプトで送るログインの段だけ。渡された値をそのまま使う。作り方の違う部品は、
   // 比べの部品がどの送信にも含まれるとみなす）と、token の送信の応答の観測（ログインの段の記録の中）。
@@ -5039,7 +5742,17 @@ export async function installPassiveRequestGuard(
   // 書き込みの段には口が渡らない）だけ、文書と http(s) の script の Worker の CSP に `ws:`・`wss:` を足す。ほかは今のまま（`WORKER_CONNECT_POLICY`）。
   // OP-N: 書き込みの段は、送信の扱いの口があっても WebSocket を通さないので、今のまま（`WORKER_CONNECT_POLICY`）。
   // OP-Q（Q1）: 書き込みの作業の中の Passive の Context（印 `writeJobEndpoint`）も、WebSocket を通さないので、今のまま。
-  const connectPolicy = options.auditSend === undefined || writeStage !== undefined || options.auditSend.writeJobEndpoint !== undefined
+  // RB-4b: リアルタイムの通信を止めない指定があれば、送信の扱いと段によらず `ws:`・`wss:` を許す（Worker の中の接続も止めない）。
+  const realtimePassThrough = options.realtimePassThrough === true;
+  // RB-4b: Isolated Interaction Context（`admitFrozenReads`）は、送信の扱いの口があっても、押した後の凍結を迂回させないため、今どおり WebSocket を止める。
+  // RB-4 fix（REV-RB4 の C-1）: 凍結しうる Context（`admitsFrozenReads`。観察の口のある発見の PRIMARY も）は、リアルタイムの通信を止めない指定があっても、Worker の
+  // 中の WebSocket を止める（凍結の後は CSP を替えられず、中継は凍結の読み取りで通した host:port への CONNECT を通し続けるため）。
+  // DEF-276: ただし、凍結の後に押さない口（`freezeOnlyForReading`。押す観察を始められない）の Context は、凍結の前のリアルタイムの通信を止めない。
+  const pressesAfterFreeze = options.admitFrozenReads === true
+    || (options.submissionObservation !== undefined && observationPressesAfterFreeze(options.submissionObservation));
+  const connectPolicy = pressesAfterFreeze
+    || (!realtimePassThrough
+      && (options.auditSend === undefined || writeStage !== undefined || options.auditSend.writeJobEndpoint !== undefined))
     ? WORKER_CONNECT_POLICY
     : AUDIT_SEND_CONNECT_POLICY;
   // AS-c: ほかの Origin の見分けには、許可 Origin と、口の承認したサービスの Origin と、監査の段の承認したサービスの Origin を使う。
@@ -5051,7 +5764,10 @@ export async function installPassiveRequestGuard(
    * 見ないため。WebSocket の判定・観察・記録は、今の書き込みの段のまま）。
    */
   // OP-Q（Q1）: 書き込みの作業の中の Passive の Context も持たない（WebSocket を通さない）。
-  const webSocketAuditSendAdmission = writeStage === undefined && auditSendAdmission?.forWriteJob !== true ? auditSendAdmission : undefined;
+  // RB-4b: Isolated Interaction Context（`admitFrozenReads`）も持たない（WebSocket を通さない。押した後の凍結を迂回させないため）。
+  const webSocketAuditSendAdmission = writeStage === undefined && auditSendAdmission?.forWriteJob !== true && options.admitFrozenReads !== true
+    ? auditSendAdmission
+    : undefined;
 
   /** OP-N（N2）: CDP の層で、送信の扱いの口が通した要求を、書き込みの段の通した一覧に記録する（書き込みの段でなければ何もしない）。 */
   const recordWriteStagePassedOf = (request: GuardRequestIdentity, event: PausedDocumentEvent): void => {
@@ -5065,23 +5781,31 @@ export async function installPassiveRequestGuard(
       body: () => requestBodyTextOf(event.request.hasPostData, event.request.postDataEntries),
     });
   };
+  /**
+   * DEF-210: 押す期間なら、判定の口に、閉じる押下の期間の扱いを足す（押す期間でなければ、そのまま）。REV-EV4: 領域のキーの押下の期間なら、その印も足す。
+   */
+  const withNotificationPress = (policy: PassiveRequestPolicyOptions | undefined): PassiveRequestPolicyOptions | undefined => {
+    const mode = guardState.notificationPress;
+    const pressed = mode === null ? policy : { ...policy, notificationPress: mode };
+    return guardState.scrollKeyPress ? { ...pressed, scrollKeyPress: true } : pressed;
+  };
   /** CDP の層の判定の口。 */
-  const cdpRequestPolicy = (): PassiveRequestPolicyOptions | undefined =>
-    requestPolicyOf(submissionAdmission?.cdpStagePolicy(), auditExclusions, auditReadAdmission?.cdpPolicy(), auditSendAdmission?.cdpPolicy());
-  /** route の層の判定の口。 */
-  const routeRequestPolicy = (method: string, url: string): PassiveRequestPolicyOptions | undefined =>
+  const cdpRequestPolicy = (): PassiveRequestPolicyOptions | undefined => withNotificationPress(
+    requestPolicyOf(submissionAdmission?.cdpStagePolicy(), auditExclusions, auditReadAdmission?.cdpPolicy(), auditSendAdmission?.policy()));
+  /** route の層の判定の口（RB-4a の X2: 送信の扱いの口は CDP の層と同じ）。 */
+  const routeRequestPolicy = (method: string, url: string): PassiveRequestPolicyOptions | undefined => withNotificationPress(
     requestPolicyOf(
       submissionAdmission?.routeStagePolicy(method, url),
       auditExclusions,
       auditReadAdmission?.routePolicy(method, url),
-      auditSendAdmission?.routePolicy(method, url),
-    );
+      auditSendAdmission?.policy(),
+    ));
   /**
    * `requestfailed` の判定の口。ログインの段の口は渡さない（許したログインの POST の失敗は、今の POST と同じく違反にしない）。除外の口は
    * 渡す（CDP の層で止めた main frame の移動の失敗を、許した移動の失敗（`HTTP_MAIN_FRAME_DELIVERY_FAILED`）と取り違えないため）。AS-a: 監査の段の送信の
    * 扱いの口も渡す（ナビゲーションの判定は変わらない）。
    */
-  const requestFailedPolicy = requestPolicyOf(undefined, auditExclusions, undefined, auditSendAdmission?.requestFailedPolicy());
+  const requestFailedPolicy = requestPolicyOf(undefined, auditExclusions, undefined, auditSendAdmission?.policy());
   /**
    * AS-c fix round 1（C-1・C-2。設計書 5 章の「AS-R … とユーザーの判断」の行）: Guard の route が通した WebSocket の接続（URL ごとの数。上限は 1 つの Context の
    * 接続の上限）。ブラウザが開いた接続の観察（`observeCreatedWebSockets`）で、同じ URL の接続を 1 つずつ照らして減らす。照らせない接続は、route を通らずに
@@ -5115,17 +5839,11 @@ export async function installPassiveRequestGuard(
    */
   /**
    * AS-c fix round 3（AS-R3 の B03・W4）: 監査の段の送信の扱いの口が CDP の層で進めた要求の、Network の要求の ID（リダイレクトの先の段を見分ける手がかり。
-   * 上限は `MAX_AUDIT_SEND_NETWORK_IDS`。超えたら古いものから捨てる）。
+   * L10（INV-LIMITS の N22）: 数の上限は撤廃した。Context の寿命まで持つ）。
    */
   const auditSendNetworkIds = new Set<string>();
   const rememberAuditSendNetworkId = (networkId: string): void => {
     auditSendNetworkIds.add(networkId);
-    if (auditSendNetworkIds.size > MAX_AUDIT_SEND_NETWORK_IDS) {
-      const [oldest] = auditSendNetworkIds;
-      if (oldest !== undefined) {
-        auditSendNetworkIds.delete(oldest);
-      }
-    }
   };
   const recordPassedAuditSendRequest = (method: string, url: string): void => {
     if (auditSendAdmission !== undefined) {
@@ -5179,10 +5897,38 @@ export async function installPassiveRequestGuard(
    * EL-12（設計書 `2026-10-24-beaksight-external-launch-block-design.md` 3.3・3.5）: 外部スキームへの移動の検出と記録（唯一の記録の所）。本番の Chromium は
    * 一時のプロファイルの設定で外部スキームへの移動を止める（OS のアプリへ渡さない）ので、Playwright の `request` は来ない。検出は CDP の事象
    * （`CDP_STARTED`・`CDP_WINDOW_OPEN`・予備の `CDP_UNREACHABLE`）で行い、`request`（テストの既定の headless shell で両方来る）と合わせて、同じ移動は
-   * 1 回だけ記録する（`ExternalNavigationDetections`）。記録の形は今と同じ: 違反 `EXTERNAL_SCHEME_NAVIGATION_ATTEMPTED`、frame の種類が分かれば
-   * `externalSchemeNavigations`（`EXTERNAL_SCHEME_NAVIGATION`）、分からなければ（`window.open`）違反 `FRAME_CLASSIFICATION_FAILED`。記録したら Context を閉じる。
+   * 1 回だけ記録する（`ExternalNavigationDetections`）。SAFE-2 の 4（違反の区分の (3)。設計者の判断）: frame の種類が分かれば `externalSchemeNavigations`
+   * （`EXTERNAL_SCHEME_NAVIGATION`）、分からなければ（`window.open`）frame の判定の失敗の記録（`frameClassificationFailures`）に残す。違反
+   * （前は `EXTERNAL_SCHEME_NAVIGATION_ATTEMPTED`・`FRAME_CLASSIFICATION_FAILED`）にせず、Context も閉じない（ブラウザが止めていて、外へは何も渡っていない）。
    * `frame` は `'MAIN'`・`'SUB'`、分からなければ `undefined`（`classifyMainFrame` が分類の失敗を記録した場合は、`frameFailure: 'RECORDED'` で、ここでは記録しない）。
    */
+  /**
+   * SAFE-2 の 4（違反の区分の (3)）: Playwright の要求の frame を引けなかったことを、frame の判定の失敗の記録に残す（URL を読めなければ空。違反にしない）。
+   * 時点は、凍結の段（閉じる途中を含む）なら `INTERACTION`、ほかは `PASSIVE`。
+   */
+  const recordFrameClassificationFailureOf = (request: Request): void => {
+    let url = '';
+    try {
+      url = request.url();
+    } catch {
+      url = '';
+    }
+    ledger.recordFrameClassificationFailure({ url, phase: isFrozenPhase(guardState.phase) ? 'INTERACTION' : 'PASSIVE' });
+  };
+  /**
+   * SAFE-2 の 4: 失敗した main frame の要求が読み取り（GET・HEAD）なら、読み取りの失敗の記録に残して真（呼ぶ側は違反にしない）。読み取りでなければ偽（今どおり違反）。
+   */
+  const recordReadNavigationFailureIfRead = (request: Request, errorText: string): boolean => {
+    const method = request.method();
+    if (!isReadMethod(method)) return false;
+    ledger.recordReadNavigationFailure({
+      method,
+      url: request.url(),
+      errorText,
+      phase: isFrozenPhase(guardState.phase) ? 'INTERACTION' : 'PASSIVE',
+    });
+    return true;
+  };
   const externalNavigationDetections = new ExternalNavigationDetections();
   const recordExternalSchemeNavigationAttempt = (
     source: ExternalNavigationSource,
@@ -5201,25 +5947,23 @@ export async function installPassiveRequestGuard(
       if (scheme === null || !externalNavigationDetections.admit(source, url, Date.now())) {
         return;
       }
-      ledger.recordInvariantViolation({
-        code: EXTERNAL_SCHEME_NAVIGATION_VIOLATION_CODE,
-        message: externalSchemeNavigationViolationMessage(scheme),
-      });
+      // SAFE-2 の 4（違反の区分の (3)。設計者の判断）: ブラウザが外部スキームへの移動を止めていて、外へは何も渡っていないので、違反
+      // （前は `EXTERNAL_SCHEME_NAVIGATION_ATTEMPTED`）にせず、Context も閉じない。記録して続ける。
       // popup（`window.open`）の navigation は frame ができる前に出るので、frame の種類が分からない。推し量って記録せず、
-      // frame の分類の失敗（`FRAME_CLASSIFICATION_FAILED`）を記録する。
+      // frame の判定の失敗の記録（`frameClassificationFailures`。前は違反 `FRAME_CLASSIFICATION_FAILED`）に残す。
+      const recordedPhase = isFrozenPhase(phase) ? 'INTERACTION' as const : 'PASSIVE' as const;
       const kind = frame();
       if (kind !== undefined) {
         ledger.recordExternalSchemeNavigation({
           url,
           scheme,
           frame: kind,
-          phase: isFrozenPhase(phase) ? 'INTERACTION' : 'PASSIVE',
+          phase: recordedPhase,
           reason: 'EXTERNAL_SCHEME_NAVIGATION',
         });
       } else if (frameFailureMessage !== null) {
-        ledger.recordInvariantViolation({ code: FRAME_CLASSIFICATION_FAILED_VIOLATION_CODE, message: frameFailureMessage });
+        ledger.recordFrameClassificationFailure({ url, phase: recordedPhase });
       }
-      initiateInvalidation(context, ledger);
     } catch (error) {
       ledger.recordInvariantViolation({ code: 'EXTERNAL_SCHEME_DETECTION_FAILED', message: errorMessage(error) });
       initiateInvalidation(context, ledger);
@@ -5301,12 +6045,15 @@ export async function installPassiveRequestGuard(
   const pageGuards = new WeakMap<Page, PageGuardRecord>();
   const pendingTasks = new Set<Promise<void>>();
   const expectedCdpFailures = new ExpectedCdpFailureRegistry(ledger);
+  // DEF-225: 凍結の前に Guard が止めたダウンロードの記録（main frame の読み取りの移動の失敗と 1 対 1 に対応付ける）。
+  const passiveDownloads = new PassiveDownloadRegistry();
   const expectedRouteFailures = new WeakSet<Request>();
   const recordedFrozenPopups = new WeakSet<Page>();
   const guardState: GuardState = {
     phase: 'INSTALLING',
     context,
     ledger,
+    drainQuietLimitMs: options.drainQuietLimitMs,
     allowedOrigins: authoritySnapshot,
     pageGuards,
     pendingTasks,
@@ -5323,6 +6070,16 @@ export async function installPassiveRequestGuard(
     taskLimitReported: false,
     drainTimeoutReported: false,
     egressFreeze: options.egressFreeze,
+    webSocketRelayCuts: new Set(),
+    // SAFE-2 の 1: ログインの段か書き込みの段の Guard か（読み込む前の凍結の口が拒む）。
+    submissionStage: options.loginStage !== undefined || options.writeStage !== undefined,
+    notificationPress: null,
+    notificationPressNavigations: 0,
+    notificationPressNavigationTargets: [],
+    scrollKeyPress: false,
+    scrollKeyPressBlocks: 0,
+    // COV-2c（C-1）: 凍結の段で 1 回だけ通す main frame の文書の移動（既定はなし）。
+    frozenMainFrameDocument: null,
     // AS-c fix round 1（I-1）: 閉じ始めるときに、送っている事前確認も止める（同じ口で止める）。
     abortWriteSubmission: writeSubmissionAbort === undefined && auditSendPreflight === undefined
       ? undefined
@@ -5393,6 +6150,13 @@ export async function installPassiveRequestGuard(
               failRequest: () => settle(() => channel.send('Fetch.failRequest', {
                 requestId: event.requestId,
                 errorReason: 'BlockedByClient',
+              })),
+              // SAFE-2 の 2（DEF-242）: 204 で応える（サーバへ届けない）。
+              fulfillNoContent: () => settle(() => channel.send('Fetch.fulfillRequest', {
+                requestId: event.requestId,
+                responseCode: NO_CONTENT_STATUS,
+                responseHeaders: [],
+                body: '',
               })),
             };
           };
@@ -5584,7 +6348,7 @@ export async function installPassiveRequestGuard(
           // - CORS の事前確認（`OPTIONS`。`Network.requestWillBeSent` の `initiator.type` が `preflight`。取れなければ
           //   `Access-Control-Request-Method` ヘッダあり）は、Playwright が横取りのあるときに行うのと同じく、`Fetch.fulfillRequest`
           //   （204 と CORS のヘッダ）で満たし、記録しない（サーバに届かない。設計書 2.4）。事前確認でない `OPTIONS` は止めて記録する。
-          // - 作業の数は、ほかの作業とは別の上限（`MAX_PENDING_GUARD_REQUEST_TASKS`）で数える（設計書 2.4）。
+          // - 作業の数は、ほかの作業とは別に数える（設計書 2.4。L10 で上限は撤廃した）。
           const preflightInitiators = new PreflightInitiatorRegistry();
           // T39b: ページのスクリプトが始めた要求の frame（API の書き込みの段の、照合にかける要求の確かめ）。
           const scriptInitiators = new ScriptInitiatorRegistry();
@@ -5698,25 +6462,34 @@ export async function installPassiveRequestGuard(
               initiateInvalidation(context, ledger);
             }, 'REQUEST');
           };
-          /** 一時停止した要求が、CORS の事前確認か（第一の根拠は `initiator`、取れなければヘッダ）。 */
+          /**
+           * 一時停止した要求が、CORS の事前確認か（第一の根拠は `initiator`、取れなければヘッダ）。
+           * DEF-217: `initiator` の記録は、取ると消える（`take`）。1 つの一時停止の事象で何度も問う（DEF-208-1 の凍結の段の読み取りの判定と、判定の
+           * `evaluate`）ので、事象ごとに最初に取った結果を覚えて、2 回目からはそれを返す（2 回目に記録がないとして、事前確認を止めない）。
+           */
+          const preflightByInitiatorOfEvent = new WeakMap<PausedDocumentEvent, boolean>();
           const isPreflight = (event: PausedDocumentEvent, facts: CorrelationRequest): boolean => {
             if (facts.method.toUpperCase() !== 'OPTIONS') return false;
-            const networkId = typeof event.networkId === 'string' && event.networkId.length > 0 ? event.networkId : null;
-            const byInitiator = networkId !== null && preflightInitiators.take(networkId, Date.now());
+            let byInitiator = preflightByInitiatorOfEvent.get(event);
+            if (byInitiator === undefined) {
+              const networkId = typeof event.networkId === 'string' && event.networkId.length > 0 ? event.networkId : null;
+              byInitiator = networkId !== null && preflightInitiators.take(networkId, Date.now());
+              preflightByInitiatorOfEvent.set(event, byInitiator);
+            }
             return byInitiator || headerValueOf(event.request.headers, ACCESS_CONTROL_REQUEST_METHOD_HEADER) !== undefined;
           };
           /**
            * AS-c fix round 1（I-1。設計書 5 章の「AS-c fix round 1 の Blocker」の行）: Guard がサーバへ送る事前確認なら、その送り先の URL（送らないなら null）。
-           * 送るのは、監査の段の送信の扱いの口と事前確認の送り手があり、送り先がほかの Origin（許可 Origin でも承認したサービスの Origin でもない）で、本番の
-           * 要求（`Access-Control-Request-Method` の method と同じ URL）を、今の口が通す見込みのもの（`auditSendAdmission` の印つきの ALLOW）だけ。ほかは
-           * 今のまま Guard が返す（許可 Origin と承認したサービスの Origin、通さない本番の要求、`READ_ONLY`）。
+           * 送るのは、監査の段の送信の扱いの口と事前確認の送り手があり、本番の要求（`Access-Control-Request-Method` の method と同じ URL）を、今の口が通す
+           * 見込みのもの（`auditSendAdmission` の印つきの ALLOW）だけ。REV-RB14 の I-1: 送り先の Origin は問わない（許可 Origin と承認したサービスの Origin への
+           * 事前確認も、サーバの答えで満たす。サーバが拒む本番の要求をブラウザに送らせない）。ほかは今のまま Guard が返す（通さない本番の要求、`READ_ONLY`）。
            */
           const auditSendPreflightUrlOf = (event: PausedDocumentEvent): string | null => {
             if (auditSendAdmission === undefined || auditSendPreflight === undefined || typeof event.request.url !== 'string') {
               return null;
             }
             const method = headerValueOf(event.request.headers, ACCESS_CONTROL_REQUEST_METHOD_HEADER);
-            if (method === undefined || !auditSendAdmission.isOtherOrigin(event.request.url)) {
+            if (method === undefined) {
               return null;
             }
             const decision = classifyPassiveRequest(
@@ -5730,7 +6503,7 @@ export async function installPassiveRequestGuard(
            * AS-c fix round 1（I-1）: 事前確認を、同じ形（`Origin`・`Access-Control-Request-Method`・`Access-Control-Request-Headers` など。資格情報なし）で
            * 中継を通してサーバへ 1 回送り（`sendWriteSubmissionOnce` の `PREFLIGHT`。上限 `AUDIT_SEND_PREFLIGHT_TIMEOUT_MS`）、その応答の状態と CORS のヘッダで
            * ブラウザの事前確認を満たす。応答がない・時間切れ・送れないは、拒む応答（`AUDIT_SEND_PREFLIGHT_REJECT_CODE`。CORS のヘッダなし）で満たす（ブラウザは
-           * 本番の要求を送らない）。送る前に、読み込みの上限の残りを 1 つ使う。書いた（送った）事前確認は、通した要求（`OPTIONS`）として Ledger に記録する。
+           * 本番の要求を送らない）。書いた（送った）事前確認は、通した要求（`OPTIONS`）として Ledger に記録する。
            * 満たす命令の失敗は、今の事前確認と同じく違反にして Context を閉じる。
            */
           const forwardAuditSendPreflight = async (
@@ -5741,7 +6514,6 @@ export async function installPassiveRequestGuard(
             if (auditSendAdmission === undefined || auditSendPreflight === undefined) {
               return;
             }
-            auditSendAdmission.admitWithoutRoute();
             // DEF-125: https の送り先は、中継の CONNECT を通す宛先に加える（Guard が通した要求と同じ）。
             if (egressDestinationHook !== undefined) {
               try {
@@ -5783,7 +6555,7 @@ export async function installPassiveRequestGuard(
             event: PausedDocumentEvent,
             commands: ReturnType<typeof pausedRequestCommands>,
             stage: Extract<AcceptedWriteStage, { readonly transport: typeof API_SCENARIO_TRANSPORT }>,
-            pageKeyValues: Readonly<Record<string, ApiJsonScalarValue>>,
+            pageKeyValues: Readonly<Record<string, ApiWritePageKeyValue>>,
           ): Promise<void> => {
             const state = writeStageStateOf(stage.monitor);
             state.submission = 'SENT';
@@ -5884,9 +6656,19 @@ export async function installPassiveRequestGuard(
                 && (await scriptInitiators.frameOf(event.networkId, SCRIPT_INITIATOR_WAIT_MS)) === mainFrameId;
               /** T39b: API の書き込みの照合が止めた理由（止めた要求を段の記録に数える）と、一致したときのページが決める鍵の値。 */
               let apiPayloadBlockReason: ApiWritePayloadBlockReason | undefined;
-              let apiPageKeyValues: Readonly<Record<string, ApiJsonScalarValue>> | undefined;
+              let apiPageKeyValues: Readonly<Record<string, ApiWritePageKeyValue>> | undefined;
               // CC-050: 段階と判定から、動作と記録を決める（`decideGuardRequest`）。ここは、その結果に従って CDP の命令を送る。
               let subresourcePolicy: PassiveRequestPolicyOptions | undefined;
+              /** DEF-233: 凍結の段の事前確認を、観察の口が認めた（承認した API の Origin の）ものか（観察の口の事前確認の数に入れるのは、それだけ）。 */
+              let observedPreflight = false;
+              /** AS-c fix round 1（I-2）・DEF-233: method の上書きの判定に使う、ヘッダと本文（判定と、凍結の段の token の更新の判定が共用する）。 */
+              const pausedSentContent: RequestSentContent = {
+                headers: event.request.headers,
+                formMethodOverrides: () => formMethodOverrideValuesOf(
+                  event.request.headers,
+                  () => requestBodyTextOf(event.request.hasPostData, event.request.postDataEntries),
+                ),
+              };
               const verdict = decideGuardRequest({
                 layer: 'CDP_REQUEST',
                 phase,
@@ -5894,17 +6676,35 @@ export async function installPassiveRequestGuard(
                 request: facts,
                 navigation: false,
                 unguardedPageNavigation: null,
-                // DEF-130-fix: Passive の段（送信の段でない）の page の、文書でない要求は、1 画面の読み込みあたりの数を数える。
-                ...(options.pageNavigationLimit === true && submissionAdmission === undefined
-                  ? { admitSubresourceRequest: (): PageLimitAdmission => admitSubresourceRequest(page) }
-                  : {}),
                 // T37b: 観察の口が有効の間の、承認した API の Origin への凍結の段の事前確認（口の判定を先に見て、事前確認の記録を無駄に使わない）。
                 ...(submissionObservation === undefined
                   ? {}
                   : {
-                    frozenPreflight: (request: GuardRequestIdentity): boolean =>
-                      observationAdmitsFrozenPreflight(submissionObservation, request.url) && isPreflight(event, request),
+                    frozenPreflight: (request: GuardRequestIdentity): boolean => {
+                      if (!isPreflight(event, request)) return false;
+                      observedPreflight = observationAdmitsFrozenPreflight(submissionObservation, request.url);
+                      // DEF-233: 凍結の段で通すサイトの token の更新の事前確認も、Guard が満たす（サーバへ送らない。判定は本番の要求と同じ部品。事前確認は
+                      // 本文を持たないので、目印は URL で照らす）。
+                      return observedPreflight || frozenTokenRefreshPreflightAdmitted({
+                        method: headerValueOf(event.request.headers, ACCESS_CONTROL_REQUEST_METHOD_HEADER) ?? SUBMISSION_POST_METHOD,
+                        url: request.url,
+                        isNavigationRequest: false,
+                        isMainFrame: false,
+                        resourceType: requestResourceTypeOf(event.resourceType),
+                      }, cdpRequestPolicy());
+                    },
                   }),
+                // DEF-208-1: 凍結の段の読み取り（文書でない要求。事前確認は上の口が先に見る）。DEF-233: サイトの token の更新も同じ口で見る（本文は要るときだけ読む）。
+                ...(facts === null || isPreflight(event, facts) ? {} : {
+                  frozenRead: frozenReadOf({
+                    method: facts.method,
+                    url: facts.url,
+                    isNavigationRequest: false,
+                    isMainFrame: false,
+                    resourceType: requestResourceTypeOf(event.resourceType),
+                    sentContent: pausedSentContent,
+                  }, cdpRequestPolicy, () => requestBodyTextOf(event.request.hasPostData, event.request.postDataEntries), event.request.headers),
+                }),
                 evaluate: (request): GuardPolicyOutcome => {
                   if (isPreflight(event, request)) return { kind: 'PREFLIGHT' };
                   subresourcePolicy = cdpRequestPolicy();
@@ -5920,13 +6720,9 @@ export async function installPassiveRequestGuard(
                     // T39b: API の書き込みの段の、窓を開いた page の main frame のページのスクリプトの要求か。
                     mainFrameScript,
                     // AS-c fix round 1（I-2）: method の上書きの判定に使う、ヘッダと本文（本文は form のときだけ読む）。
-                    sentContent: {
-                      headers: event.request.headers,
-                      formMethodOverrides: () => formMethodOverrideValuesOf(
-                        event.request.headers,
-                        () => requestBodyTextOf(event.request.hasPostData, event.request.postDataEntries),
-                      ),
-                    },
+                    sentContent: pausedSentContent,
+                    // L12b: リダイレクトの続き（書き込みの段の押した後の扱いは、本文の送り直しを通さない）。
+                    ...(event.redirectedRequestId === undefined ? {} : { redirectReplay: true }),
                   }, authoritySnapshot, subresourcePolicy), { method: request.method, url: request.url, headers: event.request.headers },
                   () => requestBodyTextOf(event.request.hasPostData, event.request.postDataEntries), cookies);
                   if (classified.action === 'ALLOW' && classified.writeStageApiWrite === true) {
@@ -5935,7 +6731,9 @@ export async function installPassiveRequestGuard(
                     if (apiWriteStage === undefined || submissionAdmission === undefined) {
                       return { kind: 'DECISION', decision: { action: 'BLOCK', category: 'REQUEST', reason: 'NON_READ_METHOD' } };
                     }
-                    const checked = checkApiWritePayload(apiWriteStage.expectation, {
+                    // LU-9: 前の値を後から入れる印のある期待は、入れた期待で照らす。入れていなければ印のある期待のまま照らし、必ず
+                    // `EXPECTATION_INVALID` で止まる（fail-closed）。
+                    const checked = checkApiWritePayload(suppliedPriorExpectationOf<ApiWritePayloadExpectation>(apiWriteStage.monitor, API_SCENARIO_TRANSPORT) ?? apiWriteStage.expectation, {
                       method: event.request.method,
                       url: event.request.url,
                       headers: event.request.headers ?? {},
@@ -5952,11 +6750,17 @@ export async function installPassiveRequestGuard(
                 },
               });
               // DEF-125: 通した要求の宛先を、中継に知らせる（命令を送る前）。
-              admitEgressDestinationOf(verdict);
+              admitEgressDestinationOf(verdict, 'CDP_REQUEST');
+              countFrozenRead(page, verdict, subresourcePolicy ?? cdpRequestPolicy());
+              // fix round 2（SREV-233 の M-3）・fix round 3: 通した token の更新を、要求の header と本文とともに factory に知らせる。
+              notifyTokenRefreshAdmitted(verdict, subresourcePolicy ?? cdpRequestPolicy(), event.request.headers,
+                () => requestBodyTextOf(event.request.hasPostData, event.request.postDataEntries));
               recordGuardVerdictBeforeBlock(ledger, verdict);
               if (verdict.kind === 'BLOCK_FROZEN') {
                 // T37b: 観察の口が有効なら、止める要求の型を口に渡す（止め方と記録は今どおり）。
                 observeFrozenRequest(verdict.request, event);
+                // DEF-233: 凍結で止めた token の更新を、監査の段の記録に数える（CDP の層で数える）。
+                countFrozenTokenRefreshBlocked(verdict.request, cdpRequestPolicy());
                 // DEF-045: owner の close を始めた後の、閉じた形の失敗は、target とともに消えた要求として違反にしない（記録は残す）。
                 try {
                   await commands.failRequest();
@@ -6008,7 +6812,8 @@ export async function installPassiveRequestGuard(
                 try {
                   await commands.fulfillPreflight();
                   // T37b: 凍結の段で満たした事前確認（観察の口が認めたもの）を、口に数える。
-                  if (submissionObservation !== undefined && isFrozenPhase(phase)) recordObservedFrozenPreflight(submissionObservation);
+                  // DEF-233: token の更新の事前確認（観察の口が認めたものでない）は、押下の観察に混ぜない。
+                  if (submissionObservation !== undefined && isFrozenPhase(phase) && observedPreflight) recordObservedFrozenPreflight(submissionObservation);
                 } catch (error) {
                   ledger.recordInvariantViolation({
                     code: 'CDP_PREFLIGHT_FULFILL_FAILED',
@@ -6058,7 +6863,7 @@ export async function installPassiveRequestGuard(
               if (auditReadAdmission !== undefined && auditStageAdmission?.kind === 'AUDIT_READ_REQUEST') {
                 auditReadAdmission.admitAtCdp(request.method, request.url, auditStageAdmission);
               }
-              // AS-a: 監査の段の送信の扱いの口が通した要求を、続ける前に数える（この層だけで数える）。
+              // AS-a: 監査の段の送信の扱いの口が通した要求を、続ける前に記録する（RB-4a の X2: 数えない）。
               const auditSendNetworkId = typeof event.networkId === 'string' && event.networkId.length > 0 ? event.networkId : null;
               if (
                 auditSendAdmission !== undefined
@@ -6066,10 +6871,9 @@ export async function installPassiveRequestGuard(
                 && (event.redirectedRequestId !== undefined || (auditSendNetworkId !== null && auditSendNetworkIds.has(auditSendNetworkId)))
               ) {
                 // AS-c fix round 2（I-D。設計書 5 章の「AS-R2」の行）: リダイレクトの先の要求（307・308 の段）は、Playwright が route を呼ばずに進めるので、
-                // 数える（route の層への印は置かない）と同時に、この層で通した要求として記録する（上限の数と記録の数をそろえる）。
+                // この層で通した要求として記録する。
                 // AS-c fix round 3（AS-R3 の B03・W4）: ほかの Origin への段は `redirectedRequestId` を持たないことがあるので、この口が既に進めた要求と同じ
                 // Network の要求の ID（リダイレクトの間は同じ ID）も、リダイレクトの先の手がかりにする。
-                auditSendAdmission.admitWithoutRoute();
                 recordPassedAuditSendRequest(request.method, request.url);
                 recordWriteStagePassedOf(request, event);
               } else if (auditSendAdmission !== undefined && verdict.decision.auditSendAdmission === true) {
@@ -6077,9 +6881,8 @@ export async function installPassiveRequestGuard(
                 if (auditSendNetworkId !== null) {
                   rememberAuditSendNetworkId(auditSendNetworkId);
                 }
-                auditSendAdmission.admitAtCdp(request.method, request.url);
                 // AS-c fix round 1（M-3）: Safety Ledger の通した要求の記録（値は残さない）は、ブラウザが送る時点に寄せる。Network の要求の ID のある要求は、
-                // Playwright の route の層が進める時点で残す（route の層の `consumeAtRoute` の所。about:blank のポップアップの realm の要求のように、Playwright が
+                // Playwright の route の層が進める時点で残す（route の層の ALLOW の所。about:blank のポップアップの realm の要求のように、Playwright が
                 // 進めず届かない要求は残さない）。ID のない要求（ページを離れるときの送信など）は、Playwright が route を呼ばずに進めるので、ここで残す。
                 if (!(typeof event.networkId === 'string' && event.networkId.length > 0)) {
                   recordPassedAuditSendRequest(request.method, request.url);
@@ -6098,8 +6901,14 @@ export async function installPassiveRequestGuard(
               const apiWrite = verdict.decision.writeStageApiWrite === true && apiWriteStage !== undefined && apiPageKeyValues !== undefined;
               // T39b: 監査の段の口が通した読み取りでない要求（登録した読み取りの手続きの呼び出し。API の書き込みの段の窓の外）は、送信の段の回数に数えない。
               // ML-a: 手動のログインの段の口が通した要求は、回数に数えず、読み取りでない要求の形だけを通した一覧に記録する。
+              // DEF-193: 自動ログインの段の口が通した要求も、回数に数えない。DEF-194: 通した一覧の行の理由は、登録の対象でない理由にする。
               const manualPass = verdict.decision.manualLoginPassThrough;
-              if (manualPass !== undefined && submissionAdmission !== undefined) {
+              const automatedPass = verdict.decision.automatedLoginPassThrough;
+              if (automatedPass !== undefined && submissionAdmission !== undefined) {
+                if (!isReadMethod(request.method)) {
+                  submissionAdmission.recordAutomatedPass(request.url, requestResourceTypeOf(event.resourceType));
+                }
+              } else if (manualPass !== undefined && submissionAdmission !== undefined) {
                 if (!isReadMethod(request.method)) {
                   submissionAdmission.recordManualPass(request.url, requestResourceTypeOf(event.resourceType), manualPass.reason);
                 }
@@ -6114,11 +6923,6 @@ export async function installPassiveRequestGuard(
               } else if (loginStageAdmission?.kind === 'SERVICE_ORIGIN_READ' && submissionAdmission?.monitor instanceof LoginStageMonitor) {
                 const state = loginStageStateOf(submissionAdmission.monitor);
                 state.serviceOriginReads = saturatingIncrement(state.serviceOriginReads);
-              }
-              // DEF-130-fix: Guard が通す（サーバへ送る）文書でない要求を数える（成果物に残す数）。T44b: ページを離れ始めた後の要求は数えない。
-              const loadState = mainFrameNavigationStateOf(page);
-              if (!loadState.leaving) {
-                loadState.subresourceRequests = saturatingIncrement(loadState.subresourceRequests);
               }
               if (apiWrite && apiWriteStage !== undefined && apiPageKeyValues !== undefined) {
                 await handOffApiWrite(event, commands, apiWriteStage, apiPageKeyValues);
@@ -6211,6 +7015,13 @@ export async function installPassiveRequestGuard(
               // DEF-129: Passive の段（送信の段でない）の page の、文書の要求（リダイレクトの続きでない）は、ページが始めた読み込みの数を frame ごとに
               // 数える（main frame と、T37R2-fix で子の frame。別のプロセスの iframe の session の要求は、すべて子の frame）。
               const isMainFrameDocument = mainFrameId !== null && event.frameId === rootFrameId;
+              // RB-14a（X11）: 見るだけの点検の押す期間の main frame の移動は、止めずに数える（移った画面は、呼ぶ側が点検しない）。
+              if (guardState.notificationPress === 'AUDIT' && isMainFrameDocument && redirectedFrom === undefined) {
+                guardState.notificationPressNavigations = saturatingIncrement(guardState.notificationPressNavigations);
+                guardState.notificationPressNavigationTargets.push(event.request.url);
+              }
+              // COV-2c（C-1）: 凍結の段で通した main frame の文書の要求のリダイレクトの先は、口の行き先を移してから判定する。
+              followFrozenMainFrameDocumentRedirect(redirectedFrom?.url, event.request.url, event.frameId === rootFrameId);
               const countsPageNavigation = options.pageNavigationLimit === true
                 && submissionAdmission === undefined
                 && redirectedFrom === undefined;
@@ -6224,9 +7035,19 @@ export async function installPassiveRequestGuard(
                 ...(countsPageNavigation
                   ? {
                     admitPageNavigation: (): PageLimitAdmission =>
-                      (isMainFrameDocument ? admitMainFrameNavigation(page) : admitChildFrameNavigation(page, event.frameId)),
+                      (isMainFrameDocument
+                        ? admitMainFrameNavigation(page, event.request.url)
+                        : admitChildFrameNavigation(page, event.frameId, event.request.url)),
                   }
                   : {}),
+                // DEF-208-1: 凍結の段の、子の frame の文書の読み取り（main frame の移動は、判定が偽を返して今どおり止める）。
+                frozenRead: frozenReadOf({
+                  method: interceptedRequest.method,
+                  url: event.request.url,
+                  isNavigationRequest: true,
+                  isMainFrame: event.frameId === rootFrameId,
+                  resourceType: requestResourceTypeOf(event.resourceType),
+                }, cdpRequestPolicy),
                 evaluate: (): GuardPolicyOutcome => {
                   if (!redirectedPredecessors.remember(event.requestId, interceptedRequest, Date.now())) {
                     return { kind: 'UNAVAILABLE' };
@@ -6241,6 +7062,16 @@ export async function installPassiveRequestGuard(
                     isMainFrame: event.frameId === rootFrameId,
                     // T34b: Document の横取りの事象（種類は `Document`）。
                     resourceType: requestResourceTypeOf(event.resourceType),
+                    // L12b: リダイレクトの続き（書き込みの段の押した後の扱いは、本文の送り直しを通さない）。
+                    ...(redirectedFrom === undefined ? {} : { redirectReplay: true }),
+                    // RB-4b（X1）: 文書の要求（form の送信）も、method の上書き（ヘッダと本文の `_method`）で削除を伝えるかを判定に渡す（文書の送信を通すので）。
+                    sentContent: {
+                      headers: event.request.headers,
+                      formMethodOverrides: () => formMethodOverrideValuesOf(
+                        event.request.headers,
+                        () => requestBodyTextOf(event.request.hasPostData, event.request.postDataEntries),
+                      ),
+                    },
                   }, authoritySnapshot, documentPolicy), { method: interceptedRequest.method, url: event.request.url, headers: event.request.headers },
                   () => requestBodyTextOf(event.request.hasPostData, event.request.postDataEntries), cookies);
                   if (
@@ -6248,6 +7079,8 @@ export async function installPassiveRequestGuard(
                     && writeStage !== undefined
                     && submissionAdmission !== undefined
                     && !isReadMethod(interceptedRequest.method)
+                    // L12a: 押した後の扱いで通したページの送信（承認した送信でない）は、照合にかけない（承認の回数にも数えない。下の記録の所）。
+                    && classified.auditSendAdmission !== true
                   ) {
                     // T30b: 承認の形の POST の本文を、続ける前に照合する（同期の関数。照合と数えるの間に、ほかの要求の判定は入らない）。文書の文字コードは、
                     // この page で送信の窓を開いたときに読んだ値（その後に main frame の文書が変わっていれば `null`）。照合が止めたら、以後どの POST も
@@ -6257,7 +7090,9 @@ export async function installPassiveRequestGuard(
                       submissionAdmission.spend();
                       return { kind: 'DECISION', decision: { action: 'BLOCK', category: 'REQUEST', reason: 'NON_READ_METHOD' } };
                     }
-                    const payloadVerdict = checkWritePayload(writeStage.expectation, {
+                    // LU-12a: 前の値を後から入れる印のある期待は、入れた期待で照らす。入れていなければ印のある期待のまま照らし、必ず
+                    // `EXPECTATION_INVALID` で止まる（fail-closed。API の形と同じ扱い）。
+                    const payloadVerdict = checkWritePayload(suppliedPriorExpectationOf<WritePayloadExpectation>(writeStage.monitor, FORM_SCENARIO_TRANSPORT) ?? writeStage.expectation, {
                       method: event.request.method,
                       url: event.request.url,
                       isMainFrameNavigation: mainFrameId !== null && event.frameId === rootFrameId,
@@ -6276,15 +7111,29 @@ export async function installPassiveRequestGuard(
                 },
               });
               // DEF-125: 通した文書の要求の宛先を、中継に知らせる（命令を送る前。リダイレクトの先も、ここで知らせる）。
-              admitEgressDestinationOf(verdict);
+              admitEgressDestinationOf(verdict, 'CDP_DOCUMENT');
+              countFrozenRead(page, verdict);
+              rememberFrozenFrameDocument(verdict);
               if (verdict.kind === 'BLOCK_FROZEN') {
-                const expectedFailure = expectedCdpFailures.register(page, playwrightVisibleRequest, Date.now());
+                // SAFE-2 の 2（DEF-242）: 操作さがしの凍結の段で、ページが始めた main frame の移動は、204 で応えて今の文書を残す（止めた記録は今どおり）。
+                const noContent = commands.fulfillNoContent !== undefined && blockedMainFrameNavigationResponseOf({
+                  phase,
+                  mainFrame: isMainFrameDocument && redirectedFrom === undefined,
+                  // 凍結の段の BeakSight 自身の読み込みは、口（`admitFrozenMainFrameDocument`）が行き先を通すので、ここ（凍結で止めた移動）には来ない。止めた main frame
+                  // の移動は、ページが始めたもの（DEF-129 の `ownNavigationPending` は、凍結の段では数え直さないので使わない）。
+                  ownNavigation: false,
+                  observing: submissionObservation !== undefined,
+                }) === 'NO_CONTENT';
+                // SREV-SAFE の I-1: 204 で応えた移動も、その後の `net::ERR_ABORTED` を予期した失敗として登録する（読み取りの失敗の記録にしない。止めた記録は下で残す）。
+                const expectedFailure = expectedCdpFailures.register(
+                  page, playwrightVisibleRequest, Date.now(), blockedMainFrameNavigationFailureTextOf(noContent ? 'NO_CONTENT' : 'BLOCKED_BY_CLIENT'),
+                );
                 recordGuardVerdictBeforeBlock(ledger, verdict);
                 // T37b: 観察の口が有効なら、止める文書の要求の型も口に渡す（止め方と記録は今どおり）。
                 observeFrozenRequest(verdict.request, event);
                 let invalidationNeeded = expectedFailure === null;
                 try {
-                  await commands.failRequest();
+                  await (noContent && commands.fulfillNoContent !== undefined ? commands.fulfillNoContent() : commands.failRequest());
                 } catch (error) {
                   if (expectedFailure !== null) expectedCdpFailures.remove(page, expectedFailure);
                   const message = errorMessage(error);
@@ -6344,6 +7193,12 @@ export async function installPassiveRequestGuard(
                 if (!isReadMethod(interceptedRequest.method)) {
                   submissionAdmission.recordManualPass(event.request.url, requestResourceTypeOf(event.resourceType), decision.manualLoginPassThrough.reason);
                 }
+              } else if (decision.action === 'ALLOW' && writeStage !== undefined && decision.auditSendAdmission === true) {
+                // L12a: 書き込みの段の押した後に、ページが自分で送った文書の要求（form の送信など）。承認した送信の回数に数えず、送り手にも渡さない（ブラウザが
+                // そのまま送る）。承認した送信のほかの送信として、通した一覧に記録する。
+                if (!isReadMethod(interceptedRequest.method)) {
+                  recordWriteStagePassedOf({ method: interceptedRequest.method, url: event.request.url }, event);
+                }
               } else if (decision.action === 'ALLOW' && submissionAdmission !== undefined && !isReadMethod(interceptedRequest.method)) {
                 // T25b: 送信の段で許した POST を、続ける前に数える（この層だけで数える）。リダイレクトでやり直す POST は route の層に
                 // 来ないので、route の層への印を置かない。T30R-fix-1（M-4）: 送り手が送る承認の POST（書き込みの段）も、ブラウザには送らせず
@@ -6366,6 +7221,8 @@ export async function installPassiveRequestGuard(
                 // C18h: Guard がこのリクエストを失敗させるので、リクエストは終わる。リダイレクトの対応付けの登録を消す。
                 redirectedPredecessors.forget(event.requestId);
                 let expectedFailure: ExpectedCdpFailure | undefined;
+                /** REV-EV4: 領域のキーの押下の期間に止めた main frame の移動を、204 で応えるか。 */
+                let keyPressNoContent = false;
                 if (redirectedFrom !== undefined) {
                   expectedFailure = expectedCdpFailures.register(page, redirectedFrom, Date.now()) ?? undefined;
                 } else if (
@@ -6373,16 +7230,36 @@ export async function installPassiveRequestGuard(
                     // DEF-129: 上限で止めたページが始めた main frame の読み込みも、Guard が止めたことを登録する（許した移動の失敗と取り違えない）。
                     // T44R の I-1: ページを離れた後に止めた main frame の読み込みも同じ。
                     || (decision.category === 'REQUEST'
-                      && (decision.reason === 'PAGE_NAVIGATION_LIMIT_REACHED' || decision.reason === 'PAGE_LEAVE_REQUEST_LIMIT_REACHED')))
+                      && (decision.reason === 'PAGE_NAVIGATION_LIMIT_REACHED' || decision.reason === 'PAGE_LEAVE_REQUEST_LIMIT_REACHED'
+                        // fix round 3（設計書 3.2.2 の 4）: 通知の枠の閉じる押下の期間に止めた main frame の移動も、Guard が止めたことを登録する。
+                        || decision.reason === NOTIFICATION_DISMISSAL_BLOCK_REASON
+                        // REV-EV4: 領域のキーの押下の期間に止めた main frame の移動も、Guard が止めたことを登録する。
+                        || decision.reason === SCROLL_KEY_PRESS_BLOCK_REASON)))
                   && event.frameId === rootFrameId
                 ) {
+                  if (decision.category === 'REQUEST' && decision.reason === NOTIFICATION_DISMISSAL_BLOCK_REASON) {
+                    guardState.notificationPressNavigations = saturatingIncrement(guardState.notificationPressNavigations);
+                  }
+                  if (decision.category === 'REQUEST' && decision.reason === SCROLL_KEY_PRESS_BLOCK_REASON) {
+                    guardState.scrollKeyPressBlocks = saturatingIncrement(guardState.scrollKeyPressBlocks);
+                  }
+                  // REV-EV4: 領域のキーの押下の期間に止めた main frame の移動は、204 で応えて今の文書を残す（その後の `net::ERR_ABORTED` を予期した失敗にする）。
+                  keyPressNoContent = commands.fulfillNoContent !== undefined && blockedMainFrameNavigationResponseOf({
+                    phase,
+                    mainFrame: true,
+                    ownNavigation: false,
+                    observing: false,
+                    scrollKeyPress: decision.category === 'REQUEST' && decision.reason === SCROLL_KEY_PRESS_BLOCK_REASON,
+                  }) === 'NO_CONTENT';
                   // T36b: 資格情報の守りで止めた main frame の移動（フォームの既定の GET の送信など）も、同じく Guard が止めたことを登録する。
                   // T26g-1: 送信の段だけの理由で止めた main frame の移動（送信の窓の中の GET など。T30b: 書き込みの段も）。`requestfailed` の判定は
                   // 段の口を持たないので、Guard が止めたことを登録し、許した移動の失敗（`HTTP_MAIN_FRAME_DELIVERY_FAILED`）と取り違えない。
-                  expectedFailure = expectedCdpFailures.register(page, playwrightVisibleRequest, Date.now()) ?? undefined;
+                  expectedFailure = expectedCdpFailures.register(
+                    page, playwrightVisibleRequest, Date.now(), blockedMainFrameNavigationFailureTextOf(keyPressNoContent ? 'NO_CONTENT' : 'BLOCKED_BY_CLIENT'),
+                  ) ?? undefined;
                 }
                 try {
-                  await commands.failRequest();
+                  await (keyPressNoContent && commands.fulfillNoContent !== undefined ? commands.fulfillNoContent() : commands.failRequest());
                   recordBlockedDecision(ledger, decision, {
                     method: event.request.method,
                     url: event.request.url,
@@ -6413,13 +7290,6 @@ export async function installPassiveRequestGuard(
               if (admittedWrite && writeStage !== undefined && writeSubmission !== undefined) {
                 await submitAdmittedWrite(event, writeStage.monitor, writeSubmission);
                 return;
-              }
-              // DEF-129: Guard が通す（サーバへ送る）文書の要求を数える（成果物に残す数。リダイレクトの続きを含む）。T37R2-fix: 子の frame は別の数。
-              const navigationState = mainFrameNavigationStateOf(page);
-              if (isMainFrameDocument) {
-                navigationState.documentRequests = saturatingIncrement(navigationState.documentRequests);
-              } else {
-                navigationState.childFrameDocumentRequests = saturatingIncrement(navigationState.childFrameDocumentRequests);
               }
               try {
                 await commands.continueRequest();
@@ -6571,10 +7441,8 @@ export async function installPassiveRequestGuard(
           if (sessions.has(sessionId)) {
             return;
           }
-          if (oopifSessionCount >= MAX_GUARD_OOPIF_SESSIONS) {
-            failOopifGuard('OOPIF_GUARD_ATTACH_FAILED', 'OOPIF guard session limit reached');
-            return;
-          }
+          // L10（INV-LIMITS の N22）: 同時に横取りを付ける OOPIF の数の上限（前は `MAX_GUARD_OOPIF_SESSIONS` 64 で、超えたら `OOPIF_GUARD_ATTACH_FAILED` にして
+          // Context を閉じた）は撤廃した。どの OOPIF にも横取りを付ける。
           const children = new Map<string, OopifGuardNode>();
           let interception: DocumentInterception | undefined;
           const channel = new OopifTargetChannel(parent, sessionId, (method, eventParams) => {
@@ -6680,6 +7548,8 @@ export async function installPassiveRequestGuard(
           pageInterception.clear();
           disposeOopifSessions(pageOopifSessions);
           expectedCdpFailures.clear(page);
+          // L10（T29）: 止めたダウンロードの記録も、持ち主の page の session を閉じたときに捨てる（期限を持たない）。
+          passiveDownloads.clear(page);
           releasePageListenerGroup(guardState, page);
           if (
             !ownerClosingPages.has(page)
@@ -6687,7 +7557,7 @@ export async function installPassiveRequestGuard(
           ) {
             ledger.recordInvariantViolation({
               code: 'CDP_SESSION_DETACHED',
-              message: 'Document interception session detached while its page remained active',
+              message: CDP_SESSION_DETACHED_MESSAGE,
             });
             initiateInvalidation(context, ledger);
           }
@@ -6755,7 +7625,11 @@ export async function installPassiveRequestGuard(
         // EL-12: 外部スキームへの移動の検出（`Page.frameStartedNavigating`・`Page.windowOpen`・予備の `Page.frameNavigated`）。page の準備の前に聞き始め、
         // `Page.enable` を送る（失敗したら、上と同じく page の準備の失敗 `CDP_SETUP_FAILED` にする。fail-closed）。
         for (const method of EXTERNAL_NAVIGATION_CDP_EVENTS) {
-          const onExternalNavigationEvent = (params: unknown): void => onExternalNavigationCdpEvent(session, rootFrameId, method, params);
+          const onExternalNavigationEvent = (params: unknown): void => {
+            onExternalNavigationCdpEvent(session, rootFrameId, method, params);
+            // SREV-SAFE の I-4: main frame の文書の替わりの記録も、同じ事象で受ける。
+            if (method === 'Page.frameNavigated') mainFrameDocumentObservers.get(page)?.(params, rootFrameId);
+          };
           session.on(method, onExternalNavigationEvent);
           listenerGroup.cleanups.push(() => session.off(method, onExternalNavigationEvent));
         }
@@ -6833,7 +7707,9 @@ export async function installPassiveRequestGuard(
           returnByValue: true,
         });
       })();
-      const outcome = await awaitBeforeDeadline(read, Date.now() + WRITE_STAGE_CHARSET_READ_TIMEOUT_MS);
+      // L12b（設計書 `2026-11-09-beaksight-remove-limits-design.md` 6.2。T34 の送り手の側）: 前の 2 秒の上限は
+      // 撤廃し、1 回のブラウザの呼び出しを見放す長さ（L0 の反応なしの長さ `PROGRESS_WATCH_QUIET_LIMIT_MS`。書き込みの入力の部品の 1 手と同じ）だけ待つ。
+      const outcome = await awaitBeforeDeadline(read, Date.now() + PROGRESS_WATCH_QUIET_LIMIT_MS);
       if (outcome.status !== 'FULFILLED' || documentChanged || outcome.value.exceptionDetails !== undefined) {
         return;
       }
@@ -6858,6 +7734,12 @@ export async function installPassiveRequestGuard(
     // OP-M: 止めた、承認した送信のほかの要求の一覧。目印は、この段で入れる生成した値（API は鍵ごとの値、form は送る欄の値）。送り先の区分は、許可 Origin
     // （テスト環境）→ 承認したサービスの Origin（監査の段の承認したサービスの Origin と、承認した API の Origin）→ 許可の外、の順に決める。
     const writeStageState = writeStageStateOf(writeStage.monitor);
+    // LU-9・LU-12a（設計書 5.3 の 2）: 前の値を後から入れる印のある期待だけ、送り方の前の値の口を開く（写しの期待。入れるのは窓を開く前の 1 回だけ）。
+    if (writeStage.expectation.deferredPriorValues !== undefined) {
+      writeStageState.deferredPrior = writeStage.transport === API_SCENARIO_TRANSPORT
+        ? { transport: API_SCENARIO_TRANSPORT, deferred: writeStage.expectation, supplied: null }
+        : { transport: FORM_SCENARIO_TRANSPORT, deferred: writeStage.expectation, supplied: null };
+    }
     const writeStageMarkers = writeStage.transport === API_SCENARIO_TRANSPORT
       ? Object.values(writeStage.expectation.values).filter((value): value is string => value !== null)
       : writeStage.expectation.submittedFields.map(({ value }) => value);
@@ -6909,26 +7791,12 @@ export async function installPassiveRequestGuard(
    * EL-F2（EL-R2 の N3）: listener の組は、page の組と同じ登録（`listenerCleanups.pages`）と上限（`MAX_GUARD_PAGE_LISTENER_GROUPS`）で数え、上限を超えたら
    * page の組と同じく `GUARD_LISTENER_GROUP_LIMIT_REACHED` で Context を閉じる。ポップアップが閉じたら、listener を外し session を切る。
    */
-  /** page と凍結の後のポップアップの listener の組が、上限（`MAX_GUARD_PAGE_LISTENER_GROUPS`）に届いた（違反は 1 回だけ記録し、Context を閉じる）。 */
-  const reportListenerGroupLimitReached = (): void => {
-    if (!guardState.listenerCleanups.pageGroupLimitReported) {
-      guardState.listenerCleanups.pageGroupLimitReported = true;
-      ledger.recordInvariantViolation({
-        code: 'GUARD_LISTENER_GROUP_LIMIT_REACHED',
-        message: 'Guard page/CDP listener cleanup group limit reached',
-      });
-    }
-    initiateInvalidation(context, ledger);
-  };
   const watchFrozenPopupExternalNavigation = (page: Page): void => {
     // 閉じる途中（無効化を含む）は付けない（ポップアップは Context と一緒に閉じる。page の組と同じ扱い）。
     if (guardState.listenerCleanups.pages.has(page) || isClosingOrInvalidatingPhase(guardState.phase) || guardState.phase === 'CLOSED') {
       return;
     }
-    if (guardState.listenerCleanups.pages.size >= MAX_GUARD_PAGE_LISTENER_GROUPS) {
-      reportListenerGroupLimitReached();
-      return;
-    }
+    // L10（INV-LIMITS の N22）: listener の組の数の上限（前は `MAX_GUARD_PAGE_LISTENER_GROUPS` 64 で `GUARD_LISTENER_GROUP_LIMIT_REACHED`）は撤廃した。
     const listenerGroup: ListenerCleanupGroup = { active: true, cleanups: [] };
     guardState.listenerCleanups.pages.set(page, listenerGroup);
     const onPopupClose = (): void => releasePageListenerGroup(guardState, page);
@@ -6962,6 +7830,21 @@ export async function installPassiveRequestGuard(
       }
     });
   };
+  /**
+   * fix round 3（設計書 3.2.2 の 4）: route に来たナビゲーションの要求が、通知の枠の閉じる押下の期間に開いたポップアップ（CDP を付けていない page）のものか。
+   * 押す期間で、要求の page を引けないか、押す期間のポップアップの page のときに真。
+   */
+  const notificationPressPopups = new WeakSet<Page>();
+  const isNotificationPressPopupRequest = (request: Request): boolean => {
+    // REV-EV4: 領域のキーの押下の期間に開いたポップアップも同じ扱い。
+    if (guardState.notificationPress === null && !guardState.scrollKeyPress) return false;
+    try {
+      const requestPage = request.frame().page();
+      return notificationPressPopups.has(requestPage) || pageGuards.get(requestPage)?.status !== 'READY';
+    } catch {
+      return true;
+    }
+  };
   const onPage = (page: Page): void => {
     const phase = guardState.phase;
     if (isFrozenPhase(phase)) {
@@ -6979,13 +7862,27 @@ export async function installPassiveRequestGuard(
       initiateInvalidation(context, ledger);
       return;
     }
+    // fix round 3（設計書 3.2.2 の 4）: 通知の枠の閉じる押下の期間に開いたポップアップは、Guard が止めたポップアップとして記録して閉じる（Guard を付けない。違反に
+    // しない）。ポップアップの文書の要求は、route の層が止める（`isNotificationPressPopupRequest`）。
+    if (guardState.notificationPress !== null && !guardState.listenerCleanups.pages.has(page)) {
+      notificationPressPopups.add(page);
+      guardState.notificationPressNavigations = saturatingIncrement(guardState.notificationPressNavigations);
+      ledger.recordBlockedPopup({ url: page.url(), reason: NOTIFICATION_DISMISSAL_BLOCK_REASON });
+      void page.close().catch(() => undefined);
+      return;
+    }
+    // REV-EV4: 領域のキーの押下の期間に開いたポップアップも、Guard が止めたポップアップとして記録して閉じる（違反にしない）。
+    if (guardState.scrollKeyPress && !guardState.listenerCleanups.pages.has(page)) {
+      notificationPressPopups.add(page);
+      guardState.scrollKeyPressBlocks = saturatingIncrement(guardState.scrollKeyPressBlocks);
+      ledger.recordBlockedPopup({ url: page.url(), reason: SCROLL_KEY_PRESS_BLOCK_REASON });
+      void page.close().catch(() => undefined);
+      return;
+    }
     if (guardState.listenerCleanups.pages.has(page)) {
       return;
     }
-    if (guardState.listenerCleanups.pages.size >= MAX_GUARD_PAGE_LISTENER_GROUPS) {
-      reportListenerGroupLimitReached();
-      return;
-    }
+    // L10（INV-LIMITS の N22）: listener の組の数の上限（前は `MAX_GUARD_PAGE_LISTENER_GROUPS` 64 で `GUARD_LISTENER_GROUP_LIMIT_REACHED`）は撤廃した。
     const listenerGroup: ListenerCleanupGroup = { active: true, cleanups: [] };
     guardState.listenerCleanups.pages.set(page, listenerGroup);
     // Contextは acceptDownloads: false で作るので、ブラウザはダウンロードを保存しない。
@@ -6996,6 +7893,8 @@ export async function installPassiveRequestGuard(
         return;
       }
       const frozen = isFrozenPhase(downloadPhase);
+      // DEF-225: 凍結の前のダウンロードだけを、main frame の読み取りの移動の失敗と対応付けるために覚える（凍結の段の扱いは変えない）。
+      if (!frozen) passiveDownloads.record(page, download.url(), Date.now());
       ledger.recordBlockedDownload({
         url: download.url(),
         suggestedFilename: download.suggestedFilename(),
@@ -7009,6 +7908,12 @@ export async function installPassiveRequestGuard(
           try {
             await download.cancel();
           } catch (error) {
+            // DEF-225: Guard が Context を閉じ始めた後の、Context が消えた形の取り消しの失敗は、違反にしない（DEF-050 と同じ考え）。Context は
+            // `acceptDownloads: false` で作るので、Chromium が自分で取り消し、何も保存しない（`isDownloadCancelAfterContextGoneFailure` の根拠）。閉じる前の失敗と、
+            // ほかの形の失敗と、凍結の段の失敗は、今までどおり違反。
+            if (!frozen && isDownloadCancelAfterContextGoneFailure(errorMessage(error)) && hasContextCloseStarted(guardState)) {
+              return;
+            }
             ledger.recordInvariantViolation({
               code: frozen ? 'INTERACTION_DOWNLOAD_CANCEL_FAILED' : 'PASSIVE_DOWNLOAD_CANCEL_FAILED',
               message: errorMessage(error),
@@ -7023,15 +7928,37 @@ export async function installPassiveRequestGuard(
         recordFrozenPopup(popup);
       }
     };
-    const onFrameNavigated = (frame: Frame): void => {
-      if (isFrozenPhase(guardState.phase)) {
+    /** SREV-SAFE の I-3: この page の main frame の、直前の文書の URL（fragment を外した形。`#` だけの移動を見分ける）。 */
+    let previousMainFrameDocument: string | null = null;
+    const recordFrozenFrameNavigation = (url: string, mainFrame: boolean): void => {
+      const documentKey = frameDocumentKeyOf(url);
+      const sameDocument = mainFrame && previousMainFrameDocument === documentKey;
+      if (mainFrame) previousMainFrameDocument = documentKey;
+      // DEF-208-1: 凍結の段で通した文書（子の frame と、SREV-SAFE の I-3 から main frame の口で通した文書とそのリダイレクトの先）の移動は、止めた移動として記録しない。
+      // SREV-SAFE の I-3: 同じ文書の中の `#` だけの移動と、最初の about:blank も、止めた移動ではない（本当に止めた移動は、要求の層が止めた記録に残す）。
+      if (isFrozenPhase(guardState.phase) && !frozenFrameDocuments.has(documentKey) && !sameDocument && url !== 'about:blank') {
         ledger.recordBlockedInteractionNavigation({
           method: 'GET',
-          url: frame.url(),
+          url,
           reason: 'INTERACTION_FROZEN',
         });
       }
     };
+    /**
+     * SREV-SAFE の I-4: main frame の文書の替わりは、page の session の準備ができた後（`READY`）は、CDP の `Page.frameNavigated`（文書が替わったときだけ出る。同じ
+     * 文書の中の `pushState`・`replaceState`・`#` は `Page.navigatedWithinDocument` で、ここには来ない）で記録する（`blob:`・`data:` への移動も、ここで記録する）。
+     * 準備の前・失敗の間は、main frame も Playwright の事象で記録する（fail-closed）。
+     */
+    const onFrameNavigated = (frame: Frame): void => {
+      const mainFrame = frame === page.mainFrame();
+      if (mainFrame && pageGuards.get(page)?.status === 'READY') return;
+      recordFrozenFrameNavigation(frame.url(), mainFrame);
+    };
+    mainFrameDocumentObservers.set(page, (params: unknown, rootFrameId: string): void => {
+      const frame = isRecord(params) && isRecord(params.frame) ? params.frame : null;
+      if (frame === null || frame.id !== rootFrameId || typeof frame.url !== 'string') return;
+      recordFrozenFrameNavigation(frame.url + (typeof frame.urlFragment === 'string' ? frame.urlFragment : ''), true);
+    });
     try {
       page.on('download', onDownload);
       listenerGroup.cleanups.push(() => page.off('download', onDownload));
@@ -7066,6 +7993,29 @@ export async function installPassiveRequestGuard(
     return awaitMainFrameCancellation(correlation, closing ? 0 : CANCELED_DOCUMENT_EVIDENCE_WAIT_MS);
   };
   /**
+   * DEF-225: main frame の読み取りの移動 `request`（応答を受けた後に失敗したもの）が、同じ page・同じ URL の、Guard が凍結の前に止めたダウンロードの記録と
+   * 1 対 1 に対応付けられるか（`PassiveDownloadRegistry`）。応答（ヘッダ）を受けていない、応答を取り出せない、page の Guard の準備ができていない場合は、偽。
+   * 記録がまだなければ `PASSIVE_DOWNLOAD_EVIDENCE_WAIT_MS` まで待つ（実機では `requestfailed` が先に来る）。
+   */
+  const isMainFrameDownloadConfirmed = async (page: Page, request: Request): Promise<boolean> => {
+    if (pageGuards.get(page)?.status !== 'READY') {
+      return false;
+    }
+    let responded = false;
+    try {
+      responded = (await request.response()) !== null;
+    } catch {
+      // 応答の取り出しの失敗は、応答がないものとして扱う（違反のまま）。
+    }
+    if (!responded) {
+      return false;
+    }
+    // 失敗を受けた時点で閉じる途中なら、ここへは来ない（閉じる途中の `net::ERR_ABORTED` は、その前に違反にしない）。失敗の後に閉じ始めても（監査は、読み込みの
+    // 失敗を受けるとすぐに閉じる）、待ちを縮めない（ダウンロードの事象は失敗の数 ms 後に来る。待ちは閉じる処理の作業の待ち `GUARD_PENDING_TASK_DRAIN_TIMEOUT_MS`
+    // より短い）。
+    return passiveDownloads.awaitAndConsume(page, request.url(), PASSIVE_DOWNLOAD_EVIDENCE_WAIT_MS);
+  };
+  /**
    * DEF-113（Task 32 の設計書 4.4）: route に来たナビゲーションの要求が、Guard が CDP の session を付けた印（`pageGuards` の `READY`）のある
    * page のものでなければ、違反の文を返す（あれば `null`）。印のない page は、page を引けないもの（ポップアップの最初の要求は frame がまだない）、
    * 準備の途中のもの、準備に失敗したものである。frame の判定（`classifyMainFrame`）の成否には頼らない。
@@ -7089,9 +8039,9 @@ export async function installPassiveRequestGuard(
         if (expectedRouteFailures.has(request)) {
           return;
         }
-        const isMainFrame = classifyMainFrame(request, ledger);
+        // SAFE-2 の 4: frame を引けない失敗した要求は、frame の判定の失敗の記録に残す（違反にせず、Context も閉じない。要求はもう失敗している）。
+        const isMainFrame = classifyMainFrame(request, () => recordFrameClassificationFailureOf(request));
         if (isMainFrame === undefined) {
-          requestInvalidation();
           return;
         }
         let requestPage: Page | undefined;
@@ -7112,7 +8062,15 @@ export async function installPassiveRequestGuard(
             errorText: message,
           }, Date.now())) return;
         }
+        // DEF-213: ページが main frame を `blob:`・`data:` へ移そうとして失敗した（不正な blob の `net::ERR_FILE_NOT_FOUND` など）。要求はネットワークへ
+        // 出ていない（配送の失敗ではない）ので、`HTTP_MAIN_FRAME_DELIVERY_FAILED` の違反にしない（凍結の前後とも。Context は閉じない）。移動は失敗のまま
+        // 残る。http(s) の移動の失敗と、リダイレクトの続きの失敗は、今の判定のまま。
+        if (isMainFrame && request.isNavigationRequest() && isNetworkFreeMainFrameNavigationFailure(request)) {
+          return;
+        }
         if (isMainFrame && boundedCorrelationRequest(request.method(), request.url()) === null) {
+          // SAFE-2 の 4: 読み取りの失敗は、違反でなく読み取りの失敗の記録にする（Context は閉じない）。
+          if (recordReadNavigationFailureIfRead(request, message)) return;
           // DEF-145: 違反に、失敗した main frame の要求（method と URL。Ledger が Origin と path だけを残す）を付ける。
           ledger.recordInvariantViolation({
             code: HTTP_MAIN_FRAME_DELIVERY_FAILED_VIOLATION_CODE,
@@ -7170,6 +8128,20 @@ export async function installPassiveRequestGuard(
               return;
             }
           }
+          // DEF-225: 許可した読み取りのナビゲーションが、凍結の前に、応答（ヘッダ）を受けた後に `net::ERR_ABORTED` で失敗し、同じ page・同じ URL の、Guard が
+          // 止めたダウンロード（`PASSIVE_DOWNLOAD`。本文はページにも保存にも渡っていない）と 1 対 1 に対応付けられた場合は、Guard 自身が止めたことによる予期した
+          // 失敗で、Guard の違反ではない（Context は閉じない）。その page の読み込みの事実に印を付ける（監査はその画面を理由つきの読めなかった画面にする）。
+          // 対応付けられない場合（ダウンロードの記録がない、別の URL、記録を使い終えた、待っても来ない）は、これまでどおり違反とする（fail-closed）。
+          if (
+            !isFrozenPhase(guardState.phase)
+            && isReadMethod(request.method())
+            && message === NAVIGATION_ABORTED_ERROR_TEXT
+            && requestPage !== undefined
+            && await isMainFrameDownloadConfirmed(requestPage, request)
+          ) {
+            mainFrameNavigationStateOf(requestPage).mainFrameDownloadBlocked = true;
+            return;
+          }
           // DEF-027（設計書 `2026-10-05-beaksight-def-027-external-cancel-design.md` 2.1、2.1.1）: 許可した読み取りのナビゲーションが、
           // 凍結の前に `net::ERR_ABORTED` で失敗し、Guard の page の session の証拠で、その要求（page、method、URL で1対1に対応付けたもの）に
           // ついて、(a) Guard が Request の段階で許可して進めた、(b) 取り消しの証拠がある、(c) 応答（ヘッダ）を1つも受けていない（応答が
@@ -7185,8 +8157,11 @@ export async function installPassiveRequestGuard(
           ) {
             return;
           }
-          // DEF-145: 違反に、失敗した main frame の要求（method と URL。Ledger が Origin と path だけを残す）を付ける。probe の段の読み取りの移動の
-          // 取り消しかを、発見の流れが method で見分ける。
+          // SAFE-2 の 4（違反の区分の (3)。DEF-145 のとおり、届いたか分からない読み取り）: 読み取り（GET・HEAD）の main frame の移動の配送の失敗は、読み取りなので、
+          // 届いても届かなくても安全の決まりに反しない。違反にせず、読み取りの失敗の記録（`readNavigationFailures`）に残し、Context は閉じない。発見の流れは、
+          // この記録で probe の読み取りの移動の取り消しを見分ける（`probeRecordContinuationOf`）。
+          if (recordReadNavigationFailureIfRead(request, message)) return;
+          // DEF-145: 違反に、失敗した main frame の要求（method と URL。Ledger が Origin と path だけを残す）を付ける（読み取りでない要求）。
           ledger.recordInvariantViolation({
             code: HTTP_MAIN_FRAME_DELIVERY_FAILED_VIOLATION_CODE,
             message,
@@ -7216,10 +8191,10 @@ export async function installPassiveRequestGuard(
         return;
       }
       const url = request.url();
-      // popup（`window.open`）の navigation は frame ができる前に出るので、frame の種類が分からない（`classifyMainFrame` が、frame の分類の失敗
-      // `FRAME_CLASSIFICATION_FAILED` を記録する）。
+      // popup（`window.open`）の navigation は frame ができる前に出るので、frame の種類が分からない（`classifyMainFrame` の失敗を、frame の判定の失敗の
+      // 記録 `frameClassificationFailures` に残す。SAFE-2 の 4: 違反にしない）。
       recordExternalSchemeNavigationAttempt('REQUEST', url, () => {
-        const isMainFrame = classifyMainFrame(request, ledger);
+        const isMainFrame = classifyMainFrame(request, () => recordFrameClassificationFailureOf(request));
         return isMainFrame === undefined ? undefined : isMainFrame ? 'MAIN' : 'SUB';
       }, null);
     } catch (error) {
@@ -7245,15 +8220,111 @@ export async function installPassiveRequestGuard(
     await context.addInitScript({ content: connectPolicy === WORKER_CONNECT_POLICY ? WORKER_CONNECT_POLICY_INIT_SCRIPT : connectPolicyInitScriptOf(connectPolicy) });
     // DEF-049: 同じく、すべての文書で、Service Worker の登録の入口を塞ぐ（`SERVICE_WORKER_REGISTRATION_BLOCK_INIT_SCRIPT`）。
     await context.addInitScript({ content: SERVICE_WORKER_REGISTRATION_BLOCK_INIT_SCRIPT });
-    // DEF-124: 同じく、すべての文書で、WebRTC の入口を塞ぐ（`WEBRTC_BLOCK_INIT_SCRIPT`）。STUN・TURN・ICE の通信は、Guard の route も CDP の
-    // 横取りも通らないためである。Passive・Interaction・ログインの段・監査の段・書き込みの段のすべての Context に付く（どれも、この Guard を付ける）。
-    await context.addInitScript({ content: WEBRTC_BLOCK_INIT_SCRIPT });
+    // DEF-124: 凍結しうる Context（Isolated Interaction Context と、送らずに観察する probe の口のある PRIMARY の Passive の Context。`admitsFrozenReads`）だけ、
+    // すべての文書で、WebRTC の入口を塞ぐ（`WEBRTC_BLOCK_INIT_SCRIPT`）。STUN・TURN・ICE の通信は、Guard の route も CDP の横取りも出口の中継の凍結も通らず、
+    // 押した後の凍結を迂回しうるためである。RB-4b（設計書 3.2 の X6）: ほかの Context は、サイト自身のリアルタイムの通信として止めない。
+    if (admitsFrozenReads(options)) {
+      await context.addInitScript({ content: WEBRTC_BLOCK_INIT_SCRIPT });
+    }
     context.on('page', onPage);
     guardState.listenerCleanups.context.cleanups.push(() => context.off('page', onPage));
     context.on('requestfailed', onRequestFailed);
     guardState.listenerCleanups.context.cleanups.push(() => context.off('requestfailed', onRequestFailed));
     context.on('request', onRequest);
     guardState.listenerCleanups.context.cleanups.push(() => context.off('request', onRequest));
+
+    /** DEF-276-relay: 中継の握手のときの User-Agent（Context で 1 つ。読めなければ送らない）。 */
+    let relayUserAgent: Promise<string> | undefined;
+    /** REV-DEF276 の M-1: ブラウザの User-Agent（CDP の `Browser.getVersion`。ページから読まない。Context で 1 回だけ読む。読めなければ送らない）。 */
+    const browserUserAgentOf = async (): Promise<string> => {
+      const session = await context.browser()?.newBrowserCDPSession();
+      if (session === undefined) return '';
+      try {
+        const version = await session.send('Browser.getVersion');
+        return version.userAgent;
+      } finally {
+        await session.detach().catch(() => undefined);
+      }
+    };
+    /** 読めない URL の frame と、http(s) でない frame は数えない。 */
+    const httpOriginOf = (frame: Frame): string | null => {
+      try {
+        const location = new URL(frame.url());
+        return isHttpProtocol(location.protocol) ? location.origin : null;
+      } catch {
+        return null;
+      }
+    };
+    /**
+     * DEF-276-relay（REV-DEF276 の I-1）: 中継の握手のヘッダ。開いている page の main frame と、そのほかの frame の Origin、宛先の URL で読んだ Cookie、ブラウザの
+     * User-Agent を集め、決め方は `relayHandshakeHeadersOf`（websocket-relay.ts）に任せる。
+     */
+    const relayHeadersOf = async (url: string): Promise<Record<string, string>> => {
+      const pages = context.pages().filter((page) => !page.isClosed());
+      const mainFrameOrigins = pages.flatMap((page) => httpOriginOf(page.mainFrame()) ?? []);
+      const frameOrigins = pages.flatMap((page) => page.frames().filter((frame) => frame !== page.mainFrame()).flatMap((frame) => httpOriginOf(frame) ?? []));
+      // Cookie は、同じ場所の http(s) の URL で読む（ws と http は同じ Cookie を使う）。
+      const cookies = await context.cookies(url.replace(/^ws/u, 'http'));
+      relayUserAgent ??= browserUserAgentOf().catch(() => '');
+      return relayHandshakeHeadersOf({ url, mainFrameOrigins, frameOrigins, cookies, userAgent: await relayUserAgent });
+    };
+    /**
+     * DEF-276-relay: route が通した文書の WebSocket を、Node の側の中継でつなぐ（握手を待ってから route の処理を終える。ページの `open` は、握手が成った後）。
+     * 握手に失敗したら、ページには失敗（code 1006）として閉じる。成ったら、送り手の扱いの口があれば通した接続として記録する（ブラウザは接続を開かないので、
+     * 観察 `recordObservedWebSocket` には来ない）。凍結と閉じでは `freezeEgress` が切る。凍結の後のページの送りは、サーバへ渡さない。
+     */
+    const relayDocumentWebSocket = async (webSocketRoute: WebSocketRoute, relay: GuardWebSocketRelay): Promise<void> => {
+      const url = webSocketRoute.url();
+      const handshake = new AbortController();
+      const cutHandshake = (): void => handshake.abort();
+      guardState.webSocketRelayCuts.add(cutHandshake);
+      let opened: RelayedWebSocket | undefined;
+      try {
+        // ヘッダを作る間（Cookie と User-Agent の読み）も、握手の上限で区切る。
+        const headers = await awaitBeforeDeadline(relayHeadersOf(url), Date.now() + WEBSOCKET_RELAY_HANDSHAKE_TIMEOUT_MS);
+        if (headers.status !== 'FULFILLED') throw new Error('WebSocket relay headers are unavailable');
+        opened = await openRelayedWebSocket({
+          url,
+          proxy: relay.proxy,
+          headers: headers.value,
+          protocols: webSocketRoute.protocols(),
+          handshakeTimeoutMs: WEBSOCKET_RELAY_HANDSHAKE_TIMEOUT_MS,
+          maxSendQueueBytes: WEBSOCKET_RELAY_MAX_SEND_QUEUE_BYTES,
+          additionalTrustedCertificates: relay.additionalTrustedCertificates,
+          signal: handshake.signal,
+        });
+      } catch {
+        opened = undefined;
+      } finally {
+        guardState.webSocketRelayCuts.delete(cutHandshake);
+      }
+      const live = (): boolean => !isFrozenPhase(guardState.phase) && !isClosingOrInvalidatingPhase(guardState.phase) && guardState.phase !== 'CLOSED';
+      if (opened === undefined || handshake.signal.aborted || !live()) {
+        opened?.destroy();
+        await webSocketRoute.close({ code: WEBSOCKET_ABNORMAL_CLOSE_CODE, reason: '' }).catch(() => undefined);
+        return;
+      }
+      const server = opened;
+      const cut = (): void => server.destroy();
+      guardState.webSocketRelayCuts.add(cut);
+      webSocketRoute.onMessage((message) => {
+        if (live()) server.send(message);
+      });
+      webSocketRoute.onClose((code, reason) => server.close(code, reason ?? ''));
+      server.onMessage((data) => webSocketRoute.send(data));
+      server.onClose((code, reason, cause) => {
+        guardState.webSocketRelayCuts.delete(cut);
+        // REV-DEF276 の M-2: 送りの列が上限を超えて切った接続は、止めた WebSocket として記録する（理由 `WEBSOCKET_SEND_QUEUE_FULL`）。
+        if (cause === 'SEND_QUEUE_FULL') {
+          ledger.recordBlockedWebSocket({ url, reason: 'WEBSOCKET_SEND_QUEUE_FULL', phase: blockedEventPhaseOf(guardState.phase, null) });
+        }
+        void webSocketRoute.close({ code, reason }).catch(() => undefined);
+      });
+      if (webSocketAuditSendAdmission !== undefined) {
+        const policy = requestPolicyOf(undefined, auditExclusions, auditReadAdmission?.cdpPolicy(), webSocketAuditSendAdmission.webSocketPolicy()) ?? {};
+        ledger.recordPassedAuditSendWebSocket({ url, outsideGuard: false, dangerous: isAuditSendDangerousWebSocket(url, policy) });
+      }
+    };
 
     await context.routeWebSocket(/.*/, (webSocketRoute) => runGuardProtocolTask(
       guardState, 'WebSocket route callback', 'GUARD_WEBSOCKET_ROUTE_TASK_FAILED', async (requestInvalidation) => {
@@ -7296,14 +8367,36 @@ export async function installPassiveRequestGuard(
         // AS-c: 監査の段の送信の扱いの口があれば、WebSocket の残りの数つきの口で判定する（監査の段の口と除外の口も渡す。送信の段の口は渡さない。
         // 送信の段と一緒の口は、Guard の取り付けで拒んである）。口がなければ、今の判定（`PASSIVE_WEBSOCKET`）。
         // OP-N: 書き込みの段では、送信の扱いの口を WebSocket に使わない（`webSocketAuditSendAdmission`）。
-        const webSocketPolicy = webSocketAuditSendAdmission === undefined
-          ? undefined
+        // L12a: 書き込みの段で送信の扱いの口があれば、書き込みの段の口（押した後の扱いを含む）で判定する（押した後だけ通す）。
+        const writeStageWebSocketPolicy = webSocketAuditSendAdmission === undefined && writeStage !== undefined && auditSendAdmission !== undefined
+          ? requestPolicyOf(submissionAdmission?.cdpStagePolicy(), auditExclusions)
+          : undefined;
+        const baseWebSocketPolicy = webSocketAuditSendAdmission === undefined
+          ? writeStageWebSocketPolicy
           : requestPolicyOf(undefined, auditExclusions, auditReadAdmission?.cdpPolicy(), webSocketAuditSendAdmission.webSocketPolicy());
+        // RB-4b: リアルタイムの通信を止めない指定があれば、その口を足す（送信の扱いの口がない READ_ONLY と、書き込みの段の押す前でも通す）。
+        const webSocketPolicy = realtimePassThrough
+          ? withRealtimePassThrough(
+            baseWebSocketPolicy ?? requestPolicyOf(submissionAdmission?.cdpStagePolicy(), auditExclusions, auditReadAdmission?.cdpPolicy()),
+          )
+          : baseWebSocketPolicy;
         const decision = classifyPassiveRequest({ kind: 'WEBSOCKET', url: webSocketRoute.url() }, authoritySnapshot, webSocketPolicy);
-        if (decision.action === 'ALLOW' && decision.auditSendWebSocketAdmission === true && webSocketAuditSendAdmission !== undefined) {
-          // 数えてから、ページの接続をサーバへつなぐ（以後の送受信は、ページとサーバの間でそのまま渡す。記録しない）。接続は出口の中継を通る。
+        if (
+          decision.action === 'ALLOW'
+          && decision.auditSendWebSocketAdmission === true
+          && (webSocketAuditSendAdmission !== undefined || writeStageWebSocketPolicy !== undefined || realtimePassThrough)
+        ) {
+          // ページの接続をサーバへつなぐ（以後の送受信は、ページとサーバの間でそのまま渡す。記録しない）。接続は出口の中継を通る。
           // AS-c fix round 1（C-1・C-2）: 記録は、ブラウザが実際に開いた接続の観察（`recordObservedWebSocket`）で残す。ここでは、route が通したことだけを残す。
-          webSocketAuditSendAdmission.admitWebSocket();
+          // L12a: 書き込みの段の押した後は数えず、承認した送信のほかの送信として、通した一覧に記録する。
+          if (writeStage !== undefined) {
+            recordWriteStagePassedRequest(writeStage.monitor, {
+              method: WEBSOCKET_HANDSHAKE_METHOD,
+              url: webSocketRoute.url(),
+              resourceType: WEBSOCKET_RESOURCE_TYPE,
+              body: (): RequestBodyText => NO_BODY_TEXT,
+            });
+          }
           // DEF-125: 出口の中継に、この接続の宛先を知らせる（Chromium は ws(s) を中継の CONNECT で通す。知らせのない宛先は中継が拒む）。
           if (egressDestinationHook !== undefined) {
             try {
@@ -7311,6 +8404,11 @@ export async function installPassiveRequestGuard(
             } catch (error) {
               ledger.recordInvariantViolation({ code: 'GUARD_EGRESS_ADMISSION_FAILED', message: errorMessage(error) });
             }
+          }
+          // DEF-276-relay: 文書の CSP が ws を止める Context（操作さがしの PRIMARY）では、ページの中で接続できないので、Node の側で中継する。
+          if (options.webSocketRelay !== undefined && connectPolicy === WORKER_CONNECT_POLICY) {
+            await relayDocumentWebSocket(webSocketRoute, options.webSocketRelay);
+            return;
           }
           try {
             webSocketRoute.connectToServer();
@@ -7320,7 +8418,10 @@ export async function installPassiveRequestGuard(
             return;
           }
           // AS-c fix round 2（I-C）: `connectToServer()` を呼んだ後に、照らし合わせの時間（`AUDIT_SEND_WEBSOCKET_MATCH_WINDOW_MS`）の締め切りを置く。
-          admitRouteWebSocket(webSocketRoute.url());
+          // L12a: 書き込みの段（観察を付けない）では置かない。
+          if (webSocketAuditSendAdmission !== undefined) {
+            admitRouteWebSocket(webSocketRoute.url());
+          }
           return;
         }
         if (decision.action === 'ALLOW') {
@@ -7368,8 +8469,22 @@ export async function installPassiveRequestGuard(
         // 動作と記録は、CDP の層と同じ `decideGuardRequest` で決める。ここは、その結果に従って route の命令を送る。
         const request = route.request();
         const isNavigationRequest = request.isNavigationRequest();
+        // fix round 3（設計書 3.2.2 の 4）: 通知の枠の閉じる押下の期間に開いたポップアップの文書の要求は、Guard が止めた要求として止める（CDP の付いていない page の
+        // 違反 `PASSIVE_GUARD_PAGE_NOT_READY` にしない）。止めたポップアップは `onPage` が記録する。
+        if (guardState.phase === 'PASSIVE_ACTIVE' && isNavigationRequest && isNotificationPressPopupRequest(request)) {
+          expectedRouteFailures.add(request);
+          try {
+            await route.abort('blockedbyclient');
+          } catch (error) {
+            ledger.recordInvariantViolation({ code: 'HTTP_ABORT_FAILED', message: errorMessage(error) });
+            requestInvalidation();
+          }
+          return;
+        }
         let routePolicy: PassiveRequestPolicyOptions | undefined;
         let isMainFrame = false;
+        /** SAFE-2 の 4: frame の判定に失敗した要求か（止めるが、Context は閉じない）。 */
+        let frameUnclassified = false;
         // T36R-fix（T36R の C-1）: 自動ログインの資格情報の守りで比べる、この要求に付く Cookie とヘッダ（判定の前に読む。部品がなければ、待たずに読まない）。
         const cookies = credentialGuard === undefined ? NO_COOKIES : await cookieTextsFor(request.url());
         const routeHeaders = credentialGuard === undefined ? undefined : request.headers();
@@ -7380,8 +8495,43 @@ export async function installPassiveRequestGuard(
           request: { method: request.method(), url: request.url() },
           navigation: isNavigationRequest,
           unguardedPageNavigation: isNavigationRequest ? unguardedPageNavigationOf(request) : null,
+          // DEF-208-1: 凍結の段の読み取り。CDP の付いた page（`pageGuards` の `READY`）の要求だけ（凍結の段のポップアップと、page を引けない要求は今どおり止める）。
+          // 凍結の読み取りを通す Guard だけ（`admitsFrozenReads`）。
+          ...(!frozenReadsAdmitted ? {} : {
+            frozenRead: ({ method, url }: GuardRequestIdentity): boolean => {
+              let isMainFrameRequest: boolean;
+              try {
+                const frame = request.frame();
+                const framePage = frame.page();
+                if (pageGuards.get(framePage)?.status !== 'READY') return false;
+                isMainFrameRequest = frame === framePage.mainFrame();
+              } catch {
+                return false;
+              }
+              // COV-2c（C-1）: CDP の層と同じく、通した main frame の文書の要求のリダイレクトの先へ、口の行き先を移す。
+              if (isNavigationRequest) followFrozenMainFrameDocumentRedirect(request.redirectedFrom()?.url(), url, isMainFrameRequest);
+              const frozenFacts = {
+                method,
+                url,
+                isNavigationRequest,
+                isMainFrame: isMainFrameRequest,
+                resourceType: requestResourceTypeOfRequest(request),
+                sentContent: requestSentContentOf(request),
+              };
+              const frozenPolicy = routeRequestPolicy(method, url);
+              // DEF-233: サイトの token の更新も、CDP の層と同じ部品で見る（本文は Playwright の要求の本文。要るときだけ読む）。
+              return (isFrozenReadAdmissible({ kind: 'HTTP', ...frozenFacts }, authoritySnapshot, frozenPolicy)
+                && frozenNonReadAllowedHere(method, url, () => requestBodyTextOfBuffer(request.postDataBuffer())))
+                || frozenTokenRefreshAdmitted(frozenFacts, frozenPolicy, () => requestBodyTextOfBuffer(request.postDataBuffer()), request.headers())
+                // COV-2c（C-1）: 呼ぶ側が指定した行き先への main frame の文書の移動（CDP の層と同じ部品）。
+                || frozenMainFrameDocumentAdmitted(frozenFacts, frozenPolicy);
+            },
+          }),
           evaluate: ({ method, url }): GuardPolicyOutcome => {
-            const mainFrame = classifyMainFrame(request, ledger);
+            const mainFrame = classifyMainFrame(request, () => {
+              frameUnclassified = true;
+              recordFrameClassificationFailureOf(request);
+            });
             if (mainFrame === undefined) return { kind: 'UNAVAILABLE' };
             isMainFrame = mainFrame;
             routePolicy = routeRequestPolicy(method, url);
@@ -7407,7 +8557,8 @@ export async function installPassiveRequestGuard(
           },
         });
         // DEF-125: 通した要求の宛先を、中継に知らせる（命令を送る前。CDP の付いていない page の要求も、ここで知らせる）。
-        admitEgressDestinationOf(verdict);
+        admitEgressDestinationOf(verdict, 'ROUTE');
+        withdrawEgressDestinationOf(verdict);
         recordGuardVerdictBeforeBlock(ledger, verdict);
         if (verdict.kind === 'BLOCK_FROZEN') {
           expectedRouteFailures.add(request);
@@ -7433,8 +8584,9 @@ export async function installPassiveRequestGuard(
         }
         if (verdict.kind === 'BLOCK_INVALID' || verdict.kind === 'BLOCK_UNAVAILABLE' || verdict.kind === 'FULFILL_PREFLIGHT') {
           // 段階の誤り、CDP の付いていない page のナビゲーション（DEF-113）、frame の判定の失敗。route に CORS の事前確認は来ない（来ない結果）。
+          // SAFE-2 の 4: frame の判定の失敗だけは、要求を止めて記録し（`frameClassificationFailures`）、Context は閉じない（違反にしない）。
           expectedRouteFailures.add(request);
-          await abortUnreadyNavigation(requestInvalidation, route, ledger);
+          await abortUnreadyNavigation(verdict.kind === 'BLOCK_UNAVAILABLE' && frameUnclassified ? () => undefined : requestInvalidation, route, ledger);
           return;
         }
         if (verdict.kind === 'BLOCK_POLICY') {
@@ -7462,8 +8614,6 @@ export async function installPassiveRequestGuard(
           auditReadAdmission.consumeAtRoute(verdict.request.method, verdict.request.url);
         }
         if (auditSendAdmission !== undefined && verdict.decision.auditSendAdmission === true) {
-          // AS-a: 監査の段の送信の扱いの口が通した要求も、CDP の層が置いた印を 1 つ使う（この層では数えない）。
-          auditSendAdmission.consumeAtRoute(verdict.request.method, verdict.request.url);
           // AS-c fix round 1（M-3）: 通した要求の記録は、ブラウザが送る時点（ここで進める）に残す。
           recordPassedAuditSendRequest(verdict.request.method, verdict.request.url);
         }

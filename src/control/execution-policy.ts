@@ -21,9 +21,9 @@
 // - MI-5（設計書 `2026-10-26-beaksight-minimal-input-ux-design.md` 3 章のユーザーの判断 1（2026-10-26。書き込みにも使うプロファイルで、読み取りの監査も
 //   できるようにする。プロファイルを 1 つにする）、4.5、5 章）: 認証つきの監査（`AUDIT`）を、書き込みのモードでもログインを使う方式で許す。監査のジョブの
 //   送信の扱いは、プロファイルのモードでなくジョブの種類で決まる（ワーカー・Run の流れ・Safety・Browser はモードを見ない）ので、書き込みのモードでも
-//   監査は読み取りだけ（`tests/integration/write-mode-audit-read-only.test.ts`）。書き込みは、今までどおりシナリオの承認と実行の許可の後だけ。
+//   監査は読み取りだけ（`tests/unit/audit-send-settings.test.ts`。SLIM W-3 で結合から置き換えた）。書き込みは、今までどおりシナリオの承認と実行の許可の後だけ。
 import { deepFreeze } from '../core/immutable.js';
-import type { AuditMode, AuthStrategy } from './contracts.js';
+import { NO_LOGIN_AUTH_STRATEGY, type AuditMode, type AuthStrategy } from './contracts.js';
 import type { AuditJobStartRejectionReason } from './job/job-records.js';
 import type { WorkerJobKind } from './worker-protocol.js';
 
@@ -58,6 +58,12 @@ const AUTH_STRATEGY_NOT_EXECUTABLE = 'AUTH_STRATEGY_NOT_EXECUTABLE' satisfies Pr
 
 /** ログインを使う方式（手動のログインと自動ログイン）。 */
 const LOGIN_STRATEGIES = ['MANUAL_SESSION', 'AUTOMATED_LOGIN'] as const satisfies readonly AuthStrategy[];
+/**
+ * ログインを使う方式と、ログインしない方式（NL-1。設計書 `2026-11-06-beaksight-no-login-test-site-design.md` 3.1 の 3）。テストの 2 つのモードの、
+ * ログインの要らない操作（監査・発見・READ の確かめ・シナリオ・書き込み・入口の確かめ）で使う。ログインしない方式のプロファイルを保存できるのは、
+ * `approvedTestOrigins` がすべて loopback のときだけ（`profile-policy.ts`）。
+ */
+const LOGIN_OR_NO_LOGIN_STRATEGIES = [...LOGIN_STRATEGIES, NO_LOGIN_AUTH_STRATEGY] as const satisfies readonly AuthStrategy[];
 /** 自動ログインの方式だけ（ログインの確かめと資格情報）。 */
 const AUTOMATED_LOGIN_ONLY = ['AUTOMATED_LOGIN'] as const satisfies readonly AuthStrategy[];
 
@@ -68,22 +74,23 @@ const AUTOMATED_LOGIN_ONLY = ['AUTOMATED_LOGIN'] as const satisfies readonly Aut
  */
 export const PROFILE_OPERATION_POLICY: Readonly<Record<ProfileOperation, Readonly<Partial<Record<AuditMode, readonly AuthStrategy[]>>>>> = deepFreeze({
   // MI-5（ユーザーの判断 2026-10-26。プロファイルを 1 つにする）: 書き込みのモードでも、読み取りの監査を許す（監査のジョブは読み取りだけ）。
-  AUDIT: { PUBLIC_PASSIVE: ['NONE'], TEST_AUTH_PASSIVE: LOGIN_STRATEGIES, TEST_APPROVED_WRITE: LOGIN_STRATEGIES },
+  // NL-1: テストの 2 つのモードは、ログインしない方式（`NONE`）も受ける。認証の設定・資格情報・ログインの確かめの行には足さない（ログインをしない）。
+  AUDIT: { PUBLIC_PASSIVE: ['NONE'], TEST_AUTH_PASSIVE: LOGIN_OR_NO_LOGIN_STRATEGIES, TEST_APPROVED_WRITE: LOGIN_OR_NO_LOGIN_STRATEGIES },
   // 公開の監査のプロファイルのログインの確かめは、方式の理由で拒む（T26d-2 から変えない）。
   LOGIN_CHECK: { PUBLIC_PASSIVE: [], TEST_AUTH_PASSIVE: AUTOMATED_LOGIN_ONLY, TEST_APPROVED_WRITE: AUTOMATED_LOGIN_ONLY },
-  DISCOVERY: { TEST_AUTH_PASSIVE: LOGIN_STRATEGIES, TEST_APPROVED_WRITE: LOGIN_STRATEGIES },
-  READ_CHECK: { TEST_AUTH_PASSIVE: LOGIN_STRATEGIES, TEST_APPROVED_WRITE: LOGIN_STRATEGIES },
+  DISCOVERY: { TEST_AUTH_PASSIVE: LOGIN_OR_NO_LOGIN_STRATEGIES, TEST_APPROVED_WRITE: LOGIN_OR_NO_LOGIN_STRATEGIES },
+  READ_CHECK: { TEST_AUTH_PASSIVE: LOGIN_OR_NO_LOGIN_STRATEGIES, TEST_APPROVED_WRITE: LOGIN_OR_NO_LOGIN_STRATEGIES },
   AUTH_SETUP: { TEST_AUTH_PASSIVE: LOGIN_STRATEGIES, TEST_APPROVED_WRITE: LOGIN_STRATEGIES },
   CREDENTIAL: { TEST_AUTH_PASSIVE: AUTOMATED_LOGIN_ONLY, TEST_APPROVED_WRITE: AUTOMATED_LOGIN_ONLY },
   // T28e fix round 1: 書き込みのシナリオ（作成・変更・承認）は、書き込みのモードだけ（発見と同じ方式。書き込みは実行しない）。
-  SCENARIO: { TEST_APPROVED_WRITE: LOGIN_STRATEGIES },
+  SCENARIO: { TEST_APPROVED_WRITE: LOGIN_OR_NO_LOGIN_STRATEGIES },
   // T30e: 書き込みのジョブ（承認された CREATE）は、書き込みのモードで、ログインを使う方式だけ（Task 30 の設計書 3 章）。
-  WRITE_CREATE: { TEST_APPROVED_WRITE: LOGIN_STRATEGIES },
+  WRITE_CREATE: { TEST_APPROVED_WRITE: LOGIN_OR_NO_LOGIN_STRATEGIES },
   // T31e fix round 1: 更新の書き込みのジョブ（承認された UPDATE）も、書き込みのモードで、ログインを使う方式だけ（Task 31 の設計書 3 章。CREATE と同じ）。
-  WRITE_UPDATE: { TEST_APPROVED_WRITE: LOGIN_STRATEGIES },
+  WRITE_UPDATE: { TEST_APPROVED_WRITE: LOGIN_OR_NO_LOGIN_STRATEGIES },
   // T43c: 入口の確かめは、公開のモードは認証なし、テストの 2 つのモードはログインを使う方式（ログインはしない。認証の設定がなくても始められる。
   // `AUTH_SETUP_FREE_OPERATIONS`）。
-  ENTRY_CHECK: { PUBLIC_PASSIVE: ['NONE'], TEST_AUTH_PASSIVE: LOGIN_STRATEGIES, TEST_APPROVED_WRITE: LOGIN_STRATEGIES },
+  ENTRY_CHECK: { PUBLIC_PASSIVE: ['NONE'], TEST_AUTH_PASSIVE: LOGIN_OR_NO_LOGIN_STRATEGIES, TEST_APPROVED_WRITE: LOGIN_OR_NO_LOGIN_STRATEGIES },
 });
 
 /**
@@ -146,12 +153,17 @@ export const isExecutableAuthStrategy = (mode: unknown, auth: unknown): boolean 
  */
 export const AUTH_SETUP_REQUIRED_AUDIT_MODES: readonly AuditMode[] = deepFreeze(Object.keys(PROFILE_OPERATION_POLICY.AUTH_SETUP) as AuditMode[]);
 
-/** 開始の前に、有効な認証の設定が要るモードか。 */
-export const requiresAuthSetup = (mode: unknown): boolean => strategiesOf('AUTH_SETUP', mode) !== undefined;
+/**
+ * 開始の前に、有効な認証の設定が要るプロファイルか（モードと認証の方式）。NL-1（設計書 3.1 の 4）: ログインしない方式（`NONE`）なら、どのモードでも
+ * 要らない。それ以外の方式の値（一覧にない値を含む）は、今までどおりモードで決める（fail-closed。一覧にない方式で、認証の設定を省かない）。
+ */
+export const requiresAuthSetup = (mode: unknown, auth: unknown): boolean =>
+  auth !== NO_LOGIN_AUTH_STRATEGY && strategiesOf('AUTH_SETUP', mode) !== undefined;
 
 /**
  * その操作に、有効な認証の設定が要るか（T28b）。操作の行にあるモードで、認証の設定が要るモードのときだけ真（開始の画面が、ログインの案内を出すかに
- * 使う。MI-5 から、書き込みのモードの監査も真）。T43c: 認証の設定が要らない操作（`AUTH_SETUP_FREE_OPERATIONS`）は、どのモードでも偽。
+ * 使う。MI-5 から、書き込みのモードの監査も真）。T43c: 認証の設定が要らない操作（`AUTH_SETUP_FREE_OPERATIONS`）は、どのモードでも偽。NL-1: ログインしない
+ * 方式（`NONE`）のプロファイルも、どの操作でも偽（`requiresAuthSetup`）。
  */
-export const operationRequiresAuthSetup = (operation: ProfileOperation, mode: unknown): boolean =>
-  !isAuthSetupFreeOperation(operation) && strategiesOf(operation, mode) !== undefined && requiresAuthSetup(mode);
+export const operationRequiresAuthSetup = (operation: ProfileOperation, mode: unknown, auth: unknown): boolean =>
+  !isAuthSetupFreeOperation(operation) && strategiesOf(operation, mode) !== undefined && requiresAuthSetup(mode, auth);

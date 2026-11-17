@@ -8,15 +8,13 @@
 //   手続きの呼び出し（送信の扱いで通した、サイトが自動で送る読み取りの手続き）だけ。詳細の画面は読まない。
 // - OP-REV6 の I-1: 一覧の画面には前の登録が並ぶので、期待は実行のたびに違う値になる欄（`uniqueEachRunFieldNamesOf`。ここはメール）と比べる。人の名前と比べる
 //   期待では、書き込みの指定を作らない（前の登録と同じ名前が一覧にあり、新しい登録が一覧にまだ出ていなくても、`VERIFIED` と報告しない）。
-// - 書き込みの安全のテストなので、テストの既定の Chromium と CLI の起動の設定の両方で、順に確かめる（同時には動かさない）。
+// - Chromium はテストの既定だけ（承認の外の送信が届かないことは、Guard の結合 `guard-api-write-stage.test.ts` が 2 つの Chromium で確かめる）。
 // 届いたかは fixture の記録で数える。各場面の後に数え、全部の場面の後に名前つきの時間だけ待って数え直す。出力先は一時のフォルダだけ。
 import { readFileSync } from 'node:fs';
 import { mkdir, mkdtemp, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import type { Browser } from 'playwright';
 import { afterAll, afterEach, beforeAll, describe, expect, it } from 'vitest';
-import { wait as sleep } from '../../src/core/deadline.js';
 import { loadConfig } from '../../src/config/load-config.js';
 import type { ActionRunDocument } from '../../src/control/actions/action-contracts.js';
 import { autoDraftReadCheckChoiceOf } from '../../src/control/approval/api-scenario-autodraft.js';
@@ -41,15 +39,13 @@ import { executeWriteCreateRun } from '../../src/worker/write-create-run.js';
 import { sampleApprovalFacts } from '../helpers/approval-facts-sample.js';
 import { createApiCreateScenario, discoverSpaMemberScreens, spaApiWriteConfigOf, spaRunAuthenticationOf } from '../helpers/api-write-scenario.js';
 import { FORM_NAVIGATION_SETUP_ITEMS } from '../helpers/auth-setup-samples.js';
-import { launchCliChromium, launchHeadlessChromium } from '../helpers/chromium.js';
+import { DEFAULT_CHROMIUM_LAUNCHERS, launchHeadlessChromium } from '../helpers/chromium.js';
 import { READ_METHODS } from '../helpers/leak-places.js';
 import { cliTargetConfig } from '../helpers/run-harness.js';
 import { SPA_APP_PATHS, SPA_BACKEND_PATHS, SPA_MEMBER_LIST_PATH, startSpaAuthSite, type SpaAuthSite } from '../helpers/spa-auth-site-fixture.js';
+import { settleLateDeliveries } from '../helpers/loopback-server.js';
+import { TEST_OBSERVATION_WINDOWS } from '../helpers/test-waits.js';
 
-const LAUNCHERS: readonly (readonly [string, () => Promise<Browser>])[] = [
-  ['the default test Chromium', () => launchHeadlessChromium()],
-  ['the CLI Chromium', () => launchCliChromium()],
-];
 const SUITE_TIMEOUT_MS = 300_000;
 const TEST_TIMEOUT_MS = 120_000;
 /** 読み込みの最小の間隔（ms。ループバックの fixture なので短くする）。 */
@@ -58,8 +54,6 @@ const NAVIGATION_INTERVAL_MS = 300;
 const RESULT_TIMEOUT_MS = 5_000;
 /** 全部の場面の後に、遅れて届く要求を見逃さないために待つ時間（ms）。 */
 const LATE_DELIVERY_SETTLE_MS = 1_500;
-/** 自動の下書きの、定義の数の上限（テストの値。上限に当たらない数）。 */
-const MAX_TEST_DEFINITIONS = 10;
 const PROFILE_ID = 'example-op-r';
 const SCENARIO_ID = 'scenario-api-create-list';
 const READ_CHECK_ID = 'rc-api-list';
@@ -123,7 +117,7 @@ beforeAll(async () => {
   const document = await discoverSpaMemberScreens(site, join(directory, 'discovery'), () => launchHeadlessChromium());
   // 本番の自動の下書きの選び方（データのない形の推しの登録。点検の段のリンクに、一覧の画面と登録の画面がある）。
   const choice = autoDraftReadCheckChoiceOf({
-    createPagePath: SPA_APP_PATHS.memberNew, readPagePaths: discoveryReadPagePaths(document), definitions: [], maxDefinitions: MAX_TEST_DEFINITIONS,
+    createPagePath: SPA_APP_PATHS.memberNew, readPagePaths: discoveryReadPagePaths(document), definitions: [],
     withoutData: true, auditLinkPaths: [SPA_APP_PATHS.admin, SPA_MEMBER_LIST_PATH, SPA_APP_PATHS.memberNew],
   });
   if (choice.kind === 'NOT_INFERRED') throw new Error('no READ page was chosen');
@@ -188,7 +182,7 @@ afterAll(async () => {
   if (directory !== '') await rm(directory, { recursive: true, force: true });
 }, SUITE_TIMEOUT_MS);
 
-describe.each(LAUNCHERS)('OP-R (R1): the verification READ of an API create on the list page with %s', (label, launch) => {
+describe.each(DEFAULT_CHROMIUM_LAUNCHERS)('OP-R (R1): the verification READ of an API create on the list page with %s', (label, launch) => {
   let expectedPosts = 0;
   let expectedOtherNonReads = 0;
   let postsBefore = 0;
@@ -205,7 +199,8 @@ describe.each(LAUNCHERS)('OP-R (R1): the verification READ of an API create on t
   });
 
   afterAll(async () => {
-    await sleep(LATE_DELIVERY_SETTLE_MS);
+    // TEST-TIME-B（案 9）: どの回も Browser を閉じた後なので、受けている途中の要求が 0 になってから短い余白だけ待つ（上限は前の固定の待ち）。
+    await settleLateDeliveries(LATE_DELIVERY_SETTLE_MS, site);
     expect(memberPosts() - postsBefore).toBe(expectedPosts);
     expect(nonReads() - nonReadsBefore).toBe(expectedPosts + expectedOtherNonReads);
   }, TEST_TIMEOUT_MS);
@@ -230,6 +225,7 @@ describe.each(LAUNCHERS)('OP-R (R1): the verification READ of an API create on t
       recheck: () => Promise.resolve(ALLOWED),
       reportSubmission: () => undefined,
       resultTimeoutMs: RESULT_TIMEOUT_MS,
+      observationWindows: TEST_OBSERVATION_WINDOWS,
     }, { onRunStarted: () => undefined, onSessionLost: () => undefined });
     site.setMemberSaveResponse(null);
     if (outcome.kind !== 'RAN') throw new Error(`the write flow did not run: ${outcome.kind}`);
@@ -281,15 +277,12 @@ describe.each(LAUNCHERS)('OP-R (R1): the verification READ of an API create on t
     }
   }, TEST_TIMEOUT_MS);
 
-  // 読み取りだけ（`READ_ONLY`）なら、今どおり、一覧の手続きの呼び出しも止める（届かない。確かめられないので `VERIFIED` にしない）。端末の負荷を抑えるため、テストの
-  // 既定の Chromium だけで確かめる。
-  if (label === LAUNCHERS[0]?.[0]) {
-    it(`does not claim the verification when the data procedure call of the list page is stopped with READ_ONLY (${label})`, async () => {
-      const run = await runWrite('READ_ONLY');
-      expectedPosts += 1;
-      expect(run.document).toMatchObject({ submission: 'SENT', responseJudgement: 'SUCCESS' });
-      expect(run.document.result).not.toBe('VERIFIED');
-      expect(backendRequests(run.since, 'POST', SPA_BACKEND_PATHS.rpcListMembers)).toBe(0);
-    }, TEST_TIMEOUT_MS);
-  }
+  // 読み取りだけ（`READ_ONLY`）なら、今どおり、一覧の手続きの呼び出しも止める（届かない。確かめられないので `VERIFIED` にしない）。
+  it(`does not claim the verification when the data procedure call of the list page is stopped with READ_ONLY (${label})`, async () => {
+    const run = await runWrite('READ_ONLY');
+    expectedPosts += 1;
+    expect(run.document).toMatchObject({ submission: 'SENT', responseJudgement: 'SUCCESS' });
+    expect(run.document.result).not.toBe('VERIFIED');
+    expect(backendRequests(run.since, 'POST', SPA_BACKEND_PATHS.rpcListMembers)).toBe(0);
+  }, TEST_TIMEOUT_MS);
 });

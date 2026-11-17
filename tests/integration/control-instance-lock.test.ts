@@ -17,6 +17,7 @@ import { MIN_PROFILE_REVISION } from '../../src/control/contracts.js';
 import { createAuditJobManager, type AuditJobManager, type AuditJobTiming } from '../../src/control/job/audit-job-manager.js';
 import {
   CONTROL_INSTANCE_ALREADY_RUNNING,
+  CONTROL_INSTANCE_STALE_AFTER_MS,
   ControlInstanceLockedError,
   readControlInstanceLock,
   releaseControlInstanceLock,
@@ -24,7 +25,7 @@ import {
 import { closeControlDatabase, openControlDatabase, type ControlDatabase } from '../../src/control/store/control-database.js';
 import { resolveControlDatabasePath } from '../../src/control/store/database-path.js';
 import { createProfile } from '../../src/control/store/profile-store.js';
-import { RUN_LOCK_STALE_AFTER_MS, currentProcessRunLockHost, isProcessRunning } from '../../src/core/process-lock.js';
+import { currentProcessRunLockHost, isProcessRunning } from '../../src/core/process-lock.js';
 import { writeFakeWorker, type FakeWorker, type FakeWorkerValues } from '../helpers/fake-audit-worker.js';
 import { fakeWorkerValuesOf } from '../helpers/job-test-support.js';
 import { INSTANCE_CHILD_PROTOCOL, startInstanceChild, type InstanceChild } from './control-instance-fixtures.js';
@@ -183,7 +184,7 @@ const workerPidOf = (profileId: string): number => {
 const stallInstanceLock = (): void => {
   const raw = new DatabaseSync(databasePath);
   try {
-    raw.prepare('UPDATE control_instance SET heartbeat_at_ms = ?').run(Date.now() - RUN_LOCK_STALE_AFTER_MS - WAIT_LIMIT_MS);
+    raw.prepare('UPDATE control_instance SET heartbeat_at_ms = ?').run(Date.now() - CONTROL_INSTANCE_STALE_AFTER_MS - WAIT_LIMIT_MS);
   } finally {
     raw.close();
   }
@@ -309,7 +310,7 @@ describe('the control instance lock: stale locks, concurrency, release', () => {
   it.each([
     ['a dead process', (): { processId: number; heartbeatAtMs: number } => ({ processId: deadProcessId(), heartbeatAtMs: Date.now() })],
     ['a running process whose heartbeat is too old', (): { processId: number; heartbeatAtMs: number } => ({
-      processId: process.pid, heartbeatAtMs: Date.now() - RUN_LOCK_STALE_AFTER_MS - WAIT_LIMIT_MS,
+      processId: process.pid, heartbeatAtMs: Date.now() - CONTROL_INSTANCE_STALE_AFTER_MS - WAIT_LIMIT_MS,
     })],
   ] as const)('takes over a stale lock of %s, and marks the unfinished job INTERRUPTED', async (_name, lockOf) => {
     writeLeftovers(lockOf());

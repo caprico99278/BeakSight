@@ -4,16 +4,19 @@
  * - 画面のサーバは、発見のジョブの終わりに、ワーカーが書いた `discovery.json` を `validateArtifact('discovery')` で確かめる（ジョブの管理）。
  *   検証は chunk の場所から `../../schemas/` を読むので、ビルドの出力に、成果物のスキーマ（`schemas/*.schema.json`）と、それが参照する Control の
  *   スキーマ（`schemas/control/`）が写っていなければならない（`build-tools/control-schemas-plugin.ts`）。
- * - 一時の root（`createTemporaryUiRoot('built')`。リポジトリの外）に写したビルドの出力の chunk を、別の Node の process で import し、検証の関数を
- *   呼ぶ（画面のサーバは起動しない）。chunk の中の検証の関数の名前は、chunk の export の一覧（`validateArtifact as <名前>`）から読む。
- * 先に `npm run build:ui` と `npm run build` が要る（`createTemporaryUiRoot` が確かめる）。
+ * - リポジトリのビルドの出力の chunk を（RB-7: 写さずに）、別の Node の process で import し、検証の関数を呼ぶ（画面のサーバは起動しない）。chunk の
+ *   中の検証の関数の名前は、chunk の export の一覧（`validateArtifact as <名前>`）から読む。
+ * 先に `npm run build:ui` が要る。
  */
 import { spawnSync } from 'node:child_process';
 import { readFileSync, readdirSync } from 'node:fs';
 import { pathToFileURL } from 'node:url';
-import { afterAll, beforeAll, describe, expect, it } from 'vitest';
+import { describe, expect, it } from 'vitest';
 import { DISCOVERY_ARTIFACT_SCHEMA_VERSION } from '../../../src/discovery/discovery-result.js';
-import { createTemporaryUiRoot, type TemporaryUiRoot } from './helpers/local-server';
+import { REPO_ROOT } from './helpers/local-server';
+
+/** ビルドした画面の出力（`apps/local-ui/dist`）。 */
+const BUILT_UI_DIRECTORY = `${REPO_ROOT}/apps/local-ui/dist`;
 
 /** chunk の export の一覧の、検証の関数の項目（`validateArtifact as <名前>`）。 */
 const VALIDATE_ARTIFACT_EXPORT = /\bvalidateArtifact as ([A-Za-z_$][\w$]*)/u;
@@ -37,7 +40,7 @@ process.stdout.write(JSON.stringify(results));
 /** 成果物の検証の名前（`ArtifactSchemaName`）のすべて。 */
 // T43c: 入口の確かめの成果物（`entry-check`。ジョブの管理と画面が、ワーカーの書いた `entry-check.json` を確かめる）を足した。
 const ARTIFACT_SCHEMA_NAMES = [
-  'run', 'audit', 'page', 'finding', 'checkpoint', 'checkpoint-page', 'site-unavailable-diagnostic', 'discovery', 'entry-check',
+  'run', 'audit', 'page', 'finding', 'checkpoint', 'checkpoint-page', 'discovery', 'entry-check',
 ] as const;
 
 const DISCOVERY_DOCUMENT = Object.freeze({
@@ -65,19 +68,9 @@ interface ChildResult {
 }
 
 describe('T27d round 2: the artifact schema validation in the built UI server', () => {
-  let root: TemporaryUiRoot | undefined;
-
-  beforeAll(() => {
-    root = createTemporaryUiRoot('built');
-  });
-
-  afterAll(() => {
-    root?.remove();
-  });
-
-  /** 一時の root のビルドの出力の chunk で、値を検証する。 */
+  /** ビルドの出力の chunk で、値を検証する。 */
   const validateInBuiltChunk = (values: readonly (readonly [string, unknown])[]): readonly ChildResult[] => {
-    const assets = `${root?.root ?? ''}/apps/local-ui/dist/server/assets`;
+    const assets = `${BUILT_UI_DIRECTORY}/server/assets`;
     const chunks = readdirSync(assets)
       .filter((name) => name.endsWith('.js'))
       .flatMap((name) => {
@@ -94,7 +87,7 @@ describe('T27d round 2: the artifact schema validation in the built UI server', 
       pathToFileURL(`${assets}/${chunk?.name ?? ''}`).href,
       chunk?.exportName ?? '',
       JSON.stringify(values),
-    ], { cwd: root?.root, encoding: 'utf8' });
+    ], { encoding: 'utf8' });
     expect(child.status, child.stderr).toBe(0);
     return JSON.parse(child.stdout) as readonly ChildResult[];
   };
@@ -114,5 +107,19 @@ describe('T27d round 2: the artifact schema validation in the built UI server', 
       schemaName,
       result: expect.objectContaining({ ok: false }) as unknown,
     })));
+  });
+
+  // T27f（SLIM-GROUP UI-1 で画面のサーバを起こすテストから移した。ビルドの出力を読むだけ）: ブラウザのバンドル（`dist/client`）に、サーバの部品
+  // （SQL、`node:` の部品）が入らない。
+  it('has no SQL, node: modules or server-only names in dist/client', () => {
+    const clientDirectory = `${BUILT_UI_DIRECTORY}/client`;
+    const files = readdirSync(clientDirectory, { recursive: true, encoding: 'utf8' }).filter((path) => path.endsWith('.js'));
+    expect(files.length).toBeGreaterThan(0);
+    const text = files.map((path) => readFileSync(`${clientDirectory}/${path}`, 'utf8')).join('\n');
+    for (const marker of ['discovery_candidates', 'discovery_jobs', 'read_check_results', 'FROM read_checks', 'SELECT ']) {
+      expect(text.includes(marker), marker).toBe(false);
+    }
+    // Node の部品の指定子（文言の中の「node:sqlite」などの語は数えない。引用符で囲まれた指定子だけ）。
+    expect(text.match(/["'`]node:[a-z/_]+["'`]/gu) ?? []).toEqual([]);
   });
 });

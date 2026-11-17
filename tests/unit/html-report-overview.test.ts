@@ -261,4 +261,12 @@ describe('renderHtmlReport: the planned writes after the audit stage (OP-H)', ()
       expect(renderHtmlReport(model)).not.toContain(escapeHtml(PLANNED));
     }
   });
+
+  // WSO: 「チェックした画面だけ」の点検の Run（`run.json` の `pageScope`）は、まとめの段に点検した範囲を 1 行で言う。サイトの全部の画面の Run は言わない。
+  it('says in the overview that only the checked screens were inspected, from the scope of the Run', () => {
+    const line = HTML_REPORT_TEXT.overview.checkedScreensOnly('2');
+    const scoped = buildReportViewModel({ ...auditRun(), run: { ...auditRun().run, pageScope: { kind: 'CHECKED_WRITE_SCREENS', pageCount: 2 } } });
+    expect(overviewOf(renderHtmlReport(scoped))).toContain(escapeHtml(line));
+    expect(renderHtmlReport(buildReportViewModel(auditRun()))).not.toContain(escapeHtml(line));
+  });
 });

@@ -14,9 +14,6 @@ import {
 } from '../../src/control/auth/auth-setup-contracts.js';
 import { FORM_NAVIGATION_SETUP_ITEMS, previousVersionSetupDocumentOf } from '../helpers/auth-setup-samples.js';
 import {
-  MAX_WORKER_APPROVED_SERVICE_ORIGINS,
-  MAX_WORKER_APPROVED_TEST_ORIGINS,
-  MAX_WORKER_NOTICE_URL_LENGTH,
   WORKER_AUTHENTICATION_SHA256_PATTERN,
   WORKER_AUTH_STATES,
   WORKER_FAILURE_REASONS,
@@ -28,7 +25,6 @@ import {
   validateWorkerToParentMessage,
   workerAuthenticationDigestOf,
 } from '../../src/control/worker-protocol.js';
-import { MAX_APPROVED_SERVICE_ORIGINS } from '../../src/control/contracts.js';
 
 const SCHEMA = JSON.parse(readFileSync(resolve(process.cwd(), 'schemas', 'control', 'worker-message.schema.json'), 'utf8')) as Record<string, unknown>;
 
@@ -108,7 +104,7 @@ describe('worker protocol (T25d): the authenticated START', () => {
     const result = validateParentToWorkerMessage(message);
     expect(result).toEqual({ ok: true, message });
     if (result.ok && result.message.type === 'START') {
-      expect(Object.isFrozen(result.message.authentication?.setup.loginPostEndpoints[0])).toBe(true);
+      expect(Object.isFrozen(result.message.authentication?.setup?.loginPostEndpoints[0])).toBe(true);
       expect(Object.isFrozen(result.message.authentication?.approvedTestOrigins)).toBe(true);
     }
   });
@@ -123,6 +119,12 @@ describe('worker protocol (T25d): the authenticated START', () => {
       automatedLogin: AUTOMATED_LOGIN,
     });
     expect(validateParentToWorkerMessage(message)).toEqual({ ok: true, message });
+  });
+
+  // LZ-3a: 承認したテストの Origin の件数の上限（前は 100）はない。
+  it('accepts more approved test origins than the former limit', () => {
+    const origins = [ORIGIN, ...Array.from({ length: 100 }, (_, index) => `http://127.0.0.2:${1000 + index}`)];
+    expect(validateParentToWorkerMessage(startWith(authenticationOf(SETUP, origins))).ok).toBe(true);
   });
 
   it('still accepts a START without authentication (the public audit)', () => {
@@ -148,7 +150,6 @@ describe('worker protocol (T25d): the authenticated START', () => {
     ['an approved origin that is not canonical', authenticationOf(SETUP, [`${ORIGIN}/`])],
     ['an approved origin that is not http(s)', authenticationOf(SETUP, ['ftp://127.0.0.1'])],
     ['duplicated approved origins', authenticationOf(SETUP, [ORIGIN, ORIGIN])],
-    ['too many approved origins', authenticationOf(SETUP, Array.from({ length: MAX_WORKER_APPROVED_TEST_ORIGINS + 1 }, (_, index) => `http://127.0.0.${index % 250}:${1000 + index}`))],
     ['a login page outside the approved origins', authenticationOf({ ...SETUP, loginStartUrl: `${OTHER_ORIGIN}/login` })],
     ['a login endpoint outside the approved origins', authenticationOf({ ...SETUP, loginPostEndpoints: [{ origin: OTHER_ORIGIN, path: '/login' }] })],
     ['a digest in upper case', { ...authenticationOf(), authenticationSha256: SHA256.toUpperCase() }],
@@ -176,8 +177,9 @@ describe('worker protocol (T25d): AUTH_STATE', () => {
     expect(validateWorkerToParentMessage(message)).toEqual({ ok: true, message });
   });
 
-  it('accepts SESSION_LOST with the URL of the page, up to the limit', () => {
-    for (const url of [`${ORIGIN}/admin/second`, 'u'.repeat(MAX_WORKER_NOTICE_URL_LENGTH)]) {
+  // URL-LEN: 前の上限（2,048）より長い URL も受ける。
+  it('accepts SESSION_LOST with the URL of the page of any length', () => {
+    for (const url of [`${ORIGIN}/admin/second`, `${ORIGIN}/${'u'.repeat(2_049)}`]) {
       const message = authState(WORKER_SESSION_LOST_STATE, url);
       expect(validateWorkerToParentMessage(message)).toEqual({ ok: true, message });
     }
@@ -187,7 +189,6 @@ describe('worker protocol (T25d): AUTH_STATE', () => {
     ['an unknown state', authState('LOGGED_IN', null)],
     ['SESSION_LOST without a URL', authState(WORKER_SESSION_LOST_STATE, null)],
     ['AUTHENTICATED with a URL', authState('AUTHENTICATED', `${ORIGIN}/admin`)],
-    ['a URL that is too long', authState(WORKER_SESSION_LOST_STATE, 'u'.repeat(MAX_WORKER_NOTICE_URL_LENGTH + 1))],
     ['a URL with a line break', authState(WORKER_SESSION_LOST_STATE, `${ORIGIN}/a\nb`)],
     ['a URL with a lone surrogate', authState(WORKER_SESSION_LOST_STATE, `${ORIGIN}/\ud800`)],
     ['an empty URL', authState(WORKER_SESSION_LOST_STATE, '')],
@@ -217,13 +218,16 @@ describe('worker protocol (T25d): value lists and the schema', () => {
   });
 
   it('has the limits and the patterns of the schema', () => {
-    expect(pointerValue(SCHEMA, '/$defs/authState/properties/sessionLostUrl/anyOf/0/maxLength')).toBe(MAX_WORKER_NOTICE_URL_LENGTH);
     expect(pointerValue(SCHEMA, '/$defs/startAuthentication/properties/authenticationSha256/pattern')).toBe(WORKER_AUTHENTICATION_SHA256_PATTERN.source);
-    expect(pointerValue(SCHEMA, '/$defs/startAuthentication/properties/approvedTestOrigins/maxItems')).toBe(MAX_WORKER_APPROVED_TEST_ORIGINS);
+    // LZ-3a: 承認したテストの Origin の件数の上限（前は 100）は撤廃した。
+    expect(pointerValue(SCHEMA, '/$defs/startAuthentication/properties/approvedTestOrigins/maxItems')).toBeUndefined();
     // T26b・LG-3b: `START` の認証の設定は版 3 だけ（親と子は同じビルドなので、前の版との互換は要らない）。サービスの Origin の上限は、プロファイルの
     // 上限と同じ。
-    expect(pointerValue(SCHEMA, '/$defs/startAuthentication/properties/setup')).toEqual({ $ref: 'urn:beaksight:schema:control:auth-setup:3' });
-    expect(pointerValue(SCHEMA, '/$defs/startAuthentication/properties/approvedServiceOrigins/maxItems')).toBe(MAX_WORKER_APPROVED_SERVICE_ORIGINS);
+    // NL-2: ログインのないテスト用のサイトは、認証の設定の代わりに null（ほかの値は受けない）。
+    expect(pointerValue(SCHEMA, '/$defs/startAuthentication/properties/setup/anyOf'))
+      .toEqual([{ $ref: 'urn:beaksight:schema:control:auth-setup:3' }, { type: 'null' }]);
+    // L11（設計書 `2026-11-09-beaksight-remove-limits-design.md` 4）で直した: サービスの Origin の件数の上限は撤廃した（プロファイルと同じ）。
+    expect(pointerValue(SCHEMA, '/$defs/startAuthentication/properties/approvedServiceOrigins/maxItems')).toBeUndefined();
   });
 });
 
@@ -253,13 +257,16 @@ describe('worker protocol (T34a): the authenticated START with an auth setup of 
   it('accepts a START with a script login setup and the service origins, and keeps the form navigation digest', () => {
     const message = startWith(scriptAuthentication());
     expect(validateParentToWorkerMessage(message)).toEqual({ ok: true, message });
+    // L11・LZ-3a: サービスの Origin の件数の上限はない（前の「too many service origins」の場面は、件数ではなく token の送信先がサービスの Origin にない
+    // ことで拒まれていた。その不一致は「a script target outside the service origins」の場面で確かめる）。
+    const many = [SERVICE_ORIGIN, ...Array.from({ length: 5 }, (_, index) => `http://127.0.0.1:${6000 + index}`)];
+    expect(validateParentToWorkerMessage(startWith(scriptAuthentication(SCRIPT_SETUP, many))).ok).toBe(true);
     // フォームの送信の版 3 は、サービスの Origin なしでも受ける。
     const formSetup = { ...SCRIPT_SETUP, loginPostEndpoints: [{ origin: ORIGIN, path: '/login' }], loginTransport: 'FORM_NAVIGATION',
       scriptLogin: null, loginSideRequests: [], successStorageKey: null } as AuthSetup;
     expect(validateParentToWorkerMessage(startWith(authenticationOf(formSetup))).ok).toBe(true);
     // フォームの送信の設定の SHA-256（LG-3b: 見本を版 2 から版 3 に替えた後の値。前の版 2 の見本の値は `e5ac4b39…` だった）。
     expect(workerAuthenticationDigestOf(SETUP, [ORIGIN], MANUAL_BINDING)).toBe('807fe35d8ebbf8494ab8fc64d1de267a97581fbb74501ddf8796a35f26345678');
-    expect(MAX_WORKER_APPROVED_SERVICE_ORIGINS).toBe(MAX_APPROVED_SERVICE_ORIGINS);
   });
 
   it.each([
@@ -274,8 +281,6 @@ describe('worker protocol (T34a): the authenticated START with an auth setup of 
     ['a service origin that is not canonical', scriptAuthentication(SCRIPT_SETUP, [`${SERVICE_ORIGIN}/`])],
     ['a service origin that is also a test origin', scriptAuthentication(SCRIPT_SETUP, [SERVICE_ORIGIN, ORIGIN])],
     ['duplicated service origins', scriptAuthentication(SCRIPT_SETUP, [SERVICE_ORIGIN, SERVICE_ORIGIN])],
-    ['too many service origins', scriptAuthentication(SCRIPT_SETUP,
-      Array.from({ length: MAX_APPROVED_SERVICE_ORIGINS + 1 }, (_, index) => `http://127.0.0.1:${6000 + index}`))],
     ['a script setup with a value in the storage key', scriptAuthentication({ ...SCRIPT_SETUP,
       successStorageKey: { origin: ORIGIN, prefix: 'sb-', suffix: '-auth-token', value: 'x' } } as unknown as AuthSetup)],
   ] as const)('rejects a version 3 START with %s', (_name, authentication) => {
@@ -298,11 +303,16 @@ describe('worker protocol (T34a): the authenticated START with an auth setup of 
   it.each([
     ['a read request outside the approved origins', { auditReadRequests: [{ ...READ, origin: OTHER_ORIGIN }] }],
     ['a read request with GET', { auditReadRequests: [{ ...READ, method: 'GET' }] }],
-    ['a read request over the limit per page load', { auditReadRequests: [{ ...READ, maxPerPageLoad: 11 }] }],
-    // DEF-141: 1 回の Run あたりの上限は 10,000 まで（前は 600 まで）。
-    ['a limit per Run over the maximum', { serviceRequestLimits: { ...LIMITS, perRun: 10_001 } }],
   ] as const)('rejects a version 3 START with %s', (_name, change) => {
     expect(validateParentToWorkerMessage(startWith(scriptAuthentication({ ...SCRIPT_SETUP, ...change } as AuthSetup))).ok).toBe(false);
+  });
+
+  // L11（設計書 `2026-11-09-beaksight-remove-limits-design.md` 4）で直した: 1 回の読み込みあたりの回数の最大と、要求の上限の最大は撤廃した（前は拒んだ）。
+  it.each([
+    ['a read request over the earlier limit per page load', { auditReadRequests: [{ ...READ, maxPerPageLoad: 11 }] }],
+    ['a limit per Run over the earlier maximum', { serviceRequestLimits: { ...LIMITS, perRun: 10_001 } }],
+  ] as const)('accepts a version 3 START with %s (L11)', (_name, change) => {
+    expect(validateParentToWorkerMessage(startWith(scriptAuthentication({ ...SCRIPT_SETUP, ...change } as AuthSetup))).ok).toBe(true);
   });
 });
 

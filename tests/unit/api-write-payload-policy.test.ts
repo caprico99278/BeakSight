@@ -7,11 +7,10 @@
 // - Guard の要約の理由の鍵（`WRITE_STAGE_PAYLOAD_BLOCK_REASONS`）は、form の照合と API の照合の理由を重ねずに合わせた一覧。
 import { describe, expect, it } from 'vitest';
 import type { ScenarioApiSpec } from '../../src/control/approval/scenario-contracts.js';
-import { MAX_API_REQUEST_BODY_BYTES, apiRequestShapeOf } from '../../src/core/api-request-shape.js';
+import { apiRequestShapeOf } from '../../src/core/api-request-shape.js';
 import {
   API_WRITE_PAYLOAD_BLOCK_REASONS,
   API_WRITE_PAYLOAD_DECISIONS,
-  MAX_API_WRITE_BODY_BYTES,
   WRITE_STAGE_PAYLOAD_BLOCK_REASONS,
   checkApiWritePayload,
   type ApiWriteCheckSpec,
@@ -147,7 +146,6 @@ describe('T39a: the closed lists of the API write payload check', () => {
     ]);
     expect(API_WRITE_PAYLOAD_BLOCK_REASONS).toEqual(API_WRITE_PAYLOAD_DECISIONS.slice(1));
     expect(Object.isFrozen(API_WRITE_PAYLOAD_DECISIONS)).toBe(true);
-    expect(MAX_API_WRITE_BODY_BYTES).toBe(65_536);
   });
 
   it('joins the form reasons and the API reasons once each, the form reasons first, for the Guard summary keys', () => {
@@ -236,10 +234,6 @@ describe('T39R-fix (M-5): the shape maker and the check read the headers and the
       expect(checkApiWritePayload(expectation, createFacts(withHeaders({ ...HEADERS, 'Content-Type': value }))).decision).toBe('ALLOW');
     },
   );
-
-  it('has the one body limit of the shape maker and the check', () => {
-    expect(MAX_API_WRITE_BODY_BYTES).toBe(MAX_API_REQUEST_BODY_BYTES);
-  });
 });
 
 /** 表の 1 行: 名前、期待（既定は CREATE）、要求の事実の差、理由。 */
@@ -288,7 +282,9 @@ const BLOCKED: readonly BlockRow[] = [
   ['no Prefer', createExpectation(), createFacts(withoutHeader('Prefer')), 'PREFER_MISMATCH'],
   // 本文の形
   ['no body', createExpectation(), createFacts({ body: null }), 'BODY_UNAVAILABLE'],
-  ['a body over the limit', createExpectation(), createFacts({ body: new Uint8Array(MAX_API_WRITE_BODY_BYTES + 1).fill(0x20) }), 'BODY_TOO_LARGE'],
+  // L12b（設計書 `2026-11-09-beaksight-remove-limits-design.md` 6.2。S18）: 大きさの上限（前は `BODY_TOO_LARGE`）を撤廃した。大きな本文も読んで照合にかける
+  // （空白だけの本文は、形の誤り）。
+  ['a body over the former limit (L12b)', createExpectation(), createFacts({ body: new Uint8Array(65_537).fill(0x20) }), 'BODY_MALFORMED'],
   ['broken JSON', createExpectation(), createFacts(withBody('{"name":')), 'BODY_MALFORMED'],
   ['trailing text after the object', createExpectation(), createFacts(withBody(`${BODY_TEXT} x`)), 'BODY_MALFORMED'],
   ['two objects', createExpectation(), createFacts(withBody(`${BODY_TEXT}${BODY_TEXT}`)), 'BODY_MALFORMED'],

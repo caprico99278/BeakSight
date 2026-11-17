@@ -6,6 +6,7 @@ import {
   AUDIT_MODES,
   AUTH_STRATEGIES,
   ENVIRONMENT_KINDS,
+  NO_LOGIN_AUTH_STRATEGY,
   type AuditMode,
   type AuthStrategy,
   type EnvironmentKind,
@@ -43,7 +44,6 @@ import type {
   SideEffectConfirmation,
 } from '../../../../src/control/approval-view.js';
 import type { ScenarioDisplayState } from './scenarios';
-import type { WriteChainState, WriteChainStopReason } from '../server/write-chain-policy';
 import type { ChainStageState, ChainState, ChainStopReason } from '../../../../src/control/job/stage-chain-policy.js';
 import type {
   ExternalDeliveryKind,
@@ -72,8 +72,6 @@ import {
   RESPONSE_JUDGEMENT_CATALOG,
   SCENARIO_TRANSPORT_CATALOG,
   SCENARIO_VERIFICATION_ITEM_CATALOG,
-  WRITE_CHAIN_STATE_CATALOG,
-  WRITE_CHAIN_STOP_REASON_CATALOG,
   STAGE_CHAIN_STATE_CATALOG,
   STAGE_CHAIN_STAGE_STATE_CATALOG,
   STAGE_CHAIN_STOP_REASON_CATALOG,
@@ -118,6 +116,7 @@ import {
   CREDENTIAL_ENVIRONMENT_CATALOG,
   AUDIT_JOB_STATE_CATALOG,
   AUDIT_MODE_CATALOG,
+  AUDIT_MODE_NO_LOGIN_CATALOG,
   AUTH_SETUP_FRESHNESS_CATALOG,
   LOGIN_TRANSPORT_CATALOG,
   ENTRY_CHECK_END_REASON_CATALOG,
@@ -142,7 +141,14 @@ export interface DisplayValue {
 /** プロファイルの状態（`src/control/store/profile-records.ts` の `PROFILE_STATUSES` の値）。 */
 export type ProfileStatusValue = keyof typeof PROFILE_STATUS_CATALOG;
 
-export const auditModeDisplay = (mode: AuditMode): DisplayValue => AUDIT_MODE_CATALOG[mode];
+/**
+ * 点検のしかた（監査モード）の表示。NL-3（設計書 `2026-11-06-beaksight-no-login-test-site-design.md` 3.3 の 4）: モードと方式の組から決める（表示面ごとに
+ * 作り直さない）。ログインのないテスト用のサイト（ログインしない方式で、`AUDIT_MODE_NO_LOGIN_CATALOG` にあるテストのモード）は、ログインの語のない表示。
+ */
+export const auditModeDisplay = (mode: AuditMode, auth: AuthStrategy): DisplayValue =>
+  auth === NO_LOGIN_AUTH_STRATEGY && Object.hasOwn(AUDIT_MODE_NO_LOGIN_CATALOG, mode)
+    ? AUDIT_MODE_NO_LOGIN_CATALOG[mode as keyof typeof AUDIT_MODE_NO_LOGIN_CATALOG]
+    : AUDIT_MODE_CATALOG[mode];
 export const environmentDisplay = (environment: EnvironmentKind): DisplayValue => ENVIRONMENT_KIND_CATALOG[environment];
 export const authStrategyDisplay = (auth: AuthStrategy): DisplayValue => AUTH_STRATEGY_CATALOG[auth];
 export const profileStatusDisplay = (status: ProfileStatusValue): DisplayValue => PROFILE_STATUS_CATALOG[status];
@@ -307,10 +313,6 @@ export const settledReservationStateDisplay = (state: SettledReservationState): 
 export const scenarioVerificationItemDisplay = (item: ScenarioVerificationItem): DisplayValue => SCENARIO_VERIFICATION_ITEM_CATALOG[item];
 
 export const recordIdSourceDisplay = (source: RecordIdSource): DisplayValue => RECORD_ID_SOURCE_CATALOG[source];
-
-/** T41g: 「登録してから更新する」の状態と、更新を始めなかった理由。 */
-export const writeChainStateDisplay = (state: WriteChainState): DisplayValue => WRITE_CHAIN_STATE_CATALOG[state];
-export const writeChainStopReasonDisplay = (reason: WriteChainStopReason): DisplayValue => WRITE_CHAIN_STOP_REASON_CATALOG[reason];
 
 /** FM2d・FM2R の Minor 3: まとめて実行の状態、段の状態、止めた理由。 */
 export const stageChainStateDisplay = (state: ChainState): DisplayValue => STAGE_CHAIN_STATE_CATALOG[state];

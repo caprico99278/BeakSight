@@ -40,6 +40,7 @@
 import type { Browser, Page } from 'playwright';
 import type { AuditConfig } from '../config/types.js';
 import type { ChromiumLaunchRefusalReason } from '../browser/chromium-launch.js';
+import { PRODUCTION_OBSERVATION_WINDOWS } from '../core/observation-windows.js';
 import { SCRIPT_REQUEST_TRANSPORT, loginTransportOf, type AuthSetup } from '../control/auth/auth-setup-contracts.js';
 import type { AuthenticatedState, LoginStateNameRecord } from '../control/auth/authenticated-state.js';
 import type {
@@ -76,8 +77,11 @@ import { observeLoginPageStart, observeLoginStageEnd } from './login-stage-obser
 /** 人がログインするのを待つ時間の上限（ms。10 分。Task 25 の設計書 4.4）。過ぎたら `LOGIN_TIMEOUT`。 */
 export const LOGIN_WAIT_TIMEOUT_MS = 600_000;
 
-/** ログインの段の状態を確かめる間隔（ms）。ページの中の読み取り（URL と要素の有無）だけで、サイトへの要求を増やさない。 */
-export const LOGIN_POLL_INTERVAL_MS = 500;
+/**
+ * ログインの段の状態を確かめる間隔（ms）。ページの中の読み取り（URL と要素の有無）だけで、サイトへの要求を増やさない。RB-2: 観察の窓の一式の
+ * `login.manualPollIntervalMs`。
+ */
+export const LOGIN_POLL_INTERVAL_MS = PRODUCTION_OBSERVATION_WINDOWS.login.manualPollIntervalMs;
 
 /**
  * 本番のログイン用の Browser を headless で起動するか（偽: headed。人が操作するため。Task 25 の設計書 4.4）。監査の Browser の headless

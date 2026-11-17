@@ -15,6 +15,7 @@ import type { Browser, BrowserContext, Locator, Page } from 'playwright';
 import { isChromiumLaunchRefused, type ChromiumLaunchRefusalReason } from '../browser/chromium-launch.js';
 import { FORM_STEP_TIMEOUT_MS } from '../browser/form-submission-common.js';
 import { awaitBeforeDeadline, wait } from '../core/deadline.js';
+import { PRODUCTION_OBSERVATION_WINDOWS } from '../core/observation-windows.js';
 import { BrowserContextFactory, readContextStorageState } from '../browser/context-factory.js';
 import type { AuditConfig } from '../config/types.js';
 import {
@@ -118,7 +119,9 @@ export interface OpenedLoginStage {
 
 /**
  * ログイン用の Browser を起動し、ログインの段の Guard を付けた Context と、Guard の準備を待った page を作る（`resources` に入れていく）。
- * Guard は、ログインの段では許可 Origin の外への要求をすべて止める（T26g-1。判定は要求の判定の owner のログインの段の口）。
+ * Guard は、ログインの段では許可 Origin の外への読み取りを止める（T26g-1。判定は要求の判定の owner のログインの段の口）。DEF-193・SFIX-1104 の M-1: 監査の段の送信の
+ * 扱いが `PASS_EXCEPT_DELETE` の自動ログインの段では、ページが自動で送る読み取りでない要求のうち、資格情報を含まず、削除・危険な語・読まないパスに当たらないものは、
+ * 許可 Origin とサービスの Origin の外（第三者の Origin）へも通すことがある（監査の段の送信の扱いと同じく送り先の Origin を限らない）。
  * 失敗は投げる（呼ぶ側が、終わり方を決めてから `closeLoginStage` で閉じる）。
  */
 export async function openLoginStagePage(resources: LoginStageResources, opening: LoginStageOpening): Promise<OpenedLoginStage> {
@@ -183,8 +186,8 @@ const parsedUrl = (value: string): URL | null => {
 /** 認証の設定の CSS のセレクタの要素を、page の main frame から引く（Playwright の独自のセレクタとして解釈させない）。 */
 export const loginStageLocator = (page: Page, selector: string): Locator => page.locator(`${CSS_SELECTOR_ENGINE}${selector}`);
 
-/** OP-K（K3）: ログインの欄が見えるのを待つ間に、確かめる間隔（ms）。 */
-export const LOGIN_FIELDS_WAIT_POLL_MS = 100;
+/** OP-K（K3）: ログインの欄が見えるのを待つ間に、確かめる間隔（ms。RB-2: 観察の窓の一式の `login.fieldsPollMs`）。 */
+export const LOGIN_FIELDS_WAIT_POLL_MS = PRODUCTION_OBSERVATION_WINDOWS.login.fieldsPollMs;
 /** OP-K（K3）: 欄が見えたとみなす、当たる要素の数の下限。 */
 const MIN_FIELD_ELEMENTS = 1;
 
@@ -262,8 +265,15 @@ export const loginStageAttemptsExceeded = (
  * 許可 Origin と同じ意味で比べる（`isOriginInAllowedOrigins`）。
  */
 export const hasSuccessStorageKey = (state: AuthenticatedState, key: SuccessStorageKey): boolean =>
-  state.origins.some(({ origin, localStorage }) => isOriginInAllowedOrigins([key.origin], origin) && localStorage.some(({ name }) =>
-    name.length >= key.prefix.length + key.suffix.length && name.startsWith(key.prefix) && name.endsWith(key.suffix)));
+  state.origins.some(({ origin, localStorage }) => localStorage.some(({ name }) => isSuccessStorageKeyName(origin, name, key)));
+
+/**
+ * その Origin のローカル ストレージの鍵の名前が、成功の鍵の形に当たるか（`hasSuccessStorageKey` の 1 項目の決まりの唯一の場所。DEF-233: 次の画面へ渡す状態に
+ * 重ねる鍵の判定にも使う）。値は見ない。
+ */
+export const isSuccessStorageKeyName = (origin: string, name: string, key: SuccessStorageKey): boolean =>
+  isOriginInAllowedOrigins([key.origin], origin)
+  && name.length >= key.prefix.length + key.suffix.length && name.startsWith(key.prefix) && name.endsWith(key.suffix);
 
 /**
  * 成功の条件の、状態の側の確かめ（T34c。Task 34 の設計書 3.4）。`SCRIPT_REQUEST` では、次の 2 つをどちらも満たすこと。`FORM_NAVIGATION` には、

@@ -10,17 +10,14 @@
  */
 import type { BeakSightBlockRelationReason } from '../core/beaksight-block-relation.js';
 import type { FindingCategory, IncompleteReasonCode, JobSafetyViolationStage } from '../core/contracts.js';
-import type {
-  BLOCKED_REQUEST_REASONS,
-  InteractionReasonCode,
-  SessionLossBlockedRequestReason,
-  SessionLossKeyChange,
-  SessionLossLandedBy,
-  SessionLossOriginKind,
-  SessionLossStorageKind,
+import {
+  INTERACTION_LEGACY_NOT_VERIFIABLE_REASON_CODES,
+  type BLOCKED_REQUEST_REASONS,
+  type InteractionLegacyNotVerifiableReasonCode,
+  type InteractionReasonCode,
 } from '../core/evidence-types.js';
 import { deepFreeze } from '../core/immutable.js';
-import { MAX_CRAWL_MAX_PAGES, REPORT_RULE_DIGEST_EXAMPLE_COUNT } from '../core/limits.js';
+import { MAX_PROFILE_DISPLAY_NAME_LENGTH, REPORT_RULE_DIGEST_EXAMPLE_COUNT } from '../core/limits.js';
 
 /** 観測できなかった値の表示（上位の設計書 14.11）。0 や空文字、「良好」などで代えない。 */
 export const NOT_OBSERVED_TEXT = '未観測';
@@ -32,6 +29,21 @@ export const NOT_OBSERVED_TEXT = '未観測';
 export const ADVANCED_SETTINGS_SUMMARY_TEXT = '詳しい内容';
 /** 文の中で区画を指すときの形（「詳しい内容」）。 */
 const ADVANCED_SETTINGS_REF_TEXT = `「${ADVANCED_SETTINGS_SUMMARY_TEXT}」`;
+
+/** OP-F: サイトの画面の「登録・更新を試せる画面」の一覧の見出し（一覧の見出しと、まとめて実行の次にできることの文と、SPEC-4 のチェックの案内が使う）。 */
+const WRITE_SCREENS_HEADING_TEXT = '登録・更新を試せる画面';
+/**
+ * SPEC-4（設計書 `2026-11-14-beaksight-slim-and-simplify-design.md` 5.1）: 書き込みは一覧のチェックだけで決めるので、人に直させる文はチェックの案内にそろえる。
+ * 技術の語（決まり・OK・手順）を使わない。
+ */
+const RECHECK_WRITE_SCREEN_ACTION_TEXT =
+  `サイトの画面の「${WRITE_SCREENS_HEADING_TEXT}」で、この画面にもう一度チェックを入れてから、次の点検を始めてください。`;
+/** SPEC-4: BeakSight が自動で直せない画面の案内（チェックを外してもらう）。 */
+const UNCHECK_WRITE_SCREEN_ACTION_TEXT =
+  `この画面は、今は試せません。サイトの画面の「${WRITE_SCREENS_HEADING_TEXT}」で、この画面のチェックを外してください。`;
+/** SPEC-4: 更新の下書きを BeakSight が作れないときの案内（人が直せることはない。登録は、チェックのまま試す）。 */
+const UPDATE_NOT_TRIABLE_ACTION_TEXT =
+  `この画面の更新は試せません。登録は、サイトの画面の「${WRITE_SCREENS_HEADING_TEXT}」でチェックしたまま試せます。`;
 
 /** 書式（`src/presentation/format.ts`）が付ける、日本語の単位。 */
 export const FORMAT_UNIT_TEXT = deepFreeze({
@@ -79,6 +91,118 @@ export const truncatedListText = (items: readonly string[], maxListed: number): 
 export const stressWidthFindingMessageText = (widthText: string, message: string): string => `レスポンシブの幅 ${widthText} の確認で、${message}`;
 
 /**
+ * DEF-210（設計書 `2026-11-06-beaksight-notification-overlay-design.md` 3.6）: 通知の枠を閉じた（隠した）ビューポートの知らせの文（Rule
+ * `NOTIFICATION_HANDLED_BEFORE_AUDIT` の Finding の文。HTML レポート・CLI・ChatGPT 用バンドルは、Finding の文として、そのまま出す）。値・URL・枠の文言を入れない。
+ */
+export const NOTIFICATION_OVERLAY_TEXT = deepFreeze({
+  /** 知らせの Rule の短い説明。 */
+  handledPlain: '点検の前に、ページの通知の枠を閉じたか、隠しました。',
+  /** 閉じた枠だけがあった。 */
+  dismissed: '通知の枠を閉じて点検しました。',
+  /** 隠した枠だけがあった。 */
+  hidden: '通知の枠を隠して点検しました。',
+  /** 閉じた枠と隠した枠の両方があった。 */
+  dismissedAndHidden: '通知の枠を閉じて（隠して）点検しました。',
+} as const);
+
+/**
+ * AUD-4d: フォーカスまで隠す要素の Rule（`FOCUSED_CONTROL_HIDDEN`）の文。`plain` は報告の本文のやさしい文、`message` は Rule の文（記録の段とバンドル）、`reasons` は
+ * 隠れたままの理由（`src/audit/focus-check.ts` の `FOCUS_CHECK_HIDDEN_OUTCOMES`）ごとの文。
+ */
+export const FOCUSED_CONTROL_HIDDEN_TEXT = deepFreeze({
+  plain: 'キーボードで移ったときにも、画面に出てこない部品があります。キーボードだけで使う人が、押せないことがあります。',
+  message: (selector: string, reason: string): string => `画面の外に置いた要素 ${selector} に、フォーカスを当てても${reason}。`,
+  reasons: {
+    OUTSIDE_VIEWPORT: '画面の中に出てきません',
+    NOT_VISIBLE: '見えるようになりません',
+    NOT_HITTABLE: 'ほかの要素の下にあり、押せません',
+  },
+} as const);
+
+/**
+ * EV-1（設計書 `2026-11-16-beaksight-finding-evidence-design.md` 3.1）: 色差の指摘（`COLOR_CONTRAST_VIOLATION`）の文に足す、色から計算した比と基準の文。比は
+ * 切り捨てて書いた値（`formatRatioFloor`）、基準は axe の基準の値（`4.5:1` の `:1` を除いた形）。
+ */
+export const CONTRAST_RATIO_TEXT = deepFreeze({
+  message: (ratio: string, criterion: string): string => `文字と背景のコントラスト比は ${ratio}（基準 ${criterion}）で、基準に届いていません。`,
+} as const);
+
+/**
+ * AUD-3c: 固定の要素の重なりの区分（`src/audit/fixed-overlap-classes.ts` の `FIXED_OVERLAP_CLASSES`）ごとの、指摘の文言の後に足すやさしい文。区分のコードは文に
+ * 出さない。Finding にしない区分（幾何だけ・モーダル・スクロールで見える）の文は、Finding の文言には使わない（区分の一覧と同じ鍵を持つための行）。
+ */
+export const FIXED_OVERLAP_TEXT = deepFreeze({
+  RENDER_AND_POINTER: '部品が下の内容を隠していて、そこを押すこともできません。',
+  POINTER_ONLY: '部品は透明で内容は見えますが、そこを押しても下の内容に届きません。',
+  RENDER_ONLY: '部品が下の内容を隠しています（押すことはできます）。',
+  GEOMETRY_ONLY: '部品の枠が重なっているだけで、内容は見えていて、押すこともできます。',
+  MODAL: '開いた確認の画面（モーダル）が、ほかの内容の上にあります。',
+  SCROLL_REVEALABLE: 'ページを動かせば、隠れた内容を見ることができます。',
+} as const);
+
+/** EV-2: 押下を捕まえる区分でも「押せません」と言えない覆い（見出しなど読む対象・測り直しで確かめられない組）の文。 */
+export const FIXED_OVERLAP_READ_TARGET_TEXT = deepFreeze({
+  RENDER_AND_POINTER: '部品が下の内容を隠しています。',
+  POINTER_ONLY: '部品は透明で、下の内容は見えています。',
+} as const);
+
+/** EV-2: 動かして測り直した覆いの区分（`FIXED_OCCLUSION_REVEAL_OUTCOMES`）ごとの文。 */
+export const FIXED_OCCLUSION_REVEAL_TEXT = deepFreeze({
+  HIDDEN_AT_END: 'ページを最後まで動かしても、隠れたままです。',
+  SCROLL_AVOIDABLE: 'ページを動かせば、隠れた内容を見ることができます。',
+  INITIAL_ONLY: '初めの位置でだけ隠れ、ページを動かすと部品は消えます。',
+} as const);
+
+/** EV-2: 指摘の保留の理由（`FINDING_HOLD_REASONS`）ごとの、利用者向けの 1 文（報告の画像の欄に出す）。 */
+export const FINDING_HOLD_REASON_TEXT = deepFreeze({
+  TARGET_NOT_IN_IMAGE: '画像に問題の場所が写っていないため、確かめを待っています。',
+  PAGE_NOT_READY: '画面の準備が終わっていなかったため、確かめを待っています。',
+  NOT_OPERATED: '問題の場所まで動かして撮れなかったため、確かめを待っています。',
+} as const);
+
+/** EV-5: 証拠の足り方の数の、利用者向けの短い言葉（HTML の件数の小節と CLI の結果の行。コードは出さない）。 */
+export const EVIDENCE_SUFFICIENCY_TEXT = deepFreeze({
+  heldLabel: '確かめを待つ問題',
+  reasons: {
+    TARGET_NOT_IN_IMAGE: '画像に写っていない',
+    PAGE_NOT_READY: '画面の準備が終わっていない',
+    NOT_OPERATED: '撮れなかった',
+  },
+  imageLabel: '問題の場所が写った画像',
+  uncollectedLabel: 'まだ見ていない画面',
+  uncollectedViewports: 'デスクトップとモバイルの表示で数えると',
+} as const);
+
+/** EV-5: 表示用モデルの証拠の足り方の数（`EvidenceSufficiencyView` と同じ形）。 */
+export interface EvidenceSufficiencyCounts {
+  readonly heldFindingCount: number;
+  readonly heldByReason: Readonly<Record<keyof typeof EVIDENCE_SUFFICIENCY_TEXT.reasons, number>>;
+  readonly targetImageJudgedCount: number;
+  readonly targetInImageCount: number;
+  readonly uncollectedPageCount: number;
+  readonly uncollectedViewportCount: number;
+}
+
+/**
+ * EV-5: 証拠の足り方の 2 行（確かめを待つ問題と、場所が写った画像の数。まだ見ていない画面の数）。HTML と CLI が同じ言葉で出す。`count` は件数の書式。理由は 0 件のものを
+ * 出さない。
+ */
+export const evidenceSufficiencyEntries = (
+  counts: EvidenceSufficiencyCounts,
+  count: (value: number) => string,
+): readonly { readonly label: string; readonly value: string }[] => {
+  const text = EVIDENCE_SUFFICIENCY_TEXT;
+  const reasons = (Object.keys(text.reasons) as (keyof typeof text.reasons)[])
+    .filter((reason) => counts.heldByReason[reason] > 0)
+    .map((reason) => `${text.reasons[reason]} ${count(counts.heldByReason[reason])}`);
+  const image = `${text.imageLabel} ${count(counts.targetImageJudgedCount)}のうち ${count(counts.targetInImageCount)}`;
+  return [
+    { label: text.heldLabel, value: countWithDetailsText(count(counts.heldFindingCount), [...reasons, image]) },
+    { label: text.uncollectedLabel, value: `${count(counts.uncollectedPageCount)}（${text.uncollectedViewports} ${count(counts.uncollectedViewportCount)}）` },
+  ];
+};
+
+/**
  * BN-c: 指摘と BeakSight の遮断の関係の理由のコード（`BEAKSIGHT_BLOCK_RELATION_REASONS`）ごとの、日本語の説明。HTML レポートの Finding の行が使う（バンドルの JSON は
  * コードのまま）。
  */
@@ -91,6 +215,7 @@ export const BEAKSIGHT_BLOCK_RELATION_REASON_DESCRIPTIONS = deepFreeze({
   FETCH_FAILED_WITH_DATA_BLOCK: '同じ読み込みで、BeakSight がデータの要求（fetch・xhr）を止めました（どの呼び出しの失敗かは記録にありません）。',
   DISABLED_FEATURE: 'BeakSight が無効にした機能（SharedWorker）を、ページが呼びました。',
   SENSITIVE_KIND_BLOCKED: '同じ読み込みの間（閉じ始める前）に、この Rule の結果を変えうる種類の要求を、BeakSight が止めました。',
+  APPROVED_SERVICE_UNAUTHORIZED: '同じ読み込みで、点検のために使うサービスが、ログインが要るという応答を返しました。BeakSight の側のログインの事情の見込みがあります。',
   NO_BLOCK_IN_LOAD: '結び付く読み込みの間（閉じ始める前）に、BeakSight は見える種類の要求を止めていません。',
   RULE_NOT_SENSITIVE: 'BeakSight は要求を止めましたが、この Rule の結果を変えうる種類ではありません。',
 } as const satisfies Record<BeakSightBlockRelationReason, string>);
@@ -121,9 +246,10 @@ export const INCOMPLETE_REASON_DESCRIPTIONS = deepFreeze({
   DOM_READINESS_FAILED: 'ページの表示の準備ができるのを、待てませんでした。',
   SCROLL_TARGET_UNRESOLVED: 'ページの内容が画面より大きいのに、どこをスクロールすればよいか分かりませんでした。',
   SCROLL_NOT_ADVANCED: 'スクロールを求めても、スクロールの位置が進みませんでした。',
-  // T44c（Task 44 の設計書 P1-4）: 理由を詳しくした（次にできることは `INCOMPLETE_REASON_NEXT_STEPS`）。
+  // T44c（Task 44 の設計書 P1-4）: 理由を詳しくした（次にできることは `INCOMPLETE_REASON_NEXT_STEPS`）。DEF-207: 今の振る舞い（いちばん大きい枠 1 つを
+  // たどり、たどりきれなかったときだけこの理由）に合わせた。
   INNER_SCROLL_CONTAINER_NOT_TRAVERSED:
-    'この画面でいちばん大きくスクロールできるのは、画面の中にある、読み込みの後に動く別のスクロールの枠でした。BeakSight は画面の全体だけをスクロールするので、その枠の中は全部は確かめていません。枠の中の問題を見落としているかもしれません。',
+    'この画面でいちばん大きくスクロールできるのは、画面の中にある、読み込みの後に動く別のスクロールの枠でした。BeakSight はその枠もスクロールしてたどりますが、時間内に終わらなかったか、途中で動かなくなったため、たどりきれませんでした。その枠の中は全部は確かめていません。枠の中の問題を見落としているかもしれません。',
   INNER_SCROLL_SCAN_LIMIT_REACHED: '画面の中の別にスクロールする枠を探す作業が上限に達し、そうした枠がないことを確かめられませんでした。',
   SCROLL_TARGET_UNSTABLE: 'スクロールする場所を切り替えてやり直しても、どこをスクロールすればよいか定まりませんでした。',
   POSITION_NOT_AT_ORIGIN: 'スクロールの後に、ページの先頭へ戻せませんでした。',
@@ -134,6 +260,12 @@ export const INCOMPLETE_REASON_DESCRIPTIONS = deepFreeze({
   PAGE_NAVIGATION_LIMIT_REACHED: '画面自身や画面の中の枠の読み込み直しや移動が、決まった回数を超えたため止めました。その画面は読み切れていません。',
   // DEF-130-fix。
   PAGE_SUBRESOURCE_LIMIT_REACHED: '画面が出す画像やデータの読み込みなどの要求が、1 画面あたりの決まった数を超えたため止めました。その画面は読み切れていません。',
+  // DEF-210: 通知の枠の閉じるボタンを押したら、画面が移ろうとした。
+  NOTIFICATION_DISMISSAL_NAVIGATION_BLOCKED: 'お知らせの枠を閉じたら、別の画面へ移ろうとしました。そのため、この画面は点検していません。',
+  // DEF-250 の c: 点検の途中で、画面がメールなどのアプリを開こうとしたか、別の画面に替わった。
+  DOCUMENT_LEFT_DURING_AUDIT: 'この画面は、メールなどのアプリを開く動きをしたか、別の画面に替わったため、途中まで確かめました。',
+  // DEF-225: 開くとファイルのダウンロードになる画面。
+  DOWNLOAD_RESPONSE: 'ファイルのダウンロードになるため読めませんでした。ファイルは保存していません。',
   PREFLIGHT_FAILED: '始める前の確認に、失敗しました。',
   RUN_DIRECTORY_UNAVAILABLE: '点検の結果を置くフォルダを、作れませんでした。',
   SAFETY_INVARIANT_VIOLATION: '安全の決まりに反する動きを、記録しました。',
@@ -160,6 +292,9 @@ export const INCOMPLETE_REASON_DESCRIPTIONS = deepFreeze({
   AUTH_SESSION_LOST: 'ログインが切れたため、そのページを点検せず、それより後の点検を始めませんでした。',
   // T35a（Task 35 の設計書 3.4）: 承認したサービスの Origin への要求の上限。
   SERVICE_REQUEST_LIMIT_REACHED: 'ログインのときに通ってよい外のサイトへの要求が、上限（1 分あたりか、1 回の点検あたり）に届きました。そのため、その要求を止めたか、それより後の点検を始めませんでした。',
+  // L0（設計書 `2026-11-09-beaksight-remove-limits-design.md` 5 の 1）: 進みの見張りが段を終えた（画面の文は 1 文）。
+  STAGE_UNRESPONSIVE: '画面がしばらく全く反応しなくなったため、その作業をそこまでの記録で終えました。',
+  STAGE_NEVER_QUIET: '画面の動きが止まらず作業が進まなくなったため、その作業をそこまでの記録で終えました。',
 } as const satisfies Record<IncompleteReasonCode, string>);
 
 /**
@@ -178,11 +313,15 @@ export const BLOCKED_REQUEST_REASON_DESCRIPTIONS = deepFreeze({
   AUDIT_SEND_OVER_LIMIT: '画面が出す書き込みの送信が、1 回の読み込みで通す決まった数を超えたため、止めました。',
   // T44R の I-1: 閉じる前にページを離れた後の、画面が出す要求の上限と、離れた後の画面の読み込み。
   PAGE_LEAVE_REQUEST_LIMIT_REACHED: '閉じる前に画面を離れた後に、画面が出す要求が決まった数を超えたか、画面を読み込み直そうとしたため、止めました（その画面の読み取りは、離れる前に終わっています）。',
+  // DEF-210: 通知の枠の閉じるボタンを押す間の決まり。
+  NOTIFICATION_DISMISSAL_RESTRICTED: '通知の枠を閉じるボタンを押した間に、画面が別の画面へ移ろうとしたか、送ってはいけない送信をしようとしたため、止めました。',
+  // REV-EV4: 横にスクロールする欄でキーを試す間の決まり。
+  SCROLL_KEY_PRESS_RESTRICTED: '横にスクロールする欄でキーを試した間に、画面が別の画面へ移ろうとしたため、止めました。',
 } as const satisfies Record<BlockedRequestReason, string>);
 
 /**
  * T44R2 の M-7: Guard が要求を止めた理由の説明（止めた要求の理由でなければ `null`）。HTML レポートの Safety の事象の一覧の、止めた要求の行の理由の欄が使う
- * （表示はこの 1 か所。画面のセッションの切れの表は `SESSION_LOSS_BLOCKED_REQUEST_REASON_DESCRIPTIONS`）。
+ * （表示はこの 1 か所）。
  */
 export const describeBlockedRequestReason = (reason: string): string | null =>
   Object.hasOwn(BLOCKED_REQUEST_REASON_DESCRIPTIONS, reason)
@@ -236,9 +375,9 @@ export const INCOMPLETE_REASON_NEXT_STEPS = deepFreeze({
   EVALUATION_FAILED: retryThenManualOf('画面の中のプログラムが、情報を集めるのを妨げることがあります。'),
   PAGE_CLOSED: retryThenManualOf('画面が自分で閉じる作りのことがあります。'),
   NAVIGATION_FAILED: 'そのページのアドレスをブラウザで開けるか、サイトが応答しているかを確かめてから、もう一度点検してください。',
-  // T44R2 の I-7: この理由は、読み込みの落ち着きの待ち（期限は `crawl.resourceSettlingTimeoutMs`）が PARTIAL のときに付く（`page-auditor.ts`）。
-  DOM_READINESS_FAILED:
-    'サイトが応答しているかを確かめてから、もう一度点検してください。続けて起きるときは、設定のファイルにある、画像やファイルの読み込みが落ち着くのを待つ時間（crawl.resourceSettlingTimeoutMs）を長くしてください。',
+  // T44R2 の I-7: この理由は、読み込みの落ち着きの待ちが PARTIAL のときに付く（`page-auditor.ts`）。LZ-1: 期限（`crawl.resourceSettlingTimeoutMs`）は今は
+  // 使わないので、その期限を長くする案内は消した。
+  DOM_READINESS_FAILED: 'サイトが応答しているかを確かめてから、もう一度点検してください。',
   SCROLL_TARGET_UNRESOLVED: 'ページの下の方は、確かめきれていないことがあります。そのページをブラウザで開き、下までスクロールして手で確かめてください。',
   SCROLL_NOT_ADVANCED: 'スクロールを止める作り（スクロールの固定など）の画面で起きます。そのページをブラウザで開き、下までスクロールして手で確かめてください。',
   INNER_SCROLL_CONTAINER_NOT_TRAVERSED:
@@ -252,6 +391,9 @@ export const INCOMPLETE_REASON_NEXT_STEPS = deepFreeze({
   PAGE_NAVIGATION_LIMIT_REACHED:
     '画面が自分で読み込み直しや移動を繰り返す作りです。そのページをブラウザで開き、表示が落ち着くかを確かめてください。ログインして点検するときは、そのページをログインの設定の「読まないページ」に足すと、次から読みません。',
   PAGE_SUBRESOURCE_LIMIT_REACHED: '画面が多くの画像やデータを読み込む作りです。そのページをブラウザで開き、表示の内容を手で確かめてください。',
+  NOTIFICATION_DISMISSAL_NAVIGATION_BLOCKED: 'そのページをブラウザで開き、お知らせの枠を閉じてから、表示の内容を手で確かめてください。',
+  DOCUMENT_LEFT_DURING_AUDIT: 'そのページをブラウザで開いて、表示の内容を手で確かめてください。',
+  DOWNLOAD_RESPONSE: 'ファイルの中身を確かめたいときは、そのページをブラウザで開いて、手で確かめてください。',
   PREFLIGHT_FAILED: `ブラウザ（Chromium）を起動できるか、出力先のフォルダに書けるかを確かめてから、もう一度監査してください。${PREFLIGHT_EXTERNAL_LAUNCH_BLOCK_TEXT}`,
   RUN_DIRECTORY_UNAVAILABLE: outputFolderNextStepOf('もう一度監査してください'),
   SAFETY_INVARIANT_VIOLATION: SAFETY_STOP_REPORT_NEXT_STEP_TEXT,
@@ -279,6 +421,9 @@ export const INCOMPLETE_REASON_NEXT_STEPS = deepFreeze({
   AUTH_SESSION_LOST:
     'ログインの状態が切れたページのパスを、認証の設定の「読まないパス」に足すと、次から読みません。残りのページは、続きから再開すると監査します。',
   SERVICE_REQUEST_LIMIT_REACHED: 'ログインの設定にある、ログインのときに通ってよい外のサイトへの要求の上限を見直してから、続きから再開してください。',
+  // L0: 進みの見張りが段を終えた。
+  STAGE_UNRESPONSIVE: retryThenManualOf('画面のプログラムが止まっていることがあります。'),
+  STAGE_NEVER_QUIET: `動き続ける画面（時計や動きのある表示など）で起きます。要るときは、${MANUAL_PAGE_CHECK_TEXT}。`,
 } as const satisfies Record<IncompleteReasonCode, string>);
 
 /** T44c: 未完了の理由のコードの、次にできること（T44h の判断 (1) から、すべての理由にある）。 */
@@ -289,8 +434,20 @@ export const nextStepOfIncompleteReason = (code: IncompleteReasonCode): string =
  * コードの一覧と、status ごとの対応は、`src/core/evidence-types.ts` の `INTERACTION_REASON_CODES`、`INTERACTION_REASON_CODES_BY_STATUS`。
  * 技術的な詳細（completeness や identityStatus の値、エラーの文言）は Evidence の `reasonDetail` にあるので、説明には書かない。
  * 「確認の期限」は、1つの操作の候補を確かめる期限。「安全のために通信を止める」は、クリックの前の Safety の凍結。
+ * SPEC-5: 前の版だけが書いたコード（`INTERACTION_LEGACY_NOT_VERIFIABLE_REASON_CODES`。読むだけ）は、1 つの説明にまとめる。
  */
+const LEGACY_INTERACTION_REASON_DESCRIPTION = '前の版の確かめ方で記録した理由です。';
+
+/**
+ * SD-1（設計書 `2026-11-16-beaksight-action-based-delete-guard-design.md` 2.3）: 削除に関する操作なので押さなかった理由（`DESTRUCTIVE_ACTION_SKIPPED`）の文。Interaction の
+ * 理由の説明と、発見の probe の理由の表示（`src/presentation/catalog.ts`）が同じ文を使う。
+ */
+export const DESTRUCTIVE_ACTION_SKIPPED_TEXT = '消す・取り消すなどのボタンなので、押しませんでした';
+
 export const INTERACTION_REASON_DESCRIPTIONS = deepFreeze({
+  ...(Object.fromEntries(
+    INTERACTION_LEGACY_NOT_VERIFIABLE_REASON_CODES.map((code) => [code, LEGACY_INTERACTION_REASON_DESCRIPTION]),
+  ) as Record<InteractionLegacyNotVerifiableReasonCode, string>),
   // VERIFIED
   OBSERVABLE_STATE_CHANGED: 'クリックの後に、ページの状態が変わることを観測しました。',
   // REJECTED_UNSAFE（`classifyInteractionCandidate` の除外の理由）
@@ -304,6 +461,8 @@ export const INTERACTION_REASON_DESCRIPTIONS = deepFreeze({
   DISABLED: '無効になっている要素なので、操作しませんでした。',
   NOT_VISIBLE: '画面に表示されていない要素なので、操作しませんでした。',
   MALFORMED_CANDIDATE: '候補の記録が不正で、安全かを判断できないので、操作しませんでした。',
+  // SD-1（設計書 `2026-11-16-beaksight-action-based-delete-guard-design.md` 2.3 の文）。
+  DESTRUCTIVE_ACTION_SKIPPED: `${DESTRUCTIVE_ACTION_SKIPPED_TEXT}。`,
   // BLOCKED_BY_SAFETY
   // `SAFETY_FREEZE_BLOCKED`: 凍結の後の、通信・移動・ポップアップ・ダウンロード・WebSocket の遮断と、外部スキームへの移動の試み
   // （`isolated-auditor.ts` の `hasFreezeEvent`）。ページのスクリプトによる外部スキームへの移動は止められないので、そのことを隠さない
@@ -320,60 +479,27 @@ export const INTERACTION_REASON_DESCRIPTIONS = deepFreeze({
   INITIAL_LOAD_DURING_LOAD: 'ページの読み込みの途中で、確認の期限を過ぎました。',
   INITIAL_LOAD_AFTER_LOAD: 'ページの読み込みを終えた後に、確認の期限を過ぎました。',
   INITIAL_LOAD_BEFORE_RENDER: 'ページの最初の描画が終わる前に、確認の期限を過ぎました。',
-  // NOT_VERIFIABLE: 通信を止める前の下準備（スクロール、マウスを重ねる、フォーカス）
-  SCROLL_PREPARATION_DEADLINE: 'スクロールの下準備の途中で、確認の期限を過ぎました。',
-  SCROLL_PREPARATION_DOM_WORK_EXHAUSTED: 'スクロールの下準備の途中で、DOM を調べる作業量の上限に達しました。',
-  SCROLL_PREPARATION_FAILED: 'スクロールの下準備が、失敗しました。',
-  SCROLL_PREPARATION_SETTLE_DEADLINE: 'スクロールの後にページが落ち着くのを待つ間に、確認の期限を過ぎました。',
-  HOVER_PREPARATION_DEADLINE: 'マウスを重ねる下準備の途中で、確認の期限を過ぎました。',
-  HOVER_PREPARATION_FAILED: 'マウスを重ねる下準備が、失敗しました。',
-  FOCUS_PREPARATION_DEADLINE: 'フォーカスの下準備の途中で、確認の期限を過ぎました。',
-  FOCUS_PREPARATION_FAILED: 'フォーカスの下準備が、失敗しました。',
-  FOCUS_PREPARATION_DOM_WORK_EXHAUSTED: 'フォーカスの下準備の途中で、DOM を調べる作業量の上限に達しました。',
-  FOCUS_PREPARATION_TARGET_DISCONNECTED: 'フォーカスの下準備の途中で、対象の要素がページから外れました。',
-  FOCUS_PREPARATION_CANDIDATE_LIMIT_REACHED: 'フォーカスの下準備で要素を調べる処理が、候補の数の上限に達しました。',
-  FOCUS_PREPARATION_TEXT_NODE_LIMIT_REACHED: 'フォーカスの下準備で要素を調べる処理が、テキストノードの数の上限に達しました。',
-  FOCUS_PREPARATION_STATE_CHANGED: 'フォーカスを当てただけで対象の状態が変わるので、クリックによる変化と見分けられません。',
-  FOCUS_PREPARATION_STATE_UNCOMPARABLE: 'フォーカスを当てる前と後で、対象の状態を比べられませんでした。',
-  // NOT_VERIFIABLE: 通信を止める前の、ページが安定しているかの確認
-  STABILITY_CHECK_DEADLINE: 'ページが安定しているかを確かめる途中で、確認の期限を過ぎました。',
-  STABILITY_CHECK_DOM_WORK_EXHAUSTED: 'ページが安定しているかを確かめる途中で、DOM を調べる作業量の上限に達しました。',
-  STABILITY_CHECK_TARGET_DISCONNECTED: 'ページが安定しているかを確かめる途中で、対象の要素がページから外れました。',
-  STABILITY_CHECK_CANDIDATE_LIMIT_REACHED: 'ページが安定しているかを確かめる処理が、候補の数の上限に達しました。',
-  STABILITY_CHECK_TEXT_NODE_LIMIT_REACHED: 'ページが安定しているかを確かめる処理が、テキストノードの数の上限に達しました。',
+  // NOT_VERIFIABLE: 通信を止める前の下準備（スクロール、マウスを重ねる）
+  SCROLL_PREPARATION_DEADLINE: 'スクロールとマウスを重ねる下準備の途中で、確認の期限を過ぎました。',
+  SCROLL_PREPARATION_FAILED: 'スクロールとマウスを重ねる下準備が、失敗しました。',
   // NOT_VERIFIABLE: 通信を止めた後の、対象の探し直し、対象の要素の確認、クリック
-  DEADLINE_AFTER_SAFETY_FREEZE: '安全のために通信を止めた直後に、確認の期限を過ぎました。',
-  DEADLINE_DURING_CANDIDATE_REDISCOVERY: '対象の要素を探し直す途中で、確認の期限を過ぎました。',
-  DOM_WORK_EXHAUSTED: '1つの操作の確認の全体で、DOM を調べる作業量の上限に達しました。',
-  CANDIDATE_REDISCOVERY_INCOMPLETE: '対象の要素を探し直す処理が、最後まで終わりませんでした。',
   CANDIDATE_IDENTITY_NOT_REDISCOVERED: '探し直しても、対象の要素が見つかりませんでした。',
   CANDIDATE_IDENTITY_AMBIGUOUS: '探し直すと、対象の要素と区別できない要素が複数ありました。',
-  DEADLINE_BEFORE_TARGET_HANDLE_ACQUISITION: '対象の要素への参照を取る前に、確認の期限を過ぎました。',
-  DEADLINE_DURING_TARGET_HANDLE_ACQUISITION: '対象の要素への参照を取る途中で、確認の期限を過ぎました。',
   TARGET_HANDLE_NOT_RESOLVED: '対象の要素への参照を、取れませんでした。',
-  TARGET_HANDLE_RESOLUTION_DOM_WORK_EXHAUSTED: '対象の要素への参照を取る途中で、DOM を調べる作業量の上限に達しました。',
-  DEADLINE_DURING_TARGET_FACT_COLLECTION: 'クリックの前に対象の要素を調べる途中で、確認の期限を過ぎました。',
-  TARGET_INSPECTION_DOM_WORK_EXHAUSTED: 'クリックの前に対象の要素を調べる途中で、DOM を調べる作業量の上限に達しました。',
-  TARGET_INSPECTION_CANDIDATE_LIMIT_REACHED: 'クリックの前に対象の要素を調べる処理が、候補の数の上限に達しました。',
-  TARGET_INSPECTION_TEXT_NODE_LIMIT_REACHED: 'クリックの前に対象の要素を調べる処理が、テキストノードの数の上限に達しました。',
   TARGET_DISCONNECTED_BEFORE_ADMISSION: '操作してよいかを判定する前に、対象の要素がページから外れました。',
   TARGET_CHANGED_DURING_EXACT_NODE_RESOLUTION: 'クリックする要素を1つに定める途中で、対象の要素が変わりました。',
-  DEADLINE_DURING_EXACT_NODE_ADMISSION: 'クリックする要素を操作してよいかを判定する途中で、確認の期限を過ぎました。',
   TARGET_NOT_SCROLL_PREPARED: '安全のために通信を止める前に、対象の要素を画面の中に入れられませんでした。',
-  DEADLINE_BEFORE_EXACT_NODE_CLICK: 'クリックする直前に、確認の期限を過ぎました。',
+  DEADLINE_BEFORE_EXACT_NODE_CLICK: '安全のために通信を止めた後、クリックを始める前に、確認の期限を過ぎました。',
   CLICK_TIMED_OUT: 'クリックが、期限までに終わりませんでした。',
-  // NOT_VERIFIABLE: クリックの後の観測
-  DEADLINE_BEFORE_POST_CONDITION_OBSERVATION: 'クリックの後の状態を観測する前に、確認の期限を過ぎました。',
-  DEADLINE_DURING_POST_CONDITION_OBSERVATION: 'クリックの後の状態を観測する途中で、確認の期限を過ぎました。',
-  PERSISTENCE_CHECK_DEADLINE: 'クリックの後の変化が続くかを確かめる途中で、確認の期限を過ぎました。',
-  NO_OBSERVABLE_CHANGE: '確認の期限までに、クリックによる状態の変化を観測しませんでした。',
-  GEOMETRY_ONLY_CHANGED_WHILE_SCROLLED: '対象を含む領域がスクロールした間に、対象の位置や大きさだけが変わりました。',
-  GEOMETRY_ONLY_CHANGED_SCROLL_UNCOMPARABLE: '対象の位置や大きさだけが変わり、対象を含む領域のスクロールの位置は比べられませんでした。',
-  GEOMETRY_ONLY_CHANGED: '対象の位置や大きさだけが変わったので、操作の結果とはみなしませんでした。',
-  RETAINED_INSPECTION_DOM_WORK_EXHAUSTED: 'クリックの後に対象の要素を調べる途中で、DOM を調べる作業量の上限に達しました。',
-  RETAINED_INSPECTION_CANDIDATE_LIMIT_REACHED: 'クリックの後に対象の要素を調べる処理が、候補の数の上限に達しました。',
-  RETAINED_INSPECTION_TEXT_NODE_LIMIT_REACHED: 'クリックの後に対象の要素を調べる処理が、テキストノードの数の上限に達しました。',
+  // NOT_VERIFIABLE: クリックの後の観測（SPEC-5: 落ち着きを待ってから 1 回だけ観測する）
+  DEADLINE_DURING_POST_CONDITION_OBSERVATION: 'クリックの後の状態を観測し終える前に、確認の期限を過ぎました。',
+  NO_OBSERVABLE_CHANGE: 'クリックの後に、ページの状態の変化を観測しませんでした。',
   RETAINED_IDENTITY_LOST: 'クリックの後に、対象の要素が同じ要素であることを確かめられなくなりました。',
+  // L5: 進みの見張りが操作を終えた（操作さがしの 1 画面の見張りの文と同じ文）。
+  STAGE_UNRESPONSIVE: '画面が反応しなくなったので、ここから先は確かめられませんでした',
+  STAGE_NEVER_QUIET: '画面が動き続けて落ち着かなかったので、ここまでで確かめを終えました',
+  // COV-4 の区切り 3: 入れ子の開いた状態まで押し直せなかった。
+  TRAIL_NOT_REPRODUCED: '前の操作を再現できなかったので、確かめられませんでした。',
   // EXECUTION_FAILED
   EXECUTION_FAILED: '操作を確かめる処理が、途中でエラーになりました。',
   CLICK_FAILED: 'クリックが、期限切れ以外の理由で失敗しました。',
@@ -413,6 +539,19 @@ export const ruleVersionText = (version: number): string => `版 ${version}`;
 export const screenshotLinkText = (viewportLabel: string, captureTypeLabel: string): string =>
   `${viewportLabel}・${captureTypeLabel}`;
 
+/** AUD-1c: 発表の前の確かめで、ファイルがなかった画像の印（スクリーンショットの参照の名前の後に添える）。 */
+export const screenshotMissingText = '画像がありません';
+
+/** AUD-3d: 幅の走査の幅の画像のリンクの文言に添える幅（例: `（幅 800 px）`）。幅は書式の関数で整えたもの。 */
+export const screenshotStressWidthText = (widthText: string): string => `（幅 ${widthText}）`;
+
+/** AUD-3d: 指摘の対象の場所の画像へのリンクの文言（報告の本文）。 */
+export const findingImageRegionLinkText = '問題の場所の画像';
+
+/** AUD-3d: 画像の上の、対象の場所の易しい説明（例: `左から 0 px、上から 12 px の所の、横 400 px・縦 60 px の範囲`）。値は書式の関数で整えたもの。 */
+export const findingImageRegionPlaceText = (left: string, top: string, width: string, height: string): string =>
+  `左から ${left}、上から ${top} の所の、横 ${width}・縦 ${height} の範囲`;
+
 // ---------------------------------------------------------------------------------------------------------------
 // Run の要約（HTML レポートと CLI。C17a）
 // ---------------------------------------------------------------------------------------------------------------
@@ -434,6 +573,11 @@ export const RUN_SUMMARY_TEXT = deepFreeze({
     skipped: 'スキップしたページ',
   },
   reasonsHeading: '未完了の理由',
+  /**
+   * L14（設計書 `2026-11-09-beaksight-remove-limits-design.md` 6.1）: 利用者が上限・期限を指定していない（上限なし）ときの値。HTML・CLI・画面で共通
+   * （`specifiedLimitText`）。
+   */
+  limitNotSpecified: '指定なし',
   /** サイトへの負荷の記録（`RunSummary.load`。サイトへの負荷の制御の設計書 3.1 の7、4.5）の、HTML の小節の見出しと CLI の行の名前。 */
   loadHeading: 'サイトへの負荷',
   /** 許可 Origin への要求（`load.requests.allowedOrigins`）。HTML の小節の項目と、CLI の負荷の行の項目。 */
@@ -459,6 +603,10 @@ const PEAK_PER_MINUTE_LABEL = '1分あたり最大';
 
 /** 直近の1分の件数（`RunLoadRecentPerMinute`。サイトへの負荷の制御の設計書 4.8）の短い名前。 */
 const RECENT_MINUTE_LABEL = '直近1分';
+
+/** L14: 利用者が指定した上限・期限の値の書式。指定していなければ「指定なし」（`RUN_SUMMARY_TEXT.limitNotSpecified`）。HTML・CLI・画面で共通。 */
+export const specifiedLimitText = (value: number | undefined, format: (value: number) => string): string =>
+  (value === undefined ? RUN_SUMMARY_TEXT.limitNotSpecified : format(value));
 
 /**
  * 件数に、補足の項目を括弧で添える（例: `12件（発見したページ 85件、上限 50件）`）。項目は、一覧の区切り（`listText`）で並べる。
@@ -516,6 +664,8 @@ export const HTML_REPORT_TEXT = deepFreeze({
      * 監査の段の事実のまま残す）。
      */
     plannedWrites: 'この点検では、この後に、チェックした画面でテスト用のデータを登録・更新します。結果はサイトの画面に出ます。',
+    /** WSO: 「チェックした画面だけ」の点検の報告のまとめの 1 行（ChatGPT 用バンドルも同じ文）。 */
+    checkedScreensOnly: (pageCount: string): string => `チェックした画面だけを点検しました（${pageCount} 画面）。ほかの画面は見ていません。`,
     scopeHeading: '何を見たか',
     site: '点検したサイト（はじめのページ）',
     result: '点検の結果',
@@ -524,6 +674,8 @@ export const HTML_REPORT_TEXT = deepFreeze({
     countsHeading: '見つかった問題の数',
     /** 問題（サイト品質の指摘。安全は分けて数える）の数の文。 */
     problemsFound: (countText: string): string => `問題が ${countText}見つかりました。`,
+    /** AUD-9c: 問題を同じ作りの所でまとめた数の文（引数は書式にかけた数）。 */
+    problemGroups: (countText: string): string => `同じ作りの所でまとめると ${countText} か所です。`,
     noProblems: '問題は見つかりませんでした。',
     countsNote: '重さごとの数です。「安全」は、サイトのデータを変えないように止めた送信などの記録で、問題の数には入れません。',
     topHeading: '大事な問題（重い順に 3 つまで）',
@@ -558,6 +710,10 @@ export const HTML_REPORT_TEXT = deepFreeze({
       'サイトの問題を、BeakSight が止めた要求との関係で分けて数えます。「遮断が原因」と「遮断の影響の可能性」の問題と安全の記録は、ChatGPT 用のファイルの本体（findings.json）から外し、別のファイルに理由つきで残します。',
     blockRelationCount: (label: string): string => `サイトの問題のうち「${label}」`,
     bundleMainFindings: 'ChatGPT 用のファイルの本体の問題',
+    /** AUD-2d: ページが落ち着く前だけに見え、落ち着いた後に確かめ直したら消えた問題の件数（本体の数に含めない）。 */
+    initialOnlyFindings: 'ページが落ち着く前だけに見えた問題（本体の数に含めていません）',
+    /** AUD-2d の直し: ページが落ち着いた後に確かめ直して、新しく見つかった問題の件数（本体の数に含める）。 */
+    lateFindings: 'ページが落ち着いた後に新しく見つかった問題（本体の数に含めています）',
     limitsHeading: '上限',
     limitColumns: ['上限', '設定', '届いたか'],
     limits: {
@@ -633,6 +789,10 @@ export const HTML_REPORT_TEXT = deepFreeze({
       popups: '別の窓（ポップアップ）',
       downloads: 'ダウンロード',
       webSockets: '常時の接続',
+      // SAFE-2 の 4: 違反にしない止めた記録と、外部スキームへの移動の試み（やさしい文。技術の名前は出さない）。
+      frameChecks: '画面の中の枠で、どこのものか確かめられなかった移動',
+      readNavigations: '画面を開くための移動で、届いたか分からなかったもの',
+      externalApps: 'ほかのアプリ（メールや電話など）を開こうとした動き',
     },
     excludedInteractionCandidates: '安全のため外した、押す候補',
     invariantViolationCount: '安全の決まりに反したこと',
@@ -689,6 +849,8 @@ export const HTML_REPORT_TEXT = deepFreeze({
     viewportColumns: ['ページの番号', '画面の幅', '返事の番号（HTTP）', '開いた結果', '見られなかった理由（記号）'],
     /** ページのやり直す前の記録の表の題（`pageId` はページの番号）。 */
     retriesCaption: (pageId: string): string => `${pageId} のやり直す前の記録`,
+    /** AUD-1c: 発表の前の確かめで見つからなかったファイル（画像など）の数（引数は書式にかけた数。1 以上のときだけ出す）。 */
+    missingArtifacts: (count: string): string => `見つからないファイル（画像など）が ${count} 件あります。`,
   },
   /**
    * OP-3: 本文の送信の扱いの、やさしい説明（送り方の名前を書かない。送り方を書いた表示カタログの説明は、記録の段と ChatGPT 用のファイルのまま）。鍵は送信の扱いの一覧
@@ -696,7 +858,8 @@ export const HTML_REPORT_TEXT = deepFreeze({
    */
   plainAuditSend: {
     READ_ONLY: 'ページが出す書き込みの送信は、すべて止めました。',
-    PASS_EXCEPT_DELETE: 'ページが出す書き込みの送信のうち、削除と危険な語の送信のほかを、サイトに届けました。',
+    // SD-3（設計書 `2026-11-16-beaksight-action-based-delete-guard-design.md`）: サイトの通信は止めない。削除の守りは BeakSight の操作の前の判定。
+    PASS_EXCEPT_DELETE: 'サイトの通信は止めませんでした。BeakSight は、消す・取り消すなどのボタンを押しません。',
   },
 } as const);
 
@@ -885,30 +1048,8 @@ export const CLI_TEXT = deepFreeze({
 // 呼び出し側（`src/cli/output.ts`）が渡す。
 // ---------------------------------------------------------------------------------------------------------------
 
-/** 同じ出力先で、別の Run が実行中（動いている Run のロックがある）なので、再開も新しい Run もせずに終える。 */
-export const activeRunInOutputDirectoryText = (runId: string): string =>
-  `同じ出力先で、別の Run（${runId}）が実行中です。その Run が終わってから実行してください。`;
-
-/**
- * 同じ出力先で、別の起動が Run を始めているところ（出力先の開始のロックがあり、Run の ID はまだ決まっていない。DEF-057。Task 24 の設計書 4.6）
- * なので、再開も新しい Run もせずに終える。`activeRunInOutputDirectoryText` と同じ扱い（終了コード 4）。
- */
-export const startingRunInOutputDirectoryText =
-  '同じ出力先で、別の Run が始まるところです。その Run が終わってから実行してください。';
-
-/**
- * DEF-172: ロック（開始のロック、Run のロック）の持ち主の起動が動いているのに、ロックが古く見えるので、取り直す前に、ロックが更新されるかを待って
- * 確かめる（`durationText` は待つ時間。`formatDuration` の書き方。例: `75秒`）。端末のスリープや時計の跳びの後に、動いている Run を取り直さないため。
- */
-export const runLockGraceWaitText = (durationText: string): string =>
-  `同じ出力先のロックの持ち主の起動が動いているため、ロックが更新されるかを最大 ${durationText}待って確かめます（スリープや時計のずれの後に、動いている Run を取り直さないためです）。`;
-
-/**
- * DEF-170: Run を始めた後に、この Run のロックを別の起動が持った（ハートビートで分かった）。サイトへの読み込みを止め、Run のフォルダに書かずに
- * 終えた（終了コードは、別の起動が Run を持つときと同じ 4）。
- */
-export const runLockLostText =
-  'この Run のロックを別の起動が持ちました。サイトへの読み込みを止め、Run のフォルダには書かずに終わりました。同じ出力先で同時に BeakSight を動かしていないか確かめてください。';
+/** 同じ出力先で、別の Run が実行中（出力先のロックを、動いている別の起動が持つ。SPEC-2）なので、再開も新しい Run もせずに終える（終了コード 4）。 */
+export const runActiveInOutputDirectoryText = '同じ出力先で、別の Run が実行中です。その Run が終わってから実行してください。';
 
 /** 途中の Run の再開のための保存（`state.json` と `state.prev.json`）を読めないので、再開の対象にしない。 */
 export const unreadableCheckpointText = (runId: string): string =>
@@ -937,12 +1078,6 @@ export const resumingRunText = (runId: string, pagesFinishedText: string): strin
 export const finalizingRunText = (runId: string): string =>
   `途中の Run（${runId}）は、安全の不変条件の違反を検出した後のため、新しいページを監査せずに、最後の処理だけを行います。`;
 
-/** 再開を始められなかった: ロックが、動いている別のプロセスの Run のもの（`LOCK_HELD_BY_ACTIVE_RUN`）。 */
-export const runLockHeldText = (runId: string): string => `別のプロセスが、この Run（${runId}）を実行しています。`;
-
-/** 再開を始められなかった: 古いロックを、別のプロセスが同時に作り直した（`LOCK_TAKEN_OVER_CONCURRENTLY`）。 */
-export const runLockTakenOverText = (runId: string): string => `別のプロセスが、同時にこの Run（${runId}）の再開を始めました。`;
-
 /** 再開を始められなかった: 再開のための保存やロックを、読み書きできなかった（`CHECKPOINT_STORE_FAILED`）。 */
 export const checkpointStoreFailedText = (runId: string): string => `再開のための保存を読み書きできませんでした（${runId}）。`;
 
@@ -966,7 +1101,7 @@ export const siteUnavailableStopText = (detail: string | null): string =>
  */
 export const AUDIT_SEND_TEXT = deepFreeze({
   label: '送信の扱い',
-  passedNotice: (countText: string): string => `この点検では、ページが出す送信のうち削除のほかを通した（${countText}）`,
+  passedNotice: (countText: string): string => `この点検では、サイトの通信は止めませんでした（${countText}）`,
   /** AS-c: 通した数の内訳（ほかの Origin への送信の数と、WebSocket の接続の数。`formatCount` の結果）。 */
   passedDetail: (otherOriginCountText: string, webSocketCountText: string): string =>
     `うち、ほかのサイトへの送信 ${otherOriginCountText}。ほかに、つないだままやりとりする接続 ${webSocketCountText}`,
@@ -980,7 +1115,7 @@ export const AUDIT_SEND_TEXT = deepFreeze({
     `つないだままやりとりする接続のうち、BeakSight の見張りを通らずに開いたもの ${outsideGuardCountText}、危険な語を含むもの ${dangerousCountText}（止められない接続です。ブラウザが開いた接続から数えました）`,
   passedWebSocketsOutsideGuard: 'Guard の判定を通らずに開いた WebSocket の接続',
   passedDangerousWebSockets: '危険な語を含む WebSocket の接続',
-  jobNotice: 'この作業では、ページが出す送信のうち、削除のほかを通しました。削除と、危険な語を含む送信は止めました。',
+  jobNotice: 'この作業では、サイトの通信は止めませんでした。BeakSight は、消す・取り消すなどのボタンを押しません。',
   passedCount: '通した送信',
   methodsCaption: '通した送信の件数（method ごと）',
   methodColumns: ['method', '件数'],
@@ -1208,12 +1343,10 @@ export const PROFILE_STORE_REJECTION_DESCRIPTIONS = deepFreeze({
 export const TARGET_SITE_PROBLEM_DESCRIPTIONS = deepFreeze({
   START_URL_REQUIRED: '開始のアドレスを入力してください。',
   START_URL_INVALID: '開始のアドレスは、http:// か https:// で始まるアドレスにしてください（例: https://example.test/）。',
-  START_URL_TOO_LONG: '開始のアドレスが長すぎます。短いアドレスにしてください。',
   START_URL_HAS_CREDENTIALS: '開始のアドレスに、ユーザー名やパスワード（@ の前の部分）を含めないでください。',
   START_URL_HAS_FRAGMENT: '開始のアドレスに、# から後ろの部分を含めないでください。',
   ALLOWED_ORIGINS_REQUIRED: '点検してよいサイトのアドレスを 1 つ以上入力してください。',
   ALLOWED_ORIGIN_INVALID: '点検してよいサイトのアドレスは、1 行に 1 つ、https://example.test のような形で書いてください。最後の / や、その後ろの部分は付けないでください。',
-  ALLOWED_ORIGINS_TOO_MANY: '点検してよいサイトのアドレスが多すぎます。数を減らしてください。',
   ALLOWED_ORIGINS_MISSING_START: '点検してよいサイトのアドレスに、開始のアドレスの頭の部分（https://〜 のサイトのアドレス）を入れてください。',
 } as const);
 
@@ -1256,8 +1389,6 @@ export const TARGET_CONFIG_CREATION_FAILURE_DESCRIPTIONS = deepFreeze({
 export const TARGET_CRAWL_LIMIT_PROBLEM_DESCRIPTIONS = deepFreeze({
   NOT_POSITIVE_INTEGER: '1 以上の整数にしてください。',
   NOT_NON_NEGATIVE_INTEGER: '0 以上の整数にしてください。',
-  // T44R（Task 44 のレビューの M-3）: 上限の値は `MAX_CRAWL_MAX_PAGES`（設定の検証と同じ）。
-  ABOVE_MAX_PAGES: `ページの上限は ${MAX_CRAWL_MAX_PAGES.toLocaleString('en-US')} ページまでです（設定の決まり）。`,
   BELOW_NAVIGATION_INTERVAL_FLOOR: '今の下限より短くはできません（サイトへの負荷の決まり）。下限は、欄の下に示しています。',
 } as const);
 
@@ -1319,6 +1450,8 @@ export const LOCAL_UI_CRAWL_LIMITS_TEXT = deepFreeze({
   },
   /** 欄の下の、今の値（`valueText` は書式を整えた値）。 */
   currentValue: (valueText: string): string => `今の値: ${valueText}`,
+  /** L14: ページの上限と時間の上限の欄の下に添える、空の意味。 */
+  emptyMeansNoLimit: '空にすると、上限を決めずに点検します。',
   /** 読み込みの間隔の下限（`floorText` は `formatDuration` の結果）。 */
   intervalFloor: (floorText: string): string => `下限: ${floorText}（これより短くはできません。サイトへの負荷の決まり）`,
   review: '変更を確かめる',
@@ -1334,7 +1467,7 @@ export const LOCAL_UI_CRAWL_LIMITS_TEXT = deepFreeze({
   },
   /** 書き込みのモードで、今承認が有効なシナリオがあるとき（`countText` は `formatCount` の結果）。 */
   approvalNotice: (countText: string): string =>
-    `書き込みの OK を出した書き込みの手順（${countText}）の OK が外れます。OK は設定のファイルの内容に結びついているため、書き込みを始める前に、もう一度書き込みの OK を出してください。`,
+    `チェックした画面（${countText}）のチェックが外れます。サイトの画面の「${WRITE_SCREENS_HEADING_TEXT}」で、もう一度チェックしてください。`,
   /**
    * 途中の Run は再開されない旨（いつも出す。途中の Run を探す部品は、画面のコードが読み込めない範囲にあるため、あるかどうかは示さない）。
    */
@@ -1516,6 +1649,8 @@ export const PROFILE_VALIDATION_ERROR_DESCRIPTIONS = deepFreeze({
     '点検する管理画面のサイトのアドレス（点検してよいサイトのアドレス）は、ログインのときに通ってよい外のサイトのアドレスには入れません。手でログインすると、ログインの先のサイトのアドレスが自動で入ります。',
   // PL-F 修正の 1 回目（PL-REV の Minor 2）: 確かめた記録の参照が秘密に見える。
   ISOLATION_REFERENCE_SECRET_LIKE: 'パスワードなどの秘密に見える文字は入れられません。確かめた記録の名前だけを入れてください。',
+  // NL-1（設計書 `2026-11-06-beaksight-no-login-test-site-design.md` 3.1 の 2）: ログインのないテスト用のサイトは、このパソコンで動くサイトだけ。
+  PROFILE_NO_LOGIN_REQUIRES_LOOPBACK: 'ログインのないサイトで操作をさがしたり書き込みを試したりできるのは、このパソコンで動かしているサイトだけです。',
 } as const);
 
 /** ローカルの管理画面の文言（設計書 4.7）。 */
@@ -1576,9 +1711,11 @@ export const LOCAL_UI_TEXT = deepFreeze({
     // MI-1: 使い方の 2 択（環境・監査モード・認証の方式は、ここから決まる。詳しい設定で直せる）。
     usage: '使い方',
     // OP-1（設計書 `2026-10-27-beaksight-one-pass-flow-design.md` 4.1 の D11）: ログインが要るかで選ぶ語にした。
-    usageTestAuth: 'ログインが必要なサイト',
-    usagePublic: 'ログインしなくても見られるサイト',
-    // PL-1: 隔離の扱いの 2 択（作成）は外した（保存した日の未確認の参照をサーバが作り、確かめた記録の参照は「書き込みも試す」の確認で選ぶ。PL-5）。作成の
+    // NL-3（設計書 `2026-11-06-beaksight-no-login-test-site-design.md` 3.3 の 1）: ログインの有無は聞かない。自分たちで用意したテスト用のサイトか、公開して
+    // いるサイトかで選ぶ（ログインのないテスト用のサイトも前者。ログインが要るかは、下調べで BeakSight が決める）。
+    usageTestAuth: 'テスト用のサイト（自分たちで用意したサイト）',
+    usagePublic: '公開しているサイト（見るだけ）',
+    // PL-1: 隔離の扱いの 2 択（作成）は外した（保存した日の未確認の参照をサーバが作り、確かめた記録の参照は「書き込みも試す」の確認で選ぶ。PL-5。OP-2 で、その確認も外した）。作成の
     // 「詳しい設定」の欄（と、その空のままのときの決め方の説明）も消した。
     // MI-2（設計書 4.2 の「保存して入口を確かめる」）: テスト環境のときの保存のボタンと、その下の説明。
     // OP-1（設計書 `2026-10-27-beaksight-one-pass-flow-design.md` 4.1 の D11、4.1.3 の 3）: ボタンは 1 つ。保存 → サイトの下調べ → 点検へ、自動で進む。
@@ -1586,7 +1723,9 @@ export const LOCAL_UI_TEXT = deepFreeze({
     manualLoginEveryTime: '毎回手でログインする',
     manualLoginEveryTimeHint: '入れると、点検のたびに開いたブラウザで手でログインします。外すと、BeakSight が自動でログインします（保存した ID とパスワードは消しません）。',
     saveAndCheckEntry: '点検を始める',
-    saveAndCheckEntryNote: '押すと、サイトを下調べしてから点検を始めます。ログインの画面が開いたら、いつもどおりログインしてください。次からは BeakSight がログインします。',
+    // NL-3: ログインのないテスト用のサイトもこの説明になるので、ログインの文は「ログインの画面があるサイト」に限って言う。
+    saveAndCheckEntryNote:
+      '押すと、サイトを下調べしてから点検を始めます。ログインの画面があるサイトでは、開いたブラウザで、いつもどおりログインしてください。次からは BeakSight がログインします。',
     // OP-1 修正の 2 回目（4.1.3 の 3。設計者の判断「公開のサイトも点検を始める 1 つ」）: ログインしなくても見られるサイトのときの説明（ログインの文はない）。
     saveAndCheckEntryNotePublic: '押すと、サイトを下調べしてから点検を始めます。',
     // MI-1: 開始の URL の Origin を許可 Origin に含む設定のファイルが 2 つ以上あった（何も保存していない）。
@@ -1611,6 +1750,8 @@ export const LOCAL_UI_TEXT = deepFreeze({
       noJobs: 'このサイトの下調べの作業は、まだありません。',
     },
     profileId: '名前',
+    /** DN-1: 編集の欄の見分けの印のラベル（画面に出す名前は別の欄で変える）。 */
+    profileIdFixed: '最初に付けた名前（変えられません）',
     profileIdHint: '使える文字は、小文字の英字と数字とハイフン（-）です（例: example-public）。保存した後は変えられません。',
     targetConfigPath: '設定のファイル',
     targetConfigPathHint: 'config/targets/ か local/targets/ の中の JSON です。',
@@ -1715,7 +1856,7 @@ export const AUDIT_JOB_START_REJECTION_DESCRIPTIONS = deepFreeze({
   // 読むだけ）ので、「書き込みのモードでは監査を始められない」の文を外した。
   MODE_NOT_EXECUTABLE: {
     description: 'このサイトの点検のしかたでは、この作業を始められません。',
-    action: '点検は、「公開の画面の点検」か、テスト用のサイトの点検（「ログインして見るだけの点検」か「書き込みも試す点検」）のサイトで始めてください。点検そのものは、どれも見るだけです。操作さがしと見るだけの確かめは、「ログインして見るだけの点検」か「書き込みも試す点検」のサイトの画面から始めてください。書き込みは、「書き込みも試す点検」のサイトの、書き込みの手順から始めてください。',
+    action: '点検は、「公開の画面の点検」か、テスト用のサイトの点検（「ログインして見るだけの点検」か「書き込みも試す点検」）のサイトで始めてください。点検そのものは、どれも見るだけです。操作さがしと見るだけの確かめは、「ログインして見るだけの点検」か「書き込みも試す点検」のサイトの画面から始めてください。書き込みは、サイトの画面の一覧「登録・更新を試せる画面」でチェックした画面だけ、点検のときに行います。',
   },
   TARGET_PATH_INVALID: {
     description: 'このサイトが使う設定のファイルの場所を、受け付けません。',
@@ -1786,18 +1927,19 @@ export const AUDIT_JOB_START_REJECTION_DESCRIPTIONS = deepFreeze({
     action: '「見るだけの確かめ」の画面で、見るだけの操作を選び、送る値とあるはずのものを決めて保存してから、もう一度始めてください。見つかった操作がなければ、先に「操作さがしを始める」を押してください。',
   },
   // T30e（Task 30 の設計書 3 章）: 書き込みのジョブの開始を拒む理由。画面の始める口は T30g。
+  // SPEC-4: 人に直させる文は、一覧のチェックの案内にした（決まりや答え合わせを人に選ばせない）。
   WRITE_GRANT_REJECTED: {
-    description: '書き込みの OK を使えませんでした（ない、使い終わった、期限が切れた、取り消された、OK を出したときと状況が変わった、など）。書き込みは送っていません。',
-    action: '書き込みの手順の、書き込みの OK の状態を確かめてください。必要なら書き込みの OK を出し直してから、もう一度始めてください。',
+    description: 'この画面を試してよいという確認が、今は使えませんでした（サイトの設定が変わった、など）。書き込みは送っていません。',
+    action: RECHECK_WRITE_SCREEN_ACTION_TEXT,
   },
   WRITE_DATA_NOT_GENERATED: {
-    description: '送る値を作れませんでした（入れる値の決まりが定まらない、重ならない値の組み合わせを使い切った、答え合わせの見るだけの確かめに結び付ける値がない、など）。書き込みは送っていません。',
-    action: '書き込みの手順の、入れる値の決まりと答え合わせのしかたを見直してください。それから書き込みの OK を出し直して、もう一度始めてください。',
+    description: 'BeakSight が、この画面に入れる値を作れませんでした。書き込みは送っていません。',
+    action: UNCHECK_WRITE_SCREEN_ACTION_TEXT,
   },
   // T37d（設計者の判断 5）: 書き込みの照合の READ に、画面の path の定義は使わない。
   WRITE_READ_VERIFICATION_PAGE_TARGET: {
-    description: '答え合わせに選んだ見るだけの確かめが、ページ（アドレスの後ろ）を読むものです。書き込みの答え合わせには、見るだけの操作を読む確かめだけを使えます。書き込みは送っていません。',
-    action: '書き込みの手順の答え合わせのしかたで、見るだけの操作を読む確かめを選び直してください。それから書き込みの OK を出し直して、もう一度始めてください。',
+    description: 'この画面は、書き込んだ後に結果を確かめるしかたが決まりませんでした。書き込みは送っていません。',
+    action: UNCHECK_WRITE_SCREEN_ACTION_TEXT,
   },
 } as const satisfies Record<string, ControlReasonText>);
 
@@ -2039,8 +2181,8 @@ export const AUDIT_JOB_FAILURE_REASON_DESCRIPTIONS = deepFreeze({
   },
   // T30d（Task 30 の設計書 3 章の「記録」）: 書き込みのジョブ（`WRITE_CREATE`）の理由。始める口と画面は T30e・T30g。
   WRITE_GRANT_REJECTED: {
-    description: '書き込みの OK を使えなかった（取り消された、期限が切れた、OK を出したときと状況が変わった、など）ため、送らずに止めました。',
-    action: '書き込みの手順の、書き込みの OK の状態を確かめてください。必要なら書き込みの OK を出し直してから、もう一度書き込みを始めてください。',
+    description: 'この画面を試してよいという確認が、今は使えなかった（チェックが外れた、サイトの設定が変わった、など）ため、送らずに止めました。',
+    action: RECHECK_WRITE_SCREEN_ACTION_TEXT,
   },
   WRITE_RESULT_INVALID: {
     description: '書き込みの作業の結果のファイル（action-run.json）を読めないか、形が正しくなかったため、結果を「分からない」として記録しました。登録されたかどうかは分かりません。',
@@ -2078,10 +2220,6 @@ export const READ_CHECK_DEFINITION_REJECTION_DESCRIPTIONS = deepFreeze({
   READ_CANDIDATE_NOT_READ: {
     description: '対象の操作の候補は、前回の操作さがしの結果で、見るだけの操作に分けられていません。見るだけの確かめには使えません。保存していません。',
     action: '見るだけの操作に分けられた候補を選んでください。',
-  },
-  READ_CHECK_LIMIT_EXCEEDED: {
-    description: 'このサイトの見るだけの確かめが、上限の数に達しています。保存していません。',
-    action: '使わない見るだけの確かめを削除してから、もう一度保存してください。',
   },
   READ_CHECK_PROFILE_NOT_FOUND: {
     description: '対象のサイトが見つかりません。保存していません。',
@@ -2181,6 +2319,10 @@ export const DISCOVERY_UNREAD_REASON_LABELS = deepFreeze({
   SITE_UNAVAILABLE: 'サイトが応答しない',
   SAFETY_VIOLATION: '安全の決まりの違反',
   PREFLIGHT_FAILED: '始める前の確認の失敗',
+  // DEF-208-4（F）: 同じ作りの画面は 1 つだけ読む。
+  SAME_TEMPLATE_PAGE_READ: '同じ作りの画面をもう読んだ',
+  // COV-2c fix round 5: 続きから始めた後、前の画面を作り直せなかった。
+  REBUILD_FAILED: '続きから始めたとき、前の画面を作り直せなかった',
 } as const satisfies Record<string, string>);
 
 /** 発見で画面を読み切れなかった理由（`INCOMPLETE_REASONS`。候補の契約の値）の説明。 */
@@ -2199,6 +2341,11 @@ export const DISCOVERY_INCOMPLETE_REASON_DESCRIPTIONS = deepFreeze({
   // T37a（Task 37 の設計書 3.1）。T37R2-fix: 今数えている項目（上限・401・止めた登録した呼び出し・サービスの Origin への読み取りでない要求）に合わせた。
   SERVICE_READ_REFUSED:
     'この画面を読む間に、通ってよい外のサイトへの要求を上限で止めた、外のサイトがログインしている状態を受け付けなかった、登録した見るだけの呼び出しを止めた、外のサイトへの見るだけでない要求を止めた、のどれかがありました。画面がデータを描けなかったかもしれないため、読めた分だけを示します。',
+  // fix round 4（通知の枠の設計書 3.2.3 の 3）。
+  NOTIFICATION_DISMISSAL_NAVIGATION_BLOCKED: 'お知らせの枠を閉じたら、別の画面へ移ろうとしたため止めました。そのため、この画面は読んでいません。',
+  // L6/L3-1（L0 の進みの見張り）: 操作さがしの 1 画面を、それまでの記録で終えた。
+  STAGE_UNRESPONSIVE: '画面が反応しなくなったので、ここから先は確かめられませんでした',
+  STAGE_NEVER_QUIET: '画面が動き続けて落ち着かなかったので、ここまでで確かめを終えました',
 } as const satisfies Record<string, string>);
 
 /** READ の確かめの結果の詳しい理由（`READ_CHECK_DETAILS`）の説明。 */
@@ -2215,10 +2362,15 @@ export const READ_CHECK_DETAIL_DESCRIPTIONS = deepFreeze({
   PARAMETER_NOT_SENDABLE: '送る値の欄が、今の画面では値を送れない欄（見えない、変えられない、使えない、パスワード、ファイル）になっていました。',
   URL_NOT_BUILT: '読むページのアドレスを組み立てられませんでした。送信先が候補のサイトの外になる、アドレスの後ろを開始のアドレスのサイトで組み立てられない、長さの上限、などです。',
   REQUEST_POLICY: '読まないページ、危険な語、点検してよいサイトのアドレス、ログインの画面の決まりに当たったため、止めました。',
-  NAVIGATION_FAILED: '読んだページの読み込みが失敗しました（時間切れ、接続の失敗、外のサイトへの移動を止めた、など）。',
+  NAVIGATION_FAILED: '読んだページの読み込みが失敗しました（時間切れ、接続の失敗、点検の範囲の外へ移ったので読まなかった、など）。',
   HTTP_ERROR_STATUS: '読んだページで、サイトがエラーを返しました。',
   RESULT_PAGE_UNREADABLE: '読んだページは読み込めましたが、結果の画面の形を読めませんでした。',
   SESSION_LOST: '読んだページの読み込みで、ログインが切れていました（ブラウザに残るログインの印が消えた場合を含みます）。',
+  // DEF-235: 番号の入る画面で、見る登録の番号がどこにもなかった（断らない。利用者に手を求めない）。
+  RECORD_ID_NOT_AVAILABLE: '見る登録がまだないため、見ていません。',
+  // L4（L0 の進みの見張り）: 読み取りを終えた（ほかの定義へ進む）。
+  STAGE_UNRESPONSIVE: '画面がしばらく全く反応しなくなったため、見るのをやめました。',
+  STAGE_NEVER_QUIET: '画面の動きが止まらず読み取りが進まなくなったため、見るのをやめました。',
   // T37d（Task 37 の設計書 3.5）: 読んで照らしたが、監査の段の事実で判定しなかった（照らした結果に関係なく判定できない）。
   SERVICE_READ_REFUSED:
     '読む間に、通ってよい外のサイトへの見るだけの要求を上限で止めたか、外のサイトがログインしている状態を受け付けませんでした。画面がデータを描けなかったかもしれないため、照らした結果に関係なく判定していません。',
@@ -2300,7 +2452,8 @@ export const LOCAL_UI_READ_CHECK_TEXT = deepFreeze({
   retired: '取り消したサイトでは、見るだけの確かめを作ったり変えたりできません。',
   definitionsHeading: '保存した確かめ',
   noDefinitions: 'まだ見るだけの確かめはありません。下の「見るだけの操作の候補」から作るか、「画面の読み方を決める」から作ります。',
-  definitionCount: (countText: string, maxText: string): string => `${countText}（上限 ${maxText}）`,
+  // L4（COV-7）: 件数だけを出す（上限を置かないので、上限の文を出さない）。
+  definitionCount: (countText: string): string => countText,
   candidatesHeading: '見るだけの操作の候補',
   candidatesNote: '前回の操作さがしの結果のうち、見るだけの確かめに使える候補です。',
   noCandidates: '見るだけの確かめに使える候補はありません。先に操作さがしを行ってください。',
@@ -2325,8 +2478,8 @@ export const LOCAL_UI_READ_CHECK_TEXT = deepFreeze({
   optionsHint: (valuesText: string): string => `選べる値: ${valuesText}`,
   secretLikeHint: '秘密に見える名前の欄です。値を入れても送れません（保存のときに拒みます）。',
   expectationsHeading: 'あるはずのもの',
-  /** 期待の数の説明（`maxText` は `formatCount` の結果（単位つき））。 */
-  expectationsNote: (maxText: string): string => `1 件以上、${maxText}まで。あるはずのものがすべて合うと「一致」になります。`,
+  /** 期待の数の説明。L4（COV-7）: 上限を置かないので、上限の文を出さない。 */
+  expectationsNote: '1 件以上。あるはずのものがすべて合うと「一致」になります。',
   expectationKind: '確かめる中身の種類',
   expectationCount: '行の数',
   expectationText: '含む文',
@@ -2443,30 +2596,31 @@ export const SCENARIO_DRAFT_REJECTION_DESCRIPTIONS = deepFreeze({
       '値を送れるのは、対象の操作の候補の欄のうち、見えていて、使えて、変えられる欄だけです。パスワードとファイルの欄と、送り方を上書きする欄（_method）は送りません。保存していません。',
     action: '前回の操作さがしの結果で欄が変わっていないかを確かめ、送れる欄だけを選んでください。',
   },
-  // T31b（Task 31 の設計書 3 章の「UPDATE の指定」）: UPDATE の指定の理由（文言の確かめは T31h）。
+  // T31b（Task 31 の設計書 3 章の「UPDATE の指定」）: UPDATE の指定の理由（文言の確かめは T31h）。SPEC-4: 下書きは BeakSight が一覧のチェックで作るので、
+  // 手順は、チェックの案内（作り直せるもの）か、更新は試せないことの案内にした。
   SCENARIO_UPDATE_SPEC_MISSING: {
     description: '更新する書き込みの手順には、更新の指定（参照する作ったデータの一覧、アドレスの形、保つ欄）が要ります。保存していません。',
-    action: '更新の指定を入れてから、もう一度保存してください。',
+    action: UPDATE_NOT_TRIABLE_ACTION_TEXT,
   },
   SCENARIO_UPDATE_SPEC_NOT_ALLOWED: {
     description: '新しく登録する書き込みの手順は、更新の指定を持てません。保存していません。',
-    action: '更新の指定を外してから、もう一度保存してください。',
+    action: RECHECK_WRITE_SCREEN_ACTION_TEXT,
   },
   SCENARIO_UPDATE_TARGET_NOT_FOUND: {
-    description: '作ったデータの一覧として選んだ書き込みの手順が、このサイトにありません。保存していません。',
-    action: '画面を読み込み直して、このサイトの、新しく登録する書き込みの手順から選び直してください。',
+    description: '作ったデータの一覧として使う書き込みの手順が、このサイトにありません。保存していません。',
+    action: RECHECK_WRITE_SCREEN_ACTION_TEXT,
   },
   SCENARIO_UPDATE_TARGET_NOT_CREATE: {
-    description: '作ったデータの一覧には、この手順とは別の、新しく登録する書き込みの手順だけを選べます。保存していません。',
-    action: '新しく登録する書き込みの手順から選び直してください。',
+    description: '作ったデータの一覧には、この手順とは別の、新しく登録する書き込みの手順だけを使えます。保存していません。',
+    action: RECHECK_WRITE_SCREEN_ACTION_TEXT,
   },
   SCENARIO_UPDATE_PATH_MISMATCH: {
     description: 'アドレスの形の {id} に候補の画面の値を入れても、更新の画面と送信先の、両方のアドレスの後ろに同じ値で戻りません。保存していません。',
-    action: '候補の更新の画面と送信先のアドレスの後ろを確かめて、データの番号の位置だけを {id} にしてください。',
+    action: UPDATE_NOT_TRIABLE_ACTION_TEXT,
   },
   SCENARIO_UPDATE_RECORD_ID_UNSAFE: {
     description: 'アドレスの形の {id} の位置の値が、データの番号として受ける形ではありません。保存していません。',
-    action: 'データの番号の位置を確かめて、アドレスの形を直してください。',
+    action: UPDATE_NOT_TRIABLE_ACTION_TEXT,
   },
   // T31R-fix-1 の I-2。
   SCENARIO_UPDATE_PATH_NOT_BOUND_TO_LEDGER_ID: {
@@ -2533,14 +2687,6 @@ export const SCENARIO_DRAFT_REJECTION_DESCRIPTIONS = deepFreeze({
     description: '上限が、既定の件数を超えています。書き込みの手順の上限は、既定以下だけにできます。保存していません。',
     action: '上限を、欄の説明にある既定以下にしてください。',
   },
-  SCENARIO_LIMIT_INCONSISTENT: {
-    description: '1 回の点検の上限が、合計の上限を超えています。保存していません。',
-    action: '1 回の点検の上限を、合計の上限以下にしてください。',
-  },
-  SCENARIO_TTL_ABOVE_DEFAULT: {
-    description: '書き込みの OK の期限の日数が、既定の日数を超えています。保存していません。',
-    action: '期限の日数を、欄の説明にある既定以下にしてください。',
-  },
   // T37d fix round 1: 書き込みの照合の READ に、画面の path を読む定義は使わない。
   SCENARIO_VERIFICATION_READ_CHECK_PAGE_TARGET: {
     description: '答え合わせに選んだ見るだけの確かめは、画面を読むものです。書き込みの答え合わせには、見るだけの操作の候補を読むものだけを使えます。保存していません。',
@@ -2605,8 +2751,8 @@ export const SCENARIO_DRAFT_REJECTION_DESCRIPTIONS = deepFreeze({
     description: '登録したデータの番号を読む、サイトの返事の項目の名前が、秘密に見えます。値を照らさない項目に、秘密を運ばせないためです。保存していません。',
     action: '番号の項目を別の項目にするか、空にして、書き込みの後の確かめ方にある、番号の取り方を使ってください。',
   },
-  // T40R-fix-B（Task 40 の設計書 7 章の「T40R」の行の I-2）: API のシナリオの照合の READ。T40R2-fix: 画面から取る登録の ID の型は拒まず、注意
-  // （`LOCAL_UI_WRITE_TEXT.recordIdPatternCaution`）にした。
+  // T40R-fix-B（Task 40 の設計書 7 章の「T40R」の行の I-2）: API のシナリオの照合の READ。T40R2-fix: 画面から取る登録の ID の型は拒まない
+  // （SPEC-4: 注意の文言も捨てた）。
   SCENARIO_API_READ_VERIFICATION_NOT_BOUND: {
     description: '答え合わせに使う、画面を読む見るだけの確かめ（{id} の形）のあるはずのものが、行の数だけです。登録した値と比べるものがないと、別の画面を読んでも一致しうるので、答え合わせに使えません。保存していません。',
     action: 'あるはずのものに「本文が含む」か「詳細の項目の値」を足し、比べる値に送る欄を選んでください。',
@@ -2619,6 +2765,46 @@ export const SCENARIO_DRAFT_REJECTION_DESCRIPTIONS = deepFreeze({
   SCENARIO_API_FILTER_NOT_BOUND_TO_LEDGER_ID: {
     description: '作ったデータの一覧（参照した登録の手順）の番号で、更新する行を選べるか分かりません。登録が画面を通さずに送るものでない、登録と更新の送り先（サイトのアドレスとアドレスの後ろ）が違う（別の表）、または登録したデータの番号を読む返事の項目の名前が、行を選ぶ条件の名前と違います。保存していません。',
     action: '同じ送り先（同じ表）に画面を通さずに登録し、返事の項目の名前が行を選ぶ条件の名前と同じ登録の手順を、作ったデータの一覧に選んでください。',
+  },
+  // ARR-2（設計書 `2026-11-08-beaksight-api-array-keys-design.md` 3.1）: 登録の並びの値の項目。
+  SCENARIO_API_ARRAY_NESTED: {
+    description: 'この項目の値は並びで、その中にさらにまとまりか並びがあります。中の値を照らせないため、扱えません。保存していません。',
+    action: 'この項目を、ページが決める項目から外してください。外せない場合は、この候補では書き込みの手順を作れません。',
+  },
+  SCENARIO_API_ARRAY_OVER_LIMIT: {
+    description: 'この項目の値は並びで、並びの数か、中の文字の長さが、扱える上限を超えています。保存していません。',
+    action: 'この項目を、ページが決める項目から外してください。外せない場合は、この候補では書き込みの手順を作れません。',
+  },
+  SCENARIO_API_ARRAY_ELEMENT_TYPE_MISMATCH: {
+    description: '欄の文字が入る並びの項目に、文字でない値が入っています。欄の値をそのまま照らせないため、扱えません。保存していません。',
+    action: 'この候補では、画面を通さずに送る書き込みの手順を作れません。',
+  },
+  SCENARIO_API_ARRAY_ELEMENT_COUNT_MISMATCH: {
+    description: '欄の文字が入る並びの項目に、欄の文字のほかの値も入っています（欄の文字 1 つだけの並びでありません）。扱えません。保存していません。',
+    action: 'この候補では、画面を通さずに送る書き込みの手順を作れません。',
+  },
+  // ARR-3（設計書 `2026-11-09-beaksight-api-array-rows-design.md` 2.2 の 3、2.5）: 欄の文字が 2 つ以上入る並びの項目。
+  // ARR-5（設計書 `2026-11-09-beaksight-api-array-rows-design.md` 2.4）: まとまりが並ぶ項目。
+  SCENARIO_API_ARRAY_ROW_KEYS_MISMATCH: {
+    description: 'この項目の値は、まとまりの並びで、まとまりごとに中の項目の組が違います。照らせないため、扱えません。保存していません。',
+    action: 'この候補では、画面を通さずに送る書き込みの手順を作れません。',
+  },
+  SCENARIO_API_ARRAY_INNER_KEY_NOT_ALLOWED: {
+    description: 'この項目の値は、まとまりの並びで、中の項目の名前に、秘密に見える名前、状態を表す名前、または読めない名前があります。扱えません。保存していません。',
+    action: 'この候補では、画面を通さずに送る書き込みの手順を作れません。',
+  },
+  // ARR-5 fix round 1（SREV-ARR2 の M1・M2）。
+  SCENARIO_API_ARRAY_PATH_CONFLICT: {
+    description: 'この項目の値は並びで、並びの行の欄の呼び名が、ほかの項目か、ほかの並びの行の欄と同じになります。欄ごとに照らせないため、扱えません。保存していません。',
+    action: 'この候補では、画面を通さずに送る書き込みの手順を作れません。',
+  },
+  SCENARIO_API_BODY_KEY_DUPLICATE: {
+    description: '送る中身に、同じ名前の項目が 2 回あります。どちらの値が使われるか分からないため、扱えません。保存していません。',
+    action: 'この候補では、画面を通さずに送る書き込みの手順を作れません。',
+  },
+  SCENARIO_API_ARRAY_MULTIPLE_FIELDS: {
+    description: 'この項目の値は並びで、その中に 2 つ以上の欄の文字が入っています。ページが決める値として扱えず、今は欄ごとに照らせないため、扱えません。保存していません。',
+    action: 'この項目を、ページが決める項目から外してください。外せない場合は、この候補では書き込みの手順を作れません。',
   },
 } as const satisfies Record<string, ControlReasonText>);
 
@@ -2661,21 +2847,21 @@ export const SCENARIO_REQUEST_REJECTION_DESCRIPTIONS = deepFreeze({
     description: 'この画面を開いた後に、この書き込みの手順が変わりました。何も変えていません。',
     action: '画面を読み込み直して、今の内容を確かめてから、もう一度操作してください。',
   },
+  // SPEC-4: 承認と撤回は一覧のチェックだけになったので、人に直させる文はチェックの案内にした。
   SCENARIO_APPROVAL_DIGEST_MISMATCH: {
-    description: '画面が古いため、書き込みの OK を出していません。この画面を開いた後に、OK の対象の内容が変わりました。',
-    action: '画面を読み込み直して、今の内容と変わった所を確かめてから、もう一度書き込みの OK を出してください。',
+    description: '確かめている間に、この画面の内容が変わったため、チェックできませんでした。',
+    action: RECHECK_WRITE_SCREEN_ACTION_TEXT,
   },
   SCENARIO_SIDE_EFFECTS_UNCONFIRMED: {
-    description: 'ほかへの影響の確認に、まだ確かめていない項目があります。書き込みの OK を出していません。',
-    // MI-8（設計書 4.9。MI-6 で副作用の確認は承認のダイアログの 1 回になった）: シナリオの画面にはチェックがない。
-    action: '画面を読み込み直してから「書き込みの OK を出す」を押してください。確認のダイアログで 4 項目の中身を読んで、「書き込みの OK を出す」を押してください。',
+    description: 'ほかへの影響の確認が済んでいないため、チェックできませんでした。',
+    action: RECHECK_WRITE_SCREEN_ACTION_TEXT,
   },
   SCENARIO_NOT_APPROVABLE: {
-    description: '今の状態では、書き込みの OK を出せません。OK を出していません。',
-    action: '理由を見て、操作の候補、照らす見るだけの確かめ、サイトの設定を確かめてください。候補が変わったときは、操作さがしをもう一度行い、作り直してください。',
+    description: '今の状態では、この画面をチェックできません。',
+    action: '操作さがしをもう一度行ってから、もう一度チェックしてください。',
   },
   SCENARIO_NOT_APPROVED: {
-    description: '取り消す書き込みの OK がありません（OK を出していないか、もう取り消しています）。何も変えていません。',
+    description: 'この画面には、外すチェックがありません。何も変えていません。',
     action: '画面を読み込み直して、今の状態を確かめてください。',
   },
   SCENARIO_FACTS_CHANGED: {
@@ -2683,30 +2869,25 @@ export const SCENARIO_REQUEST_REJECTION_DESCRIPTIONS = deepFreeze({
     action: '画面を読み込み直してから、もう一度操作してください。',
   },
   SCENARIO_INPUT_RULES_NOT_LATEST: {
-    description: '付けようとした入れる値の決まりが、この書き込みの手順の、いちばん新しい決まりではありません。書き込みの手順は変えていません。',
-    action: '入れる値の決まりの画面を読み込み直して、いちばん新しい中身を確かめてから、もう一度保存してください。',
+    description: 'BeakSight が付けようとした入れる値の決まりが、いちばん新しいものではありませんでした。書き込みの手順は変えていません。',
+    action: RECHECK_WRITE_SCREEN_ACTION_TEXT,
   },
   SCENARIO_FACTS_UNAVAILABLE: {
-    description: 'サイトが指す設定のファイルか、保存した ID とパスワードの記録を読めないため、書き込みの OK の状態を確かめられません。OK を出すことも取り消すこともしていません。',
+    description: 'サイトが指す設定のファイルか、保存した ID とパスワードの記録を読めないため、チェックの状態を確かめられません。チェックを入れることも外すこともしていません。',
     action: '設定のファイルの場所と中身を確かめてから、もう一度操作してください。自動ログインなら、ID とパスワードの画面も確かめてください。',
   },
 } as const satisfies Record<string, ControlReasonText>);
-
-/** 承認のダイアログの取り消しのボタンの文言（PL-S: 副作用の 4 つの約束の説明が、このボタンの名前を引く）。 */
-const APPROVE_DIALOG_CANCEL_LABEL = 'やめる';
 
 /** ローカルの管理画面の、シナリオの画面の文言（Task 28 の設計書 4.6。T28e）。 */
 export const LOCAL_UI_SCENARIO_TEXT = deepFreeze({
   pages: {
     scenarios: '書き込みの手順',
-    newScenario: '書き込みの手順を作る',
     scenario: '書き込みの手順の詳細',
-    editScenario: '書き込みの手順を変える',
   },
   notEligible: '書き込みの手順は、書き込みも試す点検のサイトだけで使えます。',
-  retired: '取り消したサイトでは、書き込みの手順を作ったり、変えたり、書き込みの OK を出したりできません。記録は見られます。',
-  noExecution:
-    'この画面からは、書き込みをしません。書き込みの OK は、書き込んでよい条件（何回目の変更か、件数の上限、期限、ほかへの影響の確認、結果の確かめ方）を記録するだけです。書き込みは、OK を出した後に、「書き込みを始める」の画面から人が始めます。',
+  retired: '取り消したサイトでは、書き込みを試せません。記録は見られます。',
+  // SPEC-4: 書き込みは一覧のチェックだけで決める（この画面は読むだけ）。
+  noExecution: `この画面からは、書き込みをしません。試すかどうかは、サイトの画面の「${WRITE_SCREENS_HEADING_TEXT}」でチェックして決めます。`,
   listHeading: '書き込みの手順',
   // PL-U（設計書 14.1 の U4）: 0 件の一覧にも主のボタン「書き込みの手順を作る」を置くので、ほかの画面へは案内しない。
   noScenarios: 'まだ書き込みの手順はありません。',
@@ -2716,438 +2897,46 @@ export const LOCAL_UI_SCENARIO_TEXT = deepFreeze({
     kind: '種類',
     page: '画面',
     state: '状態',
-    expiresAt: '書き込みの OK の期限',
-    limits: '上限と使った件数',
-    revision: '何回目の変更か',
+    // LZ-3c: 書き込みの OK の期限の列は捨てた（OK は期限で切れない）。
+    limits: '1 回の件数と使った件数',
     operations: '操作',
     /** T29e: 入力の規則の状態。 */
     inputRules: '入れる値の決まり',
   },
-  /** 上限と使った件数（`perRunText`・`usedText`・`cumulativeText` は `formatCount` の結果）。 */
-  limitsValue: (perRunText: string, usedText: string, cumulativeText: string): string =>
-    `1 回に ${perRunText}・合計 ${usedText} / ${cumulativeText}`,
+  /** 1 回の件数と使った件数（`perRunText`・`usedText` は `formatCount` の結果。LZ-3c: 累積の上限は出さない）。 */
+  limitsValue: (perRunText: string, usedText: string): string => `1 回に ${perRunText}・合計 ${usedText}`,
   usedNote: '使った件数は、送る前に取り置いた件数・送った件数・送ったか分からない件数の合計です。送る前に取り置きを戻した件数は数えません。',
-  /** シナリオの版の表示（`revisionText` は `formatInteger` の結果）。 */
-  revisionValue: (revisionText: string): string => `${revisionText} 回目の変更`,
-  noExpiry: 'なし（書き込みの OK を出していません）',
   open: '開く',
-  factsUnavailable: 'サイトが使う設定のファイルか、保存した ID とパスワードが何回目の変更かを読めないため、書き込みの OK の状態を確かめられません。',
-  // 作成と変更のフォーム。
-  targetHeading: '対象の候補',
-  formHeading: '内容',
+  factsUnavailable: 'サイトが使う設定のファイルか、保存した ID とパスワードが何回目の変更かを読めないため、チェックの状態を確かめられません。',
   fieldsHeading: '送る欄',
-  fieldsNote:
-    '値を送る欄を選びます。選べるのは、操作の候補の欄のうち、見えていて、変えられて、使える状態の欄だけです。名前が秘密に見える欄と、危ない語の欄は選べません（理由を出します）。送る値の作り方（入れる値の決まり）は、保存した後に、書き込みの手順の詳細の「入れる値の決まりを開く」から決めます。',
-  noFields: '値を送れる欄はありません。',
-  limitsHeading: '上限',
-  perRunLimit: '1 回に書き込む件数の上限（件）',
-  cumulativeLimit: '合計の件数の上限（件）',
-  /** 上限の欄の説明（`minText`・`maxText` は `formatCount` の結果）。 */
-  limitHint: (minText: string, maxText: string): string => `${minText}以上、最初から決まっている上限の ${maxText}以下にします。`,
-  ttl: '書き込みの OK の期限（日）',
-  /** 期限の欄の説明（`minText`・`maxText` は `formatInteger` の結果）。 */
-  ttlHint: (minText: string, maxText: string): string => `書き込みの OK を出してから期限までの日数です。${minText} 日以上、最初から決まっている上限の ${maxText} 日以下にします。`,
-  /**
-   * MI-6（設計書 `2026-10-26-beaksight-minimal-input-ux-design.md` 4.6、ユーザーの判断 2）: 決まった値の欄（入力の欄でなく表示だけ）と、たたんだ詳しい設定の
-   * 説明（`countText` は `formatCount` の結果）。
-   */
-  perRunLimitValue: (countText: string): string => `${countText}（決まった値です）`,
-  advancedLimitsNote: '合計の件数の上限と書き込みの OK の期限は、最初の値のままで保存できます。変えるときだけ開いてください。',
-  /** MI-6: 既定の値が分からない欄（保存の確かめが送る欄にすることを求める欄）の印。 */
-  mustSendHint: '最初に入っている値が分からない欄なので、必ず送ります。',
-  save: '保存する',
-  saving: '保存しています…',
-  saved: '保存しました。',
-  saveRejectedHeading: '保存できませんでした',
-  /** T38c（Task 38 の設計書 3.3）: API のシナリオの要求の型の要約（承認の画面と詳細。値は持たない）。 */
+  /** T38c（Task 38 の設計書 3.3）: API の欄の名前の表示（ARR-5。SPEC-4 で、作成の画面と承認の画面の要約の文言は捨てた）。 */
   api: {
-    method: '通信の種類',
-    origin: '送り先のサイトのアドレス',
-    pathShape: 'アドレスの形',
-    keyFields: '本文の項目と欄',
-    pageKeys: 'ページが決める項目',
-    none: 'なし',
-    /** 鍵と欄の 1 件（`fieldText` は欄の名前か CSS）。 */
-    keyField: (key: string, type: string, fieldText: string): string => `${key}（JSON の ${type}）← 欄 ${fieldText}`,
-    /** ページが決める鍵の 1 件。 */
-    pageKey: (key: string, type: string): string => `${key}（JSON の ${type}。値は照らしません）`,
-    /** 欄の識別（名前か CSS）。 */
-    fieldName: (name: string): string => `名前 ${name}`,
-    fieldSelector: (selector: string): string => `部品の目印 ${selector}`,
-    /** T38f: 送り方と、登録の ID の取り方（応答の本文の鍵）。 */
-    transport: '送り方',
-    recordId: '登録したデータの ID を読む、応答の項目',
-    recordIdUnset: '指定なし（結果の確かめ方で決めた取り方を使います）',
-    /** T38f: 作成と変更のフォーム。 */
-    formHeading: '画面を通さない送信の形と、送る項目',
-    formNote:
-      '操作さがしで対象のボタンを押したときに、ページが送ろうとした通信の形から、案を入れています。項目と欄の組み合わせを確かめてください。値は入れません。',
-    // MI-6（設計書 4.6）: 登録の送る鍵と、ページが決める鍵と、更新の filter の名前は、1 つの値しか通らないので、表示だけにした。
-    keyFieldsNote: '欄に値を入れて送る、本文の項目です。欄と組になる項目は、すべて送ります（決まった値です）。',
-    pageKeysNote:
-      '欄と組にならず、ページが値を決める本文の項目です。すべて通します（値は照らしません。決まった値です）。名前が秘密に見える項目があると、この書き込みの手順は保存できません（理由を出します）。',
-    noPageKeys: 'ページが決める項目はありません。',
-    filterNameLabel: '更新する行を選ぶ条件の名前',
-    filterNameHint: '更新する行を選ぶ、アドレスの ? の後ろの名前です。通信の形にある条件の名前を使います（決まった値です）。',
-    /** MI-6: 送る鍵・許す鍵の印（表示だけ）。 */
-    keySent: '送る',
-    pageKeyAllowed: '通す',
-    ledgerLabel: '作ったデータの一覧（更新するデータを登録した書き込みの手順）',
-    ledgerUnset: '選んでいません',
-    /** 台帳の選択肢（登録のシナリオの id と、その画面の path）。 */
-    ledgerOption: (scenarioId: string, pagePath: string): string => `${scenarioId}（${pagePath}）`,
-    // T41e-3（T41R-fix-B）: 台帳にできるのは、同じ送り先（Origin と path の型）の API の登録で、登録の ID が filter に結び付くシナリオだけ。
-    noLedgerOptions:
-      '作ったデータの一覧にできる、新しく登録する書き込みの手順がありません。使えるのは、この更新と同じ送り先（サイトのアドレスとアドレスの形）に、画面を通さない送信で新しく登録する書き込みの手順だけです。同じ送り先の、新しく登録する書き込みの手順を先に作ってください。そして書き込みをして、答え合わせが合ったデータを作ってください。',
-    formPathTemplateLabel: '更新の画面のアドレスの形',
-    formPathTemplateHint: '操作の候補の画面のアドレスの後ろで、データの ID の区切りを形の印にしたものです。',
+    /** ARR-5: 並びの行（番号は 1 から）。`list` は画面の見出しか、なければ `arrayListFallback`。 */
+    arrayRow: (list: string, row: number): string => `${list}（${String(row)} 行目）`,
+    /** ARR-5: まとまりの並びの行の中の項目。`inner` は画面の見出しか、なければ `arrayInnerFallback`。 */
+    arrayRowInner: (list: string, row: number, inner: string): string => `${list}（${String(row)} 行目）の ${inner}`,
+    arrayListFallback: '並びの項目',
+    arrayInnerFallback: '中の項目',
     // MI-7（設計書 `2026-10-26-beaksight-minimal-input-ux-design.md` 4.6）: 更新の照合の READ を、台帳の登録のシナリオの照合の READ から埋める。PL-5 の 9 の (2):
-    // 写すのは保存の口だけ（`update-verification-copy.ts`）。画面は、写すことを 1 行で出す（中身は出さない）。埋められない理由（`ledgerReadUnavailable`）は
-    // 閉じた一覧の文言として残す。
+    // 写すのは保存の口だけ（`update-verification-copy.ts`）。埋められない理由（`ledgerReadUnavailable`）は閉じた一覧の文言として残す（網羅は
+    // `catalog-coverage.ts`）。
     ledgerReadUnavailable: {
       LEDGER_READ_VERIFICATION_MISSING: {
         description: '作ったデータの一覧にした登録の手順に、答え合わせの確かめがありません。そのため、答え合わせの確かめを入れていません。',
-        action: '下の答え合わせの確かめで、アドレスの後ろに ID の印がある画面の確かめを選んでください。比べる欄には、変える欄を選んでください。',
+        action: UNCHECK_WRITE_SCREEN_ACTION_TEXT,
       },
       LEDGER_READ_CHECK_UNUSABLE: {
-        description: '作ったデータの一覧にした登録の手順の答え合わせの確かめは、取り消したものか、アドレスの後ろに ID の印がある画面の確かめではありません。そのため、この更新には使えず、答え合わせの確かめを入れていません。',
-        action: '下の答え合わせの確かめで、アドレスの後ろに ID の印がある画面の確かめを選んでください。比べる欄には、変える欄を選んでください。',
+        description: '作ったデータの一覧にした登録の手順の答え合わせの確かめは、この更新には使えないため、答え合わせの確かめを入れていません。',
+        action: UNCHECK_WRITE_SCREEN_ACTION_TEXT,
       },
     },
-    recordIdKeyLabel: '登録したデータの ID を読む、応答の項目（入れなくてもかまいません）',
-    recordIdKeyHint: '登録したときの応答の本文から、登録したデータの ID を読む項目の名前です。空にすると、下の結果の確かめ方で決めた ID の取り方を使います。',
-    errorsHeading: '画面を通さない送信の指定を直してください',
-    publicationStateKeepHint: '公開の状態にあたる欄です。最初は今の値のまま保ちます（変える欄にすると、入れる値の決まりの値を送ります）。',
   },
-  selectedYes: '送る',
-  /** T29e: シナリオの詳細から、入力の規則の画面を開く。 */
-  openRules: '入れる値の決まりを開く',
-  edit: '変える',
-  approve: '書き込みの OK を出す',
-  revoke: '書き込みの OK を取り消す',
-  approved: '書き込みの OK を出しました。',
-  revoked: '書き込みの OK を取り消しました。',
-  actionRejectedHeading: '操作できませんでした',
-  approveDialog: {
-    title: 'この書き込みの手順に、書き込みの OK を出しますか',
-    body: '下の内容で、この書き込みの手順の今の内容に OK を出します。OK を出しただけでは、書き込みは始まりません。内容が変わると、OK は引き継がれず、もう一度 OK が要ります。',
-    sideEffects: 'ほかへの影響の確認',
-    /**
-     * MI-6: 4 項目の中身と、1 回の押下で確かめたことになること。PL-S（設計書 `2026-10-26-beaksight-plain-ui-design.md` 7 章・9 章の 4）: 過去形でなく、押す前に
-     * 4 つとも確かめる形にした。
-     */
-    sideEffectsNote:
-      `次の 4 つの約束を読んでください。4 つとも本当か確かめてから「書き込みの OK を出す」を押してください。1 つでも違えば「${APPROVE_DIALOG_CANCEL_LABEL}」を押してください。まだ確かめた印のない項目があるときは、押すと、確かめた印を付けて変更の回数を 1 つ進め、その内容に OK を出します。`,
-    /**
-     * PL-S（設計書 9 章の 3）: 何を・どこへ・何件（`placeText` は操作を見つけた画面の path を 1 つ、`countText` は 1 回の Run の件数の `formatInteger` の結果）。
-     * 送り方（フォーム・API）によらず同じ文。
-     */
-    targetCreate: (placeText: string, countText: string): string =>
-      `${placeText} の画面で、作り物のデータを ${countText} 件登録します。送ったら取り消せません。`,
-    targetUpdate: (placeText: string, countText: string): string =>
-      `${placeText} の画面で、作り物のデータで ${countText} 件更新します。送ったら取り消せません。`,
-    confirm: '書き込みの OK を出す',
-    cancel: APPROVE_DIALOG_CANCEL_LABEL,
-  },
-  revokeDialog: {
-    title: '書き込みの OK を取り消しますか',
-    body:
-      '最後に出した書き込みの OK を取り消します。取り消すと、まだ使っていない OK は使えなくなり、まだ送っていない件数の取り置きは戻ります。送った書き込みは取り消せません。取り消した記録は残ります。',
-    confirm: '取り消す',
-    cancel: 'やめる',
-  },
-  reload: '読み込み直す',
-  /**
-   * T31h-1（Task 31 の設計書 3 章の「UPDATE の指定」、2 章のユーザーの判断 3・4）: UPDATE の指定の入力と表示。`placeholder` は、path の型の
-   * レコードの ID の区切りの印（契約の値。画面に書き写さない）。
-   */
+  /** T31h-1: 更新の指定の表示（SPEC-4 で入力の文言は捨てた）。 */
   update: {
-    heading: '更新の指定',
-    note:
-      '更新するデータを選ぶ、作ったデータの一覧と、更新の画面と送信先のアドレスの形と、欄ごとの役割（変える・保つ）を決めます。更新するデータは、作ったデータの一覧のうち最新の 1 件を、BeakSight が書き込みを始めるときに選びます（人は ID を入れません）。',
-    ledger: '作ったデータの一覧にする、新しく登録する書き込みの手順',
-    ledgerHint: '同じサイトの、新しく登録する書き込みの手順を選びます。この手順で BeakSight が登録して、答え合わせをしたデータだけを更新します。',
-    noLedger: '作ったデータの一覧にできる、新しく登録する書き込みの手順がありません。先に、新しく登録する操作の候補から、書き込みの手順を作ります。',
-    /** 台帳の選択肢（`pathText` は候補の画面の path）。 */
-    ledgerOption: (scenarioId: string, pathText: string): string => `${scenarioId}（${pathText}）`,
-    templates: 'アドレスの形',
-    /** path の型の選択の説明。 */
-    templatesHint: (placeholder: string): string =>
-      `候補の更新の画面と送信先のアドレスの後ろで、同じ値を持つ区切りから、データの ID の区切りを選びます。選んだ区切りは ${placeholder} になります。`,
-    /** 候補の path（`pagePath`・`actionPath` は候補のもの）。 */
-    candidatePaths: (pagePath: string, actionPath: string): string => `候補のアドレスの後ろ: 画面 ${pagePath}・送信先 ${actionPath}`,
-    /** 型の選択肢（2 つの型と、ID の区切りの値）。 */
-    templateOption: (formTemplate: string, actionTemplate: string, recordId: string): string =>
-      `画面 ${formTemplate}・送信先 ${actionTemplate}（ID の区切り: ${recordId}）`,
-    manualTemplate: '手で入力する',
-    noTemplateOption: '候補のアドレスの後ろから、アドレスの形を作れませんでした。形を手で入力します。',
-    formPathTemplate: '更新の画面のアドレスの形',
-    actionPathTemplate: '送信先のアドレスの形',
-    /** 手で入力する型の説明。 */
-    manualTemplateHint: (placeholder: string): string =>
-      `データの ID の区切りを ${placeholder} にした、アドレスの後ろです。${placeholder} は、ちょうど 1 つ、区切りの全体に書きます。`,
-    rolesHeading: '欄の役割',
-    rolesNote:
-      '見えていて変えられる欄ごとに、値を変えるか、今の値のまま保つかを選びます。最初は「保つ」になっています。状態の欄と、名前が秘密に見える欄は変えられません（理由を出します）。変える欄は 1 つ以上要ります。',
-    roleChange: '変える',
-    roleKeep: '保つ',
-    contactFieldHint:
-      'メールアドレスと電話番号の欄は、最初は保ちます。変える欄にすると、作り物の値（example.invalid、090-0XXX-XXXX）を送ります。メールや電話への知らせが外に届かないことの確認が要ります。',
-    otherFieldsHeading: '役割のない欄',
-    otherFieldsNote: '見えない欄、変えられない欄、使えない状態の欄、送り方を変える欄は、役割を持ちません（ページの値のまま送ります）。',
-    noOtherFields: 'ありません。',
     none: 'なし',
     plannedTarget: '更新する予定のデータ',
     noPlannedTarget: '更新できるデータがありません（作ったデータの一覧にした登録の手順で、答え合わせが合った登録がありません）。',
   },
-} as const);
-
-/**
- * 入力の規則の判定の細分ごとの説明と手順（Task 29 の設計書 4.1。T29e）。細分の一覧は `src/control/data-rules/rule-contracts.ts` の
- * `NEEDS_RULE_INPUT_DETAILS`・`RULE_CONFLICT_DETAILS`・`EXTERNAL_DELIVERY_BLOCKED_DETAILS`（書き漏れは画面の `catalog-coverage.ts` が型で確かめる）。
- */
-export const RULE_PROBLEM_DETAIL_DESCRIPTIONS = deepFreeze({
-  NO_RULE: {
-    description: 'この欄の値の作り方が決まっていません。',
-    action: '値の種類を選ぶか、作り方を「人が入れた値の一覧から」にして値を入れてください。',
-  },
-  REQUIRED_FIELD_NOT_SELECTED: {
-    description: '必ず入れる欄ですが、書き込みの手順の送る欄に選ばれていません。',
-    action: '書き込みの手順を変えて、この欄を送る欄に選んでください。',
-  },
-  SEMANTIC_KIND_UNDECIDED: {
-    description: '欄の名前と種類から、値の種類を決められませんでした（当て推量では作りません）。',
-    action: '値の種類を選ぶか、人が入れた値の一覧を入れてください。',
-  },
-  PATTERN_UNSUPPORTED: {
-    description: '欄に入れる値の形の決まりが、扱える単純な形（数字の桁数・英数字の長さ・カタカナなど）でないか、作る値が合いません。',
-    action: '人が入れた値の一覧で、欄の形に合う値を入れてください。',
-  },
-  RANGE_MISSING: {
-    description: '数や日時の範囲（最小と最大）が決まっていません。',
-    action: '範囲の最小と最大を入れてください。',
-  },
-  RANGE_EMPTY: {
-    description: '範囲の最小が最大を超えています。',
-    action: '範囲を直してください。',
-  },
-  CONSTRAINT_UNSUPPORTED: {
-    description: '欄の最小・最大・刻みの書き方を扱えません（any、指数の書き方、ありえない日時など）。',
-    action: '範囲を人が入れるか、人が入れた値の一覧を使ってください。',
-  },
-  LENGTH_UNSATISFIABLE: {
-    description: '欄の文字数の決まり（いちばん短い長さ・いちばん長い長さ）に合う値を作れません。',
-    action: '人が入れた値の一覧で、長さに合う値を入れてください。',
-  },
-  NO_USABLE_OPTION: {
-    description: '選べる選択肢がありません（空の値と、危ない語・使えなくする語（非表示、停止、取消、inactive など）の値を除くと残りません）。',
-    action: '人が入れた値の一覧で、使ってよい選択肢の値を入れてください。',
-  },
-  URL_FIELD: {
-    description: 'ページのアドレス（URL）の欄の値は作りません。',
-    action: '人が入れた値の一覧で、テスト用のサイトで使ってよいアドレスを入れてください。',
-  },
-  ADDRESS_FIELD: {
-    description: '住所の欄の値は作りません（実在の宛先に届くおそれがあるため）。',
-    action: '人が入れた値の一覧で、テスト用のサイトで使ってよい住所を入れてください。',
-  },
-  PHONE_FORMAT_UNSUPPORTED: {
-    description: '欄の決まりに、作り物の電話番号の形（090-0XXX-XXXX、ハイフンなしの 0900XXXXXXX）が合いません。ほかの形には切り替えません。',
-    action: 'テスト用のサイトで使ってよい番号（自分たちで管理しているテスト用の回線など）を、人が入れた値の一覧に入れてください。',
-  },
-  SEMANTIC_KIND_TYPE_MISMATCH: {
-    description: '選んだ値の種類が、欄の種類に合いません（メール・電話の欄に使えるのは、メール・電話か固定の一覧だけです）。',
-    action: '欄の種類に合う値の種類を選んでください。',
-  },
-  FIXED_VALUE_VIOLATES_CONSTRAINT: {
-    description: '人が入れた値が、欄の種類・選択肢・決まりに合わないか、危ない語か使えなくする語（非表示、停止、取消、inactive など）を含みます（メールは example.invalid の宛先だけ使えます）。',
-    action: '欄に合う値に直してください。',
-  },
-  RANGE_OUTSIDE_FIELD_CONSTRAINT: {
-    description: '人が入れた範囲が、欄の最小・最大の外です。',
-    action: '欄の範囲の中に直してください。',
-  },
-  RELATION_FIELD_MISMATCH: {
-    description: '欄どうしの関係に使う欄が、送る欄でないか、値の種類が関係の役割に合いません。',
-    action: '関係に使う欄と、その欄の値の種類を確かめてください。',
-  },
-  RELATION_UNSATISFIABLE: {
-    description: '欄どうしの関係（終了は開始より後、合計は単価 × 数量）を、範囲の中で満たせません。',
-    action: '範囲か関係を直してください。',
-  },
-  UNIQUE_COMBINATIONS_EXHAUSTED: {
-    description: 'ほかと重ならないようにする欄の組を、前に使った組と重ならないように作れません。',
-    action: 'ほかと重ならないようにする欄を見直すか、値の一覧を増やしてください。',
-  },
-  STATE_FIELD_NOT_USABLE: {
-    description: '状態の欄（有効・無効・公開・削除など）には値を入れません。',
-    action: '書き込みの手順を変えて、この欄を送る欄から外してください。',
-  },
-  NOTIFICATION_OPT_OUT_UNAVAILABLE: {
-    description: '通知・配信を求める欄で、「送らない」側の値が選べません（名前に否定の語がある欄を含む）。',
-    action: '送らない側の値を、人が入れた値の一覧で入れるか、書き込みの手順を変えて、この欄を送る欄から外してください。',
-  },
-  FIELD_NOT_SENDABLE: {
-    description: '送る欄が、操作の候補で送れる欄ではありません（見えない、変えられない、使えない状態、パスワード、ファイルなど）。',
-    action: '「操作さがしを始める」でもう一度操作さがしをして、書き込みの手順を作り直してください。',
-  },
-  PAGE_KEY_RULE_NOT_ALLOWED: {
-    description: 'この項目は、ページが値を決める項目です（書き込みの OK のときに名前を示した項目）。BeakSight は値を作らないので、決まりを持てません。',
-    action: 'この項目の決まりを消してください。値を入れる場合は、欄と組になる項目として、書き込みの手順を作り直してください。',
-  },
-  JSON_VALUE_TYPE_MISMATCH: {
-    description: '決まりが作る値が、項目の JSON の型で送れる形ではありません（数の項目に送れるのは、先頭の 0・小数の末尾の 0・指数の書き方・-0 のない、15 桁までの数だけです）。または、欄の種類と項目の JSON の型の組が合いません。',
-    action: '項目の型に合う値か範囲に直してください。組が合わない場合は、「操作さがしを始める」でもう一度操作さがしをして、書き込みの手順を作り直してください。',
-  },
-  // MI-F4（MI-6 の後の流れ）: 副作用の確認は、シナリオの画面でなく、承認のダイアログの 1 回の押下で入る。
-  EXTERNAL_NOTIFICATION_UNCONFIRMED: {
-    description: 'メール・電話の欄の値は、「メールや電話への知らせが届かない」約束を確かめて書き込みの OK を出すまで作りません（この確認は、書き込みの OK の確認の画面で行います）。',
-    action: 'テスト用のサイトで、メールや電話への知らせが外に届かないことを確かめてください。その後、書き込みの手順の詳細の「書き込みの OK を出す」を押し、確認の画面で 4 つの約束を読んでから OK を出してください。',
-  },
-} as const satisfies Record<string, ControlReasonText>);
-
-/**
- * 入力の規則の保存を拒む理由ごとの説明と手順（T29e）。理由の一覧は、保存の部品の `RULE_SET_STORE_REJECTION_REASONS`
- * （`src/control/data-rules/rule-store.ts`）と、画面のサーバの理由（`apps/local-ui/src/server/data-rule-functions.ts` の
- * `DATA_RULE_REQUEST_LOCAL_REJECTION_REASONS`）。シナリオに参照を付ける 2 段目の拒否は `SCENARIO_REQUEST_REJECTION_DESCRIPTIONS`。
- */
-export const DATA_RULE_REQUEST_REJECTION_DESCRIPTIONS = deepFreeze({
-  RULE_SET_SCENARIO_NOT_FOUND: {
-    description: '対象の書き込みの手順が見つかりません。保存していません。',
-    action: '書き込みの手順の一覧を読み込み直して、対象を確かめてください。',
-  },
-  RULE_SET_PROFILE_RETIRED: {
-    description: '取り消したサイトでは、入れる値の決まりを保存できません。保存していません。',
-    action: '使い続ける場合は、新しい名前でサイトを足し直してください。',
-  },
-  RULE_SET_MODE_NOT_WRITE: {
-    description: '入れる値の決まりは、書き込みも試す点検のサイトだけで使えます。保存していません。',
-    action: '書き込みも試す点検にした、テスト用のサイトで決めてください。',
-  },
-  RULE_SET_REVISION_CONFLICT: {
-    description: 'この画面を開いた後に、入れる値の決まりが変わりました。保存していません。',
-    action: '画面を読み込み直して、今の内容を確かめてから、もう一度保存してください。',
-  },
-  RULE_SET_SECRET_FIELD_FIXED_VALUE: {
-    description: '名前が秘密に見える欄には、人が入れた値を残せません。保存していません。',
-    action: 'その欄の値の一覧を外してください。',
-  },
-  DATA_RULE_CONTENT_INVALID: {
-    description: '入れる値の決まりの中身に誤りがあります（同じ欄の決まりが 2 つある、関係やほかと重ならないようにする欄に、決まりのない欄がある、など）。保存していません。',
-    action: '内容を見直してから、もう一度保存してください。',
-  },
-} as const satisfies Record<string, ControlReasonText>);
-
-/** ローカルの管理画面の、入力の規則（補完）の画面の文言（Task 29 の設計書 3 章の「補完の画面」、4.4。T29e）。 */
-export const LOCAL_UI_DATA_RULE_TEXT = deepFreeze({
-  pages: {
-    rules: '入れる値の決まり',
-  },
-  intro:
-    '送る欄ごとに、書き込みで送る値の作り方（入れる値の決まり）を決めます。AI は使いません。欄の種類と決まり、小さな辞書と業務テンプレート、人が入れた値の一覧から、決まった手順で作ります。決まらない欄は、当て推量で作らずに止めます。',
-  noExecution: 'この画面からは、書き込みを実行しません。データの例もサイトに送りません。',
-  stateHeading: '入れる値の決まりの状態',
-  ruleSetLabel: '保存した内容',
-  /** 保存した版（`revisionText` は `formatInteger` の結果）。 */
-  ruleSetValue: (ruleSetId: string, revisionText: string): string => `${ruleSetId}（${revisionText} 回目の変更）`,
-  noRuleSet: 'まだ保存していません（業務テンプレートと汎用の規則だけで決めています）。',
-  fieldsHeading: '送る欄の決まり',
-  fieldsNote: '「自動」は、業務テンプレートか汎用の規則で決めます。人が決めた決まりは、それより優先します。',
-  /**
-   * MI-6（設計書 `2026-10-26-beaksight-minimal-input-ux-design.md` 4.6 の C）: 推せた欄はたたみ、推せなかった欄だけを見せる。すべて推せたときの知らせと、
-   * たたんだ区画の説明（`countText` は `formatCount` の結果）。
-   */
-  undecidedNote: '次の欄は、BeakSight が値の作り方を決められませんでした。作り方を決めてください。',
-  allDecided: 'すべての欄を BeakSight が作れます。「保存する」を押すだけで使えます。',
-  decidedNote: (countText: string): string =>
-    `BeakSight が作れる欄（${countText}）と、欄どうしの関係・ほかと重ならないようにする欄の組は、ここにたたんでいます。直すときだけ開いてください。`,
-  /** MI-6: 副作用の確認を承認のときに確かめる前提で、作れる欄にしたメール・電話の欄の印。 */
-  confirmationAtApproval: '書き込みの OK を出すときに、メールや電話への知らせが外に届かないことを確かめます',
-  columns: {
-    source: '出どころ',
-    rule: '決まり',
-    external: '外に届くもの',
-  },
-  noFields: 'この書き込みの手順には、送る欄がありません。',
-  notSelected: '送る欄ではありません（必ず入れる欄です）',
-  noExternal: 'なし',
-  noSource: 'なし',
-  kindLabel: '値の種類',
-  autoKind: '自動（業務テンプレートか汎用の規則）',
-  methodLabel: '作り方',
-  fixedValuesLabel: '値の一覧（1 行に 1 つ）',
-  /** 値の一覧の説明（`maxText`・`lengthText` は `formatCount`・`formatInteger` の結果）。 */
-  fixedValuesHint: (maxText: string, lengthText: string): string =>
-    `${maxText}まで。1 つの値は ${lengthText} 文字まで。値は BeakSight の記録にそのまま残ります。名前が秘密に見える欄には入れられません。`,
-  rangeLabel: '範囲（数や日時の欄だけ。空なら、欄の決まりとテンプレートの最初の値を使います）',
-  rangeMin: '最小',
-  rangeMax: '最大',
-  rangeStep: '刻み',
-  relationsHeading: '欄どうしの関係',
-  relationsNote:
-    '人が決めた関係に、業務テンプレートの既定の関係（開始と終了、単価・数量・合計、氏名とフリガナが、それぞれ 1 つずつのとき）を足して当てます。',
-  noRelations: '人が決めた関係はありません。',
-  relationKindLabel: '関係',
-  relationRoles: {
-    startFieldName: '開始の欄',
-    endFieldName: '終了の欄',
-    unitPriceFieldName: '単価の欄',
-    quantityFieldName: '数量の欄',
-    totalFieldName: '合計の欄',
-    nameFieldName: '氏名の欄',
-    kanaFieldName: 'フリガナの欄',
-  },
-  addRelation: '関係を足す',
-  removeRelation: '外す',
-  effectiveRelationsLabel: '当てる関係',
-  noEffectiveRelations: 'なし',
-  uniqueHeading: 'ほかと重ならないようにする欄の組',
-  uniqueNote:
-    '選ばなければ、業務テンプレートで最初から決まっている組（顧客は氏名とフリガナ、商品は商品名、予約は日付・開始・選択肢）を使います。前に作った値の組と重なれば、作り直します。',
-  effectiveUniqueLabel: '当てる組',
-  noUnique: 'なし（重ならないことを求めません）',
-  examplesHeading: 'データの例（送りません）',
-  examplesNote:
-    'この画面のための決まった値で作った例です。サイトには送りません。実際の書き込みでは、書き込みを始めるたびに別の値になります。メールアドレスと電話番号は、作り物の形だけです。',
-  /** 例の見出し（`numberText` は `formatInteger` の結果）。 */
-  exampleLabel: (numberText: string): string => `例 ${numberText}`,
-  examplesUnavailable: '値の作り方が決まらない欄があるため、例は作れません。',
-  exampleColumns: {
-    field: '欄',
-    value: '値（例）',
-  },
-  notSent: '送らない',
-  syntheticEmail: '作り物のメールアドレス（example.invalid。届かない宛先）',
-  syntheticPhone: '作り物の電話番号（090-0 で始まる形）',
-  save: '保存する',
-  saving: '保存しています…',
-  saveDialog: {
-    title: '入れる値の決まりを保存しますか',
-    body:
-      '保存すると、入れる値の決まりの新しい内容ができ、書き込みの手順に付け直します。書き込みの手順の変更の回数が 1 つ進み、下書きに戻ります。書き込みの OK を出していた場合は、もう一度 OK が要ります。',
-    confirm: '保存する',
-    cancel: 'やめる',
-  },
-  saved: '入れる値の決まりを保存し、書き込みの手順に付けました。書き込みの手順は下書きに戻りました。内容を確かめてから、もう一度書き込みの OK を出してください。',
-  saveRejectedHeading: '保存できませんでした',
-  attachRejected: '入れる値の決まりは保存しましたが、書き込みの手順に付けられませんでした。画面を読み込み直してから、もう一度保存してください。',
-  reload: '読み込み直す',
-} as const);
-
-/**
- * 入力の規則の画面の、自動で作った規則の文言（手動の操作を減らす設計書 3A.3。FM2c）。出どころの印のラベルは `catalog.ts` の `RULE_ORIGIN_CATALOG`。
- * 数の文字は、呼び出し側が `formatInteger` で作って渡す。
- */
-export const LOCAL_UI_DATA_RULE_INFERENCE_TEXT = deepFreeze({
-  originLabel: '出どころの印',
-  defaultRangeHeading: '仮の幅を入れた欄（推測）',
-  /** 既定の幅の説明（`daysText`・`minText`・`maxText` は既定の幅の数）。 */
-  defaultRangeNote: (daysText: string, minText: string, maxText: string): string =>
-    `範囲の手がかり（最小・最大・刻み）がない欄に、推測で仮の幅を入れました。日付・日時は、基準の日（書き込みを始めた日）から ${daysText} 日後まで、数は ${minText}〜${maxText} の整数です。サイトが受け付けないときは、範囲を入れ直して保存してください。`,
-  defaultRangeBadge: '仮の幅（推測）',
-  /** 基準日からの幅（`fromText`・`toText` は日の数）。 */
-  baseDateWindowText: (fromText: string, toText: string): string => `基準の日から ${fromText}〜${toText} 日後`,
-  baseDateWindowLabel: '日付の幅',
 } as const);
 
 /** 画面のサーバのコンソールの、監査のジョブの文言（設計書 4.4 の「画面のサーバの起動のとき」と「終わり」）。 */
@@ -3162,6 +2951,11 @@ export const LOCAL_UI_JOB_CONSOLE_TEXT = deepFreeze({
   exitingNow: `すぐに終えます。動いていた点検は、次に画面のサーバを起動したときに中断として記録されます。${AUDIT_JOB_RESUME_ACTION_TEXT}`,
   /** ジョブの管理の背後の処理（IPC の受け手、タイマー）の誤り。詳細（英語）を添えて出す。 */
   backgroundError: '点検の作業の管理で、誤りが起きました。',
+  /**
+   * DEF-199: まとめて実行の始めに、一覧でチェックしていない画面の書き込みの OK を取り消した（「チェックした画面だけに書き込む」を保つ、意図した動き。
+   * 誤りではないので、誤りの文とは分ける）。理由のコードを添えて出す。
+   */
+  uncheckedApprovalRevoked: '一覧でチェックしていない画面の書き込みの OK を取り消しました。',
 } as const);
 
 /** T44e: 時間の上限で止まったときの、次にできること（監査と発見と READ の確かめで共用する前半）。 */
@@ -3285,7 +3079,7 @@ export const LOCAL_UI_JOB_NEXT_STEPS = deepFreeze({
 export const PRECHECK_FAILURE_DETAIL_DESCRIPTIONS = deepFreeze({
   STOPPED: {
     description: '止める合図（書き込みの OK の取り消し、書き込みの手順の変更、止める操作）を受けたため、送らずに止めました。',
-    action: '書き込みを続けるときは、書き込みの手順に書き込みの OK が出ているかを確かめてから、もう一度始めてください。',
+    action: RECHECK_WRITE_SCREEN_ACTION_TEXT,
   },
   SESSION_LOST: {
     description: '書き込みの画面で、ログインが切れていました。送っていません。',
@@ -3296,8 +3090,8 @@ export const PRECHECK_FAILURE_DETAIL_DESCRIPTIONS = deepFreeze({
     action: 'テスト用のサイトで書き込みの画面が開けるかを確かめてから、もう一度始めてください。',
   },
   CANDIDATE_CHANGED: {
-    description: '書き込みの画面の操作が、書き込みの OK を出した操作と合いませんでした（画面が変わった）。送っていません。',
-    action: '操作さがしをやり直し、書き込みの手順を見直して書き込みの OK を出し直してから、もう一度始めてください。',
+    description: '書き込みの画面の操作が、チェックしたときの操作と合いませんでした（画面が変わった）。送っていません。',
+    action: RECHECK_WRITE_SCREEN_ACTION_TEXT,
   },
   PRIOR_VALUES_EMPTY: {
     description: '更新の前に読んだ画面で、BeakSight の印を入れた欄がすべて空でした（値が入る前の画面を読んだとみなしました）。送っていません。',
@@ -3309,8 +3103,8 @@ export const PRECHECK_FAILURE_DETAIL_DESCRIPTIONS = deepFreeze({
     action: 'テスト用のサイトで、更新するデータの値を確かめてください。新しく登録する書き込みで新しいデータを作ると、そのデータは更新できます。',
   },
   PRIOR_VALUE_UNUSABLE: {
-    description: '更新の前の値を、記録や答え合わせに使えませんでした（長すぎる、書き込みの OK を出した値の種類に変えられない）。送っていません。',
-    action: '書き込みの手順の変える欄・保つ欄と、テスト用のサイトの更新するデータの値を確かめてください。',
+    description: '更新の前の値を、記録や答え合わせに使えませんでした（長すぎる、チェックしたときの値の種類に変えられない）。送っていません。',
+    action: 'テスト用のサイトで、更新するデータの値を確かめてください。',
   },
   PRIOR_VALUE_CHANGED: {
     description:
@@ -3319,15 +3113,15 @@ export const PRECHECK_FAILURE_DETAIL_DESCRIPTIONS = deepFreeze({
   },
   FORM_NOT_READY: {
     description: '入力の前の確かめ、値の入力、押す操作のどれかに失敗しました。送っていません。',
-    action: '書き込みの画面が、書き込みの OK を出したときと同じかを確かめてから、もう一度始めてください。',
+    action: '書き込みの画面が、チェックしたときと同じかを確かめてから、もう一度始めてください。',
   },
   UNEXPECTED_REQUEST: {
-    description: '値を入れた後に、書き込みの OK を出した送信のほかの通信が出たため、押しませんでした。',
+    description: '値を入れた後に、チェックしたときの送信のほかの通信が出たため、押しませんでした。',
     action: 'ページが入力の値を別の通信で送る作りでないかを、テスト用のサイトで確かめてください。',
   },
   RECHECK_REFUSED: {
-    description: '送る直前の確かめ直しで、書き込みの OK が外れていました（取り消し、期限切れ、書き込みの手順やサイトの設定の変更など）。送っていません。',
-    action: '書き込みの手順の画面で書き込みの OK の状態を確かめ、OK を出し直してから、もう一度始めてください。',
+    description: '送る直前の確かめ直しで、この画面のチェックが外れていました（チェックを外した、サイトの設定が変わった、など）。送っていません。',
+    action: RECHECK_WRITE_SCREEN_ACTION_TEXT,
   },
   AUDIT_STAGE_STOPPED: {
     description: 'ブラウザに残るログインの印がなくなったか、ログインのときに通ってよい外のサイトへの通信の回数が上限に届いたため、送りませんでした。',
@@ -3346,6 +3140,31 @@ export const PRECHECK_FAILURE_DETAIL_DESCRIPTIONS = deepFreeze({
   VERIFICATION_READ_UNAVAILABLE: {
     description: 'サイトの一覧を読めなかったので、書き込みませんでした。',
     action: '少し待ってから、もう一度始めてください。',
+  },
+  // LU-10（設計書 `2026-11-02-beaksight-list-row-update-design.md` 5.6）: 一覧の行から開く更新で送らずに止めたとき。画面の文は LU-13 でまとめる（ここは最低限の文）。
+  ROW_NOT_UNIQUE: {
+    description: '更新できませんでした（作った行が、一覧の最初のページに 1 つだけ見つかりませんでした）。送っていません。',
+    action: 'テスト用のサイトの一覧で、作ったデータが最初のページに 1 つだけ出ているかを確かめてください。',
+  },
+  OPENER_NOT_FOUND: {
+    description: '更新できませんでした（作った行に、編集のボタンが見つかりませんでした）。送っていません。',
+    action: '操作さがしをやり直してから、もう一度始めてください。',
+  },
+  OPENER_UNNAMED: {
+    description: 'この画面の更新は自動で扱えません（編集のボタンに名前がありません）。送っていません。',
+    action: 'この画面の更新は、BeakSight では行えません。',
+  },
+  OPENER_DELETE_LIKE: {
+    description: '更新できませんでした（編集のボタンが、削除のボタンに見えました）。押していません。送っていません。',
+    action: '操作さがしをやり直してから、もう一度始めてください。',
+  },
+  PRIOR_VALUES_NOT_ACCEPTED: {
+    description: '更新できませんでした（更新の前の値を、安全の確かめに渡せませんでした）。送っていません。',
+    action: '少し時間をおいて、もう一度始めてください。',
+  },
+  TARGET_RECORD_UNUSABLE: {
+    description: '更新できませんでした（更新するデータの番号の形が使えませんでした）。送っていません。',
+    action: '新しく登録する書き込みで新しいデータを作ってから、もう一度始めてください。',
   },
 } as const satisfies Record<string, ControlReasonText>);
 
@@ -3381,6 +3200,12 @@ export const LOCAL_UI_AUDIT_TEXT = deepFreeze({
     },
     /** OP-G（指示書の 5）: チェックした画面があるときの、まとめて実行の文（「読むだけ」は、チェックがないときだけ）。 */
     whatHappensWithWrites: 'サイトのページを見て回り、操作できる所を探します。チェックした画面では、テスト用のデータを登録・更新します。そのほかは見るだけです。',
+    /** WSO: チェックした画面があるときだけ出す、点検する画面の 2 択（既定は「サイトの全部の画面」）。 */
+    pageScope: {
+      legend: '点検する画面',
+      all: 'サイトの全部の画面',
+      checkedOnly: 'チェックした画面だけ（早く終わります）',
+    },
     /**
      * PL-3（4 章の 4）: 前回の点検が最後まで終わらなかったときだけ出す一文（始め方の選択は詳しい内容。`foldedHeading` はたたんだ区画の見出し
      * `LOCAL_UI_TEXT.advancedSettings.summary`）。
@@ -3446,6 +3271,9 @@ export const LOCAL_UI_AUDIT_TEXT = deepFreeze({
     downloadRunJson: 'run.json をダウンロードする',
     downloadAuditJson: 'audit.json をダウンロードする',
     downloadBundle: 'ChatGPT に渡すまとめファイル（ZIP）をダウンロードする',
+    /** AUD-1d: まとめファイルを分けたときの、リンクの文言（引数は書式にかけた全部の数と、この番号）。 */
+    downloadBundlePart: (partCount: string, partNumber: string): string =>
+      `ChatGPT に渡すまとめファイル（ZIP。全 ${partCount} 個のうち ${partNumber} 個目）をダウンロードする`,
   },
   /**
    * DEF-146: 題と確定のボタンは、止める対象の呼び名（ジョブの種類ごと。`AUDIT_JOB_STOP_TARGET_NAMES`）を入れる。取り消しは「止めずに戻る」（前の「やめる」は、
@@ -3489,6 +3317,8 @@ export const LOCAL_UI_JOB_SUMMARY_TEXT = deepFreeze({
     WRITE_UPDATE: 'チェックした画面で更新しています。',
     NEXT: '点検の続きを始めています。',
   },
+  /** WSO: 「チェックした画面だけ」の点検の作業の画面の要点の 1 行。 */
+  checkedScreensOnly: 'この点検は、チェックした画面だけを見ます。',
   /** 終わった後の結果の 1 行。 */
   finished: {
     AUDIT_COMPLETE: '点検が終わりました。最後まで見ました。',
@@ -3518,9 +3348,12 @@ export const LOCAL_UI_JOB_SUMMARY_TEXT = deepFreeze({
   auditCompleteWithoutProblems: '点検が終わりました。問題は見つかりませんでした。',
   /** 主のボタンの語（ほかの画面と同じ語は、その画面のカタログを使う）。 */
   openResult: '結果を見る',
-  /** 点検を待つ間の進み具合と、終わるまでの長くてもの見積もり（13 章の 11。分は切り上げ）。 */
-  progressEstimate: (pagesText: string, maxPagesText: string, minutesText: string): string =>
-    `読んだページ ${pagesText} / ${maxPagesText}。長くても あと 約 ${minutesText} 分`,
+  /**
+   * 点検（DEF-195: 操作さがしも）を待つ間の進み具合と、終わるまでの見積もり（13 章の 11。DEF-192: 分母は見つけたページの数（上限まで）。見つけたページが
+   * 増えうるので「長くても」とは言わない。分は切り上げ）。
+   */
+  progressEstimate: (pagesText: string, pagesTotalText: string, minutesText: string): string =>
+    `読んだページ ${pagesText} / ${pagesTotalText}。あと 約 ${minutesText} 分`,
   /** 動いている間の、画面が新しくなることと、閉じても続くこと（読み直しの間隔は書かない）。 */
   autoRefresh: (target: string): string => `この画面は自動で新しくなります。閉じても${target}は続きます。`,
   /** 確かめきれなかった所があるとき（`details` はたたんだ区画の見出し。`LOCAL_UI_TEXT.advancedSettings.summary`）。 */
@@ -3794,7 +3627,7 @@ export const LOCAL_UI_AUTH_TEXT = deepFreeze({
       '点検で読まないページです。アドレスの後ろがこれで始まるページを読みません（ログアウトの画面など）。変えて「点検を始める」を押すと、ログインの設定を保存してから始めます。変えなければ保存しません。',
     // MI-C 項目 9: 承認済みのシナリオがあるプロファイルだけ（`countText` は `formatCount` の結果で、単位「件」を含む。変えると認証の設定の digest が変わり、承認が外れる）。
     excludedPathsReapproval: (countText: string): string =>
-      `変えると、書き込みの OK を出した書き込みの手順（${countText}）は、OK を出し直す必要があります。`,
+      `変えると、チェックした画面（${countText}）は、もう一度チェックが要ります。`,
     excludedPathsDefaultWords: '次の語をアドレスの後ろか ? の後ろに含むページは、ここに書かなくても読みません。',
     excludedPathsRejected: '読まないページを保存できなかったため、まだ始めていません。',
     /** PL-3: 要点のパネルの知らせ（欄は詳しい内容の中。`foldedHeading` はたたんだ区画の見出し `LOCAL_UI_TEXT.advancedSettings.summary`）。 */
@@ -3808,55 +3641,8 @@ export const LOCAL_UI_AUTH_TEXT = deepFreeze({
     sessionLostUrl: '止まったページのアドレス',
     sessionLostGuidance: 'このページを「読まないページ」に足すと、次からこのページを読みません。足すときは、ログインの設定を開いて保存し直してください。',
     openSetup: 'ログインの設定を開く',
-    /**
-     * DEF-138: セッションの切れを判定したページの記録（`SessionLossEvidence`）。path と query の名前と数だけで、値（token、Cookie の値、query の値）は
-     * ありません。
-     */
-    sessionLoss: {
-      heading: 'ログインが切れたと判定した読み込みの記録',
-      note: 'アドレスの後ろと、? の後ろの名前と数だけを記録しています（ログインの合い札、ブラウザに残るログインの印の値、? の後ろの値は記録しません）。',
-      stage: '判定した段階',
-      requestedPath: '頼んだページ',
-      landedPath: '行き着いた先',
-      landedBy: '行き着いた先を見た場所',
-      landedByLabels: {
-        PAGE_URL: '画面の最後のアドレス',
-        BLOCKED_REDIRECT: 'BeakSight が止めた移動の先（読む範囲の外）',
-      } satisfies Record<SessionLossLandedBy, string>,
-      redirectPaths: '読み込みの経路（自動の転送と画面の移動の順）',
-      /** 経路のほかに記録しなかった段の数（`countText` は `formatCount` の結果）。 */
-      omittedText: (countText: string): string => `ほかに ${countText} の移動を記録していません。`,
-      blockedRequests: 'この読み込みの間に止めた通信',
-      blockedColumns: { method: '通信の種類', originKind: 'サイト', path: 'アドレスの後ろ', reason: '理由', count: '回数' },
-      storageKeyChange: '読み込みの前と後の、ログインの印の名前の違い',
-      storageColumns: { storage: '置き場所', originKind: 'サイト', change: '違い', count: '名前の数', shapes: '名前の形（先頭と末尾）' },
-      storageLabels: {
-        LOCAL_STORAGE: 'ブラウザの保存場所（localStorage）の名前', COOKIE: 'ブラウザに残るログインの印（Cookie）の名前', INDEXED_DB: 'ブラウザの保存場所（IndexedDB）の名前',
-      } satisfies Record<SessionLossStorageKind, string>,
-      changeLabels: { REMOVED: '消えた', ADDED: '増えた' } satisfies Record<SessionLossKeyChange, string>,
-      originKindLabels: {
-        ALLOWED: '点検してよいサイト', SERVICE: 'ログインのときに通ってよい外のサイト', OTHER: 'そのほかのサイト',
-      } satisfies Record<SessionLossOriginKind, string>,
-      /** 経路の段の Origin の区別の補足（`label` は `originKindLabels` の値）。 */
-      routeOriginText: (label: string): string => `（${label}）`,
-      /** 名前の形（先頭と末尾だけ。間と、一般の語でない端は「…」）。 */
-      shapeText: (prefix: string, suffix: string): string => `${prefix}…${suffix}`,
-      storageUnread: '読み込みの後の状態を読めなかったため、名前の違いはありません。',
-      none: 'なし',
-      noChange: '違いはありません。',
-    },
   },
 } as const);
-
-/**
- * DEF-138: セッションの切れの証拠の、止めた要求の理由（`SESSION_LOSS_BLOCKED_REQUEST_REASONS`）ごとの説明。止めた要求の理由（`BLOCKED_REQUEST_REASONS`）は
- * 今の説明を使い、main frame の移動と監査の段の除外の理由を足す。
- */
-export const SESSION_LOSS_BLOCKED_REQUEST_REASON_DESCRIPTIONS = deepFreeze({
-  ...BLOCKED_REQUEST_REASON_DESCRIPTIONS,
-  EXTERNAL_MAIN_FRAME_NAVIGATION: '点検してよいサイトの外への画面の移動を止めました。',
-  AUDIT_EXCLUDED_URL: '読まないページ・読む範囲の外・危険な語に当たる読み込みを止めました。',
-} as const satisfies Record<SessionLossBlockedRequestReason, string>);
 
 // ---------------------------------------------------------------------------------------------------------------
 // 自動ログイン（ローカルの管理画面の資格情報、ログインの確かめ、ジョブの結果。Task 26 の設計書 4.2、4.6、4.7。T26e）
@@ -4010,8 +3796,8 @@ export const DRAFT_VALUE_TEXT = deepFreeze({
     API_FIELDED_KEYS: '送る項目は、操作さがしで画面の欄と結びついた項目のすべてです。',
     API_UNFIELDED_KEYS: 'ページが決める項目は、画面の欄と結びつかない項目のうち、選べる項目のすべてです。',
     API_SHAPE_FILTER: '更新するデータを選ぶ項目の名前は、操作さがしで記録した送信の形にある名前です。',
-    CONTRACT_DEFAULTS: '上限と書き込みの OK の期限は、初めから決まっている値です。',
-    SIDE_EFFECTS_UNCONFIRMED: 'ほかへの影響の確認は、まだしていません。書き込みの OK のダイアログで 4 つの約束を読み、「書き込みの OK を出す」を押すと、確かめたことになります。',
+    CONTRACT_DEFAULTS: '1 回に書き込む件数の上限は、初めから決まっている値です。',
+    SIDE_EFFECTS_UNCONFIRMED: `ほかへの影響の確認は、まだしていません。サイトの画面の「${WRITE_SCREENS_HEADING_TEXT}」で、この画面にチェックを入れると、確かめたことになります。`,
     SINGLE_BOUND_LEDGER: '作ったデータの一覧は、この更新に結びつく登録の書き込みの手順が 1 つだけなので、それにしました。',
     ONLY_FORM_PATH_TEMPLATE: '更新の画面のアドレスの形は、選べる形が 1 つだけなので、それにしました。',
     FIRST_FORM_PATH_TEMPLATE: '更新の画面のアドレスの形は、選べる形が 2 つ以上あるので、先頭の形にしました。',
@@ -4081,19 +3867,11 @@ export const LOCAL_UI_AUTO_DRAFT_TEXT = deepFreeze({
     CREATED: '更新の下書きを作りました',
     NOT_SAVED: '更新の下書きを作れませんでした',
   },
-  rulesFailed: '入れる値の決まりを付けられませんでした。入れる値の決まりの画面で決めてください。',
+  // SPEC-4: 規則の画面を外したので、人に決めさせない（試せないことだけを伝える）。
+  rulesFailed: 'BeakSight がこの画面に入れる値を決められませんでした。この画面は試せないことがあります。',
   openScenario: '書き込みの手順を開く',
-  openCreateForm: '作成の画面で変える欄を選ぶ',
   resultHeading: '作った結果',
-  // 作成の画面（更新の案内から開いたとき）。
-  form: {
-    chooseChangedFields: 'この書き込みの手順では、変える欄を人が必ず選びます。変える欄を 1 つ以上「変える」にしてから保存してください。保存の後に、推した入れる値の決まりを付けます。',
-    chooseLedger: '作ったデータの一覧として使える、新しく登録する書き込みの手順が 2 つ以上あります。どれを使うかを選んでください。',
-    noLedger: '作ったデータの一覧として使える、新しく登録する書き込みの手順がありません。操作さがしの画面の「書き込みの手順の下書きを作る」か、新しく登録する書き込みの手順を先に作ってください。',
-  },
-  savedWithRules: '書き込みの手順を保存し、推した入れる値の決まりを付けました。推せなかった欄は、入れる値の決まりの画面で入れてください。',
-  savedRulesFailed: '書き込みの手順を保存しました。入れる値の決まりは付けられなかったので、入れる値の決まりの画面で決めてください。',
-  // シナリオの画面と承認のダイアログ。
+  // シナリオの画面。
   inferredHeading: '推測した項目（確かめてください）',
   inferredItems: {
     RECORD_ID_KEY: '登録したデータの番号を読む、返事の項目',
@@ -4102,7 +3880,6 @@ export const LOCAL_UI_AUTO_DRAFT_TEXT = deepFreeze({
     UPDATE_FORM_PATH_TEMPLATE: '更新の画面のアドレスの形（前もって選んだ先頭の形）',
     DEFAULT_RANGE_FIELD: '範囲に初めから決まっている幅を入れた欄（入れる値の決まり）',
   },
-  approveInferredHeading: '推測した項目が残っています',
   // PL-6b（設計書 `2026-10-26-beaksight-plain-ui-design.md` 8.1 の「決められないとき」）: フォームの形の下書きの時点で出す、決められなかった理由（1 行）。
   formGaps: {
     RECORD_ID_NOT_FOUND: '作ったデータを後で探せません（更新は試せません）。同じデータを更新する画面が、操作さがしで見つかりませんでした。',
@@ -4293,8 +4070,12 @@ export const LOCAL_UI_NEXT_STEP_TEXT = deepFreeze({
     AUDIT_MANUAL_LOGIN: 'ログインの画面が見つかりました。次は、点検を始めて、開いたブラウザで手でログインします。',
     AUDIT_AUTOMATED_LOGIN:
       '次の点検から、BeakSight が自動でログインします。ログインに失敗したときは、点検は止まり、作業の画面に理由が出ます。',
+    // NL-3（設計書 `2026-11-06-beaksight-no-login-test-site-design.md` 3.3 の 4）: ログインのないテスト用のサイト（ログインの語を出さない）。
+    AUDIT_NO_LOGIN: 'テスト用のサイトを、そのまま点検します。「点検を始める」を押してください。',
     // OP-2: 「書き込みも試す」と「書き込みの手順へ」の段は外した（書き込みは、下の一覧でチェックした画面だけ、点検の中で行う）。
     AUDIT_AGAIN: '前回の点検が終わりました。もう一度点検するときは、「点検を始める」を押してください。',
+    // DEF-197: 点検（まとめて実行の連鎖のどれかの段）が動いている間。文は作業の画面の、連鎖の点検の段の 1 行と同じ。
+    AUDIT_RUNNING: LOCAL_UI_JOB_SUMMARY_TEXT.chainStage.AUDIT,
   },
   /**
    * OP-3（設計書 `2026-10-27-beaksight-one-pass-flow-design.md` 4.1 の D12）: 点検から移ってきたときの段の文（要点の 1 行目が点検の結果の 1 行なので、
@@ -4339,7 +4120,10 @@ export const LOCAL_UI_NEXT_STEP_TEXT = deepFreeze({
     AUDIT_PUBLIC: '次は点検です',
     AUDIT_MANUAL_LOGIN: '次は点検です（手でログインします）',
     AUDIT_AUTOMATED_LOGIN: '次は点検です（自動でログインします）',
+    AUDIT_NO_LOGIN: '次は点検です',
     AUDIT_AGAIN: '点検が終わっています',
+    // DEF-197: 点検が動いている間（文は上の段の文と同じ 1 か所）。
+    AUDIT_RUNNING: LOCAL_UI_JOB_SUMMARY_TEXT.chainStage.AUDIT,
   },
   /** サイトの一覧の行の、サイトの画面へ進むボタン。 */
   continue: '続ける',
@@ -4357,203 +4141,12 @@ export const LOCAL_UI_NEXT_STEP_TEXT = deepFreeze({
   },
 } as const);
 
-/**
- * 実行の許可の発行を拒む理由ごとの説明と手順（T30g。理由の一覧は `src/control/approval/execution-grant.ts` の `EXECUTION_GRANT_REJECTION_REASONS`。
- * 書き漏れと余分は `apps/local-ui/src/display/catalog-coverage.ts` が型で確かめる）。書き込みの開始の画面が使う。消費と確かめ直しの理由も、一覧に
- * あるので並べる（画面の開始では、ジョブの管理が `WRITE_GRANT_REJECTED` として返す）。
- */
-export const EXECUTION_GRANT_REJECTION_DESCRIPTIONS = deepFreeze({
-  GRANT_SCENARIO_NOT_FOUND: { description: '書き込みの手順が見つかりません。書き込みは始めていません。', action: '書き込みの手順の一覧を読み込み直してください。' },
-  GRANT_REVISION_CONFLICT: {
-    description: 'この画面を開いた後に、書き込みの手順が変わりました。書き込みは始めていません。',
-    action: '画面を読み込み直して、今の内容を確かめてから、もう一度始めてください。',
-  },
-  GRANT_APPROVAL_INVALID: {
-    description: '書き込みの OK が、今は使えません（理由を下に示します）。書き込みは始めていません。',
-    action: '書き込みの手順の画面で理由を確かめ、必要なら書き込みの OK を出し直してください。',
-  },
-  NEEDS_RULE_INPUT: {
-    description: '入れる値の決まりがまだない欄があります。書き込みは始めていません。',
-    action: '入れる値の決まりの画面で、送る欄すべての決まりを作ってください。',
-  },
-  VERIFICATION_SPEC_MISSING: {
-    description: '結果の確かめ方（成功の条件・入れた値の誤りの条件・登録したデータの番号の取り方・答え合わせ）に、まだ決めていない項目があります。書き込みは始めていません。',
-    action: '書き込みの手順を変える画面で、結果の確かめ方をすべて決めて保存し、書き込みの OK を出し直してください。',
-  },
-  GRANT_ENVIRONMENT_EVIDENCE_MISSING: {
-    description: 'サイトの設定に、テスト用のサイトであることを確かめた記録の参照がありません。書き込みは始めていません。',
-    // MI-8（設計書 4.9）: プロファイルの編集は、プロファイルの詳細の「詳しい設定」の中にある（MI-1）。
-    action: `サイトの画面の${ADVANCED_SETTINGS_REF_TEXT}（サイトの設定）で、テスト用のサイトであることを確かめた記録の参照を入れてください。`,
-  },
-  GRANT_WRITE_INTERVAL_NOT_ELAPSED: {
-    description: '同じ書き込みの手順の前回の書き込みから、決まった間隔が経っていません。書き込みは始めていません。',
-    action: '次に始められる時刻の後に、もう一度始めてください。',
-  },
-  GRANT_DAILY_WRITE_LIMIT_REACHED: {
-    description: '同じ書き込みの手順で、24 時間の間に書き込んだ件数が上限に達しています。書き込みは始めていません。',
-    action: '次に始められる時刻の後に、もう一度始めてください。',
-  },
-  GRANT_ALREADY_OPEN: {
-    description: 'この書き込みの手順には、まだ使っていない書き込みの OK があります。書き込みは始めていません。',
-    action: '少し待ってから（この OK の期限は短い時間です）、画面を読み込み直して、もう一度始めてください。',
-  },
-  GRANT_WRITE_CONCURRENCY_EXCEEDED: {
-    description: 'ほかの書き込みが動いています（書き込みは同時に 1 つだけです）。書き込みは始めていません。',
-    action: '動いている書き込みが終わってから、もう一度始めてください。',
-  },
-  GRANT_RUN_LIMIT_EXCEEDED: { description: '1 回で書き込める件数の上限を超えます。書き込みは始めていません。', action: '書き込みの手順の上限を確かめてください。' },
-  GRANT_CUMULATIVE_LIMIT_REACHED: {
-    description: '合計の上限に達しています（これから送る分・送った分・送ったか分からない分を数えます）。書き込みは始めていません。',
-    action: 'これ以上は書き込めません。上限を変えるときは、書き込みの手順を変えて、書き込みの OK を出し直してください（初めから決まっている値以下だけ）。',
-  },
-  GRANT_FACTS_CHANGED: {
-    description: '確かめている間に、操作さがしの結果が記録されました。書き込みは始めていません。',
-    action: '画面を読み込み直してから、もう一度始めてください。',
-  },
-  GRANT_NOT_FOUND: { description: '書き込みの OK が見つかりません。書き込みは始めていません。', action: '画面を読み込み直してから、もう一度始めてください。' },
-  GRANT_MISMATCH: { description: '書き込みの OK が、この書き込みの手順と作業のものではありません。書き込みは始めていません。', action: '画面を読み込み直してから、もう一度始めてください。' },
-  GRANT_EXPIRED: { description: '書き込みの OK の期限が過ぎました。書き込みは始めていません。', action: 'もう一度始めてください。' },
-  GRANT_ALREADY_CONSUMED: { description: '書き込みの OK は、もう使われています。', action: '書き込みの履歴を確かめてください。' },
-  GRANT_INVALIDATED: { description: '書き込みの OK は、取り消されたか期限が切れたため、使えなくなりました。', action: '書き込みの手順の状態を確かめてから、もう一度始めてください。' },
-  GRANT_NOT_CONSUMED: { description: '書き込みの OK が、まだ使われていません。', action: '画面を読み込み直してください。' },
-  GRANT_RESERVATION_SETTLED: { description: '書き込みの OK の取り置きは、もう締められています。', action: '書き込みの履歴を確かめてください。' },
-  GRANT_CLOCK_BEFORE_APPROVAL: {
-    description: 'このパソコンの時計が、書き込みの OK を出した時刻より前を指しています。書き込みは始めていません。',
-    action: 'このパソコンの時計を確かめてから、もう一度始めてください。',
-  },
-  GRANT_CLOCK_BEFORE_ISSUE: {
-    description: 'このパソコンの時計が、書き込みを始める準備をした時刻より前を指しています。書き込みは始めていません。',
-    action: 'このパソコンの時計を確かめてから、もう一度始めてください。',
-  },
-  // T31e（Task 31 の設計書 3 章の「対象の選び方」）: UPDATE の対象の選び直し（文言の確かめは T31h）。
-  TARGET_SELECTION_CHANGED: {
-    description: 'この画面を開いた後に、更新する予定のデータが変わりました（新しく登録したデータがあったなど）。書き込みは始めていません。',
-    action: '画面を読み込み直して、更新する予定のデータを確かめてから、もう一度始めてください。',
-  },
-  TARGET_RECORD_UNAVAILABLE: {
-    description: '更新できるデータ（結びつけた新しく登録する書き込みの手順で、BeakSight が登録して答え合わせが合ったもの）がありません。書き込みは始めていません。',
-    action: '結びつけた新しく登録する書き込みの手順で、登録の書き込みを答え合わせまで済ませてから、もう一度始めてください。',
-  },
-  // T31R-fix-1 の I-2: 発行の確かめ直し（下書きの保存の後に、台帳の登録の ID の取り方が変わった）。
-  SCENARIO_UPDATE_PATH_NOT_BOUND_TO_LEDGER_ID: {
-    description: '作ったデータの一覧（結びつけた新しく登録する書き込みの手順）で、登録したデータの番号の取り方が変わりました。そのため、この更新の手順のアドレスの形で、番号を入れる所に合わなくなりました。書き込みは始めていません。',
-    action: 'この書き込みの手順を変更して、作ったデータの一覧の番号の取り方に合うアドレスの形を選び、書き込みの OK を出し直してください。',
-  },
-  // T41b: 発行の確かめ直し（下書きの保存の後に、台帳の登録の ID を読む応答の鍵が変わった）。
-  SCENARIO_API_FILTER_NOT_BOUND_TO_LEDGER_ID: {
-    description: '作ったデータの一覧（結びつけた新しく登録する書き込みの手順）の今の内容では、登録したデータの番号で、更新するデータを選べなくなりました（送り先のアドレスが違うか、番号を読む返事の項目の名前が、データを選ぶ項目の名前と違います）。書き込みは始めていません。',
-    action: '登録の送り先と番号の項目の名前を合わせるか、同じ表の作ったデータの一覧を選んでこの書き込みの手順を変更し、書き込みの OK を出し直してください。',
-  },
-  // MI-F1（設計書 4.7.1 の 5）: シナリオの今の版の副作用の確認が済んでいない（承認の判定と別の多重の守り）。
-  SCENARIO_SIDE_EFFECTS_UNCONFIRMED: {
-    description: 'この書き込みの手順の今の内容は、ほかへの影響の確認が済んでいません。書き込みは始めていません。',
-    action: '書き込みの手順の画面で、ほかへの影響を確かめて、書き込みの OK を出し直してください。',
-  },
-  // T40R2-fix（Task 40 の設計書 7 章の「T40R2」の行の M-1）: 照合の READ の期待が、実行のたびに変わる値と比べない。
-  READ_VERIFICATION_NOT_VARYING: {
-    description: '答え合わせで見るページ（番号の入るアドレスの形）で比べる欄が、毎回同じ値になる欄（値が 1 つだけの決まった一覧など）だけです。別のデータのページを見ても合ってしまうことがあるので、書き込みは始めていません。',
-    action: '比べる欄を、BeakSight が作った値の欄（毎回変わる欄）にするか、その欄の入れる値の決まりを、値が 2 つ以上になる作り方にしてください。',
-  },
-} as const satisfies Record<string, ControlReasonText>);
-
-/**
- * 書き込みの開始を、画面のサーバが拒む理由ごとの説明と手順（T30g。理由の一覧は `apps/local-ui/src/server/write-job-functions.ts` の
- * `WRITE_START_LOCAL_REJECTION_REASONS`）。
- */
-export const WRITE_START_LOCAL_REJECTION_DESCRIPTIONS = deepFreeze({
-  WRITE_SCENARIO_NOT_FOUND: { description: '書き込みの手順かサイトが見つかりません。書き込みは始めていません。', action: '書き込みの手順の一覧を読み込み直してください。' },
-  // T31h-2: 更新（UPDATE）も画面から始められるようになったので、登録の開始の口の理由として書き直した。
-  WRITE_KIND_NOT_CREATE: {
-    description: '新しく登録する書き込みを始められるのは、新しく登録する書き込みの手順だけです。書き込みは始めていません。',
-    action: '書き込みの手順の画面を読み込み直して、その画面の「書き込みを始める画面を開く」から始めてください。',
-  },
-  WRITE_FACTS_UNAVAILABLE: {
-    description: 'サイトの設定のファイルか、保存した ID とパスワードが何回目の変更かを読めないため、書き込みの OK の状態を確かめられません。書き込みは始めていません。',
-    action: '設定のファイルの場所と中身（自動ログインなら ID とパスワードの画面）を確かめてから、もう一度始めてください。',
-  },
-  // T31h-2: 更新（UPDATE）の開始の口に、UPDATE でないシナリオが来た。
-  WRITE_KIND_NOT_UPDATE: {
-    description: '更新の書き込みを始められるのは、更新の書き込みの手順だけです。書き込みは始めていません。',
-    action: '書き込みの手順の画面を読み込み直して、その画面の「書き込みを始める画面を開く」から始めてください。',
-  },
-} as const satisfies Record<string, ControlReasonText>);
-
 /** ローカルの管理画面の、書き込みの文言（Task 30 の設計書 2 章、3 章、10 章。T30g）。 */
 export const LOCAL_UI_WRITE_TEXT = deepFreeze({
-  pages: {
-    writeStart: '書き込みを始める',
-  },
-  // 検証の指定の入力（シナリオのフォーム）。
-  verificationHeading: '結果の確かめ方',
-  // PL-6a（設計書 `2026-10-26-beaksight-plain-ui-design.md` 8.1）: 成否は BeakSight が、答え合わせと送った後の画面の形で確かめる（成功の条件と入力の誤りの条件の欄はない）。
-  verificationNote:
-    '書き込みの結果は、BeakSight が、答え合わせと、送った後の画面の形（同じ入力の画面が、入れた値のまま出たか）で確かめます。ここでは、登録の ID の取り方と答え合わせを決めます。決めていない項目があっても、保存と書き込みの OK はできます。ただし、書き込みは始められません。値には、ページの作り（アドレスの後ろと部品の目印）だけを書きます。',
-  /** T40a-fix: API のシナリオの検証の指定の説明（成否の条件と入力の誤りの条件は使わないので、欄を出さない）。 */
-  apiVerificationNote:
-    '画面を通さずに送る書き込みの手順は、送った後にサイトから返ってきた答えの状態と、取れた登録の ID で結果を確かめます。登録の ID は、返ってきた答えの中の項目か、ここの取り方のどちらかで決めます。',
-  /**
-   * T40R2-fix（Task 40 の設計書 7 章の「T40R2」の行。使える度合い）: 画面から登録の ID を取る型が、書き込みの画面の path にも当たるときの注意（保存は
-   * 拒まない）。保存の画面とシナリオの詳細の画面が出す。
-   */
-  recordIdPatternCaution:
-    'この ID の形は、書き込みの画面（登録の画面）のアドレスの後ろにも当たります。書き込みの前の画面の一部を ID と取り違えないよう、登録の ID は、返ってきた答えの項目から取る形を勧めます。',
-  recordIdSource: '取り方',
-  recordIdUnset: '指定しない',
-  recordIdValue: '形か部品の目印',
-  readVerificationCheck: '答え合わせに使う見るだけの確かめ',
-  readVerificationUnset: '指定しない',
-  /** 照合の READ の定義の選択肢（`revisionText` は `formatInteger` の結果）。 */
-  readVerificationOption: (readCheckId: string, revisionText: string): string => `${readCheckId}（${revisionText} 回目の変更）`,
-  bindingsHeading: '作った値と結び付ける送る値',
-  bindingsNote: '見るだけの確かめの送る値のうち、登録した値で探すものを、書き込みの手順の送る欄に結び付けます（1 つ以上）。',
-  bindingUnset: '結び付けない',
-  /** 結び付けの欄の名前（READ の定義の送る値の名前）。 */
-  bindingLabel: (parameterName: string): string => `送る値 ${parameterName}`,
-  expectationsHeading: 'あるはずのもの',
-  expectationKind: '確かめる中身の種類',
-  expectationCount: '行の数',
-  expectationField: '詳細の項目の名前',
-  expectationFieldName: '比べる値（送る欄）',
-  addExpectation: 'あるはずのものを足す',
-  removeExpectation: 'この項目を外す',
-  noReadChecks: 'このサイトには、答え合わせに使える見るだけの確かめがありません。',
+  // SPEC-4: 検証の指定の入力（作成の画面）と、書き込みの開始の画面の文言は、画面を外したので捨てた。ID の型が書き込みの画面にも当たるときの注意も、
+  // 出す画面がなくなったので捨てた。
   writesHeading: '書き込みの履歴',
   noWrites: 'まだ書き込んでいません。',
-  targetRecord: '更新するデータ',
-  targetRecordNote: '新しく登録する書き込みの手順で、BeakSight が登録して答え合わせが合ったデータのうち、いちばん新しいものです。始めるときに選び直し、この画面と違えば始めません。',
-  changedFields: '変える欄',
-  keptFields: '変えない欄',
-  startDialogUpdateBody: 'テスト用のサイトのデータ 1 件を更新します。始めた後は、送る直前の確かめで止まらない限り、送信を取り消せません。',
-  scenario: '書き込みの手順',
-  revision: '何回目の変更か',
-  fields: '送る欄',
-  action: '送り先',
-  perRun: '1 回で 1 件',
-  /** 累積の残り（`usedText`・`limitText`・`remainingText` は `formatCount` の結果）。 */
-  cumulativeValue: (usedText: string, limitText: string, remainingText: string): string => `使った件数 ${usedText} / 上限 ${limitText}（残り ${remainingText}）`,
-  cumulative: '合計の上限',
-  schedule: '間隔と回数の上限',
-  /** 連続の上限の表示（`intervalText` は分、`perDayText` と `remainingText` は `formatCount` の結果）。 */
-  scheduleValue: (intervalText: string, perDayText: string, remainingText: string): string =>
-    `最後の書き込みから ${intervalText} 分あける・24 時間に ${perDayText}まで（残り ${remainingText}）`,
-  nextAllowedAt: '次に始められる時刻',
-  nextAllowedNow: '今すぐ始められます',
-  notification: 'メールなどの通知',
-  notificationConfirmed: 'メールや電話への知らせが送られない設定であることを、書き込みの OK の前に確かめました。',
-  notificationUnconfirmed: 'メールなどの通知が送られないことを、まだ確かめていません。',
-  evidence: 'テスト用のサイトであることの記録',
-  evidencePresent: 'このサイトの設定に、テスト用のサイトであることを確かめた記録の参照があります。',
-  evidenceMissing: 'このサイトの設定に、テスト用のサイトであることを確かめた記録の参照がありません。',
-  approval: '書き込みの OK の状態',
-  start: '書き込みを始める',
-  starting: '始めています…',
-  startRejectedHeading: '書き込みを始められませんでした',
-  startDialog: {
-    title: '書き込みを始めますか',
-    body: 'テスト用のサイトに、新しく登録するデータを 1 件送ります。始めた後は、送る直前の確かめで止まらない限り、送信を取り消せません。',
-    confirm: '書き込みを始める',
-    cancel: 'やめる',
-  },
   // 結果。
   resultHeading: '書き込みの結果',
   /** T44e（Task 44 の設計書 P2-4）: 送る前の確かめで止めた具体的な理由の欄の見出し。 */
@@ -4607,23 +4200,23 @@ export const LOCAL_UI_WRITE_TEXT = deepFreeze({
   openJob: '作業の様子を見る',
   /**
    * T40d（Task 40 の設計書 3.4、3.5）: 送り方と API の要約の項目名と文言（書き込みの結果・履歴・開始の画面と、書き込みの報告が共用する。送り方の値の
-   * ラベルは `SCENARIO_TRANSPORT_CATALOG`）。シナリオの画面と同じ意味の項目名は、`LOCAL_UI_SCENARIO_TEXT.api` の値をそのまま使う。
+   * ラベルは `SCENARIO_TRANSPORT_CATALOG`）。SPEC-4: シナリオの作成の画面の文言を捨てたので、同じ意味の項目名は、ここに置く。
    */
   api: {
-    heading: '画面を通さない送信の形（書き込みの OK を出した形）',
-    transport: LOCAL_UI_SCENARIO_TEXT.api.transport,
-    method: LOCAL_UI_SCENARIO_TEXT.api.method,
-    origin: LOCAL_UI_SCENARIO_TEXT.api.origin,
-    pathShape: LOCAL_UI_SCENARIO_TEXT.api.pathShape,
+    heading: '画面を通さない送信の形（チェックしたときの形）',
+    transport: '送り方',
+    method: '通信の種類',
+    origin: '送り先のサイトのアドレス',
+    pathShape: 'アドレスの形',
     shapeDigest: '形の照らし合わせ用の文字列',
     keyNames: '送る鍵',
     httpFieldNames: '許すヘッダの名前',
-    recordIdKey: LOCAL_UI_SCENARIO_TEXT.api.recordId,
-    recordIdKeyUnset: LOCAL_UI_SCENARIO_TEXT.api.recordIdUnset,
+    recordIdKey: '登録したデータの ID を読む、応答の項目',
+    recordIdKeyUnset: '指定なし（結果の確かめ方で決めた取り方を使います）',
     pageKeyValuesHeading: 'ページが決める鍵とその値',
     pageKeyColumns: { key: '鍵', value: '値（JSON）' },
-    noPageKeys: LOCAL_UI_SCENARIO_TEXT.api.noPageKeys,
-    none: LOCAL_UI_SCENARIO_TEXT.api.none,
+    noPageKeys: 'ページが決める項目はありません。',
+    none: 'なし',
     /** 成否の条件と入力の誤りの条件を使わないことと、判定のしかた（T40a の報告の設計者の判断）。 */
     judgementNote:
       '書き込みの結果は、人が決める成功の条件や入力の誤りの条件を使わずに決めます（画面で送る書き込みも同じです）。画面を通さずに送る書き込みは、サイトから返ってきた答えの種類（うまくいった、送る回数が多すぎる、入力の誤り、サイトの側の誤り）と、取れた登録の ID で結果を決めます。「サイトからの答えの判定」は、こうして決めた結果です。',
@@ -4634,56 +4227,7 @@ export const LOCAL_UI_WRITE_TEXT = deepFreeze({
     /** T41e: 更新のページが決める鍵（送る前の値と照らし、値は残さない）。 */
     pageKeyValueNotKeptForUpdate: '更新では値を残しません（送る前の画面の値と同じであることを照らしました）',
   },
-  /**
-   * T41g（Task 41 の設計書 3.5.1）: 「登録してから更新する」の文言（更新のシナリオの開始の画面と、登録のジョブの画面）。状態と理由のラベルは
-   * `WRITE_CHAIN_STATE_CATALOG`・`WRITE_CHAIN_STOP_REASON_CATALOG`。
-   */
-  chain: {
-    heading: '登録してから更新する',
-    /** 出す理由ごとの説明（`WRITE_CHAIN_OFFER_REASONS`）。 */
-    offerReasons: {
-      NO_TARGET:
-        '更新できる、答え合わせが合ったデータがありません。新しく登録する書き込みの手順で 1 件登録し、答え合わせが合ったら、続けてそのデータを更新できます。',
-      PREVIOUS_UPDATE_STOPPED:
-        'いちばん新しいデータでは、前の更新が、答え合わせが合わないまま止まりました。新しく登録する書き込みの手順で 1 件登録し、答え合わせが合ったら、続けてそのデータを更新できます。',
-    },
-    open: '登録してから更新する',
-    notStartable: '新しく登録する書き込みの手順か、この更新の手順が、今は始められません。それぞれの「書き込みを始める」の画面で理由を確かめてください。',
-    dialogTitle: '登録してから更新しますか',
-    dialogBody:
-      'テスト用のサイトに、新しく登録するデータを 1 件送ります。答え合わせが合ったら、続けてそのデータの更新を 1 件送ります。登録の答え合わせが合わなければ、更新は始めません。始めた後は、送る直前の確かめで止まらない限り、送信を取り消せません。',
-    /** 確認のダイアログの 2 回の書き込み（`scenarioId` はシナリオの id）。 */
-    // PL-5（設計書 3 章の 2）: 書き込みの手順の ID と送り先は出さない。
-    stepCreate: '1 回目: 新しく登録',
-    stepUpdate: '2 回目: 更新',
-    stepRemaining: '合計の残り',
-    /** 累積の残り（`remainingText`・`limitText` は `formatCount` の結果）。 */
-    remainingValue: (remainingText: string, limitText: string): string => `残り ${remainingText}（上限 ${limitText}）`,
-    stepTarget: '更新するデータ',
-    stepTargetValue: '1 回目で登録して、答え合わせが合ったデータ',
-    confirm: '登録してから更新する',
-    stateHeading: '続けて更新する予定',
-    stateLabel: '状態',
-    reasonLabel: '更新を始めなかった理由',
-    /** T41g-3: 自動ログインの間隔を待った後に、更新を始め直す時刻の項目名。 */
-    nextStartAt: '更新を始め直す時刻',
-    openUpdateJob: '更新の作業の様子を見る',
-    /** 何も始めずに拒んだ理由（`WRITE_CHAIN_START_REJECTION_REASONS`）。 */
-    startRejections: {
-      CHAIN_NOT_OFFERED: {
-        description: '今は「登録してから更新する」を使う場面ではありません（更新する予定のデータがあります）。何も始めていません。',
-        action: '画面を読み込み直して、更新する予定のデータを確かめてから、「書き込みを始める」を使ってください。',
-      },
-      CREATE_NOT_STARTABLE: {
-        description: '新しく登録する書き込みの手順が、今は始められません。何も始めていません。',
-        action: '新しく登録する書き込みの手順の「書き込みを始める」の画面で、始められない理由を確かめてください。',
-      },
-      UPDATE_NOT_STARTABLE: {
-        description: 'この更新の手順が、今は始められません（書き込みの OK、結果の確かめ方、上限、間隔など。画面が古い場合も含みます）。何も始めていません。',
-        action: '画面を読み込み直して、始められない理由を確かめてください。',
-      },
-    },
-  },
+  // SPEC-4: 「登録してから更新する」の文言（`chain`）は、続けて始める口と表示ごと捨てた。
 } as const);
 
 /**
@@ -4723,8 +4267,8 @@ export const ACTION_REPORT_TEXT = deepFreeze({
     kind: '種類',
     job: LOCAL_UI_WRITE_TEXT.columns.job,
     run: 'Run',
-    scenario: LOCAL_UI_WRITE_TEXT.scenario,
-    revision: LOCAL_UI_WRITE_TEXT.revision,
+    scenario: '書き込みの手順',
+    revision: '何回目の変更か',
     grant: '実行の許可',
     recordId: LOCAL_UI_WRITE_TEXT.columns.recordId,
     reservation: '予約の締め（ワーカーの判定）',
@@ -4733,7 +4277,7 @@ export const ACTION_REPORT_TEXT = deepFreeze({
     candidateDigest: '画面の候補',
     blockReason: LOCAL_UI_WRITE_TEXT.columns.blockReason,
     submission: LOCAL_UI_WRITE_TEXT.columns.submission,
-    actionPath: LOCAL_UI_WRITE_TEXT.action,
+    actionPath: '送り先',
     submittedAt: LOCAL_UI_WRITE_TEXT.columns.submittedAt,
     httpStatus: LOCAL_UI_WRITE_TEXT.columns.httpStatus,
     judgement: LOCAL_UI_WRITE_TEXT.columns.responseJudgement,
@@ -4746,18 +4290,17 @@ export const ACTION_REPORT_TEXT = deepFreeze({
     receipt: '承認の記録',
     approvalDigest: '承認の digest',
     approvedAt: '承認した日時',
-    expiresAt: '承認の期限',
     approver: '承認者',
     revokedAtStart: '始めた時点で撤回されていた',
     inputRule: '入力の規則の参照',
-    limits: '件数の上限',
-    approvalTtlDays: '承認の期限の日数',
+    // LZ-3c: 承認の期限・期限の日数・累積の上限は出さない（判定に使わない名残。承認は期限で切れない）。
+    limits: '1 回の件数',
     grantIssuedAt: '許可を出した日時',
     grantExpiresAt: '許可の期限',
     grantConsumedAt: '許可を使った日時',
     reservationCount: '予約した件数',
     reservedAt: '予約した日時',
-    cumulative: LOCAL_UI_WRITE_TEXT.cumulative,
+    cumulative: '使った件数',
     capturedAt: '要約を読んだ日時',
   },
   atStartNote:
@@ -4799,12 +4342,10 @@ export const ACTION_REPORT_TEXT = deepFreeze({
   yes: 'はい',
   no: 'いいえ',
   none: LOCAL_UI_WRITE_TEXT.notApplicable,
-  /** 件数の上限（`perRunText`・`cumulativeText` は `formatInteger` の結果）。 */
-  limitsValue: (perRunText: string, cumulativeText: string): string => `1 回の Run で ${perRunText} 件・累積で ${cumulativeText} 件まで`,
-  /** 累積の件数（`usedText`・`limitText` は `formatInteger` の結果）。 */
-  cumulativeValue: (usedText: string, limitText: string): string => `使った件数 ${usedText} / 上限 ${limitText}`,
-  /** 承認の期限の日数（`daysText` は `formatInteger` の結果）。 */
-  approvalTtlDaysValue: (daysText: string): string => `${daysText} 日`,
+  /** 1 回の件数（`perRunText` は `formatInteger` の結果。LZ-3c: 累積の上限は出さない）。 */
+  limitsValue: (perRunText: string): string => `1 回の Run で ${perRunText} 件`,
+  /** 使った件数（`usedText` は `formatInteger` の結果。LZ-3c: 上限は出さない）。 */
+  cumulativeValue: (usedText: string): string => `${usedText} 件`,
   /** 入力の規則の参照（`revisionText` は `formatInteger` の結果）。 */
   inputRuleValue: (ruleSetId: string, revisionText: string, digest: string): string => `${ruleSetId}（版 ${revisionText}）・${digest}`,
   sideEffectsHeading: '副作用の確認',
@@ -4867,8 +4408,8 @@ export const LOCAL_UI_LEDGER_TEXT = deepFreeze({
   /** UPDATE の回数（`countText` は `formatCount` の結果）。 */
   updateCountValue: (countText: string): string => `${countText} 回`,
   lastUpdateLabel: '最後の結果',
-  /** 累計の件数と上限（`usedText`・`limitText` は `formatCount` の結果）。 */
-  cumulativeValue: (usedText: string, limitText: string): string => `${usedText} / 上限 ${limitText}`,
+  /** 累計の件数（`usedText` は `formatCount` の結果。LZ-3c: 上限は出さない）。 */
+  cumulativeValue: (usedText: string): string => `合計 ${usedText}`,
   cumulativeNote: '合計の件数は、書き込みを始めるときの確かめと同じ数え方です（送ったか分からない回を含みます）。',
   openScenario: '書き込みの手順を開く',
 } as const);
@@ -4957,35 +4498,6 @@ export const LOCAL_UI_LOGIN_STAGE_TEXT = deepFreeze({
   /** ML-b-3: token の送信より前に最初に見た行の印（自動の登録は、この印のある手続きの呼び出しだけをログインに伴う送信にします）。 */
   passedBeforeToken: 'ログインの送信より前',
   passedUnlisted: (countText: string): string => `ほかに ${countText}の送信を通しました（一覧の上限を超えたので、表には出していません）。`,
-} as const);
-
-/**
- * DEF-139（設計書 `2026-10-20-beaksight-login-state-carryover-design.md` 2.1）: ジョブの詳細の「ログインの段」の欄の、ログインの後のブラウザの状態の名前の記録。
- * 名前は先頭と末尾の一般の語の形だけで、値・中身・名前の全体は、画面のサーバに届かない。
- */
-export const LOCAL_UI_LOGIN_STATE_NAMES_TEXT = deepFreeze({
-  heading: 'ログインの後のブラウザの状態の名前',
-  note:
-    'ログインのステップの終わりに読んだ、ブラウザに残った情報の名前です。それぞれを点検に引き継いだか、点検してよいサイトとログインのときに通ってよい外のサイトのどちらでもないので外したかを示します。名前は先頭と末尾のよくある語だけを残し、値と中身は残しません。',
-  cookiesCaption: 'ブラウザに残るログインの印（ドメイン・アドレスの後ろ・名前の形・結果が同じものは 1 行にまとめます）',
-  localStorageCaption: 'ブラウザの保存場所の項目（サイトのアドレス・名前の形・結果が同じものは 1 行にまとめます）',
-  indexedDBCaption: 'ブラウザの保存場所のデータベース（サイトのアドレス・名前の形・結果が同じものは 1 行にまとめます）',
-  columns: {
-    domain: 'ドメイン',
-    path: 'アドレスの後ろ',
-    hostOnly: '送る先',
-    origin: 'サイトのアドレス',
-    shape: '名前の形（先頭と末尾）',
-    outcome: '点検への引き継ぎ',
-    count: '名前の数',
-  },
-  outcomeLabels: { CARRIED: '引き継いだ', OUTSIDE_APPROVED: '外した（点検してよいサイトの外）' },
-  hostOnlyLabels: { hostOnly: 'そのサイトだけ', domain: 'サブドメインにも送る' },
-  /** 先頭と末尾に一般の語のない名前（名前は残さない）。 */
-  noShape: '（よくある語のない名前）',
-  none: 'なし',
-  /** 表の上限を超えた名前の数（`countText` は `formatCount` の結果）。 */
-  unlisted: (countText: string): string => `ほかに ${countText}の名前があります（表の上限を超えたので、出していません）。`,
 } as const);
 
 /**
@@ -5084,7 +4596,7 @@ export const LOCAL_UI_MANUAL_LOGIN_TEXT = deepFreeze({
   successKeyValue: (prefix: string, suffix: string): string => `${prefix}…${suffix}`,
   none: 'なし',
   revisionNote:
-    '設定を保存すると、サイトの設定の変更の回数が進みます。OK を出した書き込みの手順や、操作さがし・見るだけの確かめの結果は、やり直しが要ることがあります。',
+    '設定を保存すると、サイトの設定の変更の回数が進みます。チェックした画面や、操作さがし・見るだけの確かめの結果は、やり直しが要ることがあります。',
   review: 'ログインの設定の画面で見直す',
 } as const);
 
@@ -5109,6 +4621,8 @@ export const LOCAL_UI_LOGIN_OBSERVATION_TEXT = deepFreeze({
   /** ボタンを出さない行の案内。 */
   manualRedactedPath: '値に見える部分を伏せたアドレスなので、登録の案を作れません。ログインの設定に手で入れてください。',
   manualAlreadyRegistered: '登録してある送信の上限か送り方で止めました。ログインの設定を開いて、登録の内容を手で直してください。',
+  /** DEF-194: 自動ログインの段で、サイトが自動で送った通信として通した行と、削除・危ないことばで止めた行（登録は要らない）。 */
+  manualNotNeeded: '登録は要りません。',
   /** ログインの段の観察の欄。 */
   observationHeading: 'ログインのステップで見つけた案',
   observationBody: 'ログインのステップの始めと終わりに読んだことから作った案です（値と画面の文字は残しません）。保存は、ログインの設定の画面であなたが行います。',
@@ -5160,14 +4674,37 @@ export const LOCAL_UI_DISPLAY_SETTINGS_TEXT = deepFreeze({
     '作業中のブラウザを画面に出しています。ログインを頼まれたときのほかは、ブラウザを操作しないでください（操作すると、結果が乱れます。ブラウザを閉じると、作業は失敗として終わります）。',
   /** AS-b（監査の段の送信の扱いの設計書 2.1）: 監査の段の送信の扱いの切り替え（OP-I の I1 から、サイトの既定は通す側）。 */
   // OP-U: 点検のほか、登録・更新の作業の値を入れる前にも当たるので、作業の名前を並べず「ページを見ている間」と言う。
-  auditSendPassExceptDelete: 'ページが出す送信のうち、削除のほかを通す（ページを見ている間）',
+  // SD-3: サイトの通信は止めない。BeakSight は消す・取り消すなどの操作をしない。
+  auditSendPassExceptDelete: 'サイトの通信を止めない（ページを見ている間）',
   auditSendHint:
-    '既定は通す側です。通すと、ページが出す書き込みの送信がサイトに届きます。削除と危険な語の送信は止めます。外すと見るだけになります（ページが出す書き込みの送信を止めます）。通す側にするときは、確認のダイアログで「通す」を選んだときに保存します。外すときは、切り替えるとすぐ保存します。切り替えても、サイトの設定の変更の回数と書き込みの OK は変わりません。次に始める作業から使います。',
+    '既定は通す側です。通すと、ページが出す書き込みの送信がサイトに届きます。BeakSight は、消す・取り消すなどのボタンを押しません。外すと見るだけになります（ページが出す書き込みの送信を止めます）。通す側にするときは、確認のダイアログで「通す」を選んだときに保存します。外すときは、切り替えるとすぐ保存します。切り替えても、サイトの設定の変更の回数と書き込みの OK は変わりません。次に始める作業から使います。',
   auditSendDialogTitle: 'ページが出す書き込みの送信を通しますか',
-  auditSendDialogBody: 'ページが出す書き込みの送信がサイトに届きます。削除と危険な語の送信は止めます。',
+  auditSendDialogBody: 'ページが出す書き込みの送信がサイトに届きます。BeakSight は、消す・取り消すなどのボタンを押しません。',
   auditSendConfirm: '通す',
   auditSendCancel: 'やめる',
   // OP-I（I1）: 「削除のほかを通す」はサイトの既定になったので、要点の「守りを緩めています」の印（`auditSendRelaxed`）はなくした。
+} as const);
+
+/**
+ * DN-1（設計書 `2026-11-16-beaksight-profile-display-name-design.md` 2 章）: サイトの画面の詳しい内容の、画面に出す名前の欄（`SiteNamePanel`）。
+ * 技術の語（ID・プロファイル）は出さない。
+ */
+export const LOCAL_UI_DISPLAY_NAME_TEXT = deepFreeze({
+  heading: '画面に出す名前',
+  label: '画面に出す名前',
+  hint: `サイトの一覧・この画面の題・作業の履歴に出す名前です。${String(MAX_PROFILE_DISPLAY_NAME_LENGTH)} 文字まで、1 行で入れます。変えても、これまでの点検の結果と設定はそのままです。`,
+  // サイトの設定の「保存する」と同じ語を含めない（同じ画面にあるので、押すボタンを取り違えないように）。
+  save: '名前を変える',
+  saving: '保存しています…',
+  saved: '画面に出す名前を保存しました。',
+  rejected: '画面に出す名前を保存できませんでした。',
+  requestFailed: '画面のサーバとのやりとりで誤りが起きました。画面のサーバが動いているかを確かめてから、もう一度保存してください。',
+  reasons: {
+    PROFILE_NOT_FOUND: 'このサイトが見つかりません。',
+    DISPLAY_NAME_EMPTY: '名前が空です。1 文字以上入れてください。',
+    DISPLAY_NAME_TOO_LONG: `名前が長すぎます。${String(MAX_PROFILE_DISPLAY_NAME_LENGTH)} 文字までにしてください。`,
+    DISPLAY_NAME_CONTROL_CHARACTER: '名前に改行などの使えない文字があります。1 行の名前にしてください。',
+  },
 } as const);
 
 /** MI-3（設計書 `2026-10-26-beaksight-minimal-input-ux-design.md` 4.3）: 認証の設定を自動で保存できなかったときに、プロファイルの詳細の「次にすること」が出すリンク。 */
@@ -5226,7 +4763,7 @@ export const LOCAL_UI_AUTOMATED_LOGIN_SETUP_TEXT = deepFreeze({
       `サイトの設定は「${beforeText}」から「${afterText}」になります。操作さがし・見るだけの確かめの結果は、やり直しが要ることがあります。`,
     /** 今承認が有効なシナリオがあるとき（`countText` は `formatCount` の結果）。 */
     approvalNotice: (countText: string): string =>
-      `書き込みの OK を出した書き込みの手順（${countText}）は、OK が外れます。OK はサイトの設定を変えると外れるためです。書き込みを始める前に、もう一度 OK を出してください。`,
+      `チェックした画面（${countText}）のチェックが外れます。サイトの設定を変えると外れるためです。サイトの画面の「${WRITE_SCREENS_HEADING_TEXT}」で、もう一度チェックしてください。`,
     confirm: '保存する',
     cancel: '保存せずに戻る',
     /**
@@ -5302,7 +4839,7 @@ export const LOCAL_UI_LOGIN_STAGE_REGISTER_TEXT = deepFreeze({
   preparing: '案を作っています…',
   dialogTitle: 'この送信を登録しますか',
   dialogBody:
-    '次の内容をログインの設定に足して、その場で保存します。保存するとサイトの設定の変更の回数が進みます。そのため、書き込みの OK を出した書き込みの手順や、操作さがし・見るだけの確かめの結果は、やり直しが要ることがあります。',
+    '次の内容をログインの設定に足して、その場で保存します。保存するとサイトの設定の変更の回数が進みます。そのため、チェックした画面や、操作さがし・見るだけの確かめの結果は、やり直しが要ることがあります。',
   tokenTarget: 'ログインの合い札をもらう送信先（ページの中のプログラムで送る形です。今の送信先があれば、これに替えます）',
   /** token の送信先の必須の query（名前だけ）。 */
   tokenQueryNames: (names: string): string => `（アドレスの ? の後ろに必ずある名前: ${names}）`,
@@ -5326,7 +4863,6 @@ export const LOCAL_UI_LOGIN_STAGE_REGISTER_TEXT = deepFreeze({
     NO_TOKEN_TARGET: 'ログインの合い札をもらう送信先がまだないので、ログインに伴う送信を足せません。先に、合い札をもらう送信の行を登録してください。',
     NO_STORAGE_KEY:
       'ログインできたことを示す、ブラウザの保存場所の鍵が分かりません。まず、もう一度手でログインしてください（ログインの後の画面で鍵を見つけられれば、自動で入ります）。それでも決まらないときだけ、ブラウザの開発者ツールのローカル ストレージで鍵の名前を確かめ、「ログインの設定の画面で直す」から成功の鍵の形を入れてください。',
-    SIDE_REQUEST_LIMIT: 'ログインに伴う送信は、もう上限の数まで登録してあります。',
     // MI-8（設計書 4.9、MI-4 の判断）: 自動ログインのプロファイルの利用者は、先に手動のログインへ戻す必要がある（詳しい設定の編集で方式を戻す）。
     NEW_TARGET_FROM_AUTOMATED_LOGIN:
       `自動ログインの記録や、自動ログインのサイトからは、新しいログインの送信先（ログインの合い札をもらう送信先と、ログインのときに通ってよい外のサイトのアドレス）を足せません。一度手でログインすると、ログインの送信先が自動で登録されます。自動ログインのサイトでは、${ADVANCED_SETTINGS_REF_TEXT}でログインのしかたを「手でログインする」に戻してから、一度手でログインしてください。`,
@@ -5413,15 +4949,6 @@ export const LOCAL_UI_EXTERNAL_SCHEME_PROBE_TEXT = deepFreeze({
 } as const);
 
 /**
- * T44c（Task 44 の設計書 P1-3）: 発見のジョブの、押す数の上限で押せなかった登録・更新の語のボタンの数（成果物の `pressLimitProbes`）の表示。
- */
-export const LOCAL_UI_PRESS_LIMIT_PROBE_TEXT = deepFreeze({
-  heading: '押す数の上限で押せなかった保存・登録のボタン',
-  body: '送らずに様子を見るためにボタンを押すのは、1 つの画面で 3 回までです。見えないボタンは数える前に除き、保存・登録・更新などの語のあるボタンを先に押します。上限を超えて押せなかったボタンは、送り方が分からないので、新しく登録・更新をする書き込みの手順の候補になりません。保存のボタンがあるのに候補が出ない画面があれば、この数を確かめてください。',
-  priorityNotPressed: '上限で押せなかった、保存・登録・更新などの語のあるボタン',
-} as const);
-
-/**
  * T44c（Task 44 の設計書 P1-4。設計者の判断）: 監査のジョブの、ページの未完了の理由ごとのページ数（`run.json` の `pageIncompleteReasonCounts`）の表示。理由の
  * 説明は `INCOMPLETE_REASON_DESCRIPTIONS`、次にできることは `INCOMPLETE_REASON_NEXT_STEPS`。
  */
@@ -5453,11 +4980,14 @@ export const LOGIN_STAGE_BLOCK_REASON_LABELS = deepFreeze({
   UNREGISTERED_NON_READ: '登録していない、見るだけでない送信',
   // T36R-fix（T36R の M-2）: 資格情報を含む要求の理由は行にしない（数だけ。`LOCAL_UI_LOGIN_STAGE_TEXT.credentialRequestsBlocked`）。
   NON_READ_METHOD: 'ログインの送信先でない所への、見るだけでない送信',
+  // DEF-194: 自動ログインの段の行だけの理由（登録は要らない）。
+  AUTOMATED_LOGIN_PASSED: 'サイトが自動で送った通信（止めずに通しました）',
+  AUTOMATED_LOGIN_RULE_BLOCKED: '削除か、危ないことばを含む通信（止めました）',
 } as const);
 
 /**
  * ログインの後の SPA の監査の画面の文言（T35d。Task 35 の設計書 3.1、3.4）。認証の設定の画面の、スクリプトの送信のときだけ出す「監査で通す読み取りの
- * 手続きの呼び出し」の一覧と、「サービスの Origin への要求の上限」の欄。
+ * 手続きの呼び出し」の一覧（LZ-3c: 「サービスの Origin への要求の上限」の欄は捨てた）。
  */
 export const LOCAL_UI_SPA_AUDIT_TEXT = deepFreeze({
   setup: {
@@ -5465,6 +4995,9 @@ export const LOCAL_UI_SPA_AUDIT_TEXT = deepFreeze({
     /** 一覧の補足（`maxText`・`perLoadText` は `formatCount`・`formatTimes` の結果）。 */
     auditReadsHint: (maxText: string, perLoadText: string): string =>
       `点検のステップで、ページの中のプログラムが出す送る通信のうち、ここに登録した送信先へのものだけを、1 回の読み込みで決まった回数まで通します（${maxText} まで登録できます。1 回の読み込みで ${perLoadText} まで通します）。`,
+    /** L11（設計書 `2026-11-09-beaksight-remove-limits-design.md` 4）: 件数と回数の上限を撤廃した後の一覧の補足。 */
+    auditReadsUnlimitedHint:
+      '点検のステップで、ページの中のプログラムが出す送る通信のうち、ここに登録した送信先へのものを通します（何件でも登録でき、何回でも通します）。',
     auditReadsJudgement:
       '登録するのは、データを見るだけの呼び出しです。見るだけかどうかは、あなたが判断して登録します。まず空のまま試し、点検でできたファイルの安全の記録で止めた通信を見て、要るものだけを登録してください。',
     readOrigin: '呼び出し先のサイトのアドレス',
@@ -5473,20 +5006,9 @@ export const LOCAL_UI_SPA_AUDIT_TEXT = deepFreeze({
     addRead: '呼び出しを足す',
     removeRead: 'この呼び出しを消す',
     noReads: '点検のときに通す、見るだけの呼び出しはありません。',
-    limitsHeading: 'ログインのときに通ってよい外のサイトへの通信の上限',
-    /**
-     * 上限の補足（既定の値。`perMinuteText`・`perRunText`・`perPageText` は `formatCount` の結果）。T44f: 1 回の Run あたりの既定は、`perRunText` か、ページの上限 ×
-     * `perPageText`（`SERVICE_REQUESTS_PER_PAGE_ALLOWANCE`）の大きいほう。
-     */
-    limitsBody: (perMinuteText: string, perRunText: string, perPageText: string): string =>
-      `点検のステップで、ログインのときに通ってよい外のサイトへ送る通信の数の上限です。空なら、1 分あたり ${perMinuteText}、点検の 1 回あたり ${perRunText} か「ページの上限 × ${perPageText}」の大きいほうを使います。書くときは、小さくはできますが、大きくはできません。1 分あたりの上限に届くと、次の画面を読む前に待ってから続けます（ページの途中では止めません）。点検の 1 回あたりの上限に届くと、点検を止めます。`,
+    // LZ-3c: 上限の欄（見出し・補足・既定の値の文）は捨てた。前に保存した設定の上限の値の誤りを示す欄の名前だけを残す。
     perMinute: '1 分あたりの上限',
-    /** 欄の補足（`minText`・`maxText` は `formatCount` の結果）。 */
-    perMinuteHint: (minText: string, maxText: string): string => `${minText} から ${maxText} まで（空なら ${maxText}）。`,
     perRun: '点検の 1 回あたりの上限',
-    /** T44f: 空のときの既定は、`maxText` か「ページの上限 × `perPageText`」の大きいほう。 */
-    perRunHint: (minText: string, maxText: string, perPageText: string): string =>
-      `${minText} から ${maxText} まで（空なら ${maxText} か「ページの上限 × ${perPageText}」の大きいほう）。`,
   },
 } as const);
 
@@ -5610,16 +5132,29 @@ export const CHATGPT_BUNDLE_GUIDE_TEXT = deepFreeze({
       `${name}: 要約です。Run の状態、ページの網羅、重大度・区分の別の件数、category の別の件数（\`findingCountsByCategory\`）、Rule の別の件数（\`findingCountsByRule\`）、本体の指摘と外した指摘の件数（\`beaksightBlockRelation\`）があります。重大度・category・Rule の別の件数は、外した指摘も含む全部の件数です。`,
     findingsByRule: (name: string): string =>
       `${name}: Rule ごとの要約です。本体の指摘の要約（\`main\`）と、外した指摘の要約（\`excluded\`）に分けてあります。件数、重大度の別の件数、出たページの数、ビューポートの別の件数、BeakSight の遮断との関係の区分の別の件数（\`byBlockRelation\`）と、例（${REPORT_RULE_DIGEST_EXAMPLE_COUNT} 件まで。ページの違うものが先）があります。全体の傾向は、\`main\` で見てください。`,
+    /** REC-4: 指摘のファイルの場所の一覧（引数は、一覧・ページごとの指摘のファイル・ページに属さない指摘のファイルの名前）。 */
+    findingFiles: (listName: string, pageFindingsName: string, runFindingsName: string): string =>
+      `${listName}: 指摘のファイルの場所の一覧です。指摘は、ページごとのファイル（${pageFindingsName}）と、ページに属さない指摘のファイル（${runFindingsName}）に分けてあります。指摘のないページのファイルはありません。一覧には、ファイルごとに、ページの ID（\`pageId\`）・場所（\`path\`）・次の 3 つの一覧の件数があります。`,
     findings: (name: string): string =>
-      `${name}: 本体の Finding です。BeakSight が止めた要求と結び付かない、サイト品質の指摘だけです（サイトの欠陥の候補）。Finding ごとに、参照する Evidence の場所と、関係するスクリーンショットのパスがあります。`,
+      `${name}: 本体の Finding です。BeakSight が止めた要求と結び付かない、サイト品質の指摘だけです（サイトの欠陥の候補）。Finding ごとに、参照する Evidence の場所と、関係するスクリーンショットのパスと、入る候補群の ID（\`groupId\`）があります。`,
     /** BN-d: 外した指摘のファイル（引数はファイルの名前）。 */
     relatedFindings: (name: string): string =>
       `${name}: 本体から外した Finding です。BeakSight の遮断が原因の指摘、遮断の影響の可能性がある指摘、安全の区分の指摘です。Finding ごとに、BeakSight の遮断との関係（\`beaksightBlockRelation\`。区分 \`relation\`・理由 \`reason\`・結び付いた遮断 \`blocks\`。安全の区分の指摘は \`null\`）があります。安全の区分の指摘には、止めた事象の時点の別の件数（\`safetyBlockPhaseCounts\`。\`CLOSING\` は閉じる途中とページを離れた後）があります。`,
+    /** AUD-2d: 初めの表示だけの指摘のファイル（引数はファイルの名前）。 */
+    initialOnlyFindings: (name: string): string =>
+      `${name}: 本体から分けた、初めの表示だけの Finding です。ページが落ち着いた後に、読み込み直さずに確かめ直したら消えた指摘です（\`verification.recheck\` が \`INITIAL_ONLY\`）。消さずに残しているので、別に評価できます。反対に、確かめ直しで新しく出た Finding は、見落とさないように本体に入れ、\`verification.recheck\` を \`LATE\` にしています。ページごとの確かめ直しの表は、\`page.json\` のビューポートの \`recheck\` にあります。`,
+    /** REC-4: 指摘の ID の一覧は持たず、件数だけ。 */
     pages: (name: string): string =>
-      `${name}: ページごとの状態と、ビューポートごとの状態です。Finding と Evidence は、ID で参照します。本体の Finding は \`findingIds\`、外した Finding は \`excludedFindingIds\` です。`,
-    evidence: (indexName: string, pageJsonName: string): string =>
-      `${indexName}・${pageJsonName}・スクリーンショット: 一次の証拠です。Evidence の索引の \`path\` と \`pointer\`（JSON Pointer）で、ZIP の中の ${pageJsonName} の記録をたどれます。`,
+      `${name}: ページごとの状態と、ビューポートごとの状態です。本体の指摘の件数（\`mainFindingCounts\`）と、外した指摘の件数（\`excludedFindingCounts\`）があります。指摘そのものは、ページごとの指摘のファイルにあります。`,
+    /** REC-4: Evidence の索引は置かない。指摘の `evidence` の場所でたどる（引数は page.json のパスの表記）。 */
+    evidence: (pageJsonName: string): string =>
+      `${pageJsonName}・スクリーンショット: 一次の証拠です。指摘の \`evidence\` の \`path\` と \`pointer\`（JSON Pointer）で、ZIP の中の ${pageJsonName} の記録をたどれます。`,
   },
+  /** REC-4: page.json 2.0 の短い形の節。 */
+  pageRecordHeading: 'page.json の短い形',
+  /** REC-4: page.json 2.0 の短い形の読み方（レイアウトとアクセシビリティの記録だけ。指摘と、記録の並びは変えない）。 */
+  pageRecordNote:
+    '`page.json`（`page-schema/2.0`）は、レイアウトとアクセシビリティの記録の、同じ形の繰り返しを短く書いています。指摘と、記録の並び（`pointer` の番号）は変えていません。一覧が `{ "keys", "common", "items" }` の形のときは、全部の項目で同じ値の欄を `common` に 1 回だけ書いています。`items` の各項目に `common` の欄を足すと元の項目になり、欄の並びは `keys` のとおりです。要素の重なり（`elementOverlaps`）の `first`・`second` が数のときは、同じレイアウトの `overlapElements` の番号です。`recheckBase` のある記録は、落ち着いた後の確かめ直しの記録です。その中の `sameAs`（`{ "sameAs": <番号> }` の形）は、`recheckBase` の記録（1 回目）の同じ一覧の、その番号の項目と同じという意味です。',
   /** `page.json` のパスの中の、ページの ID の置き場所の表記（例: `pages/<pageId>/page.json`）。 */
   pageIdPlaceholder: '<pageId>',
   /** 読む順に入らないファイルの説明。 */
@@ -5642,6 +5177,9 @@ export const CHATGPT_BUNDLE_GUIDE_TEXT = deepFreeze({
    */
   safetyNote: (groupLabel: string): string =>
     `重大度の区分が「${groupLabel}」の Finding は、BeakSight が自分の決まりで止めた送信や操作の記録です。多くは、ページが出した送信です。サイトの欠陥ではないので、サイト品質の指摘とは分けて数えています。`,
+  /** SAFE-2 の 4: 違反にしない止めた記録の数の読み方（値は run.json の safety）。 */
+  stoppedRecordsNote:
+    '`run.json` の `safety` の `frameClassificationFailureCount` は、画面の中の枠で、どこのものか確かめられなかったので止めた移動の数、`readNavigationFailureCount` は、画面を開くための移動で、届いたか分からなかったものの数、`externalSchemeNavigationCount` は、ほかのアプリ（メールや電話など）を開こうとした動きの数です。どれも安全の決まりに反したことではなく、BeakSight が止めたり記録したりしたものです。',
   /** BN-d（設計書 `2026-10-23-beaksight-bundle-beaksight-block-noise-design.md` 3.5）: 本体と外した指摘の節。 */
   blockHeading: '本体の指摘と、外した指摘',
   /** 本体の意味（引数は、本体と外した指摘のファイルの名前）。 */
@@ -5660,10 +5198,88 @@ export const CHATGPT_BUNDLE_GUIDE_TEXT = deepFreeze({
   /** BN-R1 の M-5: 閉じる途中の遮断の扱い（事実に合わせた）。 */
   closingNote:
     '閉じる途中とページを離れた後に BeakSight が止めた要求（時点 `phase` が `CLOSING` の記録と、safety の Evidence の `blockedClosingRequests`）は、測りの後のものです。影響の可能性（`POSSIBLE`）の元には使いません。指摘の対象の要求そのものを閉じる途中に止めた場合（その URL に、読み込みの最中の本当の失敗がないとき）は、遮断が原因（`CAUSED`）の参照に入ります。',
+  /** AUD-1a・1b（設計書 `2026-11-09-beaksight-audit-precision-triage.md`）: 入れた画像と、入れなかったファイルの節。 */
+  artifactsHeading: '入れた画像と、部の分け方',
+  /**
+   * どの画像を入れるかと、部の分け方と、欠けの一覧の読み方（引数は `manifest.json` の名前）。AUD-1d（ユーザーの判断 2026-11-09）: 集めた証拠は全部入れる。
+   * 起きた事実だけを書く。
+   */
+  artifactsNote: (manifestName: string): string =>
+    `点検で集めた画像（見える範囲の \`viewport.png\`、ページ全体の \`full-page.png\`、やり直す前の試行の画像）と、各ページの見える文字（\`visible-text.txt\`）を、全部入れました。1 つの ZIP に入りきらないときは、第 1 部・第 2 部…に分けました。第 1 部には、${manifestName}、この案内、\`run.json\`、要約・ページの一覧・指摘のファイルの場所の一覧などの入口の JSON があります。ページごとの指摘のファイル、各ページの \`page.json\`、見える文字、画像は、この順に（画像は指摘に関係するものを先にして）、第 1 部の残りと第 2 部以降にあります。1 つのファイルだけで大きいものは、そのファイルだけで 1 つの部です。どのファイルが何部にあるか（どのページの \`page.json\` が何部にあるかを含む）は、${manifestName} の \`files\` の \`part\` にあります。撮影・保存できなかったファイルは、${manifestName} の \`omittedFiles\` に、パス（\`path\`）・元の Evidence の ID（\`evidenceIds\`）・起きたこと（\`reason\`）つきであります。JSON の中の \`pages/\` のパスは、どれかの部にあるか、この一覧にあります。\`reason\` の値は次のとおりです。`,
+  /** AUD-1d: 各部の README の冒頭の行（引数は書式にかけた部の数と、この部の番号）。 */
+  partOf: (partCount: string, partNumber: string): string => `全 ${partCount} 部のうち第 ${partNumber} 部です。`,
+  /** AUD-1d: 第 2 部以降の README の説明（引数は README と manifest の名前）。 */
+  laterPartNote: (readmeName: string, manifestName: string): string =>
+    `この部には、指摘のファイル・\`page.json\`・見える文字・画像のどれかが入っています。読み方は第 1 部の ${readmeName} に、どのファイルが何部にあるかは第 1 部の ${manifestName} にあります。`,
+  /** 理由の 1 行（引数は理由のコードの表記、表示カタログの名前と説明）。 */
+  omissionReasonLine: (code: string, label: string, description: string): string => `${code}（${label}）: ${description}`,
+  /** 発表の前の確かめで見つからなかったファイルの数の項目の名前（値は `manifest.json` の `missingArtifactCount` と同じ）。 */
+  missingArtifactCount: '成果物のフォルダに見つからなかったファイルの数',
+  /** 発表の前の確かめをしていないときの値。 */
+  missingArtifactCountNotChecked: '確かめていません',
+  /** AUD-6a・6c: 検証の状態と、Web Vitals の観測の範囲の節。 */
+  verificationHeading: '指摘の確かめ方と、性能の観測の範囲',
+  /** AUD-6a: 指摘ごとの検証の状態の読み方。 */
+  verificationNote:
+    '指摘ごとの `verification` は、その指摘を何で確かめたかです。`basis` は Rule ごとに決まった根拠で、`STATIC_CANDIDATE`（文書の構造から見た候補）、`RENDERED`（描いた画面で確かめた）、`NAVIGATION_OBSERVED`（読み込み・移動の結果で確かめた）、`INTERACTION_REPRODUCED`（操作で再現した）のどれかです。`status` は、ふつうは `basis` と同じです。指摘が指す記録やファイルが成果物になかったときは、`status` が `UNVERIFIED` になり、`reason` に起きたことがあります（`EVIDENCE_NOT_FOUND`: 指摘が指す記録が、どのページの記録にもなかった。`EVIDENCE_FILE_MISSING`: 指摘の画像などのファイルを、撮影・保存できなかった）。指摘そのものは、`basis` の方法で見つけたものです。',
+  /** AUD-9c: 候補群の節。 */
+  findingGroupsHeading: '同じ作りの所の候補群',
+  /** AUD-9c: 候補群の読み方（引数は `finding-groups.json` の名前）。 */
+  findingGroupsNote: (name: string): string =>
+    `${name} は、同じ Rule で、同じ要素の目印（selector など。\`groupingKeys\`）を持つ指摘を、1 つの群にまとめたものです。ページやビューポートが違っても、同じ作りの所なら同じ群になります。指摘は、指摘ごとの \`groupId\` で群に結び付きます。群ごとに、影響したページ（\`pageIds\`・\`pageCount\`）、発生の数（\`occurrenceCount\`）、ビューポート、検証の状態の数（\`verification\`）、画像などのファイルを撮影・保存できなかった指摘の数（\`missingEvidenceFindingCount\`）、確信度（\`confidence\`: \`HIGH\`・\`MEDIUM\`・\`LOW\`）があります。要素の作りの印（タグの名前と class の並び。\`structure\`）が分かる指摘は、selector の番号（\`:nth-of-type(2)\` など）を \`n\` にまとめ、作りの印が同じものだけを同じ群にしました。作りの印が分からない指摘は、番号をまとめていないので、番号だけ違う所は別の群です（\`structure\` は \`null\`）。目印のない指摘は、1 件だけの群です。群は重さの順に並び、数や確信度では並べ替えていません。確信度は、指摘の確からしさの目安で、重さ（優先度）ではありません。\`findings-by-rule.json\` の Rule ごとの \`groupCount\`・\`groupIds\` は、その Rule の指摘が入る群です。`,
+  /** AUD-6c: Web Vitals の観測の範囲の読み方。 */
+  webVitalsCoverageNote:
+    '`summary.json` の `webVitalsCoverage` は、性能の指標（LCP・FCP・CLS・TTFB・INP）ごとに、観測できた数（`observed`）、観測できなかった数（`notObserved`）、ブラウザが対応していない数（`unsupported`）、集められなかった数（`notCollected`）です。数える単位は、ページとビューポートごとの性能の記録です。未観測は、良いという意味ではありません。とくに INP は、操作への応答の指標なので、見て回るだけの点検では、ほとんど観測できません。性能の指摘がないことは、観測できた指標が境界を超えなかったことだけを意味します。',
+  /** AUD-8: 色差の「測定できない」の読み方。 */
+  labelInNameNote:
+    '名前の不一致（`A11Y_LABEL_CONTENT_NAME_MISMATCH`）の指摘の `verification.labelInName` は、ブラウザのアクセシビリティの木で求めた名前（`axName`）と、その命名元（`nameSource`）、画面に見える文字のかたまり（`labelSegments`）です。`labelClass` が区分です: `MAIN_LABEL_MISSING`（見える文字が名前にない）、`SUPPLEMENT_ONLY_MISSING`（数のバッジなど、補足の文字だけが名前にない。`supplements`）、`UNDETERMINED`（主な文字を見分けられない）、`LABEL_IN_NAME`（見える文字は名前に含まれる）。`MAIN_LABEL_MISSING` のほかは、候補群の確信度を 1 段下げています。page.json の axe の要素の `nameContext` に、もとの事実があります。',
+  focusChecksNote:
+    '`summary.json` の `focusChecks` は、画面の外に置いた、押せる部品（スキップリンクなど）に、ほかの記録を集め終えた後でキーボードの移動（フォーカス）を当てて確かめた数です。`APPEARS` は画面に正しく出てきたもの（指摘にしていません）、`OUTSIDE_VIEWPORT`・`NOT_VISIBLE`・`NOT_HITTABLE` はフォーカスしても画面の外・見えない・押せないもの（`FOCUSED_CONTROL_HIDDEN` の指摘。フォーカスを当てたままの画像を参照します）、`NOT_FOCUSED` はフォーカスが当たらなかったものです。page.json の `focus` の記録に、要素ごとの矩形と事実があります。',
+  specialSchemeLinksNote:
+    '`summary.json` の `specialSchemeLinks` は、電話（scheme が `tel`）やメール（scheme が `mailto`）など、ふつうの Web ページではないものを開くリンクの数と、リンクごとの事実（ページ・scheme・href・リンクの文字）です。これらは、ふつうの Web リンクとして開いて確かめていません。不具合としては数えていません。',
+  imageRegionNote:
+    '指摘ごとの `imageRegion` は、その指摘を見つけたときと同じ状態（同じ読み込み。幅を変えて調べた指摘は、その幅。落ち着いた後に確かめ直して見つけた指摘は、確かめ直したときの画像）の画面の画像と、画像の上の対象の場所です。`relativePath` が画像のファイル（ZIP に入れなかった画像は `null`）、`stressWidth` が幅を変えて調べた画像の幅、`regions` が対象の矩形（`x`・`y`・`width`・`height`。画像の左上からの px）です。矩形の `role` は、`TARGET` が指摘の要素、`OVERLAY` が覆う部品、`COVERED` が覆われた要素です。`imageScrollPosition` と `regionScrollPosition` は、画像を撮ったときと矩形を読んだときのページの位置で、矩形はその差を直して画像にそろえています。切り出した画像は作っていません。同じ状態の画像がないときは `reason` に理由があります（`EVIDENCE_WITHOUT_STATE`: 状態を記録する前の版の記録。`NO_SCREENSHOT_OF_STATE`: その状態の画像がない）。アクセシビリティの指摘で要素の矩形がないときは、`regionUnavailableReason` に理由があります（`NOT_FOUND`: 要素が見つからなかった、`IN_FRAME`: 枠（iframe）の中の要素、`NO_BOX`: 要素の大きさがない、`NOT_READ`: 読めなかった、`NOT_RECORDED`: 矩形を記録する前の版の記録、`TARGET_NOT_IN_EVIDENCE`: 指摘の要素が記録にない）。'
+    + '部品の重なり・画面に止まって動かない部品の覆い・フォーカスの指摘では、BeakSight が画面を対象の所まで動かして撮り直しています。'
+    + '`targetInImage` は、画像に対象が写ったかです（`INSIDE`: 全部写った、`PARTIAL`: 一部だけ、`OUTSIDE`: 写っていない。ほかの部品の下に隠れた対象も写っていないとします）。'
+    + '`holdReason` があれば、その指摘は確かめを待っています（`TARGET_NOT_IN_IMAGE`: 画像に対象が写っていない、`PAGE_NOT_READY`: 画面の準備が終わっていなかった、'
+    + '`NOT_OPERATED`: 対象の所まで動かして撮れなかった）。フォーカスしても画面に出ない指摘は、写らないこと自体が問題なので、確かめを待つことにはしません。'
+    + '`revealScreenshotEvidenceIds` は、その指摘の対象の所まで動かして撮った画像の記録の番号です。'
+    + '`summary.json` の `evidenceSufficiency` は、確かめを待つ指摘の数（`heldFindingCount`）と理由ごとの数（`heldByReason`）、画像に対象が写ったかを決めた指摘の数'
+    + '（`targetImageJudgedCount`）とそのうち全部写った数（`targetInImageCount`）、まだ見ていないページ（`uncollectedPageCount`）とビューポート'
+    + '（`uncollectedViewportCount`。見ていないページの分も数える）の数です。確かめ直しで消えた指摘の数は `recheck` にあります。',
+  fixedOverlapNote:
+    '画面に止まって動かない部品（固定要素）の重なりは、重なりの中の 5 点（中心と、内側に寄せた四隅）で、いちばん手前の要素を調べて区分しています。`FIXED_ELEMENT_OCCLUSION`・`OVERSIZED_FIXED_ELEMENT` の指摘の `verification.overlap.overlapClass` が区分です: `RENDER_AND_POINTER`（内容を隠し、押すこともできない）、`POINTER_ONLY`（透明だが、押しても下に届かない）、`RENDER_ONLY`（隠すが、押すことはできる）。`renderDetermined` が `false` の指摘は、半透明や文字だけの部品などで、隠れているとまでは言い切れないもので、候補群の確信度を 1 段下げています。`summary.json` の `fixedOverlapsNotCounted` は、指摘にしなかった重なりの数です（`GEOMETRY_ONLY`: 枠が重なるだけで、内容は見えて押せる。`MODAL`: 開いたモーダル。`SCROLL_REVEALABLE`: ページを動かせば見える）。点ごとの事実（いちばん手前の要素・`pointer-events`・不透明度・背景）は、page.json の layout の `hitTest` にあります。区分のない指摘は、点の事実を記録する前の版の記録です。',
+  contrastUnmeasuredNote:
+    '`summary.json` の `contrastUnmeasured` は、文字の色と後ろの色の差を axe が測定できなかった要素の数（`nodeCount`）と、理由（`messageKey`。例: `bgImage` は背景が画像、`bgGradient` は背景がグラデーション、`bgOverlap` は別の要素が重なっている）ごとの数（`byReason`）です。測定できなかった要素は指摘にしていません。差が足りない（閾値未満）とも、足りているとも言えません。page.json の各要素の `checks` に、測った色・比・文字の大きさがあります。',
+  /** AUD-7: 4xx・5xx の応答の区分の読み方。 */
+  httpErrorsNote:
+    '`HTTP_4XX`・`RESOURCE_4XX`・`RESOURCE_5XX` の指摘の `verification.httpError.errorClass` は、応答の区分です: `SITE_FAILURE`（画面に誤りが出た、または回復しなかった）、`COLLECTION_CAUSED`（BeakSight の側の事情の見込み。`beaksightBlockRelation` が `CAUSED`・`POSSIBLE`）、`UNDETERMINED`（手がかりがぶつかって決められない。候補群の確信度を 1 段下げています）。`responses` に応答ごとの事実があります: 要求に資格（Cookie・Authorization）があったか（`credentials`。値は残していません）、同じ読み込みで後に同じ口（メソッド・Origin・path）が 2xx を返したか（`recovered`）、やり直しの結果（`retryStatuses`）、画面の誤りの表示（`errorDisplay`: role=alert・aria-live=assertive・見出し・aria-invalid の欄の近くに、誤りの語があったか）、承認したサービスの応答か（`approvedService`）、本文の要旨（`bodySummary`。許した鍵だけ・200 文字まで。秘密に見える値は残さず `secretLike` の印だけ）。`summary.json` の `httpErrorsNotCounted` は、正常の分岐（`EXPECTED_BRANCH`: 回復して、画面に誤りがない 4xx）として指摘にしなかった応答の数と事実です。',
+  /** AUD-6b: リンクの確かめの読み方。 */
+  linkChecksNote:
+    '`links.json` は、ページのリンクごとの確かめの状態です。`status` が `NAVIGATED`（行き先のページを読んで確かめた。`navigation` に、ビューポートごとの状態の番号・最後の URL・リダイレクトの鎖）、`STATIC_CANDIDATE`（外部のリンク・電話やメールのリンク・書き方が正しくない href。開いて確かめていない）、`UNVERIFIED`（サイトの中のリンクで、行き先を読んでいない。`unverified` に理由と、次に要る手順）のどれかです。`access` は、行き先が開けたか（`OPEN`）、BeakSight が止めたか（`BLOCKED`）、権限がないという応答か（`NO_PERMISSION`）です。`counts` の `unverified` は、リンク切れ（`navigatedBroken`）や確かめたリンクとは別の数です。今ある記録だけで作り、新しく移って確かめてはいません。',
+  /** COV-4 の区切り 3: 操作で開いた状態の監査の読み方。 */
+  openedStatesNote:
+    '見るだけの点検で、押して開いた状態（タブ・折りたたみ・窓など）も、読み込み直さずに点検しました。開いた状態の記録と指摘は、段（`capture.phase`）が `opened-state`、状態の ID（`capture.stateId`）の終わりが `:state-<番号>` で、画像は `…/<viewport>/state-<番号>/viewport.png` です。同じ作りの開いた状態は、点検全体で 1 回だけ点検しました。`summary.json` の `openedStates` は、点検した数（`audited`）、同じ作りを前に点検したので点検しなかった数（`sameStructureSeen`）、途中までの数（`partial`）と、開く前の画面と同じ指摘だったので除いた数（`duplicateFindingsDropped`）です。',
+  /** 設計者の判断 2026-11-11: 同じ口のくり返しをまとめた記録の読み方。 */
+  repeatedReadsNote:
+    '同じ宛先（method・Origin・path）へ、成功した読み取りがくり返されたときは、`page.json` の network の記録に 1 件ずつ並べず、`repeatedReads` にまとめました。最初の 1 件は、今までどおり 1 件の記録として残り（`firstRequestId`）、まとめた記録には、件数（`count`）、最初と最後の時刻、転送量の合計、最初の 1 件といちばん遅かった 1 件の URL と時間の内訳、query の値の違いの数があります。HTTP の誤り（4xx・5xx）・読み込みの失敗・止めた要求は、まとめずに 1 件ずつ残しています。`summary.json` の `repeatedReads` は、まとめた記録の数（`groupCount`）、その中の要求の数（`requestCount`）と、1 件ずつ並べなかった要求の数（`unlistedRequestCount`）です。',
+  /** AUD-6c: 性能の値の観測の範囲の読み方。 */
+  performanceObservationsNote:
+    '`summary.json` の `performanceObservations` は、性能の記録ごとの観測の範囲です。`stage` は測った段、`observedForMs` はページの読み込みの始まりから測った時までの時間（ms）、`operations` は測る前に BeakSight がページにした操作（縦に動かした `scrolled`、通知の枠の閉じるボタンを押した `notificationFramePressed`）です。`inp` が `NOT_OBSERVED` のときは、操作がなかったので INP を観測していません（良いという意味ではありません）。`slowMetrics` は、境界を超えた指標（LCP・FCP・TTFB）です。遅い記録の `breakdown` は時間の内訳で、`waitUntilFirstDataRequestMs` は最初のデータの要求（fetch・XHR）が始まるまでの待ち、`firstDataRequest.communicationMs` はその要求の通信の時間（Resource Timing）です。',
 } as const);
 
-/** OP-F: サイトの画面の「登録・更新を試せる画面」の一覧の見出し（一覧の見出しと、まとめて実行の次にできることの文が使う）。 */
-const WRITE_SCREENS_HEADING_TEXT = '登録・更新を試せる画面';
+/** AUD-6b: 検証できなかった指摘（`verification.status` が `UNVERIFIED`）の、次に要る手順（理由ごと。バンドルにだけ出す）。 */
+export const FINDING_UNVERIFIED_NEXT_STEP_TEXT = deepFreeze({
+  EVIDENCE_NOT_FOUND: '指摘が指す記録がありません。もう一度点検すると、記録をそろえられます。',
+  EVIDENCE_FILE_MISSING: '指摘の画像などのファイルがありません。もう一度点検すると、ファイルをそろえられます。',
+} as const satisfies Record<'EVIDENCE_NOT_FOUND' | 'EVIDENCE_FILE_MISSING', string>);
+
+/** AUD-6b: 確かめていないリンクの、次に要る手順（理由ごと。バンドルの `links.json` にだけ出す）。 */
+export const LINK_CHECK_NEXT_STEP_TEXT = deepFreeze({
+  TARGET_NOT_AUDITED: '行き先のページを、まだ読んでいません。行き先を読む点検で確かめられます。',
+  TARGET_NOT_NAVIGATED: '行き先のページを開けませんでした。行き先を読み直す点検で確かめられます。',
+} as const satisfies Record<'TARGET_NOT_AUDITED' | 'TARGET_NOT_NAVIGATED', string>);
+
 /** FM2d: まとめて実行の、各段のジョブの画面で次にできることを確かめる案内（止めた理由の多くに共通）。 */
 const STAGE_CHAIN_SEE_STAGE_TEXT = '止まったステップの作業の様子を開き、その画面の「次にできること」を確かめてください。';
 /**
@@ -5721,7 +5337,7 @@ export const LOCAL_UI_STAGE_CHAIN_TEXT = deepFreeze({
 
 /**
  * PL-5（設計書 `doc/design/2026-10-26-beaksight-plain-ui-design.md` 3 章の 1、4 章の 5・6、6 章の 6〜8、8 章）: 書き込みのステップの画面（操作さがし、書き込みの
- * 手順の詳細、書き込みを始める、作ったデータの一覧、見るだけの確かめ）の、要点のパネルの文と主のボタンの語。言葉は同じ設計書の 5 章にそろえる。数は
+ * 手順の詳細、作ったデータの一覧、見るだけの確かめ。SPEC-4 で、書き込みを始める画面は外した）の、要点のパネルの文と主のボタンの語。言葉は同じ設計書の 5 章にそろえる。数は
  * `formatCount` の結果を受ける（ここで組み立てない）。
  */
 export const LOCAL_UI_WRITE_STAGE_TEXT = deepFreeze({
@@ -5734,7 +5350,7 @@ export const LOCAL_UI_WRITE_STAGE_TEXT = deepFreeze({
     /** 書き込みを試さないサイトの、見つかった操作の数。 */
     foundReadOnly: (countText: string): string => `操作さがしが終わりました。見つかった操作は ${countText}です。`,
     nextCreate: '次は「書き込みの手順を作る」を押します。まだ何も送りません。',
-    drafted: '書き込みの手順は作ってあります。次は、書き込みの手順を開いて、書き込みの OK を出します。',
+    drafted: `書き込みの手順は作ってあります。試すかどうかは、サイトの画面の「${WRITE_SCREENS_HEADING_TEXT}」でチェックして決めます。`,
     searchAgain: 'もう一度さがす',
     createDrafts: '書き込みの手順を作る',
     openScenarios: '書き込みの手順を見る',
@@ -5742,40 +5358,25 @@ export const LOCAL_UI_WRITE_STAGE_TEXT = deepFreeze({
     /** 画面ごとの見出し（`path` はアドレスの後ろ）。 */
     pageHeading: (path: string): string => `${path} の画面`,
   },
+  // SPEC-4: 詳細の画面は読むだけ（OK と開始のボタンは外した）。試すかは一覧のチェックで決める。
   scenario: {
-    approve: '書き込みの OK',
-    start: '書き込みを始める',
-    /** 主のボタンが「書き込みの OK」のときの、次にすることの文。 */
-    nextApprove: '次は「書き込みの OK」を押して、何をどこへ書き込むかを確かめます。',
-    /** 主のボタンが「書き込みを始める」のときの、次にすることの文。 */
-    nextStart: '次は「書き込みを始める」を押します。',
-    /** 書き込みの OK は出ているが、このサイトでは今は始められないとき。 */
-    cannotStart: 'このサイトでは、今は書き込みを始められません。サイトの画面で、点検のしかたを確かめてください。',
+    /** 次にすることの文（一覧のチェックへの案内）。 */
+    nextCheck: `試すかどうかは、サイトの画面の「${WRITE_SCREENS_HEADING_TEXT}」でチェックして決めます。`,
     /** 9 の (4): フォームの登録で、作ったデータの ID の取り方を決められなかった（書き込みはできるが、書き換えはその登録からはできない）。 */
     recordIdUndetermined: '作ったデータを後で探せないので、この登録で作ったデータの更新は試せません（登録は試せます）。',
-    /** 答え合わせのしかたを決められなかった（書き込みの OK は出せるが、始められない）。 */
-    verificationMissing: '答え合わせのしかたを決められなかったので、書き込みの結果を確かめられません。このままでは書き込みを始められません。',
-    /** 入れる値の決まりに、推せなかった欄がある（詳しい内容で決める）。 */
-    rulesInsufficient: '入れる値を決められない欄があります。下の「詳しい内容」の「入れる値の決まりを開く」で決めてください。',
+    /** 答え合わせのしかたを決められなかった。 */
+    verificationMissing: '書き込んだ後に結果を確かめるしかたが決まらなかったので、この画面は試せません。',
+    /** 推せなかった欄がある。 */
+    rulesInsufficient: 'BeakSight が入れる値を決められない欄があるので、この画面は試せません。',
     /** 9 の (2): 書き換えの答え合わせを、登録の書き込みの手順から写した。 */
     verificationCopied: '答え合わせは登録のときと同じしかたで行います。',
     /** 書き換えの手順の、書き換えるデータがまだないとき。 */
-    noPlannedTarget: '更新するデータがまだありません。先に登録の書き込みをして、答え合わせが合ったデータを作ってください。',
-  },
-  write: {
-    /** 書き込みを始める画面の、何を・どこへ・何件の文の前の 1 行。 */
-    ready: '中身を確かめてから「書き込みを始める」を押してください。押すと、確認の画面が出ます。',
-    /** 今は始められないとき（理由はこの下の行）。 */
-    notReady: 'まだ書き込みを始められません。理由は次のとおりです。',
-    /** 次に始められる時刻（`atText` は `formatDateTime` の結果）。 */
-    waitUntil: (atText: string): string => `${atText}から始められます。`,
+    noPlannedTarget: '更新するデータがまだありません。点検で登録ができたら、その後の点検で更新を試します。',
   },
   ledger: {
     /** 行の数（`countText` は `formatCount` の結果）。 */
     count: (countText: string): string => `BeakSight が作ったデータは ${countText}です。`,
     none: 'BeakSight が作ったデータは、まだありません。',
-    nextUpdate: '次は「更新を試す」を押して、変える欄を選びます。',
-    updateTry: '更新を試す',
     columns: {
       what: '何を作ったか',
       at: 'いつ',
@@ -5793,6 +5394,11 @@ export const LOCAL_UI_WRITE_STAGE_TEXT = deepFreeze({
     optional: 'この画面は、見るだけの点検をしたいときだけ使います。ふだんの書き込みの流れでは開かなくてかまいません。',
   },
 } as const);
+
+/** LU-13: 一覧の行から開く更新が送らずに止まったときの、更新の 1 行の文（`LOCAL_UI_WRITE_SCREENS_TEXT.lastResult.listRowUpdateNotSent` だけが使う）。 */
+const LIST_ROW_UPDATE_NOT_SENT_TEXT = '更新できませんでした。';
+const LIST_ROW_UPDATE_ROW_NOT_FOUND_TEXT = '更新できませんでした（作った行が一覧の最初のページに見つかりませんでした）。';
+const LIST_ROW_UPDATE_OPENER_NOT_FOUND_TEXT = '更新できませんでした（一覧の行の『編集』が見つかりませんでした）。';
 
 /**
  * OP-2（設計書 `2026-10-27-beaksight-one-pass-flow-design.md` 4.1.1 の D7'、4.1.2 の R1〜R3）: サイトの画面の「登録・更新を試せる画面」の一覧（チェックの欄つき）。
@@ -5817,7 +5423,7 @@ export const LOCAL_UI_WRITE_SCREENS_TEXT = deepFreeze({
   states: {
     CHECKED: 'チェックしています',
     CHECKABLE: 'チェックできます',
-    RECHECK_NEEDED: 'サイトの設定が変わったので、チェックが外れました。もう一度チェックしてください。',
+    RECHECK_NEEDED: '前にチェックした後で変わったことがあるので、チェックが外れました。もう一度チェックしてください。',
     NOT_CHECKABLE: 'この画面では試せません',
   },
   /**
@@ -5839,11 +5445,17 @@ export const LOCAL_UI_WRITE_SCREENS_TEXT = deepFreeze({
    * 見つかったが更新する欄を決められないときは、登録だけを試す。
    */
   update: {
-    NEXT_INSPECTION: '更新は、次の点検で試します。',
+    // WSO: 「チェックした画面だけ」の点検は操作さがしをしないので、更新の画面はサイトの全部の画面の点検で見つかる。
+    NEXT_INSPECTION: '更新は、サイトの全部の画面を点検したときに試します。',
     NOT_DECIDABLE: '更新する欄を決められないため、登録だけを試します。',
     /** OP-F（安全のレビューの M-3）: 点検の中で見つかった更新の画面が知らせを送ることがあり、チェックがそれを確かめていない（更新は自動では承認しない）。 */
     MAY_NOTIFY: '更新の画面は、メールや電話への知らせを送ることがあります。もう一度チェックすると、更新も試します。',
   },
+  /**
+   * LU-13 fix round 1（設計書 `2026-11-02-beaksight-list-row-update-design.md` 4.0 の D3、5.6）: 更新の 1 行が `NOT_DECIDABLE` で、同じ表の更新の画面が名前のない
+   * 開き手（アイコンだけ）から開くものだけのときの文（`update.NOT_DECIDABLE` の代わり。状態は足さない）。理由の細部は記録にだけ残る。
+   */
+  updateOpenerUnnamed: 'この画面の更新は自動で扱えません。',
   lastResult: {
     heading: '前の点検の結果',
     created: '登録しました',
@@ -5865,6 +5477,19 @@ export const LOCAL_UI_WRITE_SCREENS_TEXT = deepFreeze({
     notSentReasons: {
       PRECHECK_FAILED: '点検の中で止めたか、送る前の準備が整わなかったため、何も送っていません。',
       PAYLOAD_MISMATCH: '送る直前の確かめで、送る内容が決めたものと違ったため、何も送っていません。',
+    },
+    /**
+     * LU-13（設計書 `2026-11-02-beaksight-list-row-update-design.md` 5.6）: 一覧の行から開く更新が送らずに止まったときの、更新の 1 行（短い 1 文。
+     * `updateNotTriedLast` の代わりに出す）。鍵は送らずに止めた具体的な理由（`PRECHECK_FAILURE_DETAILS` のうち一覧の行の更新のもの）。理由から文への対応は
+     * ここの 1 か所（網羅は `display/write-screen-values.ts` の型）。理由の細部は記録にだけ残る。
+     */
+    listRowUpdateNotSent: {
+      ROW_NOT_UNIQUE: LIST_ROW_UPDATE_ROW_NOT_FOUND_TEXT,
+      OPENER_NOT_FOUND: LIST_ROW_UPDATE_OPENER_NOT_FOUND_TEXT,
+      OPENER_UNNAMED: LIST_ROW_UPDATE_OPENER_NOT_FOUND_TEXT,
+      OPENER_DELETE_LIKE: LIST_ROW_UPDATE_OPENER_NOT_FOUND_TEXT,
+      PRIOR_VALUES_NOT_ACCEPTED: LIST_ROW_UPDATE_NOT_SENT_TEXT,
+      TARGET_RECORD_UNUSABLE: LIST_ROW_UPDATE_NOT_SENT_TEXT,
     },
   },
   saving: '保存しています…',

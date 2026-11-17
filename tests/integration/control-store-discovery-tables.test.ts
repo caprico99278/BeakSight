@@ -9,7 +9,7 @@
 import type { DatabaseSync } from 'node:sqlite';
 import { describe, expect, it } from 'vitest';
 import { candidateShapeDigestsOf, discoverySnapshotOf } from '../../src/control/approval/scenario-facts.js';
-import { MAX_INDEX_SHAPE_DIGESTS, readDiscoveryIndex, recordDiscoveryCandidates } from '../../src/control/job/discovery-index-store.js';
+import { readDiscoveryIndex, recordDiscoveryCandidates } from '../../src/control/job/discovery-index-store.js';
 import { closeControlDatabase, openControlDatabase } from '../../src/control/store/control-database.js';
 import {
   CANDIDATE_CLASSIFICATIONS,
@@ -17,9 +17,7 @@ import {
   FORM_METHODS,
   METHOD_OVERRIDE_VALUES,
 } from '../../src/discovery/candidate-contracts.js';
-import { MAX_DISCOVERY_READ_PAGE_PATHS } from '../../src/discovery/discovery-result.js';
-import { MAX_READ_CHECK_PAGE_PATH_LENGTH, READ_CHECK_RESULTS } from '../../src/discovery/read-check-contracts.js';
-import { MAX_SUBMISSION_PROBE_PRESSES_PER_PAGE } from '../../src/discovery/submission-probe-contracts.js';
+import { READ_CHECK_RESULTS } from '../../src/discovery/read-check-contracts.js';
 import {
   checkListOf,
   columnNamesOf,
@@ -133,6 +131,10 @@ describe('Control store: the discovery and READ check tables', () => {
     insertRow(connection, 'discovery_candidates', candidateRow({
       identity_digest: `sha256:${'c'.repeat(64)}`, classification: 'DISPLAY_ONLY', reason_code: 'NO_KNOWN_ACTION', action_path: null, form_method: null,
     }));
+    // URL-LEN（版 20）: 画面と送信先の path の長さの上限（前は 2,048）はない。
+    insertRow(connection, 'discovery_candidates', candidateRow({
+      identity_digest: `sha256:${'f'.repeat(64)}`, page_path: `/${'p'.repeat(2_049)}`, action_path: `/${'a'.repeat(2_049)}`,
+    }));
     for (const [name, row] of [
       ['the same profile and identity twice', candidateRow()],
       ['a digest of another shape', candidateRow({ identity_digest: 'a'.repeat(64) })],
@@ -152,7 +154,7 @@ describe('Control store: the discovery and READ check tables', () => {
     ] as const) {
       expect(() => insertRow(connection, 'discovery_candidates', row), name).toThrow();
     }
-    expect(countOf(connection, 'discovery_candidates')).toBe(4);
+    expect(countOf(connection, 'discovery_candidates')).toBe(5);
   });
 
   it('accepts READ check definitions and results in the right shape and rejects the rows that break the CHECKs', () => {
@@ -198,6 +200,8 @@ describe('Control store: the discovery and READ check tables', () => {
     const connection = latestConnection();
     insertRow(connection, 'read_checks', readCheckRow({ read_check_id: 'read-page', target_identity_digest: null, target_page_path: '/admin/members', parameters: '{}' }));
     insertRow(connection, 'read_checks', readCheckRow({ read_check_id: 'read-root', target_identity_digest: null, target_page_path: '/', parameters: '{}' }));
+    // URL-LEN（版 20）: 画面の path の長さの上限（前は 1,024）はない。
+    insertRow(connection, 'read_checks', readCheckRow({ read_check_id: 'read-long', target_identity_digest: null, target_page_path: `/${'a'.repeat(1_025)}`, parameters: '{}' }));
     insertRow(connection, 'read_check_results', resultRow({ read_check_id: 'read-page' }));
     for (const [name, row] of [
       ['no target', { target_identity_digest: null }],
@@ -208,7 +212,6 @@ describe('Control store: the discovery and READ check tables', () => {
       ['a page path with a query', { target_identity_digest: null, target_page_path: '/admin?x=1', parameters: '{}' }],
       ['a page path with a fragment', { target_identity_digest: null, target_page_path: '/admin#x', parameters: '{}' }],
       ['a page path with a backslash', { target_identity_digest: null, target_page_path: '/\\x', parameters: '{}' }],
-      ['a page path over the limit', { target_identity_digest: null, target_page_path: `/${'a'.repeat(MAX_READ_CHECK_PAGE_PATH_LENGTH)}`, parameters: '{}' }],
       ['a digest of another shape', { target_identity_digest: 'sha256:x' }],
     ] as const) {
       expect(() => insertRow(connection, 'read_checks', readCheckRow({ read_check_id: 'read-bad', ...row })), name).toThrow();
@@ -229,7 +232,8 @@ describe('Control store: the discovery jobs table', () => {
     const connection = latestConnection();
     expect(tableSqlOf(connection, 'discovery_jobs')).toMatch(/\)\s*STRICT\s*$/u);
     expect(columnNamesOf(connection, 'discovery_jobs')).toEqual(['job_id', 'profile_id', 'recorded_at', 'read_page_paths']);
-    expect(tableSqlOf(connection, 'discovery_jobs')).toContain(`json_array_length(read_page_paths) <= ${MAX_DISCOVERY_READ_PAGE_PATHS}`);
+    // LZ-3a: 読み切れた画面の path の数の上限（前は 10,000）は、版 21 で外した。
+    expect(tableSqlOf(connection, 'discovery_jobs')).not.toContain('json_array_length(read_page_paths)');
     expect(indexNamesOf(connection, 'discovery_jobs')).toEqual(['discovery_jobs_profile_recorded']);
   });
 
@@ -237,6 +241,9 @@ describe('Control store: the discovery jobs table', () => {
     const connection = latestConnection();
     insertRow(connection, 'discovery_jobs', discoveryJobRow());
     insertRow(connection, 'discovery_jobs', discoveryJobRow({ job_id: 'job-2', profile_id: OTHER_PROFILE_ID, read_page_paths: '[]' }));
+    insertRow(connection, 'discovery_jobs', discoveryJobRow({
+      job_id: 'job-many', read_page_paths: JSON.stringify(Array.from({ length: 10_001 }, (_value, index) => `/p/${index}`)),
+    }));
     for (const [name, row] of [
       ['the same job twice', discoveryJobRow()],
       ['the same job for another profile', discoveryJobRow({ profile_id: OTHER_PROFILE_ID })],
@@ -244,12 +251,11 @@ describe('Control store: the discovery jobs table', () => {
       ['a time that is not 14 digits', discoveryJobRow({ job_id: 'job-3', recorded_at: '2026-10-11' })],
       ['read page paths that are not JSON', discoveryJobRow({ job_id: 'job-3', read_page_paths: '[/admin' })],
       ['read page paths that are not an array', discoveryJobRow({ job_id: 'job-3', read_page_paths: '{"a":1}' })],
-      ['too many read page paths', discoveryJobRow({ job_id: 'job-3', read_page_paths: JSON.stringify(Array.from({ length: MAX_DISCOVERY_READ_PAGE_PATHS + 1 }, (_value, index) => `/p/${index}`)) })],
       ['an unknown profile', discoveryJobRow({ job_id: 'job-3', profile_id: 'missing-profile' })],
     ] as const) {
       expect(() => insertRow(connection, 'discovery_jobs', row), name).toThrow();
     }
-    expect(countOf(connection, 'discovery_jobs')).toBe(2);
+    expect(countOf(connection, 'discovery_jobs')).toBe(3);
   });
 });
 
@@ -266,21 +272,22 @@ describe('Control store: the digest lists of the discovery index', () => {
     expect(countOf(connection, 'discovery_candidates')).toBe(2);
   });
 
-  it('limits the shape digests and the key field digests to the presses of one page', () => {
-    // 索引の上限は、1 画面で押す回数の上限（1 つの識別の digest の型は、1 回の発見でそれより多くならない）。
-    expect(MAX_INDEX_SHAPE_DIGESTS).toBe(MAX_SUBMISSION_PROBE_PRESSES_PER_PAGE);
+  it('does not limit the number of the shape digests and the key field digests (COV-1: version 18 drops the limit of version 13)', () => {
     const connection = latestConnection();
     const sql = tableSqlOf(connection, 'discovery_candidates');
-    expect(sql).toContain(`json_array_length(shape_digests) <= ${MAX_INDEX_SHAPE_DIGESTS}`);
-    expect(sql).toContain(`json_array_length(key_field_digests) <= ${MAX_INDEX_SHAPE_DIGESTS}`);
+    expect(sql).not.toContain('json_array_length(shape_digests)');
+    expect(sql).not.toContain('json_array_length(key_field_digests)');
   });
 
-  it('accepts a JSON array within the limit, and rejects a broken JSON, an object and a too long array', () => {
+  it('accepts a JSON array of any length, and rejects a broken JSON and an object', () => {
     const connection = latestConnection();
     const display = { classification: 'DISPLAY_ONLY', reason_code: 'NO_KNOWN_ACTION', action_path: null, form_method: null } as const;
     insertRow(connection, 'discovery_candidates', candidateRow({ ...display, shape_digests: JSON.stringify([SHAPE_A, SHAPE_B]) }));
     insertRow(connection, 'discovery_candidates', candidateRow({ ...display, identity_digest: OTHER_DIGEST, shape_digests: '[]' }));
-    for (const [index, value] of ['[', '{}', '"x"', JSON.stringify(Array.from({ length: MAX_INDEX_SHAPE_DIGESTS + 1 }, () => SHAPE_A))].entries()) {
+    // COV-1: 前の上限（3）を超える長さも受ける。
+    insertRow(connection, 'discovery_candidates', candidateRow({ ...display, identity_digest: `sha256:${'9'.repeat(64)}`,
+      shape_digests: JSON.stringify(Array.from({ length: 4 }, () => SHAPE_A)), key_field_digests: JSON.stringify(Array.from({ length: 4 }, () => SHAPE_A)) }));
+    for (const [index, value] of ['[', '{}', '"x"'].entries()) {
       expect(() => insertRow(connection, 'discovery_candidates', candidateRow({ ...display, identity_digest: `sha256:${String(index).repeat(64)}`, shape_digests: value })), value)
         .toThrow();
       // T38R-fix の I-1: 鍵と欄の対応の digest の一覧の列も同じ CHECK。

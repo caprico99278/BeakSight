@@ -2,8 +2,9 @@
 <html lang="en">
   <head><meta charset="utf-8"><title>Fixture Missing Candidate</title></head>
   <body>
-    <button type="button">Remove candidate</button>
+    <button type="button">Detach candidate</button>
     <script>
+      // SD-1: ボタンの名前に削除の語を書かない（削除の語のボタンは押す前の判定で押さないので、押した後に消える要素の確かめにならない）。
       document.querySelector('button').addEventListener('click', (event) => {
         event.currentTarget.remove();
       });

@@ -145,12 +145,21 @@ describe('execution grants (T28d): G28', () => {
     expect(readWriteReservations(database, 'scenario-1')).toEqual([]);
   });
 
-  it('rejects the issue after a revocation, after the approval expired, and for a retired or passive profile', () => {
+  // L12b（設計書 `2026-11-09-beaksight-remove-limits-design.md` 6.2。S16）: 承認の有効期間を撤廃した（前は期限の後に `EXPIRED`）。期限の後も発行できる。
+  it('rejects the issue after a revocation and for a retired or passive profile, and issues after the former approval expiry (L12b)', () => {
     const scenario = prepareScenario(database, latest, 'scenario-1');
     expect(revokeScenarioApproval(database, { scenarioId: 'scenario-1', expectedRevision: scenario.revision, receiptId: 'revoke-1', at: ISSUED_AT }).ok).toBe(true);
     expect(invalidityOf(issue({ at: LATER_AT }))).toEqual(['REVOKED']);
     prepareScenario(database, latest, 'scenario-2');
-    expect(invalidityOf(issue({ at: AFTER_APPROVAL_TTL }, 'scenario-2'))).toEqual(['EXPIRED']);
+    const afterTtl = issue({ grantId: 'grant-ttl', jobId: 'job-ttl', at: AFTER_APPROVAL_TTL }, 'scenario-2');
+    expect(afterTtl.ok).toBe(true);
+    if (afterTtl.ok) {
+      expect(consumeExecutionGrant(database, consumptionOf(afterTtl, { at: AFTER_APPROVAL_TTL })).ok).toBe(true);
+      settleWriteForTest(database, {
+        grantId: afterTtl.grant.grantId, jobId: afterTtl.grant.jobId, reservationId: afterTtl.grant.reservation.reservationId, to: 'COMMITTED',
+        at: AFTER_APPROVAL_TTL,
+      });
+    }
     expect(updateProfile(database, { profile: testAuthProfile(GRANT_PROFILE_ID, MIN_PROFILE_REVISION + 1), expectedRevision: MIN_PROFILE_REVISION },
       { resolveContext: resolveTestContext }).ok).toBe(true);
     expect(invalidityOf(issue({}, 'scenario-2'))).toEqual(['PROFILE_REVISION_CHANGED', 'MODE_NOT_WRITE']);
@@ -171,13 +180,12 @@ describe('execution grants (T28d): G28', () => {
     expect(reasonOf(consumeExecutionGrant(database, consumptionOf(issued, { at: LATER_AT })))).toBe('GRANT_ALREADY_CONSUMED');
   });
 
-  it('rejects an expired grant, invalidates it and releases its reservation, and a new grant can then be issued', () => {
+  // L12b（設計書 6.2。S16）: 許可はジョブの中の予約として残し、期限（前は 5 分で `GRANT_EXPIRED`）を外した。前の期限の後でも消費できる。
+  it('consumes a grant after the former grant expiry (no grant expiry within the job) (L12b)', () => {
     prepareScenario(database, latest, 'scenario-1');
     const issued = issue();
-    expect(reasonOf(consumeExecutionGrant(database, consumptionOf(issued, { at: GRANT_EXPIRES_AT })))).toBe('GRANT_EXPIRED');
-    expect(readExecutionGrant(database, 'grant-1')).toMatchObject({ consumedAt: null, invalidatedAt: GRANT_EXPIRES_AT, reservation: { state: 'RELEASED' } });
-    expect(reasonOf(consumeExecutionGrant(database, consumptionOf(issued, { at: LATER_AT })))).toBe('GRANT_INVALIDATED');
-    expect(issue({ grantId: 'grant-2', jobId: 'job-w2', at: LATER_AT }).ok).toBe(true);
+    expect(consumeExecutionGrant(database, consumptionOf(issued, { at: GRANT_EXPIRES_AT })).ok).toBe(true);
+    expect(readExecutionGrant(database, 'grant-1')).toMatchObject({ consumedAt: GRANT_EXPIRES_AT, invalidatedAt: null, reservation: { state: 'RESERVED' } });
   });
 
   it('lets an expired open grant not block the next issue (it is invalidated in the same transaction)', () => {
@@ -262,19 +270,21 @@ describe('execution grants (T28R-fix-1): the recheck, the clock and the used cou
 });
 
 describe('execution grants (T28d): reservations', () => {
-  it('rejects a count above the per-run limit', () => {
+  // 1 つのジョブが送るのは承認した 1 回（予約の件数は 1。管理データでも縛る）。L12b（設計書 6.2。S14）: 累積の件数の上限（前は `GRANT_CUMULATIVE_LIMIT_REACHED`）
+  // は撤廃した。
+  it('rejects a count above one write of a job', () => {
     prepareScenario(database, latest, 'scenario-1');
     expect(reasonOf(issue({ count: 2 }))).toBe('GRANT_RUN_LIMIT_EXCEEDED');
   });
 
-  it('stops at the cumulative limit, counts UNKNOWN, and does not count RELEASED', () => {
+  it('does not stop at the former cumulative limit, and keeps the reservation states (L12b)', () => {
     prepareScenario(database, latest, 'scenario-1', { limits: { maxCreatesPerRun: 1, maxCumulativeCreates: 3 } });
     expect(writeOnce(1, 'COMMITTED').ok).toBe(true);
     expect(writeOnce(2, 'RELEASED').ok).toBe(true);
     expect(writeOnce(3, 'UNKNOWN').ok).toBe(true);
     expect(writeOnce(4, 'COMMITTED').ok).toBe(true);
-    expect(reasonOf(writeOnce(5))).toBe('GRANT_CUMULATIVE_LIMIT_REACHED');
-    expect(readWriteReservations(database, 'scenario-1').map(({ state }) => state)).toEqual(['COMMITTED', 'RELEASED', 'UNKNOWN', 'COMMITTED']);
+    expect(writeOnce(5, 'COMMITTED').ok).toBe(true);
+    expect(readWriteReservations(database, 'scenario-1').map(({ state }) => state)).toEqual(['COMMITTED', 'RELEASED', 'UNKNOWN', 'COMMITTED', 'COMMITTED']);
   });
 
   it('keeps one write at a time across scenarios (an open grant or a consumed grant whose reservation is not settled)', () => {

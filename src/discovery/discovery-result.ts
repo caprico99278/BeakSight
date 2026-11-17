@@ -16,7 +16,7 @@
 //   届かなかった画面の印（`SERVICE_READ_REFUSED`。読み切れなかった画面に数える）。READ の確かめの成果物（`read-check-evaluation.ts`）も、詳しい理由の
 //   一覧と数の比べ方をここから使う。成果物の版を 1.1 に上げた。
 import type { AuditSendPolicyName } from '../core/audit-send-policy.js';
-import { SESSION_KEY_LOST_DETAIL, type JobSafetyViolation, type RunAuthenticationSummary, type RunStatus } from '../core/contracts.js';
+import { SESSION_LOST_DETAILS, type JobSafetyViolation, type RunAuthenticationSummary, type RunStatus } from '../core/contracts.js';
 import type { SessionLossEvidence } from '../core/evidence-types.js';
 import { deriveRunStatus } from '../core/status.js';
 import { isSecretLikeText } from '../core/secret-like-text.js';
@@ -51,12 +51,18 @@ export type DiscoveryArtifactSchemaVersion = (typeof DISCOVERY_ARTIFACT_READABLE
  * ジョブの終わり方の詳しい理由（T37a。閉じた一覧。発見と READ の確かめの成果物の任意の項目 `endReasonDetail`）。
  * - `session-key`: ログインの状態の鍵がなくなったことで、セッションの切れとみなした（終わり方は `AUTH_SESSION_LOST`。値の owner は
  *   `src/core/contracts.ts` の `SESSION_KEY_LOST_DETAIL`。Run の理由の `detail` と同じ値）。セッションの切れの path による切れは、この項目を持たない。
+ * - `SERVICE_UNAUTHORIZED`（DEF-233）: 承認したサービスの Origin から 401 を受け、その画面が描けなかったことで、セッションの切れとみなした（終わり方は
+ *   `AUTH_SESSION_LOST`。値の owner は `src/core/contracts.ts` の `SERVICE_UNAUTHORIZED_DETAIL`）。
+ * 一覧はセッションの切れの詳しい理由の一覧（`SESSION_LOST_DETAILS`）そのもの。
  */
-export const JOB_END_REASON_DETAILS = Object.freeze([SESSION_KEY_LOST_DETAIL] as const);
+export const JOB_END_REASON_DETAILS = SESSION_LOST_DETAILS;
 export type JobEndReasonDetail = (typeof JOB_END_REASON_DETAILS)[number];
 
 /** サービスの読み取りが届かなかった画面の理由（T37a。`INCOMPLETE_REASONS` の 1 つ）。 */
 export const SERVICE_READ_REFUSED_REASON = 'SERVICE_READ_REFUSED' satisfies IncompleteReason;
+
+/** fix round 4（通知の枠の設計書 3.2.3 の 3）: 閉じる押下か隠しの押す期間に、移動かポップアップを止めた画面の理由（`INCOMPLETE_REASONS` の 1 つ）。 */
+export const NOTIFICATION_DISMISSAL_NAVIGATION_BLOCKED_REASON = 'NOTIFICATION_DISMISSAL_NAVIGATION_BLOCKED' satisfies IncompleteReason;
 
 /** DEF-129: ページが始めた main frame の読み込みを上限で止めた画面の理由（`INCOMPLETE_REASONS` の 1 つ）。 */
 export const PAGE_NAVIGATION_LIMIT_REASON = 'INCOMPLETE_PAGE_NAVIGATION_LIMIT' satisfies IncompleteReason;
@@ -65,15 +71,12 @@ export const PAGE_NAVIGATION_LIMIT_REASON = 'INCOMPLETE_PAGE_NAVIGATION_LIMIT' s
 export const PAGE_SUBRESOURCE_LIMIT_REASON = 'INCOMPLETE_PAGE_SUBRESOURCE_LIMIT' satisfies IncompleteReason;
 
 /**
- * DEF-129・DEF-130-fix: Guard が上限で止めた読み込みの事実（`src/safety/passive-request-guard.ts` の `PageLoadFacts` の一部）から、画面の不完全の
- * 理由（発見と、READ の確かめの候補の読み取りが共有する唯一の写し方）。
+ * DEF-129: Guard が上限で止めた読み込みの事実（`src/safety/passive-request-guard.ts` の `PageLoadFacts` の一部）から、画面の不完全の
+ * 理由（発見と、READ の確かめの候補の読み取りが共有する唯一の写し方）。SPEC-1: 文書でない要求の上限（DEF-130-fix）は L10 で撤廃したので、理由は
+ * 前の記録にだけある（`PAGE_SUBRESOURCE_LIMIT_REASON`）。
  */
-export const pageLoadIncompleteReasonsOf = (facts: { readonly limitReached: boolean; readonly subresourceLimitReached: boolean }): readonly IncompleteReason[] => {
-  const reasons: IncompleteReason[] = [];
-  if (facts.limitReached) reasons.push(PAGE_NAVIGATION_LIMIT_REASON);
-  if (facts.subresourceLimitReached) reasons.push(PAGE_SUBRESOURCE_LIMIT_REASON);
-  return Object.freeze(reasons);
-};
+export const pageLoadIncompleteReasonsOf = (facts: { readonly limitReached: boolean }): readonly IncompleteReason[] =>
+  Object.freeze(facts.limitReached ? [PAGE_NAVIGATION_LIMIT_REASON] : []);
 
 /** 同じ識別の digest で中身の違う候補を 1 件にまとめたときの理由のコード（分類は `DISPLAY_ONLY`）。 */
 export const DUPLICATE_IDENTITY_CONFLICT_REASON = 'DUPLICATE_IDENTITY_CONFLICT' satisfies CandidateReasonCode;
@@ -112,6 +115,10 @@ export type DiscoveryEndReason = (typeof DISCOVERY_END_REASONS)[number];
  * - `NAVIGATION_FAILED`: 読み込みが失敗した（Context と page を作れなかった場合を含む）。
  * - `HTTP_ERROR_STATUS`（DEF-136）: 画面の文書の応答が 4xx・5xx（サイトの不調の 4 つの状態を除く）だった。候補もリンクも拾わない。
  * - ほかは、巡回の終わり方（`DISCOVERY_END_REASONS` の同じ名前）で、残った画面を読まなかった。DEF-136: `SITE_UNAVAILABLE` は、不調で捨てた画面にも付く。
+ * - `SAME_TEMPLATE_PAGE_READ`（DEF-208-4。設計書 `2026-11-05-beaksight-discovery-coverage-design.md` 3.8 の F）: 同じ型（`pageTemplatePathOf`）の画面を、操作さがしで
+ *   すでに読んだ（同じ型は最初の 1 つだけ読む。設定どおり読まなかった）。
+ * - `REBUILD_FAILED`（COV-2c fix round 5。SREV-COV 4 回目の I-2）: 続きから始めた後、押下から生まれた画面に行くための前の画面（伏せた URL の祖先）を、押下を
+ *   押し直して作り直せなかった（凍結の外では読まないので、読まなかった）。
  */
 export const DISCOVERY_UNREAD_REASONS = Object.freeze([
   'EXCLUDED',
@@ -126,6 +133,8 @@ export const DISCOVERY_UNREAD_REASONS = Object.freeze([
   'SITE_UNAVAILABLE',
   'SAFETY_VIOLATION',
   'PREFLIGHT_FAILED',
+  'SAME_TEMPLATE_PAGE_READ',
+  'REBUILD_FAILED',
 ] as const);
 export type DiscoveryUnreadReason = (typeof DISCOVERY_UNREAD_REASONS)[number];
 
@@ -133,14 +142,7 @@ export type DiscoveryUnreadReason = (typeof DISCOVERY_UNREAD_REASONS)[number];
 export const DISCOVERY_PAGE_STATES = Object.freeze(['READ', 'NOT_READ'] as const);
 export type DiscoveryPageState = (typeof DISCOVERY_PAGE_STATES)[number];
 
-/** 成果物に書く、読まなかった画面の最大の件数（超えた分は `omittedUnreadPages` に件数だけ持つ）。 */
-export const MAX_DISCOVERY_UNREAD_PAGE_ENTRIES = 1_000;
-
-/**
- * 索引の更新に渡す、読んだ画面の path の最大の件数（管理データの版 5 の `discovery_jobs.read_page_paths` の上限と同じ）。超えた分は渡さない
- * （その画面の候補は `MISSING` ではなく `NOT_REVISITED` になる。消えたと言い過ぎない向き）。
- */
-export const MAX_DISCOVERY_READ_PAGE_PATHS = 10_000;
+// LZ-3a: 索引の更新に渡す、読んだ画面の path の数の上限（前は `MAX_DISCOVERY_READ_PAGE_PATHS` 10,000）は撤廃した（管理データの版 21 で CHECK も外した）。
 
 /**
  * 候補が消えたと言えない画面の、読み切れなかった理由（落ち着きの時間切れ、凍結の条件、読み取りの失敗、上限）。この理由のある画面は、読んだ画面の
@@ -158,10 +160,12 @@ const UNRELIABLE_INCOMPLETE_REASONS: ReadonlySet<IncompleteReason> = new Set<Inc
   // DEF-130-fix: ページが出す文書でない要求を上限で止めた画面（画面がデータを描き切れなかったかもしれない）。
   PAGE_SUBRESOURCE_LIMIT_REASON,
   SERVICE_READ_REFUSED_REASON,
+  // fix round 4: 閉じる押下の押す期間に移動を止めた画面（誤りの画面を読んだおそれがある）。
+  NOTIFICATION_DISMISSAL_NAVIGATION_BLOCKED_REASON,
 ]);
 
 /** Run Status を `COMPLETE` のままにする、読まなかった理由（設定どおりに読まなかった）。 */
-const EXPECTED_UNREAD_REASONS: ReadonlySet<DiscoveryUnreadReason> = new Set<DiscoveryUnreadReason>(['EXCLUDED']);
+const EXPECTED_UNREAD_REASONS: ReadonlySet<DiscoveryUnreadReason> = new Set<DiscoveryUnreadReason>(['EXCLUDED', 'SAME_TEMPLATE_PAGE_READ']);
 
 /** 1 画面分の記録（発見の入口 `src/discovery/discover-page.ts` の `discoverPageCandidates` が返す形。CC-070 (a)）。 */
 export interface DiscoveryReadPageRecord {
@@ -176,6 +180,32 @@ export interface DiscoveryReadPageRecord {
    * 読めた画面だけが持つ。前の書き手の成果物にはない（任意の項目。版は変えない）。
    */
   readonly screenName?: DiscoveryScreenName;
+  /**
+   * COV-3（網羅の設計書 3.2 の 1・3.3）: 操作さがしが選択肢を 1 つずつ選んだ欄（select・radio の組）ごとの記録（選んだ順。読み込み直した段の分を足す）。
+   * 選択肢がない画面と、前の書き手の成果物にはない（任意の項目。版は変えない）。
+   */
+  readonly optionChoices?: readonly DiscoveryOptionChoiceRecord[];
+}
+
+/** COV-3: 選択肢を選んだ欄の種類（select か、名前の同じ radio の組）。 */
+export const DISCOVERY_OPTION_FIELD_KINDS = Object.freeze(['SELECT', 'RADIO'] as const);
+export type DiscoveryOptionFieldKind = (typeof DISCOVERY_OPTION_FIELD_KINDS)[number];
+
+/**
+ * COV-3: 選択肢を選んだ欄の 1 つの記録（値と表示の文字は持たない）。
+ * - `stage`: 選んだ状態の段の番号（1 から。押す部品の段の番号と同じ数え方）。
+ * - `field`: 欄の見分け（種類、`name`（なければ null）、同じ種類と `name` の欄の中の文書の順の番号）。
+ * - `optionCount`: 欄の選択肢の数。`chosenCount`: 選んだ選択肢の数（選べない選択肢は選ばない）。
+ * - `unchangedCount`: 選んでも、画面の構造の鍵が変わらなかった選択肢の数。
+ * - `changed`: 構造の鍵が変わった選択肢（選択肢の順番、値と表示の文字の digest、新しい段にしたか。まだ見ていない構造の鍵の段だけを新しい段にする）。
+ */
+export interface DiscoveryOptionChoiceRecord {
+  readonly stage: number;
+  readonly field: { readonly kind: DiscoveryOptionFieldKind; readonly name: string | null; readonly ordinal: number };
+  readonly optionCount: number;
+  readonly chosenCount: number;
+  readonly unchangedCount: number;
+  readonly changed: readonly { readonly optionIndex: number; readonly optionDigest: string; readonly newStage: boolean }[];
 }
 
 /** OP-2 の修正の 1 回目（判断 2）: 画面の名前の長さの上限（文字の数）。 */
@@ -209,6 +239,21 @@ export const discoveryPageScreenNameOf = (document: DiscoveryDocument | null, pa
   return page.record.screenName?.heading ?? page.record.screenName?.title ?? null;
 };
 
+/**
+ * DEF-208-1: 操作さがしの凍結の後に Guard が通した読み取りの数。
+ * - `passed`: 通した読み取り（文書でない要求と子の frame の文書）の数。
+ * - `carryingMarker`: そのうち、押下の観察の間に、欄に入れた値（目印）を URL に運んだものの数（設計者の判断 (a)）。
+ */
+export interface DiscoveryFrozenReadCounts {
+  readonly passed: number;
+  readonly carryingMarker: number;
+  /**
+   * DEF-233（設計書 `2026-11-09-beaksight-discovery-token-refresh-design.md` 2.1 の 3）: 同じ Context で、凍結の後に Guard が通したサイトの token の更新の数（読み取りの
+   * 数 `passed` には入れない。値と URL は持たない）。今の書き手は必ず書く。前の書き手の成果物にはない。
+   */
+  readonly tokenRefreshes?: number;
+}
+
 /** 成果物の画面 1 件（巡回の URL は、ArtifactWriter が書くときに伏せ字を通す）。 */
 export type DiscoveryPageEntry =
   | {
@@ -218,14 +263,17 @@ export type DiscoveryPageEntry =
     /** その画面の Context で、Guard が止めて記録した要求の数（ページ自身が出した送信。発見の操作とは別に数える）。 */
     readonly blockedRequests: number;
     /**
-     * DEF-129: その画面の Context で、Guard が通した（サーバへ送った）main frame の文書の要求の数（BeakSight 自身の読み込み、リダイレクトの続き、ページが
-     * 始めた読み込みを含む）。今の書き手は必ず書く。前の書き手の成果物にはない。
+     * DEF-129・T37R2-fix・DEF-130-fix: その画面の Context で、Guard が通した main frame の文書・子の frame の文書・文書でない要求の数。SPEC-1 で書くのを
+     * やめた（どの表示も読まなかった）。前の書き手の成果物を読むために型だけ残す。
      */
     readonly documentRequests?: number;
-    /** T37R2-fix: 同じ Context で、Guard が通した子の frame の文書の要求の数（別の数）。今の書き手は必ず書く。前の書き手の成果物にはない。 */
     readonly childFrameDocumentRequests?: number;
-    /** DEF-130-fix: 同じ Context で、Guard が通した文書でない要求の数（別の数）。今の書き手は必ず書く。前の書き手の成果物にはない。 */
     readonly subresourceRequests?: number;
+    /**
+     * DEF-208-1（設計書 `2026-11-05-beaksight-discovery-coverage-design.md` 3.1）: 同じ Context で、操作さがしの凍結の後に Guard が通した読み取りの数（値と URL は
+     * 持たない）。今の書き手は必ず書く。前の書き手の成果物にはない。
+     */
+    readonly frozenReadRequests?: DiscoveryFrozenReadCounts;
     /**
      * DEF-144（設計書 `2026-10-20-beaksight-probe-external-scheme-design.md` 2.2）: probe の押下で外部スキームへの移動の違反が起きた画面の、違反の中身（起きた順。
      * 読み込み直しの前と後で 2 件まで）。発見は止めずに続けた。なければ持たない。
@@ -250,12 +298,20 @@ export interface DiscoveryDocument {
   readonly finishedAt: string;
   readonly runStatus: RunStatus;
   readonly endReason: DiscoveryEndReason;
-  /** 設定の `crawl.maxPages`。 */
-  readonly maxPages: number;
+  /** 設定の `crawl.maxPages`（先に読む画面の数を足した値）。L14 の後の段: 指定がなければ持たない（上限なし）。 */
+  readonly maxPages?: number;
   /** 画面（読んだ画面は読んだ順、読まなかった画面はその後に見つけた順）。 */
   readonly pages: readonly DiscoveryPageEntry[];
-  /** `MAX_DISCOVERY_UNREAD_PAGE_ENTRIES` を超えて書かなかった、読まなかった画面の件数。 */
+  /**
+   * 前は、読まなかった画面の件数の上限（1,000）を超えて書かなかった件数。COV-2（L7 の N34）で上限を撤廃したので、今の書き手は常に 0。成果物の schema
+   * （`discovery.schema.json`）が求める項目で、前の成果物を読むために残す（LZ-1: 版の決まりがないため、消さない）。
+   */
   readonly omittedUnreadPages: number;
+  /**
+   * COV-2c の M-1（設計者の判断）: 凍結の中でだけ読む状態の祖先を、最初から凍結した Context で読めず（描けない・作り直せない・お知らせの枠を閉じる押下が止められた）、
+   * 凍結の外で読み込む形に戻した回数（1 回以上のときだけ持つ）。
+   */
+  readonly frozenStartFallbacks?: number;
   /** 終わり方の詳しい理由（T37a。鍵の消失によるセッションの切れのときだけ。ほかは持たない）。 */
   readonly endReasonDetail?: JobEndReasonDetail;
   /** 監査の段の数（T37a。`run.json` の `authentication` と同じ形。認証の指定に監査の段の口があるジョブだけ。数だけで、URL・値を持たない）。 */
@@ -279,6 +335,11 @@ export interface DiscoveryDocument {
    * 書く。前の書き手の成果物にはない。
    */
   readonly pressLimitProbes?: DiscoveryPressLimitProbes;
+  /**
+   * SFIX-1104（SREV-1104 の M-3）: ログインし直した続きで、伏せた印（`[REDACTED]`）を含む URL を、その形のまま読んだ画面の数（状態の保存の URL は伏せて
+   * あるので、秘密の query の値は元に戻らない）。0 のときは持たない（今の文書の形を変えない。前の書き手の成果物にもない）。
+   */
+  readonly resumedRedactedUrlPages?: number;
 }
 
 /** T44c: 押す数の上限で押せなかった、登録・更新の語の候補の数。 */
@@ -395,6 +456,8 @@ export const withIncompleteReason = (record: DiscoveryReadPageRecord, reason: In
   }))),
   // OP-K（K1）: 画面の名前は写す（前は落としていた）。
   ...(record.screenName === undefined ? {} : { screenName: record.screenName }),
+  // COV-3: 選択肢を選んだ欄の記録も写す。
+  ...(record.optionChoices === undefined ? {} : { optionChoices: record.optionChoices }),
 });
 
 /**
@@ -519,7 +582,7 @@ export const isDiscoveryPageReadInFull = (record: DiscoveryReadPageRecord): reco
   record.location !== null && !record.incompleteReasons.some((reason) => UNRELIABLE_INCOMPLETE_REASONS.has(reason));
 
 /**
- * 候補が消えたと言える、読み切れた画面の path（重複なし、UTF-16 のコード単位の順。上限 `MAX_DISCOVERY_READ_PAGE_PATHS`）。読んだ画面のうち、
+ * 候補が消えたと言える、読み切れた画面の path（重複なし、UTF-16 のコード単位の順。数の上限はない）。読んだ画面のうち、
  * 読み切れたもの（`isDiscoveryPageReadInFull`）だけ。索引の更新は、ここにある path の候補で今回ないものを `MISSING`、ほかの今回ない候補を
  * `NOT_REVISITED` にする。
  */
@@ -530,7 +593,7 @@ export const discoveryReadPagePaths = (document: Pick<DiscoveryDocument, 'pages'
       paths.add(record.location.path);
     }
   }
-  return Object.freeze([...paths].sort(compareCodeUnits).slice(0, MAX_DISCOVERY_READ_PAGE_PATHS));
+  return Object.freeze([...paths].sort(compareCodeUnits));
 };
 
 /** 件数の要約（読んだ画面、読まなかった画面（書かなかった分を含む）、候補（まとめる前））。 */

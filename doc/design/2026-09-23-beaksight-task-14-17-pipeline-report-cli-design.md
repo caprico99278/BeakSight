@@ -520,6 +520,7 @@ run.json に、次の環境の事実を記録する（設計書 18.1）。
   - User-Agent は、ビューポートごとに Guard の付いた Passive Context で `about:blank` を開き、`navigator.userAgent` を読む。
   - `toolVersion` は、BeakSight の `package.json` から取る。
 - `runId` は、開始の時刻（UTC）から作る。形は `RUN-YYYYMMDDHHmmss` である（スキーマの `^RUN-[0-9]{6,}$` に合う）。時計は注入する。
+- 2026-11-17 の追補（DEF-281）: 同じ出力先に同じ秒の Run のディレクトリがすでにあれば、2 桁の連番（01〜99）を足した名前（例 `RUN-YYYYMMDDHHmmss01`）を順に試して作る（`createRunArtifactDirectoryForStart`）。並びは時刻の順を保つ。99 まですべてあれば、今どおり作れないとして終える。再開の Run は今の ID を使う。
 
 #### 5.6.8 fixture
 

@@ -20,6 +20,9 @@ export { closeLocalUiStore, prepareLocalUiStore, type LocalUiStorePreparation } 
 export { runningLocalUiAuditJobCount, shutdownLocalUiAuditJobs } from './audit-jobs';
 // T26e（Task 26 の設計書 4.1 の「起動のとき」）: 資格情報のフォルダの一時のファイルの片付けと、暗号化の確かめ（待ち受けの前に 1 回）。
 export { prepareLocalUiCredentials } from './credential-runtime';
+// RB-7: テストの起動の入口（`apps/local-ui/tests/helpers/ui-test-launcher.ts`）だけが、待ち受けの前に別のデータの根とワーカーの入口を入れる。本番の
+// 起動の部品（`launcher/serve.ts`）は呼ばない（Gate `local-ui-runtime-boundary`）。
+export { installLocalUiRuntime } from './local-ui-runtime';
 
 const ACTIVE_JOB_STATES: ReadonlySet<AuditJobState> = new Set(ACTIVE_AUDIT_JOB_STATES);
 

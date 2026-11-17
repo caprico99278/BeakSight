@@ -88,7 +88,10 @@ import { Notice } from './Notice';
  */
 export type TargetSource = ProfileTargetChoice;
 
-/** MI-1: 使い方の 2 択（ログインして読む（テスト環境）・公開の画面だけ）。 */
+/**
+ * MI-1: 使い方の 2 択（テスト用のサイト・公開しているサイト）。NL-3: ログインの有無は聞かない（テスト用のサイトは、手でログインする方式で作り、下調べで
+ * ログインの画面が見つからず、このパソコンで動かすサイトなら、BeakSight がログインしない方式で保存し直す。ジョブの管理の `#saveEntryCheckProposal`）。
+ */
 export type ProfileUsage = 'TEST_AUTH' | 'PUBLIC';
 
 /** 使い方の順（画面の選択肢の順。先頭が既定）。 */
@@ -148,18 +151,18 @@ const FIELD_OF_ERROR_CODE: Readonly<Record<ProfileValidationErrorCode, FieldName
   PROFILE_SERVICE_ORIGIN_INSIDE_TARGET: 'approvedServiceOrigins',
   // PL-F 修正の 1 回目: 確かめた記録の参照が秘密に見える。
   ISOLATION_REFERENCE_SECRET_LIKE: 'environmentEvidenceRef',
+  // NL-1: ログインのないテスト用のサイトは、loopback の Origin だけ（テスト用のサイトのアドレスの欄に出す）。
+  PROFILE_NO_LOGIN_REQUIRES_LOOPBACK: 'approvedTestOrigins',
 });
 
 /** T43b: 開始の URL と許可 Origin の欄の誤りが指す欄。 */
 const FIELD_OF_SITE_PROBLEM: Readonly<Record<TargetSiteProblem, 'startUrl' | 'allowedOrigins'>> = Object.freeze({
   START_URL_REQUIRED: 'startUrl',
   START_URL_INVALID: 'startUrl',
-  START_URL_TOO_LONG: 'startUrl',
   START_URL_HAS_CREDENTIALS: 'startUrl',
   START_URL_HAS_FRAGMENT: 'startUrl',
   ALLOWED_ORIGINS_REQUIRED: 'allowedOrigins',
   ALLOWED_ORIGIN_INVALID: 'allowedOrigins',
-  ALLOWED_ORIGINS_TOO_MANY: 'allowedOrigins',
   ALLOWED_ORIGINS_MISSING_START: 'allowedOrigins',
 });
 
@@ -256,7 +259,7 @@ export const profileDocumentOf = (values: ProfileFormValues, revision: number): 
     environmentEvidenceRef: evidence.length === 0 ? null : evidence,
     ...(serviceOrigins.length === 0 ? {} : { approvedServiceOrigins: serviceOrigins }),
     // OP-1: 「毎回手でログインする」は、ログインの設定を使うモードで入れたときだけ項目にする（外せば省く。省けば自動ログイン）。
-    ...(values.manualLoginEveryTime && requiresAuthSetup(values.mode) ? { loginPreference: MANUAL_EVERY_TIME_LOGIN_PREFERENCE } : {}),
+    ...(values.manualLoginEveryTime && requiresAuthSetup(values.mode, values.auth) ? { loginPreference: MANUAL_EVERY_TIME_LOGIN_PREFERENCE } : {}),
   };
 };
 
@@ -632,7 +635,8 @@ export function ProfileForm({ kind, initialValues, targetConfigCandidates, onSav
       }}
     >
       {(field) => (
-        <FieldFrame label={text.profileId} hint={text.profileIdHint} errors={[...clientErrorsOf(field.state.meta.errors), ...serverErrorsOf('profileId')]}>
+        // DN-1: 編集のときは、見分けの印を画面に出す名前と取り違えないラベルにする（作成のときは今のまま）。
+        <FieldFrame label={creating ? text.profileId : text.profileIdFixed} hint={text.profileIdHint} errors={[...clientErrorsOf(field.state.meta.errors), ...serverErrorsOf('profileId')]}>
           {({ id, describedBy, invalid }) => (
             <input
               id={id}
@@ -733,11 +737,14 @@ export function ProfileForm({ kind, initialValues, targetConfigCandidates, onSav
               </select>
             )}
           </FieldFrame>
-          {requiresAuthSetup(field.state.value) ? (
-            <Notice kind="caution">
-              <p data-testid="profile-auth-setup-notice">{LOCAL_UI_AUTH_TEXT.profileFormNotice}</p>
-            </Notice>
-          ) : null}
+          {/* NL-3（NL-1 の申し送り）: 認証の方式を購読して決める（方式だけを変えたときも、注意書きが今の値に合う）。 */}
+          <form.Subscribe selector={(state) => requiresAuthSetup(state.values.mode, state.values.auth)}>
+            {(shown) => (shown ? (
+              <Notice kind="caution">
+                <p data-testid="profile-auth-setup-notice">{LOCAL_UI_AUTH_TEXT.profileFormNotice}</p>
+              </Notice>
+            ) : null)}
+          </form.Subscribe>
         </>
       )}
     </form.Field>
@@ -846,7 +853,7 @@ export function ProfileForm({ kind, initialValues, targetConfigCandidates, onSav
 
   /** OP-1（D5）: 編集の「毎回手でログインする」の切り替え（ログインの設定を使うモードだけ）。 */
   const manualLoginEveryTimeField = (
-    <form.Subscribe selector={(state) => requiresAuthSetup(state.values.mode)}>
+    <form.Subscribe selector={(state) => requiresAuthSetup(state.values.mode, state.values.auth)}>
       {(shown) => (shown ? (
         <form.Field name="manualLoginEveryTime">
           {(field) => (
@@ -872,7 +879,7 @@ export function ProfileForm({ kind, initialValues, targetConfigCandidates, onSav
   );
 
   const saveButton: ReactNode = (
-    <form.Subscribe selector={(state) => [state.isSubmitting, requiresAuthSetup(state.values.mode)] as const}>
+    <form.Subscribe selector={(state) => [state.isSubmitting, requiresAuthSetup(state.values.mode, state.values.auth)] as const}>
       {([isSubmitting, logsIn]) => (
         <div className="field">
           <div className="button-row">

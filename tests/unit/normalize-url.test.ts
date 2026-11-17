@@ -1,6 +1,5 @@
 import { describe, expect, it } from 'vitest';
 import { URL_REJECTION_REASONS } from '../../src/core/evidence-types.js';
-import { MAX_URL_LENGTH } from '../../src/core/limits.js';
 import { classifyUrl } from '../../src/crawl/admission-policy.js';
 import {
   LOOPBACK_HOSTNAMES,
@@ -106,37 +105,31 @@ describe('normalizeUrl', () => {
     });
   });
 
-  it('accepts a normalized URL of exactly MAX_URL_LENGTH code units', () => {
+  // L14（INV-LIMITS の表 A の N23）: 長さでは拒まない（前は 2,048 を超えたら `URL_TOO_LONG`）。
+  it('accepts a URL whose normalized form is longer than the former limit', () => {
     const origin = 'https://example.test';
-    const path = `/${'a'.repeat(MAX_URL_LENGTH - origin.length - 1)}`;
+    const path = `/${'a'.repeat(2_048 - origin.length)}`;
 
     expect(normalizeUrl(path, `${origin}/`, new Set())).toEqual({ ok: true, url: `${origin}${path}` });
   });
 
-  it('does not accept a URL whose normalized form is longer than MAX_URL_LENGTH', () => {
-    const origin = 'https://example.test';
-    const path = `/${'a'.repeat(MAX_URL_LENGTH - origin.length)}`;
+  it('accepts a short relative URL with a long base', () => {
+    const base = `https://example.test/${'b'.repeat(2_048)}/`;
 
-    expect(normalizeUrl(path, `${origin}/`, new Set())).toEqual({ ok: false, rawUrl: path, reason: 'URL_TOO_LONG' });
+    expect(normalizeUrl('next', base, new Set())).toEqual({ ok: true, url: `${base}next` });
   });
 
-  it('measures the length after normalization, so a short relative URL with a long base is not accepted', () => {
-    const base = `https://example.test/${'b'.repeat(MAX_URL_LENGTH)}/`;
-
-    expect(normalizeUrl('next', base, new Set())).toEqual({ ok: false, rawUrl: 'next', reason: 'URL_TOO_LONG' });
-  });
-
-  it('uses only the closed rejection reason codes', () => {
+  it('uses only the closed rejection reason codes, and no longer uses URL_TOO_LONG', () => {
     const rejections = [
       normalizeUrl('mailto:help@example.test', 'https://example.test/', new Set()),
       normalizeUrl('http://[::1', 'https://example.test/', new Set()),
       normalizeUrl('https://user@example.test/', 'https://example.test/', new Set()),
-      normalizeUrl(`/${'a'.repeat(MAX_URL_LENGTH)}`, 'https://example.test/', new Set()),
     ];
 
     const reasons = rejections.map((result) => (result.ok ? null : result.reason));
-    expect(reasons).toEqual(['UNSUPPORTED_SCHEME', 'INVALID_URL', 'CREDENTIALS_NOT_ALLOWED', 'URL_TOO_LONG']);
-    expect(new Set(reasons)).toEqual(new Set(URL_REJECTION_REASONS));
+    expect(reasons).toEqual(['UNSUPPORTED_SCHEME', 'INVALID_URL', 'CREDENTIALS_NOT_ALLOWED']);
+    // `URL_TOO_LONG` は、前の記録の読み方のために一覧に残す（片付けは LZ）。
+    expect(new Set([...reasons, 'URL_TOO_LONG'])).toEqual(new Set(URL_REJECTION_REASONS));
   });
 });
 

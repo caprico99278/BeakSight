@@ -1,8 +1,12 @@
-import { isNonNegativeSafeInteger, isPositiveSafeInteger, isRecord } from '../core/guards.js';
+import { isNonNegativeSafeInteger, isRecord } from '../core/guards.js';
 import { saturatingIncrement } from '../core/saturating-count.js';
 import { LOAD_PEAK_WINDOW_MS } from './load-meter.js';
 
 /**
+ * L11（設計書 `2026-11-09-beaksight-remove-limits-design.md` 4。ユーザーの判断「要求の上限…は基本方針に反する。削除以外は全て通せ」）: 上限は撤廃した。
+ * この部品は、承認したサービスの Origin への要求を数えるだけで、断らない（`tryConsume` はいつも真）・待たせない（`waitBeforeNextLoadMs` はいつも 0）・上限に
+ * 届いたと言わない（`snapshot().limitReached` はいつも偽）。LZ-3c: 上限の値（前の `perMinute`・`perRun`）は受けず、`isLimitReached` は捨てた。下の説明は撤廃の前のもの。
+ *
  * 承認したサービスの Origin への要求の上限を数える部品（T35b。Task 35 の設計書 3.4。この意味の owner）。実行ごとに 1 つを作り（T35c）、factory の指定
  * （`BrowserContextFactoryOptions.serviceRequestBudget`）で、どの役割の Context の Guard にも渡す（T35R-fix の C-1。幅の走査と Interaction の Context は
  * サービスの Origin へ送らないが、数える側にも置いて守りを重ねる。T44b: 送信の扱い `PASS_EXCEPT_DELETE` の幅の走査は送り、ここで数える）。Guard は、承認した
@@ -23,8 +27,7 @@ export interface ServiceRequestBudget {
   tryConsume(): boolean;
   /** DEF-141: 次の読み込みを始める前に待つ時間（ms。0 以上 `LOAD_PEAK_WINDOW_MS` 以下の整数。待たなくてよければ 0）。 */
   waitBeforeNextLoadMs(): number;
-  /** 上限に届いたか。 */
-  isLimitReached(): boolean;
+  // LZ-3c: 上限に届いたか（前の `isLimitReached`。いつも偽）は、呼ぶ側の分岐と一緒に捨てた。
   /** 数えた要求の数、断った要求の数、上限に届いたか（JSON にできる、凍結した値）。 */
   snapshot(): ServiceRequestBudgetSnapshot;
   /**
@@ -40,12 +43,8 @@ export interface ServiceRequestBudgetSnapshot {
   readonly limitReached: boolean;
 }
 
-/** `createServiceRequestBudget` の入力。 */
+/** `createServiceRequestBudget` の入力（LZ-3c: 上限の値 `perMinute`・`perRun` は受けない）。 */
 export interface ServiceRequestBudgetOptions {
-  /** 直近の 1 分あたりの上限（1 以上の安全な整数）。 */
-  readonly perMinute: number;
-  /** 1 回の Run あたりの上限（1 以上の安全な整数。T35R-fix: 再開をまたいで数える）。 */
-  readonly perRun: number;
   /** 前の実行までに数えた要求の数（0 以上の安全な整数。省略は 0。T35R-fix）。 */
   readonly initialAdmitted?: number;
   /** 現在の時刻（エポックからの ms。0 以上の安全な整数）。 */
@@ -75,27 +74,19 @@ const carriedWindowTimesOf = (value: unknown): number[] => {
   return times;
 };
 
-/** `ServiceRequestBudget` を作る。上限が 1 以上の安全な整数でなければ `RangeError`、入力の形が違えば `TypeError`。 */
+/** `ServiceRequestBudget` を作る。入力の形が違えば `TypeError`、数や時刻が範囲の外なら `RangeError`。 */
 export function createServiceRequestBudget(options: ServiceRequestBudgetOptions): ServiceRequestBudget {
   if (!isRecord(options) || typeof options.now !== 'function') {
-    throw new TypeError('ServiceRequestBudget requires limits and a current time function');
+    throw new TypeError('ServiceRequestBudget requires a current time function');
   }
-  const { perMinute, perRun, now } = options;
-  if (!isPositiveSafeInteger(perMinute) || !isPositiveSafeInteger(perRun)) {
-    throw new RangeError('ServiceRequestBudget limits must be positive safe integers');
-  }
+  const { now } = options;
   const initialAdmitted = options.initialAdmitted ?? 0;
   if (!isNonNegativeSafeInteger(initialAdmitted)) {
     throw new RangeError('ServiceRequestBudget initial admitted count must be a non-negative safe integer');
   }
-  /**
-   * 直近の 1 分に数えた要求の時刻（古い順。この実行の分だけ）。待つ時間に要るのは新しい方から `perMinute` 件だけなので、それより古いものは捨てる
-   * （持つ数は `perMinute` 以下）。
-   */
-  // FM2d: 持ち越した窓は、新しい方から `perMinute` 件だけ持つ（持つ数の決まりは同じ）。最後の時刻は、時計が戻ったときの基準にする。
-  const windowTimesMs: number[] = carriedWindowTimesOf(options.initialWindowTimesMs).slice(-perMinute);
+  // 直近の 1 分に数えた要求の時刻（古い順。持ち越した窓を含む）。最後の時刻は、時計が戻ったときの基準にする。
+  const windowTimesMs: number[] = carriedWindowTimesOf(options.initialWindowTimesMs);
   let admitted = initialAdmitted;
-  let refused = 0;
   let lastTimeMs: number | null = windowTimesMs.length === 0 ? null : (windowTimesMs[windowTimesMs.length - 1] ?? null);
 
   /** 今の時刻（戻る前の最後の時刻より前には戻さない）を記録して返し、窓を出た時刻を捨てる。 */
@@ -112,31 +103,20 @@ export function createServiceRequestBudget(options: ServiceRequestBudgetOptions)
     return nowMs;
   };
 
+  // L11（設計書 `2026-11-09-beaksight-remove-limits-design.md` 4）: 上限は使わない（LZ-3c: 値も受けない）。数えるだけで、断らず、待たせず、上限に届いたとも
+  // 言わない（記録の形は今のまま。`refused` は 0、`limitReached` は偽）。窓は直近 1 分の全部の時刻を持つ（持ち越しの記録）。
   return Object.freeze({
     tryConsume(): boolean {
-      const nowMs = advanceWindow();
-      if (admitted >= perRun) {
-        refused = saturatingIncrement(refused);
-        return false;
-      }
-      windowTimesMs.push(nowMs);
-      if (windowTimesMs.length > perMinute) {
-        windowTimesMs.shift();
-      }
-      admitted += 1;
+      windowTimesMs.push(advanceWindow());
+      admitted = saturatingIncrement(admitted);
       return true;
     },
     waitBeforeNextLoadMs(): number {
-      const nowMs = advanceWindow();
-      const oldest = windowTimesMs[0];
-      // 持つ数は `perMinute` 以下なので、`perMinute` 件あれば、最も古いもの（新しい方から `perMinute` 番目）が窓を出るまで待つ。
-      return windowTimesMs.length < perMinute || oldest === undefined ? 0 : oldest + LOAD_PEAK_WINDOW_MS - nowMs;
-    },
-    isLimitReached(): boolean {
-      return refused > 0 || admitted >= perRun;
+      advanceWindow();
+      return 0;
     },
     snapshot(): ServiceRequestBudgetSnapshot {
-      return Object.freeze({ admitted, refused, limitReached: refused > 0 || admitted >= perRun });
+      return Object.freeze({ admitted, refused: 0, limitReached: false });
     },
     windowTimesMs(): readonly number[] {
       advanceWindow();

@@ -616,3 +616,70 @@ describe('NavigationPacer.recordDocumentRequestSent (DEF-100 fix)', () => {
     expect(sleeps).toEqual([INTERVAL_MS - 1_000]);
   });
 });
+
+describe('NavigationPacer.waitUntilNextNavigationDue (DEF-236)', () => {
+  it('waits for the rest of the interval without recording a navigation, and adds the wait to the total', async () => {
+    const time = new FakeTime();
+    const pacer = pacerWith(time);
+    await time.settle(pacer.beforeNavigation());
+    time.advance(1_200);
+
+    await expect(time.settle(pacer.waitUntilNextNavigationDue())).resolves.toBe(3_800);
+
+    expect(time.sleeps).toEqual([3_800]);
+    expect(pacer.snapshot()).toEqual({ navigationCount: 1, totalWaitMs: 3_800, lastNavigationStartedAtMs: START_MS });
+  });
+
+  it('lets the next navigation start without waiting after the wait', async () => {
+    const time = new FakeTime();
+    const pacer = pacerWith(time);
+    await time.settle(pacer.beforeNavigation());
+    time.advance(1_000);
+    await time.settle(pacer.waitUntilNextNavigationDue());
+
+    await expect(time.settle(pacer.beforeNavigation())).resolves.toBe(0);
+
+    expect(time.sleeps).toEqual([4_000]);
+    expect(pacer.snapshot()).toEqual({ navigationCount: 2, totalWaitMs: 4_000, lastNavigationStartedAtMs: START_MS + INTERVAL_MS });
+  });
+
+  it('does not wait before the first navigation, nor when the interval has passed or is 0', async () => {
+    const time = new FakeTime();
+    const pacer = pacerWith(time);
+    await expect(time.settle(pacer.waitUntilNextNavigationDue())).resolves.toBe(0);
+    await time.settle(pacer.beforeNavigation());
+    time.advance(INTERVAL_MS);
+    await expect(time.settle(pacer.waitUntilNextNavigationDue())).resolves.toBe(0);
+    const zero = pacerWith(time, 0);
+    await time.settle(zero.beforeNavigation());
+    await expect(time.settle(zero.waitUntilNextNavigationDue())).resolves.toBe(0);
+
+    expect(time.sleeps).toEqual([]);
+    expect(pacer.snapshot()).toEqual({ navigationCount: 1, totalWaitMs: 0, lastNavigationStartedAtMs: START_MS });
+  });
+
+  it('waits again from a document request sent during the wait, before the next navigation', async () => {
+    const time = new FakeTime();
+    const pacer = pacerWith(time);
+    await time.settle(pacer.beforeNavigation());
+    await time.settle(pacer.waitUntilNextNavigationDue());
+    // 待ちの後に、画面が自分で文書を読み込んだ（送った時刻）。次の読み込みは、そこから間隔を空ける。
+    time.advance(500);
+    pacer.recordDocumentRequestSent();
+
+    await expect(time.settle(pacer.beforeNavigation())).resolves.toBe(INTERVAL_MS);
+    expect(pacer.snapshot().totalWaitMs).toBe(INTERVAL_MS * 2);
+  });
+
+  it('keeps the order with the navigations (one chain)', async () => {
+    const time = new FakeTime();
+    const pacer = pacerWith(time);
+    await time.settle(pacer.beforeNavigation());
+    const due = pacer.waitUntilNextNavigationDue();
+    const next = pacer.beforeNavigation();
+
+    await expect(time.settle(due)).resolves.toBe(INTERVAL_MS);
+    await expect(time.settle(next)).resolves.toBe(0);
+    expect(pacer.snapshot()).toEqual({ navigationCount: 2, totalWaitMs: INTERVAL_MS, lastNavigationStartedAtMs: START_MS + INTERVAL_MS });
+  });
+});

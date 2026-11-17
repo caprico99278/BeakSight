@@ -48,7 +48,6 @@ import { navigationIntervalFloorMsOf, validateConfig } from '../../../../src/con
 import { inspectRealArtifactEntry } from '../../../../src/core/contained-artifact-file.js';
 import { errorCodeOf } from '../../../../src/core/errors.js';
 import { isNonNegativeSafeInteger, isPositiveSafeInteger, isRecord } from '../../../../src/core/guards.js';
-import { MAX_CRAWL_MAX_PAGES } from '../../../../src/core/limits.js';
 import { temporaryPathFor } from '../../../../src/core/temporary-file-name.js';
 import { ENVIRONMENT_KINDS, type EnvironmentKind, type ProfileValidationErrorCode } from '../../../../src/control/contracts.js';
 import { TEST_ORIGIN_MODES, environmentAcceptsEvidence } from '../../../../src/control/profile-combinations.js';
@@ -229,10 +228,11 @@ const validatedTargetConfigOf = (document: Record<string, unknown>, validate: Co
   return validation.ok ? validation.value : undefined;
 };
 
-const crawlLimitsOf = (config: AuditConfig): TargetCrawlLimits => ({
-  maxPages: config.crawl.maxPages,
-  maxRuntimeMs: config.crawl.maxRuntimeMs,
-  minNavigationIntervalMs: config.crawl.minNavigationIntervalMs,
+/** 負荷の値（L14 の後の段: ページの上限と時間の上限は、指定したときだけ持つ）。 */
+const crawlLimitsOf = (limits: Pick<AuditConfig['crawl'], TargetCrawlLimitField> | TargetCrawlLimits): TargetCrawlLimits => ({
+  ...(limits.maxPages === undefined ? {} : { maxPages: limits.maxPages }),
+  ...(limits.maxRuntimeMs === undefined ? {} : { maxRuntimeMs: limits.maxRuntimeMs }),
+  minNavigationIntervalMs: limits.minNavigationIntervalMs,
 });
 
 /** 今の負荷の値を読んだ結果。 */
@@ -254,7 +254,7 @@ export const readTargetCrawlLimits = (content: string, validate: ConfigValidator
   if (config === undefined) {
     return { ok: false };
   }
-  return { ok: true, limits: crawlLimitsOf(config), minNavigationIntervalFloorMs: navigationIntervalFloorMsOf(config.site), targetConfig: config };
+  return { ok: true, limits: crawlLimitsOf(config.crawl), minNavigationIntervalFloorMs: navigationIntervalFloorMsOf(config.site), targetConfig: config };
 };
 
 /** 欄の値の誤り。 */
@@ -263,15 +263,15 @@ export interface TargetCrawlLimitProblem {
   readonly code: TargetCrawlLimitProblemCode;
 }
 
-/** 欄の値の確かめ（`validateConfig` と同じ範囲。間隔の下限は `floorMs`。T44R の M-3: ページの上限の上限は `MAX_CRAWL_MAX_PAGES`）。 */
+/**
+ * 欄の値の確かめ（`validateConfig` と同じ範囲。間隔の下限は `floorMs`。LZ-3a: ページの上限の上限はない）。L14 の後の段: ページの上限と
+ * 時間の上限は、ない（指定なし）ときは確かめない。
+ */
 const crawlLimitProblemsOf = (limits: TargetCrawlLimits, floorMs: number): readonly TargetCrawlLimitProblem[] =>
   TARGET_CRAWL_LIMIT_FIELDS.flatMap((field): TargetCrawlLimitProblem[] => {
     const value = limits[field];
     if (field !== 'minNavigationIntervalMs') {
-      if (!isPositiveSafeInteger(value)) {
-        return [{ field, code: 'NOT_POSITIVE_INTEGER' }];
-      }
-      return field === 'maxPages' && value > MAX_CRAWL_MAX_PAGES ? [{ field, code: 'ABOVE_MAX_PAGES' }] : [];
+      return value === undefined || isPositiveSafeInteger(value) ? [] : [{ field, code: 'NOT_POSITIVE_INTEGER' }];
     }
     if (!isNonNegativeSafeInteger(value)) {
       return [{ field, code: 'NOT_NON_NEGATIVE_INTEGER' }];
@@ -307,20 +307,22 @@ export const prepareTargetCrawlLimitsChange = (
   if (document === undefined || current === undefined) {
     return { ok: false, reason: 'TARGET_CONFIG_INVALID', problems: [] };
   }
-  const after: TargetCrawlLimits = {
-    maxPages: limits.maxPages,
-    maxRuntimeMs: limits.maxRuntimeMs,
-    minNavigationIntervalMs: limits.minNavigationIntervalMs,
-  };
+  const after = crawlLimitsOf(limits);
   const problems = crawlLimitProblemsOf(after, navigationIntervalFloorMsOf(current.site));
   if (problems.length > 0) {
     return { ok: false, reason: 'CRAWL_LIMITS_INVALID', problems };
   }
-  const before = crawlLimitsOf(current);
+  const before = crawlLimitsOf(current.crawl);
   if (TARGET_CRAWL_LIMIT_FIELDS.every((field) => before[field] === after[field])) {
     return { ok: false, reason: 'CRAWL_LIMITS_UNCHANGED', problems: [] };
   }
-  const currentCrawl = isRecord(document['crawl']) ? document['crawl'] : {};
+  // L14 の後の段: 指定なしにした項目は、ファイルから除く（ほかの項目は変えない）。
+  const currentCrawl: Record<string, unknown> = { ...(isRecord(document['crawl']) ? document['crawl'] : {}) };
+  for (const field of TARGET_CRAWL_LIMIT_FIELDS) {
+    if (!Object.hasOwn(after, field)) {
+      delete currentCrawl[field];
+    }
+  }
   const changed = { ...document, crawl: { ...currentCrawl, ...after } };
   const targetConfig = validatedTargetConfigOf(changed, validate);
   if (targetConfig === undefined) {

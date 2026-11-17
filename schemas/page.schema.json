@@ -15,7 +15,8 @@
   "properties": {
     "schemaVersion": {
       "description": "BN-a (BeakSight block noise design 3.1, item 5): page-schema/1.1 has the marks of the BeakSight blocks (the phase and resource type of the stopped events, the requests stopped while closing, the network failure marks, and the load of each safety evidence). LG-4: a page.json of page-schema/1.0 (without the marks) and a checkpoint holding one are no longer read.",
-      "enum": ["page-schema/1.1"]
+      "enum": ["page-schema/1.1", "page-schema/2.0"],
+      "$comment": "REC-3: page-schema/2.0 is the form on the disk (page.json and the result of a checkpoint page): the layout and accessibility Evidence repeat less (layoutEvidenceRecord, accessibilityRuleRecord, factoredList, sameAsRef, recheckBase). page-schema/1.1 is the form in memory. A checkpoint page of the earlier version is not read."
     },
     "pageId": { "type": "string", "pattern": "^PAGE-[0-9]{6,}$" },
     "pageUrl": { "type": "string", "minLength": 1 },
@@ -65,6 +66,141 @@
           "description": "Optional (DEF-130-fix): the requests other than documents (images, fetch, xhr and so on) that the Guard sent in the context of the viewport (a separate count).",
           "type": "integer",
           "minimum": 0
+        },
+        "stateId": {
+          "description": "Optional (AUD-2a): the state ID of the load of the viewport (<pageId>:<viewport>:<attempt>). The Evidence of the load has the same value in capture.stateId.",
+          "$ref": "#/$defs/evidenceStateId"
+        },
+        "settling": {
+          "description": "Optional (AUD-2a): the result of the settling (page-settling with the progress watch). Absent when the settling stage did not start.",
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["status", "reason", "elapsedMs", "observationCount", "lastScrollHeight", "watchEnd"],
+          "properties": {
+            "status": { "enum": ["SETTLED", "PARTIAL", "NOT_COMPLETED"] },
+            "reason": { "type": ["string", "null"] },
+            "elapsedMs": { "type": "number", "minimum": 0 },
+            "observationCount": { "type": "integer", "minimum": 0 },
+            "lastScrollHeight": { "type": ["number", "null"] },
+            "watchEnd": { "enum": ["STAGE_UNRESPONSIVE", "STAGE_NEVER_QUIET", "RUN_TIME_LIMIT", null] },
+            "loadPhases": {
+              "description": "Optional (AUD-2b): the transitions of the load phase (only when it changed; the first is AFTER_DOM_CONTENT_LOADED).",
+              "type": "array",
+              "items": {
+                "type": "object",
+                "additionalProperties": false,
+                "required": ["phase", "at"],
+                "properties": {
+                  "phase": { "enum": ["AFTER_DOM_CONTENT_LOADED", "LOADING", "AFTER_DATA", "SETTLED"] },
+                  "at": { "type": "string", "minLength": 1 }
+                }
+              }
+            }
+          }
+        },
+        "recheck": {
+          "description": "Optional (AUD-2d): the recheck after the page settled (no reload). The marks of the findings (by fingerprint) and of the headings: PERSISTENT, INITIAL_ONLY or LATE.",
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["status", "reason", "stateId", "startedAt", "finishedAt", "settling", "axeRuleIds", "findings", "headings"],
+          "properties": {
+            "status": { "enum": ["RECHECKED", "NOT_RECHECKED"] },
+            "reason": { "enum": ["FIRST_PASS_NOT_COMPLETED", "STAGE_NOT_COMPLETED", null] },
+            "stateId": { "$ref": "#/$defs/evidenceStateId" },
+            "startedAt": { "type": "string", "minLength": 1 },
+            "finishedAt": { "type": "string", "minLength": 1 },
+            "settling": {
+              "anyOf": [{ "type": "null" }, { "$ref": "#/$defs/viewportAuditResult/properties/settling" }]
+            },
+            "axeRuleIds": { "type": "array", "items": { "type": "string" } },
+            "findings": {
+              "type": "array",
+              "items": {
+                "type": "object",
+                "additionalProperties": false,
+                "required": ["fingerprint", "ruleId", "state"],
+                "properties": {
+                  "fingerprint": { "type": "string", "minLength": 1 },
+                  "ruleId": { "type": "string", "minLength": 1 },
+                  "state": { "enum": ["PERSISTENT", "INITIAL_ONLY", "LATE"] }
+                }
+              }
+            },
+            "headings": {
+              "type": "array",
+              "items": {
+                "type": "object",
+                "additionalProperties": false,
+                "required": ["level", "text", "state"],
+                "properties": {
+                  "level": { "type": "integer", "minimum": 1 },
+                  "text": { "type": "string" },
+                  "state": { "enum": ["PERSISTENT", "INITIAL_ONLY", "LATE"] }
+                }
+              }
+            },
+            "pageReady": {
+              "description": "Optional (EV-3): whether the page was ready (no visible loading indicator) when the recheck read it again. Only when RECHECKED.",
+              "type": "boolean"
+            }
+          }
+        },
+        "notificationHandling": {
+          "description": "Optional (AUD-2a): the handling of the notification frames of the main load (the dismissed and hidden counts and the digests of the frames). Absent when the stage did not start.",
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["dismissedCount", "hiddenCount", "digests"],
+          "properties": {
+            "dismissedCount": { "type": "integer", "minimum": 0 },
+            "hiddenCount": { "type": "integer", "minimum": 0 },
+            "digests": { "type": "array", "items": { "type": "string" } }
+          }
+        }
+      }
+    },
+    "evidenceStateId": { "type": "string", "pattern": "^PAGE-[0-9]{6,}:(desktop|mobile):[1-9][0-9]*(:state-[1-9][0-9]*)?$" },
+    "evidenceCapture": {
+      "description": "AUD-2a: the state and the time of the collection of one Evidence (the phase is a page audit stage).",
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["stateId", "phase", "startedAt", "finishedAt", "url", "scrollPosition"],
+      "properties": {
+        "stateId": { "$ref": "#/$defs/evidenceStateId" },
+        "phase": {
+          "enum": [
+            "navigation",
+            "settling",
+            "scroll",
+            "dom",
+            "layout",
+            "stress-layout",
+            "color",
+            "accessibility",
+            "performance",
+            "screenshot",
+            "recheck",
+            "focus-check",
+            "links",
+            "interaction-discovery",
+            "interaction",
+            "opened-state",
+            "safety",
+            "rules"
+          ]
+        },
+        "startedAt": { "type": "string", "minLength": 1 },
+        "finishedAt": { "type": "string", "minLength": 1 },
+        "url": { "type": ["string", "null"] },
+        "scrollPosition": {
+          "anyOf": [
+            { "type": "null" },
+            {
+              "type": "object",
+              "additionalProperties": false,
+              "required": ["x", "y"],
+              "properties": { "x": { "type": "number" }, "y": { "type": "number" } }
+            }
+          ]
         }
       }
     },
@@ -88,13 +224,23 @@
             "screenshot",
             "scroll",
             "metadata",
-            "safety"
+            "safety",
+            "focus"
           ]
         },
         "pageId": { "type": "string", "pattern": "^PAGE-[0-9]{6,}$" },
         "viewport": { "enum": ["desktop", "mobile", null] },
         "observedAt": { "type": "string", "minLength": 1 },
-        "payload": true
+        "payload": true,
+        "capture": {
+          "description": "Optional (AUD-2a): the state and the time of the collection. Absent on the Evidence of an older run and on the Evidence that does not belong to a viewport load.",
+          "$ref": "#/$defs/evidenceCapture"
+        },
+        "recheckBase": {
+          "description": "Optional (REC-3, the form on the disk): the ID of the first Evidence that the rechecked layout or accessibility Evidence refers to with sameAs.",
+          "type": "string",
+          "pattern": "^EV-(LAYOUT|A11Y)-[0-9]{6,}$"
+        }
       },
       "oneOf": [
         {
@@ -187,8 +333,97 @@
             "type": { "const": "safety" },
             "payload": { "$ref": "#/$defs/safetyEventsEvidence" }
           }
+        },
+        {
+          "properties": {
+            "evidenceId": { "type": "string", "pattern": "^EV-FOCUS-[0-9]{6,}$" },
+            "type": { "const": "focus" },
+            "payload": { "$ref": "#/$defs/focusCheckEvidence" }
+          }
         }
       ]
+    },
+    "focusCheckEvidence": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["status", "viewportWidth", "viewportHeight", "scrollPosition", "items"],
+      "properties": {
+        "status": { "enum": ["COMPLETE", "PARTIAL"] },
+        "viewportWidth": { "type": "number", "minimum": 0 },
+        "viewportHeight": { "type": "number", "minimum": 0 },
+        "scrollPosition": { "$ref": "#/$defs/scrollPosition" },
+        "stressWidth": { "type": "integer", "minimum": 1 },
+        "scrollableRegions": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["targetSelectors", "outcome", "keys", "region", "scroll", "screenshotEvidenceId"],
+            "properties": {
+              "targetSelectors": { "$ref": "#/$defs/accessibilityRule/properties/nodes/items/properties/targetSelectors" },
+              "outcome": { "enum": ["REACHED_AND_MOVED", "REACHED_NOT_MOVED", "NOT_REACHED", "NOT_TRIED", "KEY_TRIGGERED_NAVIGATION"] },
+              "keys": { "type": "array", "items": { "type": "string" } },
+              "region": {
+                "oneOf": [
+                  { "type": "null" },
+                  { "$ref": "#/$defs/focusCheckEvidence/properties/items/items/properties/scroll/properties/ancestors/items" }
+                ]
+              },
+              "scroll": {
+                "oneOf": [{ "type": "null" }, { "$ref": "#/$defs/focusCheckEvidence/properties/items/items/properties/scroll" }]
+              },
+              "screenshotEvidenceId": { "type": ["string", "null"], "pattern": "^EV-SHOT-[0-9]{6,}$" }
+            }
+          }
+        },
+        "items": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["selector", "tagName", "beforeRect", "focused", "afterRect", "visibleAfterFocus", "hitAfterFocus", "screenshotEvidenceId"],
+            "properties": {
+              "selector": { "type": "string" },
+              "tagName": { "type": "string" },
+              "beforeRect": { "$ref": "#/$defs/rectangle" },
+              "focused": { "type": "boolean" },
+              "afterRect": { "oneOf": [{ "type": "null" }, { "$ref": "#/$defs/rectangle" }] },
+              "visibleAfterFocus": { "type": "boolean" },
+              "hitAfterFocus": { "type": "boolean" },
+              "screenshotEvidenceId": { "type": ["string", "null"], "pattern": "^EV-SHOT-[0-9]{6,}$" },
+              "operation": { "enum": ["DIRECT_FOCUS"] },
+              "hitTestPointCount": { "type": "integer", "minimum": 0 },
+              "hitPointCount": { "type": "integer", "minimum": 0 },
+              "scroll": {
+                "type": "object",
+                "additionalProperties": false,
+                "required": ["document", "ancestors"],
+                "properties": {
+                  "document": {
+                    "type": "object",
+                    "additionalProperties": false,
+                    "required": ["before", "after"],
+                    "properties": { "before": { "$ref": "#/$defs/scrollPosition" }, "after": { "$ref": "#/$defs/scrollPosition" } }
+                  },
+                  "ancestors": {
+                    "type": "array",
+                    "items": {
+                      "type": "object",
+                      "additionalProperties": false,
+                      "required": ["selector", "before", "after"],
+                      "properties": {
+                        "selector": { "type": "string" },
+                        "before": { "$ref": "#/$defs/elementScrollOffset" },
+                        "after": { "$ref": "#/$defs/elementScrollOffset" }
+                      }
+                    }
+                  }
+                }
+              }
+            }
+          }
+        }
+      }
     },
     "scrollPosition": {
       "type": "object",
@@ -327,7 +562,96 @@
         "contentLengthHeader": { "type": ["string", "null"] },
         "timing": { "$ref": "#/$defs/networkTiming" },
         "transferSize": { "$ref": "#/$defs/responseTransferSize" },
-        "truncated": { "type": "boolean" }
+        "truncated": { "type": "boolean" },
+        "errorContext": { "$ref": "#/$defs/responseErrorContext" }
+      }
+    },
+    "responseErrorContext": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["bodySummary", "approvedService"],
+      "properties": {
+        "bodySummary": {
+          "oneOf": [
+            {
+              "type": "object",
+              "additionalProperties": false,
+              "required": ["status", "format", "fields"],
+              "properties": {
+                "status": { "const": "OBSERVED" },
+                "format": { "enum": ["JSON", "TEXT", "HTML"] },
+                "fields": {
+                  "type": "array",
+                  "items": {
+                    "type": "object",
+                    "additionalProperties": false,
+                    "required": ["key", "valueType", "value", "secretLike", "truncated"],
+                    "properties": {
+                      "key": { "type": "string" },
+                      "valueType": { "enum": ["string", "number", "boolean", "null", "object", "array"] },
+                      "value": { "type": ["string", "null"] },
+                      "secretLike": { "type": "boolean" },
+                      "truncated": { "type": "boolean" }
+                    }
+                  }
+                }
+              }
+            },
+            {
+              "type": "object",
+              "additionalProperties": false,
+              "required": ["status", "reason", "errorText"],
+              "properties": {
+                "status": { "const": "NONE" },
+                "reason": { "enum": ["EMPTY_BODY", "UNSUPPORTED_CONTENT_TYPE", "UNPARSABLE_JSON", "UNREADABLE"] },
+                "errorText": { "type": ["string", "null"] }
+              }
+            }
+          ]
+        },
+        "approvedService": { "type": "boolean" }
+      }
+    },
+    "errorDisplay": {
+      "oneOf": [
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["status", "matches"],
+          "properties": {
+            "status": { "const": "OBSERVED" },
+            "matches": {
+              "type": "array",
+              "items": {
+                "type": "object",
+                "additionalProperties": false,
+                "required": ["source", "words"],
+                "properties": {
+                  "source": { "enum": ["ALERT", "ASSERTIVE_LIVE", "HEADING", "INVALID_FIELD"] },
+                  "words": { "type": "array", "items": { "type": "string" } }
+                }
+              }
+            }
+          }
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["status", "errorText"],
+          "properties": {
+            "status": { "const": "FAILED" },
+            "errorText": { "type": "string" }
+          }
+        }
+      ]
+    },
+    "performanceOperations": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["scrolled", "notificationFramePressed"],
+      "properties": {
+        "scrolled": { "type": "boolean" },
+        "notificationFramePressed": { "type": "boolean" }
       }
     },
     "networkFailure": {
@@ -380,7 +704,61 @@
         "failures": { "type": "array", "items": { "$ref": "#/$defs/networkFailure" } },
         "omittedRequestCount": { "type": "integer", "minimum": 0 },
         "omittedResponseCount": { "type": "integer", "minimum": 0 },
-        "omittedFailureCount": { "type": "integer", "minimum": 0 }
+        "omittedFailureCount": { "type": "integer", "minimum": 0 },
+        "repeatedReads": { "type": "array", "items": { "$ref": "#/$defs/networkRepeatedRead" } }
+      }
+    },
+    "networkRepeatedReadSample": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["url", "timing"],
+      "properties": {
+        "url": { "type": "string" },
+        "timing": { "$ref": "#/$defs/networkTiming" }
+      }
+    },
+    "networkRepeatedRead": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "method",
+        "origin",
+        "path",
+        "resourceType",
+        "status",
+        "isMainFrame",
+        "count",
+        "firstRequestId",
+        "first",
+        "slowest",
+        "firstStartTime",
+        "lastStartTime",
+        "transfer",
+        "distinctQueryCount"
+      ],
+      "properties": {
+        "method": { "type": "string" },
+        "origin": { "type": "string" },
+        "path": { "type": "string" },
+        "resourceType": { "type": "string" },
+        "status": { "type": "integer" },
+        "isMainFrame": { "type": ["boolean", "null"] },
+        "count": { "type": "integer", "minimum": 2 },
+        "firstRequestId": { "type": "string" },
+        "first": { "$ref": "#/$defs/networkRepeatedReadSample" },
+        "slowest": { "$ref": "#/$defs/networkRepeatedReadSample" },
+        "firstStartTime": { "type": "number" },
+        "lastStartTime": { "type": "number" },
+        "transfer": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["observedCount", "totalBytes"],
+          "properties": {
+            "observedCount": { "type": "integer", "minimum": 0 },
+            "totalBytes": { "type": "integer", "minimum": 0 }
+          }
+        },
+        "distinctQueryCount": { "type": "integer", "minimum": 1 }
       }
     },
     "consoleEvidence": {
@@ -438,6 +816,7 @@
         "anchorText": { "type": "string" },
         "ariaLabel": { "type": ["string", "null"] },
         "title": { "type": ["string", "null"] },
+        "imageAlts": { "type": "array", "minItems": 1, "items": { "type": "string" } },
         "rawHref": { "type": "string" },
         "normalized": {
           "oneOf": [
@@ -505,7 +884,9 @@
       "required": ["links", "omittedLinkCount"],
       "properties": {
         "links": { "type": "array", "items": { "$ref": "#/$defs/linkEvidence" } },
-        "omittedLinkCount": { "type": "integer", "minimum": 0 }
+        "omittedLinkCount": { "type": "integer", "minimum": 0 },
+        "collectedInParts": { "type": "integer", "minimum": 1 },
+        "frames": { "type": "array", "items": { "type": "string" } }
       }
     },
     "formFieldEvidence": {
@@ -706,6 +1087,18 @@
             "omittedUnassociatedFieldCount": { "type": "integer", "minimum": 0 },
             "omittedDuplicateIdCount": { "type": "integer", "minimum": 0 }
           }
+        },
+        "collectedInParts": { "type": "integer", "minimum": 1 },
+        "errorDisplay": { "$ref": "#/$defs/errorDisplay" },
+        "loadingIndicators": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["ariaBusyCount", "progressbarCount", "indeterminateProgressCount"],
+          "properties": {
+            "ariaBusyCount": { "type": "integer", "minimum": 0 },
+            "progressbarCount": { "type": "integer", "minimum": 0 },
+            "indeterminateProgressCount": { "type": "integer", "minimum": 0 }
+          }
         }
       }
     },
@@ -751,7 +1144,11 @@
         "opacity": { "type": "number" },
         "hiddenAttribute": { "type": "boolean" },
         "ariaHidden": { "type": "boolean" },
-        "clientRectCount": { "type": "integer", "minimum": 0 }
+        "clientRectCount": { "type": "integer", "minimum": 0 },
+        "clippedToZeroArea": {
+          "description": "Optional (DEF-205): whether clip or clip-path of the element or an ancestor leaves no painted area (visually hidden). Older evidence does not have it.",
+          "type": "boolean"
+        }
       }
     },
     "layoutElement": {
@@ -780,6 +1177,95 @@
         "overflowX": { "type": "string" },
         "overflowY": { "type": "string" },
         "fixedOrStickyAncestor": { "type": "boolean" }
+      }
+    },
+    "elementScrollOffset": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["scrollLeft", "scrollTop"],
+      "properties": { "scrollLeft": { "type": "number" }, "scrollTop": { "type": "number" } }
+    },
+    "scrollContainer": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["selector", "rect", "scrollTop", "scrollRangeY"],
+      "properties": {
+        "selector": { "type": "string" },
+        "rect": { "$ref": "#/$defs/rectangle" },
+        "scrollTop": { "type": "number" },
+        "scrollRangeY": { "type": "number", "minimum": 0 }
+      }
+    },
+    "lineOverlap": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["area", "pointCount", "bothHitPointCount"],
+      "properties": {
+        "area": { "type": "number", "minimum": 0 },
+        "pointCount": { "type": "integer", "minimum": 0 },
+        "bothHitPointCount": { "type": "integer", "minimum": 0 }
+      }
+    },
+    "overlapHitLayer": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "selector",
+        "relation",
+        "position",
+        "zIndex",
+        "pointerEvents",
+        "effectiveOpacity",
+        "visibility",
+        "backgroundColor",
+        "hasBackgroundImage",
+        "paintsOwnSurface"
+      ],
+      "properties": {
+        "selector": { "type": "string" },
+        "relation": { "enum": ["COVERED", "COVERED_DESCENDANT", "OVERLAY", "OVERLAY_DESCENDANT", "OTHER"] },
+        "position": { "type": "string" },
+        "zIndex": { "type": "string" },
+        "pointerEvents": { "type": "string" },
+        "effectiveOpacity": { "type": "number" },
+        "visibility": { "type": "string" },
+        "backgroundColor": { "type": "string" },
+        "hasBackgroundImage": { "type": "boolean" },
+        "paintsOwnSurface": { "type": "boolean" }
+      }
+    },
+    "overlapHitTest": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["target", "points", "overlay", "modal"],
+      "properties": {
+        "target": { "enum": ["COVERED", "BENEATH"] },
+        "points": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["x", "y", "topRelation", "layers", "targetFound", "targetSelector"],
+            "properties": {
+              "x": { "type": "number" },
+              "y": { "type": "number" },
+              "topRelation": { "enum": ["COVERED", "COVERED_DESCENDANT", "OVERLAY", "OVERLAY_DESCENDANT", "OTHER", null] },
+              "layers": { "type": "array", "items": { "$ref": "#/$defs/overlapHitLayer" } },
+              "targetFound": { "type": "boolean" },
+              "targetSelector": { "type": ["string", "null"] }
+            }
+          }
+        },
+        "overlay": { "$ref": "#/$defs/overlapHitLayer" },
+        "modal": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["dialogModal", "ariaModal"],
+          "properties": {
+            "dialogModal": { "type": "boolean" },
+            "ariaModal": { "type": "boolean" }
+          }
+        }
       }
     },
     "layoutEvidence": {
@@ -934,6 +1420,8 @@
             "properties": {
               "selector": { "type": "string" },
               "text": { "type": "string" },
+              "tagName": { "type": "string" },
+              "role": { "type": ["string", "null"] },
               "rect": { "$ref": "#/$defs/rectangle" },
               "visibility": { "$ref": "#/$defs/visibility" },
               "position": { "type": "string" },
@@ -947,7 +1435,28 @@
               "widthClipped": { "type": "boolean" },
               "heightClipped": { "type": "boolean" },
               "partiallyClippedText": { "type": "boolean" },
-              "truncated": { "type": "boolean" }
+              "truncated": { "type": "boolean" },
+              "clippingStyle": {
+                "type": "object",
+                "additionalProperties": false,
+                "required": ["textOverflow", "whiteSpace", "webkitLineClamp", "lineClamp", "display", "webkitBoxOrient", "maxHeight"],
+                "properties": {
+                  "textOverflow": { "type": "string" },
+                  "whiteSpace": { "type": "string" },
+                  "webkitLineClamp": { "type": "string" },
+                  "lineClamp": { "type": "string" },
+                  "display": { "type": "string" },
+                  "webkitBoxOrient": { "type": "string" },
+                  "maxHeight": { "type": "string" }
+                }
+              },
+              "lineHeightPx": { "anyOf": [{ "type": "null" }, { "type": "number", "minimum": 0 }] },
+              "visibleLineCount": { "anyOf": [{ "type": "null" }, { "type": "number", "minimum": 0 }] },
+              "lineClampCount": { "anyOf": [{ "type": "null" }, { "type": "integer", "minimum": 1 }] },
+              "collapsedByControl": { "type": "boolean" },
+              "intendedClipping": {
+                "anyOf": [{ "type": "null" }, { "enum": ["INTENDED_ELLIPSIS", "LINE_CLAMP", "COLLAPSED"] }]
+              }
             }
           }
         },
@@ -990,7 +1499,9 @@
               "headingOverflowX": { "type": "string" },
               "headingOverflowY": { "type": "string" },
               "intersection": { "$ref": "#/$defs/intersection" },
-              "truncated": { "type": "boolean" }
+              "truncated": { "type": "boolean" },
+              "hitTest": { "$ref": "#/$defs/overlapHitTest" },
+              "coveredScrollContainer": { "$ref": "#/$defs/scrollContainer" }
             }
           }
         },
@@ -1004,7 +1515,10 @@
               "first": { "$ref": "#/$defs/layoutElement" },
               "second": { "$ref": "#/$defs/layoutElement" },
               "intersection": { "$ref": "#/$defs/intersection" },
-              "truncated": { "type": "boolean" }
+              "truncated": { "type": "boolean" },
+              "hitTest": { "$ref": "#/$defs/overlapHitTest" },
+              "coveredScrollContainer": { "$ref": "#/$defs/scrollContainer" },
+              "lineOverlap": { "$ref": "#/$defs/lineOverlap" }
             }
           }
         },
@@ -1043,7 +1557,10 @@
               "viewportIntersectionArea": { "type": "number", "minimum": 0 },
               "viewportArea": { "type": "number", "minimum": 0 },
               "viewportAreaRatio": { "type": "number", "minimum": 0 },
-              "truncated": { "type": "boolean" }
+              "truncated": { "type": "boolean" },
+              "paintsOwnSurface": { "type": "boolean" },
+              "pointerEvents": { "type": "string" },
+              "hitTest": { "$ref": "#/$defs/overlapHitTest" }
             }
           }
         },
@@ -1072,8 +1589,124 @@
             "clippedTextNodeScanLimitReachedCount": { "type": "integer", "minimum": 0 },
             "renderedDescendantScanLimitReachedCount": { "type": "integer", "minimum": 0 }
           }
-        }
+        },
+        "collectedInParts": { "type": "integer", "minimum": 1 }
       }
+    },
+    "sameAsRef": {
+      "description": "REC-3 (the form on the disk): an item of a rechecked list that is the same as the item at this index of the same list of the first Evidence (recheckBase).",
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["sameAs"],
+      "properties": { "sameAs": { "type": "integer", "minimum": 0 } }
+    },
+    "factoredList": {
+      "description": "REC-3 (the form on the disk): a list whose fields of the same value on every item are written once in common. keys is the order of the fields of an item; an item has the other fields.",
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["keys", "common", "items"],
+      "properties": {
+        "keys": { "type": "array", "minItems": 1, "items": { "type": "string" } },
+        "common": { "type": "object", "minProperties": 1 },
+        "items": { "type": "array", "minItems": 2, "items": { "type": "object" } }
+      }
+    },
+    "layoutEvidenceRecord": {
+      "description": "REC-3: layoutEvidence, or its form on the disk (the lists are factored or refer to the first Evidence, and the elements of the overlaps are indexes into overlapElements).",
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "scrollPosition",
+        "document",
+        "boxesOutsideViewport",
+        "zeroSizeInteractive",
+        "clippedText",
+        "fixedHeadingOverlaps",
+        "elementOverlaps",
+        "fixedElements",
+        "truncation"
+      ],
+      "properties": {
+        "scrollPosition": { "$ref": "#/$defs/layoutEvidence/properties/scrollPosition" },
+        "document": { "$ref": "#/$defs/layoutEvidence/properties/document" },
+        "boxesOutsideViewport": {
+          "anyOf": [
+            { "type": "array", "items": { "anyOf": [{ "$ref": "#/$defs/layoutEvidence/properties/boxesOutsideViewport/items" }, { "$ref": "#/$defs/sameAsRef" }] } },
+            { "$ref": "#/$defs/factoredList" }
+          ]
+        },
+        "zeroSizeInteractive": {
+          "anyOf": [
+            { "type": "array", "items": { "anyOf": [{ "$ref": "#/$defs/layoutEvidence/properties/zeroSizeInteractive/items" }, { "$ref": "#/$defs/sameAsRef" }] } },
+            { "$ref": "#/$defs/factoredList" }
+          ]
+        },
+        "clippedText": {
+          "anyOf": [
+            { "type": "array", "items": { "anyOf": [{ "$ref": "#/$defs/layoutEvidence/properties/clippedText/items" }, { "$ref": "#/$defs/sameAsRef" }] } },
+            { "$ref": "#/$defs/factoredList" }
+          ]
+        },
+        "fixedHeadingOverlaps": {
+          "anyOf": [
+            { "type": "array", "items": { "anyOf": [{ "$ref": "#/$defs/layoutEvidence/properties/fixedHeadingOverlaps/items" }, { "$ref": "#/$defs/sameAsRef" }] } },
+            { "$ref": "#/$defs/factoredList" }
+          ]
+        },
+        "fixedElements": {
+          "anyOf": [
+            { "type": "array", "items": { "anyOf": [{ "$ref": "#/$defs/layoutEvidence/properties/fixedElements/items" }, { "$ref": "#/$defs/sameAsRef" }] } },
+            { "$ref": "#/$defs/factoredList" }
+          ]
+        },
+        "elementOverlaps": {
+          "type": "array",
+          "items": {
+            "anyOf": [
+              { "$ref": "#/$defs/layoutEvidence/properties/elementOverlaps/items" },
+              { "$ref": "#/$defs/sameAsRef" },
+              {
+                "type": "object",
+                "additionalProperties": false,
+                "required": ["first", "second", "intersection", "truncated"],
+                "properties": {
+                  "first": { "type": "integer", "minimum": 0 },
+                  "second": { "type": "integer", "minimum": 0 },
+                  "intersection": { "$ref": "#/$defs/intersection" },
+                  "truncated": { "type": "boolean" },
+                  "hitTest": { "$ref": "#/$defs/overlapHitTest" },
+                  "coveredScrollContainer": { "$ref": "#/$defs/scrollContainer" },
+                  "lineOverlap": { "$ref": "#/$defs/lineOverlap" }
+                }
+              }
+            ]
+          }
+        },
+        "overlapElements": { "type": "array", "minItems": 1, "items": { "$ref": "#/$defs/layoutElement" } },
+        "truncation": { "$ref": "#/$defs/layoutEvidence/properties/truncation" },
+        "collectedInParts": { "$ref": "#/$defs/layoutEvidence/properties/collectedInParts" }
+      }
+    },
+    "accessibilityRuleRecord": {
+      "description": "REC-3: accessibilityRule, or its form on the disk (the nodes are factored, or the rule of a rechecked Evidence refers to the first Evidence).",
+      "anyOf": [
+        { "$ref": "#/$defs/accessibilityRule" },
+        { "$ref": "#/$defs/sameAsRef" },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["ruleId", "impact", "help", "helpUrl", "tags", "nodes", "omittedNodeCount"],
+          "properties": {
+            "ruleId": { "$ref": "#/$defs/accessibilityRule/properties/ruleId" },
+            "impact": { "$ref": "#/$defs/accessibilityRule/properties/impact" },
+            "help": { "$ref": "#/$defs/accessibilityRule/properties/help" },
+            "helpUrl": { "$ref": "#/$defs/accessibilityRule/properties/helpUrl" },
+            "tags": { "$ref": "#/$defs/accessibilityRule/properties/tags" },
+            "nodes": { "$ref": "#/$defs/factoredList" },
+            "omittedNodeCount": { "$ref": "#/$defs/accessibilityRule/properties/omittedNodeCount" }
+          }
+        }
+      ]
     },
     "layoutCollectionResult": {
       "oneOf": [
@@ -1081,7 +1714,7 @@
           "type": "object",
           "additionalProperties": false,
           "required": ["status", "layout"],
-          "properties": { "status": { "const": "COMPLETE" }, "layout": { "$ref": "#/$defs/layoutEvidence" } }
+          "properties": { "status": { "const": "COMPLETE" }, "layout": { "$ref": "#/$defs/layoutEvidenceRecord" } }
         },
         {
           "type": "object",
@@ -1090,7 +1723,7 @@
           "properties": {
             "status": { "const": "PARTIAL" },
             "reason": { "enum": ["DEADLINE_EXCEEDED", "LAYOUT_COMPARISON_LIMIT_REACHED"] },
-            "layout": { "anyOf": [{ "type": "null" }, { "$ref": "#/$defs/layoutEvidence" }] }
+            "layout": { "anyOf": [{ "type": "null" }, { "$ref": "#/$defs/layoutEvidenceRecord" }] }
           }
         }
       ]
@@ -1105,7 +1738,8 @@
             "width": { "type": "integer", "minimum": 1 },
             "height": { "type": "integer", "minimum": 1 },
             "status": { "const": "COMPLETE" },
-            "layout": { "$ref": "#/$defs/layoutEvidence" }
+            "layout": { "$ref": "#/$defs/layoutEvidenceRecord" },
+            "capture": { "$ref": "#/$defs/evidenceCapture" }
           }
         },
         {
@@ -1117,7 +1751,8 @@
             "height": { "type": "integer", "minimum": 1 },
             "status": { "const": "PARTIAL" },
             "reason": { "enum": ["DEADLINE_EXCEEDED", "LAYOUT_COMPARISON_LIMIT_REACHED"] },
-            "layout": { "anyOf": [{ "type": "null" }, { "$ref": "#/$defs/layoutEvidence" }] }
+            "layout": { "anyOf": [{ "type": "null" }, { "$ref": "#/$defs/layoutEvidenceRecord" }] },
+            "capture": { "$ref": "#/$defs/evidenceCapture" }
           }
         },
         {
@@ -1131,7 +1766,8 @@
             "stage": { "enum": ["NOT_STARTED", "NAVIGATION", "COLLECTION"] },
             "reason": { "enum": ["DEADLINE_EXCEEDED", "EVALUATION_FAILED", "PAGE_CLOSED", "NAVIGATION_FAILED"] },
             "message": { "type": ["string", "null"] },
-            "layout": { "type": "null" }
+            "layout": { "type": "null" },
+            "capture": { "$ref": "#/$defs/evidenceCapture" }
           }
         }
       ]
@@ -1144,7 +1780,49 @@
         "primary": { "$ref": "#/$defs/layoutCollectionResult" },
         "stressSweep": {
           "anyOf": [{ "type": "null" }, { "type": "array", "items": { "$ref": "#/$defs/stressLayoutEvidence" } }]
+        },
+        "beforeNotificationDismissal": { "$ref": "#/$defs/layoutCollectionResult" },
+        "notificationOverlay": { "$ref": "#/$defs/notificationOverlayEvidence" },
+        "stressNotificationOverlays": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["width", "overlay"],
+            "properties": {
+              "width": { "type": "integer", "minimum": 1 },
+              "overlay": { "$ref": "#/$defs/notificationOverlayEvidence" }
+            }
+          }
         }
+      }
+    },
+    "notificationOverlayEvidence": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["readStatus", "frames", "pressCount", "navigated", "truncated"],
+      "properties": {
+        "readStatus": { "enum": ["READ", "FAILED"] },
+        "frames": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["digest", "status", "pressed", "dismissed", "hidden", "hiddenReason", "firstSeen"],
+            "properties": {
+              "digest": { "type": "string", "pattern": "^sha256:[0-9a-f]{64}$" },
+              "status": { "enum": ["DISMISSIBLE", "TOO_LARGE", "CLOSE_BUTTON_DISABLED", "NO_CLOSE_BUTTON"] },
+              "pressed": { "type": "boolean" },
+              "dismissed": { "type": "boolean" },
+              "hidden": { "type": "boolean" },
+              "hiddenReason": { "enum": ["NOT_DISMISSED", "CLOSE_BUTTON_DISABLED", "NO_CLOSE_BUTTON", null] },
+              "firstSeen": { "type": "boolean" }
+            }
+          }
+        },
+        "pressCount": { "type": "integer", "minimum": 0 },
+        "navigated": { "type": "boolean" },
+        "truncated": { "type": "boolean" }
       }
     },
     "cssColor": {
@@ -1278,7 +1956,8 @@
           }
         },
         "omittedDistributionEntryCount": { "type": "integer", "minimum": 0 },
-        "observedArea": { "type": "number", "minimum": 0 }
+        "observedArea": { "type": "number", "minimum": 0 },
+        "collectedInParts": { "type": "integer", "minimum": 1 }
       }
     },
     "clsAttribution": {
@@ -1822,7 +2501,10 @@
                   }
                 }
               ]
-            }
+            },
+            "observedForMs": { "type": ["number", "null"], "minimum": 0 },
+            "operationsBeforeMeasurement": { "$ref": "#/$defs/performanceOperations" },
+            "lcpBeforeScroll": { "$ref": "#/$defs/webVitals/properties/LCP" }
           }
         },
         {
@@ -1844,7 +2526,14 @@
           "properties": {
             "status": { "const": "PARTIAL" },
             "reason": {
-              "enum": ["DEADLINE_EXCEEDED", "EVALUATION_FAILED", "INVALID_BROWSER_DATA", "RESOURCE_LIMIT_REACHED"]
+              "enum": [
+                "DEADLINE_EXCEEDED",
+                "EVALUATION_FAILED",
+                "INVALID_BROWSER_DATA",
+                "RESOURCE_LIMIT_REACHED",
+                "STAGE_UNRESPONSIVE",
+                "STAGE_NEVER_QUIET"
+              ]
             },
             "webVitals": { "anyOf": [{ "type": "null" }, { "$ref": "#/$defs/webVitals" }] },
             "navigationTiming": { "anyOf": [{ "type": "null" }, { "$ref": "#/$defs/navigationTiming" }] },
@@ -1965,7 +2654,10 @@
                   }
                 }
               ]
-            }
+            },
+            "observedForMs": { "type": ["number", "null"], "minimum": 0 },
+            "operationsBeforeMeasurement": { "$ref": "#/$defs/performanceOperations" },
+            "lcpBeforeScroll": { "$ref": "#/$defs/webVitals/properties/LCP" }
           }
         }
       ]
@@ -1994,12 +2686,142 @@
               },
               "failureSummary": { "type": ["string", "null"] },
               "htmlSnippet": { "type": "string" },
-              "truncated": { "type": "boolean" }
+              "truncated": { "type": "boolean" },
+              "checks": { "type": "array", "items": { "$ref": "#/$defs/accessibilityCheck" } },
+              "truncations": { "type": "array", "items": { "$ref": "#/$defs/accessibilityValueTruncation" } },
+              "disabledFacts": {
+                "oneOf": [{ "type": "null" }, { "$ref": "#/$defs/accessibilityDisabledFacts" }]
+              },
+              "countExclusion": { "enum": ["DISABLED_FOR_ASSISTIVE_TECH", null] },
+              "computedContrastRatio": { "type": "number", "minimum": 1 },
+              "region": {
+                "oneOf": [
+                  {
+                    "type": "object",
+                    "additionalProperties": false,
+                    "required": ["status", "rect"],
+                    "properties": { "status": { "const": "READ" }, "rect": { "$ref": "#/$defs/rectangle" } }
+                  },
+                  {
+                    "type": "object",
+                    "additionalProperties": false,
+                    "required": ["status", "reason"],
+                    "properties": {
+                      "status": { "const": "UNREADABLE" },
+                      "reason": { "enum": ["NOT_FOUND", "IN_FRAME", "NO_BOX", "NOT_READ"] }
+                    }
+                  }
+                ]
+              },
+              "nameContext": {
+                "oneOf": [
+                  {
+                    "type": "object",
+                    "additionalProperties": false,
+                    "required": ["status", "axName", "axRole", "axDisabled", "nameSource", "labelSegments"],
+                    "properties": {
+                      "status": { "const": "READ" },
+                      "axName": { "type": ["string", "null"] },
+                      "axRole": { "type": ["string", "null"] },
+                      "axDisabled": { "type": "boolean" },
+                      "nameSource": {
+                        "oneOf": [
+                          { "type": "null" },
+                          {
+                            "type": "object",
+                            "additionalProperties": false,
+                            "required": ["type", "attribute"],
+                            "properties": { "type": { "type": "string" }, "attribute": { "type": ["string", "null"] } }
+                          }
+                        ]
+                      },
+                      "labelSegments": { "type": "array", "items": { "type": "string" } }
+                    }
+                  },
+                  {
+                    "type": "object",
+                    "additionalProperties": false,
+                    "required": ["status", "reason"],
+                    "properties": {
+                      "status": { "const": "UNREADABLE" },
+                      "reason": { "enum": ["NOT_FOUND", "IN_FRAME", "IN_SHADOW", "NOT_READ"] }
+                    }
+                  }
+                ]
+              }
             }
           }
         },
         "omittedNodeCount": { "type": "integer", "minimum": 0 }
       }
+    },
+    "accessibilityCheck": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["id", "group", "result", "messageKey", "data"],
+      "properties": {
+        "id": { "type": "string" },
+        "group": { "enum": ["any", "all", "none"] },
+        "result": { "enum": ["FAILED", "UNDETERMINED"] },
+        "messageKey": { "type": ["string", "null"] },
+        "data": {
+          "type": "object",
+          "additionalProperties": {
+            "oneOf": [{ "type": "string" }, { "type": "number" }, { "type": "boolean" }, { "type": "null" }]
+          }
+        }
+      }
+    },
+    "accessibilityValueTruncation": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["field", "originalLength", "keptLength"],
+      "properties": {
+        "field": { "type": "string", "pattern": "^/" },
+        "originalLength": { "type": "integer", "minimum": 0 },
+        "keptLength": { "type": "integer", "minimum": 0 }
+      }
+    },
+    "accessibilityDisabledPlace": { "enum": ["SELF", "ANCESTOR", null] },
+    "accessibilityDisabledFacts": {
+      "oneOf": [
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "status",
+            "matchesDisabled",
+            "disabledAttribute",
+            "ariaDisabled",
+            "inert",
+            "axDisabled",
+            "pointerEvents",
+            "cursor",
+            "tabIndexNegative",
+            "disabledForAssistiveTech",
+            "disabledStateNotExposed"
+          ],
+          "properties": {
+            "status": { "const": "READ" },
+            "matchesDisabled": { "type": "boolean" },
+            "disabledAttribute": { "$ref": "#/$defs/accessibilityDisabledPlace" },
+            "ariaDisabled": { "$ref": "#/$defs/accessibilityDisabledPlace" },
+            "inert": { "$ref": "#/$defs/accessibilityDisabledPlace" },
+            "axDisabled": { "type": ["boolean", "null"] },
+            "pointerEvents": { "type": "string" },
+            "cursor": { "type": "string" },
+            "tabIndexNegative": { "type": "boolean" },
+            "disabledForAssistiveTech": { "type": "boolean" },
+            "disabledStateNotExposed": { "type": "boolean" }
+          }
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["status"],
+          "properties": { "status": { "enum": ["NOT_FOUND", "NOT_READ"] } }
+        }
+      ]
     },
     "accessibilityEvidence": {
       "oneOf": [
@@ -2011,8 +2833,10 @@
             "status": { "const": "COMPLETE" },
             "scrollPosition": { "$ref": "#/$defs/scrollPosition" },
             "frameScope": { "const": "SAME_ORIGIN_ONLY" },
-            "violations": { "type": "array", "items": { "$ref": "#/$defs/accessibilityRule" } },
-            "incomplete": { "type": "array", "items": { "$ref": "#/$defs/accessibilityRule" } }
+            "violations": { "type": "array", "items": { "$ref": "#/$defs/accessibilityRuleRecord" } },
+            "incomplete": { "type": "array", "items": { "$ref": "#/$defs/accessibilityRuleRecord" } },
+            "regionScrollPosition": { "anyOf": [{ "type": "null" }, { "$ref": "#/$defs/scrollPosition" }] },
+            "axeVersion": { "type": "string" }
           }
         },
         {
@@ -2021,11 +2845,13 @@
           "required": ["status", "reason", "scrollPosition", "frameScope", "violations", "incomplete"],
           "properties": {
             "status": { "const": "PARTIAL" },
-            "reason": { "enum": ["DEADLINE_EXCEEDED", "EVALUATION_FAILED"] },
+            "reason": { "enum": ["DEADLINE_EXCEEDED", "EVALUATION_FAILED", "STAGE_UNRESPONSIVE", "STAGE_NEVER_QUIET"] },
             "scrollPosition": { "anyOf": [{ "type": "null" }, { "$ref": "#/$defs/scrollPosition" }] },
             "frameScope": { "const": "SAME_ORIGIN_ONLY" },
-            "violations": { "type": "array", "items": { "$ref": "#/$defs/accessibilityRule" } },
-            "incomplete": { "type": "array", "items": { "$ref": "#/$defs/accessibilityRule" } }
+            "violations": { "type": "array", "items": { "$ref": "#/$defs/accessibilityRuleRecord" } },
+            "incomplete": { "type": "array", "items": { "$ref": "#/$defs/accessibilityRuleRecord" } },
+            "regionScrollPosition": { "anyOf": [{ "type": "null" }, { "$ref": "#/$defs/scrollPosition" }] },
+            "axeVersion": { "type": "string" }
           }
         }
       ]
@@ -2077,6 +2903,7 @@
         "type": { "type": ["string", "null"] },
         "disabled": { "type": "boolean" },
         "visible": { "type": "boolean" },
+        "destructiveAction": { "type": "boolean" },
         "boundingBox": {
           "type": "object",
           "additionalProperties": false,
@@ -2130,6 +2957,7 @@
         "DISABLED",
         "NOT_VISIBLE",
         "MALFORMED_CANDIDATE",
+        "DESTRUCTIVE_ACTION_SKIPPED",
         "SAFETY_FREEZE_BLOCKED",
         "OWNER_CLOSE_SAFETY_FAILURE",
         "SESSION_OPEN_DEADLINE",
@@ -2187,6 +3015,9 @@
         "RETAINED_INSPECTION_CANDIDATE_LIMIT_REACHED",
         "RETAINED_INSPECTION_TEXT_NODE_LIMIT_REACHED",
         "RETAINED_IDENTITY_LOST",
+        "STAGE_UNRESPONSIVE",
+        "STAGE_NEVER_QUIET",
+        "TRAIL_NOT_REPRODUCED",
         "EXECUTION_FAILED",
         "CLICK_FAILED"
       ]
@@ -2209,7 +3040,8 @@
                   "DOWNLOAD",
                   "DISABLED",
                   "NOT_VISIBLE",
-                  "MALFORMED_CANDIDATE"
+                  "MALFORMED_CANDIDATE",
+                  "DESTRUCTIVE_ACTION_SKIPPED"
                 ] } } }
         },
         {
@@ -2273,7 +3105,10 @@
                   "RETAINED_INSPECTION_DOM_WORK_EXHAUSTED",
                   "RETAINED_INSPECTION_CANDIDATE_LIMIT_REACHED",
                   "RETAINED_INSPECTION_TEXT_NODE_LIMIT_REACHED",
-                  "RETAINED_IDENTITY_LOST"
+                  "RETAINED_IDENTITY_LOST",
+                  "STAGE_UNRESPONSIVE",
+                  "STAGE_NEVER_QUIET",
+                  "TRAIL_NOT_REPRODUCED"
                 ] } } }
         },
         {
@@ -2324,7 +3159,30 @@
             "reasonDetail": { "type": ["string", "null"] }
           }
         },
-        "notVerifiableKind": { "enum": ["OBSERVED_NO_CHANGE", "CHECK_NOT_COMPLETED", null] }
+        "notVerifiableKind": { "enum": ["OBSERVED_NO_CHANGE", "CHECK_NOT_COMPLETED", null] },
+        "postInteractionUrl": { "type": "string" },
+        "pressTrail": {
+          "type": "array",
+          "minItems": 1,
+          "items": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["candidateId", "ordinal"],
+            "properties": { "candidateId": { "type": "string" }, "ordinal": { "type": "integer", "minimum": 0 } }
+          }
+        },
+        "openedState": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["stateId", "structureKey", "status", "duplicateFindingCount"],
+          "properties": {
+            "stateId": { "$ref": "#/$defs/evidenceStateId" },
+            "structureKey": { "type": "string", "pattern": "^sha256:[0-9a-f]{64}$" },
+            "status": { "enum": ["AUDITED", "SAME_STRUCTURE_SEEN", "PARTIAL"] },
+            "duplicateFindingCount": { "type": "integer", "minimum": 0 },
+            "recheck": { "$ref": "#/$defs/viewportAuditResult/properties/recheck" }
+          }
+        }
       }
     },
     "screenshotEvidence": {
@@ -2336,7 +3194,58 @@
         "viewport": { "enum": ["desktop", "mobile"] },
         "relativePath": { "type": "string", "minLength": 1 },
         "captureType": { "enum": ["VIEWPORT", "FULL_PAGE"] },
-        "scrollPosition": { "$ref": "#/$defs/scrollPosition" }
+        "scrollPosition": { "$ref": "#/$defs/scrollPosition" },
+        "stressWidth": { "type": "integer", "minimum": 1 },
+        "reveal": { "$ref": "#/$defs/revealCapture" }
+      }
+    },
+    "revealCapture": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["viewportWidth", "viewportHeight", "targets"],
+      "properties": {
+        "viewportWidth": { "type": "number", "minimum": 0 },
+        "viewportHeight": { "type": "number", "minimum": 0 },
+        "targets": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": [
+              "purpose", "selectors", "position", "found", "scroll", "rect", "elementRects", "lineRectCounts", "visibleRect",
+              "hitTestPointCount", "hitPointCount", "inclusion"
+            ],
+            "properties": {
+              "purpose": { "enum": ["ELEMENT_OVERLAP", "FIXED_ELEMENT_OCCLUSION", "FOCUS", "TEXT_CLIPPING", "SCROLLABLE_REGION"] },
+              "selectors": { "type": "array", "items": { "type": "string" } },
+              "overlaySelector": { "type": "string" },
+              "position": { "enum": ["TARGET", "END", "AS_IS", "ONE_SCREEN"] },
+              "found": { "type": "boolean" },
+              "scroll": { "$ref": "#/$defs/focusCheckEvidence/properties/items/items/properties/scroll" },
+              "rect": { "oneOf": [{ "type": "null" }, { "$ref": "#/$defs/rectangle" }] },
+              "elementRects": { "type": "array", "items": { "oneOf": [{ "type": "null" }, { "$ref": "#/$defs/rectangle" }] } },
+              "lineRectCounts": { "type": "array", "items": { "type": "integer", "minimum": 0 } },
+              "visibleRect": { "oneOf": [{ "type": "null" }, { "$ref": "#/$defs/rectangle" }] },
+              "hitTestPointCount": { "type": "integer", "minimum": 0 },
+              "hitPointCount": { "type": "integer", "minimum": 0 },
+              "coveredPointCount": { "type": "integer", "minimum": 0 },
+              "overlayPresent": { "type": "boolean" },
+              "control": {
+                "type": "object",
+                "additionalProperties": false,
+                "required": ["interactive", "enabled"],
+                "properties": { "interactive": { "type": "boolean" }, "enabled": { "type": "boolean" } }
+              },
+              "inclusion": { "enum": ["INSIDE", "PARTIAL", "OUTSIDE"] },
+              "segment": {
+                "type": "object",
+                "additionalProperties": false,
+                "required": ["index", "count"],
+                "properties": { "index": { "type": "integer", "minimum": 0 }, "count": { "type": "integer", "minimum": 1 } }
+              }
+            }
+          }
+        }
       }
     },
     "scrollObservation": {
@@ -2391,6 +3300,50 @@
         }
       }
     },
+    "innerScrollContainer": {
+      "description": "Optional (L9, COV-5, AUD-5): one inner scroll container that the controlled scroll traversed, in document order.",
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "selector",
+        "originTop",
+        "clientHeight",
+        "initialScrollHeight",
+        "finalScrollHeight",
+        "maxScrollTop",
+        "reachedBottom",
+        "stepCount",
+        "heightGrowthCount",
+        "stopReason",
+        "restored"
+      ],
+      "properties": {
+        "selector": { "type": ["string", "null"] },
+        "originTop": { "type": ["number", "null"] },
+        "clientHeight": { "type": ["number", "null"] },
+        "initialScrollHeight": { "type": ["number", "null"] },
+        "finalScrollHeight": { "type": ["number", "null"] },
+        "maxScrollTop": { "type": ["number", "null"] },
+        "reachedBottom": { "type": "boolean" },
+        "stepCount": { "type": "integer", "minimum": 0 },
+        "heightGrowthCount": { "type": "integer", "minimum": 0 },
+        "stopReason": {
+          "enum": [
+            "BOTTOM_AND_HEIGHT_STABLE",
+            "NO_NEW_STRUCTURE",
+            "NOT_ADVANCED",
+            "STAGE_UNRESPONSIVE",
+            "STAGE_NEVER_QUIET",
+            "DEADLINE_EXCEEDED",
+            "DISCONNECTED",
+            "NOT_FOUND",
+            "EVALUATION_FAILED",
+            "PAGE_CLOSED"
+          ]
+        },
+        "restored": { "type": ["boolean", "null"] }
+      }
+    },
     "scrollRestoration": {
       "oneOf": [
         {
@@ -2408,7 +3361,9 @@
           "required": ["status", "reason", "position"],
           "properties": {
             "status": { "const": "NOT_RESTORED" },
-            "reason": { "enum": ["DEADLINE_EXCEEDED", "EVALUATION_FAILED", "PAGE_CLOSED", "POSITION_NOT_AT_ORIGIN"] },
+            "reason": {
+              "enum": ["DEADLINE_EXCEEDED", "EVALUATION_FAILED", "PAGE_CLOSED", "POSITION_NOT_AT_ORIGIN", "STAGE_UNRESPONSIVE", "STAGE_NEVER_QUIET"]
+            },
             "position": { "anyOf": [{ "type": "null" }, { "$ref": "#/$defs/scrollPosition" }] }
           }
         }
@@ -2432,13 +3387,14 @@
           ],
           "properties": {
             "status": { "const": "COMPLETE" },
-            "reason": { "const": "BOTTOM_AND_HEIGHT_STABLE" },
+            "reason": { "enum": ["BOTTOM_AND_HEIGHT_STABLE", "NO_NEW_STRUCTURE"] },
             "heightGrowthCount": { "type": "integer", "minimum": 0 },
             "observations": { "type": "array", "items": { "$ref": "#/$defs/scrollObservation" } },
             "omittedObservationCount": { "type": "integer", "minimum": 0 },
             "targetSwitchCount": { "type": "integer", "minimum": 0 },
             "restoration": { "$ref": "#/$defs/scrollRestoration" },
             "innerScrollScan": { "anyOf": [{ "type": "null" }, { "$ref": "#/$defs/innerScrollScan" }] },
+            "innerScrollContainers": { "type": "array", "items": { "$ref": "#/$defs/innerScrollContainer" } },
             "finalSnapshot": { "$ref": "#/$defs/scrollObservation" }
           }
         },
@@ -2467,7 +3423,9 @@
                 "SCROLL_NOT_ADVANCED",
                 "INNER_SCROLL_CONTAINER_NOT_TRAVERSED",
                 "INNER_SCROLL_SCAN_LIMIT_REACHED",
-                "SCROLL_TARGET_UNSTABLE"
+                "SCROLL_TARGET_UNSTABLE",
+                "STAGE_UNRESPONSIVE",
+                "STAGE_NEVER_QUIET"
               ]
             },
             "heightGrowthCount": { "type": "integer", "minimum": 0 },
@@ -2476,6 +3434,7 @@
             "targetSwitchCount": { "type": "integer", "minimum": 0 },
             "restoration": { "$ref": "#/$defs/scrollRestoration" },
             "innerScrollScan": { "anyOf": [{ "type": "null" }, { "$ref": "#/$defs/innerScrollScan" }] },
+            "innerScrollContainers": { "type": "array", "items": { "$ref": "#/$defs/innerScrollContainer" } },
             "finalSnapshot": { "anyOf": [{ "type": "null" }, { "$ref": "#/$defs/scrollObservation" }] }
           }
         }
@@ -2530,7 +3489,7 @@
       "properties": {
         "method": { "type": "string" },
         "url": { "type": "string" },
-        "reason": { "enum": ["NON_READ_METHOD", "SERVICE_REQUEST_LIMIT_REACHED", "SERVICE_ORIGIN_REVISIT", "PAGE_NAVIGATION_LIMIT_REACHED", "PAGE_SUBRESOURCE_LIMIT_REACHED", "AUDIT_SEND_OVER_LIMIT", "PAGE_LEAVE_REQUEST_LIMIT_REACHED"] },
+        "reason": { "enum": ["NON_READ_METHOD", "SERVICE_REQUEST_LIMIT_REACHED", "SERVICE_ORIGIN_REVISIT", "PAGE_NAVIGATION_LIMIT_REACHED", "PAGE_SUBRESOURCE_LIMIT_REACHED", "AUDIT_SEND_OVER_LIMIT", "PAGE_LEAVE_REQUEST_LIMIT_REACHED", "NOTIFICATION_DISMISSAL_RESTRICTED", "SCROLL_KEY_PRESS_RESTRICTED"] },
         "resourceType": { "$ref": "#/$defs/blockedResourceType" },
         "phase": { "$ref": "#/$defs/blockedEventPhase" },
         "speculative": { "$ref": "#/$defs/blockedSpeculativeMark" }
@@ -2557,7 +3516,7 @@
       "required": ["url", "reason", "phase"],
       "properties": {
         "url": { "type": "string" },
-        "reason": { "enum": ["PASSIVE_WEBSOCKET", "WORKER_CONNECT_POLICY", "AUDIT_SEND_OVER_LIMIT"] },
+        "reason": { "enum": ["PASSIVE_WEBSOCKET", "WORKER_CONNECT_POLICY", "AUDIT_SEND_OVER_LIMIT", "WEBSOCKET_SEND_QUEUE_FULL"] },
         "phase": { "$ref": "#/$defs/blockedEventPhase" }
       }
     },
@@ -2580,6 +3539,50 @@
               "resourceType": { "$ref": "#/$defs/blockedResourceType" },
               "phase": { "const": "CLOSING" },
               "speculative": { "$ref": "#/$defs/blockedSpeculativeMark" }
+            }
+          }
+        }
+      }
+    },
+    "frameClassificationFailures": {
+      "description": "SAFE-2 item 4 (category (3) of the violations; designer's decision): the navigations whose frame kind (main frame or child frame) the Guard could not classify (formerly the violation FRAME_CLASSIFICATION_FAILED). The browser stopped them and nothing went out, so they are not violations and the Context stays open. Only when at least one was recorded. count also counts the events beyond the event limit. Not a SAFETY finding.",
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["count", "events"],
+      "properties": {
+        "count": { "type": "integer", "minimum": 1 },
+        "events": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["url", "phase"],
+            "properties": {
+              "url": { "type": "string" },
+              "phase": { "$ref": "#/$defs/externalSchemeNavigationEvent/properties/phase" }
+            }
+          }
+        }
+      }
+    },
+    "readNavigationFailures": {
+      "description": "SAFE-2 item 4 (DEF-145): the failures of the delivery of the main frame navigations that are reads (GET and HEAD) the Guard allowed (formerly the violation HTTP_MAIN_FRAME_DELIVERY_FAILED; a non-read failure is still a violation). Whether the read reached the server is unknown, and a read is safe either way. url has the origin and the path only (no query, fragment or value). Only when at least one was recorded. count also counts the events beyond the event limit. Not a SAFETY finding.",
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["count", "events"],
+      "properties": {
+        "count": { "type": "integer", "minimum": 1 },
+        "events": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["method", "url", "errorText", "phase"],
+            "properties": {
+              "method": { "type": "string" },
+              "url": { "type": "string" },
+              "errorText": { "type": "string" },
+              "phase": { "$ref": "#/$defs/externalSchemeNavigationEvent/properties/phase" }
             }
           }
         }
@@ -2634,7 +3637,8 @@
             "DOWNLOAD",
             "DISABLED",
             "NOT_VISIBLE",
-            "MALFORMED_CANDIDATE"
+            "MALFORMED_CANDIDATE",
+            "DESTRUCTIVE_ACTION_SKIPPED"
           ]
         }
       }
@@ -2646,7 +3650,8 @@
       "properties": {
         "method": { "type": "string" },
         "url": { "type": "string" },
-        "reason": { "enum": ["INTERACTION_FROZEN", "INTERACTION_FROZEN_EGRESS", "EGRESS_UPSTREAM_DENIED", "GUARD_BYPASS_EGRESS"] }
+        "reason": { "enum": ["INTERACTION_FROZEN", "INTERACTION_FROZEN_EGRESS", "EGRESS_UPSTREAM_DENIED", "GUARD_BYPASS_EGRESS"] },
+        "preRequestConnection": { "const": true }
       }
     },
     "blockedInteractionNavigationEvent": {
@@ -2665,7 +3670,7 @@
       "required": ["url", "reason"],
       "properties": {
         "url": { "type": "string" },
-        "reason": { "enum": ["INTERACTION_FROZEN"] }
+        "reason": { "enum": ["INTERACTION_FROZEN", "NOTIFICATION_DISMISSAL_RESTRICTED", "SCROLL_KEY_PRESS_RESTRICTED"] }
       }
     },
     "blockedDownloadEvent": {
@@ -2856,7 +3861,9 @@
         "blockedAuditExclusions": { "$ref": "#/$defs/blockedAuditExclusions" },
         "passedAuditSendRequests": { "$ref": "#/$defs/passedAuditSendRequests" },
         "passedAuditSendWebSockets": { "$ref": "#/$defs/passedAuditSendWebSockets" },
-        "blockedClosingRequests": { "$ref": "#/$defs/blockedClosingRequests" }
+        "blockedClosingRequests": { "$ref": "#/$defs/blockedClosingRequests" },
+        "frameClassificationFailures": { "$ref": "#/$defs/frameClassificationFailures" },
+        "readNavigationFailures": { "$ref": "#/$defs/readNavigationFailures" }
       }
     }
   }

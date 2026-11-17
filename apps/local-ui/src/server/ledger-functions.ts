@@ -1,7 +1,7 @@
 /**
  * 監査済みデータの台帳の画面の Server Function（T32g。Task 32 の設計書 4.1 の「監査済みデータの台帳」。ロードマップ 13.4）。読むだけ。
  * - 台帳の行の読み出しは `src/control/actions/write-result-facts.ts` の `readAuditedDataLedger`（書き込みの結果の表の読み出しの owner。画面は管理
- *   データを直接読まない）。累計の件数は、発行の判定と同じ数え方（`readUsedCumulativeWrites`）。上限はシナリオの今の版の値。
+ *   データを直接読まない）。累計の件数は、発行の判定と同じ数え方（`readUsedCumulativeWrites`）。上限は返さない（LZ-3c）。
  * - 書き込みのモードのプロファイル（`usesScenarios`）だけ、台帳の行を返す。ほかのプロファイルは、行を返さず `eligible` を偽にする（画面が理由を
  *   出す）。プロファイルがなければ `null`。
  * - seed の記録は、許可の ID と入力の規則の集まりの digest だけ（seed の値・基準日・試行の番号は返さない）。送った値も返さない。日時は ISO 8601。
@@ -48,15 +48,13 @@ export interface LedgerEntryView {
   };
 }
 
-/** 台帳の、シナリオごとの累計の件数と上限。 */
+/** 台帳の、シナリオごとの累計の件数（LZ-3c: 累積の上限は判定に使わない名残なので返さない）。 */
 export interface LedgerScenarioView {
   readonly scenarioId: string;
   readonly kind: ScenarioKind;
   readonly revision: number;
   /** 累計の使った件数（発行の判定と同じ数え方）。 */
   readonly used: number;
-  /** 累計の上限（今の版の値）。 */
-  readonly limit: number;
 }
 
 /** 台帳の画面の値。 */
@@ -116,7 +114,6 @@ export const auditedDataLedgerPageFn = createServerFn({ method: 'GET' })
         kind: scenario.current.kind,
         revision: scenario.revision,
         used: readUsedCumulativeWrites(localUiStore(), scenario.scenarioId, now),
-        limit: scenario.current.limits.maxCumulativeCreates,
       })),
     };
   });

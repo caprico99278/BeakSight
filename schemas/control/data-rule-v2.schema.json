@@ -9,18 +9,18 @@
     "ruleSetId": { "type": "string", "pattern": "^[a-z0-9][a-z0-9-]{0,63}$" },
     "scenarioId": { "type": "string", "pattern": "^[a-z0-9][a-z0-9-]{0,63}$" },
     "revision": { "type": "integer", "minimum": 1 },
-    "fieldRules": { "type": "array", "maxItems": 200, "items": { "$ref": "#/$defs/fieldRule" } },
-    "relations": { "type": "array", "maxItems": 200, "items": { "$ref": "#/$defs/relation" } },
-    "uniqueKeyFieldNames": { "type": "array", "uniqueItems": true, "maxItems": 200, "items": { "$ref": "#/$defs/fieldName" } },
+    "fieldRules": { "type": "array", "items": { "$ref": "#/$defs/fieldRule" } },
+    "relations": { "type": "array", "items": { "$ref": "#/$defs/relation" } },
+    "uniqueKeyFieldNames": { "type": "array", "uniqueItems": true, "items": { "$ref": "#/$defs/fieldName" } },
     "uniqueKeyOrigin": { "$ref": "#/$defs/origin" },
     "templateDefaultsSaved": { "type": "boolean" },
     "createdAt": { "$ref": "#/$defs/timestamp" }
   },
   "$defs": {
-    "fieldName": { "type": "string", "minLength": 1, "maxLength": 256 },
+    "fieldName": { "type": "string", "minLength": 1 },
     "timestamp": { "type": "string", "pattern": "^[0-9]{14}$" },
     "origin": { "enum": ["HUMAN", "INFERRED"] },
-    "rangeValue": { "type": "string", "minLength": 1, "maxLength": 512 },
+    "rangeValue": { "type": "string", "minLength": 1 },
     "range": {
       "type": "object",
       "additionalProperties": false,
@@ -82,8 +82,7 @@
         "fixedValues": {
           "type": "array",
           "uniqueItems": true,
-          "maxItems": 50,
-          "items": { "type": "string", "minLength": 1, "maxLength": 256 }
+          "items": { "type": "string", "minLength": 1 }
         },
         "origin": { "$ref": "#/$defs/origin" },
         "baseDateWindow": { "anyOf": [{ "$ref": "#/$defs/baseDateWindow" }, { "type": "null" }] },

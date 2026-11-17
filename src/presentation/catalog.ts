@@ -13,6 +13,7 @@ import type {
   PageAuditStatus,
   RunExecutionEndReason,
   RunStatus,
+  SessionLostDetail,
   Severity,
   ViewportProfile,
 } from '../core/contracts.js';
@@ -21,6 +22,7 @@ import type { AuditSendPolicyName } from '../core/audit-send-policy.js';
 import type { BeakSightBlockRelation } from '../core/beaksight-block-relation.js';
 import type { BlockedEventPhase, InteractionNotVerifiableKind, SafetyEventKind, ScreenshotCaptureType } from '../core/evidence-types.js';
 import { deepFreeze } from '../core/immutable.js';
+import { DESTRUCTIVE_ACTION_SKIPPED_TEXT } from './messages.js';
 
 /**
  * 色のトークンの名前の閉じた一覧。バッジや強調の色は、この名前で選ぶ。
@@ -304,6 +306,13 @@ export const EVIDENCE_TYPE_CATALOG = deepFreeze({
     tone: 'shield',
     description: '安全のために止めた操作の記録です。',
   },
+  // AUD-4d: 画面の外に置いた、押せる部品に、フォーカスを当てて確かめた記録。
+  focus: {
+    label: 'フォーカスの確かめ',
+    order: 14,
+    tone: 'neutral',
+    description: '画面の外に置いた部品に、キーボードで移ったときに現れるかを確かめた記録です。',
+  },
 } as const satisfies Record<EvidenceType, DisplaySpec>);
 
 export const VIEWPORT_PROFILE_CATALOG = deepFreeze({
@@ -315,6 +324,21 @@ export const SCREENSHOT_CAPTURE_TYPE_CATALOG = deepFreeze({
   VIEWPORT: { label: '表示範囲', order: 1, tone: 'neutral', description: '画面に見えている範囲です。' },
   FULL_PAGE: { label: 'ページ全体', order: 2, tone: 'neutral', description: 'ページの全体です。' },
 } as const satisfies Record<ScreenshotCaptureType, DisplaySpec>);
+
+/**
+ * AUD-1a（設計書 `doc/design/2026-11-09-beaksight-audit-precision-triage.md`）: ChatGPT 用バンドルに入れなかったファイルの理由（`manifest.json` の
+ * `omittedFiles[].reason`）の表示。値の一覧の owner は `src/report/chatgpt-bundle.ts` の `CHATGPT_BUNDLE_OMISSION_REASONS`（このファイルは core の外を import
+ * しないので、鍵の網羅は、バンドルの側の型で確かめる）。説明はバンドルの読み方の案内（`README.md`）に出す。
+ */
+export const CHATGPT_BUNDLE_OMISSION_REASON_CATALOG = deepFreeze({
+  // AUD-1d: 大きさの上限で外す理由と、再試行の前の画像を外す理由は、使わないので除いた（集めた証拠は全部入れる）。
+  ARTIFACT_FILE_NOT_FOUND: {
+    label: 'ファイルが見つからない',
+    order: 1,
+    tone: 'caution',
+    description: 'このファイルは、撮影・保存できず、成果物のフォルダにありませんでした。',
+  },
+} as const satisfies Record<string, DisplaySpec>);
 
 // ---------------------------------------------------------------------------------------------------------------
 // Safety の事象の記録の種類（Task 14〜17 の設計書 6.1.10）
@@ -352,7 +376,7 @@ export const SAFETY_EVENT_KIND_CATALOG = deepFreeze({
     tone: 'shield',
     // DEF-040（NP4）: 理由のコードごとの意味を示す（レポートは、事象の理由のコードをそのまま表示する）。
     description:
-      'WebSocket の接続を、遮断しました。理由が PASSIVE_WEBSOCKET の記録は、ページ（文書）が開いた接続を Guard が止めたものです。理由が WORKER_CONNECT_POLICY の記録は、Worker の中で開いた接続を、BeakSight が文書と Worker に加える通信の制限（CSP の connect-src）が止めたものです。この記録は観察によるもので、止めた接続のすべてが残るとは限りません。理由が AUDIT_SEND_OVER_LIMIT の記録は、ページが出す送信を通す扱いで、1 つの読み込みで通す接続の数の上限を超えたものです。',
+      'WebSocket の接続を、遮断しました。理由が PASSIVE_WEBSOCKET の記録は、ページ（文書）が開いた接続を Guard が止めたものです。理由が WORKER_CONNECT_POLICY の記録は、Worker の中で開いた接続を、BeakSight が文書と Worker に加える通信の制限（CSP の connect-src）が止めたものです。この記録は観察によるもので、止めた接続のすべてが残るとは限りません。理由が AUDIT_SEND_OVER_LIMIT の記録は、ページが出す送信を通す扱いで、1 つの読み込みで通す接続の数の上限を超えたものです。理由が WEBSOCKET_SEND_QUEUE_FULL の記録は、送る量が多すぎたため、リアルタイムの通信を 1 つ閉じたものです。',
   },
   blockedExternalActions: {
     label: '押さなかった、外への動きのある操作',
@@ -564,6 +588,26 @@ export const AUDIT_MODE_CATALOG = deepFreeze({
     description: 'テスト用のサイトで、書き込みの OK を出した操作も試します。',
   },
 } as const satisfies Record<string, DisplaySpec>);
+
+/**
+ * NL-3（設計書 `doc/design/2026-11-06-beaksight-no-login-test-site-design.md` 3.3 の 4）: ログインのないテスト用のサイト（テストの 2 つのモード × 認証の方式
+ * `NONE`）の監査モードの表示（ログインの語を出さない）。どちらを使うかは、画面の表示の部品の 1 か所（`apps/local-ui/src/display/labels.ts` の
+ * `auditModeDisplay`）が、モードと方式の組から決める。順と色は `AUDIT_MODE_CATALOG` と同じ。
+ */
+export const AUDIT_MODE_NO_LOGIN_CATALOG = deepFreeze({
+  TEST_AUTH_PASSIVE: {
+    label: 'テスト用のサイトを見るだけの点検',
+    order: AUDIT_MODE_CATALOG.TEST_AUTH_PASSIVE.order,
+    tone: AUDIT_MODE_CATALOG.TEST_AUTH_PASSIVE.tone,
+    description: 'このパソコンで動かすテスト用のサイトを、見るだけで点検します。',
+  },
+  TEST_APPROVED_WRITE: {
+    label: 'テスト用のサイトに書き込みも試す点検',
+    order: AUDIT_MODE_CATALOG.TEST_APPROVED_WRITE.order,
+    tone: AUDIT_MODE_CATALOG.TEST_APPROVED_WRITE.tone,
+    description: 'このパソコンで動かすテスト用のサイトで、書き込みの OK を出した操作も試します。',
+  },
+} as const satisfies Record<Exclude<keyof typeof AUDIT_MODE_CATALOG, 'PUBLIC_PASSIVE'>, DisplaySpec>);
 
 /** 環境の種類（`ENVIRONMENT_KINDS`）の表示。 */
 export const ENVIRONMENT_KIND_CATALOG = deepFreeze({
@@ -814,10 +858,10 @@ export const ENTRY_CHECK_END_REASON_CATALOG = deepFreeze({
     description: '開始のアドレスのページを開き、表示が落ち着いた後に、見るだけで調べました。',
   },
   LEFT_ALLOWED_ORIGINS: {
-    label: '点検してよいサイトの外へ移ろうとした',
+    label: '点検してよいサイトの外へ移った',
     order: 2,
     tone: 'caution',
-    description: '開始のアドレスのページが、点検してよいサイトの外へ移ろうとしました。BeakSight は移らずに止め、移ろうとしたサイトのアドレスだけを記録しました。外のログインのサービスへ移る形かもしれません。案は作っていません。',
+    description: '開始のアドレスのページが、点検してよいサイトの外へ移りました。点検の範囲の外なので、移った先は点検せず、移った先のサイトのアドレスだけを記録しました。外のログインのサービスへ移る形かもしれません。案は作っていません。',
   },
   READ_FAILED: {
     label: '中身を見られなかった',
@@ -881,13 +925,13 @@ export const CANDIDATE_CLASSIFICATION_CATALOG = deepFreeze({
     label: '登録（新しく作る）',
     order: 2,
     tone: 'notice',
-    description: '新しく登録する操作に見える候補です。この画面からは実行できません。書き込みも試す点検のサイトでは、書き込みの手順にして書き込みの OK を出した後に、1 件ずつ送れます。',
+    description: '新しく登録する操作に見える候補です。この画面からは実行できません。一覧「登録・更新を試せる画面」でチェックした画面だけ、点検のときに 1 件登録します。',
   },
   UPDATE: {
     label: '更新',
     order: 3,
     tone: 'notice',
-    description: '更新する操作に見える候補です。この画面からは実行できません。書き込みも試す点検のサイトでは、書き込みの手順にして書き込みの OK を出した後に、BeakSight が登録したデータを 1 件ずつ更新できます。',
+    description: '更新する操作に見える候補です。この画面からは実行できません。一覧「登録・更新を試せる画面」でチェックした画面だけ、点検のときに、BeakSight が登録したデータを 1 回更新します。',
   },
   NOT_EXECUTABLE: {
     label: '実行しない（削除など）',
@@ -929,23 +973,16 @@ export const CANDIDATE_KIND_CATALOG = deepFreeze({
 
 /** 候補の索引のドリフト（`src/control/job/discovery-index-store.ts` の `DISCOVERY_INDEX_DRIFTS`。最後の発見のジョブに対するもの）の表示。 */
 export const DISCOVERY_DRIFT_CATALOG = deepFreeze({
-  NEW: { label: '新しい', order: 1, tone: 'notice', description: '一番新しい操作さがしで、初めて見つかった候補です。' },
-  CHANGED: {
-    label: '変わった',
-    order: 2,
-    tone: 'caution',
-    description: 'その前の操作さがしから、入れる値の決まり（必須・変えられない・制約・選択肢など）、分類、理由、状態の欄の印のどれかが変わりました。',
-  },
-  UNCHANGED: { label: '変わらない', order: 3, tone: 'neutral', description: 'その前の操作さがしと同じです。' },
+  SEEN: { label: '見つかった', order: 1, tone: 'neutral', description: '一番新しい操作さがしで見つかった候補です。' },
   MISSING: {
     label: '消えた',
-    order: 4,
+    order: 2,
     tone: 'caution',
     description: '一番新しい操作さがしで見終えた画面に、この候補がありませんでした。記録は消さずに残し、前に見たときの内容を示します。',
   },
   NOT_REVISITED: {
     label: '見直していない',
-    order: 5,
+    order: 3,
     tone: 'neutral',
     description: '一番新しい操作さがしでは、この候補の画面を見ませんでした（見るページの数の上限や、見終えられなかった画面など）。前に見たときの内容を示します。',
   },
@@ -1006,15 +1043,38 @@ export const SUBMISSION_PROBE_REASON_CATALOG = deepFreeze({
   FILTER_MISSING: { label: '更新するデータの指定がない', order: 12, tone: 'critical', description: null },
   FILTER_MULTIPLE: { label: '更新するデータの指定が 2 つ以上', order: 13, tone: 'critical', description: null },
   FILTER_NOT_PAGE_VALUE: { label: '更新するデータの指定が、画面で最後に見たデータと違う', order: 14, tone: 'critical', description: null },
-  UNRECOGNIZED: { label: '新しく登録と更新のどちらの形でもない', order: 15, tone: 'critical', description: null },
+  // LU-2（設計書 `2026-11-02-beaksight-list-row-update-design.md` の K4）: 番号のある送り先への登録の送信。登録として扱わない。
+  CREATE_PATH_HAS_ID: { label: 'もうあるデータに向けた送信なので、登録として扱わない', order: 15, tone: 'critical', description: null },
+  UNRECOGNIZED: { label: '新しく登録と更新のどちらの形でもない', order: 16, tone: 'critical', description: null },
   // DEF-144: 外部のアプリ（メール・電話など）へ移るボタン。押さない（押して移ろうとしたものも、この理由にする）。
-  EXTERNAL_SCHEME: { label: 'ほかのアプリ（メールや電話など）へ移るボタンなので押さなかった', order: 16, tone: 'caution', description: null },
-  PAGE_CHANGED: { label: '押した後に画面が移った', order: 17, tone: 'caution', description: null },
-  PRESS_LIMIT_REACHED: { label: '1 画面の押す回数の上限を超えた', order: 18, tone: 'neutral', description: null },
-  TARGET_NOT_FOUND: { label: '押す前に同じボタンが見つからなかった', order: 19, tone: 'caution', description: null },
-  PRESS_FAILED: { label: '入力か押す操作が失敗した', order: 20, tone: 'caution', description: null },
+  EXTERNAL_SCHEME: { label: 'ほかのアプリ（メールや電話など）へ移るボタンなので押さなかった', order: 17, tone: 'caution', description: null },
+  // DEF-186: 一覧の行の「編集」などで、開くとサイトが自動で送る作り。登録として扱わない（開いた窓の中の保存を確かめる）。
+  OPENER_SIDE_REQUEST: { label: '開いたときにサイトが自動で送ったので、登録として扱わない', order: 18, tone: 'caution', description: null },
+  PAGE_CHANGED: { label: '押した後に画面が移った', order: 19, tone: 'caution', description: null },
+  PRESS_LIMIT_REACHED: { label: '1 画面の押す回数の上限を超えた', order: 20, tone: 'neutral', description: null },
+  TARGET_NOT_FOUND: { label: '押す前に同じボタンが見つからなかった', order: 21, tone: 'caution', description: null },
+  PRESS_FAILED: { label: '入力か押す操作が失敗した', order: 22, tone: 'caution', description: null },
   // DEF-144: 安全の違反の後に Guard が画面を閉じたので、押せなかった（画面が移ったのとは別）。
-  CONTEXT_CLOSED_BY_GUARD: { label: '安全のために画面を閉じたので押せなかった', order: 21, tone: 'caution', description: null },
+  CONTEXT_CLOSED_BY_GUARD: { label: '安全のために画面を閉じたので押せなかった', order: 23, tone: 'caution', description: null },
+  // LU-4（D7）: 一覧の行ごとの「編集」など、同じボタンは 1 つだけ押す。LU-13: 3 つの理由の文を、利用者向けの短い形にそろえた。
+  SAME_IDENTITY_PRESSED: { label: '同じボタンは 1 つだけ押すので、ここは押さなかった', order: 24, tone: 'neutral', description: null },
+  // DEF-208-2（C）: 同じ名前のボタンを押して何も起きなかったので、2 つ目からは押さない。
+  SAME_WORDS_NO_REQUEST: { label: '同じ名前のボタンを押しても何も送らなかったので、ここは押さなかった', order: 25, tone: 'neutral', description: null },
+  // DEF-208-2（D）: 押せない（灰色の）ボタン。
+  DISABLED_SUBMITTER: { label: 'ボタンが押せない状態だったので、押さなかった', order: 26, tone: 'neutral', description: null },
+  // DEF-208-4（A）: どの画面にもある枠（左の帯など）のボタン。最初の画面でだけ押す。
+  SHARED_LAYOUT_PRESSED: { label: 'どの画面にもある枠のボタンで、前の画面で押したので、ここは押さなかった', order: 27, tone: 'neutral', description: null },
+  // SREV-1105-3 の再レビューの Minor-A: 入力した後に押せなくなるボタンが多い画面。入力の回数の上限を超えたので押さなかった。
+  DISABLED_FILL_LIMIT_REACHED: { label: '入力した後にボタンが押せなくなる画面で、入力の回数の上限を超えたので、押さなかった', order: 28, tone: 'neutral', description: null },
+  // COV-2: 番号だけ違う同じ作りの画面などで、同じボタンをもう押した。
+  SAME_STATE_PRESSED: { label: '同じ作りの画面で同じボタンをもう押したので、ここは押さなかった', order: 29, tone: 'neutral', description: null },
+  // L6/L3-1（L0 の進みの見張り）: 操作さがしの 1 画面を、それまでの記録で終えたので押せなかった。
+  STAGE_UNRESPONSIVE: { label: '画面が反応しなくなったので、押せませんでした', order: 30, tone: 'caution', description: null },
+  STAGE_NEVER_QUIET: { label: '画面が落ち着かなかったので、押せませんでした', order: 31, tone: 'caution', description: null },
+  // L6/L3-1 の続き（A1）: 押す前に、ボタンがほかの表示（モーダルの窓など）に覆われていた。
+  COVERED_BY_OTHER: { label: 'ほかの表示に覆われていたので、押せませんでした', order: 32, tone: 'neutral', description: null },
+  // SD-1（設計書 `2026-11-16-beaksight-action-based-delete-guard-design.md` 2.3）: 削除に関する操作なので押さなかった（文は Interaction の理由と同じ）。
+  DESTRUCTIVE_ACTION_SKIPPED: { label: DESTRUCTIVE_ACTION_SKIPPED_TEXT, order: 33, tone: 'neutral', description: null },
 } as const satisfies Record<string, DisplaySpec>);
 
 /** 発見のジョブの終わり方（`DISCOVERY_END_REASONS`）の表示。 */
@@ -1066,6 +1126,15 @@ export const DISCOVERY_END_REASON_CATALOG = deepFreeze({
     description: '始める前の確認が失敗したため、画面を 1 つも見ていません。',
   },
 } as const satisfies Record<string, DisplaySpec>);
+
+/**
+ * DEF-233（設計書 `2026-11-09-beaksight-discovery-token-refresh-design.md` 2.3）: ジョブの終わり方の詳しい理由（`JOB_END_REASON_DETAILS`。どれもセッションの切れの
+ * 詳しい理由）の説明。画面の文は増やさず、今のセッションの切れの止まり方の文（`DISCOVERY_END_REASON_CATALOG.AUTH_SESSION_LOST`）を使う。
+ */
+export const JOB_END_REASON_DETAIL_DESCRIPTIONS = deepFreeze({
+  'session-key': DISCOVERY_END_REASON_CATALOG.AUTH_SESSION_LOST.description,
+  SERVICE_UNAUTHORIZED: DISCOVERY_END_REASON_CATALOG.AUTH_SESSION_LOST.description,
+} as const satisfies Record<SessionLostDetail, string>);
 
 /** READ の確かめの結果（`READ_CHECK_RESULTS`。期待 1 件の結果にも使う）の表示。 */
 export const READ_CHECK_RESULT_CATALOG = deepFreeze({
@@ -1252,16 +1321,16 @@ export const SCENARIO_KIND_CATALOG = deepFreeze({
  * サーバが 1 つ選ぶ）の表示。
  */
 export const SCENARIO_DISPLAY_STATE_CATALOG = deepFreeze({
-  DRAFT: { label: '下書き', order: 1, tone: 'neutral', description: 'まだ書き込みの OK を出していません。内容を確かめてから OK を出します。' },
+  DRAFT: { label: '下書き', order: 1, tone: 'neutral', description: 'まだ書き込みの OK を出していません。一覧「登録・更新を試せる画面」でチェックすると、OK になります。' },
   APPROVED: { label: 'OK を出した', order: 2, tone: 'positive', description: '今の内容で書き込みの OK を出しています（期限まで）。OK を出しただけでは、書き込みは始まりません。' },
   NEEDS_REAPPROVAL: {
     label: 'OK の出し直しが要る',
     order: 3,
     tone: 'caution',
-    description: 'OK を出した後に、OK に関わる内容が変わりました。前の OK は引き継がないので、内容を確かめてから、もう一度 OK を出します。',
+    description: 'OK を出した後に、OK に関わる内容が変わりました。前の OK は引き継がないので、一覧「登録・更新を試せる画面」で、もう一度チェックします。',
   },
-  EXPIRED: { label: '期限切れ', order: 4, tone: 'caution', description: '書き込みの OK の期限を過ぎました。使うには、内容を確かめてから、もう一度 OK を出します。' },
-  REVOKED: { label: 'OK を取り消した', order: 5, tone: 'neutral', description: '書き込みの OK を取り消しました。使うには、内容を確かめてから、もう一度 OK を出します。' },
+  EXPIRED: { label: '期限切れ', order: 4, tone: 'caution', description: '書き込みの OK の期限を過ぎました。使うには、一覧「登録・更新を試せる画面」で、もう一度チェックします。' },
+  REVOKED: { label: 'OK を取り消した', order: 5, tone: 'neutral', description: '書き込みの OK を取り消しました。使うには、一覧「登録・更新を試せる画面」で、もう一度チェックします。' },
 } as const satisfies Record<string, DisplaySpec>);
 
 /** 再承認が要る理由（`APPROVAL_INVALIDITY_REASONS`。20 種。T31b で UPDATE の 2 種、T38c で API の 2 種、T38R-fix で API の 3 種を足した）の表示。 */
@@ -1360,8 +1429,8 @@ export const APPROVAL_INVALIDITY_REASON_CATALOG = deepFreeze({
 } as const satisfies Record<string, DisplaySpec>);
 
 /**
- * 副作用の確認の項目（`SIDE_EFFECT_CONFIRMATIONS`。承認の前に人がすべて確かめる 4 項目）の表示。PL-S（設計書 `2026-10-26-beaksight-plain-ui-design.md` 7 章・9 章の 4）:
- * 説明は、確かめたことの過去形でなく、約束の中身を現在形で書く（押す前に確かめるのは承認のダイアログの文 `sideEffectsNote`）。
+ * 副作用の確認の項目（`SIDE_EFFECT_CONFIRMATIONS`。承認の記録の 4 項目）の表示。PL-S（設計書 `2026-10-26-beaksight-plain-ui-design.md` 7 章・9 章の 4）:
+ * 説明は、確かめたことの過去形でなく、約束の中身を現在形で書く（SPEC-4: 確かめるのは一覧「登録・更新を試せる画面」のチェック。承認のダイアログは外した）。
  */
 export const SIDE_EFFECT_CONFIRMATION_CATALOG = deepFreeze({
   TEST_RECORDS_ONLY: {
@@ -1448,7 +1517,7 @@ export const APPROVAL_DIGEST_ITEM_CATALOG = deepFreeze({
     label: '更新の画面のアドレスの形',
     order: 21,
     tone: 'neutral',
-    description: 'データの ID の位置を {id} にした、更新の画面のアドレスの後ろです。更新の指定がなければ null です。',
+    description: 'データの ID の位置を {id} にした、更新の画面のアドレスの後ろです。一覧から行を選んで更新するときは、一覧の画面のアドレスと、行の中の開くボタンと、行を選ぶ欄も含みます。更新の指定がなければ null です。',
   },
   updateActionPathTemplate: {
     label: '送信先のアドレスの形',
@@ -1516,7 +1585,7 @@ export const APPROVAL_DIGEST_ITEM_CATALOG = deepFreeze({
     label: '画面を通さない送信の、作ったデータの一覧の参照',
     order: 33,
     tone: 'neutral',
-    description: '更新するデータを登録した新しく登録する手順と、更新の画面のアドレスの形と、その形にした画面を見分ける中身です。画面を通さない送信で更新する手順でなければ null です。',
+    description: '更新するデータを登録した新しく登録する手順と、更新の画面のアドレスの形と、その形にした画面を見分ける中身です。一覧から行を選んで更新するときは、一覧の画面のアドレスと、行の中の開くボタンと、行を選ぶ欄も含みます。画面を通さない送信で更新する手順でなければ null です。',
   },
   // T41a: API の UPDATE の保つ鍵。
   apiKeptKeys: {
@@ -1729,58 +1798,7 @@ export const RECORD_ID_SOURCE_CATALOG = deepFreeze({
 } as const satisfies Record<string, DisplaySpec>);
 
 /**
- * T41g（Task 41 の設計書 3.5.1）: 「登録してから更新する」の状態（`apps/local-ui/src/server/write-chain-policy.ts` の `WRITE_CHAIN_STATES`）の表示。値の一覧と
- * 意味は画面のサーバが持ち、ここは表示だけを持つ。書き漏れは画面の単体のテスト（`write-chain-policy.test.ts`）と `catalog-coverage.ts` が確かめる。
- */
-export const WRITE_CHAIN_STATE_CATALOG = deepFreeze({
-  CREATING: { label: '登録中（終わったら続けて更新します）', order: 1, tone: 'notice', description: null },
-  // T41g-3: 自動ログインの最小の間隔を待っている（次に始められる時刻に、1 回だけ更新を始め直す）。
-  WAITING_LOGIN_INTERVAL: {
-    label: '自動ログインの間隔を待っています（待った後に続けて更新します）',
-    order: 2,
-    tone: 'notice',
-    description: '自動ログインどうしの最小の間隔があるため、登録のすぐ後には更新を始められません。次に始められる時刻まで待ってから、1 回だけ更新を始めます。',
-  },
-  UPDATE_STARTED: { label: '続けて更新を始めました', order: 3, tone: 'positive', description: null },
-  NOT_STARTED: { label: '更新は始めませんでした', order: 4, tone: 'caution', description: null },
-} as const satisfies Record<string, DisplaySpec>);
-
-/** T41g: 「登録してから更新する」で更新を始めなかった理由（`WRITE_CHAIN_STOP_REASONS`）の表示。 */
-export const WRITE_CHAIN_STOP_REASON_CATALOG = deepFreeze({
-  CREATE_NOT_VERIFIED: {
-    label: '登録の答え合わせが合いませんでした',
-    order: 1,
-    tone: 'caution',
-    description: '登録の作業の結果が「答え合わせが合った」でないので、そのデータは更新しません。登録の結果を確かめてください。',
-  },
-  CREATE_RECORD_ID_MISSING: {
-    label: '登録の ID が記録にありません',
-    order: 2,
-    tone: 'caution',
-    description: '登録は答え合わせが合いましたが、登録の ID が記録にないので、更新する対象を決められません。',
-  },
-  PLANNED_TARGET_MISMATCH: {
-    label: '更新の予定の対象が、登録したデータと違います',
-    order: 3,
-    tone: 'caution',
-    description: '更新の予定の対象（作ったデータの一覧で、答え合わせが合った登録の最新の 1 件）が、今登録したデータではありません。開始の画面で予定の対象を確かめてください。',
-  },
-  UPDATE_START_REJECTED: {
-    label: '更新を始められませんでした',
-    order: 4,
-    tone: 'caution',
-    description: '更新の書き込みの OK を使う準備か、作業の開始で断られました。更新の書き込みの手順の開始の画面で理由を確かめてください。',
-  },
-  CREATE_WAIT_TIMEOUT: {
-    label: '登録の作業が待つ時間の中で終わりませんでした',
-    order: 5,
-    tone: 'caution',
-    description: '登録の作業の終わりを待つ上限の時間を過ぎたので、更新は始めません。',
-  },
-} as const satisfies Record<string, DisplaySpec>);
-
-/**
- * FM2d・FM2R の Minor 3: まとめて実行の状態（`src/control/job/stage-chain-policy.ts` の `CHAIN_STATES`）の表示（書き込みの連鎖と同じ形）。書き漏れは
+ * FM2d・FM2R の Minor 3: まとめて実行の状態（`src/control/job/stage-chain-policy.ts` の `CHAIN_STATES`）の表示。書き漏れは
  * `apps/local-ui/src/display/catalog-coverage.ts` が確かめる。
  */
 export const STAGE_CHAIN_STATE_CATALOG = deepFreeze({
@@ -1922,14 +1940,14 @@ export const RULE_SOURCE_CATALOG = deepFreeze({
 /** 欄ごとの判定の状態（`FIELD_RULE_STATUSES`）の表示。 */
 export const FIELD_RULE_STATUS_CATALOG = deepFreeze({
   DECIDED: { label: '決まった', order: 1, tone: 'positive', description: null },
-  NEEDS_RULE_INPUT: { label: '決まりを選ぶ必要がある', order: 2, tone: 'caution', description: '推し量らずに止めました。この欄の入れる値の決まりを選んでください。' },
+  NEEDS_RULE_INPUT: { label: '決まりを決められない', order: 2, tone: 'caution', description: '推し量らずに止めました。この欄に入れる値を決められないので、この画面では試せません。' },
   RULE_CONFLICT: { label: '決まりがぶつかる', order: 3, tone: 'critical', description: '欄の入れられる値の範囲や、欄どうしの関係と、決まりが合いません。' },
   EXTERNAL_DELIVERY_BLOCKED: {
     label: '外に届く欄なので止めた',
     order: 4,
     tone: 'shield',
-    // MI-F4（MI-6 の後の流れ）: 副作用の確認は、承認のダイアログの 1 回の押下で入る。
-    description: 'メール・電話の欄の値は、書き込みの OK を出す確認の画面で、約束「メールや電話への知らせが送られない設定です」を確かめて OK を出すまで作りません。',
+    // SPEC-4: 副作用の確認は、一覧「登録・更新を試せる画面」のチェックが兼ねる（承認のダイアログは外した）。
+    description: 'メール・電話の欄の値は、一覧「登録・更新を試せる画面」でチェックして、知らせがだれにも届かない設定だと確かめるまで作りません。',
   },
 } as const satisfies Record<string, DisplaySpec>);
 
@@ -1965,10 +1983,11 @@ export const AUDIT_SEND_POLICY_CATALOG = deepFreeze({
     prominent: false,
   },
   PASS_EXCEPT_DELETE: {
-    label: '削除のほかを通す',
+    // SD-3（設計書 `2026-11-16-beaksight-action-based-delete-guard-design.md`）: サイトの通信は止めない。BeakSight は消す・取り消すなどの操作をしない。
+    label: 'サイトの通信を止めない',
     order: 2,
     tone: 'caution',
-    description: 'ページが出す書き込みの送信のうち、削除と危険な語の送信のほかを、サイトに届けました。',
+    description: 'ページが出す書き込みの送信を、止めずにサイトに届けました。BeakSight は、消す・取り消すなどのボタンを押しません。',
     prominent: true,
   },
 } as const satisfies Record<AuditSendPolicyName, DisplaySpec & { readonly prominent: boolean }>);

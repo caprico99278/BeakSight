@@ -156,3 +156,14 @@ export const entryCheckAuthSetupDecisionOf = ({ usesAuthSetup, hasAuthSetup, ent
   }
   return entryCheck.facts?.loginPage === true ? 'PROPOSE' : 'NOT_LOGIN_PAGE';
 };
+
+/** 手動のログインの方式（NL-3。ログインなしへ切り替える前の方式）。 */
+const MANUAL_SESSION_AUTH_STRATEGY = 'MANUAL_SESSION' satisfies AuthStrategy;
+
+/**
+ * NL-3（設計書 `2026-11-06-beaksight-no-login-test-site-design.md` 3.3 の 2）: 入口の確かめの後に、プロファイルの次の改訂をログインなし（`NONE`）で保存しようと
+ * するか。手動のログインのプロファイルで、判定が `NOT_LOGIN_PAGE`（認証の設定を使い、まだなく、読んだがログインの画面に見えなかった）のときだけ。保存できるか
+ * （`approvedTestOrigins` がすべて loopback か）は、呼ぶ側の保存の部品のプロファイルの検証（`validateSiteProfile`）が決める（規則をここに写さない）。
+ */
+export const entryCheckSwitchesToNoLogin = (auth: AuthStrategy, decision: EntryCheckAuthSetupDecision): boolean =>
+  auth === MANUAL_SESSION_AUTH_STRATEGY && decision === 'NOT_LOGIN_PAGE';

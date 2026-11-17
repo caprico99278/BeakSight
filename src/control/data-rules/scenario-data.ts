@@ -19,6 +19,7 @@
 //   （`json-value.ts`。判定が拒むので、判定の見込みを外れた値だけ。例: 絶対値が 0.000001 未満の数）、止めて `JSON_VALUE_TYPE_MISMATCH`。値を
 //   入れない欄（null）は確かめない。
 import { deepFreeze } from '../../core/immutable.js';
+import { apiKeyFieldValueTypeOf } from '../../core/json-value.js';
 import { sortedKeysJsonOf } from '../../core/sorted-keys-json.js';
 import { compareCodeUnits } from '../../core/text.js';
 import type { ScenarioApiSpec, ScenarioRevision } from '../approval/scenario-contracts.js';
@@ -117,7 +118,8 @@ const jsonMismatchKeyOf = (values: Readonly<Record<string, string | null>>, api:
   }
   return api.keyFields.find(({ key, type }) => {
     const value = values[key];
-    return typeof value === 'string' && !isJsonValueConvertible(value, type);
+    // ARR-2: 一覧の鍵（array）の値は、要素の文字（`apiKeyFieldValueTypeOf`）。
+    return typeof value === 'string' && !isJsonValueConvertible(value, apiKeyFieldValueTypeOf(type));
   })?.key ?? null;
 };
 

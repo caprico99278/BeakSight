@@ -5,44 +5,57 @@
 // 任せることも、Run Coordinator を差し替える口（`createRunCoordinator`）で確かめる。
 // R5a（中断した Run の再開の設計書 4.7、4.7.1）: 偽の Run Coordinator は、保存の終わり方（`checkpointConclusion()`）も返す。`run` が、保存の
 // セッションと止める印を Run Coordinator に渡すことと、本番の Browser の起動が Playwright の既定のシグナルの処理を止めることも確かめる。
-import { mkdtemp, readdir, readFile, rm } from 'node:fs/promises';
+import { existsSync } from 'node:fs';
+import { mkdir, mkdtemp, readdir, readFile, rm } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
-import { join } from 'node:path';
+import { join, relative } from 'node:path';
 import { unzipSync } from 'fflate';
 import { chromium } from 'playwright';
-import { afterAll, afterEach, beforeAll, describe, expect, it, vi } from 'vitest';
+import { afterAll, afterEach, beforeAll, describe, expect, it, vi, type MockInstance } from 'vitest';
 import {
   CHROMIUM_PROFILE_DIRECTORY_PREFIX,
-  CHROMIUM_GOOGLE_ENDPOINTS_REDIRECTED_ARGS,
-  CHROMIUM_GOOGLE_SERVICES_DISABLED_ARGS,
+  CHROMIUM_DISABLED_FEATURES_ARGS,
   CHROMIUM_PRELOADING_DISABLED_ARGS,
   CHROMIUM_SHARED_WORKERS_DISABLED_ARGS,
-  CHROMIUM_WEBRTC_NON_PROXIED_UDP_DISABLED_ARGS,
 } from '../../src/browser/chromium-launch.js';
 import { writeAuditRunOutputs } from '../../src/cli/audit-run.js';
-import { EXIT_CODES } from '../../src/cli/exit-codes.js';
+import { EXIT_CODES, RUN_UNAVAILABLE_EXIT_CODE } from '../../src/cli/exit-codes.js';
 import { runNoticeLines } from '../../src/cli/output.js';
 import { finishAuditRun, PRODUCTION_RUN_DEPENDENCIES, runAuditCommand } from '../../src/cli/run-command.js';
 import {
+  CHECKPOINT_ARTIFACT_DIRECTORY,
   RUN_ARTIFACT_FILE_NAMES,
   artifactFilePath,
   bundleFileName,
+  checkpointArtifactRelativePath,
   isBundleFileName,
   runArtifactDirectory,
 } from '../../src/core/artifact-layout.js';
-import type { PageAuditResult, RunSummary } from '../../src/core/contracts.js';
+import type { AuditRunResult, PageAuditResult, RunSummary } from '../../src/core/contracts.js';
 import { deriveRunStatus } from '../../src/core/status.js';
+import type { RunCheckpoint } from '../../src/orchestration/run-checkpoint.js';
 import { RunCheckpointSession } from '../../src/orchestration/run-checkpoint-session.js';
 import {
+  RunResumeUnavailableError,
   SITE_UNAVAILABLE_RECHECK_DELAYS_MS,
   type RunCoordinatorCheckpointConclusion,
   type RunCoordinatorDependencies,
   type RunNotice,
+  type RunResumeUnavailableReason,
 } from '../../src/orchestration/run-coordinator.js';
 import { RUN_STATUS_CATALOG } from '../../src/presentation/catalog.js';
-import { CLI_TEXT, labelWithCodeText } from '../../src/presentation/messages.js';
-import { auditRun } from '../helpers/audit-run-fixture.js';
+import {
+  CLI_TEXT,
+  HTML_REPORT_TEXT,
+  checkpointStoreFailedText,
+  finishedCheckpointCleanupFailedText,
+  labelWithCodeText,
+} from '../../src/presentation/messages.js';
+import { ArtifactWriteError, ArtifactWriter } from '../../src/report/artifact-writer.js';
+import { CHATGPT_BUNDLE_FILE_NAMES, type ChatGptBundleManifest } from '../../src/report/chatgpt-bundle.js';
+import { auditRun, edgeCaseAuditRun, FIXTURE_RUN_ID } from '../helpers/audit-run-fixture.js';
 import { fakePersistentChromium } from '../helpers/fake-persistent-chromium.js';
+import { sampleRunCheckpoint, sampleRunCheckpointPage } from '../helpers/run-checkpoint-samples.js';
 import { captureCliOutput } from '../helpers/run-harness.js';
 import { createTestConfig } from '../helpers/test-config.js';
 
@@ -193,6 +206,25 @@ describe('writeAuditRunOutputs: the profile name in the bundle name (PRE42-BN)',
   });
 });
 
+// AUD-1c（設計書 `2026-11-09-beaksight-audit-precision-triage.md`）: 本番の書き出し（`writeAuditRunOutputs`）は、発表の前に参照先があるかを確かめてから
+// 表示用モデルを作る。欠けの数は `null` でなく、HTML とバンドルは同じ数を示す。見本の Run の画像は書き出されない（`writeRun` は画像を書かない）ので、5 枚が欠ける。
+describe('writeAuditRunOutputs: the references are checked before publishing (AUD-1c)', () => {
+  it('shows the same missing count, not null, in the report and in the bundle', async () => {
+    const outputDirectory = join(workDirectory, 'checked-references');
+    const result = edgeCaseAuditRun();
+    const outputs = await writeAuditRunOutputs(result, outputDirectory);
+    const runDirectory = runArtifactDirectory(outputDirectory, outputs.runId);
+    const [bundleName] = (await readdir(runDirectory)).filter(isBundleFileName);
+    const entries = unzipSync(new Uint8Array(await readFile(join(runDirectory, bundleName ?? ''))));
+    const manifest = JSON.parse(Buffer.from(entries[CHATGPT_BUNDLE_FILE_NAMES.manifest] ?? new Uint8Array()).toString('utf8')) as ChatGptBundleManifest;
+
+    expect(manifest.missingArtifactCount).toBe(5);
+    expect(manifest.omittedFiles.filter(({ reason }) => reason === 'ARTIFACT_FILE_NOT_FOUND')).toHaveLength(5);
+    const html = await readFile(join(runDirectory, RUN_ARTIFACT_FILE_NAMES.report), 'utf8');
+    expect(html).toContain(HTML_REPORT_TEXT.record.missingArtifacts('5'));
+  });
+});
+
 describe('runAuditCommand: the production run hands the confirmed Run to finishAuditRun (R17r Minor-2)', () => {
   const failingLaunch = async (): Promise<never> => {
     throw new Error('browser launch is not allowed in this test');
@@ -306,6 +338,231 @@ describe('runAuditCommand: the production run hands the confirmed Run to finishA
   });
 });
 
+// R5a（中断した Run の再開の設計書 4.7.1）: Run の後の保存の終わり方（`FINISH`・`ABANDON`・`NONE`）、`finish` と片付けの失敗、Run Coordinator の
+// 例外、再開を始められない理由を、偽の Run Coordinator で確かめる（Browser を起動しない。SLIM-GROUP で `tests/integration/cli-resume.test.ts` から移した）。
+describe('R5a: after the Run, the CLI follows the checkpoint conclusion of the Run Coordinator (resumable run design 4.7.1)', () => {
+  interface FakeRun {
+    readonly outcome: { readonly code: number; readonly stdout: string; readonly stderr: string } | null;
+    readonly rejection: unknown;
+    readonly runDirectory: string;
+    readonly finish: MockInstance<RunCheckpointSession['finish']>;
+    readonly abandon: MockInstance<RunCheckpointSession['abandon']>;
+  }
+
+  interface FakeRunOptions {
+    /** 偽の `run()` で、CLI の保存のセッションを始め、ページの保存と状態の保存を1回ずつ書く。 */
+    readonly startSession: boolean;
+    readonly conclusion: RunCoordinatorCheckpointConclusion;
+    /** 偽の `run()` の終わり方（省略すると、見本の Run（COMPLETE）を返す）。 */
+    readonly run?: (runDirectory: string) => Promise<AuditRunResult>;
+    /** 保存のセッションの `finish` を、実際には行わずに失敗させる。 */
+    readonly failFinish?: boolean;
+  }
+
+  afterEach(() => {
+    vi.restoreAllMocks();
+  });
+
+  const failingLaunch = async (): Promise<never> => {
+    throw new Error('browser launch is not allowed in this test');
+  };
+
+  /** Run のディレクトリの `checkpoint/` の下のファイルの、`checkpoint/` からの相対パス（区切りは `/`。名前の順）。 */
+  async function checkpointFilesIn(runDirectory: string): Promise<string[]> {
+    const directory = artifactFilePath(runDirectory, CHECKPOINT_ARTIFACT_DIRECTORY);
+    if (!existsSync(directory)) {
+      return [];
+    }
+    const entries = await readdir(directory, { recursive: true, withFileTypes: true });
+    return entries
+      .filter((entry) => entry.isFile())
+      .map((entry) => relative(directory, join(entry.parentPath, entry.name)).split('\\').join('/'))
+      .sort();
+  }
+
+  const readState = async (runDirectory: string): Promise<RunCheckpoint> =>
+    JSON.parse(await readFile(artifactFilePath(runDirectory, checkpointArtifactRelativePath('state')), 'utf8')) as RunCheckpoint;
+
+  /** 偽の Run Coordinator で `run` を行う。CLI が作った保存のセッションの `finish` と `abandon` を見張る。 */
+  async function runWithFakeCoordinator(name: string, options: FakeRunOptions): Promise<FakeRun> {
+    const config = createTestConfig('http://127.0.0.1:9', '/', { output: { directory: join(workDirectory, name) } });
+    const runDirectory = runArtifactDirectory(join(workDirectory, name), FIXTURE_RUN_ID);
+    let finish: MockInstance<RunCheckpointSession['finish']> | undefined;
+    let abandon: MockInstance<RunCheckpointSession['abandon']> | undefined;
+    const stdout = captureCliOutput();
+    const stderr = captureCliOutput();
+    let outcome: FakeRun['outcome'] = null;
+    let rejection: unknown = null;
+    try {
+      const code = await runAuditCommand(config, { stdout: stdout.output, stderr: stderr.output }, {
+        launchBrowser: failingLaunch,
+        clock: () => new Date(),
+        now: () => Date.now(),
+        createRunCoordinator: (coordinatorDependencies: RunCoordinatorDependencies) => {
+          const session = coordinatorDependencies.checkpointSession as RunCheckpointSession;
+          expect(session).toBeInstanceOf(RunCheckpointSession);
+          finish = vi.spyOn(session, 'finish');
+          if (options.failFinish === true) {
+            finish.mockRejectedValueOnce(new Error('simulated failure of the final checkpoint'));
+          }
+          abandon = vi.spyOn(session, 'abandon');
+          return {
+            run: async () => {
+              if (options.startSession) {
+                await mkdir(runDirectory, { recursive: true });
+                await expect(session.start(runDirectory, { mode: 'NEW_RUN' })).resolves.toEqual({ ok: true });
+                await session.savePage(sampleRunCheckpointPage());
+                await session.saveState(sampleRunCheckpoint({ startPageFinished: true }));
+              }
+              return options.run === undefined ? auditRun() : options.run(runDirectory);
+            },
+            checkpointConclusion: () => options.conclusion,
+          };
+        },
+      });
+      outcome = { code, stdout: stdout.text(), stderr: stderr.text() };
+    } catch (error) {
+      rejection = error;
+    }
+    if (finish === undefined || abandon === undefined) {
+      throw new Error('the fake Run Coordinator was not created');
+    }
+    return { outcome, rejection, runDirectory, finish, abandon };
+  }
+
+  /**
+   * `FINISH` の終わり方。`finishEvenIfOutputFails`（出力の書き出しに失敗しても `finish` を行うか。R7c）は、省略すると偽（違反のない Run）。
+   * 出力の書き出しに失敗した場合の保存の終わり方（4 つの終わり方のすべて）は、`tests/unit/cli.test.ts` で確かめる（TEST-SLIM J2）。
+   */
+  const finishConclusion = (state: 'FINISHED' | 'STOPPED', finishEvenIfOutputFails = false): RunCoordinatorCheckpointConclusion =>
+    ({ action: 'FINISH', checkpoint: sampleRunCheckpoint({ state }), finishEvenIfOutputFails });
+
+  it('FINISH with FINISHED: finishes the session with the final checkpoint, then leaves only state.json', async () => {
+    const finalCheckpoint = sampleRunCheckpoint({ state: 'FINISHED' });
+    const fake = await runWithFakeCoordinator('after-finish-finished', {
+      startSession: true,
+      conclusion: { action: 'FINISH', checkpoint: finalCheckpoint, finishEvenIfOutputFails: false },
+    });
+
+    expect(fake.outcome?.code).toBe(EXIT_CODES.COMPLETE);
+    expect(fake.outcome?.stderr).toBe('');
+    expect(fake.finish).toHaveBeenCalledTimes(1);
+    expect(fake.finish).toHaveBeenCalledWith(finalCheckpoint);
+    expect(fake.abandon).not.toHaveBeenCalled();
+    expect(await checkpointFilesIn(fake.runDirectory)).toEqual(['state.json']);
+    expect(await readState(fake.runDirectory)).toEqual(sampleRunCheckpoint({ state: 'FINISHED' }));
+    // 出力は、保存の終わりの前に書いた。
+    expect(existsSync(artifactFilePath(fake.runDirectory, RUN_ARTIFACT_FILE_NAMES.report))).toBe(true);
+  });
+
+  it('FINISH with STOPPED: finishes the session, and keeps the page checkpoints and state.prev.json for the resume', async () => {
+    const fake = await runWithFakeCoordinator('after-finish-stopped', { startSession: true, conclusion: finishConclusion('STOPPED') });
+
+    expect(fake.outcome?.code).toBe(EXIT_CODES.COMPLETE);
+    expect(fake.finish).toHaveBeenCalledTimes(1);
+    expect(fake.abandon).not.toHaveBeenCalled();
+    expect(await checkpointFilesIn(fake.runDirectory)).toEqual(['pages/PAGE-000001.json', 'state.json', 'state.prev.json']);
+    expect((await readState(fake.runDirectory)).state).toBe('STOPPED');
+  });
+
+  it('ABANDON: abandons the session after writing the output, and keeps the checkpoint', async () => {
+    const fake = await runWithFakeCoordinator('after-abandon', { startSession: true, conclusion: { action: 'ABANDON' } });
+
+    expect(fake.outcome?.code).toBe(EXIT_CODES.COMPLETE);
+    expect(fake.outcome?.stderr).toBe('');
+    expect(fake.abandon).toHaveBeenCalledTimes(1);
+    expect(fake.finish).not.toHaveBeenCalled();
+    expect(await checkpointFilesIn(fake.runDirectory)).toEqual(['pages/PAGE-000001.json', 'state.json']);
+    expect((await readState(fake.runDirectory)).state).toBe('IN_PROGRESS');
+  });
+
+  it('NONE: neither finishes nor abandons the session', async () => {
+    const fake = await runWithFakeCoordinator('after-none', { startSession: false, conclusion: { action: 'NONE' } });
+
+    expect(fake.outcome?.code).toBe(EXIT_CODES.COMPLETE);
+    expect(fake.outcome?.stderr).toBe('');
+    expect(fake.finish).not.toHaveBeenCalled();
+    expect(fake.abandon).not.toHaveBeenCalled();
+    expect(await checkpointFilesIn(fake.runDirectory)).toEqual([]);
+  });
+
+  it('warns on stderr when the final checkpoint cannot be written, abandons the session, and keeps the exit code of the Run Status', async () => {
+    const fake = await runWithFakeCoordinator('after-finish-failure', {
+      startSession: true,
+      conclusion: finishConclusion('FINISHED'),
+      failFinish: true,
+    });
+
+    expect(fake.outcome?.code).toBe(EXIT_CODES.COMPLETE);
+    expect(fake.outcome?.stderr.split('\n')).toContain(CLI_TEXT.resume.finishFailed);
+    expect(fake.finish).toHaveBeenCalledTimes(1);
+    expect(fake.abandon).toHaveBeenCalledTimes(1);
+    expect(fake.abandon.mock.invocationCallOrder[0]).toBeGreaterThan(fake.finish.mock.invocationCallOrder[0] ?? Number.POSITIVE_INFINITY);
+    // 片付けもしない（保存の状態は、最後に書けた IN_PROGRESS のまま）。
+    expect(await checkpointFilesIn(fake.runDirectory)).toEqual(['pages/PAGE-000001.json', 'state.json']);
+  });
+
+  it('warns on stderr with the path when the checkpoint files of the finished Run cannot be removed, and keeps the exit code', async () => {
+    const blockedPath = join(workDirectory, 'after-cleanup-failure', 'blocked-path');
+    const cleanUp = vi.spyOn(ArtifactWriter.prototype, 'removeFinishedCheckpointFiles')
+      .mockRejectedValueOnce(new ArtifactWriteError(blockedPath, new Error('EBUSY: resource busy or locked')));
+
+    const fake = await runWithFakeCoordinator('after-cleanup-failure', { startSession: true, conclusion: finishConclusion('FINISHED') });
+
+    expect(fake.outcome?.code).toBe(EXIT_CODES.COMPLETE);
+    expect(cleanUp).toHaveBeenCalledWith(fake.runDirectory);
+    expect(fake.outcome?.stderr.split('\n')).toContain(finishedCheckpointCleanupFailedText(blockedPath));
+    expect(fake.finish).toHaveBeenCalledTimes(1);
+    expect(fake.abandon).not.toHaveBeenCalled();
+  });
+
+  it.each([
+    ['ABANDON', 1],
+    ['NONE', 0],
+  ] as const)('rejects with the unexpected error of the Run Coordinator, abandoning the session only for %s', async (action, abandons) => {
+    const unexpected = new Error('unexpected failure of the Run Coordinator');
+    const fake = await runWithFakeCoordinator(`after-unexpected-${action.toLowerCase()}`, {
+      startSession: action === 'ABANDON',
+      conclusion: { action },
+      run: async () => {
+        throw unexpected;
+      },
+    });
+
+    expect(fake.rejection).toBe(unexpected);
+    expect(fake.abandon).toHaveBeenCalledTimes(abandons);
+    expect(fake.finish).not.toHaveBeenCalled();
+  });
+
+  it.each([
+    ['CHECKPOINT_STORE_FAILED', checkpointStoreFailedText],
+  ] as const satisfies readonly (readonly [RunResumeUnavailableReason, (runId: string) => string])[])(
+    'exits with 4 with the message for %s when the resume cannot start, writing no output',
+    async (reason, text) => {
+      const name = `resume-unavailable-${reason.toLowerCase()}`;
+      const cause = new Error('EACCES: permission denied, open checkpoint/state.json');
+      const fake = await runWithFakeCoordinator(name, {
+        startSession: false,
+        conclusion: { action: 'NONE' },
+        run: async (runDirectory) => {
+          throw new RunResumeUnavailableError({ runId: FIXTURE_RUN_ID, runDirectory, reason, cause });
+        },
+      });
+
+      expect(fake.outcome?.code).toBe(RUN_UNAVAILABLE_EXIT_CODE);
+      const lines = fake.outcome?.stderr.split('\n') ?? [];
+      expect(lines[0]).toBe(text(FIXTURE_RUN_ID));
+      expect(lines).toContain(`${CLI_TEXT.detailsHeading}:`);
+      expect(lines.filter((line) => line.includes(cause.message))).toHaveLength(1);
+      // 出力を作らない（結果の要約も示さない）。
+      expect(fake.outcome?.stdout).not.toContain(CLI_TEXT.run.resultHeading);
+      expect(existsSync(join(workDirectory, name))).toBe(false);
+      expect(fake.finish).not.toHaveBeenCalled();
+      expect(fake.abandon).not.toHaveBeenCalled();
+    },
+  );
+});
+
 // R5a（中断した Run の再開の設計書 4.7）: Playwright の既定のシグナルの処理を止める。Ctrl+C などで、Playwright が Browser を閉じて
 // プロセスを終えると、最後の処理（出力の書き出し）が行われないため（シグナルは、R5b で BeakSight が受ける）。
 // R7a（中断した Run の再開の設計書 4.10。RR の Critical-1）: headless と headed の両方で、Playwright に同梱の Chromium の `channel: 'chromium'`
@@ -315,18 +572,14 @@ describe('runAuditCommand: the production run hands the confirmed Run to finishA
 // `src/browser/chromium-launch.ts` の1か所にあり、先読みが止まることは tests/integration/preloading-disabled.test.ts で確かめる。
 // DEF-044（NP5）: Shared Worker を無効にする起動の引数（`CHROMIUM_SHARED_WORKERS_DISABLED_ARGS`）も渡す。効くことは、
 // tests/integration/safety-gates.test.ts の GATE-S01 の Shared Worker の場面で確かめる。
-// DEF-070: Chromium 自身の Google への接続を止める起動の引数（`CHROMIUM_GOOGLE_SERVICES_DISABLED_ARGS`。Playwright の既定の
-// `--disable-features` の値を含む1つの引数）と、起動のときの ListAccounts と GCM の checkin の向け先を、使われないローカルの宛先に変える
-// 引数（`CHROMIUM_GOOGLE_ENDPOINTS_REDIRECTED_ARGS`）も渡す。効くことは、tests/integration/chromium-google-connections.test.ts で、実際に渡った値は
+// `--disable-features` の 1 つの引数（`CHROMIUM_DISABLED_FEATURES_ARGS`。Playwright の既定の値を含む）も渡す。実際に渡った値は
 // tests/integration/preloading-disabled.test.ts で確かめる。
-// DEF-124: WebRTC の中継を通らない UDP を止める起動の引数（`CHROMIUM_WEBRTC_NON_PROXIED_UDP_DISABLED_ARGS`）も渡す。効くことは、
-// tests/integration/webrtc-egress-blocked.test.ts で確かめる。
 describe('PRODUCTION_RUN_DEPENDENCIES: the browser launch does not let Playwright handle the signals', () => {
   afterEach(() => {
     vi.restoreAllMocks();
   });
 
-  it.each([true, false])('launches Chromium with headless %s, with the channel chromium, with the args that stop preloading, stop the Google connections of Chromium itself, disable Shared Workers and stop the non-proxied UDP of WebRTC, and with handleSIGINT, handleSIGTERM and handleSIGHUP false', async (headless) => {
+  it.each([true, false])('launches Chromium with headless %s, with the channel chromium, with the args that stop preloading and disable Shared Workers, and with handleSIGINT, handleSIGTERM and handleSIGHUP false', async (headless) => {
     // EL-12: 起動は、外部のアプリの起動を止める起動の部品（一時のプロファイルの `launchPersistentContext`）で、値はそのまま渡す。
     const fake = fakePersistentChromium();
     const launch = vi.spyOn(chromium, 'launchPersistentContext').mockResolvedValue(fake.context);
@@ -341,10 +594,8 @@ describe('PRODUCTION_RUN_DEPENDENCIES: the browser launch does not let Playwrigh
       channel: 'chromium',
       args: [
         ...CHROMIUM_PRELOADING_DISABLED_ARGS,
-        ...CHROMIUM_GOOGLE_SERVICES_DISABLED_ARGS,
-        ...CHROMIUM_GOOGLE_ENDPOINTS_REDIRECTED_ARGS,
+        ...CHROMIUM_DISABLED_FEATURES_ARGS,
         ...CHROMIUM_SHARED_WORKERS_DISABLED_ARGS,
-        ...CHROMIUM_WEBRTC_NON_PROXIED_UDP_DISABLED_ARGS,
       ],
       handleSIGINT: false,
       handleSIGTERM: false,

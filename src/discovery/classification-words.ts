@@ -55,7 +55,116 @@ export const DISCOVERY_DESTRUCTIVE_WORDS = Object.freeze([
   '抹消',
   '中止',
   'ログアウト',
+  // DEF-210（通知の枠の設計書 3.2.1 の 5。SREV-1106 の I-2）: ログオフ・サインアウト・sign off（区切りを除いた形でも比べる）。
+  'signoff',
+  'sign-off',
+  'ログオフ',
+  'サインアウト',
 ] as const);
+
+/**
+ * SD-1（設計書 `2026-11-16-beaksight-action-based-delete-guard-design.md` 2.2。設計者の判断 2026-11-16）: 巡回の移る先の URL の path と query に、既定の除外の語
+ * （`DEFAULT_EXCLUDED_URL_WORDS`）に足して当てる語（区切りが `_` のログアウトの語。URL は区切りを除かずにも比べるので書く）。操作の前の判定の足す語
+ * （`DESTRUCTIVE_ACTION_EXTRA_WORDS`）の一部。
+ */
+export const DESTRUCTIVE_ACTION_URL_EXTRA_WORDS = Object.freeze(['sign_out', 'log_out'] as const);
+
+/**
+ * REV-SD2 の I-2・M-5（設計者の判断 2026-11-16）: ログオフ・サインオフの英語の形（語の境界で比べる）。巡回の移る先の URL・リンクの文字・ボタンの操作の前の判定に
+ * 当てる。監査の段の送信の扱いの危険な語（`DESTRUCTIVE_ACTION_URL_EXTRA_WORDS` を使う `src/orchestration/audit-send-options.ts`）には入れない（通信の層の一覧を
+ * 変えない）。
+ */
+export const DESTRUCTIVE_ACTION_LOGOFF_WORDS = Object.freeze([
+  'logoff',
+  'log-off',
+  'log_off',
+  'log off',
+  'signoff',
+  'sign-off',
+  'sign_off',
+  'sign off',
+] as const);
+
+/**
+ * REV-SD2 の M-7: 巡回の移る先の URL の path と query にだけ足す、削除・取り消しの名詞（語の境界で比べると `cancel`・`delete`・`remove` に当たらない形）。
+ * ボタンとリンクの文字には当てない（「Cancellation policy」などを止めない）。
+ */
+export const CRAWL_URL_EXTRA_NOUN_WORDS = Object.freeze(['cancellation', 'deletion', 'removal'] as const);
+
+/**
+ * REV-EV12 の M-3（設計者の判断 2026-11-16）: 巡回の URL の名詞（`CRAWL_URL_EXTRA_NOUN_WORDS`）の直後の語（同じ区切りの中か、次の区切り）がこの案内の語なら当てない
+ * （`/help/cancellation-policy`・`/deletion/faq` の案内の画面へは移る）。リンクの文字の名詞の続く語（`DESTRUCTIVE_WORD_NOUN_SUFFIXES`）と同じ考え方。
+ */
+export const CRAWL_URL_NOUN_GUIDE_WORDS = Object.freeze([
+  'policy', 'policies', 'guide', 'guides', 'faq', 'faqs', 'help', 'about', 'terms', 'info', 'information', 'howto',
+] as const);
+
+/**
+ * SD-1（設計書 2.2。設計者の判断 2026-11-16）: 操作の前の判定（`src/discovery/destructive-action.ts`）だけが、危険な語（`DISCOVERY_DESTRUCTIVE_WORDS`）に足して
+ * 当てる語（ゴミ箱・空にする・クリア・リセット・初期化・取り下げと、`DESTRUCTIVE_ACTION_URL_EXTRA_WORDS`）。危険な語の一覧は変えない（READ の送る値の確かめ・
+ * 欄の名前の判定・候補の `submitterWords` と識別の digest は、今までどおり危険な語の一覧だけを使う）。比べ方は危険な語と同じ。
+ */
+export const DESTRUCTIVE_ACTION_EXTRA_WORDS = Object.freeze([
+  'clear',
+  'trash',
+  ...DESTRUCTIVE_ACTION_URL_EXTRA_WORDS,
+  ...DESTRUCTIVE_ACTION_LOGOFF_WORDS,
+  'ゴミ箱',
+  '空にする',
+  'クリア',
+  'リセット',
+  '初期化',
+  '取り下げ',
+  '取下',
+  // REV-SD の I-3（設計者の判断 2026-11-16）: 非表示・撤回・解除・退出と、英語の unfollow・unlink・disconnect・close account（deactivate・unsubscribe は
+  // 危険な語にある）。英語の hide と日本語の「止め」は、止めすぎになるので入れない。
+  '非表示',
+  '撤回',
+  '解除',
+  '退出',
+  'unfollow',
+  'unlink',
+  'disconnect',
+  'close account',
+  // REV-SD2 の M-5（設計者の判断 2026-11-16）: 消す・脱退・unregister・uninstall・opt out・サインオフ（ログオフ・log off・logoff・sign off は上の URL の語と
+  // 危険な語にある）。「外す」「Leave」「抜ける」「さくじょ」は入れない（止めすぎ・まれ）。
+  '消す',
+  '脱退',
+  'unregister',
+  'uninstall',
+  'opt out',
+  'サインオフ',
+] as const);
+
+/**
+ * REV-SD の M-2（設計者の判断 2026-11-16）: リンクの文字に当てる日本語の動きの語（英語は、巡回の URL と同じ狭い一覧）。アーカイブ・ゴミ箱・キャンセルのような
+ * 名詞は入れない（読むだけの一覧の画面へのリンクが多いため）。
+ */
+export const DESTRUCTIVE_LINK_TEXT_JA_WORDS = Object.freeze([
+  '削除', '消去', '退会', '解約', 'ログアウト', 'サインアウト', '取り消', '取消',
+  // REV-SD2 の I-2。
+  'ログオフ', 'サインオフ',
+] as const);
+
+/**
+ * REV-SD の M-2: リンクの文字で、日本語の語の直後がこの語なら当てない（「削除済みの項目」「キャンセル一覧」「取り消し履歴」「停止中のユーザー」「キャンセルポリシー」。
+ * 語の直後の送り仮名「し」は飛ばして見る）。
+ */
+export const DESTRUCTIVE_WORD_NOUN_SUFFIXES = Object.freeze([
+  '済', '一覧', '履歴', '中', 'ポリシー',
+  // REV-SD2 の M-6: 「削除の手順の説明」「退会について」「解約の方法」「ログアウトできない場合」「削除依頼について」。
+  'の', 'について', '方法', 'できない', '依頼',
+] as const);
+
+/** REV-SD の M-2: 日本語の語の直後で、名詞の続く語を見る前に飛ばす送り仮名（「取り消し履歴」の「し」）。 */
+export const DESTRUCTIVE_WORD_SKIPPED_OKURIGANA = 'し';
+
+/**
+ * SD-1（設計書 2.2 の「キャンセル」）: 名前がこの語だけのボタンは、枠（dialog・region）の閉じる場所にあり、枠の名前が壊す操作の目的語（予約・注文など。
+ * `NOTIFICATION_CLOSE_DESTRUCTIVE_OBJECT_WORDS`）でも削除の語でもないときだけ、枠を閉じる操作とみなす（判定は `src/discovery/destructive-action.ts`）。
+ * どの語も危険な語（`DISCOVERY_DESTRUCTIVE_WORDS`）に含まれる。
+ */
+export const DESTRUCTIVE_CLOSE_CANCEL_WORDS = Object.freeze(['cancel', 'キャンセル'] as const);
 
 /** 検索の語。POST の候補の、ボタンの文言か送信先の path に当たれば、扱えない読み取り（`UNSUPPORTED_READ_TRANSPORT`）にする。 */
 export const DISCOVERY_SEARCH_WORDS = Object.freeze([
@@ -87,6 +196,14 @@ export const DISCOVERY_UPDATE_WORDS = Object.freeze([
   '修正',
 ] as const);
 
+/**
+ * DEF-186（設計書 `2026-11-02-beaksight-list-row-update-design.md` 4.0.1 の K2、5.1 の 4）: 開き手の語（一覧の行の「編集」など、押すと入力の窓を開くボタンの語）。
+ * どれも更新の語（`DISCOVERY_UPDATE_WORDS`）でもあり、候補の `submitterWords` に載る（送信ボタンの語の閉じた一覧には重ねて足さない）。登録の語がなく
+ * この語だけを持つ候補の押下が登録の形（`API_CREATE`）を出したら、開くとサイトが自動で送る要求として登録にしない（`submission-probe-contracts.ts` の
+ * `isOpenerOnlySubmitter`）。削除の語のある候補は開き手にしない。語を足すときは、この 1 か所に足す。
+ */
+export const DISCOVERY_OPENER_WORDS = Object.freeze(['編集', '修正', 'edit'] as const);
+
 /** 登録の語（表示だけの `CREATE`）。 */
 export const DISCOVERY_CREATE_WORDS = Object.freeze([
   'create',
@@ -109,6 +226,14 @@ export const DISCOVERY_CREATE_PAGE_LINK_WORDS = Object.freeze([
   ...DISCOVERY_CREATE_WORDS,
   '新しく',
 ] as const);
+
+/**
+ * DEF-208-2（設計書 `2026-11-05-beaksight-discovery-coverage-design.md` 3.2）: 行を足す語（「追加」「新規」など、押すと行や入力の窓を足すだけのことが多いボタンの
+ * 語）。どれも登録の語（`DISCOVERY_CREATE_WORDS`）でもある部分集合で、候補の `submitterWords` に載る（送信ボタンの語の閉じた一覧には重ねて足さない。開き手の語
+ * `DISCOVERY_OPENER_WORDS` が更新の語の部分集合であるのと同じ作り）。使うのは、送らずに観察する probe の押す順（`submission-probe-contracts.ts` の
+ * `pressRankOf`。確定の語を先に押す）だけ。語を足すときは、この 1 か所に足す。
+ */
+export const DISCOVERY_ROW_ADD_WORDS = Object.freeze(['add', 'new', 'create', '追加', '新規', '作成'] as const satisfies readonly (typeof DISCOVERY_CREATE_WORDS)[number][]);
 
 /**
  * 送信ボタンの語の閉じた一覧（T27R-fix-1。DEF-086）: 危険な語、検索の語、更新の語、登録の語を、この順に並べたもの。候補は送信ボタンの文言を持たず、
@@ -377,4 +502,124 @@ export const DISCOVERY_LOGOUT_GENERAL_WORDS = Object.freeze([
   'dropdown',
   'admin',
   'app',
+] as const);
+
+/**
+ * 通知の枠の閉じる語（設計書 `2026-11-06-beaksight-notification-overlay-design.md` 3.1 の 3）。押せる要素の名前（見える文字・`aria-label`・`title`）が
+ * この語に当たれば、閉じるボタンとみなす（比べ方は `src/interaction/notification-overlay.ts` の `isNotificationCloseName`。英語の語は語の境界、
+ * 日本語の語は部分一致）。どのサイトにも当てはまる一般の語だけを置き、サイトの文言は入れない。語を足すときは、この 1 か所に足す。
+ */
+export const NOTIFICATION_CLOSE_WORDS = Object.freeze(['閉じる', 'とじる', 'close', 'dismiss'] as const);
+
+/** 通知の枠の閉じる記号（設計書 3.1 の 3）。名前が、空白を除いてこの記号だけのとき、閉じるボタンとみなす。 */
+export const NOTIFICATION_CLOSE_SYMBOLS = Object.freeze(['×', '✕', '✖'] as const);
+
+/**
+ * 通知の枠の閉じる語の、汎用の目的語の閉じた一覧（設計書 3.2.1 の 5。「〈目的語〉を閉じる」「Close 〈目的語〉」の目的語）。どのサイトにも当てはまる一般の語だけを
+ * 置き、サイトの文言は入れない。比べ方は `src/interaction/notification-overlay.ts` の `isNotificationCloseName`（日本語は語そのもの、英語は語か複数形）。
+ */
+/**
+ * fix round 3（通知の枠の設計書 3.2.2 の 3）: 壊す操作の目的語の閉じた一覧（「アカウントを閉じる」「Close account」の目的語）。枠の名前と同じ目的語でも、この一覧に当たれば
+ * 閉じる語として当てない。英語は語か複数形、日本語は部分一致で比べる。サイトの文言は入れない。
+ */
+export const NOTIFICATION_CLOSE_DESTRUCTIVE_OBJECT_PAIRS = Object.freeze([
+  // fix round 4（通知の枠の設計書 3.2.3 の 2）: 日本語と英語の対で持つ（対が揃うことは、単体のテストで確かめる）。
+  Object.freeze(['アカウント', 'account'] as const),
+  Object.freeze(['口座', 'account'] as const),
+  Object.freeze(['契約', 'contract'] as const),
+  Object.freeze(['会員', 'membership'] as const),
+  Object.freeze(['サブスクリプション', 'subscription'] as const),
+  Object.freeze(['チケット', 'ticket'] as const),
+  Object.freeze(['注文', 'order'] as const),
+  Object.freeze(['申込', 'application'] as const),
+  Object.freeze(['申し込み', 'application'] as const),
+  Object.freeze(['予約', 'booking'] as const),
+  Object.freeze(['プラン', 'plan'] as const),
+  Object.freeze(['ワークスペース', 'workspace'] as const),
+  Object.freeze(['プロジェクト', 'project'] as const),
+  Object.freeze(['案件', 'case'] as const),
+  Object.freeze(['ルーム', 'room'] as const),
+  Object.freeze(['チャンネル', 'channel'] as const),
+] as const);
+
+/** 壊す操作の目的語の平らな一覧（対の語を、重ねずに並べたもの）。 */
+export const NOTIFICATION_CLOSE_DESTRUCTIVE_OBJECT_WORDS: readonly string[] = Object.freeze([...new Set(NOTIFICATION_CLOSE_DESTRUCTIVE_OBJECT_PAIRS.flat())]);
+
+/** 通知の枠の閉じる語の、目的語の後の助詞（「〈目的語〉を閉じる」の「を」。除いて比べる）。 */
+export const NOTIFICATION_CLOSE_OBJECT_PARTICLES = Object.freeze(['を'] as const);
+
+/** 通知の枠の閉じる語の、目的語の前の丁寧の接頭語（「ご案内」の「ご」。除いた形でも比べる）。 */
+export const NOTIFICATION_CLOSE_HONORIFIC_PREFIXES = Object.freeze(['ご', 'お'] as const);
+
+export const NOTIFICATION_CLOSE_OBJECT_WORDS = Object.freeze([
+  '通知',
+  'お知らせ',
+  '案内',
+  'ダイアログ',
+  'メニュー',
+  'パネル',
+  'ウィンドウ',
+  'バナー',
+  'メッセージ',
+  'notification',
+  'notice',
+  'dialog',
+  'modal',
+  'popup',
+  'banner',
+  'panel',
+  'message',
+  'menu',
+  'window',
+] as const);
+
+/**
+ * COV-2（網羅の設計書 `2026-11-09-beaksight-coverage-by-state-design.md` 3.1 の 2）: 状態の語の閉じた一覧。画面の見える文字（小文字にした形）に
+ * この語があるかだけを、状態の構造の鍵に入れる（`src/discovery/state-keys.ts` の `STATE_WORDS`。文字の値そのものは入れない）。同じ作りの画面でも、状態
+ * （取り消し済み・確定など）でボタンが変わる画面を、別の状態として見分けるための語。
+ */
+export const DISCOVERY_STATE_WORDS = Object.freeze([
+  '取り消し済み',
+  'キャンセル済み',
+  '取消済',
+  '確定',
+  '確定済み',
+  '未確定',
+  '完了',
+  '未完了',
+  '承認済み',
+  '承認待ち',
+  '却下',
+  '保留',
+  '下書き',
+  '公開中',
+  '非公開',
+  '受付中',
+  '受付終了',
+  '満席',
+  '空きあり',
+  '期限切れ',
+  '支払い済み',
+  '未払い',
+  '処理中',
+  '停止中',
+  '無効',
+  '有効',
+  'エラー',
+  '該当なし',
+  'データがありません',
+  'canceled',
+  'cancelled',
+  'confirmed',
+  'completed',
+  'pending',
+  'approved',
+  'rejected',
+  'draft',
+  'published',
+  'expired',
+  'paid',
+  'unpaid',
+  'error',
+  'no results',
 ] as const);

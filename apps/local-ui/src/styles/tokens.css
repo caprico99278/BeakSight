@@ -65,6 +65,8 @@
   --sidebar-width: 15rem;
   /* 本文の最大幅（パネルの中の 1 行が約 41 字） */
   --content-max-width: 48rem;
+  /* DEF-196: 表のある画面の本文の最大幅（広い画面で、表を横スクロールにせず本文の枠に収める。文だけの画面は上の幅のまま） */
+  --content-wide-max-width: 80rem;
   /* 押せる部品（ボタン・欄）の最小の高さ（44px） */
   --control-min-height: 2.75rem;
   /* checkbox と radio の大きさ */

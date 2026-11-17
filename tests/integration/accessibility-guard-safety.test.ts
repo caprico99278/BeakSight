@@ -40,7 +40,7 @@ describe('DEF-001: axe in a guarded Passive Context', () => {
       context.on('page', onPage);
       let evidence;
       try {
-        evidence = await collectAccessibilityEvidence(page, { deadlineAtMs: Date.now() + 20_000 });
+        evidence = await collectAccessibilityEvidence(page);
       } finally {
         context.off('page', onPage);
       }

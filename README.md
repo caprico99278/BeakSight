@@ -95,6 +95,10 @@ node dist/cli/index.js run --config local/targets/<対象名>.json --headless --
 
 監査プロファイルを登録し、3 つのモードの監査と書き込みを動かす、このコンピュータの中だけで動く画面です。
 
+Windows では、このフォルダの `BeakSight.cmd` をダブルクリックすると起動します。macOS・Linux では `bash beaksight.sh` で起動します。どちらも、足りないもの（合う版の Node.js、依存パッケージ、Playwright の Chromium）を自動で用意してから、画面を起動します（Node.js は BeakSight 専用に `local/runtime/` に置き、PC 全体の設定は変えません）。`BeakSight.cmd --port 4400` のように、引数も渡せます。
+
+これまでどおり、次のコマンドでも起動できます。
+
 ```bash
 npm run setup:local
 npm run ui
@@ -118,7 +122,7 @@ npm run ui
 - [CLI](doc/spec/cli.md): オプションの細かい決まり、headless で使うブラウザ、終了コード、CLI の表示、Windows PowerShell での日本語の表示
 - [監査の対象の設定](doc/spec/configuration.md): 設定のファイルの書き方、既定値、`config/targets/` と `local/` の使い分け
 - [中断と再開](doc/spec/resume.md): 続きからの再開、`--new`、Ctrl+C で止める、実行時間の上限、再開のための保存、タスク スケジューラ
-- [サイトが応答しないとき](doc/spec/site-unavailability.md): サイトの不調を検知したときの止まり方、確かめ直し、診断の記録
+- [サイトが応答しないとき](doc/spec/site-unavailability.md): サイトの不調を検知したときの止まり方、確かめ直し
 - [出力と結果の読み方](doc/spec/output.md): 出力の構成、HTML レポート、Run Status、Finding と Evidence、ChatGPT 用のバンドル
 - [読み取り専用と安全](doc/spec/safety.md): 読み取り専用の保証の範囲、headed で実行するときの注意、Safety Ledger の読み方
 - [サイトへの負荷](doc/spec/site-load.md): 読み込みの間隔と回数、キャッシュ、full audit での上限の選び方、実績の確かめ方
