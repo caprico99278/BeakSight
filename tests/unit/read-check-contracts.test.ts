@@ -7,17 +7,7 @@ import { readFileSync } from 'node:fs';
 import { resolve } from 'node:path';
 import { describe, expect, it } from 'vitest';
 import { validateControlDocument } from '../../src/control/control-schema-validator.js';
-import { MAX_CANDIDATE_FIELDS, MAX_FIELD_NAME_LENGTH } from '../../src/discovery/candidate-contracts.js';
 import {
-  MAX_READ_CHECK_DEFINITIONS_PER_PROFILE,
-  MAX_READ_CHECK_DETAIL_FIELD_LENGTH,
-  MAX_READ_CHECK_EXPECTATIONS,
-  MAX_READ_CHECK_EXPECTED_TEXT_LENGTH,
-  MAX_READ_CHECK_PARAMETER_VALUE_LENGTH,
-  MAX_READ_CHECK_PARAMETERS,
-  MAX_READ_CHECK_ROW_COUNT,
-  MAX_READ_CHECKS_PER_JOB,
-  MAX_READ_CHECK_PAGE_PATH_LENGTH,
   READ_CHECK_EXPECTATION_KINDS,
   READ_CHECK_RESULTS,
   READ_CHECK_TARGET_KINDS,
@@ -35,6 +25,8 @@ const SCHEMA = JSON.parse(readFileSync(resolve(process.cwd(), 'schemas/control/r
   readonly $defs: Record<string, { readonly properties: Record<string, Record<string, unknown>> }>;
 };
 const DIGEST = `sha256:${'a'.repeat(64)}`;
+/** URL-LEN: 前の画面の path の上限（1,024）を超える長さ。 */
+const LONG_PATH_LENGTH = 1_025;
 
 const definition = (overrides: Record<string, unknown> = {}): Record<string, unknown> => ({
   targetIdentityDigest: DIGEST,
@@ -53,12 +45,6 @@ describe('READ check contracts (T27c)', () => {
     expect(Object.isFrozen(READ_CHECK_RESULTS)).toBe(true);
   });
 
-  it('limits the READ of one job to 20 and uses the same constant for the definitions of one profile', () => {
-    expect(MAX_READ_CHECKS_PER_JOB).toBe(20);
-    expect(MAX_READ_CHECK_DEFINITIONS_PER_PROFILE).toBe(MAX_READ_CHECKS_PER_JOB);
-    expect(MAX_READ_CHECK_PARAMETERS).toBeLessThanOrEqual(MAX_CANDIDATE_FIELDS);
-  });
-
   it('has the expectation kinds of the schema as the const of each branch, in the order of the contract', () => {
     const kinds = (SCHEMA.properties.expectations?.items as { oneOf: { $ref: string }[] }).oneOf
       .map(({ $ref }) => SCHEMA.$defs[$ref.split('/').at(-1) ?? '']?.properties.kind?.const);
@@ -67,14 +53,25 @@ describe('READ check contracts (T27c)', () => {
 
   it('has the limits of the schema equal to the named constants', () => {
     const parameters = SCHEMA.properties.parameters ?? {};
-    expect(parameters.maxProperties).toBe(MAX_READ_CHECK_PARAMETERS);
-    expect((parameters.propertyNames as Record<string, unknown>).maxLength).toBe(MAX_FIELD_NAME_LENGTH);
-    expect((parameters.additionalProperties as Record<string, unknown>).maxLength).toBe(MAX_READ_CHECK_PARAMETER_VALUE_LENGTH);
-    expect(SCHEMA.properties.expectations?.maxItems).toBe(MAX_READ_CHECK_EXPECTATIONS);
-    expect(SCHEMA.$defs.rowCount).toMatchObject({ maximum: MAX_READ_CHECK_ROW_COUNT });
-    expect(SCHEMA.$defs.textContains?.properties.text).toMatchObject({ maxLength: MAX_READ_CHECK_EXPECTED_TEXT_LENGTH });
-    expect(SCHEMA.$defs.detailFieldEquals?.properties.field).toMatchObject({ maxLength: MAX_READ_CHECK_DETAIL_FIELD_LENGTH });
-    expect(SCHEMA.$defs.detailFieldEquals?.properties.value).toMatchObject({ maxLength: MAX_READ_CHECK_EXPECTED_TEXT_LENGTH });
+    // L4（INV-LIMITS の N33）: 送る値の数と期待の数に上限を置かない。
+    expect(parameters.maxProperties).toBeUndefined();
+    // LZ-2: 名前・値・期待の文・項目の名前の長さの上限（前は 256）は置かない。
+    expect((parameters.propertyNames as Record<string, unknown>).maxLength).toBeUndefined();
+    expect((parameters.additionalProperties as Record<string, unknown>).maxLength).toBeUndefined();
+    expect(SCHEMA.properties.expectations?.maxItems).toBeUndefined();
+    // LZ-3a: 行の数の期待の上限（前は 100,000）は置かない。
+    expect(SCHEMA.$defs.rowCount).not.toHaveProperty('maximum');
+    expect(SCHEMA.$defs.textContains?.properties.text?.maxLength).toBeUndefined();
+    expect(SCHEMA.$defs.detailFieldEquals?.properties.field?.maxLength).toBeUndefined();
+    expect(SCHEMA.$defs.detailFieldEquals?.properties.value?.maxLength).toBeUndefined();
+  });
+
+  it('LZ-2: accepts names, values, texts and fields longer than the former limit (256)', () => {
+    const long = 'x'.repeat(257);
+    expect(validateControlDocument('read-check-definition', definition({
+      parameters: { [long]: long },
+      expectations: [{ kind: 'TEXT_CONTAINS', text: long }, { kind: 'DETAIL_FIELD_EQUALS', field: long, value: long }],
+    })).ok).toBe(true);
   });
 
   it('accepts a definition of every expectation kind and rejects the shapes outside the contract', () => {
@@ -82,7 +79,8 @@ describe('READ check contracts (T27c)', () => {
       parameters: {},
       expectations: [
         { kind: 'ROW_COUNT_EQUALS', count: 0 },
-        { kind: 'ROW_COUNT_AT_LEAST', count: MAX_READ_CHECK_ROW_COUNT },
+        // LZ-3a: 前の上限（100,000）を超える行の数も受ける。
+        { kind: 'ROW_COUNT_AT_LEAST', count: 100_001 },
         { kind: 'TEXT_CONTAINS', text: '一覧' },
         { kind: 'DETAIL_FIELD_EQUALS', field: '名前', value: 'example' },
       ],
@@ -91,22 +89,22 @@ describe('READ check contracts (T27c)', () => {
       ['an unknown property', definition({ label: 'x' })],
       ['a digest of another shape', definition({ targetIdentityDigest: 'a'.repeat(64) })],
       ['no expectation', definition({ expectations: [] })],
-      ['too many expectations', definition({ expectations: Array.from({ length: MAX_READ_CHECK_EXPECTATIONS + 1 }, () => ({ kind: 'ROW_COUNT_EQUALS', count: 1 })) })],
       ['an unknown expectation kind', definition({ expectations: [{ kind: 'STATUS_EQUALS', count: 1 }] })],
       ['a negative row count', definition({ expectations: [{ kind: 'ROW_COUNT_EQUALS', count: -1 }] })],
-      ['a row count over the limit', definition({ expectations: [{ kind: 'ROW_COUNT_AT_LEAST', count: MAX_READ_CHECK_ROW_COUNT + 1 }] })],
       ['a fractional row count', definition({ expectations: [{ kind: 'ROW_COUNT_EQUALS', count: 1.5 }] })],
       ['an empty text', definition({ expectations: [{ kind: 'TEXT_CONTAINS', text: '' }] })],
-      ['a text over the limit', definition({ expectations: [{ kind: 'TEXT_CONTAINS', text: 'x'.repeat(MAX_READ_CHECK_EXPECTED_TEXT_LENGTH + 1) }] })],
       ['a detail without the field', definition({ expectations: [{ kind: 'DETAIL_FIELD_EQUALS', value: 'x' }] })],
       ['an extra property of an expectation', definition({ expectations: [{ kind: 'TEXT_CONTAINS', text: 'x', count: 1 }] })],
       ['a parameter value that is not a string', definition({ parameters: { q: 1 } })],
-      ['a parameter value over the limit', definition({ parameters: { q: 'x'.repeat(MAX_READ_CHECK_PARAMETER_VALUE_LENGTH + 1) } })],
       ['an empty parameter name', definition({ parameters: { '': 'x' } })],
-      ['too many parameters', definition({ parameters: Object.fromEntries(Array.from({ length: MAX_READ_CHECK_PARAMETERS + 1 }, (_, index) => [`p${index}`, 'x'])) })],
     ] as const) {
       expect(validateControlDocument('read-check-definition', value).ok, name).toBe(false);
     }
+    // L4: 前の上限を超える期待と送る値も受ける。
+    expect(validateControlDocument('read-check-definition', definition({
+      expectations: Array.from({ length: 11 }, () => ({ kind: 'ROW_COUNT_EQUALS', count: 1 })),
+      parameters: Object.fromEntries(Array.from({ length: 51 }, (_, index) => [`p${index}`, 'x'])),
+    })).ok).toBe(true);
   });
 });
 
@@ -162,15 +160,16 @@ describe('T37d: the two targets of a READ check definition (a READ candidate or 
     ...overrides,
   });
 
-  it('has the closed list of the target kinds and the limit of the page path equal to the schema', () => {
+  it('has the closed list of the target kinds', () => {
     expect(READ_CHECK_TARGET_KINDS).toEqual(['CANDIDATE', 'PAGE']);
     expect(Object.isFrozen(READ_CHECK_TARGET_KINDS)).toBe(true);
-    expect(SCHEMA.properties.targetPagePath).toMatchObject({ maxLength: MAX_READ_CHECK_PAGE_PATH_LENGTH });
   });
 
   it('accepts a page path definition with no parameters, and tells the target kind of each definition', () => {
     expect(validateControlDocument('read-check-definition', pageDefinition()).ok).toBe(true);
     expect(validateControlDocument('read-check-definition', pageDefinition({ targetPagePath: '/' })).ok).toBe(true);
+    // URL-LEN: 前の上限（1,024）より長い画面の path も受ける。
+    expect(validateControlDocument('read-check-definition', pageDefinition({ targetPagePath: `/${'a'.repeat(LONG_PATH_LENGTH)}` })).ok).toBe(true);
     expect(readCheckTargetKindOf(pageDefinition() as unknown as ReadCheckDefinition)).toBe('PAGE');
     expect(readCheckTargetKindOf(definition() as unknown as ReadCheckDefinition)).toBe('CANDIDATE');
   });
@@ -187,7 +186,6 @@ describe('T37d: the two targets of a READ check definition (a READ candidate or 
       ['a page path with a fragment', pageDefinition({ targetPagePath: '/admin#top' })],
       ['a page path with a backslash', pageDefinition({ targetPagePath: '/\\example.invalid' })],
       ['a page path with a space', pageDefinition({ targetPagePath: '/admin page' })],
-      ['a page path over the limit', pageDefinition({ targetPagePath: `/${'a'.repeat(MAX_READ_CHECK_PAGE_PATH_LENGTH)}` })],
     ] as const) {
       expect(validateControlDocument('read-check-definition', value).ok, name).toBe(false);
     }
@@ -198,7 +196,9 @@ describe('T37d: the two targets of a READ check definition (a READ candidate or 
     expect(readCheckPageUrlOf(origin, '/admin/members')).toBe(`${origin}/admin/members`);
     expect(readCheckPageUrlOf(origin, '/')).toBe(`${origin}/`);
     expect(readCheckPageUrlOf(origin, '/a%20b')).toBe(`${origin}/a%20b`);
-    for (const path of ['admin', '//example.invalid/x', '/a/../b', '/a/./b', '/\\example.invalid', '/a\tb', '/会員', '/a b', '/a?b', '/a#b', '', `/${'a'.repeat(MAX_READ_CHECK_PAGE_PATH_LENGTH)}`]) {
+    // URL-LEN: 長さでは拒まない（前は 1,024 を超えたら null）。
+    expect(readCheckPageUrlOf(origin, `/${'a'.repeat(LONG_PATH_LENGTH)}`)).toBe(`${origin}/${'a'.repeat(LONG_PATH_LENGTH)}`);
+    for (const path of ['admin', '//example.invalid/x', '/a/../b', '/a/./b', '/\\example.invalid', '/a\tb', '/会員', '/a b', '/a?b', '/a#b', '']) {
       expect(readCheckPageUrlOf(origin, path), JSON.stringify(path)).toBeNull();
     }
     expect(readCheckPageUrlOf('ftp://127.0.0.1', '/admin')).toBeNull();

@@ -6,17 +6,14 @@
 // - 足すのは、違反が起きた段（`stage`）、その画面の path（`pagePath`。query・値は持たない）、probe の押下の中なら押した候補（`press`。送信ボタンの語と識別の
 //   digest）。
 // - 文（`message`）は、IPC で送れる 1 行にし（制御文字と行の区切りを空白に）、文の中の絶対形の URL の query の値と path の値に見える区切りを伏せる（伏せ字の
-//   owner `redactUrlSecretsInText` のサービスの Origin の伏せ方を、文の中のどの Origin にも当てる）。上限の長さで切る。一覧は名前つきの数まで（数は全体）。
+//   owner `redactUrlSecretsInText` のサービスの Origin の伏せ方を、文の中のどの Origin にも当てる）。LZ-2: 長さでは切らない。LZ-3a: 一覧の数でも切らない（前は 16 まで）。
 // 値（本文、query の値、Cookie、token）は残さない。
 import {
-  MAX_JOB_SAFETY_VIOLATION_ENTRIES,
-  MAX_JOB_SAFETY_VIOLATION_MESSAGE_LENGTH,
   type JobSafetyViolation,
   type JobSafetyViolationPress,
   type JobSafetyViolationStage,
 } from '../core/contracts.js';
-import { MAX_URL_LENGTH } from '../core/limits.js';
-import { removeBidiControls, replaceControlOrLineSeparators, replaceLoneSurrogates, truncateText, truncateWellFormed } from '../core/text.js';
+import { removeBidiControls, replaceControlOrLineSeparators, replaceLoneSurrogates } from '../core/text.js';
 import { redactValueLikePathSegments } from '../core/url-path-redaction.js';
 import { asHttpSchemeUrl } from '../core/url-redaction.js';
 import {
@@ -30,8 +27,6 @@ import { summarizePageSafety, type SafetyLedgerSnapshot } from './safety-ledger.
 
 export {
   JOB_SAFETY_VIOLATION_STAGES,
-  MAX_JOB_SAFETY_VIOLATION_ENTRIES,
-  MAX_JOB_SAFETY_VIOLATION_MESSAGE_LENGTH,
   type JobSafetyViolation,
   type JobSafetyViolationPress,
   type JobSafetyViolationStage,
@@ -61,17 +56,16 @@ const originsInText = (text: string): readonly string[] => [...text.matchAll(ABS
   }
 });
 
-/** 違反の文を、1 行で、URL の値を伏せた、上限の長さの文にする。 */
+/** 違反の文を、1 行で、URL の値を伏せた文にする（LZ-2: 長さの上限（前は 1,024）は置かない。切り詰めない）。 */
 const safeMessageOf = (message: string): string => {
   const line = replaceLoneSurrogates(removeBidiControls(replaceControlOrLineSeparators(message, TEXT_REPLACEMENT)));
-  const redacted = redactUrlSecretsInText(line, { serviceOrigins: originsInText(line) });
-  return truncateWellFormed(redacted, MAX_JOB_SAFETY_VIOLATION_MESSAGE_LENGTH);
+  return redactUrlSecretsInText(line, { serviceOrigins: originsInText(line) });
 };
 
-/** 画面の URL の path（値に見える区切りを伏せる。読めなければ空）。 */
+/** 画面の URL の path（値に見える区切りを伏せる。読めなければ空）。URL-LEN: 長さでは切り詰めない（前は 2,048）。 */
 const pagePathOf = (url: string): string => {
   try {
-    return truncateText(redactValueLikePathSegments(new URL(url).pathname), MAX_URL_LENGTH).text;
+    return redactValueLikePathSegments(new URL(url).pathname);
   } catch {
     return '';
   }
@@ -118,6 +112,26 @@ export function probeViolationContinuationOf(violation: JobSafetyViolation): Pro
   return codes.includes(HTTP_MAIN_FRAME_DELIVERY_FAILED_VIOLATION_CODE) ? 'READ_NAVIGATION_CANCELED' : null;
 }
 
+/**
+ * SAFE-2 の 4（違反の区分の (3)。設計者の判断）: probe の押下の後に、発見をどう続けるかを、違反でなく Safety の記録から決める（`probeViolationContinuationOf` の
+ * 後継。外部スキームの移動・frame の判定の失敗・読み取りの main frame の移動の失敗は、違反でなくなったので、発見は止まらない。押した候補の結果を決めるために使う）。
+ * 凍結の後（時点 `INTERACTION`）の記録だけを見る（凍結の前の読み込みの記録と、Guard が止めたサーバのリダイレクトは使わない）。
+ * - ページによる外部スキームの移動（`externalSchemeNavigations` の `EXTERNAL_SCHEME_NAVIGATION`）か、frame の判定の失敗（`window.open` の外部スキームなど）: `EXTERNAL_SCHEME`。
+ * - 読み取り（GET・HEAD）の main frame の移動の失敗（DEF-145。届いたか分からない）: `READ_NAVIGATION_CANCELED`。
+ * - どれもない: `null`。
+ */
+export function probeRecordContinuationOf(snapshot: SafetyLedgerSnapshot): ProbeViolationContinuation | null {
+  const afterFreeze = <Event extends { readonly phase: string }>(events: readonly Event[] | undefined): readonly Event[] =>
+    (events ?? []).filter(({ phase }) => phase === 'INTERACTION');
+  if (
+    afterFreeze(snapshot.externalSchemeNavigations).some(({ reason }) => reason === 'EXTERNAL_SCHEME_NAVIGATION')
+    || afterFreeze(snapshot.frameClassificationFailures?.events).length > 0
+  ) {
+    return 'EXTERNAL_SCHEME';
+  }
+  return afterFreeze(snapshot.readNavigationFailures?.events).some(({ method }) => isReadMethod(method)) ? 'READ_NAVIGATION_CANCELED' : null;
+}
+
 /** 違反の中身を組み立てる（違反の一覧と数は `summarizePageSafety`。純粋。結果は凍結する）。 */
 export function jobSafetyViolationOf(input: JobSafetyViolationInput): JobSafetyViolation {
   const summary = summarizePageSafety([input.snapshot]);
@@ -128,7 +142,7 @@ export function jobSafetyViolationOf(input: JobSafetyViolationInput): JobSafetyV
       ? null
       : Object.freeze({ submitterWords: Object.freeze([...input.press.submitterWords]), identityDigest: input.press.identityDigest }),
     invariantViolationCount: summary.invariantViolationCount,
-    invariantViolations: Object.freeze(summary.invariantViolations.slice(0, MAX_JOB_SAFETY_VIOLATION_ENTRIES).map((violation) => Object.freeze({
+    invariantViolations: Object.freeze(summary.invariantViolations.map((violation) => Object.freeze({
       ...violation,
       message: safeMessageOf(violation.message),
     }))),

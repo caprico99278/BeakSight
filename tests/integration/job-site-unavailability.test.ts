@@ -30,7 +30,7 @@ import { executeDiscoveryRun } from '../../src/worker/discovery-run.js';
 import type { JobRunNotice as JobSiteNotice } from '../../src/worker/job-site-availability.js';
 import { executeReadCheckRun } from '../../src/worker/read-check-run.js';
 import { overrideBrowser } from '../helpers/browser-proxies.js';
-import { isCliChromiumSelected, launchCliChromium, launchHeadlessChromium } from '../helpers/chromium.js';
+import { BOTH_CHROMIUM_LAUNCHERS, CLI_CHROMIUM_RUN_LABEL } from '../helpers/chromium.js';
 import {
   DISCOVERY_SITE_FAULT_LINK,
   DISCOVERY_SITE_LOCAL_STORAGE_ITEM,
@@ -57,11 +57,10 @@ const P = DISCOVERY_SITE_PATHS;
 const STATUS_503: DiscoverySitePageFault = { kind: 'STATUS', status: 503 };
 const STATUS_503_ONCE: DiscoverySitePageFault = { kind: 'STATUS', status: 503, times: 1 };
 
-// 4 つ目は、その回の Chromium が CLI の起動の設定か（DEF-166。テストの既定の Chromium は、`BEAKSIGHT_TEST_DEFAULT_CHROMIUM=cli` のとき CLI の設定）。
-describe.each([
-  ['the default test Chromium', () => launchHeadlessChromium(), true, isCliChromiumSelected()],
-  ['the CLI Chromium', () => launchCliChromium(), false, true],
-] as const)('DEF-136: the site unavailability of the discovery and READ check jobs (%s)', (_label, launch, everyCase, cliChromium) => {
+// TEST-SLIM: 2 つの Chromium の組（`BOTH_CHROMIUM_LAUNCHERS`）。3 つ目は、全部の場面を流すか（組の先頭の回だけ。SLIM-B0）。CLI の Chromium は、止めた後に
+// サーバへ届く要求（ネットワークの層の送り直しを含む。記録されない要求）の確かめの場面だけを流す。4 つ目は、その回の Chromium が CLI の起動の設定か（DEF-166）。
+describe.each(BOTH_CHROMIUM_LAUNCHERS.map(([label, launch], index) => [label, launch, index === 0, label === CLI_CHROMIUM_RUN_LABEL] as const))(
+  'DEF-136: the site unavailability of the discovery and READ check jobs (%s)', (_label, launch, everyCase, cliChromium) => {
   let site: DiscoverySite;
   let outputDirectory: string;
 
@@ -159,19 +158,22 @@ describe.each([
     return page === undefined ? undefined : page.state === 'READ' ? 'READ' : `NOT_READ/${page.reason}`;
   };
 
-  // 受け入れ条件 1・2: 2 つ目の画面（一覧）が不調のままなら、確かめ直しを 1 回だけ行って止め、3 つ目の画面は読み込まない。
+  // 受け入れ条件 1・2: 2 つ目の画面が不調のままなら、確かめ直しを 1 回だけ行って止め、3 つ目の画面は読み込まない。
+  // OP-I（I2。設計書 `2026-10-27-beaksight-one-pass-flow-design.md` 4.1.5）: 操作さがしの段は、登録の画面らしいリンクを先に読むので、入口の次に読む
+  // 2 つ目の画面は登録の画面（その次の 3 つ目が一覧）。不調にするのは、2 つ目に読む登録の画面。
   it.each<[string, DiscoverySitePageFault]>([
     ['503', STATUS_503],
     ...(everyCase ? [['a refused connection', { kind: 'REFUSE' }], ['no response', { kind: 'HANG' }]] as [string, DiscoverySitePageFault][] : []),
   ])('stops the discovery when the second page stays unavailable (%s), after one recheck, and reads no third page', async (_name, fault) => {
-    site.setPageFault(P.list, fault);
+    site.setPageFault(P.create, fault);
     const { document, notices } = await discover();
     expect(document).toMatchObject({ endReason: 'SITE_UNAVAILABLE', runStatus: 'PARTIAL' });
     expect(stateOf(document, P.admin)).toBe('READ');
+    expect(stateOf(document, P.create)).toBe('NOT_READ/SITE_UNAVAILABLE');
     expect(stateOf(document, P.list)).toBe('NOT_READ/SITE_UNAVAILABLE');
     expect(stateOf(document, P.search)).toBe('NOT_READ/SITE_UNAVAILABLE');
-    expectLoadsAndArrivals([P.admin, P.list, P.list], fault.kind === 'REFUSE' ? P.list : undefined);
-    expect(notices).toEqual([{ kind: 'SITE_UNAVAILABLE_RECHECK', url: `${site.origin}${P.list}`, delayMs: RECHECK_DELAY_MS, attempt: 1, maxAttempts: 1 }]);
+    expectLoadsAndArrivals([P.admin, P.create, P.create], fault.kind === 'REFUSE' ? P.create : undefined);
+    expect(notices).toEqual([{ kind: 'SITE_UNAVAILABLE_RECHECK', url: `${site.origin}${P.create}`, delayMs: RECHECK_DELAY_MS, attempt: 1, maxAttempts: 1 }]);
   }, TEST_TIMEOUT_MS);
 
   if (!everyCase) {

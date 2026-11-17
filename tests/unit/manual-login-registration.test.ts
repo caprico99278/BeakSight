@@ -183,3 +183,75 @@ describe('ML-a: building the auth setup from the manual login', () => {
     });
   });
 });
+
+// OP-1（設計書 `2026-10-27-beaksight-one-pass-flow-design.md` 4.1 の D3・D4。4.1.3 の 1）: ログインの直後の登録の組み立て（`loginRegistrationAfterLoginOf`）。
+// - 送信先の登録は今の部品（`manualLoginRegistrationOf`）のまま。組み立てられないとき（フォームの送信のログインなど）も、今の設定を次の改訂に結んで返す。
+// - 空の成功の条件は、観察した成功の画面の path（`successPathPrefix`）で埋める。読む範囲のパスがログインの画面の path だけなら、それも成功の画面の path にする。
+describe('OP-1: the registration right after the login', () => {
+  it('fills an empty success condition and a login-page-only audit path with the observed success path, and keeps the form setup', async () => {
+    const { loginRegistrationAfterLoginOf } = await import('../../src/control/manual-login-registration.js');
+    const setup: AuthSetupV3 = {
+      ...FORM_SETUP,
+      successCondition: { pathPrefix: '', selector: null },
+      auditPathPrefixes: ['/auth'],
+    };
+    const result = loginRegistrationAfterLoginOf({
+      setup, profile: PROFILE, passedRequests: undefined, observation: { successPathPrefix: '/admin' }, nextProfileRevision: 4,
+    });
+    expect(result.setup.profileRevision).toBe(4);
+    expect(result.setup.successCondition).toEqual({ pathPrefix: '/admin', selector: null });
+    expect(result.setup.auditPathPrefixes).toEqual(['/admin']);
+    expect(result.setup.loginPostEndpoints).toEqual(FORM_SETUP.loginPostEndpoints);
+    expect(result.addServiceOrigins).toEqual([]);
+    expect(result.changed).toBe(true);
+  });
+
+  it('registers the token destination with the current part and keeps a configured success condition', async () => {
+    const { loginRegistrationAfterLoginOf } = await import('../../src/control/manual-login-registration.js');
+    const result = loginRegistrationAfterLoginOf({
+      setup: FORM_SETUP, profile: PROFILE, passedRequests: passed(TOKEN), observation: { ...OBSERVATION, successPathPrefix: '/home' }, nextProfileRevision: 4,
+    });
+    expect(result.setup.scriptLogin?.origin).toBe(SERVICE);
+    expect(result.setup.successCondition).toEqual(FORM_SETUP.successCondition);
+    expect(result.addServiceOrigins).toEqual([SERVICE]);
+    expect(result.changed).toBe(true);
+  });
+
+  it('reports no change when there is nothing to add', async () => {
+    const { loginRegistrationAfterLoginOf } = await import('../../src/control/manual-login-registration.js');
+    const result = loginRegistrationAfterLoginOf({ setup: FORM_SETUP, profile: PROFILE, passedRequests: undefined, observation: undefined, nextProfileRevision: 4 });
+    expect(result.changed).toBe(false);
+    expect(result.setup.profileRevision).toBe(4);
+  });
+});
+
+// DEF-182（OP-DEF 修正の 1 回目。案 (b)）: token の送信先がテスト環境と同じ Origin（許可 Origin）のときは、送信先を登録せず、閉じた理由で飛ばす（同じ Origin を
+// 承認したサービスの Origin に足すと、プロファイルの検証が拒む。安全の境目（token の送信先はサービスの Origin）は変えない）。ログインの直後の登録は、自動ログインへ
+// 切り替えない印を返す（手動のログインのまま点検を続ける）。
+describe('DEF-182: a token request to the same origin as the test environment', () => {
+  const SAME_ORIGIN_TOKEN = row(APP, '/auth/v1/token', { grantType: 'password' });
+  const SAME_ORIGIN_RPC = row(APP, '/rest/v1/rpc/resolve_tenant', { beforeToken: true });
+
+  it('skips the registration with a closed reason and adds no service origin', () => {
+    expect(MANUAL_LOGIN_REGISTRATION_SKIP_REASONS).toContain('TOKEN_TARGET_ON_TEST_ORIGIN');
+    expect(build([SAME_ORIGIN_RPC, SAME_ORIGIN_TOKEN])).toEqual({ ok: false, reason: 'TOKEN_TARGET_ON_TEST_ORIGIN' });
+  });
+
+  it('keeps the current setup right after the login, adds no service origin, and marks the switch to the automated login as blocked', async () => {
+    const { loginRegistrationAfterLoginOf } = await import('../../src/control/manual-login-registration.js');
+    const result = loginRegistrationAfterLoginOf({
+      setup: FORM_SETUP, profile: PROFILE, passedRequests: passed(SAME_ORIGIN_TOKEN), observation: OBSERVATION, nextProfileRevision: 4,
+    });
+    expect(result.setup.scriptLogin).toBeNull();
+    expect(result.setup.loginPostEndpoints).toEqual(FORM_SETUP.loginPostEndpoints);
+    expect(result.addServiceOrigins).toEqual([]);
+    expect(result.changed).toBe(false);
+    expect(result.automatedLoginBlocked).toBe('TOKEN_TARGET_ON_TEST_ORIGIN');
+  });
+
+  it('does not block the switch for a token request to a service origin', async () => {
+    const { loginRegistrationAfterLoginOf } = await import('../../src/control/manual-login-registration.js');
+    const result = loginRegistrationAfterLoginOf({ setup: FORM_SETUP, profile: PROFILE, passedRequests: passed(TOKEN), observation: OBSERVATION, nextProfileRevision: 4 });
+    expect(result.automatedLoginBlocked).toBeNull();
+  });
+});

@@ -10,12 +10,10 @@ import { describe, expect, it } from 'vitest';
 import { REDACTED_PATH_SEGMENT } from '../../src/core/url-path-redaction.js';
 import {
   LOGIN_OBSERVED_QUERY_VALUE_NAMES,
-  MAX_LOGIN_OBSERVED_QUERY_NAMES,
   MAX_LOGIN_OBSERVED_QUERY_NAME_LENGTH,
   MAX_LOGIN_OBSERVED_QUERY_VALUE_LENGTH,
   LOGIN_OBSERVED_KEY_SEPARATORS,
   MAX_LOGIN_OBSERVED_KEY_PART_LENGTH,
-  MAX_LOGIN_OBSERVED_STORAGE_KEY_NAMES,
   MIN_LOGIN_OBSERVED_KEY_PART_LENGTH,
   SUCCESS_SELECTOR_CANDIDATE_KINDS,
   isLoginObservedQueryName,
@@ -44,7 +42,6 @@ describe('T43d: the query names and the closed list value of a blocked request',
   it('has the closed list and the limits', () => {
     expect(LOGIN_OBSERVED_QUERY_VALUE_NAMES).toEqual(['grant_type']);
     expect(Object.isFrozen(LOGIN_OBSERVED_QUERY_VALUE_NAMES)).toBe(true);
-    expect(MAX_LOGIN_OBSERVED_QUERY_NAMES).toBe(4);
     expect(MAX_LOGIN_OBSERVED_QUERY_NAME_LENGTH).toBe(64);
     expect(MAX_LOGIN_OBSERVED_QUERY_VALUE_LENGTH).toBe(32);
   });
@@ -60,10 +57,11 @@ describe('T43d: the query names and the closed list value of a blocked request',
     expect(JSON.stringify(queryOf('?redirect=%2Fadmin&email=someone%40example.invalid'))).not.toContain('example.invalid');
   });
 
-  it('hides a value-like name and a long name, and counts the names over the limit', () => {
+  // LZ-3a: 名前の数の上限（前は 4）は撤廃した。前の上限を超える名前も残らず残す（`omitted` は前の記録の形のために残し、0）。
+  it('hides a value-like name and a long name, and keeps every name beyond the former limit', () => {
     const query = queryOf(`?${JWT_LIKE}=1&${'n'.repeat(MAX_LOGIN_OBSERVED_QUERY_NAME_LENGTH + 1)}=2&a=1&b=2&c=3&d=4`);
     // 伏せた名前は 1 つにまとまる（重ならない名前の数で数える）。
-    expect(query).toEqual({ names: [REDACTED_PATH_SEGMENT, 'a', 'b', 'c'], omitted: 1, values: [] });
+    expect(query).toEqual({ names: [REDACTED_PATH_SEGMENT, 'a', 'b', 'c', 'd'], omitted: 0, values: [] });
     expect(JSON.stringify(query)).not.toContain(JWT_LIKE);
   });
 
@@ -78,10 +76,10 @@ describe('T43d: the query names and the closed list value of a blocked request',
     expect(queryOf('?grant_type=refresh_token')?.values).toEqual([{ name: 'grant_type', value: 'refresh_token' }]);
   });
 
-  it('merges the names of the same row, keeping the limit and the omitted count', () => {
+  it('merges the names of the same row', () => {
     const first = queryOf('?grant_type=password&a=1');
     const merged = mergeLoginObservedQuery(first, queryOf('?b=1&c=2&d=3'));
-    expect(merged).toEqual({ names: ['a', 'b', 'c', 'grant_type'], omitted: 1, values: [{ name: 'grant_type', value: 'password' }] });
+    expect(merged).toEqual({ names: ['a', 'b', 'c', 'd', 'grant_type'], omitted: 0, values: [{ name: 'grant_type', value: 'password' }] });
     expect(mergeLoginObservedQuery(null, null)).toBeNull();
     expect(mergeLoginObservedQuery(null, first)).toEqual(first);
   });
@@ -104,7 +102,6 @@ describe('T43R-fix C-1 (a): the prefix and the suffix of the new local storage k
   const USER = 'entry-user';
 
   it('has the limits and the separators', () => {
-    expect(MAX_LOGIN_OBSERVED_STORAGE_KEY_NAMES).toBe(4);
     expect(LOGIN_OBSERVED_KEY_SEPARATORS).toEqual(['.', ':', '_', '/', '-']);
     expect(MIN_LOGIN_OBSERVED_KEY_PART_LENGTH).toBe(2);
     expect(MAX_LOGIN_OBSERVED_KEY_PART_LENGTH).toBe(64);
@@ -142,10 +139,11 @@ describe('T43R-fix C-1 (a): the prefix and the suffix of the new local storage k
     expect(newStorageKeyShapesOf([], ['app:token:alice', 'fixture-auth-token'])).toEqual({ shapes: [{ prefix: '', suffix: '-token' }], omitted: 1 });
   });
 
-  it('counts the proposals over the limit, and checks a recorded shape', () => {
+  // LZ-3a: 案の数の上限（前は 4）は撤廃した。前の上限を超える案も残らず残す。
+  it('keeps every proposal beyond the former limit, and checks a recorded shape', () => {
     const shapes = newStorageKeyShapesOf([], ['a1.x.token', 'a2.x.auth', 'a3.x.session', 'a4.x.jwt', 'a5.x.access']);
-    expect(shapes?.shapes).toHaveLength(MAX_LOGIN_OBSERVED_STORAGE_KEY_NAMES);
-    expect(shapes?.omitted).toBe(1);
+    expect(shapes?.shapes).toHaveLength(5);
+    expect(shapes?.omitted).toBe(0);
     for (const shape of [{ prefix: '', suffix: '-token' }, { prefix: 'session.', suffix: '' }, { prefix: 'auth:', suffix: '.idToken' }]) {
       expect(isLoginObservedStorageKeyShape(shape), JSON.stringify(shape)).toBe(true);
     }

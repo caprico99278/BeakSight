@@ -177,6 +177,8 @@ async function runWorker(start: Record<string, unknown>): Promise<Run> {
       calls.automatedLogin += 1;
       return Promise.resolve({ kind: 'AUTH_RESULT_UNKNOWN', submitted: 'NO', retryAfterUntil: null });
     },
+    // W-FIX: 書き込みの流れを渡しても、単独の書き込みの `START` は拒む（書き込みは、まとめて実行の書き込みの段だけで行う）。
+    executeWriteCreate: () => Promise.reject(new Error('the write flow must not run')),
     startTimeoutMs: START_TIMEOUT_MS,
     heartbeatIntervalMs: HEARTBEAT_INTERVAL_MS,
   });
@@ -194,9 +196,8 @@ describe('worker job kinds (T27c)', () => {
     // T31e: 更新の書き込みのジョブ `WRITE_UPDATE` を一覧に足した（ワーカーの対応は T31g。それまでは `JOB_KIND_NOT_SUPPORTED` で拒む）。
     // T43c: 入口の確かめのジョブ `ENTRY_CHECK` を一覧の後ろに足した（ワーカーも対応する。流れが渡されていなければ拒む）。
     expect(WORKER_JOB_KINDS).toEqual(['AUDIT', 'LOGIN_CHECK', 'DISCOVERY', 'READ_CHECK', 'WRITE_CREATE', 'WRITE_UPDATE', 'ENTRY_CHECK']);
-    // T30f: ワーカーが書き込みのジョブに対応した（流れが渡されていなければ、下の場合のとおり `JOB_KIND_NOT_SUPPORTED` で拒む）。
-    // T31g-2: 更新の書き込みのジョブにも対応した（同じ書き込みの流れ。流れが渡されていなければ、同じく拒む）。
-    expect(WORKER_IMPLEMENTED_JOB_KINDS).toEqual(['AUDIT', 'LOGIN_CHECK', 'DISCOVERY', 'READ_CHECK', 'WRITE_CREATE', 'WRITE_UPDATE', 'ENTRY_CHECK']);
+    // W-FIX: 書き込みの種類は、単独の `START` では受けない（まとめて実行の書き込みの段 `NEXT_STAGE` だけ。`audit-worker-session-chain.test.ts`）。
+    expect(WORKER_IMPLEMENTED_JOB_KINDS).toEqual(['AUDIT', 'LOGIN_CHECK', 'DISCOVERY', 'READ_CHECK', 'ENTRY_CHECK']);
     expect(Object.isFrozen(WORKER_IMPLEMENTED_JOB_KINDS)).toBe(true);
   });
 
@@ -236,7 +237,7 @@ describe('audit worker session (T27c): a START of a job kind the worker does not
     expect(run.sent.every((message) => validateWorkerToParentMessage(message).ok)).toBe(true);
   });
 
-  // T30d: 書き込みのジョブは、書き込みの流れが渡されていなければ（T30f）、設定を読まず、ログインも監査もせずに `JOB_KIND_NOT_SUPPORTED` で拒む。
+  // T30d: 書き込みのジョブの単独の `START` は、設定を読まず、ログインも監査もせずに `JOB_KIND_NOT_SUPPORTED` で拒む（W-FIX: 書き込みの流れが渡されていても）。
   // T30e: 契約の検証（認証の指定と書き込みの指定が要る）を通った `START` だけ。通らない `START` は契約の違反（`PROTOCOL_VIOLATION`）。
   it.each([
     ['without authentication', { ...baseStart('WRITE_CREATE'), write: sampleStartWrite(ORIGIN) }],
@@ -261,7 +262,7 @@ describe('audit worker session (T27c): a START of a job kind the worker does not
   });
 
   // T31f: 更新の書き込みのジョブ（`WRITE_UPDATE`）は、UPDATE の指定のない `START` は契約の違反（`PROTOCOL_VIOLATION`）。T31g-2: 確かめを通った
-  // `START` も、書き込みの流れが渡されていなければ `JOB_KIND_NOT_SUPPORTED` で拒む（`WRITE_CREATE` と同じ）。どちらも設定を読まず、ログインも監査もしない。
+  // `START` も、`JOB_KIND_NOT_SUPPORTED` で拒む（`WRITE_CREATE` と同じ。W-FIX: 書き込みの流れが渡されていても）。どちらも設定を読まず、ログインも監査もしない。
   it.each([
     ['without authentication', { ...baseStart('WRITE_UPDATE'), write: sampleStartUpdateWrite(ORIGIN) }],
     ['without the update block', { ...manualStart('WRITE_UPDATE'), write: sampleStartWrite(ORIGIN) }],

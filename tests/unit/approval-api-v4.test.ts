@@ -77,8 +77,8 @@ const API_ITEMS = [
 const FORM_V3_DIGEST = 'sha256:f1d363c24e761a844bd54a540f2d39769201813176a94b484b91410eb0f269c0';
 
 describe('T38c: the approval digest v4', () => {
-  it('has the format beaksight-approval/4 and the API items at the end of the items', () => {
-    expect(APPROVAL_DIGEST_FORMAT).toBe('beaksight-approval/4');
+  it('has the format beaksight-approval/6 (LU-6 K5; PL-6a made v5; v4 added the API items) and the API items at the end of the items', () => {
+    expect(APPROVAL_DIGEST_FORMAT).toBe('beaksight-approval/6');
     expect(APPROVAL_DIGEST_ITEMS.slice(-API_ITEMS.length)).toEqual([...API_ITEMS]);
     expect(APPROVAL_DIGEST_ITEMS.slice(0, -API_ITEMS.length)).toContain('updateTemplatedIdentityDigest');
   });
@@ -116,13 +116,15 @@ describe('T38c: the approval digest v4', () => {
 
   // LG-3（2026-10-24 の設計 3.7.2）: シナリオの版の前の形を捨てる前のコードで求めた、API の登録と更新の見本の値（捨てた後も変わらない）。
   it('keeps the digest values of the API CREATE and the API UPDATE samples (fixed values, LG-3)', () => {
-    expect(computeApprovalDigest(apiScenario(), DIGEST_FACTS)).toBe('sha256:48c194c26e2df556662352849bdd783255c6f751ca507fbfb77b8b730a2c703d');
+    // PL-6a: 印を v5 に上げたので、値を求め直した（API の項目の値は変わらない）。LU-6（K5）: 印を v6 に上げたので、値を求め直した（項目の値は変わらない。
+    // 印を v5 に戻すと前の値に戻ることを、一時の確かめで見た）。
+    expect(computeApprovalDigest(apiScenario(), DIGEST_FACTS)).toBe('sha256:93a1d425db151fe4c55b1f6e2c160b39abafaf6d37826761a3f60dad34af7295');
     const update = apiScenario({
       request: { ...API_SPEC.request, method: 'PATCH' }, filterName: 'id', recordId: null,
       ledger: { targetCreateScenarioId: 'scenario-ledger', formPathTemplate: '/admin/members/{id}/edit' }, keptKeys: [API_SPEC.keyFields[1] as never],
       templatedIdentityDigest: `sha256:${'e'.repeat(64)}`,
     }, { kind: 'UPDATE', update: null, fieldNames: ['email'] });
-    expect(computeApprovalDigest(update, DIGEST_FACTS)).toBe('sha256:2c28aa37ab3645515dee74bbf397c6e105db9cd2124b51902e6ae6ccb330437b');
+    expect(computeApprovalDigest(update, DIGEST_FACTS)).toBe('sha256:7925cf4a77333ef11ed0ecfd90f09d10ef772f1b0e75252240c5249ca94ea33c');
   });
 
   const UPDATE_LEDGER = { targetCreateScenarioId: 'scenario-ledger', formPathTemplate: '/admin/members/{id}/edit' };
@@ -169,11 +171,11 @@ const API_FACTS: ApprovalCurrentFacts = Object.freeze<ApprovalCurrentFacts>({
   authSetupDigest: AUTH_SETUP_DIGEST,
   targetConfigDigest: TARGET_CONFIG_DIGEST,
   // API の候補は probe の対象（分類は `NEEDS_BINDING`。kind とは比べない）。
-  candidate: { identityDigest: IDENTITY, ruleDigest: RULE, classification: 'NEEDS_BINDING', drift: 'UNCHANGED' },
+  candidate: { identityDigest: IDENTITY, ruleDigest: RULE, classification: 'NEEDS_BINDING', drift: 'SEEN' },
   candidateShapeDigests: [SHAPE_A, SHAPE_B],
   // T38R-fix: 鍵と欄の対応の digest（見本のシナリオの対応）、型の Origin の番号、最新の発見の改訂（今の改訂と同じ）。
   candidateKeyFieldDigests: [apiKeyFieldsDigestOf(SHAPE_A, API_SPEC.keyFields)],
-  apiShapeOriginIndex: 0,
+  apiShapeOrigin: { kind: 'APPROVED_API', index: 0 },
   latestDiscoveryProfileRevision: 4,
   templatedCandidates: null,
   inputRuleReference: INPUT_RULES,
@@ -208,9 +210,6 @@ describe('T38c: the approval validity of an API scenario', () => {
 
   it('is approved when the shape digest of the scenario is in the shapes of the candidate (the classification is not compared with the kind)', () => {
     expect(evaluateApprovalValidity(apiInput())).toMatchObject({ approved: true });
-    // drift CHANGED・NEW でも、digest と型が同じなら受ける（FORM と同じ）。
-    expect(evaluateApprovalValidity(apiInput(apiScenario(), { candidate: { ...API_FACTS.candidate, drift: 'CHANGED' } as ApprovalCurrentFacts['candidate'] })))
-      .toMatchObject({ approved: true });
   });
 
   it.each<readonly [string, Partial<ApprovalCurrentFacts>, readonly string[]]>([
@@ -239,7 +238,7 @@ describe('T38c: the approval validity of an API scenario', () => {
       ledger: { targetCreateScenarioId: 'scenario-ledger', formPathTemplate: '/admin/members/{id}/edit' }, keptKeys: [], templatedIdentityDigest: templated,
     }, { kind: 'UPDATE', update: null });
     const templatedFact = {
-      templatedIdentityDigests: [templated], ruleDigest: RULE, classification: 'NEEDS_BINDING' as const, drift: 'UNCHANGED' as const,
+      templatedIdentityDigests: [templated], ruleDigest: RULE, classification: 'NEEDS_BINDING' as const, drift: 'SEEN' as const,
       shapeDigests: [SHAPE_A, SHAPE_B], keyFieldDigests: [apiKeyFieldsDigestOf(SHAPE_A, API_SPEC.keyFields)],
     };
     expect(evaluateApprovalValidity(apiInput(update, { templatedCandidates: [templatedFact] }))).toMatchObject({ approved: true });
@@ -252,7 +251,7 @@ describe('T38c: the approval validity of an API scenario', () => {
     const form = sampleScenario();
     const facts: ApprovalCurrentFacts = {
       ...API_FACTS,
-      candidate: { identityDigest: form.candidate.identityDigest, ruleDigest: form.candidate.ruleDigest, classification: 'NEEDS_BINDING', drift: 'UNCHANGED' },
+      candidate: { identityDigest: form.candidate.identityDigest, ruleDigest: form.candidate.ruleDigest, classification: 'NEEDS_BINDING', drift: 'SEEN' },
       candidateShapeDigests: null,
     };
     expect(reasonsOf({ scenario: form, facts, lastApproval: sampleApproval(digestOf(form, facts)), lastRevocation: null, now: NOW }))

@@ -17,7 +17,10 @@
     "evidenceRefs"
   ],
   "properties": {
-    "schemaVersion": { "const": "finding-schema/1.0" },
+    "schemaVersion": {
+      "description": "AUD-9a: 1.1 added groupingKeys (required in 1.1, absent in 1.0). New Findings are 1.1; 1.0 is read for the Runs of the earlier writers. The $id stays 1.0 because the change only adds a field.",
+      "enum": ["finding-schema/1.0", "finding-schema/1.1"]
+    },
     "findingId": { "type": "string", "pattern": "^FIND-[0-9]{6,}$" },
     "fingerprint": { "type": "string", "pattern": "^sha256:[a-f0-9]{64}$" },
     "ruleId": { "type": "string", "minLength": 1 },
@@ -46,6 +49,22 @@
       "type": "array",
       "minItems": 1,
       "items": { "type": "string", "pattern": "^EV-[A-Z0-9_]+-[0-9]{6,}$" }
+    },
+    "groupingKeys": {
+      "description": "AUD-9a: the keys to group the Findings of the same UI later. Only the selector-like and rule-identifying fields of the fingerprint identity (the allow-list in src/audit/finding-grouping-keys.ts), with the same values. Not the fingerprint input.",
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["name", "value"],
+        "properties": {
+          "name": { "type": "string", "minLength": 1 },
+          "value": { "type": "string" }
+        }
+      }
     }
-  }
+  },
+  "if": { "properties": { "schemaVersion": { "const": "finding-schema/1.1" } } },
+  "then": { "properties": { "groupingKeys": true }, "required": ["groupingKeys"] },
+  "else": { "not": { "properties": { "groupingKeys": true }, "required": ["groupingKeys"] } }
 }

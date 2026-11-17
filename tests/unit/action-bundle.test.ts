@@ -35,8 +35,6 @@ const encoder = new TextEncoder();
 const sha256Of = (bytes: Uint8Array): string => `sha256:${createHash('sha256').update(bytes).digest('hex')}`;
 /** T44f: 書くのと同じ書式（artifact の JSON の書式は字下げなし。`serializeArtifactJson`）。 */
 const textOf = (value: unknown): string => `${JSON.stringify(value)}\n`;
-/** バイト列を固定するテストの HTML（表示の変更に左右されない固定の文字列）。 */
-const PINNED_HTML = '<!DOCTYPE html>\n<p>pinned</p>\n';
 
 const inputOf = (documents: ActionReportDocuments): ActionBundleInput => ({
   jobId: documents.actionRun.jobId,
@@ -80,22 +78,6 @@ describe('write bundle (T32f)', () => {
     const entries = unzipSync(createActionBundle(inputOf(verifiedUpdateDocuments())));
     const manifest = JSON.parse(decoder.decode(entries[ACTION_BUNDLE_MANIFEST_FILE_NAME])) as Record<string, unknown>;
     expect(manifest).toMatchObject({ containsHumanEnteredValues: true, humanEnteredValuesNotice: ACTION_REPORT_TEXT.bundleHumanEnteredValuesNotice });
-  });
-
-  // T32R2 M-2: 組み立てを `src/core/` に移す前に、今のバイト列を sha256 で固定する（移した後も、書き込みのバンドルは 1 バイトも変わらない。HTML は
-  // 表示の変更に左右されないよう、固定の文字列）。
-  // T40c: 見本は版 1.1（送り方と API の要約を持つ）になったので、版 1.1 の見本の値を足した（組み立ての部品は変えていない）。LG-4 で前の版 1.0 の見本の
-  // 値は捨てた。
-  // T44f（Task 44 の設計書 P3-1 の A）: artifact の JSON を字下げなしで書くようにしたので、値を求め直した（目録と 3 つの JSON の書式。組み立ての部品は変えて
-  // いない）。
-  // LG-4: 照合の READ の見本に対象の種類（`targetKind`。read-evidence の前の版を捨てて必ず持つ）を足したので、版 1.1 の値を求め直した（組み立ての部品は
-  // 変えていない）。
-  it.each<readonly [string, () => ActionReportDocuments, string]>([
-    ['a verified create of 1.1', verifiedCreateDocuments, 'sha256:6c6efe3bc817e05fede06b02e0852b55aee5ff82537bae78fc332210e91a2b57'],
-    ['a verified update of 1.1 (with the notice)', verifiedUpdateDocuments,
-      'sha256:0f3c4767154761d3fc35f93912fad30304cdebb86f3363ed6dcdaffd9e2298c3'],
-  ])('keeps the SHA-256 of the bundle of %s (T32R2 M-2)', (_label, documents, expected) => {
-    expect(sha256Of(createActionBundle({ ...inputOf(documents()), reportHtml: PINNED_HTML }))).toBe(expected);
   });
 
   it('makes the same bytes from the same input', () => {

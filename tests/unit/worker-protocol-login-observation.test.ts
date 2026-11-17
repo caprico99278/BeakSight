@@ -1,6 +1,6 @@
 // T43d（Task 43 の設計書 3 章、4.4）: 手動のログインで観察したことの IPC の契約（`src/control/worker-protocol.ts`、
 // `schemas/control/worker-message.schema.json`。スキーマの版は上げない。任意の項目なので、古いメッセージは今どおり受ける）。
-// - 止めた要求の行の任意の項目 `query`: 名前の一覧（値なし。上限 `MAX_LOGIN_OBSERVED_QUERY_NAMES`。値に見える名前は伏せた表記だけ）、一覧に入れなかった
+// - 止めた要求の行の任意の項目 `query`: 名前の一覧（値なし。LZ-3a: 数の上限はない。値に見える名前は伏せた表記だけ）、一覧に入れなかった
 //   名前の数、閉じた一覧の名前（`grant_type`）の決まった形の値。値の名前は名前の一覧にある。同じ Origin・path・種類・理由でも、値が違えば別の行。
 // - `AUTH_STATE` の任意の項目 `loginObservation`: 成功の鍵の名前の案（ログインの画面の Origin と、新しく出た鍵の名前。値は持たない）と、成功の画面の
 //   セレクタの案（認証の設定として受ける CSS、候補の種類、ログアウトの語の閉じた一覧の語）。止めた一覧と同じ状態だけが持てる。空の観察は拒む。
@@ -8,23 +8,19 @@
 import { readFileSync } from 'node:fs';
 import { resolve } from 'node:path';
 import { describe, expect, it } from 'vitest';
-import { MAX_SUCCESS_SELECTOR_LENGTH } from '../../src/control/auth/auth-setup-contracts.js';
 import { DEFAULT_EXCLUDED_URL_WORDS } from '../../src/core/default-excluded-url-words.js';
 import { DISCOVERY_DESTRUCTIVE_WORDS, DISCOVERY_LOGOUT_WORDS } from '../../src/discovery/classification-words.js';
 import { REDACTED_PATH_SEGMENT } from '../../src/core/url-path-redaction.js';
 import {
-  MAX_WORKER_NOTICE_URL_LENGTH,
   WORKER_LOGIN_FAILURE_STATES,
   WORKER_PROTOCOL_VERSION,
   validateWorkerToParentMessage,
 } from '../../src/control/worker-protocol.js';
 import {
   LOGIN_OBSERVED_QUERY_VALUE_NAMES,
-  MAX_LOGIN_OBSERVED_QUERY_NAMES,
   MAX_LOGIN_OBSERVED_QUERY_NAME_LENGTH,
   MAX_LOGIN_OBSERVED_QUERY_VALUE_LENGTH,
   MAX_LOGIN_OBSERVED_KEY_PART_LENGTH,
-  MAX_LOGIN_OBSERVED_STORAGE_KEY_NAMES,
   MIN_LOGIN_OBSERVED_KEY_PART_LENGTH,
   SUCCESS_SELECTOR_CANDIDATE_KINDS,
 } from '../../src/discovery/login-observation.js';
@@ -61,7 +57,8 @@ const ok = (message: unknown): boolean => validateWorkerToParentMessage(JSON.par
 describe('T43d: the query of a blocked request in AUTH_STATE', () => {
   it('has the query in the schema with the same limits', () => {
     const query = '/$defs/loginStageBlockedRequests/properties/requests/items/properties/query';
-    expect(pointerValue(SCHEMA, `${query}/properties/names/maxItems`)).toBe(MAX_LOGIN_OBSERVED_QUERY_NAMES);
+    // LZ-3a: 名前の数の上限（前は 4）はない。名前の長さ（伏せる長さ）と値の名前の閉じた一覧は残す。
+    expect(pointerValue(SCHEMA, `${query}/properties/names/maxItems`)).toBeUndefined();
     expect(pointerValue(SCHEMA, `${query}/properties/names/items/maxLength`)).toBe(MAX_LOGIN_OBSERVED_QUERY_NAME_LENGTH);
     expect(pointerValue(SCHEMA, `${query}/properties/values/maxItems`)).toBe(LOGIN_OBSERVED_QUERY_VALUE_NAMES.length);
     expect(pointerValue(SCHEMA, `${query}/properties/values/items/properties/name/enum`)).toEqual([...LOGIN_OBSERVED_QUERY_VALUE_NAMES]);
@@ -73,12 +70,13 @@ describe('T43d: the query of a blocked request in AUTH_STATE', () => {
     expect(ok(withRow({ query: undefined }))).toBe(true);
     expect(ok(withQuery({ names: [REDACTED_PATH_SEGMENT, 'grant_type', 'redirect_to'], omitted: 3 }))).toBe(true);
     expect(ok(withQuery({ names: ['redirect_to'], values: [] }))).toBe(true);
+    // LZ-3a: 名前の数の上限（前は 4）はない。
+    expect(ok(withQuery({ names: ['grant_type', 'n0', 'n1', 'n2', 'n3'] }))).toBe(true);
     const refresh = { ...TOKEN_ROW, query: { names: ['grant_type'], omitted: 0, values: [{ name: 'grant_type', value: 'refresh_token' }] } };
     expect(ok(authState('LOGIN_TIMEOUT', { blockedRequests: { requests: [TOKEN_ROW, refresh], unlisted: 0 } }))).toBe(true);
   });
 
   it.each([
-    ['too many names', withQuery({ names: Array.from({ length: MAX_LOGIN_OBSERVED_QUERY_NAMES + 1 }, (_, index) => `n${index}`) })],
     ['a value-like name', withQuery({ names: ['grant_type', JWT_LIKE] })],
     ['an empty name', withQuery({ names: ['grant_type', ''] })],
     ['a repeated name', withQuery({ names: ['grant_type', 'grant_type'] })],
@@ -98,14 +96,17 @@ describe('T43d: the query of a blocked request in AUTH_STATE', () => {
 describe('T43d: the login observation in AUTH_STATE', () => {
   it('has the observation in the schema with the same limits and lists', () => {
     expect(pointerValue(SCHEMA, '/$defs/authState/properties/loginObservation')).toEqual({ $ref: '#/$defs/loginObservation' });
-    expect(pointerValue(SCHEMA, '/$defs/loginObservation/properties/storageKeys/properties/origin/maxLength')).toBe(MAX_WORKER_NOTICE_URL_LENGTH);
-    expect(pointerValue(SCHEMA, '/$defs/loginObservation/properties/storageKeys/properties/shapes/maxItems')).toBe(MAX_LOGIN_OBSERVED_STORAGE_KEY_NAMES);
+    // URL-LEN: Origin の長さの上限（前は 2,048）はない。
+    expect(pointerValue(SCHEMA, '/$defs/loginObservation/properties/storageKeys/properties/origin/maxLength')).toBeUndefined();
+    // LZ-3a: 鍵の名前の案の数の上限（前は 4）はない。
+    expect(pointerValue(SCHEMA, '/$defs/loginObservation/properties/storageKeys/properties/shapes/maxItems')).toBeUndefined();
     expect(pointerValue(SCHEMA, '/$defs/loginObservation/properties/storageKeys/properties/shapes/items/properties/prefix/maxLength'))
       .toBe(MAX_LOGIN_OBSERVED_KEY_PART_LENGTH + 1);
     expect(pointerValue(SCHEMA, '/$defs/loginObservation/properties/storageKeys/properties/shapes/items/properties/suffix/minLength'))
       .toBe(0);
     expect(MIN_LOGIN_OBSERVED_KEY_PART_LENGTH).toBe(2);
-    expect(pointerValue(SCHEMA, '/$defs/loginObservation/properties/successSelector/properties/selector/maxLength')).toBe(MAX_SUCCESS_SELECTOR_LENGTH);
+    // LZ-2: セレクタの長さの上限（前は 256）はない。
+    expect(pointerValue(SCHEMA, '/$defs/loginObservation/properties/successSelector/properties/selector/maxLength')).toBeUndefined();
     expect(pointerValue(SCHEMA, '/$defs/loginObservation/properties/successSelector/properties/kind/enum')).toEqual([...SUCCESS_SELECTOR_CANDIDATE_KINDS]);
     expect(pointerValue(SCHEMA, '/$defs/loginObservation/properties/successSelector/properties/logoutWord/enum')).toEqual([...DISCOVERY_LOGOUT_WORDS]);
   });
@@ -128,6 +129,10 @@ describe('T43d: the login observation in AUTH_STATE', () => {
     expect(ok(withObservation({ storageKeys: { origin: ORIGIN, shapes: [{ prefix: '', suffix: '.idToken' }, { prefix: 'session:', suffix: '' }, { prefix: 'auth.', suffix: '-jwt' }], omitted: 2 } })))
       .toBe(true);
     expect(ok(withObservation({ credentialDiscarded: 2 }))).toBe(true);
+    // LZ-3a: 鍵の名前の案の数の上限（前は 4）はない。
+    expect(ok(withObservation({
+      storageKeys: { ...OBSERVATION.storageKeys, shapes: ['-token', '-auth', '-session', '-jwt', '-access'].map((suffix) => ({ prefix: '', suffix })) },
+    }))).toBe(true);
   });
 
   // T43R-fix の C-1（意図して直した期待）: 名前の全体、利用者の名前の入る CSS、nav の案は持てない。
@@ -142,9 +147,6 @@ describe('T43d: the login observation in AUTH_STATE', () => {
     ['a prefix without a separator', withObservation({ storageKeys: { ...OBSERVATION.storageKeys, shapes: [{ prefix: 'example', suffix: '-token' }] } })],
     ['a value-like part', withObservation({ storageKeys: { ...OBSERVATION.storageKeys, shapes: [{ prefix: `${'a'.repeat(40)}0123.`, suffix: '-token' }] } })],
     ['a repeated shape', withObservation({ storageKeys: { ...OBSERVATION.storageKeys, shapes: [OBSERVATION.storageKeys.shapes[0], OBSERVATION.storageKeys.shapes[0]] } })],
-    ['too many shapes', withObservation({
-      storageKeys: { ...OBSERVATION.storageKeys, shapes: ['-token', '-auth', '-session', '-jwt', '-access'].map((suffix) => ({ prefix: '', suffix })) },
-    })],
     // T43R2-fix: 利用者の名前が端に来る形と、両側とも空の組は持てない。
     ['a user name at the start', withObservation({ storageKeys: { ...OBSERVATION.storageKeys, shapes: [{ prefix: 'entryuser.', suffix: '' }] } })],
     ['a user name at the end', withObservation({ storageKeys: { ...OBSERVATION.storageKeys, shapes: [{ prefix: '', suffix: '.entryuser' }] } })],
@@ -170,9 +172,9 @@ describe('FM2e: the login field proposals in the login observation', () => {
   const FIELDS = Object.freeze({ username: '#email', password: 'input[name="password"]', submit: 'button[type="submit"]' });
   const AUTOMATED_REPORT = Object.freeze({ result: 'SUCCEEDED', submitted: 'YES', retryAfterUntil: null, formInvalidReason: null });
 
-  it('has the field proposals in the schema with the selector limit', () => {
+  it('has the field proposals in the schema without a selector length limit (LZ-2)', () => {
     for (const field of ['username', 'password', 'submit']) {
-      expect(pointerValue(SCHEMA, `/$defs/loginObservation/properties/loginFields/properties/${field}/maxLength`)).toBe(MAX_SUCCESS_SELECTOR_LENGTH);
+      expect(pointerValue(SCHEMA, `/$defs/loginObservation/properties/loginFields/properties/${field}/maxLength`)).toBeUndefined();
     }
     expect(pointerValue(SCHEMA, '/$defs/loginObservation/properties/loginFields/required')).toEqual(['username', 'password', 'submit']);
   });
@@ -181,6 +183,8 @@ describe('FM2e: the login field proposals in the login observation', () => {
     expect(ok(withObservation({ loginFields: FIELDS }))).toBe(true);
     expect(ok(withObservation({ ...OBSERVATION, loginFields: FIELDS }))).toBe(true);
     expect(ok(withObservation({ loginFields: { ...FIELDS, username: null, submit: null } }))).toBe(true);
+    // LZ-2: 前の上限（256）より長いセレクタも受ける。
+    expect(ok(withObservation({ loginFields: { ...FIELDS, username: `#${'a'.repeat(256)}` } }))).toBe(true);
   });
 
   it.each([
@@ -189,7 +193,6 @@ describe('FM2e: the login field proposals in the login observation', () => {
     ['a value', withObservation({ loginFields: { ...FIELDS, value: 'entry-user' } })],
     ['a selector that the auth setup does not accept', withObservation({ loginFields: { ...FIELDS, username: 'text=メール' } })],
     ['a selector with a line break', withObservation({ loginFields: { ...FIELDS, submit: '#a\n#b' } })],
-    ['a too long selector', withObservation({ loginFields: { ...FIELDS, username: `#${'a'.repeat(MAX_SUCCESS_SELECTOR_LENGTH)}` } })],
     ['two same selectors', withObservation({ loginFields: { ...FIELDS, submit: FIELDS.username } })],
     ['a login failure', authState('LOGIN_TIMEOUT', { loginObservation: { loginFields: FIELDS } })],
     ['the automated login', authState('AUTHENTICATED', { automatedLogin: AUTOMATED_REPORT, loginObservation: { loginFields: FIELDS } })],

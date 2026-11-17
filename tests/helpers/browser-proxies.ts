@@ -6,9 +6,8 @@
  * - `newContext` の直後に page を開く Proxy（`browserOpeningPageAfterNewContext`）は、多くのテストが使うので、
  *   `browser-opening-page.ts` に置いたまま、ここの `overrideBrowser` を使う。
  */
-import type { Browser, BrowserContext, BrowserContextOptions } from 'playwright';
+import type { Browser, BrowserContext, BrowserContextOptions, CDPSession } from 'playwright';
 import { wait } from '../../src/core/deadline.js';
-import { WEBRTC_BLOCK_INIT_SCRIPT } from '../../src/safety/passive-request-guard.js';
 import { createDeferred, type Deferred } from './deferred.js';
 
 /** 決して終わらない Promise（止まったままの処理を表す）。 */
@@ -18,6 +17,9 @@ export const neverSettles = (): Promise<never> => new Promise<never>(() => undef
 export interface BrowserOverrides {
   readonly newContext?: Browser['newContext'];
   readonly close?: Browser['close'];
+  readonly newBrowserCDPSession?: Browser['newBrowserCDPSession'];
+  readonly contexts?: Browser['contexts'];
+  readonly isConnected?: Browser['isConnected'];
 }
 
 /**
@@ -63,12 +65,41 @@ export function browserWithoutInitScript(real: Browser, content: string): Browse
   });
 }
 
+
 /**
- * Guard が Context に付ける WebRTC の入口を塞ぐ初期化のスクリプト（`WEBRTC_BLOCK_INIT_SCRIPT`。DEF-124）だけを、付けずに捨てる Browser の Proxy
- * （起動の引数の守りと中継の CONNECT の守りを確かめるテストだけが、明示して選ぶ。作りは `browserWithoutInitScript`。CC-098。PRE42-CC 組 S2 で
- * `webrtc-egress-blocked.test.ts` と `egress-tunnel-admission.test.ts` の写しをここに寄せた）。
+ * SLIM-2（X7）: 1 回の流れ（発見・READ・書き込みの Run など。製品の起動の口 `launchBrowser` が返す Browser）のための、共有の Browser の Proxy。
+ * - Context と CDP の session は、本物の Browser に作り、この Proxy が作ったものだけを覚える。`close()` は、覚えた session を外し、覚えた Context だけを
+ *   閉じる（本物の Browser の process は閉じない。次の流れが同じ process を使う）。Context は流れごとに新しいので、Cookie・保存・キャッシュ・Service Worker・
+ *   接続は流れの間で分かれる（Guard と Ledger は Context ごと）。
+ * - `contexts()` は覚えた Context のうち開いているもの、`isConnected()` は `close()` の前で本物がつながっている間だけ真。
+ * - 製品の起動の通り道（起動の部品・自己検査）は、本物の Browser を起こすときに 1 回通る。使うのは、同じ process の中の流れを何度も動かすテストだけ。
  */
-export const browserWithoutWebRtcBlock = (real: Browser): Browser => browserWithoutInitScript(real, WEBRTC_BLOCK_INIT_SCRIPT);
+export function browserSharedForRun(real: Browser): Browser {
+  const contexts = new Set<BrowserContext>();
+  const sessions = new Set<CDPSession>();
+  let closed = false;
+  return overrideBrowser(real, {
+    newContext: async (...args: Parameters<Browser['newContext']>): Promise<BrowserContext> => {
+      const context = await real.newContext(...args);
+      contexts.add(context);
+      context.once('close', () => contexts.delete(context));
+      return context;
+    },
+    newBrowserCDPSession: async (): Promise<CDPSession> => {
+      const session = await real.newBrowserCDPSession();
+      sessions.add(session);
+      return session;
+    },
+    contexts: () => [...contexts],
+    isConnected: () => !closed && real.isConnected(),
+    close: async (): Promise<void> => {
+      closed = true;
+      await Promise.all([...sessions].map((session) => session.detach().catch(() => undefined)));
+      sessions.clear();
+      await Promise.all([...contexts].map((context) => context.close().catch(() => undefined)));
+    },
+  });
+}
 
 /** `newContext` が必ず失敗する Browser の Proxy（Guard の取り付けに進まずに、Context の作成が失敗する場合を作る）。 */
 export function browserFailingNewContext(real: Browser, message = 'newContext failed in the Safety Gate test'): Browser {

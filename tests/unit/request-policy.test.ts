@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import { classifyPassiveRequest, hasAllowedOrigin, isReadMethod } from '../../src/safety/request-policy.js';
+import { classifyPassiveRequest, hasAllowedOrigin, isOutsideAuditScope, isReadMethod } from '../../src/safety/request-policy.js';
 
 const allowedOrigins = new Set(['HTTPS://EXAMPLE.TEST:443/path']);
 
@@ -59,7 +59,8 @@ describe('classifyPassiveRequest', () => {
     }
   });
 
-  it('blocks external main-frame navigation while allowing an external subresource', () => {
+  // SD-2（設計書 `2026-11-16-beaksight-action-based-delete-guard-design.md` 2.4）: 許可 Origin の外への main frame の移動も止めない（ログインの段のほか）。
+  it('allows an external main-frame navigation (outside the login stage) and an external subresource', () => {
     const externalMainFrame = {
       kind: 'HTTP' as const,
       method: 'GET',
@@ -68,11 +69,7 @@ describe('classifyPassiveRequest', () => {
       isMainFrame: true,
     };
 
-    expect(classifyPassiveRequest(externalMainFrame, allowedOrigins)).toEqual({
-      action: 'BLOCK',
-      category: 'NAVIGATION',
-      reason: 'EXTERNAL_MAIN_FRAME_NAVIGATION',
-    });
+    expect(classifyPassiveRequest(externalMainFrame, allowedOrigins)).toEqual({ action: 'ALLOW', delivery: 'INSPECT_REDIRECTS' });
     expect(classifyPassiveRequest({ ...externalMainFrame, isMainFrame: false }, allowedOrigins)).toEqual({
       action: 'ALLOW',
       delivery: 'DIRECT',
@@ -98,12 +95,7 @@ describe('classifyPassiveRequest', () => {
   it('does not grant authority from invalid or non-HTTP allowed-origin entries', () => {
     const invalidOrigins = new Set(['not a URL', 'mailto:help@example.test']);
 
-    expect(classifyPassiveRequest({
-      kind: 'HTTP',
-      method: 'GET',
-      url: 'https://example.test/catalog',
-      isNavigationRequest: true,
-      isMainFrame: true,
-    }, invalidOrigins)).toMatchObject({ action: 'BLOCK', category: 'NAVIGATION' });
+    // SD-2: 範囲の判定（`isOutsideAuditScope`）で、許可 Origin として読まない。
+    expect(isOutsideAuditScope('https://example.test/catalog', invalidOrigins, undefined)).toBe(true);
   });
 });

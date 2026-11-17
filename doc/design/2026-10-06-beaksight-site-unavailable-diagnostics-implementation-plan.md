@@ -1,5 +1,7 @@
 # BeakSight サイトの不調で止めたときの診断の記録 実装計画
 
+> 2026-11-14: SPEC-3 で廃止した（D1・D2・D3・D3R・DR）。`2026-11-14-beaksight-slim-and-simplify-design.md` の 5.1 が置き換える。この文書は履歴として残す。
+
 設計書: `doc/design/2026-10-06-beaksight-site-unavailable-diagnostics-design.md`
 目標: サイトの不調で捨てたページの監査の記録と、ページ本体の要求がネットワークへ送られたかの観察を、`diagnostics/` に残す。
 作業記録置き場: `.superpowers/sdd/2026-08-27-beaksight-implementation-plan/`

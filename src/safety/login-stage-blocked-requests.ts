@@ -3,17 +3,15 @@
 //   `AUTH_STATE` に載せ、ジョブの管理が管理データのジョブの行に残し、ローカルの画面だけに出す（Run の成果物には入れない）。
 // - 1 行は、Origin と path（fragment・本文・値は持たない。query は T43d の名前の記録だけ）、要求の種類（`RequestResourceType`）、止めた理由
 //   （`LOGIN_STAGE_BLOCKED_REQUEST_REASONS`）、回数。同じ Origin・path・種類・理由は重ねず、回数を足す（飽和）。
-// - 一覧は上限（`MAX_LOGIN_STAGE_BLOCKED_REQUESTS`）まで。上限を超えた新しい行と、HTTP(S) の Origin の正規の直列化を作れない URL は、数だけ
-//   （`unlisted`）。一覧に入っている行は、上限の後も回数を足す。
-// - path は、値に見える区切りを伏せ（`src/core/url-path-redaction.ts` の `redactValueLikePathSegments`。T34e fix round 1。送信先の path は伏せない）、
-//   上限の長さ（`MAX_LOGIN_STAGE_BLOCKED_PATH_LENGTH`）で切り、切った後にもう一度伏せる（切った区切りが値に見える形になりうるため）。
+// - 一覧の行の数の上限はない（LZ-3a。前は 8）。HTTP(S) の Origin の正規の直列化を作れない URL は、数だけ（`unlisted`）。
+// - path は、値に見える区切りを伏せる（`src/core/url-path-redaction.ts` の `redactValueLikePathSegments`。T34e fix round 1。送信先の path は伏せない）。
+//   URL-LEN: 長さでは切らない。
 // - IPC の側の同じ意味の定義（`src/control/worker-protocol.ts` の `WORKER_LOGIN_STAGE_…`）との一致は、`tests/unit/script-login-boundary-consistency.test.ts`
 //   で確かめる（`src/control/` と `src/safety/` は互いを読み込めない）。
-// - T43d（Task 43 の設計書 4.4）: 行に、query の名前の一覧（値なし。上限つき）と、閉じた一覧の名前（今は `grant_type`）の決まった形の値を足す（任意の
+// - T43d（Task 43 の設計書 4.4）: 行に、query の名前の一覧（値なし）と、閉じた一覧の名前（今は `grant_type`）の決まった形の値を足す（任意の
 //   項目 `query`。query のない行は持たない）。形と判定の owner は `src/discovery/login-observation.ts`（IPC の検証も同じ部品を使う）。値の違う行は重ねず、
 //   名前は同じ行の間で足し合わせる。資格情報を含む要求は、今どおり行を作らない（T36R-fix。Guard が行にする前に止める）。
-import { MAX_URL_LENGTH } from '../core/limits.js';
-import { saturatingAdd, saturatingIncrement } from '../core/saturating-count.js';
+import { saturatingIncrement } from '../core/saturating-count.js';
 import { redactValueLikePathSegments } from '../core/url-path-redaction.js';
 import { canonicalHttpOriginOf } from '../crawl/normalize-url.js';
 import { loginObservedQueryOf, mergeLoginObservedQuery, type LoginObservedQuery } from '../discovery/login-observation.js';
@@ -25,26 +23,34 @@ import { SCRIPT_LOGIN_BLOCK_REASONS, type ScriptLoginBlockReason, type RequestRe
  * `NON_READ_METHOD`（許した送信先への POST のほかの、読み取りでない要求。要求の判定の理由のまま）。
  * T36R-fix（T36R の M-2）: 資格情報を含む要求の理由（`LOGIN_CREDENTIAL_BLOCK_REASON`）は数だけで、行の理由には入れない（path に値が入りうるため）。
  */
-export type LoginStageBlockedRequestReason = Exclude<ScriptLoginBlockReason, typeof LOGIN_CREDENTIAL_BLOCK_REASON> | 'NON_READ_METHOD';
+export type LoginStageBlockedRequestReason =
+  | Exclude<ScriptLoginBlockReason, typeof LOGIN_CREDENTIAL_BLOCK_REASON>
+  | 'NON_READ_METHOD'
+  | LoginStageSendRuleRowReason;
+
+/**
+ * DEF-194（設計書 `2026-11-04-beaksight-login-session-design.md` 3.3）: 行だけの理由（数の鍵 `SCRIPT_LOGIN_BLOCK_REASONS` には足さない。保存済みのジョブの数の形を
+ * 変えないため）。自動ログインの段の口（DEF-193）が、サイトが自動で送る通信として通した行（`AUTOMATED_LOGIN_PASSED`）と、その口の決まり（DELETE・DELETE の上書き・
+ * 危険な語と読まないパス）で止めた行（`AUTOMATED_LOGIN_RULE_BLOCKED`）。どちらも登録の対象ではない（登録の案と「行を選んで登録してください」に数えない）。
+ */
+export const LOGIN_STAGE_SEND_RULE_ROW_REASONS = Object.freeze(['AUTOMATED_LOGIN_PASSED', 'AUTOMATED_LOGIN_RULE_BLOCKED'] as const);
+export type LoginStageSendRuleRowReason = (typeof LOGIN_STAGE_SEND_RULE_ROW_REASONS)[number];
 
 /** 行の理由か（資格情報を含む要求の理由のほか）。 */
-export const isLoginStageBlockedRequestReason = <Reason extends ScriptLoginBlockReason | 'NON_READ_METHOD'>(
+export const isLoginStageBlockedRequestReason = <Reason extends ScriptLoginBlockReason | 'NON_READ_METHOD' | LoginStageSendRuleRowReason>(
   reason: Reason,
 ): reason is Exclude<Reason, typeof LOGIN_CREDENTIAL_BLOCK_REASON> => reason !== LOGIN_CREDENTIAL_BLOCK_REASON;
 
 export const LOGIN_STAGE_BLOCKED_REQUEST_REASONS: readonly LoginStageBlockedRequestReason[] = Object.freeze([
   ...SCRIPT_LOGIN_BLOCK_REASONS.filter(isLoginStageBlockedRequestReason),
   'NON_READ_METHOD' as const,
+  // DEF-194: 行だけの理由（数の鍵ではない）。
+  ...LOGIN_STAGE_SEND_RULE_ROW_REASONS,
 ]);
 
-/** 一覧の行の上限（Task 34 の設計書 8 章の T34e の行）。 */
-export const MAX_LOGIN_STAGE_BLOCKED_REQUESTS = 8;
+// LZ-3a: 一覧の行の数の上限（前は `MAX_LOGIN_STAGE_BLOCKED_REQUESTS` 8）は撤廃した。新しい行は残らず一覧に入れる。
 
-/** path の最大長（UTF-16 のコード単位。長い path は、この長さで切る）。 */
-export const MAX_LOGIN_STAGE_BLOCKED_PATH_LENGTH = 1_024;
-
-/** Origin の最大長（記録する URL の上限と同じ。超える Origin は一覧に入れない）。 */
-const MAX_LOGIN_STAGE_BLOCKED_ORIGIN_LENGTH = MAX_URL_LENGTH;
+// URL-LEN: path の長さの上限（前は 1,024 で切った）と Origin の長さの上限（前は 2,048 を超える Origin を一覧に入れなかった）は撤廃した。
 
 /** 一覧の 1 行（値・本文を持たない。query は名前と閉じた一覧の名前の値だけ。T43d）。 */
 export interface LoginStageBlockedRequest {
@@ -67,7 +73,7 @@ export interface LoginStageBlockedRequest {
 /** 一覧の写し（凍結）。 */
 export interface LoginStageBlockedRequests {
   readonly requests: readonly LoginStageBlockedRequest[];
-  /** 一覧に入れなかった、止めた要求の数（上限を超えた新しい行と、Origin を作れない URL。飽和）。 */
+  /** 一覧に入れなかった、止めた要求の数（Origin を作れない URL。飽和）。 */
   readonly unlisted: number;
 }
 
@@ -97,11 +103,10 @@ export const isTokenShapedLoginUrl = (url: string): boolean => {
 };
 
 /**
- * 記録する path（`URL.pathname`）の表記: 値に見える区切りを伏せてから上限の長さ（`MAX_LOGIN_STAGE_BLOCKED_PATH_LENGTH`）で切り、切った後にもう一度伏せる
- * （値の一部だけが残る形にしない。切った区切りが値に見える形になっても伏せる）。DEF-138: セッションの切れの証拠の path も、この決まりで作る。
+ * 記録する path（`URL.pathname`）の表記: 値に見える区切りを伏せる。URL-LEN: 長さでは切らない（前は 1,024 で切り、切った後にもう一度伏せた）。
+ * DEF-138: セッションの切れの証拠の path も、この決まりで作る。
  */
-export const recordedRequestPathOf = (pathname: string): string =>
-  redactValueLikePathSegments(redactValueLikePathSegments(pathname).slice(0, MAX_LOGIN_STAGE_BLOCKED_PATH_LENGTH));
+export const recordedRequestPathOf = (pathname: string): string => redactValueLikePathSegments(pathname);
 
 /** 一覧の Origin と path と query の記録（作れなければ `undefined`）。 */
 const locationOf = (url: string): { readonly origin: string; readonly path: string; readonly query: LoginObservedQuery | null } | undefined => {
@@ -112,7 +117,7 @@ const locationOf = (url: string): { readonly origin: string; readonly path: stri
     return undefined;
   }
   const origin = canonicalHttpOriginOf(parsed.origin);
-  if (origin === undefined || origin.length > MAX_LOGIN_STAGE_BLOCKED_ORIGIN_LENGTH) {
+  if (origin === undefined) {
     return undefined;
   }
   return { origin, path: recordedRequestPathOf(parsed.pathname), query: loginObservedQueryOf(parsed.searchParams) };
@@ -127,8 +132,8 @@ export class LoginStageBlockedRequestList {
   #unlisted = 0;
 
   /**
-   * 要求を 1 つ記録する。ML-a-fix: `beforeToken` は、その要求がログインの段の最初の token の送信より前か（行を最初に作った回の値を残す）。token の形の行（閉じた
-   * 一覧の `grant_type` の値を記録した行。ML-R の M-1）は、一覧が上限で埋まっていても必ず残す（token の形でない最後の行を一覧から外し、その回数を数だけにする）。
+   * 要求を 1 つ記録する。ML-a-fix: `beforeToken` は、その要求がログインの段の最初の token の送信より前か（行を最初に作った回の値を残す）。LZ-3a: 一覧の行の数の上限は
+   * ないので、token の形の行（ML-R の M-1）も、ほかの行を外さずに必ず一覧に入る。
    */
   record(url: string, resourceType: RequestResourceType, reason: LoginStageBlockedRequestReason, beforeToken = false): void {
     const location = locationOf(url);
@@ -144,25 +149,7 @@ export class LoginStageBlockedRequestList {
       entry.query = mergeLoginObservedQuery(entry.query, location.query);
       return;
     }
-    if (this.#entries.size >= MAX_LOGIN_STAGE_BLOCKED_REQUESTS && !this.#makeRoomFor(location.query)) {
-      this.#unlisted = saturatingIncrement(this.#unlisted);
-      return;
-    }
     this.#entries.set(key, { ...location, resourceType, reason, count: 1, beforeToken: beforeToken === true });
-  }
-
-  /** ML-a-fix（ML-R の M-1）: token の形の行のために、token の形でない最後の行を一覧から外す（外せたら真。回数は数だけに移す）。 */
-  #makeRoomFor(query: LoginObservedQuery | null): boolean {
-    if (!isTokenShapedQuery(query)) {
-      return false;
-    }
-    const victim = [...this.#entries].reverse().find(([, candidate]) => !isTokenShapedQuery(candidate.query));
-    if (victim === undefined) {
-      return false;
-    }
-    this.#entries.delete(victim[0]);
-    this.#unlisted = saturatingAdd(this.#unlisted, victim[1].count);
-    return true;
   }
 
   /** 一覧の写し（記録した順。凍結）。 */

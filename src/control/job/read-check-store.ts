@@ -1,6 +1,6 @@
 // READ の確かめの定義と結果の読み書きの唯一の owner（管理データの版 5 の `read_checks`、`read_check_results`。Task 27 の設計書 4.5、4.6。T27c）。
 // - 定義: 作成（版 1）、変更（画面が読んだ版と同じときだけ。版を 1 つ上げる）、取り消し（消さずに、取り消した時刻を書く。取り消した定義は変えない）。
-//   1 つのプロファイルの、取り消していない定義の数は `MAX_READ_CHECK_DEFINITIONS_PER_PROFILE` まで（数えるのは、作るのと同じトランザクションの中）。
+//   L4（COV-7）: 1 つのプロファイルの、取り消していない定義の数で拒まない（数の上限を置かない）。
 //   T27f（T27c の申し送り 6）: 取り消したプロファイルでは、作らない・変えない（`READ_CHECK_PROFILE_RETIRED`。同じトランザクションの中で確かめる）。
 //   取り消しはできる。T28b fix round 1: READ の確かめを許さないモードと認証の方式のプロファイル（`execution-policy.ts` の `READ_CHECK` の行にない。
 //   例: 公開の監査）でも、作らない・変えない（`READ_CHECK_PROFILE_NOT_ELIGIBLE`。同じトランザクションの中で確かめる）。
@@ -16,7 +16,6 @@
 //   `control-store-boundary.test.ts` の (f)(g)）。呼び出し側の誤り（形の違う入力、前の時刻、同じ ID）は `RangeError`。
 import { deepFreeze } from '../../core/immutable.js';
 import {
-  MAX_READ_CHECK_DEFINITIONS_PER_PROFILE,
   READ_CHECK_RESULTS,
   type ReadCheckDefinition,
   type ReadCheckResult,
@@ -102,9 +101,6 @@ export interface ReadCheckResultView {
   readonly recordedAt: string;
 }
 
-/** 最近の結果を読む件数の既定。 */
-export const DEFAULT_RECENT_READ_CHECK_RESULTS = 50;
-
 // ---------------------------------------------------------------------------------------------------------------
 // SQL と行
 // ---------------------------------------------------------------------------------------------------------------
@@ -141,7 +137,6 @@ const SELECT_PROFILE_READ_CHECKS_SQL = `SELECT ${READ_CHECK_COLUMNS} FROM read_c
 /** プロファイルの状態と、モードと認証の方式（T28b fix round 1。READ の確かめを許すかの判定に使う。値は `execution-policy.ts` が確かめる）。 */
 const SELECT_PROFILE_STATUS_SQL =
   "SELECT status, json_extract(document, '$.mode') AS mode, json_extract(document, '$.auth') AS auth FROM profiles WHERE profile_id = ?";
-const SELECT_ACTIVE_COUNT_SQL = 'SELECT count(*) AS n FROM read_checks WHERE profile_id = ? AND canceled_at IS NULL';
 const INSERT_READ_CHECK_SQL = `INSERT INTO read_checks (${READ_CHECK_COLUMNS}) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, NULL)`;
 const UPDATE_READ_CHECK_SQL = `UPDATE read_checks SET target_identity_digest = ?, target_page_path = ?, parameters = ?, expectations = ?, revision = ?,
   updated_at = ? WHERE read_check_id = ? AND revision = ? AND canceled_at IS NULL`;
@@ -319,9 +314,7 @@ const createIn = (connection: SqliteConnection, input: NewReadCheck): ReadCheckS
   if (profileRejection !== null) {
     return rejected(profileRejection);
   }
-  if ((connection.prepare(SELECT_ACTIVE_COUNT_SQL).get(input.profileId) as { readonly n: number }).n >= MAX_READ_CHECK_DEFINITIONS_PER_PROFILE) {
-    return rejected('READ_CHECK_LIMIT_EXCEEDED');
-  }
+  // L4（設計書 `2026-11-09-beaksight-remove-limits-design.md`。COV-7）: 取り消していない定義の数で拒まない。
   const { definition } = input;
   connection.prepare(INSERT_READ_CHECK_SQL).run(
     input.readCheckId, input.profileId, ...targetColumnsOf(definition), JSON.stringify(definition.parameters),
@@ -387,8 +380,7 @@ const recordResultIn = (connection: SqliteConnection, input: ReadCheckResultInpu
 // ---------------------------------------------------------------------------------------------------------------
 
 /**
- * 定義を作る（版 1）。プロファイルがなければ `READ_CHECK_PROFILE_NOT_FOUND`、取り消していない定義が上限に達していれば
- * `READ_CHECK_LIMIT_EXCEEDED`（どちらも何も書かない）。同じ ID は `RangeError`。
+ * 定義を作る（版 1）。プロファイルがなければ `READ_CHECK_PROFILE_NOT_FOUND`（何も書かない）。定義の数では拒まない（L4）。同じ ID は `RangeError`。
  */
 export const createReadCheck = (database: ControlDatabase, input: NewReadCheck): ReadCheckStoreResult => {
   const values: NewReadCheck = Object.freeze({
@@ -505,16 +497,22 @@ export const listReadChecksIn = (
   );
 };
 
-/** プロファイルの最近の結果（新しい順。`limit` 件まで）。 */
+/** SQLite の `LIMIT` で、件数を区切らない値。 */
+const SQL_NO_LIMIT = -1;
+
+/**
+ * プロファイルの結果（新しい順）。L4（INV-LIMITS の N40）: `limit` を省けば全部（前の既定 50 件は撤廃した）。渡せば
+ * `limit` 件まで。
+ */
 export const readRecentReadCheckResults = (
   database: ControlDatabase,
   profileId: string,
-  limit: number = DEFAULT_RECENT_READ_CHECK_RESULTS,
+  limit?: number,
 ): readonly ReadCheckResultView[] => {
-  if (!Number.isSafeInteger(limit) || limit < 1) {
+  if (limit !== undefined && (!Number.isSafeInteger(limit) || limit < 1)) {
     throw new RangeError('the limit must be a positive safe integer');
   }
   return withReadTransaction(database, (connection) => Object.freeze(
-    (connection.prepare(SELECT_RECENT_RESULTS_SQL).all(profileId, limit) as unknown as ResultRow[]).map(resultViewOf),
+    (connection.prepare(SELECT_RECENT_RESULTS_SQL).all(profileId, limit ?? SQL_NO_LIMIT) as unknown as ResultRow[]).map(resultViewOf),
   ));
 };

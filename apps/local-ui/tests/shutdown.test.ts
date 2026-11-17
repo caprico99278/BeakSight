@@ -123,6 +123,35 @@ describe('two-step shutdown of the local UI server', () => {
     expect(exits.length).toBe(2);
   });
 
+  // OP-P（P3）: 止める決まりを受けたことを、終わりの処理の前に記録する（終わりの処理の途中で process が消えても、理由が残る）。2 回目は記録しない。
+  it('records the request with the reason and the running jobs before the end work, once (OP-P)', async () => {
+    const events: unknown[] = [];
+    let release: () => void = () => undefined;
+    const held = new Promise<void>((resolveHeld) => {
+      release = resolveHeld;
+    });
+    const handler = createTwoStepShutdown<string>({
+      runningJobCount: () => 1,
+      text: TEXT,
+      log: () => undefined,
+      shutdownJobs: async () => {
+        events.push('jobs');
+        await held;
+      },
+      closeServer: async () => undefined,
+      closeStore: () => undefined,
+      exit: (code: number) => events.push(`exit:${code}`),
+      recordRequest: (reason: string | undefined, runningJobs: number) => events.push({ request: reason, runningJobs }),
+      recordEnd: (reason: string | undefined, immediate: boolean) => events.push({ end: reason, immediate }),
+    });
+    handler('CONSOLE_CLOSED');
+    expect(events).toEqual([{ request: 'CONSOLE_CLOSED', runningJobs: 1 }, 'jobs']);
+    handler('CONSOLE_CLOSED');
+    expect(events).toEqual([{ request: 'CONSOLE_CLOSED', runningJobs: 1 }, 'jobs', { end: 'CONSOLE_CLOSED', immediate: true }, `exit:${SHUTDOWN_EXIT_CODE}`]);
+    release();
+    await settle();
+  });
+
   it('still closes and exits when the job shutdown fails', async () => {
     const { record, handler } = recorder(1, true);
     handler();

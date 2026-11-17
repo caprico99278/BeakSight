@@ -22,7 +22,7 @@
 //   `CredentialProtectionError` のまま返す。
 // - 本番の入口（`createCredentialStore(repoRoot)`）は、本物の暗号化の部品・子プロセス・時刻を使う。テストは `createCredentialStoreWith` に
 //   偽物を渡す。
-import { mkdir, open, readdir, readFile, rename, rm, unlink } from 'node:fs/promises';
+import { mkdir, open, readdir, readFile, rename, rm, rmdir, unlink } from 'node:fs/promises';
 import { isAbsolute, join } from 'node:path';
 import { inspectRealArtifactEntry, type RealArtifactEntry } from '../../core/contained-artifact-file.js';
 import { resolveTimeoutMs, wait } from '../../core/deadline.js';
@@ -100,7 +100,7 @@ const CREDENTIAL_DIRECTORY_RELATIVE_PATH = `${CREDENTIAL_PARENT_DIRECTORY_NAME}/
 const CREDENTIAL_FILE_LINK_COUNT = 1n;
 
 /** 最初の改訂の番号。 */
-const FIRST_CREDENTIAL_REVISION = 1;
+export const FIRST_CREDENTIAL_REVISION = 1;
 
 // rename のやり直しの決まり（失敗のコード、回数、待ち）は、成果物の書き出しと共用するため、`src/core/rename-retry.ts` の
 // `renameWithRetry` に移した（CC-062。CCX-11）。
@@ -348,6 +348,22 @@ const SID_PATTERN = /^S-1-\d+(?:-\d+)+$/u;
 const BOOLEAN_TEXT: Readonly<Record<string, boolean>> = Object.freeze({ True: true, False: false });
 const ACCESS_TYPES: ReadonlySet<string> = new Set(['Allow', 'Deny']);
 const NON_NEGATIVE_INTEGER_PATTERN = /^\d{1,10}$/u;
+/**
+ * 権限の値の形（OP-L L2）。.NET の `FileSystemRights` は 32 ビットの符号つきの数なので、汎用の権限（`GENERIC_READ` など。継承の多い
+ * フォルダの、中へだけ受け継ぐ規則にある）を `[int]` にすると負の数になる。32 ビットの範囲だけを受け、符号なしの値に直して比べる。
+ */
+const SIGNED_INTEGER_PATTERN = /^-?\d{1,10}$/u;
+const INT32_MIN = -(2 ** 31);
+const UINT32_MAX = 2 ** 32 - 1;
+
+/** 権限の値の文字を、32 ビットの符号なしの値に直す。形か範囲が違えば `null`。 */
+const rightsOf = (text: string): number | null => {
+  if (!SIGNED_INTEGER_PATTERN.test(text)) {
+    return null;
+  }
+  const value = Number(text);
+  return value >= INT32_MIN && value <= UINT32_MAX ? value >>> 0 : null;
+};
 
 interface StorageRule {
   readonly sid: string;
@@ -377,12 +393,13 @@ const ruleOf = (line: string): StorageRule | null => {
     return null;
   }
   const [sid = '', type = '', rights = '', inheritance = '', propagation = '', inherited = ''] = fields;
-  const numbers = [rights, inheritance, propagation];
-  if (!SID_PATTERN.test(sid) || !ACCESS_TYPES.has(type) || !numbers.every((text) => NON_NEGATIVE_INTEGER_PATTERN.test(text))
+  const flags = [inheritance, propagation];
+  const rightsValue = rightsOf(rights);
+  if (!SID_PATTERN.test(sid) || !ACCESS_TYPES.has(type) || rightsValue === null || !flags.every((text) => NON_NEGATIVE_INTEGER_PATTERN.test(text))
     || !Object.hasOwn(BOOLEAN_TEXT, inherited)) {
     return null;
   }
-  return { sid, type, rights: Number(rights), inheritance: Number(inheritance), propagation: Number(propagation), inherited: BOOLEAN_TEXT[inherited] === true };
+  return { sid, type, rights: rightsValue, inheritance: Number(inheritance), propagation: Number(propagation), inherited: BOOLEAN_TEXT[inherited] === true };
 };
 
 /** 権限の読み取りの出力を、厳しく読む。形が違えば `null`（安全でないとみなす）。 */
@@ -529,12 +546,21 @@ export const createCredentialStoreWith = (repoRoot: string, dependencies: Creden
     if (!(await directoryExists(CREDENTIAL_DIRECTORY_RELATIVE_PATH))) {
       storeError('CREDENTIAL_STORAGE_UNSAFE');
     }
-    if (created) {
-      await restrictNewDirectory();
-    }
-    const access = await readStorageAccess();
-    if (access === null || !isOnlyCurrentUser(access)) {
-      storeError('CREDENTIAL_STORAGE_UNSAFE');
+    try {
+      if (created) {
+        await restrictNewDirectory();
+      }
+      const access = await readStorageAccess();
+      if (access === null || !isOnlyCurrentUser(access)) {
+        storeError('CREDENTIAL_STORAGE_UNSAFE');
+      }
+    } catch (error) {
+      // OP-L L2: 新しく作ったフォルダを絞れなかったら、作ったフォルダを消す（空のときだけ。`rmdir` は中身があれば消さない）。
+      // 絞れていないフォルダを残すと、それ以降の保存がずっと `CREDENTIAL_STORAGE_UNSAFE` になる。前からあるフォルダは消さない。
+      if (created) {
+        await rmdir(directory).catch(() => undefined);
+      }
+      throw error;
     }
   };
 

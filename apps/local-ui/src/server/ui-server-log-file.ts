@@ -4,6 +4,7 @@
  * が決め、ここはファイルの読み書きだけを渡す（`src/**` のファイルの書き込みは ArtifactWriter だけ。GATE-ARCH08。対象の設定のファイルを書く
  * `target-config-writer.ts` と同じく、画面のサーバの部品で書く）。
  * - 起動の部品（`launcher/serve.ts`）は、2 つ目の入口（`launcher-bridge.ts`）から、予期しない例外・止める決まり・process の終わりの記録を呼ぶ。
+ *   OP-P: 起動（前の起動の終わりの記録がないことも）と、止める決まりを受けたことの記録も呼ぶ。
  *   ジョブの管理（`audit-jobs.ts`）は、結果の前に終わったワーカーの終わり方を記録する。
  * - 画面のサーバの token は、起動の部品が `setLocalUiServerLogSecrets` で渡す（記録には書かない）。
  * - 終わる直前（`exit` の受け手、`uncaughtExceptionMonitor`）にも書けるように、同期で書く。書けなくても投げない（記録の部品が受け止める）。
@@ -72,6 +73,16 @@ export const recordLocalUiServerUnexpectedError = (origin: UiServerErrorOrigin, 
 /** 止める決まりの終わり（終わり方、2 回目のすぐの終わりか、止め始めたときに動いていたジョブの数）を記録する。投げない。 */
 export const recordLocalUiServerShutdown = (reason: UiServerEndReason, immediate: boolean, runningJobs: number): void => {
   localUiServerLog().write({ kind: 'SHUTDOWN', reason, immediate, runningJobs });
+};
+
+/** OP-P（P3）: 起動（待ち受けの後）を記録する。前の起動の行の後に終わりの記録がなければ、そのことを先に 1 行書く。投げない。 */
+export const recordLocalUiServerStart = (): void => {
+  localUiServerLog().recordStart();
+};
+
+/** OP-P（P3）: 止める決まりを受けたこと（終わり方と、動いていたジョブの数。終わりの処理の前）を記録する。投げない。 */
+export const recordLocalUiServerStopRequest = (reason: UiServerEndReason, runningJobs: number): void => {
+  localUiServerLog().write({ kind: 'STOP_REQUESTED', reason, runningJobs });
 };
 
 /** process の終わり（終わりの記録をまだ書いていないときだけ）を記録する。投げない。 */

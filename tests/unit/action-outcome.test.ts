@@ -14,7 +14,6 @@ import {
   type ResponseJudgement,
 } from '../../src/control/actions/action-contracts.js';
 import {
-  MAX_SAFE_RECORD_ID_LENGTH,
   actionOutcomeOf,
   isUsableRecordId,
   recordableRecordIdOf,
@@ -22,7 +21,7 @@ import {
   usableRecordIdOf,
   fieldsMatchedOf,
 } from '../../src/control/actions/action-outcome.js';
-import { MAX_RECORD_ID_LENGTH, WRITE_RESERVATION_STATES } from '../../src/control/approval/scenario-contracts.js';
+import { WRITE_RESERVATION_STATES } from '../../src/control/approval/scenario-contracts.js';
 import { isWriteReservationTransitionAllowed } from '../../src/control/approval/execution-grant.js';
 import { READ_CHECK_RESULTS, type ReadCheckResult } from '../../src/discovery/read-check-contracts.js';
 
@@ -138,7 +137,6 @@ describe('action result of an outcome (T30a)', () => {
     ['a success with a READ blocked by the policy', sent('SUCCESS', '42', 'READ_BLOCKED_BY_POLICY'), 'PARTIAL', 'READ_VERIFICATION_UNDETERMINED'],
     ['a success with a READ of a drifted candidate', sent('SUCCESS', '42', 'READ_CANDIDATE_DRIFTED'), 'PARTIAL', 'READ_VERIFICATION_UNDETERMINED'],
     ['a success with an empty record id', sent('SUCCESS', '', 'MATCHED'), 'PARTIAL', 'RECORD_ID_NOT_FOUND'],
-    ['a success with a too long record id', sent('SUCCESS', 'x'.repeat(MAX_RECORD_ID_LENGTH + 1), 'MATCHED'), 'PARTIAL', 'RECORD_ID_NOT_FOUND'],
     ['a success with a record id with a line break', sent('SUCCESS', '4\n2', 'MATCHED'), 'PARTIAL', 'RECORD_ID_NOT_FOUND'],
     // T30f: 登録の ID は path の 1 区切りに入れて安全な閉じた形（英数字・`_`・`-`、1〜64 文字）だけ。外れれば `RECORD_ID_UNSAFE`。
     ['a success with a record id with a slash', sent('SUCCESS', '4/2', 'MATCHED'), 'PARTIAL', 'RECORD_ID_UNSAFE'],
@@ -146,8 +144,10 @@ describe('action result of an outcome (T30a)', () => {
     ['a success with a record id with a space', sent('SUCCESS', 'ID 42', 'MATCHED'), 'PARTIAL', 'RECORD_ID_UNSAFE'],
     ['a success with a percent-encoded record id', sent('SUCCESS', '4%2F2', 'MATCHED'), 'PARTIAL', 'RECORD_ID_UNSAFE'],
     ['a success with a non-ASCII record id', sent('SUCCESS', '４２', 'MATCHED'), 'PARTIAL', 'RECORD_ID_UNSAFE'],
-    ['a success with a record id over 64 characters', sent('SUCCESS', 'a'.repeat(MAX_SAFE_RECORD_ID_LENGTH + 1), 'MATCHED'), 'PARTIAL', 'RECORD_ID_UNSAFE'],
-    ['a success with a 64-character record id', sent('SUCCESS', `a_-${'9'.repeat(MAX_SAFE_RECORD_ID_LENGTH - 3)}`, 'MATCHED'), 'VERIFIED',
+    // L12b（設計書 `2026-11-09-beaksight-remove-limits-design.md` 6.2。設計者の判断 1・2）: 登録の ID の長さの上限（前は 64 文字、その後 256 文字）は
+    // 撤廃した。使える文字の ID は、長さを問わず使う。
+    ['a success with a record id over the former 64 characters', sent('SUCCESS', 'a'.repeat(65), 'MATCHED'), 'VERIFIED', 'READ_VERIFICATION_MATCHED'],
+    ['a success with a record id over the former 256 characters', sent('SUCCESS', `a_-${'9'.repeat(297)}`, 'MATCHED'), 'VERIFIED',
       'READ_VERIFICATION_MATCHED'],
     ['an unsafe record id with a READ that does not match', sent('SUCCESS', '4/2', 'NOT_MATCHED'), 'UNKNOWN', 'READ_VERIFICATION_NOT_MATCHED'],
   ])('decides %s', (_label, input, result, reason) => {
@@ -157,19 +157,20 @@ describe('action result of an outcome (T30a)', () => {
   });
 
   it('narrows the usable record id to the closed safe form, and keeps a recordable id for the artifact (T30f)', () => {
-    expect(MAX_SAFE_RECORD_ID_LENGTH).toBe(64);
-    for (const usable of ['42', 'abc_DEF-9', 'a'.repeat(MAX_SAFE_RECORD_ID_LENGTH)]) {
+    // L12b（設計者の判断 2）: 長さは見ない（前は 64 文字、その後 256 文字まで）。
+    for (const usable of ['42', 'abc_DEF-9', 'a'.repeat(300)]) {
       expect(isUsableRecordId(usable), usable).toBe(true);
       expect(usableRecordIdOf(usable)).toBe(usable);
     }
-    for (const unsafe of [null, '', '4/2', '..', '.', 'a b', '4%2F2', '４２', 'a'.repeat(MAX_SAFE_RECORD_ID_LENGTH + 1), '4\n2']) {
+    for (const unsafe of [null, '', '4/2', '..', '.', 'a b', '4%2F2', '４２', '4\n2']) {
       expect(isUsableRecordId(unsafe), String(unsafe)).toBe(false);
       expect(usableRecordIdOf(unsafe)).toBeNull();
     }
-    // 記録してよい ID（成果物の `recordId`）: 1 文字以上、上限以下、制御文字・行の区切り・対でないサロゲートを含まない。形の外でも記録する（判定は
-    // `RECORD_ID_UNSAFE` になる）。
+    // 記録してよい ID（成果物の `recordId`）: 1 文字以上、制御文字・行の区切り・対でないサロゲートを含まない（L12b: 長さは見ない）。形の外でも記録する
+    // （判定は `RECORD_ID_UNSAFE` になる）。
     expect(recordableRecordIdOf('4/2')).toBe('4/2');
-    for (const unrecordable of [null, '', '4\n2', 'x'.repeat(MAX_RECORD_ID_LENGTH + 1), '\ud800']) {
+    expect(recordableRecordIdOf('x'.repeat(300))).toBe('x'.repeat(300));
+    for (const unrecordable of [null, '', '4\n2', '\ud800']) {
       expect(recordableRecordIdOf(unrecordable)).toBeNull();
     }
   });

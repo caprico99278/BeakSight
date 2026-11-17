@@ -5,7 +5,9 @@
 // - 相手は、このテストの中の 127.0.0.1 の TCP のサーバ（要求の頭を受けたら、場面ごとの生の bytes を返す）。
 // - 比べるもの: 読み込みの結果の種類（応答か失敗か）、HTTP の status、理由の文字列（`statusText`）、失敗のエラーのコード、Guard の違反の
 //   コード、本文の先頭。中継なしと同じにできない形は `ACCEPTED_DIFFERENCES` に、理由とともに置く（報告して受け入れの判断を待つ形）。
-// - Chromium は headless だけ。テストの既定（headless shell）と、CLI の起動の設定（`launchCliChromium`）の両方。
+// - Chromium は headless だけ（`BOTH_CHROMIUM_LAUNCHERS`。遅い組は CLI の起動の設定の 1 つ）。
+// - SLIM: 形ごとに Context を作り直さず、中継なしと中継ありの Context と page を 1 つずつ、形をまたいで続けて読む（違反は、その読み込みの間に増えた分を
+//   比べる）。違反が出たか page が閉じたら、その読み手を閉じて、次の形で作り直す。大きな Cookie の場面は、Cookie が残らないよう Context を新しく作る。
 import { createServer as createNetServer, type AddressInfo, type Server, type Socket } from 'node:net';
 import type { Browser, BrowserContext, Page } from 'playwright';
 import { afterAll, beforeAll, describe, expect, it } from 'vitest';
@@ -16,7 +18,7 @@ import {
   installPassiveRequestGuard,
 } from '../../src/safety/passive-request-guard.js';
 import { SafetyLedger } from '../../src/safety/safety-ledger.js';
-import { launchCliChromium, launchHeadlessChromium } from '../helpers/chromium.js';
+import { BOTH_CHROMIUM_LAUNCHERS } from '../helpers/chromium.js';
 import { createTestConfig, TEST_FACTORY_OPTIONS } from '../helpers/test-config.js';
 
 /** 読み込みの期限（ms）。本文の途中で切れる場面は、読み込みが終わらないので、この期限で終わる（中継なしと同じ）。 */
@@ -87,6 +89,13 @@ const SHAPES: Readonly<Record<string, (socket: Socket) => void>> = Object.freeze
  */
 const ACCEPTED_DIFFERENCES: Readonly<Record<string, string>> = Object.freeze({});
 
+/**
+ * 新しい Context で 1 回だけ読む形（形をまたぐ読み手で続けて読むと、前の形の後の接続の状態で中継なしの読み方が変わる形）。
+ * `/partial-header`: 続けて読むと、中継なし（Guard だけ）の読み込みだけが失敗になった（SLIM の後の流しで、中継なし FAILED・中継あり 200）。
+ * 形ごとに Context を作り直す前の形では、両方とも 200 で本文が空になり、同じ結果になる（2026-11-15 に確かめた）。
+ */
+const FRESH_CONTEXT_SHAPES: ReadonlySet<string> = new Set(['/partial-header']);
+
 interface LoadOutcome {
   readonly kind: 'RESPONSE' | 'FAILED';
   readonly status: number | null;
@@ -102,7 +111,17 @@ function errorCodeOf(error: unknown): string {
   return /net::ERR_[A-Z0-9_]+/u.exec(message)?.[0] ?? (/Timeout/u.test(message) ? 'TIMEOUT' : 'OTHER');
 }
 
+/** 形をまたいで使う読み手（Context と page と Ledger）。 */
+interface Reader {
+  readonly page: Page;
+  readonly ledger: SafetyLedger;
+  close(): Promise<void>;
+}
+
+/** `url` を読み、結果を返す。違反のコードは、この読み込みの間に増えた分だけを返す。 */
 async function load(page: Page, url: string, ledger: SafetyLedger): Promise<LoadOutcome> {
+  const start = ledger.snapshot().invariantViolations.length;
+  const violations = (): string[] => [...new Set(ledger.snapshot().invariantViolations.slice(start).map(({ code }) => code))].sort();
   try {
     const response = await page.goto(url, { waitUntil: 'domcontentloaded', timeout: LOAD_TIMEOUT_MS });
     const body = await page.evaluate(() => document.body?.innerText ?? '').catch(() => null);
@@ -112,7 +131,7 @@ async function load(page: Page, url: string, ledger: SafetyLedger): Promise<Load
       statusText: response?.statusText() ?? null,
       errorCode: null,
       body: body === null ? null : body.slice(0, 40),
-      violations: [...new Set(ledger.snapshot().invariantViolations.map(({ code }) => code))].sort(),
+      violations: violations(),
     };
   } catch (error) {
     return {
@@ -121,17 +140,12 @@ async function load(page: Page, url: string, ledger: SafetyLedger): Promise<Load
       statusText: null,
       errorCode: errorCodeOf(error),
       body: null,
-      violations: [...new Set(ledger.snapshot().invariantViolations.map(({ code }) => code))].sort(),
+      violations: violations(),
     };
   }
 }
 
-const CHROMIUM_LAUNCHES = [
-  { name: 'the CLI Chromium (launchCliChromium, headless)', launch: (): Promise<Browser> => launchCliChromium() },
-  { name: 'the headless shell (test default)', launch: (): Promise<Browser> => launchHeadlessChromium() },
-] as const;
-
-describe.each(CHROMIUM_LAUNCHES)('DEF-085 fix round 3: the egress proxy reads http: responses as Chromium does, with $name', ({ launch }) => {
+describe.each(BOTH_CHROMIUM_LAUNCHERS)('DEF-085 fix round 3: the egress proxy reads http: responses as Chromium does, with %s', (_name, launch) => {
   let browser: Browser;
   let server: Server;
   let origin = '';
@@ -164,43 +178,81 @@ describe.each(CHROMIUM_LAUNCHES)('DEF-085 fix round 3: the egress proxy reads ht
     origin = `http://127.0.0.1:${(server.address() as AddressInfo).port}`;
   });
 
+  /** 形をまたいで使う読み手（中継なしと中継あり）。 */
+  const readers: Record<'withoutProxy' | 'withProxy', Reader | null> = { withoutProxy: null, withProxy: null };
+
   afterAll(async () => {
+    await readers.withoutProxy?.close();
+    await readers.withProxy?.close();
     await browser?.close();
     await new Promise<void>((resolve) => server?.close(() => resolve()));
   });
 
-  /** 中継なし: Guard だけを付けた Context で読み込む。 */
-  async function loadWithoutProxy(path: string, cookies: boolean): Promise<LoadOutcome> {
+  /** 中継なし: Guard だけを付けた Context と page。 */
+  async function openWithoutProxy(cookies: boolean): Promise<Reader> {
     const context: BrowserContext = await browser.newContext({ viewport: VIEWPORT, serviceWorkers: 'block', acceptDownloads: false });
+    const close = (): Promise<void> => closePassiveGuardedContext(context).catch(() => context.close().catch(() => undefined));
     try {
       if (cookies) await context.addCookies(largeCookies(origin));
       const ledger = new SafetyLedger();
       await installPassiveRequestGuard(context, ledger, new Set([origin]));
       const page = await context.newPage();
       await awaitPassiveRequestGuardReady(page);
-      return await load(page, `${origin}${path}`, ledger);
-    } finally {
-      await closePassiveGuardedContext(context).catch(() => context.close().catch(() => undefined));
+      return { page, ledger, close };
+    } catch (error) {
+      await close();
+      throw error;
     }
   }
 
-  /** 中継あり: factory の Passive の Context（Guard と中継）で読み込む。 */
-  async function loadWithProxy(path: string, cookies: boolean): Promise<LoadOutcome> {
+  /** 中継あり: factory の Passive の Context（Guard と中継）と page。 */
+  async function openWithProxy(cookies: boolean): Promise<Reader> {
     const factory = new BrowserContextFactory(browser, createTestConfig(origin), () => new SafetyLedger(), TEST_FACTORY_OPTIONS);
     const context = await factory.createPassiveContext(VIEWPORT);
+    const close = async (): Promise<void> => {
+      await factory.closePassiveContext(context).catch(() => undefined);
+      await factory.close();
+    };
     try {
       if (cookies) await context.addCookies(largeCookies(origin));
       const page = await factory.createPassivePage(context);
-      return await load(page, `${origin}${path}`, factory.getSafetyLedger(context));
-    } finally {
-      await factory.closePassiveContext(context).catch(() => undefined);
-      await factory.close();
+      return { page, ledger: factory.getSafetyLedger(context), close };
+    } catch (error) {
+      await close();
+      throw error;
     }
   }
 
+  /** 新しい Context で 1 回だけ読む（大きな Cookie の場面）。 */
+  async function loadOnce(open: (cookies: boolean) => Promise<Reader>, path: string, cookies: boolean): Promise<LoadOutcome> {
+    const reader = await open(cookies);
+    try {
+      return await load(reader.page, `${origin}${path}`, reader.ledger);
+    } finally {
+      await reader.close();
+    }
+  }
+
+  /** 形をまたいで使う読み手で読む。違反が出たか page が閉じたら、その読み手を閉じて、次の形で作り直す。 */
+  async function loadShared(mode: keyof typeof readers, path: string): Promise<LoadOutcome> {
+    let reader = readers[mode];
+    if (reader === null || reader.page.isClosed()) {
+      await reader?.close();
+      reader = await (mode === 'withoutProxy' ? openWithoutProxy(false) : openWithProxy(false));
+      readers[mode] = reader;
+    }
+    const outcome = await load(reader.page, `${origin}${path}`, reader.ledger);
+    if (outcome.violations.length > 0 || reader.page.isClosed()) {
+      await reader.close();
+      readers[mode] = null;
+    }
+    return outcome;
+  }
+
   it.each(Object.keys(SHAPES))('reads %s with the same result as without the proxy', async (path) => {
-    const withoutProxy = await loadWithoutProxy(path, false);
-    const withProxy = await loadWithProxy(path, false);
+    const fresh = FRESH_CONTEXT_SHAPES.has(path);
+    const withoutProxy = fresh ? await loadOnce(openWithoutProxy, path, false) : await loadShared('withoutProxy', path);
+    const withProxy = fresh ? await loadOnce(openWithProxy, path, false) : await loadShared('withProxy', path);
     console.info(`DEF-085 C2 ${path}: ${JSON.stringify({ withoutProxy, withProxy })}`);
     if (Object.hasOwn(ACCEPTED_DIFFERENCES, path)) {
       expect(withProxy.kind).toBe(withoutProxy.kind);
@@ -210,9 +262,9 @@ describe.each(CHROMIUM_LAUNCHES)('DEF-085 fix round 3: the egress proxy reads ht
   }, SHAPE_TEST_TIMEOUT_MS);
 
   it('sends a request with about 20 KB of cookies and reads the same result as without the proxy', async () => {
-    const withoutProxy = await loadWithoutProxy('/ok', true);
+    const withoutProxy = await loadOnce(openWithoutProxy, '/ok', true);
     const withoutProxyHead = receivedHeadLengths.get('/ok') ?? 0;
-    const withProxy = await loadWithProxy('/ok', true);
+    const withProxy = await loadOnce(openWithProxy, '/ok', true);
     const withProxyHead = receivedHeadLengths.get('/ok') ?? 0;
     console.info(`DEF-085 C2 large cookies: ${JSON.stringify({ withoutProxy, withProxy, withoutProxyHead, withProxyHead })}`);
     expect(withProxy).toEqual(withoutProxy);

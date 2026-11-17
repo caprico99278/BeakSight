@@ -4,17 +4,17 @@
 // - fixture（`startSpaAuthSite`）は、画面を開くたびに token を更新してから描き（`refreshOnLoad`）、更新で前の token を無効にし、使い終えた refresh token の
 //   再使用でセッションを消す（`refreshRotation`）。更新を止めると、最初の画面でログインの画面へ移る（セッションの切れ）。引き継がないと、次の Context が
 //   古い refresh token を使ってセッションを消す。
-// - 既定（`READ_ONLY`）: token の更新を止めるので、セッションの切れで止まる（AS-c の前の `PASS_EXCEPT_DELETE` と同じ止め方。RED の形）。
-// - `PASS_EXCEPT_DELETE`: すべての画面を認証のまま監査する。更新は Context ごとに 1 回で、再使用はない。
-// - token・API の鍵・資格情報（目印）は、成果物（保存 `checkpoint/` と `run.json` を含む。ZIP の中身も）に出ない。
-// Chromium はテストの既定の headless と、CLI の起動の設定の両方。届いたかは fixture の記録で数える。
+// - `PASS_EXCEPT_DELETE`: すべての画面を認証のまま監査する。更新は Context ごとに 1 回で、再使用はない。（SLIM-GROUP L-2: `READ_ONLY` で止まる直す前の形の場面は
+//   消した。監査の段で更新が届かないことは `spa-script-login-baseline.test.ts` の C3 が確かめる。）
+// - token（更新して発行した token を含む）・API の鍵・資格情報（目印）は、Run のディレクトリ（保存 `checkpoint/` と `run.json` を含む。ZIP の中身も）に出ない
+//   （SLIM-GROUP L-2: 子 process の `audit-send-refresh-worker-fork.test.ts` を消し、その確かめはここに残す。IPC の目印の検索は画面の端から端の `login-secret-markers.test.ts`）。
+// Chromium はテストの既定の headless だけ（TEST-SLIM。監査の段の token の更新が届かないことの 2 つの Chromium での確かめは
+// `spa-script-login-baseline.test.ts` の C3）。届いたかは fixture の記録で数える。
 import { mkdtemp, rm } from 'node:fs/promises';
 import { readFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import type { Browser } from 'playwright';
 import { afterAll, afterEach, beforeAll, describe, expect, it } from 'vitest';
-import { wait } from '../../src/core/deadline.js';
 import { executeAuditRun } from '../../src/cli/audit-run.js';
 import type { AuditConfig } from '../../src/config/types.js';
 import { DEFAULT_EXCLUDED_URL_WORDS } from '../../src/core/default-excluded-url-words.js';
@@ -23,8 +23,9 @@ import type { AuditSendPolicyName } from '../../src/core/audit-send-policy.js';
 import type { RunSummary } from '../../src/core/contracts.js';
 import type { RunAuthentication } from '../../src/orchestration/authenticated-run.js';
 import { hasSuccessStorageKey } from '../../src/worker/login-stage-checks.js';
-import { launchCliChromium, launchHeadlessChromium } from '../helpers/chromium.js';
+import { DEFAULT_CHROMIUM_LAUNCHERS } from '../helpers/chromium.js';
 import { filesUnder, placesWithMarkers } from '../helpers/leak-places.js';
+import { settleLateDeliveries } from '../helpers/loopback-server.js';
 import { fastRunConfig } from '../helpers/run-harness.js';
 import {
   SPA_APP_PATHS,
@@ -35,10 +36,6 @@ import {
   type SpaAuthSite,
 } from '../helpers/spa-auth-site-fixture.js';
 
-const LAUNCHERS: readonly (readonly [string, () => Promise<Browser>])[] = [
-  ['the default test Chromium', () => launchHeadlessChromium()],
-  ['the CLI Chromium', () => launchCliChromium()],
-];
 const TEST_TIMEOUT_MS = 240_000;
 const LATE_REQUEST_WAIT_MS = 1_000;
 /** 監査する画面の数（管理画面と、会員の登録と更新の画面。どれも開くたびに token を更新する）。 */
@@ -46,9 +43,8 @@ const MAX_PAGES = 3;
 /** 1 つの画面の最初の読み込み（Desktop と Mobile）の数。 */
 const PRIMARY_LOADS_PER_PAGE = 2;
 const FIXTURE_KEY = Object.freeze({ prefix: 'fixture', suffix: '-auth-token' });
-const SERVICE_REQUEST_LIMITS = Object.freeze({ perMinute: 120, perRun: 600 });
 
-describe.each(LAUNCHERS)('AS-c: the token refresh and the state inheritance with %s', (_label, launch) => {
+describe.each(DEFAULT_CHROMIUM_LAUNCHERS)('AS-c: the token refresh and the state inheritance with %s', (_label, launch) => {
   let spa: SpaAuthSite | undefined;
   let workDirectory = '';
   let runCount = 0;
@@ -82,9 +78,7 @@ describe.each(LAUNCHERS)('AS-c: the token refresh and the state inheritance with
       auditStage: {
         approvedServiceOrigins: [site.backendOrigin],
         auditReadRequests: [],
-        scriptLogin: { origin: site.tokenOrigin, path: SPA_BACKEND_PATHS.token, requiredQuery: [{ name: 'grant_type', value: SPA_GRANT_TYPES.password }] },
-        serviceRequestLimits: SERVICE_REQUEST_LIMITS,
-      },
+        scriptLogin: { origin: site.tokenOrigin, path: SPA_BACKEND_PATHS.token, requiredQuery: [{ name: 'grant_type', value: SPA_GRANT_TYPES.password }] },      },
       sessionKeyPresent: (state) => hasSuccessStorageKey(state, { origin: site.appOrigin, ...FIXTURE_KEY }),
     };
     const base = fastRunConfig(site.appOrigin, SPA_APP_PATHS.admin, {
@@ -100,20 +94,11 @@ describe.each(LAUNCHERS)('AS-c: the token refresh and the state inheritance with
     if (outcome.kind !== 'RAN') {
       throw new Error(`the audit did not run: ${outcome.kind}`);
     }
-    await wait(LATE_REQUEST_WAIT_MS);
+    // SLIM-2（X1）: 流れは Browser を閉じて終わるので、閉じた後の数え直しの待ちは、サーバが静まるまで。
+    await settleLateDeliveries(LATE_REQUEST_WAIT_MS, site);
     const run = JSON.parse(readFileSync(join(outcome.runDirectory, 'run.json'), 'utf8')) as RunSummary;
     return { site, run, runDirectory: outcome.runDirectory };
   };
-
-  it('stops by the session loss with READ_ONLY because the token refresh is blocked (the form of the RED before AS-c)', async () => {
-    const { site, run } = await auditRotatingSite('READ_ONLY');
-    expect(site.refreshes).toBe(0);
-    expect(run.executions.at(-1)?.endReason).toBe('STOPPED_BY_AUTH_SESSION_LOST');
-    expect(run.safety.auditSend).toEqual({
-      policy: 'READ_ONLY', passedRequests: 0, passedRequestsByMethod: {}, passedOtherOriginRequests: 0, passedWebSockets: 0,
-      passedWebSocketsOutsideGuard: 0, passedDangerousWebSockets: 0,
-    });
-  }, TEST_TIMEOUT_MS);
 
   it('audits every page while signed in with PASS_EXCEPT_DELETE, refreshing once per load and handing the new state to the next Context', async () => {
     const { site, run, runDirectory } = await auditRotatingSite('PASS_EXCEPT_DELETE');

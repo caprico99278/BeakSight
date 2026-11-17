@@ -13,6 +13,7 @@ import {
   computeApprovalDigest,
   type ApprovalDigestFacts,
 } from '../../src/control/approval/approval-digest.js';
+import { storedScenarioRevisionOf } from '../../src/control/approval/scenario-policy.js';
 import { AUTH_SETUP_DIGEST, FULL_VERIFICATION, INPUT_RULES, TARGET_CONFIG_DIGEST, sampleScenario, sampleUpdateScenario } from './approval-samples.js';
 
 const FACTS: ApprovalDigestFacts = Object.freeze({
@@ -31,7 +32,9 @@ const BASE = sampleScenario();
  * FORM は null）を末尾に足し、その後の値に置き換えた（意図した変化。T38c で固定した値は
  * `sha256:a71c0a185e739a326bfc25136e4f96ca08b2253e130919398c7b55c0c82fad73`）。
  */
-const BASE_DIGEST_BEFORE_ITEMS = 'sha256:7b3e2118cfb5b83335824e3dbdf6a06d2441d0615108cb45a0319bd524bc8018';
+// PL-6a: 承認の digest の印を v5 に上げ、検証の指定の成否の条件の 2 項目を結果の判定のしかたの印に置き換えたので、値を求め直した。
+// LU-6（K5）: 印を v6 に上げたので、値を求め直した（項目の値は変わらない。印を v5 に戻すと前の値 `sha256:13e7d504…` に戻ることを、一時の確かめで見た）。
+const BASE_DIGEST_BEFORE_ITEMS = 'sha256:52ab2c2971488ee42b2d7c12055964df9a3c195bff5b4d9513f9f5ac4cd17e37';
 
 describe('approval digest items and differences (T28e)', () => {
   it('lists the items of the digest in the order of the digest, once each', () => {
@@ -52,8 +55,8 @@ describe('approval digest items and differences (T28e)', () => {
       'approvalTtlDays',
       'inputRuleReference',
       'readChecks',
-      'verificationSuccessCondition',
-      'verificationInputErrorCondition',
+      // PL-6a: 成否の条件の 2 項目を、結果の判定のしかたの印に置き換えた。
+      'verificationResultJudgement',
       'verificationRecordId',
       'verificationRead',
       // T31b: UPDATE の指定。
@@ -82,9 +85,19 @@ describe('approval digest items and differences (T28e)', () => {
     expect(computeApprovalDigest(BASE, FACTS)).toBe(BASE_DIGEST_BEFORE_ITEMS);
   });
 
+  // LZ-3c（設計者の判断 (b)）: 累積の件数と承認の期限の日数は、判定に使わない名残として digest に残す（印の版は上げない）。前に保存したシナリオは、読み直しても
+  // 同じ値のまま digest に入る（固定の値は変わらない）。前の既定を超える値も読める（スキーマの最大を外した）。
+  it('keeps the digest of a stored scenario through the read, with the cumulative count and the TTL as they are (LZ-3c)', () => {
+    expect(computeApprovalDigest(storedScenarioRevisionOf(BASE), FACTS)).toBe(BASE_DIGEST_BEFORE_ITEMS);
+    const above = sampleScenario({ limits: { maxCreatesPerRun: 1, maxCumulativeCreates: 21 }, approvalTtlDays: 31 });
+    expect(computeApprovalDigest(storedScenarioRevisionOf(above), FACTS)).toBe(computeApprovalDigest(above, FACTS));
+    expect(computeApprovalDigest(above, FACTS)).not.toBe(BASE_DIGEST_BEFORE_ITEMS);
+  });
+
   // LG-3（2026-10-24 の設計 3.7.2）: シナリオの版の前の形を捨てる前のコードで求めた、form の UPDATE の見本の値（捨てた後も変わらない）。
   it('keeps the digest value of the form UPDATE sample (fixed value, LG-3)', () => {
-    expect(computeApprovalDigest(sampleUpdateScenario(), FACTS)).toBe('sha256:2e426539c3ca129b94bb1ff3461aef817ec09dc900be052f6953adff787a15fb');
+    // PL-6a: 印を v5 に上げたので、値を求め直した。LU-6（K5）: 印を v6 に上げたので、値を求め直した（項目の値は変わらない）。
+    expect(computeApprovalDigest(sampleUpdateScenario(), FACTS)).toBe('sha256:3fd8f45dd39823f930361053f509783bc538f61a73db5cfafaf9067e2e5c0806');
   });
 
   it('gives the values of the digest by item, sorted where the order does not matter, and frozen', () => {
@@ -96,9 +109,9 @@ describe('approval digest items and differences (T28e)', () => {
     expect(entries.limits).toEqual([1, 20]);
     expect(entries.inputRuleReference).toEqual([INPUT_RULES.ruleSetId, INPUT_RULES.revision, INPUT_RULES.digest]);
     expect(entries.readChecks).toEqual(['["rc-1",2]']);
-    expect(entries.verificationSuccessCondition).toEqual(['/members/', '.registered']);
-    expect(entries.verificationInputErrorCondition).toEqual(['/members/new', '.error']);
-    expect(entries.verificationRecordId).toEqual(['URL_PATH_PATTERN', '/members/{id}']);
+    // PL-6a: 成否の条件の 2 項目は、結果の判定のしかたの印の 1 項目になった。form の ID の取り方は型の一覧（当てる順）。
+    expect(entries.verificationResultJudgement).toBe('FORM_STRUCTURE');
+    expect(entries.verificationRecordId).toEqual(['URL_PATH_PATTERNS', ['/members/{id}']]);
     expect(entries.verificationRead).toEqual(['rc-1', 2, ['["q","name"]'], ['["ROW_COUNT_EQUALS",1]', '["TEXT_CONTAINS","email"]']]);
     expect(Object.isFrozen(entries)).toBe(true);
     expect(Object.isFrozen(entries.fieldNames)).toBe(true);
@@ -132,10 +145,12 @@ describe('approval digest items and differences (T28e)', () => {
   });
 
   it('returns the verification items that changed (T30a)', () => {
-    const current = sampleScenario({ verification: { ...FULL_VERIFICATION, successCondition: null, recordId: { source: 'ELEMENT', selector: '#id' } } });
+    const current = sampleScenario({
+      verification: { ...FULL_VERIFICATION, resultJudgement: null, recordId: { source: 'URL_PATH_PATTERNS', pathPatterns: ['/members/{id}', '/members/{id}/edit'] } },
+    });
     expect(approvalDigestDifferencesOf({ scenario: BASE, facts: FACTS }, { scenario: current, facts: FACTS })).toEqual([
-      { item: 'verificationSuccessCondition', previous: ['/members/', '.registered'], current: null },
-      { item: 'verificationRecordId', previous: ['URL_PATH_PATTERN', '/members/{id}'], current: ['ELEMENT', '#id'] },
+      { item: 'verificationResultJudgement', previous: 'FORM_STRUCTURE', current: null },
+      { item: 'verificationRecordId', previous: ['URL_PATH_PATTERNS', ['/members/{id}']], current: ['URL_PATH_PATTERNS', ['/members/{id}', '/members/{id}/edit']] },
     ]);
   });
 

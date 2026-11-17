@@ -11,6 +11,7 @@ import type {
   NetworkEvidence,
   PerformanceEvidence,
   PerformanceEvidenceFacts,
+  PerformanceOperationsEvidence,
   PerformanceTruncationEvidence,
   ResourceCategory,
   ResourceCategoryBasis,
@@ -42,19 +43,15 @@ import {
   isRecord,
 } from '../core/guards.js';
 import { deepFreeze } from '../core/immutable.js';
-import { MAX_ERROR_MESSAGE_LENGTH, MAX_RESOURCE_TIMING_ENTRIES, MAX_URL_LENGTH } from '../core/limits.js';
-import { truncateText } from '../core/text.js';
+import { MAX_RESOURCE_TIMING_ENTRIES } from '../core/limits.js';
+import { requestEndpointKeyOf } from '../core/request-endpoint-key.js';
+import { watchCollection, type CollectorWatchOptions } from '../browser/collector-watch.js';
 
-const MAX_ID_LENGTH = 256;
-const MAX_TEXT_LENGTH = 512;
+// LZ-2: ID と文の長さの上限（前の `MAX_ID_LENGTH` 256・`MAX_TEXT_LENGTH` 512）は撤廃した。
+/** Resource Timing のバッファの大きさ（ページの `setResourceTimingBufferSize` に渡す）。L2: 記録の件数の上限には使わない。 */
 const MAX_RESOURCES = MAX_RESOURCE_TIMING_ENTRIES;
-const MAX_SERVER_TIMING_PER_ENTRY = 20;
-const MAX_SERVER_TIMING_TOTAL = 500;
-const MAX_TELEMETRY_HEADERS = 200;
-const MAX_TELEMETRY_CANDIDATES = 100;
-const MAX_PROJECTED_REQUESTS = MAX_RESOURCES;
-const MAX_PROJECTED_RESPONSES = MAX_TELEMETRY_HEADERS;
-const MAX_PROJECTED_HEADER_FIELDS = 32;
+// L2（設計書 `2026-11-09-beaksight-remove-limits-design.md` 4、INV-LIMITS の表 A の N10・N11）: Server-Timing（1 件 20・合計 500）・計測のヘッダ（200）・
+// 計測の候補（100）・写しの要求と応答とヘッダの欄の件数の上限は撤廃した（全部を記録する）。定数は LZ-1 で消した。
 
 const installedContexts = new WeakSet<BrowserContext>();
 const pendingInstallations = new WeakMap<BrowserContext, Promise<void>>();
@@ -83,28 +80,42 @@ const GENERIC_TELEMETRY_HINTS = Object.freeze([
 
 
 export interface PerformanceCollectionOptions {
-  readonly deadlineAtMs: number;
+  /**
+   * 収集の期限（`Date.now()` と同じ基準）。L2（設計書 `2026-11-09-beaksight-remove-limits-design.md` 5 の 1）: 省略すると期限を置かず、ブラウザの値の
+   * 読み取りを進みの見張りで待つ（全く反応がない・静まらないときだけ、それまでの記録で `PARTIAL`）。渡したときの扱いは、呼ぶ側（L1）が渡さなく
+   * なるまで今のまま残す。
+   */
+  readonly deadlineAtMs?: number | undefined;
+  /** L2: 進みの見張りの指定（期限を渡さないときだけ使う）。 */
+  readonly watch?: CollectorWatchOptions | undefined;
+  /** AUD-6c: 測る前に BeakSight がページにした操作（記録に `operationsBeforeMeasurement` として残す。省略は記録しない）。 */
+  readonly operationsBeforeMeasurement?: PerformanceOperationsEvidence | undefined;
+  /** EV-1: scroll の段の前に読んだ LCP（`readLcpBeforeScroll`。記録に `lcpBeforeScroll` として残す。省略は記録しない）。 */
+  readonly lcpBeforeScroll?: Readonly<WebVitalEvidence<LCPAttributionEvidence>> | undefined;
 }
 
 // Network Evidence の同期的な射影の途中で期限を過ぎたことを表す。
 const DEADLINE = Symbol('deadline');
 
-/** ブラウザ内の処理に渡す上限値。ブラウザ内では import できないため、Node側の定数を引数で渡す。 */
+/**
+ * ブラウザ内の処理に渡す値。ブラウザ内では import できないため、Node側の定数を引数で渡す。LZ-2: ID と文の長さの上限（前は 256・512）は渡さない
+ * （切り詰めない）。
+ */
 interface BrowserPerformanceLimits {
-  readonly maxIdLength: number;
-  readonly maxTextLength: number;
-  readonly maxUrlLength: number;
+  /** ページの Resource Timing のバッファの大きさ（L2: 記録の件数の上限ではない）。設計者の判断 2026-11-11: URL の長さの上限は渡さない（切り詰めない）。 */
   readonly maxResourceTimingEntries: number;
-  readonly maxServerTimingPerEntry: number;
 }
 
 const BROWSER_PERFORMANCE_LIMITS: BrowserPerformanceLimits = Object.freeze({
-  maxIdLength: MAX_ID_LENGTH,
-  maxTextLength: MAX_TEXT_LENGTH,
-  maxUrlLength: MAX_URL_LENGTH,
   maxResourceTimingEntries: MAX_RESOURCES,
-  maxServerTimingPerEntry: MAX_SERVER_TIMING_PER_ENTRY,
 });
+
+/**
+ * L2: Resource Timing をどこから読んだか（ブラウザ内の値）。`OBSERVER` は、初期化のときに付けた `PerformanceObserver`（`buffered`）が受けた全部の
+ * 項目（ページのバッファが満杯になっても、ページが消しても、受けた項目は残る）。`BUFFER` は、observer を付けられなかったときの、ページのバッファの
+ * 項目（満杯なら欠けうる）。値がない（古い形）ときは `BUFFER` とみなす。
+ */
+const RESOURCE_SOURCE_OBSERVER = 'OBSERVER';
 
 /** ブラウザ内の処理に渡す値の一覧。ブラウザ内では import できないため、core の配列を引数で渡す。 */
 interface BrowserPerformanceValueLists {
@@ -133,7 +144,7 @@ function initializePerformanceState(
   valueLists: BrowserPerformanceValueLists,
   stateProperty: string,
 ): void {
-  const { maxIdLength, maxTextLength, maxUrlLength, maxResourceTimingEntries } = limits;
+  const { maxResourceTimingEntries } = limits;
   // Resource Timing のバッファを広げ、満杯になったことを記録する。ページのリスナーより先に動くよう capture で登録する。
   let resourceBufferSize: number | null = null;
   try {
@@ -154,7 +165,26 @@ function initializePerformanceState(
   } catch {
     resourceBufferObservable = false;
   }
-  let textTruncated = false;
+  // L2: Resource Timing の項目は、observer で全部を受けて持つ（バッファの大きさで欠けない。件数の上限を置かない）。付けられなければ `null`。
+  let resourceObserver: PerformanceObserver | null = null;
+  const observedResources: PerformanceEntry[] = [];
+  try {
+    if (
+      typeof PerformanceObserver === 'function'
+      && Array.isArray(PerformanceObserver.supportedEntryTypes)
+      && PerformanceObserver.supportedEntryTypes.includes('resource')
+    ) {
+      const observer = new PerformanceObserver((list) => {
+        for (const entry of list.getEntries()) observedResources.push(entry);
+      });
+      observer.observe({ type: 'resource', buffered: true });
+      resourceObserver = observer;
+    }
+  } catch {
+    resourceObserver = null;
+  }
+  // LZ-2: 文は切り詰めないので、いつも偽（前の形のために残す）。
+  const textTruncated = false;
   const supportedEntries = new Set(
     typeof PerformanceObserver === 'function' && Array.isArray(PerformanceObserver.supportedEntryTypes)
       ? PerformanceObserver.supportedEntryTypes
@@ -186,11 +216,7 @@ function initializePerformanceState(
     LCP: blank(support.LCP && typeof libraryRecord.onLCP === 'function' ? 'NOT_OBSERVED' : 'UNSUPPORTED'),
     TTFB: blank(support.TTFB && typeof libraryRecord.onTTFB === 'function' ? 'NOT_OBSERVED' : 'UNSUPPORTED'),
   };
-  const boundedString = (value: unknown, maxLength: number): string | undefined => {
-    if (typeof value !== 'string') return undefined;
-    if (value.length > maxLength) textTruncated = true;
-    return value.slice(0, maxLength);
-  };
+  const stringOf = (value: unknown): string | undefined => (typeof value === 'string' ? value : undefined);
   const nonnegative = (value: unknown): number | undefined => (
     typeof value === 'number' && Number.isFinite(value) && value >= 0 ? value : undefined
   );
@@ -200,8 +226,8 @@ function initializePerformanceState(
     }
     const source = value as Record<string, unknown>;
     const output: Record<string, string | number> = {};
-    const copyString = (key: string, maxLength = maxTextLength): void => {
-      const normalized = boundedString(source[key], maxLength);
+    const copyString = (key: string): void => {
+      const normalized = stringOf(source[key]);
       if (normalized !== undefined) output[key] = normalized;
     };
     const copyNumber = (key: string): void => {
@@ -215,7 +241,8 @@ function initializePerformanceState(
       copyString('loadState');
     } else if (name === 'LCP') {
       copyString('target');
-      copyString('url', maxUrlLength);
+      // 設計者の判断 2026-11-11: URL は切り詰めない。
+      if (typeof source.url === 'string') output.url = source.url;
       copyNumber('timeToFirstByte');
       copyNumber('resourceLoadDelay');
       copyNumber('resourceLoadDuration');
@@ -247,7 +274,7 @@ function initializePerformanceState(
     state[name] = {
       status: 'OBSERVED',
       value,
-      id: boundedString(candidate.id, maxIdLength) ?? null,
+      id: stringOf(candidate.id) ?? null,
       navigationType: typeof candidate.navigationType === 'string' && navigationTypes.has(candidate.navigationType)
         ? candidate.navigationType
         : null,
@@ -276,7 +303,15 @@ function initializePerformanceState(
     readonly webVitals: Record<string, Record<string, unknown>>;
     readonly textTruncated: boolean;
     readonly resourceBuffer: { readonly size: number | null; readonly full: boolean | null };
+    readonly observedResources: readonly PerformanceEntry[] | null;
   } => ({
+    // L2: observer がまだ渡していない項目も取り出してから写す。
+    observedResources: resourceObserver === null
+      ? null
+      : (() => {
+        for (const entry of resourceObserver.takeRecords()) observedResources.push(entry);
+        return observedResources.slice();
+      })(),
     webVitals: Object.fromEntries(Object.entries(state).map(([name, metric]) => [
       name,
       {
@@ -310,18 +345,11 @@ async function createInitScript(): Promise<string> {
 }
 
 function validateOptions(options: PerformanceCollectionOptions): void {
-  if (!Number.isFinite(options.deadlineAtMs)) {
+  if (options.deadlineAtMs !== undefined && !Number.isFinite(options.deadlineAtMs)) {
     throw new Error('Performance collection deadline must be finite');
   }
 }
 
-/** 文字列を上限で切り詰める。切り詰めた場合は `state.textTruncated` を立てる。文字列でなければ `null`。 */
-function boundedString(value: unknown, maximum: number, state: TextState): string | null {
-  if (typeof value !== 'string') return null;
-  const bounded = truncateText(value, maximum);
-  if (bounded.truncated) state.textTruncated = true;
-  return bounded.text;
-}
 
 function record(value: unknown): Record<string, unknown> | null {
   return isRecord(value) ? value : null;
@@ -365,17 +393,18 @@ function addOmittedServerTiming(validation: ValidationState, count: unknown): vo
   validation.omittedServerTimingCount = total;
 }
 
-function copyOptionalString(
-  source: Record<string, unknown>,
-  target: Record<string, string | number>,
-  key: string,
-  validation: ValidationState,
-  maximum = MAX_TEXT_LENGTH,
-): void {
+/** 設計者の判断 2026-11-11: URL は切り詰めない。LZ-2: ID と文も切り詰めない（文字列ならそのまま、ほかは `null`）。 */
+function wholeString(value: unknown): string | null {
+  return typeof value === 'string' ? value : null;
+}
+
+/** 設計者の判断 2026-11-11: URL の欄を、切り詰めずに写す（あれば）。 */
+function copyOptionalWholeString(source: Record<string, unknown>, target: Record<string, string | number>, key: string): void {
   if (!(key in source)) return;
-  const value = boundedString(source[key], maximum, validation);
+  const value = wholeString(source[key]);
   if (value !== null) target[key] = value;
 }
+
 
 function copyOptionalNumber(
   source: Record<string, unknown>,
@@ -402,19 +431,19 @@ function normalizeAttribution(
   if (source === null) return null;
   const target: Record<string, string | number> = {};
   if (name === 'CLS') {
-    copyOptionalString(source, target, 'largestShiftTarget', validation);
+    copyOptionalWholeString(source, target, 'largestShiftTarget');
     copyOptionalNumber(source, target, 'largestShiftTime', validation);
     copyOptionalNumber(source, target, 'largestShiftValue', validation);
-    copyOptionalString(source, target, 'loadState', validation);
+    copyOptionalWholeString(source, target, 'loadState');
   } else if (name === 'LCP') {
-    copyOptionalString(source, target, 'target', validation);
-    copyOptionalString(source, target, 'url', validation, MAX_URL_LENGTH);
+    copyOptionalWholeString(source, target, 'target');
+    copyOptionalWholeString(source, target, 'url');
     copyOptionalNumber(source, target, 'timeToFirstByte', validation);
     copyOptionalNumber(source, target, 'resourceLoadDelay', validation);
     copyOptionalNumber(source, target, 'resourceLoadDuration', validation);
     copyOptionalNumber(source, target, 'elementRenderDelay', validation);
   } else {
-    copyOptionalString(source, target, 'interactionTarget', validation);
+    copyOptionalWholeString(source, target, 'interactionTarget');
     copyOptionalNumber(source, target, 'interactionTime', validation);
     if ('interactionType' in source) {
       const interactionType = INP_INTERACTION_TYPES.find((type) => type === source.interactionType);
@@ -426,7 +455,7 @@ function normalizeAttribution(
     copyOptionalNumber(source, target, 'inputDelay', validation);
     copyOptionalNumber(source, target, 'processingDuration', validation);
     copyOptionalNumber(source, target, 'presentationDelay', validation);
-    copyOptionalString(source, target, 'loadState', validation);
+    copyOptionalWholeString(source, target, 'loadState');
   }
   return Object.keys(target).length === 0 ? null : Object.freeze(target);
 }
@@ -463,7 +492,7 @@ function normalizeVital<TAttribution>(
     ?? (source.navigationType === null
       ? null
       : (validation.invalid = true, null));
-  const id = boundedString(source.id, MAX_ID_LENGTH, validation);
+  const id = wholeString(source.id);
   if (source.id !== null && id === null) validation.invalid = true;
   return Object.freeze({
     status: 'OBSERVED',
@@ -511,12 +540,12 @@ function normalizeServerTiming(
     validation.invalid = true;
     return Object.freeze([]);
   }
+  // L2: 1 件の項目の Server-Timing を全部記録する（ブラウザが省いたと報告した数だけを数える）。
   addOmittedServerTiming(validation, entry.omittedServerTimingCount);
-  addOmittedServerTiming(validation, Math.max(0, value.length - MAX_SERVER_TIMING_PER_ENTRY));
   const output: ServerTimingEvidence[] = [];
-  for (const candidate of value.slice(0, MAX_SERVER_TIMING_PER_ENTRY)) {
+  for (const candidate of value) {
     const item = record(candidate);
-    const name = boundedString(item?.name, MAX_TEXT_LENGTH, validation);
+    const name = wholeString(item?.name);
     const duration = nonnegative(item?.duration);
     if (item === null || name === null || duration === null) {
       validation.invalid = true;
@@ -526,7 +555,7 @@ function normalizeServerTiming(
       source,
       url,
       name,
-      description: boundedString(item.description, MAX_TEXT_LENGTH, validation) ?? '',
+      description: wholeString(item.description) ?? '',
       duration,
     }));
   }
@@ -554,7 +583,7 @@ function normalizeNavigation(value: unknown, validation: ValidationState): Navig
   }
   if (value.length === 0) return null;
   const item = record(value[0]);
-  const url = boundedString(item?.name, MAX_URL_LENGTH, validation);
+  const url = wholeString(item?.name);
   if (item === null || url === null) {
     validation.invalid = true;
     return null;
@@ -566,7 +595,7 @@ function normalizeNavigation(value: unknown, validation: ValidationState): Navig
   }
   return Object.freeze({
     url,
-    navigationType: boundedString(item.type, MAX_TEXT_LENGTH, validation) ?? '',
+    navigationType: wholeString(item.type) ?? '',
     startTime: numbers.startTime as number,
     duration: numbers.duration as number,
     responseStart: numbers.responseStart as number,
@@ -649,108 +678,102 @@ interface ProjectedNetworkResponse {
 interface ProjectedNetworkEvidence {
   readonly requests: readonly Readonly<ProjectedNetworkRequest>[];
   readonly responses: readonly Readonly<ProjectedNetworkResponse>[];
+  /**
+   * 設計者の判断 2026-11-11: 同じ口の成功した読み取りのくり返しをまとめた記録（`repeatedReads`）の、口（Origin と path）ごとの資源の種類（小文字。照らし合わせの
+   * 鍵）。1 件の記録と照らし合わせられなかった Resource Timing の項目を分けるのに使う。
+   */
+  readonly repeatedReadTypes: ReadonlyMap<string, ReadonlySet<string>>;
   /** 上限のため読まなかったリクエストと response の件数。 */
   readonly omittedRequestCount: number;
   readonly omittedResponseCount: number;
-  /** 読んだ文字列のどれかを上限で切り詰めたか。 */
+  /** 前は、読んだ文字列のどれかを上限で切り詰めたか。LZ-2 で切り詰めなくなったので、いつも偽。 */
   readonly textTruncated: boolean;
 }
 
-/** `value.slice(0, maximum)` と同じ結果を返し、切り詰めた場合は `state.textTruncated` を立てる。 */
-function clip(value: string, maximum: number, state: TextState): string {
-  const text = value.slice(0, maximum);
-  if (text.length < value.length) state.textTruncated = true;
-  return text;
-}
+/**
+ * LZ-3b: 期限 `deadlineAtMs` を受けていて、その期限を過ぎたか（`undefined` は期限なしで、比べない。前は番兵の `Infinity` を渡していた）。
+ */
+const pastDeadline = (deadlineAtMs: number | undefined): boolean => deadlineAtMs !== undefined && Date.now() >= deadlineAtMs;
 
+/** LZ-2: ID・method・資源の種類・ヘッダの値・失敗の文は切り詰めない（前は 256・512・2,048 まで）。 */
 function projectHeaderEvidence(
   headers: HeaderEvidence,
-  deadlineAtMs: number,
-  state: TextState,
+  deadlineAtMs: number | undefined,
 ): HeaderEvidence | typeof DEADLINE {
-  if (Date.now() >= deadlineAtMs) return DEADLINE;
+  if (pastDeadline(deadlineAtMs)) return DEADLINE;
   const status = headers.status;
-  if (Date.now() >= deadlineAtMs) return DEADLINE;
+  if (pastDeadline(deadlineAtMs)) return DEADLINE;
   if (status === 'FAILED') {
-    const rawErrorText = headers.errorText;
-    if (Date.now() >= deadlineAtMs) return DEADLINE;
-    const errorText = clip(rawErrorText, MAX_ERROR_MESSAGE_LENGTH, state);
+    const errorText = headers.errorText;
+    if (pastDeadline(deadlineAtMs)) return DEADLINE;
     return Object.freeze({
       status: 'FAILED',
       errorText,
     });
   }
   const sourceValues = headers.values;
-  if (Date.now() >= deadlineAtMs) return DEADLINE;
+  if (pastDeadline(deadlineAtMs)) return DEADLINE;
   const values: Record<string, string> = {};
-  let scanned = 0;
   const ownKeys = Reflect.ownKeys(sourceValues);
-  if (Date.now() >= deadlineAtMs) return DEADLINE;
+  if (pastDeadline(deadlineAtMs)) return DEADLINE;
+  // L2: 欄の数の上限を置かない（全部の欄を見る）。
   for (const key of ownKeys) {
-    if (Date.now() >= deadlineAtMs) return DEADLINE;
+    if (pastDeadline(deadlineAtMs)) return DEADLINE;
     if (typeof key !== 'string') continue;
-    scanned += 1;
-    if (scanned > MAX_PROJECTED_HEADER_FIELDS) break;
     const descriptor = Object.getOwnPropertyDescriptor(sourceValues, key);
-    if (Date.now() >= deadlineAtMs) return DEADLINE;
-    if (descriptor === undefined || !descriptor.enumerable || key.length > MAX_TEXT_LENGTH) continue;
+    if (pastDeadline(deadlineAtMs)) return DEADLINE;
+    if (descriptor === undefined || !descriptor.enumerable) continue;
     const normalizedName = key.toLowerCase();
     if (!TELEMETRY_HEADER_NAMES.has(normalizedName)) continue;
     const value = sourceValues[key];
-    if (Date.now() >= deadlineAtMs) return DEADLINE;
+    if (pastDeadline(deadlineAtMs)) return DEADLINE;
     if (typeof value === 'string') {
-      values[key] = clip(value, MAX_TEXT_LENGTH, state);
+      values[key] = value;
     }
   }
-  return Date.now() >= deadlineAtMs
+  return pastDeadline(deadlineAtMs)
     ? DEADLINE
     : Object.freeze({ status: 'OBSERVED', values: Object.freeze(values) });
 }
 
 function projectNetworkEvidence(
   networkEvidence: NetworkEvidence,
-  deadlineAtMs: number,
+  deadlineAtMs: number | undefined,
 ): ProjectedNetworkEvidence | typeof DEADLINE {
-  if (Date.now() >= deadlineAtMs) return DEADLINE;
+  if (pastDeadline(deadlineAtMs)) return DEADLINE;
   const sourceRequests = networkEvidence.requests;
-  if (Date.now() >= deadlineAtMs) return DEADLINE;
+  if (pastDeadline(deadlineAtMs)) return DEADLINE;
   const sourceResponses = networkEvidence.responses;
-  if (Date.now() >= deadlineAtMs) return DEADLINE;
+  if (pastDeadline(deadlineAtMs)) return DEADLINE;
   const requestLength = sourceRequests.length;
-  if (Date.now() >= deadlineAtMs) return DEADLINE;
+  if (pastDeadline(deadlineAtMs)) return DEADLINE;
   const responseLength = sourceResponses.length;
-  if (Date.now() >= deadlineAtMs) return DEADLINE;
-  const requestLimit = Math.min(requestLength, MAX_PROJECTED_REQUESTS);
-  const responseLimit = Math.min(responseLength, MAX_PROJECTED_RESPONSES);
+  if (pastDeadline(deadlineAtMs)) return DEADLINE;
+  // L2: 件数の上限を置かない（全部の要求と応答を写す）。
+  const requestLimit = requestLength;
+  const responseLimit = responseLength;
   const requests: ProjectedNetworkRequest[] = [];
   const responses: ProjectedNetworkResponse[] = [];
-  const state: TextState = { textTruncated: false };
   for (let index = 0; index < requestLimit; index += 1) {
-    if (Date.now() >= deadlineAtMs) return DEADLINE;
+    if (pastDeadline(deadlineAtMs)) return DEADLINE;
     const source = sourceRequests[index];
-    if (Date.now() >= deadlineAtMs) return DEADLINE;
+    if (pastDeadline(deadlineAtMs)) return DEADLINE;
     if (source === undefined) continue;
-    const rawRequestId = source.requestId;
-    if (Date.now() >= deadlineAtMs) return DEADLINE;
-    const requestId = clip(rawRequestId, MAX_ID_LENGTH, state);
+    const requestId = source.requestId;
+    if (pastDeadline(deadlineAtMs)) return DEADLINE;
     const rawUrl = source.url;
-    if (Date.now() >= deadlineAtMs) return DEADLINE;
-    const url = clip(rawUrl, MAX_URL_LENGTH, state);
-    const correlationUrl = rawUrl.length <= MAX_URL_LENGTH ? rawUrl : null;
-    const rawMethod = source.method;
-    if (Date.now() >= deadlineAtMs) return DEADLINE;
-    const method = clip(rawMethod, MAX_TEXT_LENGTH, state);
-    const rawResourceType = source.resourceType;
-    if (Date.now() >= deadlineAtMs) return DEADLINE;
-    const resourceType = clip(rawResourceType, MAX_TEXT_LENGTH, state);
-    let correlationResourceType: string | null = null;
-    if (rawResourceType.length <= MAX_TEXT_LENGTH) {
-      const normalizedResourceType = rawResourceType.toLowerCase();
-      if (normalizedResourceType.length <= MAX_TEXT_LENGTH) correlationResourceType = normalizedResourceType;
-    }
+    if (pastDeadline(deadlineAtMs)) return DEADLINE;
+    // 設計者の判断 2026-11-11: URL は切り詰めず、長い URL も Resource Timing と照らし合わせる。
+    const url = rawUrl;
+    const correlationUrl = rawUrl;
+    const method = source.method;
+    if (pastDeadline(deadlineAtMs)) return DEADLINE;
+    const resourceType = source.resourceType;
+    if (pastDeadline(deadlineAtMs)) return DEADLINE;
+    const correlationResourceType: string | null = resourceType.toLowerCase();
     const rawHeaders = source.headers;
-    if (Date.now() >= deadlineAtMs) return DEADLINE;
-    const headers = projectHeaderEvidence(rawHeaders, deadlineAtMs, state);
+    if (pastDeadline(deadlineAtMs)) return DEADLINE;
+    const headers = projectHeaderEvidence(rawHeaders, deadlineAtMs);
     if (headers === DEADLINE) return DEADLINE;
     requests.push(Object.freeze({
       requestId,
@@ -761,36 +784,44 @@ function projectNetworkEvidence(
       correlationResourceType,
       headers,
     }));
-    if (Date.now() >= deadlineAtMs) return DEADLINE;
+    if (pastDeadline(deadlineAtMs)) return DEADLINE;
   }
   for (let index = 0; index < responseLimit; index += 1) {
-    if (Date.now() >= deadlineAtMs) return DEADLINE;
+    if (pastDeadline(deadlineAtMs)) return DEADLINE;
     const source = sourceResponses[index];
-    if (Date.now() >= deadlineAtMs) return DEADLINE;
+    if (pastDeadline(deadlineAtMs)) return DEADLINE;
     if (source === undefined) continue;
-    const rawRequestId = source.requestId;
-    if (Date.now() >= deadlineAtMs) return DEADLINE;
-    const requestId = clip(rawRequestId, MAX_ID_LENGTH, state);
+    const requestId = source.requestId;
+    if (pastDeadline(deadlineAtMs)) return DEADLINE;
     const rawUrl = source.url;
-    if (Date.now() >= deadlineAtMs) return DEADLINE;
-    const url = clip(rawUrl, MAX_URL_LENGTH, state);
+    if (pastDeadline(deadlineAtMs)) return DEADLINE;
+    // 設計者の判断 2026-11-11: URL は切り詰めない。
+    const url = rawUrl;
     const rawHeaders = source.headers;
-    if (Date.now() >= deadlineAtMs) return DEADLINE;
-    const headers = projectHeaderEvidence(rawHeaders, deadlineAtMs, state);
+    if (pastDeadline(deadlineAtMs)) return DEADLINE;
+    const headers = projectHeaderEvidence(rawHeaders, deadlineAtMs);
     if (headers === DEADLINE) return DEADLINE;
     responses.push(Object.freeze({
       requestId,
       url,
       headers,
     }));
-    if (Date.now() >= deadlineAtMs) return DEADLINE;
+    if (pastDeadline(deadlineAtMs)) return DEADLINE;
+  }
+  const repeatedReadTypes = new Map<string, Set<string>>();
+  for (const repeated of networkEvidence.repeatedReads ?? []) {
+    const key = requestEndpointKeyOf(null, `${repeated.origin}${repeated.path}`);
+    const types = repeatedReadTypes.get(key) ?? new Set<string>();
+    types.add(repeated.resourceType.toLowerCase());
+    repeatedReadTypes.set(key, types);
   }
   return Object.freeze({
     requests: Object.freeze(requests),
     responses: Object.freeze(responses),
+    repeatedReadTypes,
     omittedRequestCount: requestLength - requestLimit,
     omittedResponseCount: responseLength - responseLimit,
-    textTruncated: state.textTruncated,
+    textTruncated: false,
   });
 }
 
@@ -824,6 +855,21 @@ function takeCompatibleRequest(
   if (queue.length === 1) return queue.shift();
   const resourceTypes = new Set(queue.map((request) => request.correlationResourceType));
   return resourceTypes.size === 1 ? queue.shift() : undefined;
+}
+
+/**
+ * 設計者の判断 2026-11-11: Resource Timing の項目の URL の口（Origin と path）の、まとめた記録の資源の種類（小文字）。種類が 1 つに決まらない、文書の種類、
+ * 始めた種類（`initiatorRequestType`）と合わない、URL を解析できない、まとめた記録がないときは `null`。
+ */
+function repeatedReadTypeOf(repeatedReadTypes: ReadonlyMap<string, ReadonlySet<string>>, rawUrl: string, initiatorType: string): string | null {
+  if (repeatedReadTypes.size === 0) return null;
+  // 口の鍵は、作り方の 1 か所（`requestEndpointKeyOf`。method は見ない）で作る。
+  const types = repeatedReadTypes.get(requestEndpointKeyOf(null, rawUrl));
+  if (types === undefined || types.size !== 1) return null;
+  const [type] = types;
+  if (type === undefined || type === 'document') return null;
+  const exactRequestType = initiatorRequestType(initiatorType);
+  return exactRequestType === null || exactRequestType === type ? type : null;
 }
 
 /** 文書のOrigin。文書を観測できない場合と、Originが不透明（`null`）な場合は `null`。 */
@@ -860,6 +906,7 @@ function normalizeResources(
   projectedRequests: readonly ProjectedNetworkRequest[],
   origin: string | null,
   validation: ValidationState,
+  repeatedReadTypes: ReadonlyMap<string, ReadonlySet<string>> = new Map(),
 ): readonly Readonly<ResourceTimingEvidence>[] {
   if (!Array.isArray(value)) {
     validation.invalid = true;
@@ -867,11 +914,13 @@ function normalizeResources(
   }
   const queues = requestQueues(projectedRequests);
   const output: ResourceTimingEvidence[] = [];
-  for (const candidate of value.slice(0, MAX_RESOURCES)) {
+  // L2: ブラウザが返した項目を全部記録する（件数の上限を置かない）。
+  for (const candidate of value) {
     const item = record(candidate);
     const rawUrl = typeof item?.name === 'string' ? item.name : null;
-    const url = boundedString(rawUrl, MAX_URL_LENGTH, validation);
-    const initiatorType = boundedString(item?.initiatorType, MAX_TEXT_LENGTH, validation);
+    // 設計者の判断 2026-11-11: URL は切り詰めない。
+    const url = rawUrl;
+    const initiatorType = wholeString(item?.initiatorType);
     if (item === null || rawUrl === null || url === null || initiatorType === null) {
       validation.invalid = true;
       continue;
@@ -883,9 +932,10 @@ function normalizeResources(
     }
     const queue = queues.get(rawUrl);
     const request = takeCompatibleRequest(queue, initiatorType);
-    const fromNetwork = request?.correlationResourceType === null || request === undefined
-      ? null
-      : networkCategory(request.correlationResourceType);
+    // 設計者の判断 2026-11-11: 1 件の記録と照らし合わせられなかったら、同じ口のまとめた記録の資源の種類で分ける（種類が 1 つに決まり、始めた種類と合うときだけ）。
+    const repeatedType = request === undefined ? repeatedReadTypeOf(repeatedReadTypes, rawUrl, initiatorType) : null;
+    const networkType = request === undefined ? repeatedType : request.correlationResourceType;
+    const fromNetwork = networkType === null ? null : networkCategory(networkType);
     const fromInitiator = initiatorCategory(initiatorType);
     const category = fromNetwork ?? fromInitiator;
     const categoryBasis: ResourceCategoryBasis = fromNetwork !== null
@@ -909,10 +959,8 @@ function normalizeResources(
       responseStart: numbers.responseStart as number,
       responseEnd: numbers.responseEnd as number,
       ...sizeEvidence,
-      requestId: request === undefined ? null : boundedString(request.requestId, MAX_ID_LENGTH, validation),
-      networkResourceType: request === undefined
-        ? null
-        : boundedString(request.resourceType, MAX_TEXT_LENGTH, validation),
+      requestId: request === undefined ? null : request.requestId,
+      networkResourceType: request === undefined ? repeatedType : request.resourceType,
       category,
       categoryBasis,
       serverTiming: normalizeServerTiming(item, 'RESOURCE', url, validation),
@@ -986,18 +1034,15 @@ function normalizeResourceCoverage(
     validation.invalid = true;
     return null;
   }
-  const omittedEntryCount = browserOmitted + Math.max(0, rawResources.length - MAX_RESOURCES);
-  if (!isNonNegativeSafeInteger(omittedEntryCount)) {
-    validation.invalid = true;
-    return null;
-  }
+  // L2: Node 側では捨てない。数えるのは、ブラウザが省いたと報告した数だけ。
+  const omittedEntryCount = browserOmitted;
   return Object.freeze({ bufferSize, bufferFull, retainedEntryCount, omittedEntryCount });
 }
 
 function selectedTelemetryHeaders(headers: Readonly<Record<string, string>>): Readonly<Record<string, string>> {
   return Object.freeze(Object.fromEntries(Object.entries(headers).filter(([name]) => (
     TELEMETRY_HEADER_NAMES.has(name.toLowerCase())
-  )).map(([name, value]) => [name.slice(0, MAX_TEXT_LENGTH), value.slice(0, MAX_TEXT_LENGTH)])));
+  ))));
 }
 
 function telemetryHeaderObservation(
@@ -1009,17 +1054,18 @@ function telemetryHeaderObservation(
   if (headers.status === 'FAILED') {
     return Object.freeze({
       direction,
-      requestId: requestId.slice(0, MAX_ID_LENGTH),
-      url: url.slice(0, MAX_URL_LENGTH),
+      requestId,
+      // 設計者の判断 2026-11-11: URL は切り詰めない。LZ-2: ID と失敗の文も切り詰めない。
+      url,
       status: 'FAILED',
-      errorText: headers.errorText.slice(0, MAX_ERROR_MESSAGE_LENGTH),
+      errorText: headers.errorText,
     });
   }
   const values = selectedTelemetryHeaders(headers.values);
   return Object.keys(values).length === 0 ? null : Object.freeze({
     direction,
-    requestId: requestId.slice(0, MAX_ID_LENGTH),
-    url: url.slice(0, MAX_URL_LENGTH),
+    requestId,
+    url,
     status: 'OBSERVED',
     values,
   });
@@ -1046,9 +1092,9 @@ function telemetryFacts(networkEvidence: ProjectedNetworkEvidence): TelemetryFac
     );
     if (observation !== null) allObservations.push(observation);
   }
-  const observations = allObservations.slice(0, MAX_TELEMETRY_HEADERS);
+  // L2: 件数の上限を置かない（全部の観測を記録する）。
+  const observations = allObservations;
 
-  // 候補の判定には、上限で記録しなかったヘッダの観測も使う。
   const headerNamesByRequest = new Map<string, string[]>();
   for (const observation of allObservations) {
     if (observation.status !== 'OBSERVED') continue;
@@ -1064,7 +1110,8 @@ function telemetryFacts(networkEvidence: ProjectedNetworkEvidence): TelemetryFac
   }
 
   const candidates: TelemetryCandidateEvidence[] = [];
-  let omittedCandidateCount = 0;
+  // L2: 候補の数の上限を置かない（数は常に 0）。
+  const omittedCandidateCount = 0;
   for (const request of networkEvidence.requests) {
     const matchedHeaderNames = headerNamesByRequest.get(request.requestId) ?? [];
     const lowerUrl = request.url.toLowerCase();
@@ -1073,15 +1120,11 @@ function telemetryFacts(networkEvidence: ProjectedNetworkEvidence): TelemetryFac
     if (matchedHeaderNames.length > 0) matchingBasis.push('TRACE_OR_CORRELATION_HEADER');
     if (matchedHints.length > 0) matchingBasis.push('GENERIC_URL_HINT');
     if (matchingBasis.length === 0) continue;
-    if (candidates.length >= MAX_TELEMETRY_CANDIDATES) {
-      omittedCandidateCount += 1;
-      continue;
-    }
     candidates.push(Object.freeze({
-      requestId: request.requestId.slice(0, MAX_ID_LENGTH),
-      url: request.url.slice(0, MAX_URL_LENGTH),
-      method: request.method.slice(0, MAX_TEXT_LENGTH),
-      resourceType: request.resourceType.slice(0, MAX_TEXT_LENGTH),
+      requestId: request.requestId,
+      url: request.url,
+      method: request.method,
+      resourceType: request.resourceType,
       matchingBasis: Object.freeze(matchingBasis),
       matchedHeaderNames: Object.freeze([...matchedHeaderNames]),
       matchedHints: Object.freeze([...matchedHints]),
@@ -1107,15 +1150,16 @@ function browserSnapshot({ limits, stateProperty }: BrowserSnapshotInput): unkno
   const pageStateRecord = typeof pageState === 'object' && pageState !== null && !Array.isArray(pageState)
     ? pageState as Record<string, unknown>
     : undefined;
+  // L2: Server-Timing は、1 件の項目のものも全部を写す（件数の上限を置かない）。
   const serverTimingOf = (entry: PerformanceResourceTiming) => {
     const serverTiming = Array.from(entry.serverTiming ?? []);
     return {
-      serverTiming: serverTiming.slice(0, limits.maxServerTimingPerEntry).map((server) => ({
+      serverTiming: serverTiming.map((server) => ({
         name: server.name,
         description: server.description,
         duration: server.duration,
       })),
-      omittedServerTimingCount: Math.max(0, serverTiming.length - limits.maxServerTimingPerEntry),
+      omittedServerTimingCount: 0,
     };
   };
   const navigationEntries = performance.getEntriesByType('navigation').slice(0, 1).map((entry) => {
@@ -1137,8 +1181,12 @@ function browserSnapshot({ limits, stateProperty }: BrowserSnapshotInput): unkno
       ...serverTimingOf(navigation),
     };
   });
-  const allResourceEntries = performance.getEntriesByType('resource');
-  const resourceEntries = allResourceEntries.slice(0, limits.maxResourceTimingEntries).map((entry) => {
+  // L2: observer が受けた全部の項目（なければ、ページのバッファの項目）を、件数の上限なしに写す。
+  const observed = pageStateRecord?.observedResources;
+  const allResourceEntries: readonly PerformanceEntry[] = Array.isArray(observed)
+    ? observed as PerformanceEntry[]
+    : performance.getEntriesByType('resource');
+  const resourceEntries = allResourceEntries.map((entry) => {
     const resource = entry as PerformanceResourceTiming;
     return {
       name: resource.name,
@@ -1159,7 +1207,10 @@ function browserSnapshot({ limits, stateProperty }: BrowserSnapshotInput): unkno
     resourceBuffer: pageStateRecord?.resourceBuffer,
     navigationEntries,
     resourceEntries,
-    omittedResourceEntryCount: allResourceEntries.length - resourceEntries.length,
+    resourceSource: Array.isArray(observed) ? 'OBSERVER' : 'BUFFER',
+    omittedResourceEntryCount: 0,
+    // AUD-6c: 観測の時間（文書の読み込みの始まりから、今まで）。
+    observedAtMs: performance.now(),
   };
 }
 
@@ -1207,12 +1258,12 @@ function partial(
 }
 
 function completeBeforeDeadline(
-  deadlineAtMs: number,
+  deadlineAtMs: number | undefined,
   facts: PerformanceEvidenceFacts,
 ): PerformanceEvidence {
-  if (Date.now() >= deadlineAtMs) return partial('DEADLINE_EXCEEDED', facts);
+  if (pastDeadline(deadlineAtMs)) return partial('DEADLINE_EXCEEDED', facts);
   const complete = deepFreeze({ status: 'COMPLETE' as const, reason: 'COLLECTED' as const, ...facts });
-  return Date.now() >= deadlineAtMs ? partial('DEADLINE_EXCEEDED', facts) : complete;
+  return pastDeadline(deadlineAtMs) ? partial('DEADLINE_EXCEEDED', facts) : complete;
 }
 
 export class PerformanceCollector {
@@ -1236,33 +1287,70 @@ export class PerformanceCollector {
     }
   }
 
+  /**
+   * EV-1（設計書 `2026-11-16-beaksight-finding-evidence-design.md` 3.1・2 章）: scroll の段の前に、ページの中の Web Vitals の状態から LCP だけを読む（読み込み
+   * 直しも測り直しもしない。1 回の読み取り）。スクロールで後から描かれた塊が LCP に数えられる前の値を、`collect` の `lcpBeforeScroll` に渡すため。init script が
+   * 入っていない・形が違う・読めないときは `undefined`。
+   */
+  async readLcpBeforeScroll(page: Page): Promise<Readonly<WebVitalEvidence<LCPAttributionEvidence>> | undefined> {
+    try {
+      const raw = await page.evaluate((stateProperty: string): unknown => {
+        const state: unknown = (globalThis as unknown as Record<string, unknown>)[stateProperty];
+        const vitals: unknown = typeof state === 'object' && state !== null ? (state as Record<string, unknown>)['webVitals'] : undefined;
+        return typeof vitals === 'object' && vitals !== null ? (vitals as Record<string, unknown>)['LCP'] : undefined;
+      }, PAGE_PERFORMANCE_STATE_PROPERTY);
+      if (raw === undefined) {
+        return undefined;
+      }
+      const validation = createValidationState();
+      const vital = normalizeVital<LCPAttributionEvidence>('LCP', raw, validation);
+      return validation.invalid ? undefined : deepFreeze(vital);
+    } catch {
+      return undefined;
+    }
+  }
+
   async collect(
     page: Page,
     networkEvidence: NetworkEvidence,
-    options: PerformanceCollectionOptions,
+    options: PerformanceCollectionOptions = {},
   ): Promise<PerformanceEvidence> {
     validateOptions(options);
-    const deadlineAtMs = options.deadlineAtMs;
+    // L2・LZ-3b: 期限を渡さなければ、期限は比べない（`pastDeadline`。前は番兵の `Infinity`）。ブラウザの読み取りは進みの見張りで待つ。
+    const { deadlineAtMs } = options;
+    const watched = deadlineAtMs === undefined;
     const unavailable = unobservedFacts(null, null);
-    if (Date.now() >= deadlineAtMs) return partial('DEADLINE_EXCEEDED', unavailable);
+    if (pastDeadline(deadlineAtMs)) return partial('DEADLINE_EXCEEDED', unavailable);
     const projectedNetwork = projectNetworkEvidence(networkEvidence, deadlineAtMs);
-    if (projectedNetwork === DEADLINE || Date.now() >= deadlineAtMs) {
+    if (projectedNetwork === DEADLINE || pastDeadline(deadlineAtMs)) {
       return partial('DEADLINE_EXCEEDED', unavailable);
     }
     const telemetry = telemetryFacts(projectedNetwork);
     const empty = unobservedFacts(projectedNetwork, telemetry);
-    if (Date.now() >= deadlineAtMs) return partial('DEADLINE_EXCEEDED', unavailable);
+    if (pastDeadline(deadlineAtMs)) return partial('DEADLINE_EXCEEDED', unavailable);
 
-    const evaluated = await awaitBeforeDeadline(
-      page.evaluate(browserSnapshot, { limits: BROWSER_PERFORMANCE_LIMITS, stateProperty: PAGE_PERFORMANCE_STATE_PROPERTY }),
-      deadlineAtMs,
-    );
-    if (evaluated.status === 'REJECTED') {
-      return Date.now() >= deadlineAtMs
-        ? partial('DEADLINE_EXCEEDED', empty)
-        : partial('EVALUATION_FAILED', empty);
+    const snapshotInput: BrowserSnapshotInput = { limits: BROWSER_PERFORMANCE_LIMITS, stateProperty: PAGE_PERFORMANCE_STATE_PROPERTY };
+    let evaluated: Readonly<{ status: 'FULFILLED'; value: unknown }>;
+    if (watched) {
+      // L2: 期限を置かず、進みの見張りで待つ。見張りが終えたら、写した network の事実（telemetry）を残した `PARTIAL`。
+      const outcome = await watchCollection(
+        page,
+        (signals) => signals.track(page.evaluate(browserSnapshot, snapshotInput)),
+        options.watch ?? {},
+      );
+      if (outcome.status === 'ENDED') return partial(outcome.end, empty);
+      if (outcome.status === 'REJECTED') return partial('EVALUATION_FAILED', empty);
+      evaluated = outcome;
+    } else {
+      const read = await awaitBeforeDeadline(page.evaluate(browserSnapshot, snapshotInput), deadlineAtMs);
+      if (read.status === 'REJECTED') {
+        return pastDeadline(deadlineAtMs)
+          ? partial('DEADLINE_EXCEEDED', empty)
+          : partial('EVALUATION_FAILED', empty);
+      }
+      if (read.status === 'DEADLINE_EXCEEDED') return partial('DEADLINE_EXCEEDED', empty);
+      evaluated = read;
     }
-    if (evaluated.status === 'DEADLINE_EXCEEDED') return partial('DEADLINE_EXCEEDED', empty);
 
     const validation = createValidationState();
     const rawRecord = record(evaluated.value);
@@ -1278,6 +1366,7 @@ export class PerformanceCollector {
       projectedNetwork.requests,
       documentOrigin(navigationTiming),
       validation,
+      projectedNetwork.repeatedReadTypes,
     );
     const resourceCoverage = normalizeResourceCoverage(
       rawRecord,
@@ -1289,8 +1378,8 @@ export class PerformanceCollector {
       ...(navigationTiming?.serverTiming ?? []),
       ...resources.flatMap((resource) => resource.serverTiming),
     ];
-    const serverTiming = Object.freeze(allServerTiming.slice(0, MAX_SERVER_TIMING_TOTAL));
-    addOmittedServerTiming(validation, allServerTiming.length - serverTiming.length);
+    // L2: 合計の件数の上限を置かない。
+    const serverTiming = Object.freeze(allServerTiming);
     const facts: PerformanceEvidenceFacts = {
       webVitals,
       navigationTiming,
@@ -1306,10 +1395,16 @@ export class PerformanceCollector {
         validation.omittedServerTimingCount,
         validation.textTruncated || (webVitals !== null && webVitalsTextTruncated === true),
       ),
+      // AUD-6c: 観測の時間（読めない値は `null`）と、呼び出し側が渡した、測る前の操作。
+      observedForMs: nonnegative(rawRecord.observedAtMs),
+      ...(options.operationsBeforeMeasurement === undefined ? {} : { operationsBeforeMeasurement: { ...options.operationsBeforeMeasurement } }),
+      ...(options.lcpBeforeScroll === undefined ? {} : { lcpBeforeScroll: options.lcpBeforeScroll }),
     };
-    if (Date.now() >= deadlineAtMs) return partial('DEADLINE_EXCEEDED', facts);
+    if (pastDeadline(deadlineAtMs)) return partial('DEADLINE_EXCEEDED', facts);
     if (validation.invalid) return partial('INVALID_BROWSER_DATA', facts);
-    if (resourceCoverage !== null && (resourceCoverage.bufferFull || resourceCoverage.omittedEntryCount > 0)) {
+    // L2: observer が全部を受けたときは、ページのバッファが満杯でも欠けない。バッファから読んだとき（observer を付けられなかった）だけ、満杯を欠けとする。
+    const bufferLoss = rawRecord.resourceSource !== RESOURCE_SOURCE_OBSERVER && resourceCoverage?.bufferFull === true;
+    if (resourceCoverage !== null && (bufferLoss || resourceCoverage.omittedEntryCount > 0)) {
       return partial('RESOURCE_LIMIT_REACHED', facts);
     }
     return completeBeforeDeadline(deadlineAtMs, facts);

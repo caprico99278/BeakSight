@@ -1,17 +1,22 @@
 // 複数のownerで同じ意味を持つ上限値と、複数の collector で共有する Evidence の収集の上限（console・network・Resource Timing の件数や長さ）。
-// 1つの collector だけが使う収集の上限（DOM_LIMITS、LAYOUT_THRESHOLDS など）と、特定のownerが意味を決める上限（Interaction 候補の上限など）は、そのownerに置く。
+// 1つの collector だけが使う収集の値（LAYOUT_THRESHOLDS など）と、特定のownerが意味を決める上限（Interaction 候補の上限など）は、そのownerに置く。
 
-/** 記録するURLの最大長（UTF-16 のコード単位）。 */
-export const MAX_URL_LENGTH = 2_048;
+// URL-LEN・L14: URL の長さの上限（前の `MAX_URL_LENGTH`）は撤廃した。LZ-2: URL 以外の文の長さの上限（エラーの文・エラーの名前・stack・console の文・
+// header の値・セレクタ・サイトの metadata の本文。前の `MAX_ERROR_MESSAGE_LENGTH`・`MAX_ERROR_NAME_LENGTH`・`MAX_STACK_LENGTH`・
+// `MAX_CONSOLE_TEXT_LENGTH`・`MAX_HEADER_VALUE_LENGTH`・`MAX_SELECTOR_LENGTH`・`MAX_SITE_METADATA_TEXT_LENGTH`）も撤廃した。
+import { PRODUCTION_OBSERVATION_WINDOWS } from './observation-windows.js';
 
-/** 記録するエラーメッセージの最大長（UTF-16 のコード単位）。 */
-export const MAX_ERROR_MESSAGE_LENGTH = 2_048;
-
-/** 記録するHTTPメソッドの最大長。 */
+/**
+ * HTTP メソッドの最大長。LZ-2 の後は、本番の要求の型（`src/core/api-request-shape.ts`）の method を伏せるかの判断だけが使う（承認の型の digest に関わるので、
+ * LZ-2 では外さず、設計者の判断を待つ）。記録の method は切り詰めない。
+ */
 export const MAX_HTTP_METHOD_LENGTH = 32;
 
-/** 記録するCSS selectorの最大長。 */
-export const MAX_SELECTOR_LENGTH = 512;
+/**
+ * DN-1（設計書 `2026-11-16-beaksight-profile-display-name-design.md` 2 章）: サイトの画面に出す名前の長さの上限（前後の空白を除いた文字の数）。
+ * 保存の部品（`saveProfileDisplayName`）と画面の文（`LOCAL_UI_DISPLAY_NAME_TEXT`）が使う。管理データの版 22 の CHECK は、公開した時点のこの値の写し。
+ */
+export const MAX_PROFILE_DISPLAY_NAME_LENGTH = 80;
 
 /** CSS selectorを組み立てるときにたどる祖先の最大の深さ。 */
 export const MAX_SELECTOR_DEPTH = 8;
@@ -19,74 +24,17 @@ export const MAX_SELECTOR_DEPTH = 8;
 /** ジオメトリ（CSSピクセル）を比べるときの許容誤差。 */
 export const GEOMETRY_EPSILON_PX = 0.5;
 
-/** 1ページで記録する console メッセージ（error・warning）の最大件数。超えた分は件数だけを記録する。 */
-export const MAX_CONSOLE_MESSAGES = 1_000;
-
-/** 1ページで記録する pageerror の最大件数。超えた分は件数だけを記録する。 */
-export const MAX_PAGE_ERRORS = 200;
-
-/** 記録する console メッセージの本文の最大長（UTF-16 のコード単位）。 */
-export const MAX_CONSOLE_TEXT_LENGTH = 2_048;
-
-/** 記録するエラーの名前（`Error.name`）の最大長（UTF-16 のコード単位）。 */
-export const MAX_ERROR_NAME_LENGTH = 256;
-
-/** 記録する stack の最大長（UTF-16 のコード単位）。 */
-export const MAX_STACK_LENGTH = 8_192;
-
-/** 1ページで記録するネットワークリクエストの最大件数。超えたリクエストと、その response・失敗は件数だけを記録する。 */
-export const MAX_NETWORK_REQUESTS = 2_000;
-
-/** 記録するHTTPヘッダの値の最大長（UTF-16 のコード単位）。 */
-export const MAX_HEADER_VALUE_LENGTH = 2_048;
+// L2（N8・N9）: 1 ページで記録する console・pageerror・ネットワークの要求の件数の上限（前は 1,000・200・2,000）は撤廃した（定数は LZ-1 で消した）。
 
 /** Resource Timing のバッファの大きさ（`performance.setResourceTimingBufferSize`）と、記録する Resource Timing の最大件数。 */
 export const MAX_RESOURCE_TIMING_ENTRIES = 500;
 
-/**
- * サイトの metadata（robots.txt と sitemap.xml）の Evidence に記録する本文の最大長（UTF-16 のコード単位。Task 14〜17 の設計書 5.6.2）。
- * 超えた分は切り詰め、`textTruncated` を真にする。
- * 値の根拠: 一般的な robots.txt は数 KB で、Google が読む robots.txt の上限（500 KiB）も、ほぼこの長さである。
- * sitemap.xml は1ファイルで最大 50MB になり得るので、本文は全部を残さない。sitemap の URL は、切り詰める前の本文から取り出す
- * （`MAX_SITEMAP_URLS`）。
- */
-export const MAX_SITE_METADATA_TEXT_LENGTH = 500_000;
+// LZ-3a: sitemap.xml の Evidence に記録する `<loc>` の URL の件数の上限（前は `MAX_SITEMAP_URLS` 50,000）は撤廃した。URL を残らず記録する
+// （`sitemapUrlsTruncated` は前の記録のために残し、いつも偽）。
 
-/**
- * sitemap.xml の Evidence に記録する `<loc>` の URL の最大件数（Task 14〜17 の設計書 5.6.2）。超えた分は記録せず、
- * `sitemapUrlsTruncated` を真にする。切り詰めた場合、Cross-page rule は `DISCOVERED_URL_NOT_IN_SITEMAP` を判定しない。
- * 値の根拠: sitemap のプロトコルが1ファイルに許す URL の最大件数（50,000）と同じにした。1ファイルの sitemap は切り詰めずに記録できる。
- */
-export const MAX_SITEMAP_URLS = 50_000;
-
-/**
- * Interaction の安定性の確認の時間（設計書 2026-09-23 4.4.1、R5 の N-1）。下準備の hover・focus の後、ページが落ち着くのを待ってから、
- * 凍結の前に、この時間だけ対象を観測し続ける。この間に変わった項目は「不安定」とし、click の後の根拠にしない。
- * 値は、よく使われる hover intent の遅れ（100〜300ms）、CSS の transition（150〜300ms）、300ms 周期のタイマーを、
- * 少なくとも1回は捉えられる長さにした。長くするほど、候補1つあたりの監査が長くなる。
- * `src/interaction/isolated-auditor.ts` と、このファイルの `MIN_INTERACTION_TIMEOUT_EXCLUSIVE_MS`（設定の検証
- * `src/config/validate-config.ts` が使う `crawl.interactionTimeoutMs` の下限）が参照するので、ここに1か所だけ置く
- * （F17b。`src/config` と `src/interaction` が互いに依存しないようにするため）。
- */
-export const INTERACTION_STABILITY_WINDOW_MS = 500;
-
-/**
- * Interaction の持続の確認の時間（設計書 2026-09-23 4.4.1、R5 の N-3）。click の後に根拠となる変化を見つけてから、この時間の後にも
- * 同じ変化が続いている場合だけ、根拠にする。押し下げたときの ripple（多くの UI の部品集で 400〜450ms 程度）のように、
- * すぐ元に戻る変化を除ける長さにした。置き場所の理由は `INTERACTION_STABILITY_WINDOW_MS` と同じ。
- */
-export const INTERACTION_PERSISTENCE_WINDOW_MS = 500;
-
-/**
- * `crawl.interactionTimeoutMs` の下限（この値を含まない）。F17（F16 の発見事項5）。
- * 設定の検証と、設定のスキーマ（`schemas/run.schema.json` の `interactionTimeoutMs` の `minimum` = この値 + 1）が同じ下限を使う。
- * 1つの候補の監査は、凍結の前に安定性の確認の時間の全体を、click の後に持続の確認の時間の全体を、同じ期限の中で使う。
- * 安定性の確認は、残りの時間がその長さ以下なら始めず、持続の確認は、確認の時刻が期限以後なら行わない。そのため、
- * 期限がこの2つの時間の和以下だと、どの候補も VERIFIED にならない（NOT_VERIFIABLE になる）。
- * 読み込みと初期描画は、この期限の外で、読み込みの期限（`crawl.navigationTimeoutMs`）で待つ（R6 の I-2）。
- * hover・focus・落ち着くのを待つ時間・click には決まった長さがないので、下限には含めない。
- */
-export const MIN_INTERACTION_TIMEOUT_EXCLUSIVE_MS = INTERACTION_STABILITY_WINDOW_MS + INTERACTION_PERSISTENCE_WINDOW_MS;
+// SPEC-5（設計書 2026-11-14 5.1）: Interaction の安定の窓と持続の窓（前の `INTERACTION_STABILITY_WINDOW_MS`・`INTERACTION_PERSISTENCE_WINDOW_MS`、
+// どちらも 500ms）と、その和から導いた `crawl.interactionTimeoutMs` の下限（前の `MIN_INTERACTION_TIMEOUT_EXCLUSIVE_MS`）はやめた。押した後は、ページの
+// 落ち着き（`PAGE_SETTLING_PACING`）を待ってから 1 回だけ観測する。
 
 // ---------------------------------------------------------------------------------------------------------------
 // Page Auditor の期限と待ち方（Task 14〜17 の設計書 4.5.7）。Page Auditor の期限の計算（`stageDeadline` など）が参照する。
@@ -101,18 +49,7 @@ export const MIN_INTERACTION_TIMEOUT_EXCLUSIVE_MS = INTERACTION_STABILITY_WINDOW
  */
 export const INTERACTION_CLEANUP_ALLOWANCE_MS = 2_000;
 
-/**
- * Guard が同時に持てる、要求の横取りの作業（CDP の `Fetch.requestPaused` で一時停止した、Document でない要求の判定。
- * `src/safety/passive-request-guard.ts` の `handlePausedRequest`）の数の上限（DEF-042 の設計書 2.4）。超えた要求は一時停止のまま進めず、
- * 違反 `GUARD_TASK_LIMIT_REACHED` にして Context を閉じる（fail-closed。ほかの作業の上限 `MAX_PENDING_GUARD_TASKS` = 256 と同じ扱い）。
- * 値の根拠: DEF-042 で Guard の CDP の横取りをすべての要求に広げたので、ページが一度に始める資源の要求（画像、スクリプトなど）が、
- * それぞれ 1 つの作業になる。Chromium は、接続の数の上限とは別に、要求の開始の時点で横取りするので、700 個の画像を一度に読む
- * fixture（`many-resources.html`）では、数百の要求が同時に一時停止する。ほかの作業の上限（256）は、ダウンロードの取り消しや Document の
- * 横取りのような、同時に数十までの作業を想定した値で、これには足りない。1 ページで記録するネットワークの要求の上限
- * （`MAX_NETWORK_REQUESTS` = 2,000）の 2 倍にし、記録の上限を超えるページと、同じ page の OOPIF の session の要求（同じ Guard の作業に
- * 数える）にも余裕を持たせた。
- */
-export const MAX_PENDING_GUARD_REQUEST_TASKS = 4_096;
+// L10（N22）: Guard が同時に持てる要求の横取りの作業の数の上限（前は 4,096。超えたら `GUARD_TASK_LIMIT_REACHED`）は撤廃した（定数は LZ-1 で消した）。
 
 /**
  * Browser を閉じる処理（`browser.close()`）を待つ時間の上限（ms。R15 の Minor-2）。Run Coordinator と PREFLIGHT が使う。
@@ -154,23 +91,11 @@ export const SESSION_OPEN_TIMEOUT_MS = 10_000;
  * 候補1つの予算は、`crawl.navigationTimeoutMs` + この回数 × `crawl.interactionTimeoutMs` である。
  * 1回は操作の時間、もう1回は `auditInteraction` の後片付けの上限（後片付けを始めた時刻 + `interactionTimeoutMs`。
  * `src/interaction/isolated-auditor.ts` の `cleanupDeadlineAtMs`）の分である。
- * Page Auditor の候補ごとの期限と、設定の検証（Interaction が有効なら、`crawl.overallPageTimeoutMs` がこの予算以上）が使う
- * （R14 の m2）。
+ * Page Auditor の候補ごとの期限が使う（R14 の m2。設定の検証での比べは SPEC-1 で撤廃した）。
  */
 export const INTERACTION_TIMEOUT_COUNT_PER_CANDIDATE = 2;
 
-/**
- * ページの期限と、期限を受け取る collector に渡す期限との間の余裕（ms。設計書 4.5.7、R14r の Minor-2）。
- * Page Auditor は、ページの期限で段階を見放す（`awaitBeforeDeadline`）。collector にページの期限をそのまま渡すと、collector が
- * 期限で止まって返す途中までの結果（PARTIAL の Evidence）が、見放した後に届いて捨てられる。そのため、collector には、
- * ページの期限からこの値を引いた時刻を渡す。
- * 値の根拠: collector は、期限を過ぎたら `awaitBeforeDeadline` で待つのをやめ、それまでの結果を Node 側で組み立てて返す。
- * 期限から返るまでの時間は、タイマーの遅れ（Windows では約 16ms）と、Node 側での結果の組み立てである。ブラウザ内の処理の
- * 部分結果を返すための時間（layout の収集では `LAYOUT_THRESHOLDS.partialResultReserveMs` の 250ms）は、collector が自分の期限の
- * 前に取っておくので、ここには含めない。負荷の高い環境での遅れを見込んでも、期限から返るまでは数百 ms に収まる。
- * 500ms は、それを上回る余裕で、既定のページの期限（60,000ms）の 1% 未満なので、収集の時間をほとんど減らさない。
- */
-export const COLLECTOR_DEADLINE_MARGIN_MS = 500;
+// L1: ページの期限と collector に渡す期限の間の余裕（前は 500ms）は、ページの期限を撤廃したので使わない（定数は LZ-1 で消した）。
 
 /**
  * DOM の準備を待つ処理（`waitForPageSettled`）の待ち方。期限（`deadlineAtMs`）は、Page Auditor が段階ごとに決める。
@@ -178,20 +103,14 @@ export const COLLECTOR_DEADLINE_MARGIN_MS = 500;
  *   安定の時間の中で5回測れる間隔である。短いほど早く終わるが、測る回数が増える。
  * - `stableWindowMs`: 文書の読み込み（`readyState` が `loading`）が終わり、`scrollHeight` が変わらない状態がこの時間続いたら、
  *   落ち着いたとする。500ms は、初期描画の後の画像やフォントによる高さの変化を捉えられ、ページごとの待ち時間を大きくしない長さである。
+ * RB-2: 値は観察の窓の一式（`pageSettle`）の本番の値から導く。
  */
 export const PAGE_SETTLING_PACING = Object.freeze({
-  pollIntervalMs: 100,
-  stableWindowMs: 500,
-} as const);
+  pollIntervalMs: PRODUCTION_OBSERVATION_WINDOWS.pageSettle.pollIntervalMs,
+  stableWindowMs: PRODUCTION_OBSERVATION_WINDOWS.pageSettle.stableWindowMs,
+});
 
-/**
- * T44R2 の I-6（P1-5）: 幅の走査の各幅で、落ち着きの待ちを止めて形を測るために残す時間（ms）。落ち着きの待ちの上限は、その幅の期限からこの時間を引いた
- * 時刻と、今から `crawl.resourceSettlingTimeoutMs` 後の早い方（落ち着かない画面でも、その幅の形を測る時間を残す）。
- * 値の根拠: 重いページの fixture（`startHeavyPageSite`。1,000 行）で、幅 320・768・1,024 の形を測る時間（`collectLayoutEvidence`）は、最大 322ms（テストの
- * 既定の Chromium）と 248ms（CLI の起動の設定）だった（各 3 回。2026-10-22）。混み合った環境での遅れと、収集の部分結果の予備
- * （`LAYOUT_THRESHOLDS.partialResultReserveMs` の 250ms）を見込んで、約 4 倍の 1,500ms にした。
- */
-export const STRESS_LAYOUT_MEASURE_RESERVE_MS = 1_500;
+// L1: 幅の走査の各幅で形を測るために残す時間（前は 1,500ms）は、幅の期限を撤廃したので使わない（定数は LZ-1 で消した）。
 
 /**
  * controlled scroll（`controlledScroll`）の待ち方（設計書 第11章: 人間に近い一定の刻みと待ちで、極端な操作をしない）。
@@ -201,27 +120,22 @@ export const STRESS_LAYOUT_MEASURE_RESERVE_MS = 1_500;
  *   高さ 10 画面程度のページを数秒でたどれる長さである。
  * - `stableWindowMs`: 最下部に着いた後、`scrollHeight` が変わらない状態がこの時間続いたら、たどり終えたとする。
  *   DOM の準備の安定の時間と同じ長さにする。
+ * RB-2: 待ちの 2 つは観察の窓の一式（`scroll`）の本番の値から導く（量の割合は待ちでないので、ここに置く）。
  */
 export const CONTROLLED_SCROLL_PACING = Object.freeze({
   stepViewportFraction: 0.75,
-  stepWaitMs: 250,
-  stableWindowMs: PAGE_SETTLING_PACING.stableWindowMs,
-} as const);
+  ...PRODUCTION_OBSERVATION_WINDOWS.scroll,
+});
+
+// L1・L9: scroll の段階の予算の倍率（前は `crawl.resourceSettlingTimeoutMs` の 4 倍）は、段階の期限を撤廃したので使わない（定数は LZ-1 で消した）。
 
 /**
- * scroll の段階の予算の、`crawl.resourceSettlingTimeoutMs` に対する倍率（設計書 4.5.7）。scroll は、遅延読み込みを
- * 何回も待つので、DOM の準備（`resourceSettlingTimeoutMs`）より長い予算にする。既定の設定では 20,000ms で、
- * `crawl.overallPageTimeoutMs`（既定 60,000ms）の3分の1に収まる。
+ * AUD-1d（ユーザーの判断 2026-11-09）: ChatGPT 用バンドルを部（第 1 部・第 2 部…）に分けるときの、1 つの部の大きさの目安（バイト。中身のバイト数の和）。
+ * 集めた証拠は外さず、この大きさを超える分は次の部に入れる（前の画像の予算に代わる。予算で外す決まりはやめた）。
+ * 第 1 部は JSON の全部を分けずに入れるので、JSON だけで目安を超えることがある。値の根拠: 前の画像の予算と同じ 64 MiB（ChatGPT に渡せる大きさの目安。
+ * 設計者の決定）。
  */
-export const SCROLL_STAGE_BUDGET_SETTLING_MULTIPLIER = 4;
-
-/**
- * ChatGPT 用バンドルに入れるスクリーンショットの、合計の大きさの上限（バイト。Task 14〜17 の設計書 6.1.11）。
- * 関係するスクリーンショットを、`VIEWPORT` のもの（パスの順）、`FULL_PAGE` のもの（パスの順）の順に入れ、合計がこの値を超えるものは
- * 入れない（`manifest.json` の `omittedFiles` に、理由 `BUNDLE_SIZE_LIMIT` で書く）。
- * 値の根拠: 64 MiB。手でアップロードするバンドルの大きさを抑えるための上限である（設計者の決定）。
- */
-export const CHATGPT_BUNDLE_SCREENSHOT_BUDGET_BYTES = 64 * 1024 * 1024;
+export const CHATGPT_BUNDLE_PART_SIZE_BYTES = 64 * 1024 * 1024;
 
 /**
  * Rule ごとの要約（表示用モデルの `ruleDigests`。ChatGPT 用バンドルの `findings-by-rule.json`）の、1 つの Rule の例の数の上限（T44i。Task 44 の設計書 6 章の
@@ -237,12 +151,7 @@ export const REPORT_RULE_DIGEST_EXAMPLE_COUNT = 3;
  */
 export const REPORT_BEAKSIGHT_BLOCK_REFERENCE_COUNT = 5;
 
-/**
- * 設定のページの上限（`crawl.maxPages`）の上限（T44R。Task 44 のレビューの M-3）。`validateConfig` と、プロファイルの画面の「監査の負荷」の欄の確かめが使う。
- * 値の根拠: 1 回の Run で監査するページの数として十分に大きく（既定は 500）、承認したサービスの Origin への要求の 1 回の Run の上限の既定
- * （`defaultServiceRequestLimitsFor`。ページの上限 × 1 ページあたりの量）が安全な整数を十分に下回る値（設計者の決定）。
- */
-export const MAX_CRAWL_MAX_PAGES = 100_000;
+// LZ-3a: 設定のページの上限の上限（前は `MAX_CRAWL_MAX_PAGES` 100,000）は撤廃した。利用者が指定した正の整数をそのまま受ける。
 
 /**
  * 範囲の手がかり（欄の min・max・step）がない日付・日時の欄に、入力の規則の自動の作成（`src/control/data-rules/rule-set-inference.ts`）が入れる

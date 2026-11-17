@@ -24,9 +24,15 @@
 //     path から ID の区切りを選んで型を作るための口（ID の形の判定は呼び出し側が渡す）。
 // - T41a（Task 41 の設計書 3.1）: form のない候補の、画面の path の最後の ID を `{id}` にした識別の digest（`pagePathTemplatedIdentityDigestOf`。別の印
 //   `CANDIDATE_PAGE_TEMPLATE_IDENTITY_DIGEST_FORMAT`）。索引の型にした digest の一覧の列を、印で分けて共用する（管理データの版は 14 のまま）。
+// - LU-11（設計書 `2026-11-02-beaksight-list-row-update-design.md` 5.4 の 4、D5）: 送信先の path の最後の番号の区切りだけを `{id}` にした識別の digest
+//   （`actionPathTemplatedIdentityDigestOf`。別の印 `CANDIDATE_ACTION_TEMPLATE_IDENTITY_DIGEST_FORMAT`）。行の下に広がるフォーム（画面 `/items` → 送信先
+//   `/items/N`）の、行ごとのフォームを 1 つにまとめる。`pagePathTemplatedIdentityDigestOf` と対。
+// - PL-6a（設計書 `2026-10-26-beaksight-plain-ui-design.md` 8.1 の 4）: フォームの形の鍵（`formShapeKeyOf`。別の印 `CANDIDATE_FORM_SHAPE_KEY_FORMAT`）。
+//   識別の digest の並びから画面の Origin と path を除いた形。書き込みのワーカーが、送った後の画面に同じフォームがもう一度出たかを比べる。今の識別の
+//   digest（版 2）は変えない。
 // 純粋な関数だけのファイル。Playwright、ブラウザ、`node:fs`、`src/control/`、監査エンジンを import しない
 // （`tests/architecture/discovery-boundary.test.ts`）。
-import { lastRecordIdLikePathSegmentIndexOf } from '../core/api-request-shape.js';
+import { isRecordIdLikePathSegment, lastRecordIdLikePathSegmentIndexOf } from '../core/api-request-shape.js';
 import { createSha256Fingerprint } from '../core/ids.js';
 import { PATH_TEMPLATE_ID_SEGMENT } from '../core/record-id-path-pattern.js';
 import { compareCodeUnits } from '../core/text.js';
@@ -46,11 +52,19 @@ export const CANDIDATE_IDENTITY_DIGEST_FORMAT = 'beaksight-candidate-identity/2'
  */
 export const CANDIDATE_PAGE_TEMPLATE_IDENTITY_DIGEST_FORMAT = 'beaksight-candidate-page-template-identity/1';
 
+/**
+ * 送信先の path を型にした識別の digest の入力の形の印（版つき。LU-11）。ほかの型にした識別の digest と印が違うので、互いに当たらない。
+ */
+export const CANDIDATE_ACTION_TEMPLATE_IDENTITY_DIGEST_FORMAT = 'beaksight-candidate-action-template-identity/1';
+
 /** 入力規則の digest の入力の形の印（版つき）。 */
 export const CANDIDATE_RULE_DIGEST_FORMAT = 'beaksight-candidate-rules/1';
 
 /** 型にした識別の digest の入力の形の印（版つき。T31b）。 */
 export const CANDIDATE_TEMPLATE_IDENTITY_DIGEST_FORMAT = 'beaksight-candidate-template-identity/1';
+
+/** フォームの形の鍵の入力の形の印（版つき。PL-6a）。 */
+export const CANDIDATE_FORM_SHAPE_KEY_FORMAT = 'beaksight-candidate-form-shape/1';
 
 /**
  * path の型の中の、レコードの ID の区切りの印（型にちょうど 1 つ。path の 1 つの区切りの全体。T31b）。T40R2-fix: 定義は core の
@@ -123,6 +137,18 @@ export const computeCandidateDigests = (candidate: DiscoveredCandidate): Candida
   });
 };
 
+/**
+ * PL-6a（設計書 `2026-10-26-beaksight-plain-ui-design.md` 8.1 の 4）: フォームの形の鍵（純粋）。送った後の画面に、送ったフォームと同じフォームがもう一度
+ * 出たか（入力の誤りの再表示か）を、書き込みのワーカーが比べる唯一の鍵。識別の digest の並びのうち、画面の Origin と path を除いたもの（候補の種類、
+ * method と `_method` の上書き、送信先の Origin と path と query の名前、名前のある欄の `name`・`tag`・`type`、送信ボタンの語）の SHA-256。画面の path
+ * （送った後は送信先や一覧の path に出る）と、欄の値（CSRF の token などの hidden の値、値があるか）を含めない。今の識別の digest（版 2）とは別の印の、
+ * 別の鍵（識別の digest は変えない）。
+ */
+export const formShapeKeyOf = (candidate: DiscoveredCandidate): string => {
+  const [, , ...shapeItems] = identityItemsOf(candidate, '', candidate.action?.path ?? null);
+  return createSha256Fingerprint(JSON.stringify([CANDIDATE_FORM_SHAPE_KEY_FORMAT, ...shapeItems]));
+};
+
 // ---------------------------------------------------------------------------------------------------------------
 // 型にした識別の digest（T31b）
 // ---------------------------------------------------------------------------------------------------------------
@@ -133,6 +159,38 @@ const segmentsOf = (path: string): readonly string[] => path.split(PATH_SEPARATO
 /** 区切り 1 つを `value` にした path。 */
 const replacedPathOf = (segments: readonly string[], index: number, value: string): string =>
   segments.map((segment, position) => (position === index ? value : segment)).join(PATH_SEPARATOR);
+
+/**
+ * DEF-208-4（設計書 `2026-11-05-beaksight-discovery-coverage-design.md` 3.8 の F。DEF-201）: 画面の path の型（純粋）。ID に見える区切り（core の
+ * `isRecordIdLikePathSegment`）をすべて `{id}`（`PATH_TEMPLATE_ID_SEGMENT`）にした path。ID に見える区切りがなければ null（型で見分けない画面）。操作さがしが、
+ * 同じ型の画面を 1 つだけ読むのに使う。
+ */
+export const pageTemplatePathOf = (path: string): string | null => {
+  const segments = segmentsOf(path);
+  if (!segments.some((segment) => isRecordIdLikePathSegment(segment))) {
+    return null;
+  }
+  return segments.map((segment) => (isRecordIdLikePathSegment(segment) ? PATH_TEMPLATE_ID_SEGMENT : segment)).join(PATH_SEPARATOR);
+};
+
+/** COV-2: 状態の型にした識別の digest の入力の形の印（版つき）。 */
+export const CANDIDATE_STATE_TEMPLATE_IDENTITY_DIGEST_FORMAT = 'beaksight-candidate-state-template-identity/1';
+
+/**
+ * COV-2（網羅の設計書 `2026-11-09-beaksight-coverage-by-state-design.md` 3.1 の 2、3.3）: 状態の構造の鍵と、操作さがしの押す組の鍵に入れる、候補の型にした
+ * 識別の digest（純粋）。識別の digest の並び（`identityItemsOf`）の、画面の path と送信先の path の番号に見える区切りを、すべて `{id}` にした形
+ * （`pageTemplatePathOf`。番号に見える区切りがなければ path のまま）と、enctype。番号だけが違う同じ作りの画面の候補で同じになる。識別の digest（書き込みの段・
+ * 索引・承認の照合に使う）は変えない。
+ */
+export const stateTemplateIdentityDigestOf = (candidate: DiscoveredCandidate): string => {
+  const pagePath = pageTemplatePathOf(candidate.page.path) ?? candidate.page.path;
+  const actionPath = candidate.action === null ? null : pageTemplatePathOf(candidate.action.path) ?? candidate.action.path;
+  return createSha256Fingerprint(JSON.stringify([
+    CANDIDATE_STATE_TEMPLATE_IDENTITY_DIGEST_FORMAT,
+    ...identityItemsOf(candidate, pagePath, actionPath),
+    candidate.enctype,
+  ]));
+};
 
 /**
  * 画面の path と送信先の path の、同じ値を持つ区切りの組（値が `isRecordId` に当たる組だけ。画面の位置、送信先の位置の順。上限
@@ -216,6 +274,47 @@ export const pagePathTemplatedIdentityDigestOf = (candidate: DiscoveredCandidate
     ...identityItemsOf(candidate, replacedPathOf(segmentsOf(candidate.page.path), segment, PATH_TEMPLATE_ID_SEGMENT), null),
   ]));
 };
+
+/**
+ * LU-11（設計書 `2026-11-02-beaksight-list-row-update-design.md` 5.4 の 4、D5）: 送信先のある候補（form）の、送信先の path の**最後の区切り**が番号の形
+ * （core の `isRecordIdLikePathSegment`）のとき、その区切りだけを `{id}`（`PATH_TEMPLATE_ID_SEGMENT`）にした送信先の path の型（純粋。`/items/4` →
+ * `/items/{id}`）。途中の区切りの番号（`/projects/7/items/4` の `7`）は変えない。送信先がない、最後の区切りが番号の形でない（空・`/items/4/update`）、
+ * path が根の区切りだけのときは null。送信先を型にした識別の digest と、行の下に広がるフォームの下書きの型が使う唯一の決まり。
+ */
+export const actionPathRecordIdTemplateOf = (candidate: DiscoveredCandidate): string | null => {
+  if (candidate.action === null) {
+    return null;
+  }
+  const actionSegments = segmentsOf(candidate.action.path);
+  const last = actionSegments.length - 1;
+  return last <= 0 || !isRecordIdLikePathSegment(actionSegments[last] ?? '')
+    ? null
+    : replacedPathOf(actionSegments, last, PATH_TEMPLATE_ID_SEGMENT);
+};
+
+/**
+ * LU-11: 送信先の path を型にした識別の digest（純粋）。入力は、識別の digest の並びの送信先の path を `actionPathRecordIdTemplateOf` の型にした形と、enctype
+ * （画面の path はそのまま）。番号だけが違う送信先の候補（一覧の行ごとのフォーム）で同じになる。型を作れなければ null。`pagePathTemplatedIdentityDigestOf`
+ * （送信先のない候補の画面の path）と対。
+ */
+export const actionPathTemplatedIdentityDigestOf = (candidate: DiscoveredCandidate): string | null => {
+  const template = actionPathRecordIdTemplateOf(candidate);
+  return template === null
+    ? null
+    : createSha256Fingerprint(JSON.stringify([
+      CANDIDATE_ACTION_TEMPLATE_IDENTITY_DIGEST_FORMAT,
+      ...identityItemsOf(candidate, candidate.page.path, template),
+      candidate.enctype,
+    ]));
+};
+
+/**
+ * LU-11（D5）: 行の下に広がるフォーム（形 B）の、まとめる識別の digest（判定の唯一の置き場所）。画面の path に番号の区切りがない（core の
+ * `lastRecordIdLikePathSegmentIndexOf`。番号のある画面は別の編集の画面（形 C））候補の、送信先を型にした識別の digest。ほかは null。自動の下書きの
+ * 行のまとめ、下書きの確かめの型にした識別の digest、発見の索引の型にした digest の一覧が使う。
+ */
+export const listRowFormTemplatedIdentityDigestOf = (candidate: DiscoveredCandidate): string | null =>
+  (lastRecordIdLikePathSegmentIndexOf(candidate.page.path) === null ? actionPathTemplatedIdentityDigestOf(candidate) : null);
 
 /** path の型の中の、`{id}` の区切りの位置（`{id}` がちょうど 1 つで、区切りの全体でなければ null）。 */
 const placeholderSegmentOf = (template: string): number | null => {

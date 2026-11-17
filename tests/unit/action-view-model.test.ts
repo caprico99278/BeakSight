@@ -88,9 +88,13 @@ describe('action report view model (T32f)', () => {
       AUTOMATED_ACTION_CATALOG.READ_VERIFICATION,
     ]);
     expect(create).toMatchObject({
-      approver: 'LOCAL_OPERATOR', revokedAtStartText: ACTION_REPORT_TEXT.no, cumulativeText: ACTION_REPORT_TEXT.cumulativeValue(formatInteger(1), formatInteger(20)),
+      approver: 'LOCAL_OPERATOR', revokedAtStartText: ACTION_REPORT_TEXT.no, cumulativeText: ACTION_REPORT_TEXT.cumulativeValue(formatInteger(1)),
       capturedAtText: timeText('20261015000005'), grantConsumedAtText: timeText('20261015000005'),
     });
+    // LZ-3c: 累積の上限・承認の期限・期限の日数は出さない（判定に使わない名残を上限に見せない）。
+    expect(create).not.toHaveProperty('expiresAtText');
+    expect(create).not.toHaveProperty('approvalTtlDaysText');
+    expect(create.limitsText).toBe(ACTION_REPORT_TEXT.limitsValue(formatInteger(1)));
     expect(create.sideEffects.every((item) => item.confirmedText === ACTION_REPORT_TEXT.sideEffectConfirmed)).toBe(true);
     const update = modelOf(verifiedUpdateDocuments()).approval;
     expect(update.humanDecisions).toContain(HUMAN_DECISION_CATALOG.UPDATE_FIELD_ROLES);
@@ -199,18 +203,11 @@ describe('action report view model of an API write (T40d)', () => {
     expect(model.api).toMatchObject({ pageKeys: [], httpFieldNamesText: apiText.none, recordIdKeyText: apiText.recordIdKeyUnset });
   });
 
-  it('does not show the success and input error conditions of an API write, and tells how an API write is judged', () => {
-    // 条件の値（FORM の見本の path とセレクタ）を記録に残したままの文書でも、表示用モデルに条件は入らない。条件の項目の説明も入らない。
-    const base = verifiedApiCreateDocuments();
-    const conditions = verifiedCreateDocuments().actionRun.resultConditions;
-    const text = JSON.stringify(modelOf({ ...base, actionRun: { ...base.actionRun, resultConditions: conditions } }));
+  it('tells how an API write is judged, without the way to judge a form write', () => {
+    // PL-6a: 成否の条件はもうない。API の書き込みの表示用モデルに、form の結果の確かめ方の説明は入らない。
+    const text = JSON.stringify(modelOf(verifiedApiCreateDocuments()));
     expect(text).toContain(JSON.stringify(apiText.judgementNote));
-    for (const value of ['/members/new', '.registered']) {
-      expect(text, value).not.toContain(value);
-    }
-    for (const item of [SCENARIO_VERIFICATION_ITEM_CATALOG.successCondition, SCENARIO_VERIFICATION_ITEM_CATALOG.inputErrorCondition]) {
-      expect(text).not.toContain(item.description);
-    }
+    expect(text).not.toContain(SCENARIO_VERIFICATION_ITEM_CATALOG.resultJudgement.description);
   });
 
   // T41e（Task 41 の設計書 3.5）: API の UPDATE は、API の要約と更新の前後の差分の両方を持つ。保つ欄の値は出さない。ページが決める鍵の値は、更新では

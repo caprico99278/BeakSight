@@ -10,7 +10,6 @@ import { startFixtureServer, type FixtureServer } from '../../fixtures/server.js
 import { ChromiumLaunchRefusedError } from '../../src/browser/chromium-launch.js';
 import { BrowserContextFactory } from '../../src/browser/context-factory.js';
 import type { AuditConfig } from '../../src/config/types.js';
-import { MAX_ERROR_MESSAGE_LENGTH } from '../../src/core/limits.js';
 import { createLoadMeter } from '../../src/crawl/load-meter.js';
 import { PASSIVE_CONTEXT_CLOSE_DEADLINE_MESSAGE } from '../../src/orchestration/passive-session-close.js';
 import { PASSIVE_SESSION_OPEN_DEADLINE_MESSAGE } from '../../src/orchestration/passive-session-open.js';
@@ -104,7 +103,6 @@ function expectFailure(result: PreflightResult, check: PreflightFailure['failedC
   expect(result.failedCheck).toBe(check);
   expect(result.reason).toEqual({ code: 'PREFLIGHT_FAILED', detail: check });
   expect(result.message.length).toBeGreaterThan(0);
-  expect(result.message.length).toBeLessThanOrEqual(MAX_ERROR_MESSAGE_LENGTH);
   expect(Object.isFrozen(result)).toBe(true);
   return result;
 }
@@ -305,12 +303,12 @@ describe('runPreflight (R15c)', () => {
     expect(launcher.calls).toEqual([]);
   });
 
-  it('fails BROWSER_LAUNCH with a bounded message when the injected launcher rejects', async () => {
+  it('fails BROWSER_LAUNCH with the whole message when the injected launcher rejects (LZ-2)', async () => {
     server.resetRequestObservations();
     server.resetCounters();
     const outputDirectory = await createWorkDirectory();
     const ledgers = ledgerFactory();
-    const longMessage = `spawn failed ${'x'.repeat(MAX_ERROR_MESSAGE_LENGTH * 2)}`;
+    const longMessage = `spawn failed ${'x'.repeat(2_049)}`;
 
     const result = await runPreflight({
       config: createTestConfig(server.origin),
@@ -322,7 +320,7 @@ describe('runPreflight (R15c)', () => {
     });
 
     const failure = expectFailure(result, 'BROWSER_LAUNCH');
-    expect(failure.message).toBe(longMessage.slice(0, MAX_ERROR_MESSAGE_LENGTH));
+    expect(failure.message).toBe(longMessage);
     expect(failure.safetyLedgers).toEqual([]);
     expect(ledgers.created).toEqual([]);
     expectNoTargetRequests();

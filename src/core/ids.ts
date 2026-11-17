@@ -19,6 +19,7 @@ const evidencePrefixes: Readonly<Record<EvidenceType, string>> = {
   scroll: 'SCROLL',
   metadata: 'META',
   safety: 'SAFETY',
+  focus: 'FOCUS',
 };
 
 export interface FindingFingerprintIdentityField {
@@ -112,6 +113,12 @@ export const sha256HexOfBytes = (bytes: Uint8Array): string => createHash(SHA256
 /** 文字列を UTF-8 として SHA-256 でハッシュし、前置きのない小文字の 16 進 64 桁で返す（CC-059。認証の設定の要約など）。 */
 export const sha256HexOfText = (value: string): string => createHash(SHA256_ALGORITHM).update(value, 'utf8').digest('hex');
 
+/**
+ * DEF-276-relay: 文字列を UTF-8 として SHA-1 でハッシュし、base64 で返す（WebSocket の握手の `Sec-WebSocket-Accept`。RFC 6455 が SHA-1 を決める。Finding の
+ * fingerprint ではない）。
+ */
+export const sha1Base64OfText = (value: string): string => createHash('sha1').update(value, 'utf8').digest('base64');
+
 /** `value` を UTF-8 として SHA-256 でハッシュし、`sha256:<小文字の16進64桁>` の形式で返す。 */
 export const createSha256Fingerprint = (value: string): string => `${SHA256_FINGERPRINT_PREFIX}${sha256HexOfText(value)}`;
 
@@ -120,6 +127,22 @@ export const createSha256Fingerprint = (value: string): string => `${SHA256_FING
  * `sha256:<小文字の16進64桁>` の形式で返す（ChatGPT 用バンドルの manifest の `sha256`。CC-006）。入力は変えない。
  */
 export const createSha256FingerprintOfBytes = (bytes: Uint8Array): string => `${SHA256_FINGERPRINT_PREFIX}${sha256HexOfBytes(bytes)}`;
+
+/**
+ * MEM-2（DEF-266）: 順に渡る断片（ファイルを少しずつ読んだもの）をつないだバイト列の、`createSha256FingerprintOfBytes` と同じ形の SHA-256 と、バイト数。
+ * 断片は持ち続けない。
+ */
+export const createSha256FingerprintOfChunks = async (
+  chunks: AsyncIterable<Uint8Array>,
+): Promise<{ readonly byteLength: number; readonly sha256: string }> => {
+  const hash = createHash(SHA256_ALGORITHM);
+  let byteLength = 0;
+  for await (const chunk of chunks) {
+    hash.update(chunk);
+    byteLength += chunk.byteLength;
+  }
+  return { byteLength, sha256: `${SHA256_FINGERPRINT_PREFIX}${hash.digest('hex')}` };
+};
 
 /** `sha256:<小文字の16進64桁>` の形式の文字列か。 */
 export const isSha256Fingerprint = (value: unknown): value is string =>

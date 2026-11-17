@@ -1,45 +1,12 @@
 /**
- * 入口の確かめの案から、新しい認証の設定の欄に埋める値（Task 43 の設計書 4.3。区分 b。T43c）。純粋な関数だけ（ブラウザ側とサーバの両方が使う）。
- * - 埋めた値は、保存されていない案（設計書 3 章）。利用者が変えられ、保存したものだけが通る。保存した設定があれば、案は使わない（呼ぶ側が決める）。
- * - 入口の確かめの案は、開始の URL の path の案（T43b。`start-url-draft.ts`）より優先する: 入口の確かめの案がある欄は、その値を埋める。開始の URL の
- *   path で埋めた成功の画面の path が、ログインの画面の path（セッションの切れの path）に当たるなら、成功の画面の path を空にする（ログインの画面の
- *   path に当たる成功の条件は、認証の設定の検証が誤りにするため。人が入れる）。
- * - 案のない欄（`null`）は埋めない（前の値のまま）。
+ * 入口の確かめの案と観察した要求の下書きを、認証の設定の欄に入れる部品（Task 43 の設計書 4.3、4.4。T43c、T43d）。純粋な関数だけ（ブラウザ側とサーバの両方が使う）。
+ * - MI-3: 入口の確かめの案と開始の URL の path の案から、新しい認証の設定の値を作る判断（T43c の `entryCheckDraftOf`・`keepsStartUrlSuccessPath`）は、
+ *   ジョブの管理と同じ 1 か所（`src/control/auth/auth-setup-proposal.ts` の `proposedAuthSetupBodyOf`）へ移した。
  * - T43d: 観察した要求の下書き（`observedDraftFieldsOf`）と、欄に入れる値の優先の順（ファイルの後半。この 1 か所）。
  */
 import { MIN_LOGIN_SIDE_REQUESTS_PER_LOGIN_STAGE, SCRIPT_REQUEST_TRANSPORT } from '../../../../src/control/auth/auth-setup-contracts.js';
 import type { EntryCheckProposal } from '../../../../src/control/entry-check.js';
 import type { ObservedAuthSetupDraft, ServiceOriginSources } from '../../../../src/control/login-observation-draft.js';
-
-/** 入口の確かめの案で埋める欄（認証の設定の画面の欄の名前と同じ）。値のない欄は持たない。 */
-export interface EntryCheckDraft {
-  readonly loginStartUrl?: string;
-  readonly sessionLostPathPrefix?: string;
-  readonly loginTransport?: NonNullable<EntryCheckProposal['loginTransport']>;
-  /** 1 行に 1 つ（送信先の URL）。フォームの送信のときだけ。 */
-  readonly loginPostEndpoints?: string;
-  readonly usernameSelector?: string;
-  readonly passwordSelector?: string;
-  readonly submitSelector?: string;
-}
-
-/** 入口の確かめの案から、埋める欄の値を作る（`null` の案は埋めない）。 */
-export const entryCheckDraftOf = (proposal: EntryCheckProposal): EntryCheckDraft => ({
-  ...(proposal.loginStartUrl === null ? {} : { loginStartUrl: proposal.loginStartUrl }),
-  ...(proposal.sessionLostPathPrefix === null ? {} : { sessionLostPathPrefix: proposal.sessionLostPathPrefix }),
-  ...(proposal.loginTransport === null ? {} : { loginTransport: proposal.loginTransport }),
-  ...(proposal.loginPostEndpoint === null ? {} : { loginPostEndpoints: `${proposal.loginPostEndpoint.origin}${proposal.loginPostEndpoint.path}` }),
-  ...(proposal.selectors.username === null ? {} : { usernameSelector: proposal.selectors.username }),
-  ...(proposal.selectors.password === null ? {} : { passwordSelector: proposal.selectors.password }),
-  ...(proposal.selectors.submit === null ? {} : { submitSelector: proposal.selectors.submit }),
-});
-
-/**
- * 開始の URL の path で埋めた成功の画面の path を、入口の確かめの案と並べたときに残すか（ログインの画面の path に当たるなら残さない）。案の
- * セッションの切れの path がなければ残す。
- */
-export const keepsStartUrlSuccessPath = (successPathPrefix: string, draft: EntryCheckDraft): boolean =>
-  successPathPrefix.length === 0 || draft.sessionLostPathPrefix === undefined || !draft.sessionLostPathPrefix.startsWith(successPathPrefix);
 
 // ---------------------------------------------------------------------------------------------------------------
 // T43d（Task 43 の設計書 4.4）: 観察した要求の下書き（ジョブの詳細の「登録する」「案を認証の設定に入れる」）
@@ -47,9 +14,9 @@ export const keepsStartUrlSuccessPath = (successPathPrefix: string, draft: Entry
 
 /**
  * 認証の設定の画面の欄に入れる値の、優先の順（この 1 か所で決める。`AuthSetupForm.tsx` の `authSetupFormValuesOf` が、この順で重ねる）:
- * 1. 保存した設定の値（なければ、開始の URL の path の案（T43b）と今の既定）。
- * 2. 入口の確かめの案（T43c。保存した設定がないときだけ）。
- * 3. 観察した要求の下書き（T43d。保存した設定があっても入れる。利用者が URL で持ち込んだ下書きなので、いちばん新しい観察として前の値の上に入れる）。
+ * 1. 保存した設定の値。なければ、案の設定（MI-3 の `proposedAuthSetupBodyOf`。入口の確かめの案（T43c）を、開始の URL の path の案（T43b）と今の既定より
+ *    優先する）。
+ * 2. 観察した要求の下書き（T43d。保存した設定があっても入れる。利用者が URL で持ち込んだ下書きなので、いちばん新しい観察として前の値の上に入れる）。
  *    ログインに伴う送信だけは、今の一覧に「足す」（同じ Origin と path は重ねない。回数の上限は既定の 1）。成功の画面のセレクタは、入口の確かめで読んだ
  *    ログインの画面の欄の CSS と同じなら入れない（ログインの画面にもある要素）。下書きのない欄は、前の値のまま。
  */

@@ -1,14 +1,11 @@
 import type { Frame, Page, Request, Response } from 'playwright';
-import { describe, expect, it } from 'vitest';
+import { describe, expect, it, vi } from 'vitest';
 import { ERROR_MESSAGE_FALLBACK } from '../../src/core/errors.js';
-import {
-  MAX_ERROR_MESSAGE_LENGTH,
-  MAX_HEADER_VALUE_LENGTH,
-  MAX_NETWORK_REQUESTS,
-  MAX_URL_LENGTH,
-} from '../../src/core/limits.js';
 import { NetworkCollector } from '../../src/evidence/network-collector.js';
 import { createDeferred } from '../helpers/deferred.js';
+
+/** L2 の前の要求の件数の上限（2,000。定数は LZ-1 で消した）。 */
+const MAX_NETWORK_REQUESTS = 2_000;
 
 type Listener = (...arguments_: readonly unknown[]) => void;
 
@@ -454,17 +451,50 @@ describe('NetworkCollector', () => {
       request,
       200,
       {},
-      () => Promise.reject(new Error('x'.repeat(MAX_ERROR_MESSAGE_LENGTH + 100))),
+      () => Promise.reject(new Error('x'.repeat(2_049))),
     ));
 
     const evidence = await handle.snapshot();
     expect(evidence.requests[0]?.headers).toEqual({ status: 'FAILED', errorText: ERROR_MESSAGE_FALLBACK });
     expect(evidence.responses[0]?.headers).toEqual({
       status: 'FAILED',
-      errorText: 'x'.repeat(MAX_ERROR_MESSAGE_LENGTH),
+      errorText: 'x'.repeat(2_049),
     });
   });
-  it('bounds the number of recorded requests and counts omitted requests, responses, and failures', async () => {
+  it('L2: the snapshot waits for headers while the browser responds, and records unreturned headers as failed only after the quiet limit', async () => {
+    vi.useFakeTimers();
+    try {
+      const page = new FakePage();
+      const quietLimitMs = 5_000;
+      const handle = NetworkCollector.attach(page as unknown as Page, { watch: { quietLimitMs } });
+      const slow = fakeRequest({
+        url: 'https://fixture.test/slow',
+        allHeaders: () => new Promise((resolve) => {
+          setTimeout(() => resolve({ accept: 'text/html' }), quietLimitMs - 1_000);
+        }),
+      });
+      const hung = fakeRequest({ url: 'https://fixture.test/hung', allHeaders: () => new Promise(() => undefined) });
+      page.emit('request', slow);
+      page.emit('request', hung);
+
+      let settled = false;
+      const pending = handle.snapshot().finally(() => {
+        settled = true;
+      });
+      // 遅い header が返った（進んだ）時刻から、反応なしの長さを数える。
+      await vi.advanceTimersByTimeAsync(quietLimitMs - 1_000 + quietLimitMs - 1);
+      expect(settled).toBe(false);
+      await vi.advanceTimersByTimeAsync(1);
+
+      const evidence = await pending;
+      expect(evidence.requests.map((request) => request.headers.status)).toEqual(['OBSERVED', 'FAILED']);
+      expect(evidence.requests[0]?.headers).toEqual({ status: 'OBSERVED', values: { accept: 'text/html' } });
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it('L2: records every request, response, and failure beyond the former limit and omits none', async () => {
     const page = new FakePage();
     const handle = NetworkCollector.attach(page as unknown as Page);
     const extra = 5;
@@ -479,60 +509,34 @@ describe('NetworkCollector', () => {
     page.emit('requestfailed', lateFailure);
 
     const evidence = await handle.snapshot();
-    expect(evidence.requests).toHaveLength(MAX_NETWORK_REQUESTS);
-    expect(evidence.responses).toHaveLength(MAX_NETWORK_REQUESTS);
-    expect(evidence.requests.at(-1)?.url).toBe(`https://fixture.test/item/${MAX_NETWORK_REQUESTS - 1}`);
-    expect(evidence.failures).toEqual([]);
-    expect(evidence.omittedRequestCount).toBe(extra + 1);
-    expect(evidence.omittedResponseCount).toBe(extra);
-    expect(evidence.omittedFailureCount).toBe(1);
+    expect(evidence.requests).toHaveLength(MAX_NETWORK_REQUESTS + extra + 1);
+    expect(evidence.responses).toHaveLength(MAX_NETWORK_REQUESTS + extra);
+    expect(evidence.requests.at(-2)?.url).toBe(`https://fixture.test/item/${MAX_NETWORK_REQUESTS + extra - 1}`);
+    expect(evidence.failures.map((failure) => failure.url)).toEqual(['https://fixture.test/late-failure']);
+    expect(evidence.omittedRequestCount).toBe(0);
+    expect(evidence.omittedResponseCount).toBe(0);
+    expect(evidence.omittedFailureCount).toBe(0);
   });
 
-  it('bounds URLs, header values, and failure text and marks each truncated record', async () => {
+  it('keeps whole URLs, header values, methods and failure text (LZ-2)', async () => {
     const page = new FakePage();
     const handle = NetworkCollector.attach(page as unknown as Page);
-    const longUrl = `https://fixture.test/${'u'.repeat(MAX_URL_LENGTH)}`;
-    const request = fakeRequest({
-      url: longUrl,
-      allHeaders: async () => ({ 'x-request-id': 'v'.repeat(MAX_HEADER_VALUE_LENGTH + 10) }),
-    });
-    const failed = fakeRequest({
-      url: 'https://fixture.test/failed.js',
-      resourceType: 'script',
-      failure: 'e'.repeat(MAX_ERROR_MESSAGE_LENGTH + 10),
-    });
-    const small = fakeRequest({ url: 'https://fixture.test/small' });
+    const longUrl = `https://fixture.test/${'u'.repeat(2_049)}`;
+    const requestHeader = 'v'.repeat(2_049);
+    const responseHeader = 'r'.repeat(2_049);
+    const failureText = 'e'.repeat(2_049);
+    const request = fakeRequest({ url: longUrl, allHeaders: async () => ({ 'x-request-id': requestHeader }) });
+    const failed = fakeRequest({ url: 'https://fixture.test/failed.js', resourceType: 'script', failure: failureText });
 
     page.emit('request', request);
-    page.emit('response', fakeResponse(
-      request,
-      200,
-      {},
-      async () => ({ 'x-request-id': 'r'.repeat(MAX_HEADER_VALUE_LENGTH + 10) }),
-    ));
+    page.emit('response', fakeResponse(request, 200, {}, async () => ({ 'x-request-id': responseHeader })));
     page.emit('request', failed);
     page.emit('requestfailed', failed);
-    page.emit('request', small);
-    page.emit('response', fakeResponse(small, 200, {}));
 
     const evidence = await handle.snapshot();
-    expect(evidence.requests[0]?.url).toBe(longUrl.slice(0, MAX_URL_LENGTH));
-    expect(evidence.requests[0]?.headers).toEqual({
-      status: 'OBSERVED',
-      values: { 'x-request-id': 'v'.repeat(MAX_HEADER_VALUE_LENGTH) },
-    });
-    expect(evidence.requests[0]?.truncated).toBe(true);
-    expect(evidence.responses[0]?.url).toBe(longUrl.slice(0, MAX_URL_LENGTH));
-    expect(evidence.responses[0]?.headers).toEqual({
-      status: 'OBSERVED',
-      values: { 'x-request-id': 'r'.repeat(MAX_HEADER_VALUE_LENGTH) },
-    });
-    expect(evidence.responses[0]?.truncated).toBe(true);
-    expect(evidence.failures[0]?.errorText).toBe('e'.repeat(MAX_ERROR_MESSAGE_LENGTH));
-    expect(evidence.failures[0]?.truncated).toBe(true);
-    expect(evidence.requests[1]?.truncated).toBe(false);
-    expect(evidence.requests[2]?.truncated).toBe(false);
-    expect(evidence.responses[1]?.truncated).toBe(false);
+    expect(evidence.requests[0]).toMatchObject({ url: longUrl, headers: { status: 'OBSERVED', values: { 'x-request-id': requestHeader } }, truncated: false });
+    expect(evidence.responses[0]).toMatchObject({ url: longUrl, headers: { status: 'OBSERVED', values: { 'x-request-id': responseHeader } }, truncated: false });
+    expect(evidence.failures[0]).toMatchObject({ errorText: failureText, truncated: false });
   });
 
   it('marks main-frame and navigation requests so subframe documents are distinguishable', async () => {
@@ -642,5 +646,32 @@ describe('NetworkCollector', () => {
       { status: 'FAILED', errorText: expect.stringContaining('size') },
     ]);
     expect(Object.isFrozen(evidence.responses[0]?.transferSize)).toBe(true);
+  });
+
+  // 設計者の判断（2026-11-10）: データの要求の今の数に、口（メソッドと Origin と path。query は見ない）ごとの事実を足す。落ち着きの判定（`page-settling.ts`）が、
+  // 一度応答を返し終えた口へのくり返しを「データが届いた後のくり返し」として扱うため。
+  // DEF-245 の B・D の直し: 画面の形を変える部品（画像など）の読み込みも、データの要求と同じく口ごとに数える。
+  it('reports the endpoints of the data and resource requests in flight and the endpoints whose response has finished', () => {
+    const page = new FakePage();
+    const handle = NetworkCollector.attach(page as unknown as Page);
+    const first = fakeRequest({ url: 'https://fixture.test/api/poll?i=1', resourceType: 'fetch' });
+    const second = fakeRequest({ url: 'https://fixture.test/api/poll?i=2', resourceType: 'fetch' });
+    const list = fakeRequest({ url: 'https://fixture.test/api/list', resourceType: 'xhr', method: 'POST' });
+    const image = fakeRequest({ url: 'https://fixture.test/a.png', resourceType: 'image' });
+    page.emit('request', first);
+    page.emit('requestfinished', first);
+    page.emit('request', second);
+    page.emit('request', list);
+    page.emit('request', image);
+    const poll = JSON.stringify(['GET', 'https://fixture.test', '/api/poll']);
+    expect(handle.dataRequestActivity()).toEqual({
+      inFlight: 3,
+      events: 5,
+      endpoints: {
+        inFlight: [poll, JSON.stringify(['POST', 'https://fixture.test', '/api/list']), JSON.stringify(['GET', 'https://fixture.test', '/a.png'])],
+        completed: [poll],
+      },
+    });
+    handle.detach();
   });
 });

@@ -79,6 +79,10 @@ describe('T35a: the optional items of run.json for the script login audit', () =
       'AUDIT_SEND_OVER_LIMIT',
       // T44R の I-1。
       'PAGE_LEAVE_REQUEST_LIMIT_REACHED',
+      // DEF-210: 通知の枠の閉じる押下の期間の決まりで止めた。
+      'NOTIFICATION_DISMISSAL_RESTRICTED',
+      // REV-EV4: 横にスクロールする領域のキーの押下の期間の決まりで止めた。
+      'SCROLL_KEY_PRESS_RESTRICTED',
     ]);
     expect(INCOMPLETE_REASON_DESCRIPTIONS.SERVICE_REQUEST_LIMIT_REACHED.length).toBeGreaterThan(0);
     expect(Object.keys(BLOCKED_REQUEST_REASON_DESCRIPTIONS)).toEqual([...BLOCKED_REQUEST_REASONS]);

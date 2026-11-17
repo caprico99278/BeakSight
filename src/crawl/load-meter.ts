@@ -28,6 +28,12 @@ export interface LoadMeter {
   /** 要求が失敗した（`requestfailed`）。`errorText` は失敗の理由（`request.failure()?.errorText`。なければ `null`）。 */
   recordRequestFailed(request: object, url: string, errorText: string | null): void;
   /**
+   * DEF-241: 要求の応答を受けた（`response`）。ページが本文を読まない要求（`fetch(...).catch(...)`・`if (!response.ok) return;` など）には、Chromium が
+   * `requestfinished`・`requestfailed` を出さず、`response` だけが出るので、ここでも数える（Guard の有無によらない。DEF-245 の調べで、素の Playwright でも
+   * 同じと確かめた）。同じ要求は、応答・終わり・失敗のどれが先でも 1 回だけ数える。
+   */
+  recordResponseReceived(request: object, url: string): void;
+  /**
    * `request` を、Run 全体のキャッシュから返した要求として印を付け、`servedFromCache` を1増やす（リソースの届け方の部品が、
    * 返す前に呼ぶ）。印の付いた要求は、その後の終わりの事象で数えない。同じ要求に2回付けても、1回と数える。
    */
@@ -136,10 +142,13 @@ export function createLoadMeter(options: LoadMeterOptions): RunLoadMeter {
     return lastEndTimeMs === null ? value : Math.max(value, lastEndTimeMs);
   };
 
+  // DEF-241: 数えた要求（応答・終わり・失敗のどれかで 1 回だけ数える）。
+  const counted = new WeakSet<object>();
   const count = (request: object, url: string): void => {
-    if (servedFromRunCache.has(request)) {
+    if (servedFromRunCache.has(request) || counted.has(request)) {
       return;
     }
+    counted.add(request);
     const endTimeMs = currentTimeMs();
     lastEndTimeMs = endTimeMs;
     const isAllowed = hasAllowedOrigin(url, canonicalAllowedOrigins);
@@ -152,6 +161,9 @@ export function createLoadMeter(options: LoadMeterOptions): RunLoadMeter {
 
   return Object.freeze({
     recordRequestFinished(request: object, url: string): void {
+      count(request, url);
+    },
+    recordResponseReceived(request: object, url: string): void {
       count(request, url);
     },
     recordRequestFailed(request: object, url: string, errorText: string | null): void {

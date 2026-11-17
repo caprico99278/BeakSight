@@ -44,11 +44,24 @@ export interface FindingDraft {
 }
 
 /**
+ * OP-R2（PL 設計書 14 章。UI の SSOT の決まり「Finding の文言は Rule が持つ」）: Rule の定義が持つ、結果の報告の本文に出すやさしい文。page rule（`AuditRule`）と
+ * Cross-page rule（`CrossPageRule`）の両方が持つ（必須なので、書き漏れは型のエラーになる）。
+ * - 持ち主は Rule の定義の 1 か所。表示のカタログには置かない。Finding（`findings.json`）には入れない（`message` は今のまま）。
+ * - 文の決まり: 技術の語（タグ・属性の名前、HTTP の番号、Origin、URL など）を使わない。利用者や見る人にとって何が困るかが分かる 1〜2 文。
+ * - 評価のたびに ruleId を作る Rule（`ruleIdPrefix` を持つもの）は、その群の種類（category）の文を 1 つ持つ。
+ * - 値は差し込まない: Finding が持つ値はページの住所とビューポートだけで、どちらも報告の別の欄に出る（判定のときの値は Finding に残らない）。
+ * 報告は `rulePlainMessageOf`（`./cross-page-rules.ts`）で、Finding の ruleId から引く。
+ */
+export interface RulePlainMessageOwner {
+  readonly plainMessage: string;
+}
+
+/**
  * page rule の契約。登録は `RULE_CATALOG`（`src/audit/rule-catalog.ts`）だけで行う。
  * ruleId の決まり（設計書 第6章）: `ruleIdPrefix` を持たない Rule の下書きは、ruleId が `ruleId` と一致すること。
  * `ruleIdPrefix` を持つ Rule の下書きは、ruleId がその接頭辞で始まり、かつ接頭辞より長いこと。反した場合は、その Rule の失敗になる。
  */
-export interface AuditRule {
+export interface AuditRule extends RulePlainMessageOwner {
   readonly ruleId: string;
   /**
    * 評価のたびに ruleId を作る Rule（例: axe の結果を対応づける Rule）が持つ、下書きの ruleId の接頭辞。空でない文字列。

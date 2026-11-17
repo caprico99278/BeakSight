@@ -41,6 +41,9 @@ describe('T43c: the landing location', () => {
     expect(entryCheckLocationOf(`${ORIGIN}/auth?next=/admin#x`, ALLOWED)).toEqual({ origin: ORIGIN, path: '/auth', inAllowedOrigins: true });
     expect(entryCheckLocationOf(`${ORIGIN}/invite/0123456789abcdef0123456789abcdef/login`, ALLOWED))
       .toEqual({ origin: ORIGIN, path: `/invite/${REDACTED_PATH_SEGMENT}/login`, inAllowedOrigins: true });
+    // URL-LEN: 前の上限（2,048）より長い path も残す（前は null にした）。
+    const longPath = `/${'p'.repeat(2_049)}`;
+    expect(entryCheckLocationOf(`${ORIGIN}${longPath}`, ALLOWED)).toEqual({ origin: ORIGIN, path: longPath, inAllowedOrigins: true });
   });
 
   it('keeps only the origin outside the allowed origins', () => {
@@ -129,11 +132,12 @@ describe('T43c: the end reasons, the run status and the summary', () => {
     });
   });
 
-  it('accepts only the selectors that the auth setup accepts (standard CSS, no control character, within the length)', () => {
+  it('accepts only the selectors that the auth setup accepts (standard CSS, no control character, any length)', () => {
     expect(isAcceptedEntrySelector('#email')).toBe(true);
     expect(isAcceptedEntrySelector('input[name="a>>b"]')).toBe(false);
     expect(isAcceptedEntrySelector('#a\u0001')).toBe(false);
-    expect(isAcceptedEntrySelector(`#${'a'.repeat(300)}`)).toBe(false);
+    // LZ-2: 長さの上限（前は 256）は置かない。
+    expect(isAcceptedEntrySelector(`#${'a'.repeat(300)}`)).toBe(true);
     expect(isAcceptedEntrySelector('   ')).toBe(false);
   });
 

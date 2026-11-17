@@ -15,9 +15,7 @@ import {
   AUTH_SETUP_VALIDATION_ERROR_CODES,
   AUTOMATED_LOGIN_FAILURE_CONDITION_KINDS,
   AUTOMATED_LOGIN_MAX_LOGIN_ATTEMPTS,
-  MAX_AUTH_SETUP_URL_LENGTH,
   MAX_LOGIN_ATTEMPTS,
-  MAX_SUCCESS_SELECTOR_LENGTH,
   MIN_LOGIN_ATTEMPTS,
   type AuthSetup,
   type AuthSetupValidationErrorCode,
@@ -155,9 +153,10 @@ describe('T26b: the automated login in the auth setup contract and its schema', 
 
   // LG-3b（O2）: 版 1・版 2 のスキーマの確かめは捨てた。上限の一致は `control-auth-setup.test.ts` の 1 か所（重なりを捨てた）。
   // `sessionLostCondition.pathPrefix` と `successCondition.pathPrefix` の上限は、そこで確かめていなかったので、ここに残す。
-  it('uses the named constants as the limits of the condition paths in the schema', () => {
-    expect(propertiesOf(properties.successCondition).pathPrefix?.maxLength).toBe(MAX_AUTH_SETUP_URL_LENGTH);
-    expect(propertiesOf(properties.sessionLostCondition).pathPrefix?.maxLength).toBe(MAX_AUTH_SETUP_URL_LENGTH);
+  // URL-LEN: 条件の path の長さの上限（前は 2,048）はない。
+  it('has no length limit of the condition paths in the schema', () => {
+    expect(propertiesOf(properties.successCondition).pathPrefix?.maxLength).toBeUndefined();
+    expect(propertiesOf(properties.sessionLostCondition).pathPrefix?.maxLength).toBeUndefined();
   });
 
   it('defines automatedLogin as null or the three selectors and the closed list of the failure conditions', () => {
@@ -168,7 +167,7 @@ describe('T26b: the automated login in the auth setup contract and its schema', 
     const automatedProperties = propertiesOf(automated);
     for (const name of ['usernameSelector', 'passwordSelector', 'submitSelector']) {
       expect(automatedProperties[name]?.type).toBe('string');
-      expect(automatedProperties[name]?.maxLength).toBe(MAX_SUCCESS_SELECTOR_LENGTH);
+      expect(automatedProperties[name]?.maxLength).toBeUndefined();
     }
     const failure = resolved(automatedProperties.failureConditions);
     expect(failure.additionalProperties).toBe(false);
@@ -180,8 +179,8 @@ describe('T26b: the automated login in the auth setup contract and its schema', 
       expect(condition.type).toEqual(['object', 'null']);
       expect(condition.additionalProperties).toBe(false);
       expect(condition.required).toEqual(['pathPrefix', 'selector']);
-      expect(propertiesOf(condition).pathPrefix?.maxLength).toBe(MAX_AUTH_SETUP_URL_LENGTH);
-      expect(propertiesOf(condition).selector?.maxLength).toBe(MAX_SUCCESS_SELECTOR_LENGTH);
+      expect(propertiesOf(condition).pathPrefix?.maxLength).toBeUndefined();
+      expect(propertiesOf(condition).selector?.maxLength).toBeUndefined();
     }
   });
 
@@ -231,10 +230,14 @@ describe('T26b: validateAuthSetup accepts the automated login', () => {
     ['a failure condition on the login page path (the success path does not match it)', withFailureConditions({
       invalidCredentials: { pathPrefix: '/admin/login', selector: null },
     })],
-    ['selectors of the longest length', withAutomatedLogin({
-      usernameSelector: `#${'u'.repeat(MAX_SUCCESS_SELECTOR_LENGTH - 1)}`,
-      passwordSelector: `#${'p'.repeat(MAX_SUCCESS_SELECTOR_LENGTH - 1)}`,
-      submitSelector: `#${'s'.repeat(MAX_SUCCESS_SELECTOR_LENGTH - 1)}`,
+    // LZ-2: セレクタの長さの上限（前は 256）は撤廃した。
+    ['selectors longer than the former limit', withAutomatedLogin({
+      usernameSelector: `#${'u'.repeat(256)}`,
+      passwordSelector: `#${'p'.repeat(256)}`,
+      submitSelector: `#${'s'.repeat(256)}`,
+    })],
+    ['a failure selector longer than the former limit', withFailureConditions({
+      accountLocked: { pathPrefix: '/admin/locked', selector: `#${'a'.repeat(256)}` },
     })],
   ])('accepts %s', (_name, input) => {
     const result = validate(input);
@@ -400,18 +403,6 @@ describe('T26b: validateAuthSetup rejects the automated login rule violations wi
       successCondition: { pathPrefix: '/admin/dashboard', selector: null },
     };
     expect(codesOf(validate(input))).toEqual(['AUTH_SETUP_RESULT_CONDITION_AMBIGUOUS']);
-  });
-
-  it.each([
-    ['a too long user name selector', withAutomatedLogin({ usernameSelector: `#${'a'.repeat(MAX_SUCCESS_SELECTOR_LENGTH)}` })],
-    ['a too long password selector', withAutomatedLogin({ passwordSelector: `#${'a'.repeat(MAX_SUCCESS_SELECTOR_LENGTH)}` })],
-    ['a too long submit selector', withAutomatedLogin({ submitSelector: `#${'a'.repeat(MAX_SUCCESS_SELECTOR_LENGTH)}` })],
-    ['a too long failure path', withFailureConditions({ accountLocked: { pathPrefix: `/${'a'.repeat(MAX_AUTH_SETUP_URL_LENGTH)}`, selector: null } })],
-    ['a too long failure selector', withFailureConditions({
-      accountLocked: { pathPrefix: '/admin/locked', selector: `#${'a'.repeat(MAX_SUCCESS_SELECTOR_LENGTH)}` },
-    })],
-  ])('rejects %s with AUTH_SETUP_LIMIT_EXCEEDED before the schema', (_name, input) => {
-    expect(codesOf(validate(input))).toEqual(['AUTH_SETUP_LIMIT_EXCEEDED']);
   });
 
   it('uses only the codes in the closed list, and puts no selector or path into the error details', () => {

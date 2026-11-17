@@ -1,5 +1,4 @@
-// CC-095（T36c）: ワーカーの fork のテスト（スクリプトで送るログインの手動のログイン `script-login-worker-fork`、SPA の監査 `spa-audit-worker-fork`、
-// スクリプトで送るログインの自動ログイン `automated-script-login-fork`）の共通の補助（テストのファイルではない）。テストのファイルに書き写さない。
+// CC-095（T36c）: ワーカーの fork のテスト（本物のワーカーを子の process で起こす結合と、`write-job-harness.ts`）の共通の補助（テストのファイルではない）。テストのファイルに書き写さない。
 // - 標準入力の資格情報の準備（テストだけの入口の `prelude` と `credentialsExpression`）。
 // - process とその子孫（Chromium）の一覧（`processTreeOf`）と、状態を待つ（`waitForValue`）。
 // - fork のテストのプロファイル（版の決まった欄を埋める `createForkTestProfile`）。
@@ -13,6 +12,7 @@ import { MIN_PROFILE_REVISION, SITE_PROFILE_SCHEMA_VERSION, type AuthStrategy } 
 import type { AuditWorkerForker } from '../../src/control/job/audit-job-manager.js';
 import type { ControlDatabase } from '../../src/control/store/control-database.js';
 import { createProfile, saveProfileDisplaySettings } from '../../src/control/store/profile-store.js';
+import { AUDIT_SEND_READ_ONLY } from '../../src/core/audit-send-policy.js';
 import type { RunSummary } from '../../src/core/contracts.js';
 import { filesUnder, ZIP_ENTRY_PLACE_SEPARATOR, type LeakPlace } from './leak-places.js';
 import { descendantsOf, listProcesses, type ProcessIdentity } from './process-tree.js';
@@ -139,9 +139,13 @@ export const createForkTestProfile = (
   return created;
 };
 
-/** FM-2: テストのプロファイルの表示の設定を切る（テストのジョブのブラウザは今どおり headless。既定は表示）。 */
+/**
+ * FM-2: テストのプロファイルの表示の設定を切る（テストのジョブのブラウザは今どおり headless。既定は表示）。
+ * OP-I（I1）: サイトの既定の送信の扱いが `PASS_EXCEPT_DELETE` になったので、これを使うテスト（どれもプロファイルを作った直後に呼ぶ）は、今までどおり
+ * 読み取りだけ（人が詳しい内容で選んだ形）で動かす。通す側のテストは、扱いを渡して保存する（`audit-send-worker-fork.test.ts` など）。
+ */
 export const hideJobBrowser = (database: ControlDatabase, profileId: string): void => {
-  const saved = saveProfileDisplaySettings(database, profileId, { showJobBrowser: false });
+  const saved = saveProfileDisplaySettings(database, profileId, { showJobBrowser: false, auditSendPolicy: AUDIT_SEND_READ_ONLY });
   if (!saved.ok) {
     throw new Error(`the display setting of the test profile could not be saved (${saved.reason})`);
   }

@@ -9,9 +9,9 @@ import {
 } from '../../src/browser/chromium-launch.js';
 import { SERVICE_WORKER_REGISTRATION_BLOCK_INIT_SCRIPT } from '../../src/safety/passive-request-guard.js';
 import { BROWSER_DEFAULT_FAVICON_PATH as BROWSER_DEFAULT_FAVICON_PATH_VALUE } from '../../src/safety/request-policy.js';
-import { browserWithoutInitScript } from './browser-proxies.js';
-import { TEST_DEFAULT_CHROMIUM_ARGS } from './test-chromium-args.js';
-import { CLI_CHROMIUM_SELECTION, TEST_DEFAULT_CHROMIUM_ENVIRONMENT_VARIABLE } from './test-run-environment.js';
+import { browserSharedForRun, browserWithoutInitScript } from './browser-proxies.js';
+import { TEST_DEFAULT_CHROMIUM_ARGS, withTestOnlyNoInternetArgs } from './test-chromium-args.js';
+import { CLI_CHROMIUM_SELECTION, isBothChromiumSelected, TEST_DEFAULT_CHROMIUM_ENVIRONMENT_VARIABLE } from './test-run-environment.js';
 
 /**
  * 別のサイトの iframe を別のプロセス（OOPIF）にする、Chromium の起動の引数（C18i。サイトの分離を強める側の引数）。
@@ -81,8 +81,7 @@ function withSharedWorkerArgs(args: readonly string[], sharedWorkers: TestShared
 /**
  * headless の Chromium（テストの既定の headless shell）を起動する。テストの Chromium は、いつも headless で起動する
  * （headed では、端末の外部のアプリ（電話、メールなど）が実際に起動するおそれがあるため）。Shared Worker は、既定で無効にする（DEF-044）。
- * DEF-124: CLI と同じく、WebRTC の中継を通らない UDP を止める引数（`CHROMIUM_WEBRTC_NON_PROXIED_UDP_DISABLED_ARGS`）も付ける（headless shell では、
- * その 1 つ目の switch が効く）。既定の引数は `TEST_DEFAULT_CHROMIUM_ARGS`（`test-chromium-args.ts`。CC-098）。
+ * 既定の引数は `TEST_DEFAULT_CHROMIUM_ARGS`（`test-chromium-args.ts`。CC-098）。
  */
 export function launchHeadlessChromium(options: HeadlessChromiumOptions = {}): Promise<Browser> {
   if (isCliChromiumSelected()) {
@@ -129,7 +128,8 @@ function cliLaunchOptionsOf(options: CliChromiumOptions): LaunchOptions {
   const launchOptions = chromiumLaunchOptions({ headless: true });
   return {
     ...launchOptions,
-    args: withSharedWorkerArgs([...(launchOptions.args ?? []), ...(options.args ?? [])], options.sharedWorkers),
+    // RB-4b: テストは外のインターネットへ出さないので、テストだけの引数で Chromium 自身の Google への接続を止める（`withTestOnlyNoInternetArgs`）。
+    args: withSharedWorkerArgs([...withTestOnlyNoInternetArgs(launchOptions.args ?? []), ...(options.args ?? [])], options.sharedWorkers),
   };
 }
 
@@ -154,6 +154,50 @@ async function launchCliChromiumWith(options: CliChromiumOptions, dependencies: 
 export function launchCliChromium(options: CliChromiumOptions = {}): Promise<Browser> {
   return launchCliChromiumWith(options, PRODUCTION_CHROMIUM_LAUNCH_DEPENDENCIES);
 }
+
+/**
+ * `BOTH_CHROMIUM_LAUNCHERS` の 1 つの起動（指定は、既定の Chromium と CLI の Chromium の両方が受ける形）。製品の起動の口（`{ headless }` を渡す）に
+ * そのまま渡せるよう `headless` も受けるが、テストの Chromium はいつも headless なので読まない。
+ */
+export type BothChromiumLauncher = (
+  options?: HeadlessChromiumOptions & CliChromiumOptions & { readonly headless?: boolean },
+) => Promise<Browser>;
+
+/**
+ * SLIM-B0: 2 つの Chromium の組（`[テストの既定の Chromium の回, CLI の起動の設定の回]`）のうち、この回で流すもの（唯一の入口）。既定は CLI の起動の設定
+ * （本番）の 1 つだけ。両方に広げるのは、`test-run-environment.ts` の `BOTH_CHROMIUM_RUN_ENVIRONMENT` の回（`tests/run-suite.mjs` の `safety`、
+ * `related --with-safety`・`--both-chromium`。安全の不具合を直す束、Guard・中継・起動の部品を変えた束、Chromium の版を上げるとき）だけ。
+ * ファイルの中で 2 つの Chromium の組を作るテストは、組の一覧（`describe.each` に渡す一覧、子のプロセスの入口に埋める起動の組など）を、ここに通して
+ * 受け取る（Architecture Gate `tests/architecture/test-suites.test.ts`）。1 回だけ流す場面は、受け取った一覧の先頭の回で流す。
+ */
+export function chromiumRunsOf<const L extends readonly [unknown, unknown]>(runs: L): readonly L[number][] {
+  return isBothChromiumSelected() ? Object.freeze([runs[0], runs[1]]) : Object.freeze([runs[1]]);
+}
+
+/** SLIM-B0: `BOTH_CHROMIUM_LAUNCHERS` の、CLI の起動の設定の回の名前（回の Chromium で場面を分けるテストが比べる）。 */
+export const CLI_CHROMIUM_RUN_LABEL = 'the CLI launch settings';
+
+/**
+ * TEST-SLIM H0: 2 つの Chromium（テストの既定の headless shell と、CLI の起動の設定）で同じ場面を流す組（`describe.each(BOTH_CHROMIUM_LAUNCHERS)`）。
+ * SLIM-B0: 組は `chromiumRunsOf` で選ぶ（既定は CLI の起動の設定の 1 つ、両方に広げる回だけ 2 つ）。
+ * TEST-POLICY の決まり 3: 使うのは、安全の漏れを確かめるテストだけ（`tests/suites.ts` の安全の一覧か `BOTH_CHROMIUM_LEAK_CHECK_FILES`。Architecture
+ * Gate `tests/architecture/test-suites.test.ts`）。ほかのテストは、既定の Chromium（`launchHeadlessChromium`）だけで流す。
+ */
+export const BOTH_CHROMIUM_LAUNCHERS: readonly (readonly [string, BothChromiumLauncher])[] = chromiumRunsOf([
+  Object.freeze(['the default test Chromium', (options = {}) => launchTestDefaultChromium(options)] as const),
+  Object.freeze([CLI_CHROMIUM_RUN_LABEL, (options = {}) => launchCliChromium(options)] as const),
+]);
+
+/** SLIM-B0: 1 回だけ流す場面の回の名前（`BOTH_CHROMIUM_LAUNCHERS` の先頭。両方に広げる回はテストの既定の Chromium、ほかは CLI の起動の設定）。 */
+export const ONCE_CHROMIUM_LABEL: string = BOTH_CHROMIUM_LAUNCHERS[0]?.[0] ?? '';
+
+/**
+ * TEST-SLIM W2: 既定の Chromium（`launchHeadlessChromium`）だけで流す組。前に `describe.each` で 2 つの Chromium を流していたテストが、
+ * 場面の形（名前と起動の組）を変えずに使う。CLI の回（`CLI_CHROMIUM_RUN_ENVIRONMENT`）では、`launchHeadlessChromium` が CLI の Chromium になる。
+ */
+export const DEFAULT_CHROMIUM_LAUNCHERS: readonly (readonly [string, BothChromiumLauncher])[] = Object.freeze([
+  Object.freeze(['the default test Chromium', (options = {}) => launchHeadlessChromium(options)] as const),
+]);
 
 /**
  * EL-12: 自己検査の不合格を確かめるテストだけの起動。CLI の起動の組と同じ値で、一時のプロファイルに Preferences を置かずに起動の部品を通す（起動の部品は
@@ -195,6 +239,28 @@ export function useHeadlessChromium(onLaunch: (browser: Browser) => void, option
     await launched?.close();
     launched = undefined;
   });
+}
+
+/**
+ * SLIM-2（X7）: 同じ process の中の流れ（`executeWriteCreateRun`・`executeDiscoveryRun`・`executeReadCheckRun` など）を何度も動かすテストが、流れごとに
+ * Chromium を起こし直さないための起動の関数。呼ばれた describe の中で、最初の流れが `launch` で 1 回だけ本物を起こし（切れていたら起こし直す）、流れには
+ * `browserSharedForRun` の Proxy を返す（流れの終わりの `close()` は、その流れの Context だけを閉じる）。`afterAll` で本物を閉じる。describe の直下で呼ぶ。
+ */
+export function useSharedRunBrowser(launch: () => Promise<Browser>): () => Promise<Browser> {
+  let shared: Promise<Browser> | undefined;
+  afterAll(async () => {
+    const launched = shared;
+    shared = undefined;
+    await (await launched?.catch(() => undefined))?.close().catch(() => undefined);
+  });
+  return async () => {
+    let real = shared === undefined ? undefined : await shared.catch(() => undefined);
+    if (real === undefined || !real.isConnected()) {
+      shared = launch();
+      real = await shared;
+    }
+    return browserSharedForRun(real);
+  };
 }
 
 /**

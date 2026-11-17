@@ -17,7 +17,7 @@
     "endReason": {
       "enum": ["COMPLETED", "MAX_RUNTIME_REACHED", "STOPPED", "AUTH_SESSION_LOST", "SERVICE_REQUEST_LIMIT_REACHED", "SITE_UNAVAILABLE", "SAFETY_VIOLATION", "PREFLIGHT_FAILED"]
     },
-    "checks": { "type": "array", "maxItems": 20, "items": { "$ref": "#/$defs/check" } },
+    "checks": { "type": "array", "items": { "$ref": "#/$defs/check" } },
     "endReasonDetail": {
       "description": "Optional (T37a; Task 37 design 3.1): the detail of the end (the same list as discovery.json). Absent otherwise.",
       "$ref": "urn:beaksight:schema:discovery:1.0#/properties/endReasonDetail"
@@ -112,18 +112,21 @@
             "HTTP_ERROR_STATUS",
             "RESULT_PAGE_UNREADABLE",
             "SESSION_LOST",
+            "RECORD_ID_NOT_AVAILABLE",
+            "STAGE_UNRESPONSIVE",
+            "STAGE_NEVER_QUIET",
             "SERVICE_READ_REFUSED",
             "AUDIT_STAGE_REQUEST_BLOCKED"
           ]
         },
-        "url": { "anyOf": [{ "type": "string", "minLength": 1, "maxLength": 2048 }, { "type": "null" }] },
+        "url": { "anyOf": [{ "type": "string", "minLength": 1 }, { "type": "null" }] },
         "httpStatus": {
           "description": "DEF-164: the observed HTTP status of the READ URL (the range OBSERVABLE_HTTP_STATUS_RANGE of src/core/http-status.ts; a status of 600 or more is kept and judged as an error).",
           "anyOf": [{ "type": "integer", "minimum": 100, "maximum": 999 }, { "type": "null" }]
         },
         "blockedRequests": { "$ref": "#/$defs/count" },
         "structure": { "anyOf": [{ "$ref": "#/$defs/structure" }, { "type": "null" }] },
-        "expectations": { "type": "array", "maxItems": 10, "items": { "$ref": "#/$defs/expectationEvidence" } },
+        "expectations": { "type": "array", "items": { "$ref": "#/$defs/expectationEvidence" } },
         "documentRequests": {
           "description": "Optional (DEF-129): the main frame document requests that the Guard sent when the READ URL was loaded (the load of BeakSight, the redirects and the loads started by the page).",
           "$ref": "#/$defs/count"
@@ -135,7 +138,31 @@
         "subresourceRequests": {
           "description": "Optional (DEF-130-fix): the requests other than documents (images, fetch, xhr and so on) that the Guard sent when the READ URL was loaded (a separate count).",
           "$ref": "#/$defs/count"
+        },
+        "records": {
+          "description": "Optional (DEF-235): the results of each record id filled into a page path template, in the read order (no item limit: the coverage is not cut by a count). The fields of the check above are the representative one (the first NOT_MATCHED, else the first that is not MATCHED, else the first).",
+          "type": "array",
+          "minItems": 1,
+          "items": { "$ref": "#/$defs/recordEvidence" }
         }
+      }
+    },
+    "recordEvidence": {
+      "description": "DEF-235: one read of a page path template with a record id (the record id is in the URL).",
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["result", "detail", "url", "httpStatus", "blockedRequests", "structure", "expectations"],
+      "properties": {
+        "result": { "$ref": "#/$defs/executed/properties/result" },
+        "detail": { "$ref": "#/$defs/executed/properties/detail" },
+        "url": { "$ref": "#/$defs/executed/properties/url" },
+        "httpStatus": { "$ref": "#/$defs/executed/properties/httpStatus" },
+        "blockedRequests": { "$ref": "#/$defs/count" },
+        "structure": { "$ref": "#/$defs/executed/properties/structure" },
+        "expectations": { "$ref": "#/$defs/executed/properties/expectations" },
+        "documentRequests": { "$ref": "#/$defs/count" },
+        "childFrameDocumentRequests": { "$ref": "#/$defs/count" },
+        "subresourceRequests": { "$ref": "#/$defs/count" }
       }
     },
     "notExecuted": {
@@ -160,9 +187,9 @@
       "properties": {
         "region": { "enum": ["MAIN", "BODY"] },
         "tables": { "$ref": "#/$defs/count" },
-        "tableRowCounts": { "type": "array", "maxItems": 50, "items": { "$ref": "#/$defs/count" } },
+        "tableRowCounts": { "type": "array", "items": { "$ref": "#/$defs/count" } },
         "lists": { "$ref": "#/$defs/count" },
-        "listItemCounts": { "type": "array", "maxItems": 50, "items": { "$ref": "#/$defs/count" } },
+        "listItemCounts": { "type": "array", "items": { "$ref": "#/$defs/count" } },
         "detailFields": { "$ref": "#/$defs/count" },
         "textLength": { "$ref": "#/$defs/count" },
         "limitReached": { "type": "boolean" },
@@ -208,7 +235,7 @@
         "expectation": { "$ref": "urn:beaksight:schema:control:read-check-definition:1#/$defs/detailFieldEquals" },
         "result": { "$ref": "#/$defs/expectationResult" },
         "undeterminedReason": { "$ref": "#/$defs/undeterminedReason" },
-        "observedValue": { "anyOf": [{ "type": "string", "maxLength": 256 }, { "type": "null" }] }
+        "observedValue": { "anyOf": [{ "type": "string" }, { "type": "null" }] }
       }
     }
   }

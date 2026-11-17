@@ -224,13 +224,18 @@ immutable AuditConfig
 | Run checkpoint content and resumption（再開のための保存の中身と、再開の判定） | `src/orchestration/run-checkpoint.ts` |
 | Run checkpoint session（保存、ロック、ハートビート） | `src/orchestration/run-checkpoint-session.ts` |
 | Site unavailability（サイトの不調とみなす読み込みの失敗の判定） | `src/orchestration/site-availability.ts` |
-| Navigation diagnostics（Passive のページ本体の要求の観察。診断のためだけ） | `src/browser/navigation-diagnostics.ts` |
+| Run page storage（Run の中のページの結果の置き場所と、メモリの中だけの圧縮の書式） | `src/core/run-page-store.ts` |
+| Browser port（ブラウザに頼む口の型・印・結果の形。判定は持たない） | `src/browser/port/browser-port.ts` |
 
 > 2026-10-01 追補: 表の最後の5行は、ユーザーの承認を得た追補設計書 `2026-10-01-beaksight-site-load-control-design.md`（第5章）と `2026-10-01-beaksight-resumable-run-design.md`（第5章）で加えた owner である。許可の判定（Passive HTTP authority）は、引き続き `request-policy.ts` だけが行い、届け方の部品は、許可された要求の届け方（ネットワーク、キャッシュから返す、送らない）を選ぶだけである。保存とロックのファイルの読み書きは、引き続き `artifact-writer.ts` だけが行う。
 
 > 2026-10-05 追補: 最後の行（Site unavailability）は、ユーザーの判断を反映した追補設計書 `2026-10-05-beaksight-site-unavailability-stop-design.md`（第2章、第4章）で加えた owner である。不調で止めた後の実行の終わり方と保存の終わり方は、引き続き `run-checkpoint.ts` だけが決める。
 
-> 2026-10-06 追補: Navigation diagnostics の行は、ユーザーの指示を反映した追補設計書 `2026-10-06-beaksight-site-unavailable-diagnostics-design.md`（第3章）で加えた owner である。観察だけで、判定も、監査の結果への記録もしない（診断のファイルにだけ書く）。
+> 2026-11-13 追補: 最後の行（Run page storage）は、追補設計書 `2026-11-13-beaksight-run-memory-scaling-design.md`（3 章の MEM-3。DEF-266）で加えた owner である。入れ物と圧縮の書式だけを持ち、ページの結果の中身の意味は、今の owner（Page Auditor・Rule・`artifact-writer.ts`）のままである。圧縮した本体はメモリの中だけに置き、ディスクと成果物に出さない。
+
+> 2026-11-15 追補: 最後の行（Browser port）は、追補設計書 `2026-11-15-beaksight-test-rebuild-design.md`（2 章の 1、3.1）で加えた owner である。本物は `src/browser/playwright/`（Playwright を import してよい唯一の所。Gate `playwright-import-allowlist`）、偽は `tests/helpers/fake-browser-port/`。止める・通すの判定の owner は `request-policy.ts` と Guard のまま。
+
+> 2026-10-06 追補: Navigation diagnostics の行は、ユーザーの指示を反映した追補設計書 `2026-10-06-beaksight-site-unavailable-diagnostics-design.md`（第3章）で加えた owner だった。2026-11-14 の SPEC-3（`2026-11-14-beaksight-slim-and-simplify-design.md` 5.1）で、観察の部品と診断のファイルをやめたので、行を消した。
 
 新しい実装で第二ownerが必要に見えた場合は、第二ownerを追加せず停止して設計上の問題として報告してください。
 

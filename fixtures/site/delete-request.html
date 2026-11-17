@@ -6,9 +6,10 @@
   </head>
   <body>
     <h1>Fixture Delete Request</h1>
-    <button type="button" id="send-delete">Send DELETE</button>
+    <button type="button" id="send-delete">Send request</button>
     <script>
       // ボタンを押すと DELETE を送る（Task 18 の S02）。Interaction 中は、サーバに届いてはいけない。
+      // SD-1: ボタンの名前に削除の語を書かない（削除の語のボタンは押す前の判定で押さないので、押した後の凍結を確かめられなくなる）。
       document.querySelector('#send-delete').addEventListener('click', () => {
         void fetch('/__mutation', { method: 'DELETE' }).catch(() => undefined);
       });

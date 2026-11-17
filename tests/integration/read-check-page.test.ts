@@ -1,10 +1,11 @@
 // T37d（Task 37 の設計書 3.5、6 章の 5。設計者の判断「止めた読み取りの数の扱い」）: 画面の path を対象にした READ と、判定できない読み込みの
-// `UNDETERMINED`。本物の factory と Guard。Chromium はテストの既定の headless と、CLI の起動の設定の両方。
+// `UNDETERMINED`。本物の factory と Guard。Chromium はテストの既定の headless（登録していない手続きの呼び出しを止める場面だけ、CLI の起動の設定でも）。
 // - データを後から API で描く SPA の画面（`startSpaAuthSite`）を、画面の path の定義で読む: 一覧の行の数と文字、詳細の項目が期待どおりなら `MATCHED`、
 //   違えば `NOT_MATCHED`。1 定義あたり読み込み 1 回。アプリの Origin への計測の送信（止める）は数えない。
-// - サービスの Origin の 401、上限で断った要求、承認したサービスの Origin への読み取りでない要求（登録していない手続きの呼び出し）を止めた画面は、
+// - サービスの Origin の 401、承認したサービスの Origin への読み取りでない要求（登録していない手続きの呼び出し）を止めた画面は、
 //   照らした結果に関係なく `UNDETERMINED`（`NOT_MATCHED` にならない）。
-// - 今の候補の READ（GET の form の候補）でも、READ の URL の読み込みで上限で断った要求か 401 があれば `UNDETERMINED`（自前の 127.0.0.1 のサーバ）。
+// - 今の候補の READ（GET の form の候補）でも、READ の URL の読み込みで 401 があれば `UNDETERMINED`（自前の 127.0.0.1 のサーバ）。
+// - L11（要求の上限の撤廃）は、`guard-audit-stage.test.ts` と単体 `service-request-budget.test.ts` で確かめる（TEST-SLIM M4 でここから外した）。
 // - サーバに届いた読み取りでない要求は、登録した読み取りの手続きの呼び出しのほかは 0（サーバの記録で数え、各ジョブの後に名前つきの時間だけ待って
 //   数え直す）。値は出力しない。
 import { readFileSync } from 'node:fs';
@@ -15,7 +16,6 @@ import { join } from 'node:path';
 import type { Browser } from 'playwright';
 import { afterAll, afterEach, beforeAll, describe, expect, it } from 'vitest';
 import { wait } from '../../src/core/deadline.js';
-import type { AuditStageServiceRequests } from '../../src/browser/context-factory.js';
 import type { AuditConfig } from '../../src/config/types.js';
 import { DEFAULT_EXCLUDED_URL_WORDS } from '../../src/core/default-excluded-url-words.js';
 import { filterAuthenticatedState } from '../../src/control/auth/authenticated-state.js';
@@ -28,7 +28,7 @@ import type { RunAuthentication } from '../../src/orchestration/authenticated-ru
 import { executeDiscoveryRun } from '../../src/worker/discovery-run.js';
 import { hasSuccessStorageKey } from '../../src/worker/login-stage-checks.js';
 import { executeReadCheckRun } from '../../src/worker/read-check-run.js';
-import { launchCliChromium, launchHeadlessChromium } from '../helpers/chromium.js';
+import { BOTH_CHROMIUM_LAUNCHERS, DEFAULT_CHROMIUM_LAUNCHERS } from '../helpers/chromium.js';
 import { READ_METHODS } from '../helpers/leak-places.js';
 import { startLoopbackHttpServer, type LoopbackHttpServer } from '../helpers/loopback-server.js';
 import { fastRunConfig } from '../helpers/run-harness.js';
@@ -44,17 +44,10 @@ import {
   type SpaAuthSiteOptions,
 } from '../helpers/spa-auth-site-fixture.js';
 
-const LAUNCHERS: readonly (readonly [string, () => Promise<Browser>])[] = [
-  ['the default test Chromium', () => launchHeadlessChromium()],
-  ['the CLI Chromium', () => launchCliChromium()],
-];
 const TEST_TIMEOUT_MS = 240_000;
 /** 各ジョブの後に、遅れて届く要求を待つ時間（ms）。 */
 const LATE_REQUEST_WAIT_MS = 1_000;
 const MAX_PAGES = 4;
-const DEFAULT_LIMITS = Object.freeze({ perMinute: 120, perRun: 600 });
-/** 1 回の読み込みで、テナントの手続きの呼び出し（1 件）だけを通す上限（一覧の読み取りは断られる）。 */
-const ONE_REQUEST_LIMITS = Object.freeze({ perMinute: 1, perRun: 1 });
 const ONE_PER_LOAD = 1;
 /** 期限の切れた token（401 を受ける）の有効期限（ms）。 */
 const EXPIRED_TOKEN_LIFETIME_MS = 1;
@@ -70,7 +63,8 @@ const noObserver = { onRunStarted: (): void => undefined, onSessionLost: (): voi
 const outcomesOf = (document: ReadEvidenceDocument): Readonly<Record<string, string>> => Object.fromEntries(document.checks.map((check: ReadCheckEvidence) =>
   [check.readCheckId, check.state === 'EXECUTED' ? `${check.result}/${check.detail}` : `NOT_EXECUTED/${check.reason}`]));
 
-describe.each(LAUNCHERS)('T37d: the READ check of a page path on the SPA fixture with %s', (_label, launch) => {
+/** 画面の path の READ の場面の支度（作業のフォルダと fixture の後始末）と、場面が使う道具（describe の中で呼ぶ）。 */
+const usePageReadCheck = (launch: () => Promise<Browser>) => {
   let spa: SpaAuthSite | undefined;
   let workDirectory = '';
   let runCount = 0;
@@ -98,10 +92,12 @@ describe.each(LAUNCHERS)('T37d: the READ check of a page path on the SPA fixture
   const setup = (
     site: SpaAuthSite,
     reads: readonly string[],
-    limits: AuditStageServiceRequests['serviceRequestLimits'] = DEFAULT_LIMITS,
+    // DEF-233 fix round 1: 自動でログインし直せるプロファイルか（既定は自動ログイン。偽は手動のログイン）。
+    automatedRelogin = true,
   ): { readonly config: AuditConfig; readonly authentication: RunAuthentication } => {
     runCount += 1;
     const authentication: RunAuthentication = {
+      ...(automatedRelogin ? { automatedRelogin: true } : {}),
       initialState: { cookies: [], origins: [{ origin: site.appOrigin, localStorage: [{ name: SPA_AUTH_STORAGE_KEY, value: site.issueStoredSession() }] }] },
       approvedTestOrigins: [site.appOrigin],
       auditExclusions: { excludedPathPrefixes: [SPA_APP_PATHS.logout], auditPathPrefixes: [], dangerousTerms: DEFAULT_EXCLUDED_URL_WORDS },
@@ -111,7 +107,6 @@ describe.each(LAUNCHERS)('T37d: the READ check of a page path on the SPA fixture
         approvedServiceOrigins: [site.backendOrigin],
         auditReadRequests: reads.map((path) => ({ origin: site.backendOrigin, path, method: 'POST', maxPerPageLoad: ONE_PER_LOAD })),
         scriptLogin: { origin: site.tokenOrigin, path: SPA_BACKEND_PATHS.token, requiredQuery: [{ name: 'grant_type', value: SPA_GRANT_TYPES.password }] },
-        serviceRequestLimits: limits,
       },
       sessionKeyPresent: (state) => hasSuccessStorageKey(state, { origin: site.appOrigin, ...FIXTURE_KEY }),
     };
@@ -134,9 +129,9 @@ describe.each(LAUNCHERS)('T37d: the READ check of a page path on the SPA fixture
     site: SpaAuthSite,
     readChecks: readonly WorkerStartReadCheck[],
     reads: readonly string[],
-    limits?: AuditStageServiceRequests['serviceRequestLimits'],
+    automatedRelogin = true,
   ): Promise<ReadEvidenceDocument> => {
-    const { config, authentication } = setup(site, reads, limits);
+    const { config, authentication } = setup(site, reads, automatedRelogin);
     const outcome = await executeReadCheckRun({
       config, jobId: `job-read-page-${runCount}`, authentication, readChecks, launchBrowser: launch,
       clock: () => new Date(), now: () => Date.now(), stopSignal: new AbortController().signal,
@@ -162,6 +157,27 @@ describe.each(LAUNCHERS)('T37d: the READ check of a page path on the SPA fixture
   const appLoadsOf = (site: SpaAuthSite, path: string): number =>
     site.requests.filter((request) => request.origin === 'app' && request.method === 'GET' && request.path === path).length;
 
+  return { startSite, run, pageCheck, unexpectedNonReads, appLoadsOf };
+};
+
+// TEST-SLIM M4: 登録していない手続きの呼び出し（読み取りでない要求）がサーバに届かない場面は、2 つの Chromium で流す（安全の漏れの確かめ）。
+describe.each(BOTH_CHROMIUM_LAUNCHERS)('T37d: the READ check of a page path on the SPA fixture, the blocked call with %s', (_label, launch) => {
+  const { startSite, run, pageCheck, unexpectedNonReads } = usePageReadCheck(launch);
+
+  it('says UNDETERMINED for a page whose unregistered call of a read procedure of the service was blocked', async () => {
+    // 一覧を手続きの呼び出しで読む形（登録していないので、Guard が止める）。
+    const site = await startSite({ rpcReads: true });
+    const document = await run(site, [pageCheck(site, 'read-list', ADMIN, [{ kind: 'ROW_COUNT_AT_LEAST', count: 1 }])], []);
+    expect(outcomesOf(document)).toEqual({ 'read-list': 'UNDETERMINED/AUDIT_STAGE_REQUEST_BLOCKED' });
+    expect(document.authentication?.otherNonReadBlocked).toBeGreaterThan(0);
+    await wait(LATE_REQUEST_WAIT_MS);
+    expect(unexpectedNonReads(site, [])).toEqual([]);
+  }, TEST_TIMEOUT_MS);
+});
+
+describe.each(DEFAULT_CHROMIUM_LAUNCHERS)('T37d: the READ check of a page path on the SPA fixture with %s', (_label, launch) => {
+  const { startSite, run, pageCheck, unexpectedNonReads, appLoadsOf } = usePageReadCheck(launch);
+
   it('reads a page that draws its data later through the API and says MATCHED, once per definition', async () => {
     // テナントの手続きの呼び出しが要る形（登録して通す）と、アプリの Origin への計測の送信（Guard が止める。判定には数えない）。
     const site = await startSite({ preLoginRpc: 'required', rumBeacon: true });
@@ -181,6 +197,8 @@ describe.each(LAUNCHERS)('T37d: the READ check of a page path on the SPA fixture
     expect(unexpectedNonReads(site, TENANT_READS)).toEqual([]);
   }, TEST_TIMEOUT_MS);
 
+  // RB-11: 前の上限（20）より多い定義も 1 定義 1 回ずつ読む段の輪（L4）は、偽の段の口の単体（`tests/unit/read-check-loop.test.ts`）が確かめる。
+
   it('says NOT_MATCHED when the drawn data differs from the expectations', async () => {
     const site = await startSite({});
     const document = await run(site, [
@@ -192,59 +210,36 @@ describe.each(LAUNCHERS)('T37d: the READ check of a page path on the SPA fixture
     expect(unexpectedNonReads(site, [])).toEqual([]);
   }, TEST_TIMEOUT_MS);
 
-  it('says UNDETERMINED, not NOT_MATCHED, for a page that could not draw its data because of a 401 of the service', async () => {
+  // DEF-233（設計書 `2026-11-09-beaksight-discovery-token-refresh-design.md` 2.3）: 401 で描けなかった画面は、セッションの切れ（`SERVICE_UNAUTHORIZED`）にする
+  // （判定せず、残りの定義は読まない。DEF-200 のログインし直しへ回す）。
+  it('says UNDETERMINED, not NOT_MATCHED, for a page that could not draw its data because of a 401 of the service, and stops by the session loss', async () => {
     const site = await startSite({ tokenLifetimeMs: EXPIRED_TOKEN_LIFETIME_MS });
     const document = await run(site, [
       pageCheck(site, 'read-list', ADMIN, [{ kind: 'ROW_COUNT_AT_LEAST', count: 1 }]),
       pageCheck(site, 'read-detail', DETAIL, [{ kind: 'TEXT_CONTAINS', text: FIRST_NAME }]),
     ], []);
-    expect(outcomesOf(document)).toEqual({ 'read-list': 'UNDETERMINED/SERVICE_READ_REFUSED', 'read-detail': 'UNDETERMINED/SERVICE_READ_REFUSED' });
-    // 照らした結果（データが描かれていない）は残す。
-    const [list] = document.checks;
-    expect(list?.state === 'EXECUTED' ? list.expectations.map(({ result }) => result) : []).toEqual(['NOT_MATCHED']);
+    expect(outcomesOf(document)).toEqual({ 'read-list': 'UNDETERMINED/SESSION_LOST', 'read-detail': 'NOT_EXECUTED/AUTH_SESSION_LOST' });
+    expect(document.endReason).toBe('AUTH_SESSION_LOST');
+    expect(document.endReasonDetail).toBe('SERVICE_UNAUTHORIZED');
+    expect(appLoadsOf(site, DETAIL)).toBe(0);
     expect(document.authentication?.serviceUnauthorizedResponses).toBeGreaterThan(0);
     expect(document.runStatus).toBe('PARTIAL');
     await wait(LATE_REQUEST_WAIT_MS);
     expect(unexpectedNonReads(site, [])).toEqual([]);
   }, TEST_TIMEOUT_MS);
 
-  it('says UNDETERMINED for a page whose service read was refused by the limit, and reads no more definitions', async () => {
-    const site = await startSite({ preLoginRpc: 'required' });
+  // DEF-233 fix round 1（設計書 2.3 の 4）: 手動のログインのプロファイルは止めず、今のとおり `UNDETERMINED/SERVICE_READ_REFUSED` で残りの定義も読む。
+  it('says UNDETERMINED/SERVICE_READ_REFUSED and goes on to the next definition for a manual login profile on a 401 of the service', async () => {
+    const site = await startSite({ tokenLifetimeMs: EXPIRED_TOKEN_LIFETIME_MS });
     const document = await run(site, [
       pageCheck(site, 'read-list', ADMIN, [{ kind: 'ROW_COUNT_AT_LEAST', count: 1 }]),
       pageCheck(site, 'read-detail', DETAIL, [{ kind: 'TEXT_CONTAINS', text: FIRST_NAME }]),
-    ], TENANT_READS, ONE_REQUEST_LIMITS);
-    expect(outcomesOf(document)).toEqual({ 'read-list': 'UNDETERMINED/SERVICE_READ_REFUSED', 'read-detail': 'NOT_EXECUTED/SERVICE_REQUEST_LIMIT_REACHED' });
-    expect(document.endReason).toBe('SERVICE_REQUEST_LIMIT_REACHED');
-    expect(document.authentication?.serviceRequestLimitReached).toBe(true);
-    expect(appLoadsOf(site, DETAIL)).toBe(0);
-    await wait(LATE_REQUEST_WAIT_MS);
-    expect(site.requests.filter((request) => request.origin === 'backend' && !request.preflight).length).toBeLessThanOrEqual(ONE_REQUEST_LIMITS.perRun);
-    expect(unexpectedNonReads(site, TENANT_READS)).toEqual([]);
-  }, TEST_TIMEOUT_MS);
-
-  // T37d fix round 1（T37d の発見事項 6）: 登録した読み取りの手続きの呼び出しを、1 回の読み込みあたりの回数の上限で止めた画面（データは描けていても、
-  // 照らした結果に関係なく判定しない）。
-  it('says UNDETERMINED for a page whose registered call of a read procedure went over the limit of one load', async () => {
-    const listReads: readonly string[] = [SPA_BACKEND_PATHS.rpcListMembers];
-    const site = await startSite({ rpcReads: true, repeatedListRpc: true });
-    const document = await run(site, [pageCheck(site, 'read-list', ADMIN, [{ kind: 'ROW_COUNT_EQUALS', count: 2 }])], listReads);
-    expect(outcomesOf(document)).toEqual({ 'read-list': 'UNDETERMINED/AUDIT_STAGE_REQUEST_BLOCKED' });
-    const [list] = document.checks;
-    expect(list?.state === 'EXECUTED' ? list.expectations.map(({ result }) => result) : []).toEqual(['MATCHED']);
-    await wait(LATE_REQUEST_WAIT_MS);
-    // 登録した呼び出しは、上限の 1 回だけ届いた。ほかの読み取りでない要求は届いていない。
-    expect(site.requests.filter((request) => request.origin === 'backend' && !request.preflight && request.method === 'POST'
-      && request.path === SPA_BACKEND_PATHS.rpcListMembers).length).toBe(ONE_PER_LOAD);
-    expect(unexpectedNonReads(site, listReads)).toEqual([]);
-  }, TEST_TIMEOUT_MS);
-
-  it('says UNDETERMINED for a page whose unregistered call of a read procedure of the service was blocked', async () => {
-    // 一覧を手続きの呼び出しで読む形（登録していないので、Guard が止める）。
-    const site = await startSite({ rpcReads: true });
-    const document = await run(site, [pageCheck(site, 'read-list', ADMIN, [{ kind: 'ROW_COUNT_AT_LEAST', count: 1 }])], []);
-    expect(outcomesOf(document)).toEqual({ 'read-list': 'UNDETERMINED/AUDIT_STAGE_REQUEST_BLOCKED' });
-    expect(document.authentication?.otherNonReadBlocked).toBeGreaterThan(0);
+    ], [], false);
+    expect(outcomesOf(document)).toEqual({ 'read-list': 'UNDETERMINED/SERVICE_READ_REFUSED', 'read-detail': 'UNDETERMINED/SERVICE_READ_REFUSED' });
+    expect(document.endReason).not.toBe('AUTH_SESSION_LOST');
+    expect(document.endReasonDetail).toBeUndefined();
+    expect(document.authentication?.serviceUnauthorizedResponses).toBeGreaterThan(0);
+    expect(document.runStatus).toBe('PARTIAL');
     await wait(LATE_REQUEST_WAIT_MS);
     expect(unexpectedNonReads(site, [])).toEqual([]);
   }, TEST_TIMEOUT_MS);
@@ -263,7 +258,7 @@ interface ServerRecord {
   readonly method: string;
 }
 
-describe.each(LAUNCHERS)('T37d: the UNDETERMINED rule of the READ check of a candidate with %s', (_label, launch) => {
+describe.each(DEFAULT_CHROMIUM_LAUNCHERS)('T37d: the UNDETERMINED rule of the READ check of a candidate with %s', (_label, launch) => {
   let app: LoopbackHttpServer;
   let service: LoopbackHttpServer;
   let workDirectory = '';
@@ -309,9 +304,13 @@ describe.each(LAUNCHERS)('T37d: the UNDETERMINED rule of the READ check of a can
     await rm(workDirectory, { recursive: true, force: true });
   });
 
-  const setup = (limits: AuditStageServiceRequests['serviceRequestLimits']): { readonly config: AuditConfig; readonly authentication: RunAuthentication } => {
+  const setup = (
+    // DEF-233 fix round 1: 自動でログインし直せるプロファイルか（既定は自動ログイン。偽は手動のログイン）。
+    automatedRelogin = true,
+  ): { readonly config: AuditConfig; readonly authentication: RunAuthentication } => {
     runCount += 1;
     const authentication: RunAuthentication = {
+      ...(automatedRelogin ? { automatedRelogin: true } : {}),
       initialState: { cookies: [], origins: [] },
       approvedTestOrigins: [app.origin],
       auditExclusions: { excludedPathPrefixes: ['/logout'], auditPathPrefixes: [], dangerousTerms: DEFAULT_EXCLUDED_URL_WORDS },
@@ -321,7 +320,6 @@ describe.each(LAUNCHERS)('T37d: the UNDETERMINED rule of the READ check of a can
         approvedServiceOrigins: [service.origin],
         auditReadRequests: [],
         scriptLogin: { origin: service.origin, path: '/auth/v1/token', requiredQuery: [{ name: 'grant_type', value: 'password' }] },
-        serviceRequestLimits: limits,
       },
     };
     const base = fastRunConfig(app.origin, SEARCH_PATH, {
@@ -332,7 +330,7 @@ describe.each(LAUNCHERS)('T37d: the UNDETERMINED rule of the READ check of a can
 
   /** 発見のジョブで、検索の form の候補の識別の digest を読む。 */
   const searchCandidateDigest = async (): Promise<string> => {
-    const { config, authentication } = setup(DEFAULT_LIMITS);
+    const { config, authentication } = setup();
     const outcome = await executeDiscoveryRun({
       config, jobId: `job-discovery-${runCount}`, authentication, launchBrowser: launch, clock: () => new Date(), now: () => Date.now(),
       stopSignal: new AbortController().signal,
@@ -349,8 +347,11 @@ describe.each(LAUNCHERS)('T37d: the UNDETERMINED rule of the READ check of a can
     return candidate.identityDigest;
   };
 
-  const readCandidate = async (digest: string, limits: AuditStageServiceRequests['serviceRequestLimits']): Promise<ReadEvidenceDocument> => {
-    const { config, authentication } = setup(limits);
+  const readCandidate = async (
+    digest: string,
+    automatedRelogin = true,
+  ): Promise<ReadEvidenceDocument> => {
+    const { config, authentication } = setup(automatedRelogin);
     const outcome = await executeReadCheckRun({
       config, jobId: `job-read-candidate-${runCount}`, authentication, launchBrowser: launch, clock: () => new Date(), now: () => Date.now(),
       stopSignal: new AbortController().signal,
@@ -373,19 +374,23 @@ describe.each(LAUNCHERS)('T37d: the UNDETERMINED rule of the READ check of a can
   const nonReadsSince = (start: number): readonly string[] =>
     records.slice(start).filter(({ method }) => !READ_METHODS.has(method)).map(({ server, method }) => `${server} ${method}`);
 
-  it('says MATCHED when both service reads are drawn, and UNDETERMINED when one of them was refused by the limit or answered 401', async () => {
+  // 2 件とも描かれれば MATCHED。401 で描けなかった画面は UNDETERMINED（上限の撤廃 L11 は `guard-audit-stage.test.ts` で確かめる）。
+  it('says MATCHED when both service reads are drawn, and UNDETERMINED when one of them answered 401', async () => {
     serviceStatus = HTTP_OK;
     const digest = await searchCandidateDigest();
     const start = records.length;
-    const drawn = await readCandidate(digest, DEFAULT_LIMITS);
+    const drawn = await readCandidate(digest);
     expect(outcomesOf(drawn)).toEqual({ 'read-candidate': 'MATCHED/EXPECTATIONS_EVALUATED' });
     expect(drawn.checks[0]?.targetKind).toBe('CANDIDATE');
-    // 上限（1 回の Run で 1 件）: 2 件目の読み取りを断ったので、一覧は描かれない。照らした結果に関係なく判定しない。
-    const limited = await readCandidate(digest, ONE_REQUEST_LIMITS);
-    expect(outcomesOf(limited)).toEqual({ 'read-candidate': 'UNDETERMINED/SERVICE_READ_REFUSED' });
     serviceStatus = HTTP_UNAUTHORIZED;
-    const unauthorized = await readCandidate(digest, DEFAULT_LIMITS);
-    expect(outcomesOf(unauthorized)).toEqual({ 'read-candidate': 'UNDETERMINED/SERVICE_READ_REFUSED' });
+    const unauthorized = await readCandidate(digest);
+    // DEF-233: 401 で描けなかった画面は、セッションの切れ（判定しない）。
+    expect(outcomesOf(unauthorized)).toEqual({ 'read-candidate': 'UNDETERMINED/SESSION_LOST' });
+    expect(unauthorized.endReasonDetail).toBe('SERVICE_UNAUTHORIZED');
+    // DEF-233 fix round 1: 手動のログインのプロファイルは、今のとおり `UNDETERMINED/SERVICE_READ_REFUSED`（止めない）。
+    const manual = await readCandidate(digest, false);
+    expect(outcomesOf(manual)).toEqual({ 'read-candidate': 'UNDETERMINED/SERVICE_READ_REFUSED' });
+    expect(manual.endReasonDetail).toBeUndefined();
     serviceStatus = HTTP_OK;
     await wait(LATE_REQUEST_WAIT_MS);
     expect(nonReadsSince(start)).toEqual([]);

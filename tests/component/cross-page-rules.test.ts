@@ -1,7 +1,9 @@
 import { describe, expect, it } from 'vitest';
 import {
   CROSS_PAGE_RULES,
+  crossPagePageFactsOf,
   evaluateCrossPageRules,
+  type CrossPagePageFacts,
   type CrossPagePageResult,
   type CrossPageRule,
   type CrossPageRuleInput,
@@ -226,7 +228,7 @@ const sitemap = (paths: readonly string[], truncated = false): SitemapEvidence =
 });
 
 const evaluate = (
-  pages: readonly CrossPagePageResult[],
+  pages: readonly (CrossPagePageResult | CrossPagePageFacts)[],
   overrides: Partial<CrossPageRuleInput> = {},
 ): ReturnType<typeof evaluateCrossPageRules> =>
   evaluateCrossPageRules({
@@ -613,6 +615,17 @@ describe('evaluateCrossPageRules: canonical', () => {
     expect(gone?.message).toContain('410');
   });
 
+  // WSO（REV-WSO の I-2）: サイトの全部を巡回していない点検（チェックした画面だけ）は、「発見されませんでした」と言えないので、その枝を判定しない（HTTP の
+  // エラーの枝はそのまま）。
+  it('does not say a canonical target was not discovered when the crawl does not cover the site, and keeps the HTTP error', () => {
+    const result = evaluate([
+      page({ sequence: 1, path: '/a', canonical: '/never-linked' }),
+      page({ sequence: 2, path: '/b', canonical: '/gone' }),
+      page({ sequence: 3, path: '/gone', viewports: { desktop: { httpStatus: 410 }, mobile: { httpStatus: 410 } } }),
+    ], { crawlCoversSite: false });
+    expect(findingsOf(result, 'CANONICAL_TARGET_NOT_FOUND').map((finding) => finding.pageId)).toEqual([createPageId(2)]);
+  });
+
   it('does not report CANONICAL_TARGET_NOT_FOUND for found, redirected-to, unaudited but discovered, or external targets', () => {
     const result = evaluate([
       page({ sequence: 1, path: '/a', canonical: '/b' }),
@@ -760,6 +773,15 @@ describe('evaluateCrossPageRules: navigation outcomes', () => {
       ],
       { allowedOrigins: [ORIGIN, HTTPS_ORIGIN] },
     );
+
+    expect(findingsOf(result, 'UNEXPECTED_ORIGIN_REDIRECT')).toEqual([]);
+  });
+
+  // SD-2（設計書 `2026-11-16-beaksight-action-based-delete-guard-design.md` 2.4）: 同じ Origin の点検の範囲の外（読まないパスなど）へ移ったので点検しなかった画面は、
+  // サイトの外へ移されたのではないので数えない（最終 URL が許可 Origin の中）。
+  it('does not report UNEXPECTED_ORIGIN_REDIRECT for a page that moved outside the audit scope inside the allowed origins (SD-2)', () => {
+    const insideMove: ViewportSpec = { ...BLOCKED_REDIRECT_VIEWPORT, finalUrl: `${ORIGIN}/logout` };
+    const result = evaluate([page({ sequence: 1, path: '/moves', viewports: { desktop: insideMove, mobile: insideMove } })]);
 
     expect(findingsOf(result, 'UNEXPECTED_ORIGIN_REDIRECT')).toEqual([]);
   });
@@ -991,6 +1013,12 @@ describe('evaluateCrossPageRules: determinism and contract', () => {
     expect(backward).toEqual(forward);
   });
 
+  // MEM-3b（DEF-266）: ページの結果の本体を持たずに、ページごとの材料（`crossPagePageFactsOf`）から評価しても、同じ Finding・失敗・数になる。
+  it('gives the same result from the facts of each page as from the page results (MEM-3b)', () => {
+    const overrides = { sitemap: sitemap(['/', '/orphan']) };
+    expect(evaluate(scenarioPages().map(crossPagePageFactsOf), overrides)).toEqual(evaluate(scenarioPages(), overrides));
+  });
+
   it('numbers findings from the injected sequence and fingerprints them with the injected target id', () => {
     const result = evaluate(scenarioPages(), { firstFindingSequence: 40 });
 
@@ -1058,6 +1086,7 @@ describe('evaluateCrossPageRules: determinism and contract', () => {
       version: 1,
       category: 'CROSS_PAGE',
       severity: 'WARN',
+      plainMessage: 'テストの指摘です。',
       evaluate: () => {
         throw new Error('fixture cross-page rule failure');
       },
@@ -1092,6 +1121,7 @@ describe('evaluateCrossPageRules: determinism and contract', () => {
       version: 1,
       category: 'CROSS_PAGE',
       severity: 'INFO',
+      plainMessage: 'テストの指摘です。',
       evaluate: () => [],
     });
     const input: CrossPageRuleInput = {
@@ -1138,6 +1168,7 @@ describe('evaluateCrossPageRules: determinism and contract', () => {
         version: brokenLink.version,
         category: brokenLink.category,
         severity: brokenLink.severity,
+        plainMessage: brokenLink.plainMessage,
         evaluate: (index) =>
           brokenLink.evaluate(index).map(({ context, draft }) => ({ context, draft: { ...draft, ruleId, ...override } })),
       });

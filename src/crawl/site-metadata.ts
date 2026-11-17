@@ -7,6 +7,7 @@ import {
   type MainFrameLoadObservation,
   type MainFrameLoadSettlement,
 } from '../browser/main-frame-load.js';
+import { attachPageProgressSignals } from '../browser/page-progress-signals.js';
 import { isPlaywrightTimeoutError } from '../browser/playwright-errors.js';
 import type { AuditConfig } from '../config/types.js';
 import type { EvidenceRecordFor, PageId } from '../core/contracts.js';
@@ -19,12 +20,12 @@ import type {
   SitemapEvidence,
   SitemapXmlMetadataEvidence,
 } from '../core/evidence-types.js';
-import { isNonNegativeSafeInteger, isPositiveSafeInteger, isRecord } from '../core/guards.js';
+import { isPositiveSafeInteger, isRecord } from '../core/guards.js';
 import { SUCCESS_HTTP_STATUS_RANGE, isHttpStatusInRange } from '../core/http-status.js';
 import { deepFreeze } from '../core/immutable.js';
-import { MAX_ERROR_MESSAGE_LENGTH, MAX_SITE_METADATA_TEXT_LENGTH, MAX_SITEMAP_URLS } from '../core/limits.js';
-import { truncateText } from '../core/text.js';
+import { PROGRESS_SIGNAL_KINDS, watchProgress } from '../core/progress-watch.js';
 import { createEvidenceRecord, type EvidenceRecordContext } from '../orchestration/evidence-builder.js';
+import { OPEN_ENDED_STAGE_MS } from '../orchestration/stage-deadline.js';
 import { IdAllocator } from '../orchestration/id-allocator.js';
 import { closePassivePageAndContext, type PassiveSessionCloseFailure } from '../orchestration/passive-session-close.js';
 import {
@@ -41,19 +42,7 @@ import { classifyUrl } from './admission-policy.js';
 import { normalizeUrl } from './normalize-url.js';
 import { sitemapEvidenceFromMetadata } from './sitemap-evidence.js';
 
-/** 本文の文字数と、sitemap の URL の件数の上限。 */
-export interface SiteMetadataLimits {
-  /** Evidence に残す本文の最大長（UTF-16 のコード単位）。 */
-  readonly maxTextLength: number;
-  /** Evidence に残す sitemap の URL の最大件数。 */
-  readonly maxSitemapUrls: number;
-}
-
-/** 本番の上限（`src/core/limits.ts` の定数）。`SiteMetadataOptions.limits` で差し替えても、この値は変わらない。 */
-export const SITE_METADATA_DEFAULT_LIMITS: SiteMetadataLimits = Object.freeze({
-  maxTextLength: MAX_SITE_METADATA_TEXT_LENGTH,
-  maxSitemapUrls: MAX_SITEMAP_URLS,
-});
+// LZ-2: 本文の長さの上限は置かない。LZ-3a: sitemap の URL の件数の上限（前は `SiteMetadataLimits.maxSitemapUrls`）も置かない。切り詰めない。
 
 /** `collectSiteMetadata` の入力（Task 14〜17 の設計書 5.6.2）。 */
 export interface SiteMetadataOptions {
@@ -79,8 +68,6 @@ export interface SiteMetadataOptions {
   readonly allocator: IdAllocator;
   /** Evidence の `observedAt` に使う時計。 */
   readonly clock: () => Date;
-  /** 上限の差し替え口（テスト用）。省略した項目は `SITE_METADATA_DEFAULT_LIMITS`。 */
-  readonly limits?: Partial<SiteMetadataLimits>;
   /**
    * Passive Context と page の作成・終了の期限の注入口（DEF-008、R15r-4）。省略した項目は、`limits.ts` の定数を使う。
    */
@@ -101,6 +88,8 @@ export interface SiteMetadataOptions {
    * そのまま reject する（呼び出し側の誤り）。
    */
   readonly afterNavigation?: ((observation: MainFrameLoadObservation) => void) | undefined;
+  /** DEF-245: 期限なしの取得の、進みの見張りの反応なしの長さ（ms。テスト用。省略すると `PROGRESS_WATCH_QUIET_LIMIT_MS`）。 */
+  readonly quietLimitMs?: number | undefined;
   /**
    * 取りに行かない URL の判定（Task 25 の設計書 4.2、4.7。T25c round 3）。省略すると、今のまま両方のファイルを取得する（公開監査）。
    * 渡すと、真を返した URL のファイルは、読み込みも、間隔の待ち（`beforeNavigation`）も、観測の受け口（`afterNavigation`）の呼び出しもせず、
@@ -109,12 +98,17 @@ export interface SiteMetadataOptions {
    * 関数でない値は、Context を作らずに `TypeError` を投げる。判定が投げた例外は、そのまま reject する（呼び出し側の誤り）。
    */
   readonly isExcludedUrl?: ((url: string) => boolean) | undefined;
+  /**
+   * WSO（REV-WSO の I-2）: sitemap.xml を取りに行かない（「チェックした画面だけ」の点検。サイトの全部を巡回しないので、sitemap と比べない）。真なら、sitemap.xml は
+   * `isExcludedUrl` に当たったファイルと同じ扱い（結果 `EXCLUDED`。読み込みも待ちもしない）。省略は今のまま。
+   */
+  readonly skipSitemap?: boolean | undefined;
 }
 
 /**
  * 応答を得られなかった取得（`FAILED` で、`httpStatus` が `null`）の詳細。Evidence には残らないので、呼び出し側が理由の記録に使う。
  * - `timedOut`: Playwright の期限切れ（`isPlaywrightTimeoutError`）か、本文の読み取りが期限を過ぎた。
- * - `detail`: 上限（`MAX_ERROR_MESSAGE_LENGTH`）付きのエラーのメッセージ。
+ * - `detail`: エラーのメッセージ。
  */
 export interface SiteMetadataFetchFailure {
   readonly kind: SiteMetadataKind;
@@ -203,7 +197,7 @@ type OpenedPage =
  * （Task 14〜17 の設計書 5.6.2）。本文は、ナビゲーションの応答（`response.text()`）から読む。Node の `fetch` は使わない。
  *
  * - `outcome`: 2xx は `OK`、404 と 410 は `NOT_FOUND`、それ以外の応答と、応答を得られなかった場合は `FAILED`。
- *   本文（`text`）は `OK` の場合だけ残し、上限で切り詰めた場合は `textTruncated` を真にする。
+ *   本文（`text`）は `OK` の場合だけ残す。LZ-2: 切り詰めない（`textTruncated` は前の記録の形のために残し、いつも偽）。
  * - 読み込みが例外で終わっても、main frame の最後の文書の応答の status（読み込みの観測の `httpStatus`）が 2xx でなければ、その status の
  *   応答として扱う（DEF-029 の設計書 2.3。例: 本文が空の 404 は `NOT_FOUND`、本文が空の 503 は `FAILED` で `httpStatus` は 503。どちらも
  *   `failures` には入らない）。status がない、または 2xx の場合は、応答を得られなかった `FAILED`（`httpStatus` は `null`）のまま。
@@ -235,13 +229,14 @@ type OpenedPage =
  */
 export async function collectSiteMetadata(options: SiteMetadataOptions): Promise<SiteMetadataResult> {
   const validated = validateOptions(options);
-  const { contextFactory, limits, timeoutMs, allowedQueryParameters, targets, deadlines, beforeNavigation, afterNavigation } = validated;
+  const { contextFactory, timeoutMs, allowedQueryParameters, targets, deadlines, beforeNavigation, afterNavigation } = validated;
   const evidenceContext: EvidenceRecordContext = { allocator: options.allocator, clock: options.clock };
   // T25c round 3: 取りに行かないファイル（判定がなければ、なし）。すべてが当たれば、Context を作らない。
   const { isExcludedUrl } = validated;
-  const excludedUrls: ReadonlySet<string> = new Set(
-    isExcludedUrl === undefined ? [] : targets.filter(({ url }) => isExcludedUrl(url)).map(({ url }) => url),
-  );
+  // WSO: sitemap.xml を取りに行かない指定は、取りに行かないファイルと同じ扱い。
+  const excludedUrls: ReadonlySet<string> = new Set(targets
+    .filter(({ kind, url }) => (options.skipSitemap === true && kind === 'SITEMAP_XML') || (isExcludedUrl !== undefined && isExcludedUrl(url)))
+    .map(({ url }) => url));
   const session: OpenedContext = targets.every(({ url }) => excludedUrls.has(url))
     ? NO_CONTEXT_NEEDED
     : await openContext(contextFactory, options.config.viewports.primaryDesktop, deadlines);
@@ -277,20 +272,19 @@ export async function collectSiteMetadata(options: SiteMetadataOptions): Promise
               abandonedFailure = opened.failure;
             }
           } else {
-            fetched = await fetchMetadata(opened.page, url, timeoutMs, { beforeNavigation, afterNavigation });
+            fetched = await fetchMetadata(opened.page, url, timeoutMs, { beforeNavigation, afterNavigation, quietLimitMs: validated.quietLimitMs });
           }
         }
       }
       if (fetched.failure !== null) {
         failures.push({ kind, ...fetched.failure });
       }
-      const text = fetched.body === null ? null : truncateText(fetched.body, limits.maxTextLength);
       const base = {
         url,
         outcome: fetched.outcome,
         httpStatus: fetched.httpStatus,
-        text: text === null ? null : text.text,
-        textTruncated: text !== null && text.truncated,
+        text: fetched.body,
+        textTruncated: false,
       };
       let payload: MetadataEvidence;
       if (kind === 'ROBOTS_TXT') {
@@ -298,13 +292,14 @@ export async function collectSiteMetadata(options: SiteMetadataOptions): Promise
       } else {
         const sitemap = fetched.body === null
           ? null
-          : sitemapUrlsFrom(fetched.body, allowedQueryParameters, limits.maxSitemapUrls);
+          : sitemapUrlsFrom(fetched.body, allowedQueryParameters);
         unnormalizableSitemapUrlCount = sitemap === null ? 0 : sitemap.unnormalizableCount;
         payload = {
           kind,
           ...base,
           sitemapUrls: sitemap === null ? null : sitemap.urls,
-          sitemapUrlsTruncated: sitemap !== null && sitemap.truncated,
+          // LZ-3a: 件数で切り詰めないので、いつも偽（前の記録の形のために残す）。
+          sitemapUrlsTruncated: false,
         } satisfies SitemapXmlMetadataEvidence;
       }
       records.push(
@@ -333,14 +328,16 @@ export async function collectSiteMetadata(options: SiteMetadataOptions): Promise
 
 interface ValidatedOptions {
   readonly contextFactory: BrowserContextFactory;
-  readonly limits: SiteMetadataLimits;
-  readonly timeoutMs: number;
+  /** L14: `undefined`（利用者が期限を指定していない）なら期限を置かず、進みの見張りで待つ。 */
+  readonly timeoutMs: number | undefined;
   readonly allowedQueryParameters: ReadonlySet<string>;
   readonly targets: readonly { readonly kind: SiteMetadataKind; readonly url: string }[];
   readonly deadlines: ResolvedPassiveSessionDeadlines;
   readonly beforeNavigation: () => Promise<number>;
   readonly afterNavigation: SiteMetadataOptions['afterNavigation'];
   readonly isExcludedUrl: SiteMetadataOptions['isExcludedUrl'];
+  /** DEF-245: 進みの見張りの反応なしの長さ（省略は `undefined`）。 */
+  readonly quietLimitMs: number | undefined;
 }
 
 function validateOptions(options: SiteMetadataOptions): ValidatedOptions {
@@ -380,16 +377,11 @@ function validateOptions(options: SiteMetadataOptions): ValidatedOptions {
   if (!Array.isArray(allowedOrigins) || !Array.isArray(allowedQueryParameters)) {
     throw new TypeError('site metadata requires the allowed origins and the allowed query parameters');
   }
-  if (!isPositiveSafeInteger(navigationTimeoutMs)) {
+  if (navigationTimeoutMs !== undefined && !isPositiveSafeInteger(navigationTimeoutMs)) {
     throw new RangeError('site metadata navigation timeout must be a positive safe integer');
-  }
-  const limits = { ...SITE_METADATA_DEFAULT_LIMITS, ...options.limits };
-  if (!isNonNegativeSafeInteger(limits.maxTextLength) || !isNonNegativeSafeInteger(limits.maxSitemapUrls)) {
-    throw new RangeError('site metadata limits must be non-negative safe integers');
   }
   return {
     contextFactory,
-    limits,
     timeoutMs: navigationTimeoutMs,
     allowedQueryParameters: new Set(allowedQueryParameters),
     targets: metadataTargets(origin, allowedOrigins),
@@ -397,6 +389,7 @@ function validateOptions(options: SiteMetadataOptions): ValidatedOptions {
     beforeNavigation,
     afterNavigation,
     isExcludedUrl,
+    quietLimitMs: options.quietLimitMs,
   };
 }
 
@@ -482,7 +475,7 @@ async function openPage(
 
 /** 作成の期限切れの失敗。期限を過ぎたので `timedOut` は真にする。 */
 function openDeadlineFailureOf(error: PassiveSessionOpenDeadlineError): Omit<SiteMetadataFetchFailure, 'kind'> {
-  return { timedOut: true, detail: safeErrorMessage(error, MAX_ERROR_MESSAGE_LENGTH) };
+  return { timedOut: true, detail: safeErrorMessage(error) };
 }
 
 /**
@@ -498,14 +491,62 @@ function openDeadlineFailureOf(error: PassiveSessionOpenDeadlineError): Omit<Sit
 async function fetchMetadata(
   page: Page,
   url: string,
-  timeoutMs: number,
-  hooks: Pick<ValidatedOptions, 'beforeNavigation' | 'afterNavigation'>,
+  timeoutMs: number | undefined,
+  hooks: Pick<ValidatedOptions, 'beforeNavigation' | 'afterNavigation' | 'quietLimitMs'>,
 ): Promise<FetchOutcome> {
   try {
     await hooks.beforeNavigation();
   } catch (error) {
     return { outcome: 'FAILED', httpStatus: null, body: null, failure: failureOf(error) };
   }
+  if (timeoutMs !== undefined) {
+    return await loadMetadata(page, url, timeoutMs, hooks);
+  }
+  // L14（設計書 `2026-11-09-beaksight-remove-limits-design.md` 6 の L14、表 A の T10）: 期限を指定していなければ、期限を置かず進みの見張りで待つ
+  // （読み込みは通信と画面の変化そのものが進み）。全く反応がなければ、時間切れの失敗にする（読み込みの間隔の待ちは、見張りの外）。
+  // 受け口は、読み込みを始めたファイルごとに 1 回だけ呼ぶ（見張りが終えた後に、見放した読み込みが返っても呼ばない）。
+  let reported = false;
+  const reportOnce = (observation: MainFrameLoadObservation): void => {
+    if (!reported) {
+      reported = true;
+      hooks.afterNavigation?.(observation);
+    }
+  };
+  const watched = await watchProgress((signals) => {
+    const detach = attachPageProgressSignals(page, signals);
+    return loadMetadata(page, url, OPEN_ENDED_STAGE_MS, { afterNavigation: reportOnce }).finally(detach);
+  }, { contentKinds: PROGRESS_SIGNAL_KINDS, quietLimitMs: hooks.quietLimitMs });
+  if (watched.status === 'REJECTED') {
+    throw watched.reason;
+  }
+  if (watched.status === 'FULFILLED') {
+    return watched.value;
+  }
+  // DEF-245 の 4: 全く反応がなければ、その読み込みを応答のない時間切れとして受け口へ渡す（Run Coordinator が、サイトが応答しないと判定する。ページの読み込み
+  // の見張りが終えたときと同じ観測）。Run の時間の上限で終えた読み込みは、サイトの不調にしない。
+  if (watched.end === 'STAGE_UNRESPONSIVE') {
+    reportOnce(UNRESPONSIVE_METADATA_OBSERVATION);
+  }
+  return { outcome: 'FAILED', httpStatus: null, body: null, failure: { timedOut: true, detail: SITE_METADATA_UNRESPONSIVE_DETAIL } };
+}
+
+/** DEF-245 の 4: 全く反応がなかった取得の観測（応答のない時間切れ）。 */
+const UNRESPONSIVE_METADATA_OBSERVATION: MainFrameLoadObservation = Object.freeze({
+  navigationOutcome: 'TIMEOUT',
+  httpStatus: null,
+  failureDetail: null,
+});
+
+/** L14: 期限なしの取得を、見張りが終えたとき（全く反応がない）の失敗の詳細。 */
+const SITE_METADATA_UNRESPONSIVE_DETAIL = 'the site did not respond while loading the file (progress watch)';
+
+/** 1 つのファイルの読み込みと本文の読み取り（`timeoutMs` までに終える）。 */
+async function loadMetadata(
+  page: Page,
+  url: string,
+  timeoutMs: number,
+  hooks: Pick<ValidatedOptions, 'afterNavigation'>,
+): Promise<FetchOutcome> {
   const deadlineAtMs = Date.now() + timeoutMs;
   const tracker = trackMainFrameDocument(page);
   let navigated: GotoSettlement;
@@ -575,15 +616,13 @@ function outcomeOf(httpStatus: number): SiteMetadataOutcome {
 }
 
 function failureOf(error: unknown): Omit<SiteMetadataFetchFailure, 'kind'> {
-  return { timedOut: isPlaywrightTimeoutError(error), detail: safeErrorMessage(error, MAX_ERROR_MESSAGE_LENGTH) };
+  return { timedOut: isPlaywrightTimeoutError(error), detail: safeErrorMessage(error) };
 }
 
 /** sitemap の本文から取り出した URL。 */
 interface SitemapUrls {
   /** 正規化した URL（文書の順。重複を含む）。 */
   readonly urls: readonly string[];
-  /** ページの URL の一覧として不完全か（件数の上限で切り詰めた）。 */
-  readonly truncated: boolean;
   readonly unnormalizableCount: number;
 }
 
@@ -594,12 +633,11 @@ interface SitemapUrls {
  *     「sitemap にない」と言いすぎるためである。
  *   - `<sitemapindex>`: `<loc>` は入れ子の sitemap の URL で、ページの URL ではない。入れ子はたどらないので、ページの URL の一覧は
  *     得られない（Task 14〜17 の設計書 5.6.2。R15b の発見事項）。
- * - `maxUrls` 件を超える URL があれば、そこで読むのをやめ、`truncated` を真にする。
+ * - LZ-3a: URL の件数では読むのをやめない（前は上限の件数で切り詰めた）。
  */
 function sitemapUrlsFrom(
   body: string,
   allowedQueryParameters: ReadonlySet<string>,
-  maxUrls: number,
 ): SitemapUrls | null {
   const extracted = extractSitemapLocations(body);
   if (extracted.root !== 'urlset') {
@@ -607,7 +645,6 @@ function sitemapUrlsFrom(
   }
   const urls: string[] = [];
   let unnormalizableCount = 0;
-  let truncated = false;
   for (const location of extracted.locations) {
     // 正規化の基準の URL は値そのもの（相対の URL は受け入れない。Cross-page rule の正規化と同じ）。
     const normalized = location === null ? null : normalizeUrl(location, location, allowedQueryParameters);
@@ -615,13 +652,9 @@ function sitemapUrlsFrom(
       unnormalizableCount += 1;
       continue;
     }
-    if (urls.length >= maxUrls) {
-      truncated = true;
-      break;
-    }
     urls.push(normalized.url);
   }
-  return { urls, truncated, unnormalizableCount };
+  return { urls, unnormalizableCount };
 }
 
 /** sitemap の根の要素の名前。 */

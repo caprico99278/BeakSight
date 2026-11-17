@@ -12,7 +12,6 @@ import { parseArgs } from 'node:util';
 import { ConfigError } from '../config/config-error.js';
 import { HEADED_CONFIG_OVERRIDES, HEADLESS_CONFIG_OVERRIDES } from '../config/config-overrides.js';
 import type { AuditConfigOverrides } from '../config/types.js';
-import { MAX_ERROR_MESSAGE_LENGTH } from '../core/limits.js';
 import { safeErrorMessage } from '../core/errors.js';
 import { normalizeWhitespace } from '../core/text.js';
 
@@ -62,7 +61,7 @@ const CLI_COMMAND_SET: ReadonlySet<string> = new Set(CLI_COMMANDS);
 const isCliCommand = (value: string): value is CliCommand => CLI_COMMAND_SET.has(value);
 
 /** 例外の文を、1行の技術的な詳細にする。 */
-const oneLineDetail = (error: unknown): string => normalizeWhitespace(safeErrorMessage(error, MAX_ERROR_MESSAGE_LENGTH));
+const oneLineDetail = (error: unknown): string => normalizeWhitespace(safeErrorMessage(error));
 
 const parseStrictly = (argv: readonly string[]) =>
   parseArgs({ args: [...argv], allowPositionals: true, strict: true, tokens: true, options: CLI_OPTIONS });

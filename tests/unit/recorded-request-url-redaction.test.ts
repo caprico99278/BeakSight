@@ -7,7 +7,9 @@ import { describe, expect, it } from 'vitest';
 import { REDACTED } from '../../src/core/redaction.js';
 import {
   RECORDED_REQUEST_URL_LIST_NAMES,
+  recordedRequestUrlRedactionTableOf,
   redactRecordedRequestUrl,
+  redactRecordedRequestUrlsByTable,
   redactRecordedRequestUrlsInValue,
 } from '../../src/safety/redact.js';
 import { startCpuStopwatch } from '../architecture/source-scan.js';
@@ -19,9 +21,15 @@ const PERF_REQUESTS_PER_PAGE = 200;
 const PERF_STRINGS_PER_PAGE = 2_000;
 const REDACTION_TIME_LIMIT_MS = 10_000;
 const REDACTION_TEST_TIMEOUT_MS = 120_000;
-/** T44R5 の m-1: 同じ芯（`/p?id=1`）の、末尾だけ違う identity の数と、上限の時間（ms。ブラウザなし）。 */
-const SAME_CORE_IDENTITIES = 8_000;
-const SAME_CORE_TIME_LIMIT_MS = 100;
+/**
+ * T44R5 の m-1・DEF-282: 同じ芯（`/p?id=1`）の、末尾だけ違う identity の数（小さい方）と、大きい方への倍率。時間は上限の秒でなく、2 つの大きさの
+ * CPU の時間の比で確かめる（混雑で両方が延びても比は崩れにくい）。比の上限は、線形（倍率と同じ約 4）と、identity の一覧をたどる形（倍率の 2 乗の
+ * 約 16）の間。各大きさは数回測って最も短い回を使う（混雑は時間を延ばす向きにだけ働く）。
+ */
+const SAME_CORE_IDENTITIES = 32_000;
+const SAME_CORE_SCALE = 3;
+const SAME_CORE_MAX_GROWTH = SAME_CORE_SCALE * 2;
+const SAME_CORE_REPEATS = 3;
 const RAW = `https://user:pass@example.com/api/items/${HEX_VALUE}/detail?marker=mark-a&token=mark-b&empty=#frag=mark-c`;
 const REDACTED_URL = `https://${REDACTED}@example.com/api/items/${REDACTED}/detail?marker=${REDACTED}&token=${REDACTED}&empty=#frag=${REDACTED}`;
 
@@ -294,6 +302,35 @@ describe('T44R3: the values kept from the value matching are only the page ident
     expect(output.links).toEqual([{ rawHref: '/news?id=11', url: later }]);
     expect(output.evidence[0]?.payload.requests[0]?.url).toBe(`${H}/news?id=${REDACTED}`);
   });
+
+  // SLIM（public-audit-url-values-resume の置き換え）: 保存のページ（`url` と `result`）を、巡回が知っている URL（待ち行列と監査したページ）を渡して照らす形。
+  // ページ `/news?id=10` が文書でない要求 `/news?id=1`（ページの URL の前の部分）と `/news?id=11`（あとで監査するページ）を出しても、保存のページの URL と
+  // あとのページへのリンクは変わらない（再開で同じ保存を読める）。要求の URL の値は伏せる。
+  it('keeps the checkpoint page URL and the crawl URLs, and redacts the request URLs', () => {
+    const page = `${H}/news?id=10`;
+    const later = `${H}/news?id=11`;
+    const checkpointPage = {
+      url: page,
+      result: {
+        pageUrl: page,
+        finalUrl: page,
+        evidence: {
+          network: { requests: [
+            { requestId: 'R1', url: page, isNavigationRequest: true, isMainFrame: true, redirectChainRequestIds: [] },
+            { requestId: 'R2', url: `${H}/news?id=1`, isNavigationRequest: false, isMainFrame: true, redirectChainRequestIds: [] },
+            { requestId: 'R3', url: later, isNavigationRequest: false, isMainFrame: true, redirectChainRequestIds: [] },
+          ], responses: [{ requestId: 'R1', url: page, status: 200 }] },
+          links: [{ rawHref: '/news?id=11', url: later }, { rawHref: '/news?id=12', url: `${H}/news?id=12` }],
+        },
+      },
+    };
+    const output = redactRecordedRequestUrlsInValue(checkpointPage, { keptUrls: [page, later, `${H}/news?id=12`] });
+    expect(output.url).toBe(page);
+    expect(output.result.pageUrl).toBe(page);
+    expect(output.result.finalUrl).toBe(page);
+    expect(output.result.evidence.links).toEqual(checkpointPage.result.evidence.links);
+    expect(output.result.evidence.network.requests[1]?.url).toBe(`${H}/news?id=${REDACTED}`);
+  });
 });
 
 // T44R3 の M-1: 字句の中の ASCII の連なりを引くとき、末尾の行と列（`:\d+(:\d+)?`）・閉じ括弧・`,`・`.` と、先頭の `(`・`url(` を外した形でも引く。
@@ -383,17 +420,24 @@ describe('T44R4: the stripped forms do not rewrite the page identity', () => {
     expect(output.config.site.startUrl).toBe(`${H}/s?id=1:1`);
   });
 
-  // T44R5 の m-1: 同じ芯の identity が多くても、時間は字句の長さに比例する（一覧をたどらない）。
-  it(`keeps the time within the named limit with ${String(SAME_CORE_IDENTITIES)} identities of the same core`, () => {
-    const value = {
-      pages: Array.from({ length: SAME_CORE_IDENTITIES }, (_unused, index) => ({ pageUrl: `${H}/p?id=1:${String(index + 2)}` })),
+  // T44R5 の m-1: 同じ芯の identity が多くても、時間は字句の長さに比例する（一覧をたどらない）。DEF-282: 上限の秒でなく、大きさを変えた比で確かめる。
+  it('grows the time linearly with the identities of the same core', () => {
+    const valueOf = (identities: number) => ({
+      pages: Array.from({ length: identities }, (_unused, index) => ({ pageUrl: `${H}/p?id=1:${String(index + 2)}` })),
       requests: [{ url: `${H}/p?id=1` }],
-      big: `${H}/p?id=1:1, `.repeat(SAME_CORE_IDENTITIES),
-    };
-    // 速さは CPU の時間で測る（TS-d。DEF-153 と同じ型の揺らぎが、組 G・DF-1 の報告で出た）。
-    const stopwatch = startCpuStopwatch();
-    const output = redactRecordedRequestUrlsInValue(value);
-    expect(stopwatch.elapsedMs()).toBeLessThan(SAME_CORE_TIME_LIMIT_MS);
+      big: `${H}/p?id=1:1, `.repeat(identities),
+    });
+    // 速さは CPU の時間で測る（TS-d）。
+    const shortestCpuMsOf = (identities: number): number => Math.min(...Array.from({ length: SAME_CORE_REPEATS }, () => {
+      const value = valueOf(identities);
+      const stopwatch = startCpuStopwatch();
+      redactRecordedRequestUrlsInValue(value);
+      return stopwatch.elapsedMs();
+    }));
+    const small = shortestCpuMsOf(SAME_CORE_IDENTITIES);
+    const large = shortestCpuMsOf(SAME_CORE_IDENTITIES * SAME_CORE_SCALE);
+    expect(large / small).toBeLessThan(SAME_CORE_MAX_GROWTH);
+    const output = redactRecordedRequestUrlsInValue(valueOf(SAME_CORE_IDENTITIES));
     expect(output.big.startsWith(`${H}/p?id=${REDACTED}:1, `)).toBe(true);
     expect(output.pages[SAME_CORE_IDENTITIES - 1]?.pageUrl).toBe(`${H}/p?id=1:${String(SAME_CORE_IDENTITIES + 1)}`);
   }, REDACTION_TEST_TIMEOUT_MS);
@@ -407,5 +451,38 @@ describe('T44R4: the stripped forms do not rewrite the page identity', () => {
     });
     expect(output.config.site.startUrl).toBe(startUrl);
     expect(output.viewport.requestedUrl).toBe(`${H}/news?id=1:10`);
+  });
+});
+
+// MEM-1（DEF-266）: 伏せ字を 2 つの段に分ける。1 回目で Run 全体の照らす表を作り、2 回目で部分（ページなど）ごとに表で伏せる。結果は 1 回の伏せ字と同じ。
+describe('MEM-1: the table of the whole Run, then each part, gives the same result as one pass', () => {
+  const H = 'http://127.0.0.1:5000';
+  /** ページ 1 の要求（止めた POST と文書でない要求）が、ページ 2 の文と Run の Finding に現れ、ページ 2 の URL が要求の URL から始まる Run の形。 */
+  const runValue = () => ({
+    run: { startUrl: `${H}/`, retries: [{ url: `${H}/list?page=2&sort=a` }] },
+    pages: [
+      {
+        pageUrl: `${H}/form`,
+        evidence: [{ payload: {
+          requests: [
+            { requestId: 'R1', url: `${H}/form`, isNavigationRequest: true, isMainFrame: true, redirectChainRequestIds: [] },
+            { requestId: 'R2', url: `${H}/api/b?mk=SECRET7`, isNavigationRequest: false, isMainFrame: true, redirectChainRequestIds: [] },
+            { requestId: 'R3', url: `${H}/list?page=2`, isNavigationRequest: false, isMainFrame: false, redirectChainRequestIds: [] },
+          ],
+          responses: [{ requestId: 'R1', url: `${H}/form`, status: 200 }],
+        } }, { payload: { blockedRequests: [{ method: 'POST', url: `${H}/submit?order=SECRET8`, reason: 'NON_READ_METHOD' }] } }],
+      },
+      { pageUrl: `${H}/list?page=2&sort=a`, texts: [`例: GET ${H}/api/b?mk=SECRET7 と /submit?order=SECRET8`, `${H}/list?page=2`] },
+    ],
+    findings: [{ message: `遮断しました（例: POST ${H}/submit?order=SECRET8）。` }],
+  });
+
+  it.each([{}, { keptUrls: [`${H}/list?page=2`] }, { matchValues: false }])('redacts the same with %j', (options) => {
+    const value = runValue();
+    const rest = { ...value, pages: [] };
+    const table = recordedRequestUrlRedactionTableOf([rest, ...value.pages], options);
+    const twoPasses = { ...redactRecordedRequestUrlsByTable(rest, table), pages: value.pages.map((part) => redactRecordedRequestUrlsByTable(part, table)) };
+    expect(JSON.stringify(twoPasses)).toBe(JSON.stringify(redactRecordedRequestUrlsInValue(value, options)));
+    expect(JSON.stringify(twoPasses).includes('SECRET')).toBe(options.matchValues === false);
   });
 });

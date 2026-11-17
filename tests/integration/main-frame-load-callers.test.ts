@@ -2,12 +2,11 @@
 // `src/browser/main-frame-load.ts` に 1 つにまとめる前後で、3 つの呼ぶ側の観測（`observeMainFrameLoad` の結果）が変わらないことを固定する。
 // - `navigatePage`（`src/orchestration/page-navigation.ts`。`waitUntil: 'domcontentloaded'`）
 // - `collectSiteMetadata` の各ファイルの取得（`src/crawl/site-metadata.ts`。`waitUntil: 'domcontentloaded'`。受け口 `afterNavigation`）
-// - `auditInteraction` の候補の読み込み（`src/interaction/isolated-auditor.ts`。`waitUntil: 'load'`。受け口 `afterTargetLoad`。
-//   観測とともに、読み込みの直後に止めた診断の記録の結果を渡す）
+// - `auditInteraction` の候補の読み込み（`src/interaction/isolated-auditor.ts`。`waitUntil: 'load'`。受け口 `afterTargetLoad`）
 // 終わり方の表: 応答あり（2xx・4xx・5xx）、応答なし（`null`。同じ文書の中のナビゲーション）、期限切れの例外、読み込みの失敗の例外
 // （サーバが接続を切る）、ページを閉じた後。呼ぶ側の作りで起こせない行は、表に載せない（理由を各表に書く）。
 // まとめた部品（`settleMainFrameLoad`）そのものの終わり方も、同じ行の表で確かめる。
-// 実際の headless の Chromium（テストの既定と、CLI と同じ起動の設定の両方）と、テストの中の 127.0.0.1 のサーバで確かめる。
+// 実際の headless の Chromium（テストの既定。CLI の回では CLI と同じ起動の設定）と、テストの中の 127.0.0.1 のサーバで確かめる。
 import { readFile } from 'node:fs/promises';
 import type { IncomingMessage, ServerResponse } from 'node:http';
 import { resolve } from 'node:path';
@@ -17,16 +16,14 @@ import { BrowserContextFactory } from '../../src/browser/context-factory.js';
 import { settleMainFrameLoad, type MainFrameLoadObservation } from '../../src/browser/main-frame-load.js';
 import { isPlaywrightTimeoutError } from '../../src/browser/playwright-errors.js';
 import type { Viewport } from '../../src/config/types.js';
-import type { NavigationDiagnostics } from '../../src/core/contracts.js';
 import { safeErrorMessage } from '../../src/core/errors.js';
-import { MAX_ERROR_MESSAGE_LENGTH } from '../../src/core/limits.js';
 import { collectSiteMetadata } from '../../src/crawl/site-metadata.js';
 import { auditInteraction } from '../../src/interaction/isolated-auditor.js';
 import { IdAllocator } from '../../src/orchestration/id-allocator.js';
 import { chromiumNetErrorCode, navigatePage } from '../../src/orchestration/page-navigation.js';
 import type { InteractionCandidate } from '../../src/safety/interaction-policy.js';
 import { SafetyLedger } from '../../src/safety/safety-ledger.js';
-import { isCliChromiumSelected, launchCliChromium, launchHeadlessChromium } from '../helpers/chromium.js';
+import { DEFAULT_CHROMIUM_LAUNCHERS, isCliChromiumSelected } from '../helpers/chromium.js';
 import { discoverInteractionCandidate, interactionAuditInput } from '../helpers/gate-harness.js';
 import { startLoopbackHttpServer, type LoopbackHttpServer } from '../helpers/loopback-server.js';
 import { NO_PACING_WAIT } from '../helpers/navigation-pacer.js';
@@ -82,7 +79,6 @@ function detailKind(detail: string | null): string | null {
     return null;
   }
   expect(detail.length).toBeGreaterThan(0);
-  expect(detail.length).toBeLessThanOrEqual(MAX_ERROR_MESSAGE_LENGTH);
   const code = chromiumNetErrorCode(detail);
   if (code !== null) {
     return code;
@@ -128,29 +124,16 @@ function sendDocument(response: ServerResponse, status: number, body: string, co
  */
 const BAD_GATEWAY_STATUS = 502;
 
-interface Launcher {
-  readonly launch: () => Promise<Browser>;
-  /** Interaction の候補の読み込みで、サーバが接続を切ったときの観測。 */
-  readonly interactionResetObservation: ObservationSummary;
-}
-
 /** CLI と同じ起動の設定で、サーバが接続を切ったときの Interaction の候補の読み込みの観測（上の説明の 2 つ目）。 */
 const CLI_INTERACTION_RESET_OBSERVATION = failed('FAILED', 'net::ERR_HTTP_RESPONSE_CODE_FAILURE', BAD_GATEWAY_STATUS);
 
 /**
- * PRE42-CC 組 Z（DF-2b の発見）: テストの既定の Chromium（`launchHeadlessChromium`）は、CLI の回（`BEAKSIGHT_TEST_DEFAULT_CHROMIUM=cli`）では CLI の
- * 起動の設定に替わる。そのときは、既定の Chromium の名前の組も、CLI の起動の設定の観測を期待する（`isCliChromiumSelected`）。
+ * Interaction の候補の読み込みで、サーバが接続を切ったときの観測。PRE42-CC 組 Z（DF-2b の発見）: テストの既定の Chromium（`launchHeadlessChromium`）は、
+ * CLI の回（`BEAKSIGHT_TEST_DEFAULT_CHROMIUM=cli`）では CLI の起動の設定に替わる。そのときは、CLI の起動の設定の観測を期待する（`isCliChromiumSelected`）。
  */
-const LAUNCHERS: readonly (readonly [string, Launcher])[] = [
-  ['the default test Chromium', {
-    launch: () => launchHeadlessChromium(),
-    interactionResetObservation: isCliChromiumSelected() ? CLI_INTERACTION_RESET_OBSERVATION : ok(BAD_GATEWAY_STATUS),
-  }],
-  ['the CLI launch settings', { launch: () => launchCliChromium(), interactionResetObservation: CLI_INTERACTION_RESET_OBSERVATION }],
-];
+const INTERACTION_RESET_OBSERVATION = isCliChromiumSelected() ? CLI_INTERACTION_RESET_OBSERVATION : ok(BAD_GATEWAY_STATUS);
 
-describe.each(LAUNCHERS)('the observations of the three callers of page.goto (CCX-7a, %s)', (_name, launcher) => {
-  const { launch } = launcher;
+describe.each(DEFAULT_CHROMIUM_LAUNCHERS)('the observations of the three callers of page.goto (CCX-7a, %s)', (_name, launch) => {
   let browser: Browser;
   let server: LoopbackHttpServer;
   let accordion: string;
@@ -234,7 +217,7 @@ describe.each(LAUNCHERS)('the observations of the three callers of page.goto (CC
       : {
         status: 'REJECTED',
         timeout: isPlaywrightTimeoutError(settlement.reason),
-        detail: detailKind(safeErrorMessage(settlement.reason, MAX_ERROR_MESSAGE_LENGTH)),
+        detail: detailKind(safeErrorMessage(settlement.reason)),
         frozen,
       };
   }
@@ -397,19 +380,12 @@ describe.each(LAUNCHERS)('the observations of the three callers of page.goto (CC
       });
     }, TEST_TIMEOUT_MS);
 
-    interface TargetLoad {
-      readonly observations: readonly ObservationSummary[];
-      /** 受け口に渡った診断の記録の状態（読み込みの直後に止めた観察の結果）。 */
-      readonly diagnostics: readonly NavigationDiagnostics['status'][];
-    }
-
     async function auditTarget(
       path: DocumentPath,
       options: { readonly navigationTimeoutMs?: number; readonly closePageBeforeLoad?: boolean } = {},
-    ): Promise<TargetLoad> {
+    ): Promise<readonly ObservationSummary[]> {
       const factory = factoryFor();
       const observations: MainFrameLoadObservation[] = [];
-      const diagnostics: NavigationDiagnostics['status'][] = [];
       await auditInteraction({
         ...interactionAuditInput({ factory, origin: server.origin, viewport, path, candidate }),
         ...(options.navigationTimeoutMs === undefined ? {} : { navigationTimeoutMs: options.navigationTimeoutMs }),
@@ -422,12 +398,11 @@ describe.each(LAUNCHERS)('the observations of the three callers of page.goto (CC
             },
           }
           : {}),
-        afterTargetLoad: (observation, navigationDiagnostics) => {
+        afterTargetLoad: (observation) => {
           observations.push(observation);
-          diagnostics.push(navigationDiagnostics.status);
         },
       });
-      return { observations: observations.map(summarize), diagnostics };
+      return observations.map(summarize);
     }
 
     it.each([
@@ -435,22 +410,22 @@ describe.each(LAUNCHERS)('the observations of the three callers of page.goto (CC
       ['a 4xx response', PATHS.notFound, ok(NOT_FOUND_STATUS)],
       ['a 5xx response', PATHS.unavailable, ok(SERVICE_UNAVAILABLE_STATUS)],
     ] as const)('observes %s', async (_case, path, expected) => {
-      expect(await auditTarget(path)).toEqual({ observations: [expected], diagnostics: ['OBSERVED'] });
+      expect(await auditTarget(path)).toEqual([expected]);
     }, TEST_TIMEOUT_MS);
 
     it('observes the timeout exception', async () => {
       expect(await auditTarget(PATHS.hang, { navigationTimeoutMs: SHORT_LOAD_TIMEOUT_MS }))
-        .toEqual({ observations: [failed('TIMEOUT', 'TIMEOUT_MESSAGE')], diagnostics: ['OBSERVED'] });
+        .toEqual([failed('TIMEOUT', 'TIMEOUT_MESSAGE')]);
     }, TEST_TIMEOUT_MS);
 
     it('observes the load failure exception', async () => {
       expect(await auditTarget(PATHS.reset))
-        .toEqual({ observations: [launcher.interactionResetObservation], diagnostics: ['OBSERVED'] });
+        .toEqual([INTERACTION_RESET_OBSERVATION]);
     }, TEST_TIMEOUT_MS);
 
     it('observes the exception after the page was closed', async () => {
       expect(await auditTarget(PATHS.ok, { closePageBeforeLoad: true }))
-        .toEqual({ observations: [failed('FAILED', 'CLOSED_MESSAGE')], diagnostics: ['NOT_OBSERVED'] });
+        .toEqual([failed('FAILED', 'CLOSED_MESSAGE')]);
     }, TEST_TIMEOUT_MS);
   });
 });

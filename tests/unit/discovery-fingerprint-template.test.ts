@@ -16,6 +16,7 @@ import {
   computeCandidateDigests,
   concretePathOfTemplate,
   pagePathTemplateOptionsOf,
+  pageTemplatePathOf,
   pathTemplateOptionsOf,
   recordIdOfTemplates,
   recordIdSegmentPairOfTemplates,
@@ -239,5 +240,45 @@ describe('T38f: the page path template options of a page path', () => {
     expect(pagePathTemplateOptionsOf('/', isRecordId)).toEqual([]);
     expect(pagePathTemplateOptionsOf('/会員/一覧', isRecordId)).toEqual([]);
     expect(pagePathTemplateOptionsOf('/admin/members/1', () => false)).toEqual([]);
+  });
+});
+
+describe('DEF-208-4 F: the page path template of the discovery (the same type is read once)', () => {
+  it('replaces every record id like segment with {id}', () => {
+    expect(pageTemplatePathOf('/f/items/101')).toBe(`/f/items/${PATH_TEMPLATE_ID_SEGMENT}`);
+    expect(pageTemplatePathOf('/f/items/102')).toBe(pageTemplatePathOf('/f/items/101'));
+    expect(pageTemplatePathOf('/orgs/7/items/9/edit')).toBe(`/orgs/${PATH_TEMPLATE_ID_SEGMENT}/items/${PATH_TEMPLATE_ID_SEGMENT}/edit`);
+    expect(pageTemplatePathOf('/items/0b6a8f8e-0c3f-4a8a-9d3c-0b9f6d1e2a3b')).toBe(`/items/${PATH_TEMPLATE_ID_SEGMENT}`);
+  });
+
+  it('is null for a path without a record id like segment', () => {
+    expect(pageTemplatePathOf('/f/list')).toBeNull();
+    expect(pageTemplatePathOf('/admin/items/new')).toBeNull();
+    expect(pageTemplatePathOf('/')).toBeNull();
+  });
+});
+
+describe('COV-2: the state template identity digest (the candidate identity of the state structure key)', () => {
+  it('is the same for candidates whose page and action paths differ only in record id like segments', async () => {
+    const { stateTemplateIdentityDigestOf } = await import('../../src/discovery/fingerprint.js');
+    const first = stateTemplateIdentityDigestOf(editForm('101'));
+    expect(isSha256Fingerprint(first)).toBe(true);
+    expect(stateTemplateIdentityDigestOf(editForm('102'))).toBe(first);
+    // 識別の digest は今のまま（番号の違いで違う）。
+    expect(computeCandidateDigests(editForm('101')).identityDigest).not.toBe(computeCandidateDigests(editForm('102')).identityDigest);
+  });
+
+  it('differs when the fields, the words or a path segment that is not a record id differ', async () => {
+    const { stateTemplateIdentityDigestOf } = await import('../../src/discovery/fingerprint.js');
+    const base = stateTemplateIdentityDigestOf(editForm('101'));
+    expect(stateTemplateIdentityDigestOf(editForm('101', { fields: [sampleField('name')] }))).not.toBe(base);
+    expect(stateTemplateIdentityDigestOf(editForm('101', { submitterWords: [] }))).not.toBe(base);
+    expect(stateTemplateIdentityDigestOf(editForm('101', { page: { origin: SAMPLE_ORIGIN, path: '/members/101/copy' } }))).not.toBe(base);
+  });
+
+  it('keeps the path as is when it has no record id like segment, and works for a candidate without an action', async () => {
+    const { stateTemplateIdentityDigestOf } = await import('../../src/discovery/fingerprint.js');
+    const button = sampleForm({ page: { origin: SAMPLE_ORIGIN, path: '/settings' }, action: null, submitterText: '保存' });
+    expect(isSha256Fingerprint(stateTemplateIdentityDigestOf(button))).toBe(true);
   });
 });

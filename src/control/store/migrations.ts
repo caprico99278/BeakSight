@@ -4,7 +4,7 @@
 // - 基準の版より前の版（版 1〜16）の管理データは、版を読む確かめの段で、何も書かないうちに止める（`DATABASE_FROM_OLDER_VERSION`。WAL にもしない。
 //   利用者のファイルは変えない）。
 // - 基準の版の後の段（`CONTROL_MIGRATIONS`）は、基準の版の次（版 18）から 1 ずつ増える。表を足すときは、段を 1 つ足すだけにする（設計書 6）。
-//   今は空。段の文は、公開した後は変えない（公開した版の CHECK と索引が参照する値の一覧と数値は、公開した時点の写しで固定する）。
+//   版 18（COV-1）: 発見の索引の型の digest の件数の CHECK を外す。段の文は、公開した後は変えない（公開した版の CHECK と索引が参照する値の一覧と数値は、公開した時点の写しで固定する）。
 // - 版ごとに、書き込みの唯一の入口（`withWriteTransaction`。`BEGIN IMMEDIATE`）の中で、DDL → seed → `PRAGMA user_version = N` を行う。
 //   失敗したら、その版のトランザクションは元に戻る（表も版も `application_id` も）。
 // - トランザクションの中で版を読み直す（別の process が同じ版を先に済ませていたら、二重に作らない）。
@@ -12,6 +12,11 @@
 //   管理データを変えない）。
 import { formatCompactUtcTimestamp } from '../../core/utc-timestamp.js';
 import { CONTROL_SCHEMA_V17 } from './control-schema-v17.js';
+import { CONTROL_SCHEMA_V18 } from './control-schema-v18.js';
+import { CONTROL_SCHEMA_V19 } from './control-schema-v19.js';
+import { CONTROL_SCHEMA_V20 } from './control-schema-v20.js';
+import { CONTROL_SCHEMA_V21 } from './control-schema-v21.js';
+import { CONTROL_SCHEMA_V22 } from './control-schema-v22.js';
 import { STORE_META_KEYS } from './profile-records.js';
 import { ControlStoreError, toControlStoreError } from './store-errors.js';
 import type { SqliteConnection } from './sqlite-module.js';
@@ -52,8 +57,19 @@ const seedBase = (connection: SqliteConnection, context: ControlMigrationContext
 /** 基準の版 17（凍結。`control-schema-v17.ts`）。 */
 export const CONTROL_SCHEMA_BASE: ControlSchemaBase = Object.freeze({ ...CONTROL_SCHEMA_V17, seed: seedBase });
 
-/** 基準の版の後の段の一覧（凍結。版 18 から。今は空）。 */
-export const CONTROL_MIGRATIONS: readonly ControlMigration[] = Object.freeze([]);
+/**
+ * 基準の版の後の段の一覧（凍結。版 18 から）。表の文は、版ごとに 1 つのファイルに置く（版 17 の `control-schema-v17.ts` と同じ形）。
+ * - 版 18（COV-1。`control-schema-v18.ts`）: 発見の索引の型の digest と鍵と欄の対応の digest の一覧の件数の CHECK を外す。
+ * - 版 19（L12b。`control-schema-v19.ts`）: 実行の許可と書き込みの結果の、対象のレコードの ID の長さの上限（64 文字）を外す（使える文字の決まりは残す）。
+ * - 版 20（URL-LEN。`control-schema-v20.ts`）: 発見の索引・ジョブ・書き込みの結果・READ の確かめの定義の、URL と URL の path の長さの上限と、URL を含む JSON の
+ *   全体の長さの上限を外す（空でないこと・形の決まりは残す）。
+ * - 版 21（LZ-3a。`control-schema-v21.ts`）: 発見のジョブの、読み切れた画面の path の数の上限（10,000）を外す（JSON の配列の決まりは残す）。
+ * - 版 22（DN-1。`control-schema-v22.ts`）: プロファイルの表示の設定に、画面に出す名前の列を足す（前の版の行は名前なし）。
+ */
+export const CONTROL_MIGRATIONS: readonly ControlMigration[] = Object.freeze([
+  CONTROL_SCHEMA_V18, CONTROL_SCHEMA_V19, CONTROL_SCHEMA_V20, CONTROL_SCHEMA_V21, CONTROL_SCHEMA_V22,
+]);
+
 
 /** この BeakSight が知る最新の版（基準の版と、その後の段の数）。 */
 export const CONTROL_SCHEMA_VERSION: number = CONTROL_SCHEMA_BASE.version + CONTROL_MIGRATIONS.length;

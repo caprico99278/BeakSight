@@ -4,8 +4,8 @@
  * - 対象は、ジョブの行の Run のディレクトリ（出力先の中の相対）の中だけ。出力先は、ジョブのプロファイルのターゲット設定の `output.directory` を
  *   リポジトリの root で解決したもの（監査のワーカーと同じ解決。ワーカーは cwd をリポジトリの root にして `resolve` する）。
  * - 配るのは、許可の一覧のファイルだけ: `run.json`、`audit.json`、`report.html`、ChatGPT 用バンドルの ZIP（`isBundleFileName`）、`audit.json` が
- *   参照するもの（`audit.json` の `pages` のページの `page.json` と `visible-text.txt`、Evidence のスクリーンショットの相対パス）。
- *   `audit.json` は `run.json` の内容（`run`）を含むので、`run.json` の参照も `audit.json` から読む（`run.json` そのものは、相対パスを持たない）。
+ *   参照するもの（ページの `page.json` と `visible-text.txt`、Evidence のスクリーンショットの相対パス）。MEM-4（DEF-266）: 参照は `audit.json` を
+ *   丸ごと読まずに、そのページの `page.json` から見分ける（`src/core/run-page-artifact-references.ts` の `isRunPageArtifactReference`。見分け方は今どおり）。
  *   スクリーンショットの相対パスは、そのページの `pages/<pageId>/` の下の、スクリーンショットのファイルの名前（`SCREENSHOT_FILE_NAMES`）のもの
  *   だけを受ける（`checkpoint/` など、ほかの場所を指す値は受けない）。それ以外は 404。
  *   T27f: 発見のジョブの `discovery.json` と、READ の確かめのジョブの `read-evidence.json` も、決まった名前の成果物として配る（ダウンロード）。
@@ -31,7 +31,9 @@ import { createHash } from 'node:crypto';
 import { readdir } from 'node:fs/promises';
 import { extname, resolve } from 'node:path';
 import type { WriteReportCheck } from '../../../../src/control/job/job-records.js';
-import type { AuditJobView } from '../../../../src/control/job/job-store.js';
+import { readAllJobs, type AuditJobView } from '../../../../src/control/job/job-store.js';
+import { FINISHED_AUDIT_JOB_STATE, WORKER_AUDIT_JOB_KIND } from '../../../../src/core/audit-job-values.js';
+import { readAuditStageLinks } from '../../../../src/core/audit-stage-links.js';
 import { getProfile } from '../../../../src/control/store/profile-store.js';
 import { WORKER_JOB_ID_PATTERN } from '../../../../src/control/worker-protocol.js';
 import {
@@ -41,26 +43,24 @@ import {
   APPROVAL_SUMMARY_ARTIFACT_FILE_NAME,
   DISCOVERY_ARTIFACT_FILE_NAME,
   ENTRY_CHECK_ARTIFACT_FILE_NAME,
-  PAGES_ARTIFACT_DIRECTORY,
   READ_EVIDENCE_ARTIFACT_FILE_NAME,
+  REPORT_SUMMARY_ARTIFACT_FILE_NAME,
   RUN_ARTIFACT_FILE_NAMES,
-  SCREENSHOT_FILE_NAMES,
   actionBundleFileName,
   artifactFilePath,
-  bundleFileNameTimestampOf,
+  newestBundleFileSetOf,
   isActionBundleFileName,
   isBundleFileName,
   isPortableRelativeArtifactPath,
-  pageArtifactRelativePath,
 } from '../../../../src/core/artifact-layout.js';
 import {
   DEFAULT_CONTAINED_ARTIFACT_FILE_MAX_BYTES,
   inspectRealArtifactEntry,
   readContainedArtifactFile,
+  streamContainedArtifactFile,
 } from '../../../../src/core/contained-artifact-file.js';
 import { isRecord } from '../../../../src/core/guards.js';
-import { isPageId } from '../../../../src/core/ids.js';
-import { compareCodeUnits } from '../../../../src/core/text.js';
+import { isRunPageArtifactReference } from '../../../../src/core/run-page-artifact-references.js';
 import { validateArtifact, type ArtifactSchemaName } from '../../../../src/core/schema-validator.js';
 import { LOCAL_UI_AUDIT_TEXT } from '../../../../src/presentation/messages.js';
 import { ARTIFACT_ROUTE_PREFIX, ARTIFACT_STYLE_HASH_RESPONSE_HEADER, artifactRoutePath } from '../security/artifact-route';
@@ -69,10 +69,11 @@ import { localUiRepositoryRoot, localUiStore } from './control-store';
 import { loadTargetContext } from './target-config';
 
 /**
- * 成果物の 1 つのファイルを読む大きさの上限（バイト）。値は、リンクをたどらない読み取りの部品の既定の上限（ChatGPT 用バンドルの ZIP を
- * 十分に超える値）と同じにする（同じ意味の値を 2 つ持たない）。`audit.json` を読んで参照を集めるときも、この上限で読む。
+ * 成果物の 1 つのファイルを読む大きさの上限（バイト）。値は、リンクをたどらない読み取りの部品の既定の上限と同じにする（同じ意味の値を 2 つ持たない）。
+ * MEM-4: 参照は `audit.json` を読まずに、ページの `page.json` から集める（`isRunPageArtifactReference`）。AUD-1d: ChatGPT 用バンドルの部は、この上限を
+ * 当てず、読みながら送る（`streamContainedArtifactFile`）。
  */
-export const ARTIFACT_FILE_MAX_BYTES = DEFAULT_CONTAINED_ARTIFACT_FILE_MAX_BYTES;
+const ARTIFACT_FILE_MAX_BYTES = DEFAULT_CONTAINED_ARTIFACT_FILE_MAX_BYTES;
 
 /** 成果物の応答の状態。 */
 const ARTIFACT_STATUS = Object.freeze({ OK: 200, NOT_FOUND: 404, METHOD_NOT_ALLOWED: 405 } as const);
@@ -117,9 +118,6 @@ const attachmentContentDispositionOf = (fileName: string): string => {
   return `attachment; filename="${fallback}"; filename*=UTF-8''${encoded}`;
 };
 
-/** スクリーンショットのファイルの名前（撮り方ごと）。 */
-const SCREENSHOT_NAMES: ReadonlySet<string> = new Set(Object.values(SCREENSHOT_FILE_NAMES));
-
 /**
  * ジョブの詳細に出す成果物の種類（表示の文言は画面の側で選ぶ）。T27f: 発見のジョブの `discovery.json` と、READ の確かめのジョブの
  * `read-evidence.json` を足した（どちらも、値・トークン・選択肢の label を持たない成果物。URL は書くときに伏せ字を通してある）。
@@ -148,6 +146,8 @@ export interface JobArtifactView {
   readonly relativePath: string;
   /** 成果物の Server Routes の URL のパス。 */
   readonly href: string;
+  /** AUD-1d: 部に分けた ChatGPT 用バンドルの、部の番号と数（2 部以上のときだけ）。 */
+  readonly part?: { readonly partNumber: number; readonly partCount: number };
 }
 
 /** 書き込みのジョブの報告の成果物の種類（T32g。親の確かめが `VALID` のジョブだけ配る）。 */
@@ -207,6 +207,25 @@ const runDirectoryOf = async (job: AuditJobView): Promise<string | null> => {
   return artifactFilePath(resolve(localUiRepositoryRoot(), context.targetConfig.output.directory), job.runDirectory);
 };
 
+/**
+ * OP-R（設計書 `2026-10-27-beaksight-one-pass-flow-design.md` 4.1.9 の R1）: プロファイルの、`notAfter`（UTC の 14 桁。null は問わない）までに作った最後の終わった
+ * 点検（監査）のジョブの成果物の、点検の段が見つけたリンクの URL（見つけた順。読み方は J1 と同じ共通の部品 `readAuditStageLinks`）。ジョブがない・読めなければ空。
+ * 自動の下書きが、登録の画面の 1 つ上の一覧の画面を、点検の段のリンクから選ぶために使う。
+ */
+export const readLatestAuditStageLinkUrls = createServerOnlyFn(async (profileId: string, notAfter: string | null): Promise<readonly string[]> => {
+  const job = readAllJobs(localUiStore()).find((candidate) => candidate.profileId === profileId && candidate.jobKind === WORKER_AUDIT_JOB_KIND
+    && candidate.state === FINISHED_AUDIT_JOB_STATE && candidate.runDirectory !== null && (notAfter === null || candidate.createdAt <= notAfter));
+  if (job === undefined) {
+    return [];
+  }
+  try {
+    const runDirectory = await runDirectoryOf(job);
+    return runDirectory === null ? [] : (await readAuditStageLinks(runDirectory)).map(({ url }) => url);
+  } catch {
+    return [];
+  }
+});
+
 /** 相対パスが、リンクでないファイルとしてあるか（調べられないときは、ないとみなす）。 */
 const isRealFile = async (runDirectory: string, relativePath: string): Promise<boolean> => {
   try {
@@ -217,29 +236,26 @@ const isRealFile = async (runDirectory: string, relativePath: string): Promise<b
 };
 
 /**
- * バンドルの名前の、新しい順（名前の日時 `bundleFileNameTimestampOf` の新しい順。日時が同じなら、名前のコード単位の逆の順）。
- * PRE42-BN: 名前にプロファイルの名前が入るので、名前の順では新しい順にならない。
+ * Run のディレクトリの直下の ChatGPT 用バンドルの名前（日時の新しい順の最初の組。AUD-1d: 部に分けたバンドルは、同じ組の全部の部を部の番号の順に。なければ空）。
+ * リンクは数えない。
  */
-const compareBundleNamesNewestFirst = (left: string, right: string): number =>
-  compareCodeUnits(bundleFileNameTimestampOf(right) ?? '', bundleFileNameTimestampOf(left) ?? '') || compareCodeUnits(right, left);
-
-/** Run のディレクトリの直下の ChatGPT 用バンドルの名前（日時の新しい順の最初。なければ `null`）。リンクは数えない。 */
-const bundleNameOf = async (runDirectory: string): Promise<string | null> => {
+const bundleNamesOf = async (runDirectory: string): Promise<readonly string[]> => {
   let names: readonly string[];
   try {
     names = (await readdir(runDirectory, { withFileTypes: true }))
       .filter((entry) => entry.isFile() && isBundleFileName(entry.name))
-      .map((entry) => entry.name)
-      .sort(compareBundleNamesNewestFirst);
+      .map((entry) => entry.name);
   } catch {
-    return null;
+    return [];
   }
+  const real: string[] = [];
   for (const name of names) {
     if (await isRealFile(runDirectory, name)) {
-      return name;
+      real.push(name);
     }
   }
-  return null;
+  // 組の選び方と部の並びは、名前の owner（`newestBundleFileSetOf`）の 1 か所。
+  return newestBundleFileSetOf(real);
 };
 
 /**
@@ -257,12 +273,18 @@ const JOB_RESULT_DOCUMENTS = Object.freeze({
   // AS-b: 監査の Run の `run.json`（ジョブの詳細が、監査の段の送信の扱いと通した数を読む）。ジョブの ID を持たないので、Run の ID がこのジョブの Run の ID で
   // あることを確かめる（`isDocumentOfJob`）。
   run: { fileName: RUN_ARTIFACT_FILE_NAMES.run, schema: 'run' },
+  // PL-R（plain UI の設計書 14 章、13 章の 13）: 監査の報告の小さなまとめ（作業の画面の要点が、問題の数を読む。`audit.json` は読まない）。`run.json` と同じく、
+  // Run の ID で確かめる。配らない（許可の一覧には入れない）。
+  'report-summary': { fileName: REPORT_SUMMARY_ARTIFACT_FILE_NAME, schema: 'report-summary' },
 } as const satisfies Record<string, { readonly fileName: string; readonly schema: ArtifactSchemaName }>);
 export type JobResultDocumentKind = keyof typeof JOB_RESULT_DOCUMENTS;
 
-/** 文書がこのジョブのものか（`run.json` は Run の ID、ほかはジョブの ID で確かめる）。 */
+/** ジョブの ID を持たず、Run の ID で確かめる文書（`run.json` と、PL-R の報告の小さなまとめ）。 */
+const RUN_ID_CHECKED_DOCUMENTS: ReadonlySet<JobResultDocumentKind> = new Set(['run', 'report-summary']);
+
+/** 文書がこのジョブのものか（`run.json` と報告の小さなまとめは Run の ID、ほかはジョブの ID で確かめる）。 */
 const isDocumentOfJob = (job: AuditJobView, kind: JobResultDocumentKind, value: Readonly<Record<string, unknown>>): boolean =>
-  kind === 'run' ? job.runId !== null && value['runId'] === job.runId : value['jobId'] === job.jobId;
+  RUN_ID_CHECKED_DOCUMENTS.has(kind) ? job.runId !== null && value['runId'] === job.runId : value['jobId'] === job.jobId;
 
 /** T32g: 配る前にスキーマとジョブの ID を確かめ直す、書き込みの報告の JSON（Run のディレクトリからの相対パス → 文書の種類）。 */
 const CHECKED_WRITE_REPORT_DOCUMENTS: ReadonlyMap<string, JobResultDocumentKind> = new Map([
@@ -330,10 +352,16 @@ export const listJobArtifacts = createServerOnlyFn(async (job: AuditJobView): Pr
       found.push({ ...artifact, href: artifactRoutePath(job.jobId, artifact.relativePath) });
     }
   }
-  const bundle = await bundleNameOf(runDirectory);
-  if (bundle !== null) {
-    found.push({ kind: 'BUNDLE', relativePath: bundle, href: artifactRoutePath(job.jobId, bundle) });
-  }
+  // AUD-1d: 部に分けたバンドルは、全部の部を部の番号の順に（部の番号と数を添える）。
+  const bundles = await bundleNamesOf(runDirectory);
+  bundles.forEach((bundle, index) => {
+    found.push({
+      kind: 'BUNDLE',
+      relativePath: bundle,
+      href: artifactRoutePath(job.jobId, bundle),
+      ...(bundles.length > 1 ? { part: { partNumber: index + 1, partCount: bundles.length } } : {}),
+    });
+  });
   if (isWriteReportDistributable(job)) {
     for (const artifact of WRITE_REPORT_ARTIFACTS) {
       if (await isRealFile(runDirectory, artifact.relativePath)) {
@@ -363,46 +391,8 @@ export const readJobResultDocument = createServerOnlyFn(async (job: AuditJobView
   }
 });
 
-/** スクリーンショットの相対パスとして受けるか（そのページの `pages/<pageId>/` の下の、スクリーンショットのファイルの名前のもの）。 */
-const isScreenshotPathOfPage = (relativePath: unknown, pageId: string): relativePath is string =>
-  isPortableRelativeArtifactPath(relativePath)
-  && relativePath.startsWith(`${PAGES_ARTIFACT_DIRECTORY}/${pageId}/`)
-  && SCREENSHOT_NAMES.has(relativePath.slice(relativePath.lastIndexOf('/') + 1));
-
-/** `audit.json` が参照する相対パス（読めない、形が違う場合は空）。 */
-const referencedPathsOf = async (runDirectory: string): Promise<ReadonlySet<string>> => {
-  const reading = await readContainedArtifactFile(runDirectory, RUN_ARTIFACT_FILE_NAMES.audit, { maxBytes: ARTIFACT_FILE_MAX_BYTES });
-  if (!reading.ok) {
-    return new Set();
-  }
-  let document: unknown;
-  try {
-    document = JSON.parse(reading.bytes.toString('utf8')) as unknown;
-  } catch {
-    return new Set();
-  }
-  const pages = isRecord(document) && Array.isArray(document['pages']) ? (document['pages'] as unknown[]) : [];
-  const paths = new Set<string>();
-  for (const page of pages) {
-    if (!isRecord(page) || !isPageId(page['pageId'])) {
-      continue;
-    }
-    const pageId = page['pageId'];
-    paths.add(pageArtifactRelativePath(pageId, 'page'));
-    paths.add(pageArtifactRelativePath(pageId, 'visibleText'));
-    const evidence = Array.isArray(page['evidence']) ? (page['evidence'] as unknown[]) : [];
-    for (const record of evidence) {
-      const payload = isRecord(record) && record['type'] === 'screenshot' && isRecord(record['payload']) ? record['payload'] : null;
-      if (payload !== null && isScreenshotPathOfPage(payload['relativePath'], pageId)) {
-        paths.add(payload['relativePath']);
-      }
-    }
-  }
-  return paths;
-};
-
 /**
- * 許可の一覧に入るか（決まった名前とバンドルは、そのまま。ほかは `audit.json` の参照）。T32g: 書き込みの報告の 3 つの決まった名前と、
+ * 許可の一覧に入るか（決まった名前とバンドルは、そのまま。ほかはページの成果物の参照）。T32g: 書き込みの報告の 3 つの決まった名前と、
  * `action-run.json` から決まる書き込みのバンドルの名前は、報告を配るジョブ（親の確かめが `VALID`）だけ。
  */
 const isAllowedArtifactPath = async (job: AuditJobView, runDirectory: string, relativePath: string): Promise<boolean> => {
@@ -414,7 +404,7 @@ const isAllowedArtifactPath = async (job: AuditJobView, runDirectory: string, re
   }
   return FIXED_ARTIFACT_PATHS.has(relativePath)
     || isBundleFileName(relativePath)
-    || (await referencedPathsOf(runDirectory)).has(relativePath);
+    || (await isRunPageArtifactReference(runDirectory, relativePath));
 };
 
 /** 要求の URL のパスから、ジョブの ID と、Run のディレクトリからの相対パスを読む。読めなければ `null`。 */
@@ -488,6 +478,23 @@ export const serveJobArtifact = async (request: Request): Promise<Response> => {
   const runDirectory = await runDirectoryOf(job);
   if (runDirectory === null || !(await isAllowedArtifactPath(job, runDirectory, parsed.relativePath))) {
     return notFound();
+  }
+  // AUD-1d（設計者の判断 2026-11-09 の案 3）: ChatGPT 用バンドル（部を含む）は、同じ確かめを通したうえで、大きさの上限を当てずに読みながら送る（BeakSight の
+  // 都合で落とせないファイルを作らない）。ほかの成果物は、今のまま上限つきで読む。
+  if (isBundleFileName(parsed.relativePath)) {
+    const streaming = await streamContainedArtifactFile(runDirectory, parsed.relativePath);
+    if (!streaming.ok) {
+      return notFound();
+    }
+    return new Response(streaming.stream, {
+      status: ARTIFACT_STATUS.OK,
+      headers: {
+        'Content-Type': contentType,
+        'Content-Length': String(streaming.size),
+        'X-Content-Type-Options': 'nosniff',
+        'Content-Disposition': attachmentContentDispositionOf(attachmentFileNameOf(job.runDirectory, parsed.relativePath)),
+      },
+    });
   }
   const reading = await readContainedArtifactFile(runDirectory, parsed.relativePath, { maxBytes: ARTIFACT_FILE_MAX_BYTES });
   if (!reading.ok) {

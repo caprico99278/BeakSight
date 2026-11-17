@@ -13,11 +13,11 @@ BeakSight は、文章の自然さや配色の美しさのような、意味や�
 | モード | 内容 | 使う場所 |
 | --- | --- | --- |
 | 公開サイトの読み取りだけの監査（`PUBLIC_PASSIVE`） | ログインせずに、`GET` と `HEAD` だけでページを観測します。 | CLI と管理画面 |
-| テスト環境の認証つきの監査（`TEST_AUTH_PASSIVE`） | テスト環境にログインした後の画面を、読み取りだけで監査します。ログインは、人が開いたブラウザで行うか、Windows では BeakSight が保存した資格情報で行います。 | 管理画面だけ |
-| 承認された書き込み（`TEST_APPROVED_WRITE`） | テスト環境の管理画面の操作の候補を見つけ、人が承認したシナリオに従って、登録（CREATE）か更新（UPDATE）を 1 回の Run で 1 件だけ送り、結果を照合します。 | 管理画面だけ |
+| テスト環境の認証つきの監査（`TEST_AUTH_PASSIVE`） | テスト環境にログインした後の画面を、書き込みをせずに監査します（ページが自動でする通信は、削除のほかは止めないのが管理画面の既定です。「[監査の段の送信の扱い](doc/spec/safety.md#監査の段の送信の扱い)」）。1 回目は人が開いたブラウザで手でログインし、Windows では、その後 BeakSight が自動でログインします。 | 管理画面だけ |
+| 承認された書き込み（`TEST_APPROVED_WRITE`） | テスト環境の管理画面の登録の画面を見つけ、プロファイルの詳細の一覧でチェックした画面だけ、点検の最後に登録（CREATE）と更新（UPDATE）を 1 件ずつ送り、結果を照合します（チェックが承認を兼ねます）。 | 管理画面だけ |
 
 - 認証つきの監査と書き込みは、テスト環境だけに使います。本番には使いません。書き込みは、本番から隔離されていることを確かめてから行います。隔離が未確認のテスト環境で読み取りだけを行う扱いは「[実テスト環境の手順](doc/spec/real-test-environment.md)」にあります。
-- 認証つきの監査と書き込みは、テスト用の小さなサイトで確かめています。実際のテスト環境では、まだ確かめていません（「[実テスト環境の手順](doc/spec/real-test-environment.md)」）。
+- 認証つきの監査と書き込みは、テスト用の小さなサイトで確かめています。実際のテスト環境では、サイト 1 つで、ログイン・点検・API の登録 1 件までを確かめました。更新とフォームの送信の書き込みは、まだ確かめていません（「[実テスト環境で確かめたこと](doc/spec/real-test-environment.md#実テスト環境で確かめたこと2026-11-02-時点)」）。
 - 導入から最初の監査までは「[導入](doc/spec/getting-started.md)」に、3 つのモードの通しの使い方は「[通しの使い方](doc/spec/end-to-end-usage.md)」にあります。
 
 設計の詳細は [doc/design/](doc/design/) を参照してください。
@@ -95,6 +95,10 @@ node dist/cli/index.js run --config local/targets/<対象名>.json --headless --
 
 監査プロファイルを登録し、3 つのモードの監査と書き込みを動かす、このコンピュータの中だけで動く画面です。
 
+Windows では、このフォルダの `BeakSight.cmd` をダブルクリックすると起動します。macOS・Linux では `bash beaksight.sh` で起動します。どちらも、足りないもの（合う版の Node.js、依存パッケージ、Playwright の Chromium）を自動で用意してから、画面を起動します（Node.js は BeakSight 専用に `local/runtime/` に置き、PC 全体の設定は変えません）。`BeakSight.cmd --port 4400` のように、引数も渡せます。
+
+これまでどおり、次のコマンドでも起動できます。
+
 ```bash
 npm run setup:local
 npm run ui
@@ -118,7 +122,7 @@ npm run ui
 - [CLI](doc/spec/cli.md): オプションの細かい決まり、headless で使うブラウザ、終了コード、CLI の表示、Windows PowerShell での日本語の表示
 - [監査の対象の設定](doc/spec/configuration.md): 設定のファイルの書き方、既定値、`config/targets/` と `local/` の使い分け
 - [中断と再開](doc/spec/resume.md): 続きからの再開、`--new`、Ctrl+C で止める、実行時間の上限、再開のための保存、タスク スケジューラ
-- [サイトが応答しないとき](doc/spec/site-unavailability.md): サイトの不調を検知したときの止まり方、確かめ直し、診断の記録
+- [サイトが応答しないとき](doc/spec/site-unavailability.md): サイトの不調を検知したときの止まり方、確かめ直し
 - [出力と結果の読み方](doc/spec/output.md): 出力の構成、HTML レポート、Run Status、Finding と Evidence、ChatGPT 用のバンドル
 - [読み取り専用と安全](doc/spec/safety.md): 読み取り専用の保証の範囲、headed で実行するときの注意、Safety Ledger の読み方
 - [サイトへの負荷](doc/spec/site-load.md): 読み込みの間隔と回数、キャッシュ、full audit での上限の選び方、実績の確かめ方

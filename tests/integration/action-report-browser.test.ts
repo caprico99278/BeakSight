@@ -1,5 +1,4 @@
-// T32f（Task 32 の設計書 4.1 の `action-report.html` の行）: 書き込みの報告の HTML を、本物の Chromium（headless。テストの既定と CLI の起動の設定の
-// 両方）で開き、要素と文があることを確かめる（CSP の下でスタイルが効くかは、画面の配布の T32g の範囲）。ネットワークには出ない（文字列を開くだけ）。
+// T32f（Task 32 の設計書 4.1 の `action-report.html` の行）: 書き込みの報告の HTML を、本物の Chromium（headless。テストの既定）で開き、要素と文があることを確かめる（CSP の下でスタイルが効くかは、画面の配布の T32g の範囲）。ネットワークには出ない（文字列を開くだけ）。
 import type { Browser } from 'playwright';
 import { afterAll, beforeAll, describe, expect, it } from 'vitest';
 import { ACTION_RESULT_CATALOG, HUMAN_DECISION_CATALOG } from '../../src/presentation/catalog.js';
@@ -7,15 +6,11 @@ import { ACTION_REPORT_TEXT } from '../../src/presentation/messages.js';
 import { renderActionReport } from '../../src/report/action-report.js';
 import { buildActionViewModel } from '../../src/report/action-view-model.js';
 import { verifiedUpdateDocuments } from '../helpers/action-report-samples.js';
-import { launchCliChromium, launchHeadlessChromium } from '../helpers/chromium.js';
+import { DEFAULT_CHROMIUM_LAUNCHERS } from '../helpers/chromium.js';
 
-const CASES = [
-  ['the default test Chromium', () => launchHeadlessChromium()],
-  ['the CLI launch settings', () => launchCliChromium()],
-] as const;
 const TEST_TIMEOUT_MS = 60_000;
 
-describe.each(CASES)('the write report HTML in a browser (%s)', (_name, launch) => {
+describe.each(DEFAULT_CHROMIUM_LAUNCHERS)('the write report HTML in a browser (%s)', (_name, launch) => {
   let browser: Browser;
 
   beforeAll(async () => {

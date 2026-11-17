@@ -1,7 +1,6 @@
 /**
  * 書き出しの途中の一時ファイルの名前の決まり（`.<名前>.<UUID>.tmp`。中断した Run の再開の設計書 4.3、4.5。T24h-3 で
- * `src/report/artifact-writer.ts` から移した）。`ArtifactWriter` の一時ファイルと、古いロックを動かす先の名前（`src/core/lock-file.ts`）が
- * 同じ形を使う。そのため、どちらも、再開のときの後始末（`ArtifactWriter.cleanUpForResume`）が `isTemporaryFileName` で見分けて消す。
+ * `src/report/artifact-writer.ts` から移した）。再開のときの後始末（`ArtifactWriter.cleanUpForResume`）が `isTemporaryFileName` で見分けて消す。
  */
 import { randomUUID } from 'node:crypto';
 import { basename, dirname, join } from 'node:path';

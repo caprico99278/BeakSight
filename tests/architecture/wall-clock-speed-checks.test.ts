@@ -45,11 +45,17 @@ const TIMER_WAIT = '注入した短い期限のタイマーの待ち（期限の
 
 /** 除外（閉じた一覧。ファイル → 件数と理由）。 */
 const WALL_CLOCK_EXCEPTIONS: FileExceptions = Object.freeze({
-  'tests/component/layout-collector.test.ts': { count: 2, reason: `観察の開始の期限と、評価の期限（V8）。${TIMER_WAIT}` },
+  'tests/component/layout-collector.test.ts': { count: 1, reason: `評価の期限（V8）。${TIMER_WAIT}` },
   'tests/unit/discovery-isolated-read.test.ts': { count: 1, reason: `session を開く期限と切り離しの期限。${TIMER_WAIT}` },
-  'tests/unit/discovery-settle.test.ts': { count: 1, reason: `落ち着きの待ちの期限の下限。${TIMER_WAIT}` },
+  'tests/unit/discovery-settle.test.ts': { count: 2, reason: `落ち着きの待ちの期限の下限と、文書が消えたときに子の見張りの長さを待たないこと。${TIMER_WAIT}` },
+  // RB-14b: Guard の偽の口のテストを結合から単体へ移した。取り消しの証拠の待ち（DEF-026・DEF-052）の長さの内に決まるか。
+  'tests/unit/passive-request-guard.test.ts': { count: 2, reason: `取り消しの証拠の待ちの期限の内に決まるか。${TIMER_WAIT}` },
   'tests/unit/passive-session-open.test.ts': { count: 5, reason: `session を開く期限と Context を閉じる期限。${TIMER_WAIT}` },
   'tests/unit/run-coordinator.test.ts': { count: 2, reason: `Browser と Context を閉じる期限。${TIMER_WAIT}` },
+  // L6/L3-1: 1 画面の見張りが、注入した見張りの長さの内に画面を終えるか。
+  'tests/unit/discovery-screen-watch.test.ts': { count: 1, reason: `1 画面の見張りの長さの上限。${TIMER_WAIT}` },
+  // L6/L3-1 の続き（T18）: 押した後の事実の待ちが、静まりの窓の下限と、前の決まった時間より早く返るか。
+  'tests/unit/submission-probe-settle-after-action.test.ts': { count: 5, reason: `押した後の落ち着きの待ちと最短の観察の長さの下限と上限。${TIMER_WAIT}` },
 });
 
 const planted = (content: string): readonly string[] => wallClockElapsedIn(sourceFileOf('tests/unit/planted.test.ts', content));

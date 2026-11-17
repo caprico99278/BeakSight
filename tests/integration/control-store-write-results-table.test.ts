@@ -7,9 +7,6 @@
 // 一時のフォルダだけを使い、終わったら消す。
 import type { DatabaseSync } from 'node:sqlite';
 import { describe, expect, it } from 'vitest';
-import { MAX_SAFE_RECORD_ID_LENGTH } from '../../src/control/actions/action-outcome.js';
-import { MAX_API_SHAPE_PATH_LENGTH } from '../../src/core/api-request-shape.js';
-import { MAX_URL_LENGTH } from '../../src/core/limits.js';
 import {
   countOf,
   foreignTablesOf,
@@ -103,6 +100,8 @@ describe('Control store: the rows of a write result (T30d)', () => {
     })],
     ['a failed row (input error)', verifiedRow({ http_status: 422, response_judgement: 'INPUT_ERROR', record_id: null, read_verification: null,
       result: 'FAILED', reason: 'INPUT_ERROR' })],
+    // L12b（設計書 `2026-11-09-beaksight-remove-limits-design.md` 6.2。設計者の判断 2）: 版 19 で登録の ID の長さの上限（前は 256 文字）を外した。
+    ['a verified row with a record id of 300 characters', verifiedRow({ record_id: 'r'.repeat(300) })],
   ])('accepts %s', (_label, row) => {
     const connection = latestConnection();
     insertRow(connection, 'write_results', row);
@@ -162,7 +161,9 @@ describe('Control store: the write kind, the target and the update evidence of a
     ['an unknown update row without evidence', pendingRow({ write_kind: 'UPDATE', target_record_id: '42', submission: 'UNKNOWN', result: 'UNKNOWN',
       reason: 'NO_RESPONSE', reservation_state: 'UNKNOWN', settled_at: SETTLED_AT })],
     ['a blocked update row', blockedRow({ write_kind: 'UPDATE', target_record_id: '42' })],
-    ['a target id of the maximum length', pendingRow({ write_kind: 'UPDATE', target_record_id: 'x'.repeat(MAX_SAFE_RECORD_ID_LENGTH) })],
+    // L12b: 版 19 で長さの上限を外した（前の上限 64 を超える ID も、300 文字の ID も受ける）。
+    ['a target id over the former limit', pendingRow({ write_kind: 'UPDATE', target_record_id: 'x'.repeat(65) })],
+    ['a target id of 300 characters', pendingRow({ write_kind: 'UPDATE', target_record_id: 'x'.repeat(300) })],
   ])('accepts %s', (_label, row) => {
     const connection = latestConnection();
     insertRow(connection, 'write_results', row);
@@ -179,7 +180,7 @@ describe('Control store: the write kind, the target and the update evidence of a
     ['a target with a space', pendingRow({ write_kind: 'UPDATE', target_record_id: '4 2' })],
     ['a non-ASCII target', pendingRow({ write_kind: 'UPDATE', target_record_id: 'レコード' })],
     ['an empty target', pendingRow({ write_kind: 'UPDATE', target_record_id: '' })],
-    ['a too long target', pendingRow({ write_kind: 'UPDATE', target_record_id: 'x'.repeat(MAX_SAFE_RECORD_ID_LENGTH + 1) })],
+    // L12b（設計書 `2026-11-09-beaksight-remove-limits-design.md` 6.2）: 版 19 で対象のレコードの ID の長さの上限を外したので、長い ID は拒まない（上の受ける場合）。
     ['evidence of a create row', verifiedRow({ update_evidence: EVIDENCE })],
     ['evidence of a pending update row', pendingRow({ write_kind: 'UPDATE', target_record_id: '42', update_evidence: EVIDENCE })],
     ['evidence that is not an object', verifiedRow({ write_kind: 'UPDATE', target_record_id: '42', update_evidence: '[]' })],
@@ -199,8 +200,9 @@ describe('Control store: the transport and the API summary of a write result (T4
     ['a pending API row', pendingRow(API_COLUMNS)],
     ['a verified API row', verifiedRow(API_COLUMNS)],
     ['a blocked API row', blockedRow(API_COLUMNS)],
-    ['an API row of the longest origin and path', pendingRow({
-      ...API_COLUMNS, api_origin: `http://${'a'.repeat(MAX_URL_LENGTH - 7)}`, api_path_shape: `/${'p'.repeat(MAX_API_SHAPE_PATH_LENGTH - 1)}`,
+    // URL-LEN（版 20）: Origin と path の形の長さの上限（前は 2,048・1,024）はない。
+    ['an API row of an origin and a path longer than the former limits', pendingRow({
+      ...API_COLUMNS, api_origin: `http://${'a'.repeat(2_049)}`, api_path_shape: `/${'p'.repeat(1_025)}`,
     })],
   ])('accepts %s', (_label, row) => {
     const connection = latestConnection();
@@ -222,9 +224,7 @@ describe('Control store: the transport and the API summary of a write result (T4
     ['a bad shape digest', pendingRow({ ...API_COLUMNS, api_shape_digest: 'sha256:x' })],
     ['an unknown method', pendingRow({ ...API_COLUMNS, api_method: 'GET' })],
     ['an empty origin', pendingRow({ ...API_COLUMNS, api_origin: '' })],
-    ['a too long origin', pendingRow({ ...API_COLUMNS, api_origin: `http://${'a'.repeat(MAX_URL_LENGTH - 6)}` })],
     ['a path shape without "/"', pendingRow({ ...API_COLUMNS, api_path_shape: 'rest/v1/members' })],
-    ['a too long path shape', pendingRow({ ...API_COLUMNS, api_path_shape: `/${'p'.repeat(MAX_API_SHAPE_PATH_LENGTH)}` })],
     ['a VERIFIED API row without a matched READ', verifiedRow({ ...API_COLUMNS, read_verification: 'UNDETERMINED' })],
     ['a NOT_SENT API row with a response', blockedRow({ ...API_COLUMNS, http_status: 200 })],
   ])('rejects %s', (_label, row) => {

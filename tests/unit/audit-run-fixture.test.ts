@@ -4,7 +4,7 @@ import { mkdtemp, rm } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { afterEach, describe, expect, it } from 'vitest';
-import { screenshotRelativePath } from '../../src/core/artifact-layout.js';
+import { RUN_ARTIFACT_FILE_NAMES, pageArtifactRelativePath, screenshotRelativePath } from '../../src/core/artifact-layout.js';
 import type { AuditRunResult, EvidenceRecord } from '../../src/core/contracts.js';
 import { INTERACTION_REASON_CODES_BY_STATUS, type InteractionEvidence } from '../../src/core/evidence-types.js';
 import { createEvidenceId, createFindingId } from '../../src/core/ids.js';
@@ -50,7 +50,13 @@ afterEach(async () => {
 
 /** run.json、audit.json、各ページの page.json、各 Finding を、それぞれのスキーマで検証した結果の一覧（合わないものだけ）。 */
 async function schemaErrorsOf(result: AuditRunResult): Promise<string[]> {
-  const audit = { schemaVersion: 'audit-schema/1.0', run: result.run, pages: result.pages, findings: result.findings };
+  // REC-2: audit.json は目録（run.json のパス、ページの page.json のパス、Run だけの Finding）。
+  const audit = {
+    schemaVersion: 'audit-schema/2.0',
+    run: RUN_ARTIFACT_FILE_NAMES.run,
+    pages: result.pages.map(({ pageId }) => pageArtifactRelativePath(pageId, 'page')),
+    findings: result.findings,
+  };
   const checks: [string, Promise<unknown>][] = [
     ['run', validateArtifact('run', result.run)],
     ['audit', validateArtifact('audit', audit)],

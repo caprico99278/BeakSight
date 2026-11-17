@@ -16,9 +16,21 @@ import { isApiWriteKeyNameSecretLike } from '../../src/discovery/classify.js';
 // T44g（Task 44 の設計書 P4-2。設計者の判断）: 誤検知の語を、名前つきの閉じた一覧（`API_WRITE_SECRET_LIKE_KEY_EXCLUDED_NAMES`）で除く。比べ方は今の部分一致の
 // まま、鍵の名前の比べる形（NFKC と大文字小文字を畳み、文字と数字以外を除いた形）が一覧の語にちょうど当たる鍵だけを除く。`session_count`・`hmac_ok` は除かない。
 describe('T44g: the excluded false positives of the secret-like names of the API body keys (policy 6, P4-2)', () => {
-  it('lists author and footprint as the excluded names', () => {
-    expect([...API_WRITE_SECRET_LIKE_KEY_EXCLUDED_NAMES]).toEqual(['author', 'footprint']);
+  // OP-K（K2。設計者の判断 4）: 作成者の番号の鍵（`authorid` の比べる形）を足した（画面が自動で入れる作成者の番号で、認証の秘密ではない）。
+  it('lists author, authorid and footprint as the excluded names', () => {
+    expect([...API_WRITE_SECRET_LIKE_KEY_EXCLUDED_NAMES]).toEqual(['author', 'authorid', 'footprint']);
   });
+
+  it.each(['author_id', 'authorId', 'AUTHOR_ID', 'author-id', 'authorid'])('does not treat the author number key %s as secret-like (OP-K)', (key) => {
+    expect(isApiWriteKeyNameSecretLike(key)).toBe(false);
+  });
+
+  it.each(['auth_token', 'authorization', 'author_id_token', 'authorid_token', 'auth_id', 'auth', 'x_auth_key', 'authorid_secret'])(
+    'keeps the key %s secret-like after the author number key was excluded (OP-K)',
+    (key) => {
+      expect(isApiWriteKeyNameSecretLike(key)).toBe(true);
+    },
+  );
 
   it.each(['author', 'Author', 'AUTHOR', 'footprint', 'foot_print', 'FootPrint'])('does not treat the excluded key %s as secret-like', (key) => {
     expect(isApiWriteKeyNameSecretLike(key)).toBe(false);

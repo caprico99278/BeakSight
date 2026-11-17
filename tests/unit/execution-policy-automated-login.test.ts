@@ -12,17 +12,32 @@ import { scanSource } from '../architecture/source-scan.js';
 const POLICY_PATH = resolve(process.cwd(), 'src', 'control', 'execution-policy.ts');
 
 describe('executable auth strategies of the automated login (T26d-2)', () => {
-  it('accepts AUTOMATED_LOGIN of the authenticated passive audit as a strategy, on any platform', () => {
+  // MI-5（設計書 `2026-10-26-beaksight-minimal-input-ux-design.md` 4.5）: 書き込みのモードの監査も、手動のログインと自動ログインで始められる。
+  it('accepts AUTOMATED_LOGIN of the authenticated passive audit and of the write mode (MI-5) as a strategy, on any platform', () => {
     const accepted = AUDIT_MODES.flatMap((mode) =>
       AUTH_STRATEGIES.filter((auth) => isExecutableAuthStrategy(mode, auth)).map((auth) => `${mode}/${auth}`));
-    expect(accepted).toEqual(['PUBLIC_PASSIVE/NONE', 'TEST_AUTH_PASSIVE/MANUAL_SESSION', 'TEST_AUTH_PASSIVE/AUTOMATED_LOGIN']);
-    expect(EXECUTABLE_AUTH_STRATEGIES).toEqual({ PUBLIC_PASSIVE: ['NONE'], TEST_AUTH_PASSIVE: ['MANUAL_SESSION', 'AUTOMATED_LOGIN'] });
+    // NL-1（設計書 `2026-11-06-beaksight-no-login-test-site-design.md` 3.1 の 3）: テストの 2 つのモードは、ログインしない方式（`NONE`）も受ける
+    // （保存は loopback の Origin だけ。`profile-policy.ts`）。
+    expect(accepted).toEqual([
+      'PUBLIC_PASSIVE/NONE',
+      'TEST_AUTH_PASSIVE/NONE',
+      'TEST_AUTH_PASSIVE/MANUAL_SESSION',
+      'TEST_AUTH_PASSIVE/AUTOMATED_LOGIN',
+      'TEST_APPROVED_WRITE/NONE',
+      'TEST_APPROVED_WRITE/MANUAL_SESSION',
+      'TEST_APPROVED_WRITE/AUTOMATED_LOGIN',
+    ]);
+    expect(EXECUTABLE_AUTH_STRATEGIES).toEqual({
+      PUBLIC_PASSIVE: ['NONE'],
+      TEST_AUTH_PASSIVE: ['MANUAL_SESSION', 'AUTOMATED_LOGIN', 'NONE'],
+      TEST_APPROVED_WRITE: ['MANUAL_SESSION', 'AUTOMATED_LOGIN', 'NONE'],
+    });
     expect(Object.isFrozen(EXECUTABLE_AUTH_STRATEGIES)).toBe(true);
   });
 
-  it('never accepts the automated login of the other modes, or values that are not strategies', () => {
+  it('never accepts the automated login of the public mode, or values that are not strategies', () => {
     for (const [mode, auth] of [
-      ['TEST_APPROVED_WRITE', 'AUTOMATED_LOGIN'],
+      ['TEST_APPROVED_WRITE', 'automated_login'],
       ['PUBLIC_PASSIVE', 'AUTOMATED_LOGIN'],
       ['TEST_AUTH_PASSIVE', 'automated_login'],
       ['TEST_AUTH_PASSIVE', null],

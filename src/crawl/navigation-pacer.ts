@@ -38,6 +38,13 @@ export interface NavigationPacer {
    * Guard を通らない）は、開始の時刻だけで数える。待った時間（ms。0 以上の整数）を返す。呼び出し側は、待った時間を期限から除く（設計書 4.4）。
    */
   beforeNavigation(): Promise<number>;
+  /**
+   * DEF-236（設計書 `2026-11-09-beaksight-visible-pacing-wait-design.md` 3.1 の 3）: 次の読み込みを始めてよい目標の時刻（`beforeNavigation` と同じ式）まで
+   * 待つだけの口。読み込みとして記録しない（回数も開始の時刻も変えない）。待った時間（ms。0 以上の整数）を記録の待った時間の合計（`totalWaitMs`）に
+   * 足して返す。呼ぶ側は、前の画面を閉じずに見せたまま待つ（証拠を集め終えた後、閉じる前）。待ちの後の `beforeNavigation()` は、ほぼ待たない
+   * （待つ間に送った時刻が記録されたなら、その分だけ待つ）。`beforeNavigation()` と同じ鎖で、呼ばれた順に 1 つずつ処理する。
+   */
+  waitUntilNextNavigationDue(): Promise<number>;
   /** これまでの読み込みの回数、待った時間の合計、最後の読み込みの開始の時刻（凍結した値）。 */
   snapshot(): NavigationPacerSnapshot;
   /**
@@ -134,21 +141,27 @@ export function createNavigationPacer(options: NavigationPacerOptions): Navigati
     return Math.min(Math.max(...origins) + minIntervalMs, capAtMs);
   };
 
-  const pace = async (): Promise<number> => {
+  /** 目標の時刻まで待ち、呼ばれた時刻と待ち終えた時刻を返す（`pace` と `waitUntilDue` が共有する。記録は変えない）。 */
+  const sleepUntilDue = async (): Promise<{ readonly calledAtMs: number; readonly endedAtMs: number }> => {
     const calledAtMs = currentTimeMs();
-    let startedAtMs = calledAtMs;
+    let endedAtMs = calledAtMs;
     if (minIntervalMs > 0) {
       for (let sleepCount = 0; sleepCount < MAX_SLEEPS_PER_NAVIGATION; sleepCount += 1) {
         const targetStartAtMs = targetStartAtMsOf(calledAtMs);
-        if (targetStartAtMs === null || startedAtMs >= targetStartAtMs) {
+        if (targetStartAtMs === null || endedAtMs >= targetStartAtMs) {
           break;
         }
         // 待っている途中で時計が戻ると、残りが `minIntervalMs` より長くなる。1回の待ちは `minIntervalMs` 以下に切り詰める
         // （L2-fix-round-2）。時計が戻らなければ、残りは `minIntervalMs` 以下なので、切り詰めは働かない。
-        await sleep(Math.min(targetStartAtMs - startedAtMs, minIntervalMs));
-        startedAtMs = currentTimeMs();
+        await sleep(Math.min(targetStartAtMs - endedAtMs, minIntervalMs));
+        endedAtMs = currentTimeMs();
       }
     }
+    return { calledAtMs, endedAtMs };
+  };
+
+  const pace = async (): Promise<number> => {
+    const { calledAtMs, endedAtMs: startedAtMs } = await sleepUntilDue();
     const waitedMs = Math.max(0, startedAtMs - calledAtMs);
     state = Object.freeze({
       navigationCount: state.navigationCount + 1,
@@ -158,11 +171,26 @@ export function createNavigationPacer(options: NavigationPacerOptions): Navigati
     return waitedMs;
   };
 
+  // DEF-236: 目標の時刻まで待つだけ（読み込みとして記録しない。待った時間だけを合計に足す）。
+  const waitUntilDue = async (): Promise<number> => {
+    const { calledAtMs, endedAtMs } = await sleepUntilDue();
+    const waitedMs = Math.max(0, endedAtMs - calledAtMs);
+    state = Object.freeze({ ...state, totalWaitMs: state.totalWaitMs + waitedMs });
+    return waitedMs;
+  };
+
+  const chained = (step: () => Promise<number>): Promise<number> => {
+    const current = previous.then(step);
+    previous = current.catch(() => undefined);
+    return current;
+  };
+
   return Object.freeze({
     beforeNavigation(): Promise<number> {
-      const current = previous.then(pace);
-      previous = current.catch(() => undefined);
-      return current;
+      return chained(pace);
+    },
+    waitUntilNextNavigationDue(): Promise<number> {
+      return chained(waitUntilDue);
     },
     snapshot(): NavigationPacerSnapshot {
       return state;
@@ -234,6 +262,8 @@ export function withAdditionalNavigationWait(pacer: NavigationPacer, options: Ad
       previous = current.catch(() => undefined);
       return current;
     },
+    // DEF-236: 見せたままの待ちは、包んだ部品の間隔だけ（口の待ちは、今どおり次の `beforeNavigation()` で待つ）。
+    waitUntilNextNavigationDue: (): Promise<number> => pacer.waitUntilNextNavigationDue(),
     snapshot: (): NavigationPacerSnapshot => pacer.snapshot(),
     raiseMinimumInterval: (minIntervalMs: number): void => pacer.raiseMinimumInterval(minIntervalMs),
     recordDocumentRequestSent: (): void => pacer.recordDocumentRequestSent(),

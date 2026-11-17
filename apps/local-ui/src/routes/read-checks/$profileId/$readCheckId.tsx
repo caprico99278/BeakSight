@@ -1,5 +1,5 @@
 import { useState } from 'react';
-import { Link, createFileRoute, notFound, useNavigate, useRouter } from '@tanstack/react-router';
+import { createFileRoute, notFound, useNavigate, useRouter } from '@tanstack/react-router';
 import { useServerFn } from '@tanstack/react-start';
 import { formatDateTime } from '../../../../../../src/presentation/format.js';
 import {
@@ -8,9 +8,10 @@ import {
   READ_CHECK_DEFINITION_REJECTION_DESCRIPTIONS,
   READ_CHECK_TARGET_KIND_LABELS,
 } from '../../../../../../src/presentation/messages.js';
+import { AdvancedSettings } from '../../../components/AdvancedSettings';
 import { ConfirmDialog } from '../../../components/ConfirmDialog';
 import { Notice } from '../../../components/Notice';
-import { PageFrame } from '../../../components/PageFrame';
+import { PageFrame, readChecksTrail } from '../../../components/PageFrame';
 import { ReadCheckForm } from '../../../components/ReadCheckForm';
 import { expectationText, parametersText } from '../../../display/read-checks';
 import {
@@ -54,28 +55,10 @@ function EditReadCheckPage() {
   };
 
   return (
-    <PageFrame title={text.pages.editReadCheck}>
-      <section className="panel">
+    <PageFrame title={text.pages.editReadCheck} trail={readChecksTrail(profile.profileId)}>
+      {/* PL-5 の修正の 1 回目（設計書 3 章の 1）: 要点のパネル（直す欄と、主のボタン「保存」1 つ）。 */}
+      <section className="panel" data-testid="read-check-edit-summary">
         <h2 className="panel-heading">{text.formHeading}</h2>
-        <dl className="facts" data-testid="read-check-current" data-revision={String(definition.revision)}>
-          <dt>{text.page.target}</dt>
-          <dd data-testid="read-check-current-target" data-target-kind={definition.targetKind}>
-            {READ_CHECK_TARGET_KIND_LABELS[definition.targetKind]}
-            {definition.targetPagePath === null ? null : <>{' '}<code>{definition.targetPagePath}</code></>}
-          </dd>
-          <dt>{text.columns.revision}</dt>
-          <dd>{LOCAL_UI_TEXT.profileForm.revisionText(definition.revision)}</dd>
-          <dt>{text.columns.updatedAt}</dt>
-          <dd>{formatDateTime(definition.updatedAt)}</dd>
-          <dt>{text.columns.parameters}</dt>
-          <dd>{parametersText(definition.definition.parameters)}</dd>
-          <dt>{text.columns.expectations}</dt>
-          <dd>
-            <ul>
-              {definition.definition.expectations.map((expectation, index) => <li key={String(index)}>{expectationText(expectation)}</li>)}
-            </ul>
-          </dd>
-        </dl>
         {!page.editable ? (
           <Notice kind="caution">
             <p data-testid="read-check-retired">{page.eligible ? text.retired : text.notEligible}</p>
@@ -99,7 +82,26 @@ function EditReadCheckPage() {
           />
         )}
       </section>
+      {/* 3 章の 1: 詳しい内容 1 つ（今の定義と、削除。何回目の変更かは出さない）。 */}
       <section className="panel">
+        <AdvancedSettings testId="read-check-advanced" openRequested={removeRejection !== null}>
+        <dl className="facts" data-testid="read-check-current" data-revision={String(definition.revision)}>
+          <dt>{text.page.target}</dt>
+          <dd data-testid="read-check-current-target" data-target-kind={definition.targetKind}>
+            {READ_CHECK_TARGET_KIND_LABELS[definition.targetKind]}
+            {definition.targetPagePath === null ? null : <>{' '}<code>{definition.targetPagePath}</code></>}
+          </dd>
+          <dt>{text.columns.updatedAt}</dt>
+          <dd>{formatDateTime(definition.updatedAt)}</dd>
+          <dt>{text.columns.parameters}</dt>
+          <dd>{parametersText(definition.definition.parameters)}</dd>
+          <dt>{text.columns.expectations}</dt>
+          <dd>
+            <ul>
+              {definition.definition.expectations.map((expectation, index) => <li key={String(index)}>{expectationText(expectation)}</li>)}
+            </ul>
+          </dd>
+        </dl>
         {removeRejection === null ? null : (
           <Notice kind="critical" heading={text.removeRejectedHeading}>
             <p data-testid="read-check-remove-rejection" data-reason={removeRejection.reason}>
@@ -111,12 +113,14 @@ function EditReadCheckPage() {
         <button type="button" className="button button--danger" data-testid="read-check-remove" onClick={() => setDialogOpen(true)}>
           {text.remove}
         </button>
+        </AdvancedSettings>
         <ConfirmDialog
           open={dialogOpen}
           title={text.removeDialog.title}
           body={text.removeDialog.body}
           confirmLabel={text.removeDialog.confirm}
           cancelLabel={text.removeDialog.cancel}
+          confirmTone="danger"
           busy={removing}
           onCancel={() => setDialogOpen(false)}
           onConfirm={() => {
@@ -135,9 +139,6 @@ function EditReadCheckPage() {
           }}
         />
       </section>
-      <p>
-        <Link to="/read-checks/$profileId" params={{ profileId: profile.profileId }} className="button">{text.backToList}</Link>
-      </p>
     </PageFrame>
   );
 }

@@ -22,17 +22,21 @@ type SettledOutcome<T> = Exclude<DeadlineOutcome<T>, { readonly status: 'DEADLIN
  * - 期限の前に完了すれば `FULFILLED`、拒否されれば `REJECTED` を返す。例外は投げない。
  * - 呼び出し時点で期限を過ぎている場合と、完了を確かめた時点で期限を過ぎている場合は `DEADLINE_EXCEEDED` を返す。
  * - 期限が有限の数でない場合は、期限を過ぎたものとして扱う（fail-closed）。
+ * - LZ-3b: 期限が `undefined` なら期限を置かない（タイマーを置かずに、操作の終わりを待つ）。期限なしを大きな数（番兵）で表さないための口。
  * - `operation` には必ず rejection handler を付けるので、期限切れの後に拒否されても unhandledRejection にならない。
  * - 期限のタイマーは、結果が決まった時点で解除する。
  */
 export async function awaitBeforeDeadline<T>(
   operation: PromiseLike<T>,
-  deadlineAtMs: number,
+  deadlineAtMs: number | undefined,
 ): Promise<DeadlineOutcome<T>> {
   const settled = Promise.resolve(operation).then<SettledOutcome<T>, SettledOutcome<T>>(
     (value) => Object.freeze({ status: 'FULFILLED', value }),
     (reason: unknown) => Object.freeze({ status: 'REJECTED', reason }),
   );
+  if (deadlineAtMs === undefined) {
+    return settled;
+  }
   if (!Number.isFinite(deadlineAtMs) || deadlineAtMs - Date.now() <= 0) {
     return DEADLINE_EXCEEDED;
   }

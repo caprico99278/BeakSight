@@ -17,7 +17,6 @@ import {
 import {
   APPROVER_LOCAL_OPERATOR,
   DEFAULT_MAX_CREATES_PER_RUN,
-  DEFAULT_MAX_CUMULATIVE_CREATES,
   MIN_SCENARIO_LIMIT,
 } from '../../src/control/approval/scenario-contracts.js';
 import { validateArtifact } from '../../src/core/schema-validator.js';
@@ -131,7 +130,8 @@ describe('approval-summary.json schema (T32c)', () => {
     expect(count.maximum).toBe(DEFAULT_MAX_CREATES_PER_RUN);
     const used = prop(prop(facts, 'cumulativeAtStart'), 'used');
     expect(used.minimum).toBe(0);
-    expect(used.maximum).toBe(DEFAULT_MAX_CUMULATIVE_CREATES);
+    // LZ-3c: 累積の上限（前は 20 件）は L12b で当てなくなったので、使った件数の最大も置かない（21 件目からの書き込みの成果物を拒まない）。
+    expect(used.maximum).toBeUndefined();
     expect(prop(facts, 'humanDecisions').maxItems).toBe(HUMAN_DECISIONS.length);
     expect(prop(facts, 'automatedActions').maxItems).toBe(AUTOMATED_ACTIONS.length);
     const then = (kindLists['then'] as JsonSchema | undefined) ?? {};
@@ -164,7 +164,8 @@ describe('approval-summary.json schema (T32c)', () => {
     ['a summary without an auth setup digest', createSummary({
       approval: { ...createSummary().approval, bound: { ...createSummary().approval.bound, authSetupDigest: null } },
     })],
-    ['a summary whose cumulative count is at the limit', createSummary({ cumulativeAtStart: { used: 20, limit: 20 } })],
+    // LZ-3c: 累積の上限は当てないので、前の既定（20 件）を超えた使った件数も受ける（21 件目からの書き込みの成果物を拒まない）。
+    ['a summary whose cumulative count is above the former default limit', createSummary({ cumulativeAtStart: { used: 21, limit: 20 } })],
   ])('accepts %s', async (_label, document) => {
     expect(await validateArtifact('approval-summary', document)).toEqual({ ok: true });
   });
@@ -185,7 +186,8 @@ describe('approval-summary.json schema (T32c)', () => {
     ['a bad approval digest', createSummary({ approval: { ...createSummary().approval, approvalDigest: 'x' } })],
     ['a bad input rule digest', createSummary({ inputRuleReference: { ruleSetId: 'rules-1', revision: 2, digest: 'x' } })],
     ['limits above the defaults', createSummary({ limits: { maxCreatesPerRun: 2, maxCumulativeCreates: 20 } })],
-    ['a TTL above the default', createSummary({ approvalTtlDays: 31 })],
+    // LZ-3c: 期限の日数は判定に使わない名残（最大はない）。0 は形の誤り。
+    ['a TTL of zero days', createSummary({ approvalTtlDays: 0 })],
     ['side effect confirmations without an item', createSummary({
       sideEffectConfirmations: (({ NOT_DESTRUCTIVE: _omitted, ...rest }) => rest)(createSummary().sideEffectConfirmations) as never,
     })],
@@ -194,7 +196,6 @@ describe('approval-summary.json schema (T32c)', () => {
     ['a bad grant time', createSummary({ grantAtStart: { ...createSummary().grantAtStart, issuedAt: '2026-10-15' } })],
     ['a reservation of two writes', createSummary({ reservationAtStart: { count: 2, reservedAt: '20261015000000' } })],
     ['a reservation of no write', createSummary({ reservationAtStart: { count: 0, reservedAt: '20261015000000' } })],
-    ['a cumulative count above the limit default', createSummary({ cumulativeAtStart: { used: 21, limit: 20 } })],
     ['a negative cumulative count', createSummary({ cumulativeAtStart: { used: -1, limit: 20 } })],
     ['an unknown human decision', createSummary({ humanDecisions: [...createSummary().humanDecisions, 'TARGET' as never] })],
     ['a duplicated automated action', createSummary({ automatedActions: [...createSummary().automatedActions, 'SUBMISSION'] })],

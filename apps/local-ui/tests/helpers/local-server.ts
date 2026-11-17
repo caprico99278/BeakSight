@@ -2,12 +2,11 @@
  * 画面のサーバのテストの補助（T23e、T23f）。一時の root、子の process の起動と停止、空きの port、Host を自由に指定できる HTTP の要求。
  * - サーバは 127.0.0.1 だけで待ち受ける。外部へは繋がない。
  * - 起動の部品がコンソールに出す `?token=` の URL を、子の process の標準出力から読む（token はテストの中だけで使い、書き出さない）。
- * - T24f: 一時の root（`built`）には、監査の本体のビルドの出力（`dist/`）も写す。画面のサーバが起動する監査のワーカーは、一時の root の
- *   `dist/worker/audit-worker.js` で、cwd は一時の root（設定のファイルと出力先は、一時の root の中だけ）。
- * - 画面のサーバは、起動の初めに、自分の場所から決めたリポジトリの root の `local-data/` に管理データを準備する。テストは、リポジトリの
- *   外の一時のフォルダ（OS の一時のフォルダ）に、画面の起動に要るものを写して起動する（`createTemporaryUiRoot`）。リポジトリの
- *   `local-data/` を作らない。データの場所を変える口（引数、環境変数）は、製品にもテストにもない。
- * - 一時の root の `node_modules` は、リポジトリの `node_modules` への junction（依存のパッケージを読むため）。片付けでは、junction を
+ * - RB-7: 一時の root（`built`）はデータの根だけ（ビルドの出力を写さない）。画面のサーバは、テストの起動の入口（`ui-test-launcher.ts`）で、リポジトリの
+ *   ビルドの出力をそのまま使い、一時の root を cwd とデータの根にして起動する（管理データ・資格情報・設定・出力は、一時の root の中だけ。リポジトリの
+ *   `local-data/` を作らない）。監査のワーカーの入口は、一時の root の `TEST_WORKER_ENTRY`（リポジトリの `dist/` を絶対の URL で読む）。
+ *   データの場所を変える口（引数、環境変数）は、製品にない（テストの起動の入口だけが、2 つ目の入口に根を入れる）。
+ * - 一時の root の `node_modules` は、リポジトリの `node_modules` への junction（ワーカーの入口が依存のパッケージを読むため）。片付けでは、junction を
  *   先に外してから（リンクの先をたどらずに）、一時のフォルダを消す。
  */
 import { spawn, spawnSync, type ChildProcess } from 'node:child_process';
@@ -16,7 +15,12 @@ import { request } from 'node:http';
 import { createServer } from 'node:net';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { fileURLToPath } from 'node:url';
+import { fileURLToPath, pathToFileURL } from 'node:url';
+import { TEST_CLI_CHROMIUM_LAUNCH_SOURCE } from '../../../../tests/helpers/test-chromium-args.js';
+import { TEST_WAITS_HOOK_SOURCE } from '../../../../tests/helpers/test-waits.js';
+import { TEST_WORKER_ENTRY } from './test-worker-entry.ts';
+
+export { TEST_WORKER_ENTRY };
 
 /** リポジトリの root（区切りは `/`、末尾の `/` なし）。 */
 export const REPO_ROOT = fileURLToPath(new URL('../../../../', import.meta.url)).replaceAll('\\', '/').replace(/\/$/u, '');
@@ -33,11 +37,14 @@ const VITE_CLI = `${REPO_ROOT}/node_modules/vite/bin/vite.js`;
 /** ビルドの出力のサーバの入口（テストの前に `npm run build:ui` が要る）。 */
 export const BUILT_SERVER_ENTRY = `${REPO_ROOT}/apps/local-ui/dist/server/server.js`;
 
-/**
- * 監査の本体のビルドの出力の、監査のワーカーの入口（テストの前に `npm run build` が要る。T24f）。一時の root に `dist/` を写し、画面のサーバは
- * 一時の root の `dist/worker/audit-worker.js` を起動する（リポジトリの `dist/` を直接は使わない）。
- */
+/** 監査の本体のビルドの出力の、監査のワーカーの入口（テストの前に `npm run build` が要る。T24f）。 */
 export const BUILT_WORKER_ENTRY = `${REPO_ROOT}/dist/worker/audit-worker.js`;
+
+/** RB-7: 一時の root のワーカーの入口が、リポジトリの監査の本体のビルドの出力を読む URL（`/` で終わる。`testLoginWorkerEntrySource` の `distPrefix`）。 */
+export const BUILT_DIST_URL = pathToFileURL(`${REPO_ROOT}/dist/`).href;
+
+/** RB-7: テストの起動の入口（データの根を入れてから、本番の起動の部品の本体を呼ぶ）。 */
+const UI_TEST_LAUNCHER = `${REPO_ROOT}/apps/local-ui/tests/helpers/ui-test-launcher.ts`;
 
 /** 一時の root に写す、例の設定のファイル（リポジトリの root から。`local/` は使わない）。 */
 export const EXAMPLE_TARGET_CONFIG = 'config/targets/example.json';
@@ -71,18 +78,26 @@ const copyFromRepository = (root: string, relativePath: string, filter?: (source
 const isCopiedSource = (source: string): boolean => !/\/apps\/local-ui\/(?:dist|node_modules)(?:\/|$)/u.test(source.replaceAll('\\', '/'));
 
 /**
- * FM-2（設計書 `2026-10-19-beaksight-fewer-manual-steps-design.md` 2.2）: 一時の root のワーカーの入口（写した `dist/worker/audit-worker.js`）を、ジョブのブラウザを
- * 表示しないテストだけの口（`runAuditWorkerProcess` の `hideJobBrowser`）で始める入口に置き換える。画面のテストのジョブのブラウザは今どおり headless（プロファイルの
- * 表示の設定の既定は表示）。リポジトリの `dist/` は変えない（写しだけ）。
+ * FM-2（設計書 `2026-10-19-beaksight-fewer-manual-steps-design.md` 2.2）: 一時の root のワーカーの入口（`TEST_WORKER_ENTRY`）を、ジョブのブラウザを
+ * 表示しないテストだけの口（`runAuditWorkerProcess` の `hideJobBrowser`）で始める入口にする。画面のテストのジョブのブラウザは今どおり headless（プロファイルの
+ * 表示の設定の既定は表示）。リポジトリの `dist/` は変えない。
  */
 const hideJobBrowserOfWorker = (root: string): void => {
+  mkdirSync(`${root}/${TEST_WORKER_ENTRY.slice(0, TEST_WORKER_ENTRY.lastIndexOf('/'))}`, { recursive: true });
   writeFileSync(
-    `${root}/dist/worker/audit-worker.js`,
-    "import { runAuditWorkerProcess } from './audit-worker-process.js';\nrunAuditWorkerProcess(process, { hideJobBrowser: true });\n",
+    `${root}/${TEST_WORKER_ENTRY}`,
+    // TEST-TIME-B: 押した後の静まりの窓と probe の観察も短くする（テストだけの口 `observationWindows`。RB-2）。
+    // RB-4 fix（M-1）: Run の Browser に、テストだけの外へ出ない引数を足す（テストだけの口 `launchRunBrowser`）。
+    // DEF-277: ログインの段の 2 つの Browser も同じ起動にする（手動のログインのプロファイルで点検を始めて止める場面がある。テストでは headless）。
+    `import { chromiumLaunchOptions, launchChromiumWith } from '${BUILT_DIST_URL}browser/chromium-launch.js';\n`
+    + `import { runAuditWorkerProcess } from '${BUILT_DIST_URL}worker/audit-worker-process.js';\n`
+    + `runAuditWorkerProcess(process, { hideJobBrowser: true,\n  launchRunBrowser: () => ${TEST_CLI_CHROMIUM_LAUNCH_SOURCE},\n`
+    + `  loginStage: { launchLoginBrowser: () => ${TEST_CLI_CHROMIUM_LAUNCH_SOURCE} },\n`
+    + `  automatedLoginStage: { launchAutomatedLoginBrowser: () => ${TEST_CLI_CHROMIUM_LAUNCH_SOURCE} },${TEST_WAITS_HOOK_SOURCE}\n});\n`,
   );
 };
 
-/** 画面の起動に要るものを、OS の一時のフォルダに写す（`local-data/` は作らない。画面のサーバが作る）。 */
+/** 画面の起動に要るものを、OS の一時のフォルダに作る（`built` はデータの根だけ。`local-data/` は作らない。画面のサーバが作る）。 */
 export const createTemporaryUiRoot = (kind: TemporaryUiRootKind): TemporaryUiRoot => {
   if (kind !== 'source' && !existsSync(BUILT_SERVER_ENTRY)) {
     throw new Error('ビルドの出力がない。先に `npm run build:ui` を実行する');
@@ -102,23 +117,12 @@ export const createTemporaryUiRoot = (kind: TemporaryUiRootKind): TemporaryUiRoo
     rmSync(root, { recursive: true, force: true });
   };
   try {
-    copyFromRepository(root, 'package.json');
     mkdirSync(`${root}/config/targets`, { recursive: true });
     copyFromRepository(root, EXAMPLE_TARGET_CONFIG);
-    if (kind === 'built') {
-      // 監査のワーカー（T24f）: 監査の本体のビルドの出力（`dist/`。スキーマを含む）を写す。ワーカーは一時の root を cwd にして動く。
-      copyFromRepository(root, 'dist');
-      hideJobBrowserOfWorker(root);
-      copyFromRepository(root, 'apps/local-ui/dist');
-      copyFromRepository(root, 'apps/local-ui/launcher');
-      copyFromRepository(root, 'apps/local-ui/src/security');
-    } else {
-      if (kind === 'combined') {
-        // 本番の起動の部品の分（起動の部品と src/security は、開発のサーバの分の写しに入る）。
-        copyFromRepository(root, 'dist');
-        hideJobBrowserOfWorker(root);
-        copyFromRepository(root, 'apps/local-ui/dist');
-      }
+    // 監査のワーカー（T24f）: ワーカーは一時の root を cwd にして動き、リポジトリの `dist/` を読む（RB-7。写さない）。
+    hideJobBrowserOfWorker(root);
+    if (kind !== 'built') {
+      copyFromRepository(root, 'package.json');
       copyFromRepository(root, 'tsconfig.json');
       copyFromRepository(root, 'src');
       copyFromRepository(root, 'schemas');
@@ -211,10 +215,10 @@ const startProcess = async (args: readonly string[], port: number, cwd: string):
   return { child, port, origin: `http://${LOOPBACK_HOST}:${port}`, tokenUrl, output: () => output };
 };
 
-/** 一時の root の起動の部品の入口。 */
-const launcherEntryOf = (root: TemporaryUiRoot): string => `${root.root}/apps/local-ui/launcher/serve.ts`;
+/** RB-7: 起動の部品の入口（どの root でも、テストの起動の入口。root は cwd とデータの根にする）。 */
+const launcherEntryOf = (_root: TemporaryUiRoot): string => UI_TEST_LAUNCHER;
 
-/** ビルドした画面を、一時の root の起動の部品（`launcher/serve.ts`）で起動する。 */
+/** ビルドした画面を、起動の部品の本体（`launcher/serve.ts` の `runLocalUiLauncher`）で、一時の root をデータの根にして起動する。 */
 export const startLauncher = async (root: TemporaryUiRoot, port: number): Promise<StartedServer> =>
   startProcess([launcherEntryOf(root), '--port', String(port), ...KEEP_RUNNING_PRESENCE_ARGUMENTS], port, root.root);
 

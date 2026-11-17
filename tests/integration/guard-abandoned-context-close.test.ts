@@ -1,7 +1,7 @@
 // DEF-110: 期限で見捨てた（`closePassiveContextBeforeDeadline` が待つのをやめた）Guard の付いた Context の close が、Browser を閉じた後に
 // reject されても、Guard は違反（`GUARDED_CONTEXT_CLOSE_FAILED`）に数えない。Context がもう存在しないことを、文言に頼らずに確かめられた
 // 場合（Guard がその Context の close の事象を見た場合）だけ、閉じたとみなす。確かめられない場合（Browser も Context も生きている）は、
-// 今のまま違反にする（fail-closed）。テストの既定の headless shell と CLI の Chromium の両方で確かめる。
+// 今のまま違反にする（fail-closed）。テストの既定の Chromium で確かめる（TEST-SLIM G1）。
 import type { Browser, BrowserContext } from 'playwright';
 import { afterAll, beforeAll, describe, expect, it } from 'vitest';
 import { startFixtureServer, type FixtureServer } from '../../fixtures/server.js';
@@ -21,7 +21,7 @@ import {
 } from '../../src/safety/passive-request-guard.js';
 import { SafetyLedger } from '../../src/safety/safety-ledger.js';
 import { overrideBrowser } from '../helpers/browser-proxies.js';
-import { launchCliChromium, launchHeadlessChromium, testContextsOf } from '../helpers/chromium.js';
+import { DEFAULT_CHROMIUM_LAUNCHERS, testContextsOf } from '../helpers/chromium.js';
 import { createDeferred } from '../helpers/deferred.js';
 import { createGuardHarness, createHarnessPage, type GuardHarness } from '../helpers/passive-guard-harness.js';
 import { createTestConfig, TEST_FACTORY_OPTIONS } from '../helpers/test-config.js';
@@ -121,10 +121,8 @@ async function waitForGuardOutcome(context: BrowserContext, ledger: SafetyLedger
   ).toBe(true);
 }
 
-describe.each([
-  { name: 'the headless shell', launch: (): Promise<Browser> => launchHeadlessChromium() },
-  { name: 'the CLI Chromium', launch: (): Promise<Browser> => launchCliChromium() },
-])('DEF-110: an abandoned guarded Context close rejected after the Browser closed, with $name', ({ launch }) => {
+// TEST-SLIM G1: 違反の数え方（close の失敗の扱い）の確かめで、サーバに届く要求の漏れではないので、既定の Chromium だけで流す。
+describe.each(DEFAULT_CHROMIUM_LAUNCHERS)('DEF-110: an abandoned guarded Context close rejected after the Browser closed, with %s', (_name, launch) => {
   let server: FixtureServer;
 
   beforeAll(async () => {

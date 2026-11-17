@@ -3,8 +3,6 @@
 import { describe, expect, it } from 'vitest';
 import {
   decideGuardRequest,
-  PAGE_INITIATED_NAVIGATION_LIMIT_PER_FRAME,
-  PAGE_SUBRESOURCE_REQUEST_LIMIT,
   UNGUARDED_PAGE_REQUEST_VIOLATION_CODE,
   type GuardPhase,
   type GuardPolicyOutcome,
@@ -158,31 +156,13 @@ describe('decideGuardRequest (CC-050)', () => {
     decideGuardRequest(inputOf({ layer: 'CDP_DOCUMENT', phase: 'FROZEN_ACTIVE', navigation: true, admitPageNavigation: admit(false) }).input);
     decideGuardRequest(inputOf({ layer: 'CDP_DOCUMENT', phase: 'PASSIVE_CLOSING', navigation: true, admitPageNavigation: admit(false) }).input);
     expect(admissions).toBe(2);
-    expect(PAGE_INITIATED_NAVIGATION_LIMIT_PER_FRAME).toBe(2);
   });
 
-  // DEF-130-fix: ページが出す文書でない要求の数の上限も、この 1 か所で、判定が通す要求だけを数えて決める（判定が止める要求、凍結と閉じる途中は数えない）。
-  it('blocks a subresource request over the limit after the judgement allows it, and counts nothing blocked, frozen or closing', () => {
+  // L10・SPEC-1: 撤廃した上限の確かめ（単体 1 つ）。判定が通す文書でない要求には、数の上限の口がなく、そのまま通す（前は 1,000 件で
+  // `PAGE_SUBRESOURCE_LIMIT_REACHED` で止めた）。
+  it('passes a subresource request the judgement allows, without a count limit (L10)', () => {
     const allowed = { kind: 'DECISION', decision: { action: 'ALLOW', delivery: 'DIRECT' } } as const;
-    let admissions = 0;
-    const admit = (result: boolean) => (): boolean => {
-      admissions += 1;
-      return result;
-    };
-    const over = inputOf({ layer: 'CDP_REQUEST', outcome: allowed, admitSubresourceRequest: admit(false) });
-    expect(decideGuardRequest(over.input)).toEqual({
-      kind: 'BLOCK_POLICY', request: REQUEST, decision: { action: 'BLOCK', category: 'REQUEST', reason: 'PAGE_SUBRESOURCE_LIMIT_REACHED' },
-    });
-    const within = inputOf({ layer: 'CDP_REQUEST', outcome: allowed, admitSubresourceRequest: admit(true) });
-    expect(decideGuardRequest(within.input)).toEqual({ kind: 'ALLOW', request: REQUEST, decision: allowed.decision });
-    expect(admissions).toBe(2);
-    expect(decideGuardRequest(inputOf({ layer: 'CDP_REQUEST', admitSubresourceRequest: admit(false) }).input)).toMatchObject({
-      kind: 'BLOCK_POLICY', decision: { reason: 'NON_READ_METHOD' },
-    });
-    decideGuardRequest(inputOf({ layer: 'CDP_REQUEST', phase: 'FROZEN_ACTIVE', admitSubresourceRequest: admit(false) }).input);
-    decideGuardRequest(inputOf({ layer: 'CDP_REQUEST', phase: 'PASSIVE_CLOSING', admitSubresourceRequest: admit(false) }).input);
-    decideGuardRequest(inputOf({ layer: 'CDP_REQUEST', outcome: { kind: 'PREFLIGHT' }, admitSubresourceRequest: admit(false) }).input);
-    expect(admissions).toBe(2);
-    expect(PAGE_SUBRESOURCE_REQUEST_LIMIT).toBe(1_000);
+    expect(decideGuardRequest(inputOf({ layer: 'CDP_REQUEST', outcome: allowed }).input))
+      .toEqual({ kind: 'ALLOW', request: REQUEST, decision: allowed.decision });
   });
 });

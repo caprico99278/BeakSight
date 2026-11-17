@@ -52,7 +52,6 @@ export type { ReadCheckPageContext } from './read-check-page-path.js';
  * - `READ_PARAMETER_NOT_ALLOWED`: 候補の欄でない、名前がない、hidden（見えない）、readonly、disabled の欄に値を送る。
  * - `READ_CANDIDATE_UNKNOWN`: 対象の候補が分からない（渡されない、識別の digest が違う）。
  * - `READ_CANDIDATE_NOT_READ`: 対象の候補の今の分類が `READ` でない。
- * - `READ_CHECK_LIMIT_EXCEEDED`: プロファイルの、取り消していない定義の数が上限（`MAX_READ_CHECK_DEFINITIONS_PER_PROFILE`）に達している。
  * - `READ_CHECK_PROFILE_NOT_FOUND`: プロファイルがない。
  * - `READ_CHECK_NOT_FOUND`: 変える・取り消す定義がない。
  * - `READ_CHECK_REVISION_CONFLICT`: 画面が読んだ版と、保存されている版が違う。
@@ -74,7 +73,6 @@ export const READ_CHECK_DEFINITION_REJECTION_REASONS = Object.freeze([
   'READ_PARAMETER_NOT_ALLOWED',
   'READ_CANDIDATE_UNKNOWN',
   'READ_CANDIDATE_NOT_READ',
-  'READ_CHECK_LIMIT_EXCEEDED',
   'READ_CHECK_PROFILE_NOT_FOUND',
   'READ_CHECK_NOT_FOUND',
   'READ_CHECK_REVISION_CONFLICT',

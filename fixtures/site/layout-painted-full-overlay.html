@@ -1,0 +1,22 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8">
+    <title>Painted full overlay fixture</title>
+    <style>
+      * { box-sizing: border-box; }
+      body { margin: 0; font-family: sans-serif; font-size: 16px; line-height: 1.25; }
+      main { width: 400px; padding: 8px; }
+      main p { margin: 0 0 8px; }
+      /* 全面の、背景を描く固定の要素（押下は受けない）。今までどおり数える。 */
+      #painted-layer { position: fixed; inset: 0; z-index: 40; pointer-events: none; background: rgba(0, 0, 0, 0.4); }
+    </style>
+  </head>
+  <body>
+    <main>
+      <h1 id="page-heading">Sample page</h1>
+      <p id="intro">This paragraph explains the page in plain words for the test.</p>
+    </main>
+    <div id="painted-layer"></div>
+  </body>
+</html>

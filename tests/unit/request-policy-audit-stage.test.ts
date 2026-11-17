@@ -5,16 +5,15 @@
 // - 監査の段の口: 登録した読み取りの手続きの呼び出しだけを、読み込みごとの回数の中で通す（`auditStageAdmission`）。token の送信先への、必須の
 //   query と違う POST（更新など）は `TOKEN_REFRESH`、ほかの読み取りでない要求は `UNREGISTERED_NON_READ`（今どおり `NON_READ_METHOD`）。
 //   承認したサービスの Origin への読み取りは、数えるために `SERVICE_ORIGIN_READ` の印を付けて通す。
-// - 読む範囲の外の静的な資源: 許可 Origin への GET のサブリソースで、種類が script・stylesheet・image・font・media なら、`auditPathPrefixes` の
-//   外でも通す（監査の段の口があるときだけ）。読まないパスと危険な語は、すべての要求に当てる。
+// - SD-2: 読む範囲・読まないパス・危険な語は、main frame の文書の読み込みだけに当てる（前の静的な資源の例外は外した）。
 // 例の値は、匿名の値（`example.com`、`example.invalid`）だけを使う。
 import { describe, expect, it } from 'vitest';
 import {
   AUDIT_STAGE_BLOCK_REASONS,
   REGISTERED_SUBMISSION_BLOCK_REASONS,
   SCRIPT_LOGIN_BLOCK_REASONS,
-  STATIC_SUBRESOURCE_TYPES,
   classifyPassiveRequest,
+  isAuditExcludedUrl,
   registeredSubmissionVerdict,
   type AuditExclusionPolicy,
   type AuditStageBlockReason,
@@ -65,7 +64,6 @@ const readAdmitted = (index: number, serviceOrigin: boolean): PassiveRequestDeci
 const serviceRead: PassiveRequestDecision = { action: 'ALLOW', delivery: 'DIRECT', auditStageAdmission: { kind: 'SERVICE_ORIGIN_READ' } };
 const blocked = (auditStageBlock: AuditStageBlockReason): PassiveRequestDecision =>
   ({ action: 'BLOCK', category: 'REQUEST', reason: 'NON_READ_METHOD', auditStageBlock });
-const excluded: PassiveRequestDecision = { action: 'BLOCK', category: 'AUDIT_EXCLUSION', reason: 'AUDIT_EXCLUDED_URL' };
 const directRead: PassiveRequestDecision = { action: 'ALLOW', delivery: 'DIRECT' };
 
 describe('T35b: the common judgment of the registered submissions', () => {
@@ -79,7 +77,6 @@ describe('T35b: the common judgment of the registered submissions', () => {
       // T36c: 自動ログインの資格情報の守りの理由を足した。
       'LOGIN_CREDENTIAL_IN_REQUEST',
     ]);
-    expect(STATIC_SUBRESOURCE_TYPES).toEqual(['script', 'stylesheet', 'image', 'font', 'media']);
   });
 
   it.each([
@@ -156,8 +153,8 @@ describe('T35b: the audit stage of the script login audit', () => {
     expect(decide(facts(method, `${SERVICE_ORIGIN}/rest/v1/members?select=*`, 'fetch'))).toEqual(serviceRead);
     expect(decide(facts(method, `${SERVICE_ORIGIN}/avatar.png`, 'image'))).toEqual(serviceRead);
     expect(decide(facts(method, `${SERVICE_ORIGIN}/frame`, 'document', true, false))).toEqual(serviceRead);
-    expect(decide(facts(method, `${SERVICE_ORIGIN}/`, 'document', true, true)))
-      .toEqual({ action: 'BLOCK', category: 'NAVIGATION', reason: 'EXTERNAL_MAIN_FRAME_NAVIGATION' });
+    // SD-2: main frame の移動は止めず、印も付けない（数えない。範囲の外へ移った画面は読み込みの側が点検しない）。
+    expect(decide(facts(method, `${SERVICE_ORIGIN}/`, 'document', true, true))).toEqual({ action: 'ALLOW', delivery: 'INSPECT_REDIRECTS' });
   });
 
   it('keeps the other reads outside the allowed origins as before (no mark)', () => {
@@ -165,62 +162,23 @@ describe('T35b: the audit stage of the script login audit', () => {
   });
 });
 
-describe('T35b: the static resources outside the read range', () => {
-  it.each(STATIC_SUBRESOURCE_TYPES)('reads a GET %s sub resource of the allowed origin outside the read range', (type) => {
-    expect(decide(facts('GET', `${APP_ORIGIN}/app.js?v=1`, type))).toEqual(directRead);
-  });
-
-  // BN-0（設計書 `2026-10-23-beaksight-bundle-beaksight-block-noise-design.md` 3.0。ユーザーの判断 2026-10-23）: 監査の段の Passive の Context では、ページが出す
-  // 文書でない GET・HEAD には、読む範囲も読まないパスも危険な語も当てない（データの GET と HEAD も読む）。種類の分からない要求と文書の読み込みは、今どおり当てる。
-  it.each([
-    ['a fetch', facts('GET', `${APP_ORIGIN}/api/members`, 'fetch')],
-    ['an xhr', facts('GET', `${APP_ORIGIN}/api/members`, 'xhr')],
-    ['an other type', facts('GET', `${APP_ORIGIN}/data.bin`, 'other')],
-    ['a HEAD script', facts('HEAD', `${APP_ORIGIN}/app.js`, 'script')],
-  ])('reads %s outside the read range in a Passive context (BN-0)', (_label, request) => {
-    expect(decide(request)).toEqual(directRead);
-  });
-
-  it.each([
-    ['an omitted type', facts('GET', `${APP_ORIGIN}/app.js`, undefined)],
-    ['a sub frame navigation', facts('GET', `${APP_ORIGIN}/other`, 'document', true, false)],
-    ['a main frame navigation', facts('GET', `${APP_ORIGIN}/other`, 'document', true, true)],
-  ])('keeps %s outside the read range excluded', (_label, request) => {
-    expect(decide(request)).toEqual(excluded);
-  });
-
-  it.each([
-    ['a fetch', facts('GET', `${APP_ORIGIN}/api/members`, 'fetch')],
-    ['a HEAD script', facts('HEAD', `${APP_ORIGIN}/app.js`, 'script')],
-  ])('keeps %s outside the read range excluded in the Interaction context (BN-0)', (_label, request) => {
-    expect(classifyPassiveRequest(request, ALLOWED_ORIGINS, {
-      auditExclusions: { ...EXCLUSIONS, applyToPageSubresourceReads: true },
-      auditStage: auditStage(),
-    })).toEqual(excluded);
-  });
-
-  it('reads the page static resources that hit the excluded paths or the dangerous terms in a Passive context, and stops them in the Interaction context (BN-0)', () => {
-    const urls = [`${APP_ORIGIN}/auth/logout/app.js`, `${APP_ORIGIN}/static/delete-icon.png`, `${APP_ORIGIN}/admin/app.js?action=logout`];
-    const types = ['script', 'image', 'script'] as const;
-    urls.forEach((url, index) => {
-      expect(decide(facts('GET', url, types[index]))).toEqual(directRead);
-      expect(classifyPassiveRequest(facts('GET', url, types[index]), ALLOWED_ORIGINS, {
-        auditExclusions: { ...EXCLUSIONS, applyToPageSubresourceReads: true },
-        auditStage: auditStage(),
-      })).toEqual(excluded);
-    });
-    // 文書の読み込みには、今どおり当てる。
-    expect(decide(facts('GET', `${APP_ORIGIN}/auth/logout`, 'document', true, true))).toEqual(excluded);
-  });
-
-  it('keeps the read range for the document loads and the Interaction context without the audit stage (the form navigation login audit)', () => {
-    // BN-0: ページの文書でない読み取りは、監査の段の口がなくても読む。
-    expect(decide(facts('GET', `${APP_ORIGIN}/app.js`, 'script'), null)).toEqual(directRead);
-    expect(decide(facts('GET', `${APP_ORIGIN}/other`, 'document', true, true), null)).toEqual(excluded);
-    expect(classifyPassiveRequest(facts('GET', `${APP_ORIGIN}/app.js`, 'script'), ALLOWED_ORIGINS, {
-      auditExclusions: { ...EXCLUSIONS, applyToPageSubresourceReads: true },
-    })).toEqual(excluded);
-    expect(decide(facts('GET', `${APP_ORIGIN}/admin/app.js`, 'script'), null)).toEqual(directRead);
+// SD-2（設計書 `2026-11-16-beaksight-action-based-delete-guard-design.md` 2.4。前の T35b の静的な資源の例外と BN-0 の Interaction の印は外した）: 読む範囲・
+// 読まないパス・危険な語は、要求の判定では当てない（監査の段の口の有無によらない）。BeakSight 自身の移動の前の判定（`isAuditExcludedUrl`）が当てる。
+describe('T35b and SD-2: the read range is not applied by the request policy', () => {
+  it('reads the page reads and the main frame loads outside the read range or hitting the exclusions, with or without the audit stage', () => {
+    for (const stage of [auditStage(), null] as const) {
+      for (const request of [
+        facts('GET', `${APP_ORIGIN}/app.js?v=1`, 'script'),
+        facts('GET', `${APP_ORIGIN}/api/members`, 'fetch'),
+        facts('HEAD', `${APP_ORIGIN}/app.js`, undefined),
+        facts('GET', `${APP_ORIGIN}/other`, 'document', true, false),
+        facts('GET', `${APP_ORIGIN}/static/delete-icon.png`, 'image'),
+      ]) {
+        expect(decide(request, stage)).toEqual(directRead);
+      }
+      expect(decide(facts('GET', `${APP_ORIGIN}/other`, 'document', true, true), stage)).toEqual({ action: 'ALLOW', delivery: 'INSPECT_REDIRECTS' });
+    }
+    expect([`${APP_ORIGIN}/other`, `${APP_ORIGIN}/auth/logout`].map((url) => isAuditExcludedUrl(url, ALLOWED_ORIGINS, EXCLUSIONS))).toEqual([true, true]);
   });
 
   it('keeps the reads inside the read range', () => {

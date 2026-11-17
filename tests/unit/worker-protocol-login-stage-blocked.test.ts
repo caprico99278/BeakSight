@@ -1,9 +1,9 @@
 // T34e（Task 34 の設計書 3.5 と 8 章の T34e の行）: ログインの段で止めた読み取りでない要求の一覧の IPC の契約（`src/control/worker-protocol.ts`、
 // `schemas/control/worker-message.schema.json`。スキーマの版は上げない）。
-// - `AUTH_STATE` の任意の項目 `blockedRequests`: 一覧（Origin、path、要求の種類、理由、回数。上限 `MAX_WORKER_LOGIN_STAGE_BLOCKED_REQUESTS`）と、一覧に
+// - `AUTH_STATE` の任意の項目 `blockedRequests`: 一覧（Origin、path、要求の種類、理由、回数。LZ-3a: 行の数の上限はない）と、一覧に
 //   入れなかった数（`unlisted`）。手動のログインの段の結果の状態（`AUTHENTICATED` とログインの段の失敗）だけが持て、自動ログインの結果と一緒には持てない。
 //   送るのは、止めた要求があったときだけ（一覧も数も空の値は拒む）。
-// - Origin は正規の直列化。path は `/` で始まり（query・fragment なし）、制御文字なし、上限の長さまで。T34e fix round 1: 値に見える区切り
+// - Origin は正規の直列化。path は `/` で始まり（query・fragment なし）、制御文字なし（URL-LEN: 長さの上限はない）。T34e fix round 1: 値に見える区切り
 //   （`src/core/url-path-redaction.ts`）が残っていない（伏せた区切り `[REDACTED]` は受ける。送信先の path は伏せない）。同じ Origin・path・種類・理由の行は
 //   重ねない。回数は 1 以上。
 // 例の値は、匿名の値（`127.0.0.1`、`example`）だけを使う。
@@ -12,9 +12,6 @@ import { resolve } from 'node:path';
 import { describe, expect, it } from 'vitest';
 import { REDACTED_PATH_SEGMENT } from '../../src/core/url-path-redaction.js';
 import {
-  MAX_WORKER_LOGIN_STAGE_BLOCKED_PATH_LENGTH,
-  MAX_WORKER_LOGIN_STAGE_BLOCKED_REQUESTS,
-  MAX_WORKER_NOTICE_URL_LENGTH,
   WORKER_LOGIN_FAILURE_STATES,
   WORKER_LOGIN_CREDENTIAL_BLOCK_REASON,
   WORKER_LOGIN_STAGE_BLOCK_REASONS,
@@ -56,17 +53,21 @@ describe('T34e: the blocked requests of the login stage in AUTH_STATE', () => {
   it('has the closed lists and the limits in the schema', () => {
     const item = '/$defs/loginStageBlockedRequests/properties/requests/items';
     expect(pointerValue(SCHEMA, '/$defs/authState/properties/blockedRequests')).toEqual({ $ref: '#/$defs/loginStageBlockedRequests' });
-    expect(pointerValue(SCHEMA, '/$defs/loginStageBlockedRequests/properties/requests/maxItems')).toBe(MAX_WORKER_LOGIN_STAGE_BLOCKED_REQUESTS);
-    expect(pointerValue(SCHEMA, `${item}/properties/origin/maxLength`)).toBe(MAX_WORKER_NOTICE_URL_LENGTH);
-    expect(pointerValue(SCHEMA, `${item}/properties/path/maxLength`)).toBe(MAX_WORKER_LOGIN_STAGE_BLOCKED_PATH_LENGTH);
+    // LZ-3a: 行の数の上限（前は 8）はない。
+    expect(pointerValue(SCHEMA, '/$defs/loginStageBlockedRequests/properties/requests/maxItems')).toBeUndefined();
+    // URL-LEN: Origin と path の長さの上限（前は 2,048・1,024）はない。
+    expect(pointerValue(SCHEMA, `${item}/properties/origin/maxLength`)).toBeUndefined();
+    expect(pointerValue(SCHEMA, `${item}/properties/path/maxLength`)).toBeUndefined();
     expect(pointerValue(SCHEMA, `${item}/properties/resourceType/enum`)).toEqual([...WORKER_REQUEST_RESOURCE_TYPES]);
     expect(pointerValue(SCHEMA, `${item}/properties/reason/enum`)).toEqual([...WORKER_LOGIN_STAGE_BLOCK_REASONS]);
     // T36R-fix（T36R の M-2。意図して直した期待）: 資格情報の理由は数だけで、行の理由の一覧には入れない。
     expect(WORKER_LOGIN_STAGE_BLOCK_REASONS).toEqual([
       ...WORKER_SCRIPT_LOGIN_BLOCK_REASONS.filter((reason) => reason !== WORKER_LOGIN_CREDENTIAL_BLOCK_REASON),
       'NON_READ_METHOD',
+      // DEF-194（意図して足した期待）: 行だけの理由。
+      'AUTOMATED_LOGIN_PASSED',
+      'AUTOMATED_LOGIN_RULE_BLOCKED',
     ]);
-    expect(MAX_WORKER_LOGIN_STAGE_BLOCKED_REQUESTS).toBe(8);
     for (const list of [WORKER_LOGIN_STAGE_BLOCK_REASONS, WORKER_REQUEST_RESOURCE_TYPES]) {
       expect(Object.isFrozen(list)).toBe(true);
     }
@@ -79,14 +80,16 @@ describe('T34e: the blocked requests of the login stage in AUTH_STATE', () => {
     expect(validateWorkerToParentMessage(message)).toEqual({ ok: true, message });
   });
 
-  it('accepts the list with the script login counts, a full list with unlisted requests, and the unlisted count only', () => {
+  it('accepts the list with the script login counts, more rows than the former limit with unlisted requests, and the unlisted count only', () => {
     expect(validateWorkerToParentMessage(authState('AUTHENTICATED', { scriptLogin: COUNTS, blockedRequests: BLOCKED })).ok).toBe(true);
-    const full = Array.from({ length: MAX_WORKER_LOGIN_STAGE_BLOCKED_REQUESTS }, (_, index) => ({ ...ENTRY, path: `/rest/v1/rpc/call_${index}` }));
-    expect(validateWorkerToParentMessage(withRequests(full, 3)).ok).toBe(true);
+    // LZ-3a: 前の上限（8）を超える 9 行も受ける。
+    const many = Array.from({ length: 9 }, (_, index) => ({ ...ENTRY, path: `/rest/v1/rpc/call_${index}` }));
+    expect(validateWorkerToParentMessage(withRequests(many, 3)).ok).toBe(true);
     expect(validateWorkerToParentMessage(withRequests([], 1)).ok).toBe(true);
     // T34e fix round 1: 送信先の path は伏せない（そのまま受ける）。
     expect(validateWorkerToParentMessage(withEntry({ path: '/auth/v1/token', reason: 'TOKEN_REQUEST_QUERY_MISMATCH' })).ok).toBe(true);
-    expect(validateWorkerToParentMessage(withEntry({ path: `/${'p'.repeat(MAX_WORKER_LOGIN_STAGE_BLOCKED_PATH_LENGTH - 1)}` })).ok).toBe(true);
+    // URL-LEN: 前の上限（1,024）より長い path も受ける。
+    expect(validateWorkerToParentMessage(withEntry({ path: `/${'p'.repeat(1_025)}` })).ok).toBe(true);
   });
 
   it.each([
@@ -94,8 +97,6 @@ describe('T34e: the blocked requests of the login stage in AUTH_STATE', () => {
     // T36c（意図して直した期待）: 自動ログインの段の結果は一覧を持てるようになった。止める印の状態と自動ログインの結果の組は、今も拒む。
     ['the automated login result with the stop state', authState('AWAITING_LOGIN', { automatedLogin: SUCCEEDED_REPORT, blockedRequests: BLOCKED })],
     ['nothing blocked', withRequests([], 0)],
-    ['too many requests', withRequests(Array.from({ length: MAX_WORKER_LOGIN_STAGE_BLOCKED_REQUESTS + 1 },
-      (_, index) => ({ ...ENTRY, path: `/rest/v1/rpc/call_${index}` })))],
     ['a duplicated request', withRequests([ENTRY, ENTRY])],
     ['an origin that is not canonical', withEntry({ origin: `${SERVICE_ORIGIN}/` })],
     ['an origin with a path', withEntry({ origin: `${SERVICE_ORIGIN}/rest` })],
@@ -109,7 +110,6 @@ describe('T34e: the blocked requests of the login stage in AUTH_STATE', () => {
     ['a path with a long hexadecimal segment', withEntry({ path: `/k/${'0'.repeat(32)}` })],
     ['a path that is only the redacted marker', withEntry({ path: REDACTED_PATH_SEGMENT })],
     ['a path with a line break', withEntry({ path: '/rest/v1\n/rpc' })],
-    ['a path that is too long', withEntry({ path: `/${'p'.repeat(MAX_WORKER_LOGIN_STAGE_BLOCKED_PATH_LENGTH)}` })],
     ['an unknown reason', withEntry({ reason: 'OTHER' })],
     ['an unknown resource type', withEntry({ resourceType: 'beacon' })],
     ['a count of zero', withEntry({ count: 0 })],
@@ -117,5 +117,35 @@ describe('T34e: the blocked requests of the login stage in AUTH_STATE', () => {
     ['a negative unlisted count', withRequests([ENTRY], -1)],
   ] as const)('rejects the blocked requests with %s', (_name, message) => {
     expect(validateWorkerToParentMessage(JSON.parse(JSON.stringify(message)) as unknown).ok).toBe(false);
+  });
+});
+
+// DEF-194（設計書 `doc/design/2026-11-04-beaksight-login-session-design.md` 3.3）: 行だけの理由（自動ログインの段で通した行・その通し方の決まりで止めた行）。数の鍵には
+// 足さない（保存済みのジョブの数の形を変えない）。自動ログインの段の結果の通した一覧は、通した行の理由だけを持つ。
+describe('DEF-194: the row reasons of the automated login stage send rule', () => {
+  const passedRow = Object.freeze({ origin: SERVICE_ORIGIN, path: '/functions/v1/sync_access', resourceType: 'fetch', reason: 'AUTOMATED_LOGIN_PASSED', count: 2 });
+
+  it('adds the two row reasons to the row list and the schema, but not to the count keys', () => {
+    expect(WORKER_LOGIN_STAGE_BLOCK_REASONS.slice(-2)).toEqual(['AUTOMATED_LOGIN_PASSED', 'AUTOMATED_LOGIN_RULE_BLOCKED']);
+    expect(pointerValue(SCHEMA, '/$defs/loginStageBlockedRequests/properties/requests/items/properties/reason/enum')).toEqual(WORKER_LOGIN_STAGE_BLOCK_REASONS);
+    expect(WORKER_SCRIPT_LOGIN_BLOCK_REASONS).not.toContain('AUTOMATED_LOGIN_PASSED');
+    expect(WORKER_SCRIPT_LOGIN_BLOCK_REASONS).not.toContain('AUTOMATED_LOGIN_RULE_BLOCKED');
+  });
+
+  it('accepts the passed list and the rule blocked rows of an automated login result, and the stored form without the automated report', () => {
+    const blocked = { requests: [{ ...ENTRY, reason: 'AUTOMATED_LOGIN_RULE_BLOCKED' }], unlisted: 0 };
+    expect(validateWorkerToParentMessage(authState('AUTHENTICATED', {
+      automatedLogin: SUCCEEDED_REPORT, scriptLogin: COUNTS, blockedRequests: blocked, passedRequests: { requests: [passedRow], unlisted: 0 },
+    })).ok).toBe(true);
+    // ジョブの記録の読み直し（自動ログインの結果を付けない形）でも読める。
+    expect(validateWorkerToParentMessage(authState('AUTHENTICATED', { scriptLogin: COUNTS, passedRequests: { requests: [passedRow], unlisted: 0 } })).ok).toBe(true);
+  });
+
+  it('rejects an automated login passed list with another reason or the before-token mark', () => {
+    for (const row of [{ ...passedRow, reason: 'UNREGISTERED_NON_READ' }, { ...passedRow, beforeToken: true }]) {
+      expect(validateWorkerToParentMessage(authState('AUTHENTICATED', {
+        automatedLogin: SUCCEEDED_REPORT, scriptLogin: COUNTS, passedRequests: { requests: [row], unlisted: 0 },
+      })).ok).toBe(false);
+    }
   });
 });

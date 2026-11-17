@@ -2,13 +2,15 @@ import type { Browser, Page } from 'playwright';
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 import { createPageId } from '../../src/core/ids.js';
 import type { CrawlCandidate } from '../../src/crawl/crawl-queue.js';
-import { MAX_URL_LENGTH } from '../../src/core/limits.js';
 import {
-  LINK_LIMITS,
+  LINK_COLLECTION_PART_SIZE,
   discoverLinks,
   type LinkDiscoveryPolicy,
 } from '../../src/crawl/discover-links.js';
 import { launchHeadlessChromium } from '../helpers/chromium.js';
+
+/** URL-LEN: 前の URL の上限（2,048）を超える長さ。 */
+const LONGER_THAN_FORMER_URL_LIMIT = 2_049;
 
 describe('discoverLinks', () => {
   let browser: Browser | undefined;
@@ -211,22 +213,22 @@ describe('discoverLinks', () => {
       allowedQueryParameters: new Set(),
     };
 
-    it('records at most LINK_LIMITS.maxLinks links in document order and counts the omitted ones', async () => {
-      const total = LINK_LIMITS.maxLinks + 3;
+    it('COV-6: records every link in document order, reading the page in parts from the next position', async () => {
+      const total = LINK_COLLECTION_PART_SIZE + 3;
       const anchors = Array.from({ length: total }, (_value, index) => `<a href="/item-${index}">Item ${index}</a>`);
       await page.setContent(`<base href="https://example.test/">${anchors.join('')}`);
 
       const evidence = await discoverLinks(page, createPageId(9), policy);
 
-      expect(evidence.links).toHaveLength(LINK_LIMITS.maxLinks);
-      expect(evidence.omittedLinkCount).toBe(3);
+      expect(evidence.links).toHaveLength(total);
+      expect(evidence.omittedLinkCount).toBe(0);
+      expect(evidence.collectedInParts).toBe(2);
       expect(evidence.links[0]).toMatchObject({ anchorText: 'Item 0', rawHref: '/item-0' });
-      expect(evidence.links.at(-1)).toMatchObject({
-        anchorText: `Item ${LINK_LIMITS.maxLinks - 1}`,
-        rawHref: `/item-${LINK_LIMITS.maxLinks - 1}`,
+      expect(evidence.links[LINK_COLLECTION_PART_SIZE]).toMatchObject({
+        anchorText: `Item ${LINK_COLLECTION_PART_SIZE}`,
+        rawHref: `/item-${LINK_COLLECTION_PART_SIZE}`,
       });
-      // 入口は discoverLinks() の1つだけで、link の Evidence の payload（links と omittedLinkCount）を返す（F08 の項目7）。
-      expect(Object.keys(evidence).sort()).toEqual(['links', 'omittedLinkCount']);
+      expect(evidence.links.at(-1)).toMatchObject({ anchorText: `Item ${total - 1}`, rawHref: `/item-${total - 1}` });
     });
 
     it('reports no omitted link when the page is within the count limit', async () => {
@@ -238,102 +240,59 @@ describe('discoverLinks', () => {
       expect(evidence.omittedLinkCount).toBe(0);
     });
 
-    it('truncates anchorText, ariaLabel, and title to LINK_LIMITS.maxTextLength and marks the link', async () => {
-      const long = 'x'.repeat(LINK_LIMITS.maxTextLength + 10);
-      await page.setContent(`
-        <base href="https://example.test/">
-        <a href="/text">${long}</a>
-        <a href="/label" aria-label="${long}">Label</a>
-        <a href="/title" title="${long}">Title</a>
-        <a href="/short" aria-label="Short" title="Short">Short</a>
-      `);
+    // LZ-3b: 前の文の上限（1,024）より長い anchorText・ariaLabel・title も、切り詰めずに記録する。
+    it('records anchorText, ariaLabel, and title longer than the former text limit without truncating them', async () => {
+      const long = 'x'.repeat(1_025);
+      await page.setContent(`<base href="https://example.test/"><a href="/text" aria-label="${long}" title="${long}">${long}</a>`);
 
       const { links } = await discoverLinks(page, createPageId(11), policy);
-      const bounded = 'x'.repeat(LINK_LIMITS.maxTextLength);
 
-      expect(links).toMatchObject([
-        { anchorText: bounded, truncated: true },
-        { ariaLabel: bounded, anchorText: 'Label', truncated: true },
-        { title: bounded, anchorText: 'Title', truncated: true },
-        { ariaLabel: 'Short', title: 'Short', anchorText: 'Short', truncated: false },
-      ]);
+      expect(links).toMatchObject([{ anchorText: long, ariaLabel: long, title: long, truncated: false }]);
     });
 
-    it('bounds a long href to MAX_URL_LENGTH and does not accept it for the crawl queue', async () => {
-      const href = `/${'a'.repeat(MAX_URL_LENGTH + 10)}`;
+    // URL-LEN: 前の URL の上限（2,048）より長い href も、巡回に受け入れ、記録の値も切り詰めない。
+    it('records and accepts a href longer than the former URL limit without truncating it', async () => {
+      const href = `/${'a'.repeat(LONGER_THAN_FORMER_URL_LIMIT)}`;
       await page.setContent(`<base href="https://example.test/"><a href="${href}">Long</a>`);
 
       const { links: [link] } = await discoverLinks(page, createPageId(12), policy);
 
-      expect(link).toEqual({
+      expect(link).toMatchObject({
         sourcePageId: createPageId(12),
         anchorText: 'Long',
-        ariaLabel: null,
-        title: null,
-        rawHref: href.slice(0, MAX_URL_LENGTH),
-        normalized: { ok: false, rawUrl: href.slice(0, MAX_URL_LENGTH), reason: 'URL_TOO_LONG' },
-        admission: { kind: 'REJECTED_INVALID', rawUrl: href.slice(0, MAX_URL_LENGTH), reason: 'URL_TOO_LONG' },
-        truncated: true,
+        rawHref: href,
+        normalized: { ok: true, url: `https://example.test${href}` },
+        truncated: false,
       });
+      expect(link?.admission.kind).not.toBe('REJECTED_INVALID');
     });
 
-    it('bounds the raw URL of a long special-scheme href', async () => {
-      const href = `mailto:${'m'.repeat(MAX_URL_LENGTH + 10)}@example.test`;
+    it('records the whole raw URL of a long special-scheme href', async () => {
+      const href = `mailto:${'m'.repeat(LONGER_THAN_FORMER_URL_LIMIT)}@example.test`;
       await page.setContent(`<a href="${href}">Mail</a>`);
 
       const { links: [link] } = await discoverLinks(page, createPageId(13), policy);
 
       expect(link).toMatchObject({
-        rawHref: href.slice(0, MAX_URL_LENGTH),
-        normalized: { ok: false, rawUrl: href.slice(0, MAX_URL_LENGTH), reason: 'UNSUPPORTED_SCHEME' },
-        admission: { kind: 'SPECIAL_SCHEME_RECORD_ONLY', rawUrl: href.slice(0, MAX_URL_LENGTH), scheme: 'mailto' },
-        truncated: true,
+        rawHref: href,
+        normalized: { ok: false, rawUrl: href, reason: 'UNSUPPORTED_SCHEME' },
+        admission: { kind: 'SPECIAL_SCHEME_RECORD_ONLY', rawUrl: href, scheme: 'mailto' },
+        truncated: false,
       });
     });
 
-    it('redacts the credentials of a long href before truncating it', async () => {
-      const href = `https://user:secret@example.test/${'a'.repeat(MAX_URL_LENGTH)}`;
+    it('redacts the credentials of a long href', async () => {
+      const href = `https://user:secret@example.test/${'a'.repeat(LONGER_THAN_FORMER_URL_LIMIT)}`;
       await page.setContent(`<a href="${href}">Long credentials</a>`);
 
       const { links: [link] } = await discoverLinks(page, createPageId(14), policy);
 
-      expect(link?.rawHref.startsWith('https://[REDACTED]@example.test/')).toBe(true);
+      expect(link?.rawHref).toBe(`https://[REDACTED]@example.test/${'a'.repeat(LONGER_THAN_FORMER_URL_LIMIT)}`);
       expect(link).toMatchObject({
         normalized: { ok: false, reason: 'CREDENTIALS_NOT_ALLOWED' },
         admission: { kind: 'REJECTED_INVALID', reason: 'CREDENTIALS_NOT_ALLOWED' },
-        truncated: true,
       });
       expect(JSON.stringify(link)).not.toContain('secret');
-    });
-
-    it('keeps every recorded string within its limit', async () => {
-      const long = 'y'.repeat(LINK_LIMITS.maxTextLength * 2);
-      const longPath = 'p'.repeat(MAX_URL_LENGTH * 2);
-      await page.setContent(`
-        <base href="https://example.test/">
-        <a href="/${longPath}" aria-label="${long}" title="${long}">${long}</a>
-        <a href="ftp://${longPath}">${long}</a>
-        <a href="${longPath}:rest">${long}</a>
-      `);
-
-      const { links } = await discoverLinks(page, createPageId(15), policy);
-
-      expect(links).toHaveLength(3);
-      for (const link of links) {
-        expect(link.truncated).toBe(true);
-        expect(link.anchorText.length).toBeLessThanOrEqual(LINK_LIMITS.maxTextLength);
-        expect(link.ariaLabel?.length ?? 0).toBeLessThanOrEqual(LINK_LIMITS.maxTextLength);
-        expect(link.title?.length ?? 0).toBeLessThanOrEqual(LINK_LIMITS.maxTextLength);
-        const urlFields = [
-          link.rawHref,
-          link.normalized.ok ? link.normalized.url : link.normalized.rawUrl,
-          'url' in link.admission ? link.admission.url : link.admission.rawUrl,
-          link.admission.kind === 'SPECIAL_SCHEME_RECORD_ONLY' ? link.admission.scheme : '',
-        ];
-        for (const value of urlFields) {
-          expect(value.length).toBeLessThanOrEqual(MAX_URL_LENGTH);
-        }
-      }
     });
   });
 });

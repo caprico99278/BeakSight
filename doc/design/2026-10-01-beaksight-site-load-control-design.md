@@ -183,7 +183,7 @@ export function createNavigationPacer(options: {
 待った時間は、サイトの応答の遅さではないので、ページの監査の期限を消費させない。次のとおりにする。
 
 - **Passive の監査**: `#auditViewport` の初めに待つ。ページの期限は、待った後の時刻から計算する（今の計算の位置の前に待つだけでよい）。
-- **幅の走査**: `collectStressLayout` は、`beforeNavigation()` が返した待ち時間の分だけ、自分の期限を延ばす。`page-auditor.ts` は、走査の前後の `pacer.snapshot().totalWaitMs` の差の分だけ、ページの期限（`pageDeadlineAtMs` と `collectorDeadlineAtMs`）を延ばす。走査の後の段階（配色、accessibility、performance、スクリーンショット、Link、Interaction の候補の発見）は、延ばした期限を使う。
+- **幅の走査**: `collectStressLayout` は、`beforeNavigation()` が返した待ち時間の分だけ、自分の期限を延ばす。`page-auditor.ts` は、走査の前後の `pacer.snapshot().totalWaitMs` の差の分だけ、ページの期限（`pageDeadlineAtMs` と `collectorDeadlineAtMs`）を延ばす。走査の後の段階（配色、accessibility、performance、スクリーンショット、Link、Interaction の候補の発見）は、延ばした期限を使う。→ 2026-11-06 改訂（DEF-191・DEF-216）: DEF-191 の後は、Desktop の幅の走査を D の Context を閉じた後（Interaction の後）に行う。走査の期限は「走査を始めた時刻 + 主の layout の直後に控えた残り（collector の期限 − その時の時刻）」とする。そのため、走査の前の時間（候補の前の待ちと、候補・Context を閉じる時間）の分だけ、期限は後ろへずれる。accessibility などの段階は、走査より前に行うので、延ばさない期限を使う。
 - **Interaction**: 各候補の前に待つ。待った時間の分だけ、段階の期限（`interactionStageDeadlineAtMs`）を延ばす。1件目の候補の開始の時刻（今は候補の発見が終わった時刻）も、待った時間の分だけ後ろにずらす。こうすると、設定の検証を通った設定なら、1件目の候補が予算に収まるという今の性質（4.5.7）が保たれる。
 - **robots.txt と sitemap.xml**: 各ファイルの期限は、待った後の時刻から計算する。
 - **実行時間の上限**: 待ち時間を含めた実際の時間で判定する（今のまま）。

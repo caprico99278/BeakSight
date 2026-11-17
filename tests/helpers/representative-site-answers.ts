@@ -4,8 +4,8 @@
  * - 静的なサイト（公開の監査）: `fixtures/site/full-crawl/`（`startFixtureServer({ siteMetadataDirectory: 'full-crawl' })`）。
  * - スクリプトでログインする SPA の管理画面: `spa-auth-site-fixture.ts`（`SPA_REPRESENTATIVE_OPTIONS` と、会員 2 人）。T44c: 実テスト環境の形を足したもの
  *   （`SPA_REAL_ENV_SHAPE_OPTIONS`）。
- * 静的なサイトの一覧は、`tests/integration/fixture-full-crawl.test.ts` の `EXPECTED_AUDITED_PATHS`・`EXPECTED_RULE_IDS_BY_PATH` と同じ中身（そのテストは
- * 別のプロセスの CLI を確かめるので、ここからは読まない。共通化の候補として記録する）。
+ * 静的なサイトの一覧は、`tests/integration/control-audit-jobs-worker.test.ts` の T19a の場面（SLIM-GROUP: 前の `fixture-full-crawl.test.ts` をまとめた先）も
+ * ここから読む。
  */
 import {
   SPA_APP_PATHS,
@@ -103,7 +103,7 @@ export const SPA_EXPECTED_READ_CHECKS = Object.freeze({
  * T44c: 代表の SPA（`SPA_REPRESENTATIVE_OPTIONS`）に、実テスト環境で多かった形を足した振る舞い。
  * - 登録の画面: 欄と保存のボタンが閉じたダイアログの中にあり、開くボタンの後に見える（`createSaveInDialog`）。
  * - 更新の画面: 先頭に多くの文字のないボタン、保存の後に登録・更新の語の道具のボタン、最後に見えないボタン（`crowdedEditScreen`。押す回数の上限を使い切る形）。
- * - 管理画面: 一覧の表が内側のスクロールの領域の中（`innerScrollList`。`INNER_SCROLL_CONTAINER_NOT_TRAVERSED` になる形）、一覧の後のサービスへの読み取り
+ * - 管理画面: 一覧の表が内側のスクロールの領域の中（`innerScrollList`。DEF-207 の前は `INNER_SCROLL_CONTAINER_NOT_TRAVERSED` になった形。今はその領域をたどる）、一覧の後のサービスへの読み取り
  *   （`serviceReadOnList`。幅の走査の読み込みでも出る）、閉じるときの計測の送信（`closingBeacon`）。
  * 画面・API の候補・READ の確かめの正解は、代表の SPA と同じ（`SPA_EXPECTED_SCREENS`・`SPA_EXPECTED_API_CANDIDATES`・`SPA_EXPECTED_READ_CHECKS`）。
  */
@@ -117,20 +117,23 @@ export const SPA_REAL_ENV_SHAPE_OPTIONS: SpaAuthSiteOptions = Object.freeze({
 });
 
 /**
- * T44c: 実テスト環境の形の SPA の、probe の正解（fixture の作りから決めた数。更新の画面ごと）。押す回数は 1 画面 3 回（`MAX_SUBMISSION_PROBE_PRESSES_PER_PAGE`）。
- * - 見えないボタン（`SPA_HIDDEN_PRESS_TARGET_WORDS`）は、押す数を数える前に除く（`TARGET_NOT_FOUND`）。
- * - 押すのは、保存（`API_UPDATE`）と、その後の道具のボタンの 2 つ（`NO_REQUEST`）。残りの道具のボタンは、押す数の上限で押せなかった登録・更新の語の候補
- *   （`PRESS_LIMIT_REACHED`）。文字のないボタンも `PRESS_LIMIT_REACHED`（登録・更新の語ではない）。
+ * T44c: 実テスト環境の形の SPA の、probe の正解（fixture の作りから決めた数。更新の画面ごと）。COV-1（網羅の設計書 3.3）: 押す数の上限（前は 1 画面 3 回）を
+ * 外したので、見えるボタンは全部押す。
+ * - 見えないボタン（`SPA_HIDDEN_PRESS_TARGET_WORDS`）は押さない（`TARGET_NOT_FOUND`）。
+ * - 押すのは、保存（`API_UPDATE`）と、道具のボタンの全部と、文字のないボタンの全部（`NO_REQUEST`）。上限で押せなかった候補（`PRESS_LIMIT_REACHED`）はない。
  */
 export const SPA_REAL_ENV_EXPECTED_EDIT_SCREEN_PROBES = Object.freeze({
   targetNotFound: SPA_HIDDEN_PRESS_TARGET_WORDS.length,
-  noRequest: 2,
-  priorityPressLimitReached: SPA_TOOLBAR_PRESS_WORDS.length - 2,
-  otherPressLimitReached: SPA_CROWDED_ICON_BUTTON_COUNT,
+  noRequest: SPA_TOOLBAR_PRESS_WORDS.length + SPA_CROWDED_ICON_BUTTON_COUNT,
+  priorityPressLimitReached: 0,
+  otherPressLimitReached: 0,
 } as const);
 
 /** T44c: 実テスト環境の形の SPA の、登録の画面の probe の正解（開くボタンは `NO_REQUEST`、ダイアログの中の保存は `API_CREATE`）。 */
 export const SPA_REAL_ENV_EXPECTED_CREATE_SCREEN_PROBES = Object.freeze({ noRequest: 1, apiCreate: 1 } as const);
 
-/** T44c: 実テスト環境の形の SPA で、監査が `INNER_SCROLL_CONTAINER_NOT_TRAVERSED` になるべき画面（一覧の表が内側のスクロールの領域の中）。 */
-export const SPA_REAL_ENV_EXPECTED_INNER_SCROLL_PAGES: readonly string[] = Object.freeze([SPA_APP_PATHS.admin]);
+/**
+ * T44c: 実テスト環境の形の SPA で、監査が `INNER_SCROLL_CONTAINER_NOT_TRAVERSED` になるべき画面。DEF-207 で、内側のスクロールの領域（管理画面の一覧の表）を
+ * たどるようにしたので、ない。
+ */
+export const SPA_REAL_ENV_EXPECTED_INNER_SCROLL_PAGES: readonly string[] = Object.freeze([]);

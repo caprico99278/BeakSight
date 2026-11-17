@@ -1,7 +1,7 @@
 // AS-a（設計書 `doc/design/2026-10-19-beaksight-audit-send-policy-design.md` 2.2・2.3）: 監査の段の送信の扱い `PASS_EXCEPT_DELETE` の、
 // 要求の判定の口（`classifyPassiveRequest` の `auditSend`）、Guard の口の確かめ（`PassiveRequestGuardOptions.auditSend`）、Safety Ledger の通した要求の記録。
 // - 通す: ナビゲーションでない、method が GET・HEAD でも DELETE でもない要求で、送り先が許可 Origin か承認したサービスの Origin、path と query に危険な語が
-//   なく（今の監査の段の除外と同じ比べ方）、残りの数が 1 以上（`auditSendAdmission`）。残りがなければ `AUDIT_SEND_OVER_LIMIT`。
+//   なく（今の監査の段の除外と同じ比べ方）（`auditSendAdmission`）。RB-4a（X2）で数の上限の名残を外した。
 // - 止める（今どおり）: DELETE、文書のナビゲーション、ほかの Origin、危険な語、ログインの段・書き込みの段の口と一緒（口を使わない。fail-closed）。
 // - スクリプトで送るログインの監査の段の口と一緒: 登録していない読み取りでない要求を通す。token の更新と、サービスの Origin へ送らない Context の
 //   サービスの Origin への要求は、今どおり止める。
@@ -10,10 +10,7 @@ import { readFileSync } from 'node:fs';
 import { Ajv } from 'ajv';
 import type { BrowserContext } from 'playwright';
 import { describe, expect, it } from 'vitest';
-import { BLOCKED_REQUEST_REASONS } from '../../src/core/evidence-types.js';
-import { BLOCKED_REQUEST_REASON_DESCRIPTIONS } from '../../src/presentation/messages.js';
 import {
-  AUDIT_SEND_MAX_PASSED_PER_CONTEXT,
   installPassiveRequestGuard,
   isGuardAuditSend,
   type GuardAuditSend,
@@ -37,10 +34,9 @@ const ALLOWED_ORIGINS: ReadonlySet<string> = new Set([APP_ORIGIN]);
 const DANGEROUS_TERMS = Object.freeze(['logout', 'delete', 'remove', 'cancel']);
 const TOKEN_PATH = '/auth/v1/token';
 
-const auditSend = (remainingPasses = 1): AuditSendPolicy => ({
+const auditSend = (): AuditSendPolicy => ({
   approvedServiceOrigins: [SERVICE_ORIGIN],
   dangerousTerms: DANGEROUS_TERMS,
-  remainingPasses,
 });
 
 const facts = (
@@ -71,50 +67,43 @@ describe('AS-a: the audit send policy of the request policy (classifyPassiveRequ
 
   it('does not change reads, and keeps blocking WebSockets when the option has no WebSocket count', () => {
     expect(decide(facts('GET', `${APP_ORIGIN}/api/list`))).toEqual({ action: 'ALLOW', delivery: 'DIRECT' });
-    // AS-c: WebSocket は、口に WebSocket の残りの数（`remainingWebSockets`）があるときだけ通す（`audit-send-wider.test.ts`）。
+    // AS-c: WebSocket は、口に WebSocket の印（`webSockets`）があるときだけ通す（`audit-send-wider.test.ts`）。
     expect(decide({ kind: 'WEBSOCKET', url: 'wss://example.com/socket' })).toEqual({ action: 'BLOCK', category: 'WEBSOCKET', reason: 'PASSIVE_WEBSOCKET' });
   });
 
   // AS-c: ほかの Origin への要求は、送り先の Origin の制限をなくしたので通す（`audit-send-wider.test.ts`）。
-  it('keeps blocking DELETE (any case), navigations and dangerous terms in the path or the query', () => {
-    expect(decide(facts('DELETE', `${APP_ORIGIN}/api/session`))).toEqual(NON_READ);
-    expect(decide(facts('delete', `${APP_ORIGIN}/api/session`))).toEqual(NON_READ);
-    expect(decide(facts('Delete', `${SERVICE_ORIGIN}/api/session`))).toEqual(NON_READ);
-    expect(decide(facts('POST', `${APP_ORIGIN}/form`, 'document', true, true))).toEqual(NON_READ);
-    expect(decide(facts('POST', `${APP_ORIGIN}/form`, 'document', true, false))).toEqual(NON_READ);
-    expect(decide(facts('POST', `${OTHER_ORIGIN}/api/save`))).toEqual(PASSED);
-    expect(decide(facts('POST', 'not a url'))).toEqual(NON_READ);
-    expect(decide(facts('POST', `${APP_ORIGIN}/api/logout`))).toEqual(NON_READ);
-    expect(decide(facts('POST', `${SERVICE_ORIGIN}/rpc/remove_member`))).toEqual(NON_READ);
-    expect(decide(facts('POST', `${APP_ORIGIN}/api/%64elete`))).toEqual(NON_READ);
-    expect(decide(facts('PUT', `${APP_ORIGIN}/api/save?action=cancel`))).toEqual(NON_READ);
-  });
-
-  it('also applies the excluded paths of the audit exclusions when they are given', () => {
-    const policy: PassiveRequestPolicyOptions = {
+  // RB-4b: ページの script の form の送信（文書のナビゲーション）は通す（main frame は届け方 `INSPECT_REDIRECTS`）。本文の `_method=DELETE` は止める。
+  // SD-2（設計書 `2026-11-16-beaksight-action-based-delete-guard-design.md` 2.1・2.4）: DELETE・削除の上書き・危険な語・読まないパスでも止めない。
+  it('passes DELETE (any case), a DELETE override, dangerous terms, excluded paths and form posts, and blocks a non-http URL', () => {
+    const excluding: PassiveRequestPolicyOptions = {
       auditSend: auditSend(),
       auditExclusions: { excludedPathPrefixes: ['/admin/danger'], auditPathPrefixes: ['/admin'], dangerousTerms: [] },
     };
-    expect(decide(facts('POST', `${APP_ORIGIN}/admin/danger/zone`), policy)).toEqual(NON_READ);
-    // 読む範囲（`auditPathPrefixes`）は、読み取りでない要求には当てない（登録した読み取りの手続きの呼び出しと同じ）。
-    expect(decide(facts('POST', `${APP_ORIGIN}/api/save`), policy)).toEqual(PASSED);
+    for (const request of [
+      facts('DELETE', `${APP_ORIGIN}/api/session`),
+      facts('delete', `${SERVICE_ORIGIN}/api/session`),
+      facts('POST', `${APP_ORIGIN}/form`, 'document', true, false),
+      facts('POST', `${OTHER_ORIGIN}/api/save`),
+      facts('POST', `${APP_ORIGIN}/api/logout`),
+      facts('PUT', `${APP_ORIGIN}/api/save?action=cancel`),
+    ]) {
+      expect(decide(request)).toEqual(PASSED);
+    }
+    expect(decide({
+      ...facts('POST', `${APP_ORIGIN}/form`, 'document', true, true),
+      sentContent: { headers: { 'Content-Type': 'application/x-www-form-urlencoded' }, formMethodOverrides: () => ['DELETE'] },
+    })).toEqual({ ...PASSED, delivery: 'INSPECT_REDIRECTS' });
+    expect(decide(facts('POST', `${APP_ORIGIN}/admin/danger/zone`), excluding)).toEqual(PASSED);
+    expect(decide(facts('POST', 'not a url'))).toEqual(NON_READ);
   });
 
-  it('blocks a passable request with AUDIT_SEND_OVER_LIMIT when nothing remains, and keeps the other reasons first', () => {
-    expect(decide(facts('POST', `${APP_ORIGIN}/api/save`), { auditSend: auditSend(0) }))
-      .toEqual({ action: 'BLOCK', category: 'REQUEST', reason: 'AUDIT_SEND_OVER_LIMIT' });
-    expect(decide(facts('DELETE', `${APP_ORIGIN}/api/save`), { auditSend: auditSend(0) })).toEqual(NON_READ);
-    expect(decide(facts('POST', `${OTHER_ORIGIN}/api/save`), { auditSend: auditSend(0) }))
-      .toEqual({ action: 'BLOCK', category: 'REQUEST', reason: 'AUDIT_SEND_OVER_LIMIT' });
-    expect(decide(facts('POST', `${APP_ORIGIN}/api/save`), { auditSend: auditSend(Number.NaN) }))
-      .toEqual({ action: 'BLOCK', category: 'REQUEST', reason: 'AUDIT_SEND_OVER_LIMIT' });
-  });
 
-  it('does not use the policy together with the login stage or the write stage (fail-closed)', () => {
-    const authSetup = { loginPostEndpoints: [{ origin: APP_ORIGIN, path: '/login' }], remainingPosts: 1 };
-    expect(decide(facts('POST', `${APP_ORIGIN}/api/save`), { auditSend: auditSend(), authSetup })).toEqual(NON_READ);
-    const writeStage = { writeEndpoint: { origin: APP_ORIGIN, path: '/members' }, remainingPosts: 1 };
-    expect(decide(facts('POST', `${APP_ORIGIN}/api/save`), { auditSend: auditSend(), writeStage })).toEqual(NON_READ);
+  // OP-N・RB-4b: 書き込みの段の口と一緒のときも、送信の窓の中でも使う（決まりの全体は `request-policy-write-stage-audit-send.test.ts`）。RB-14b: ログインの段の
+  // 口とは一緒に作れない（型）。
+  it('uses the policy inside the submission window of the write stage', () => {
+    const writeStage = { writeEndpoint: { origin: APP_ORIGIN, path: '/members' }, remainingPosts: 1, submissionWindowOpen: true };
+    expect(decide(facts('POST', `${APP_ORIGIN}/api/save`), { auditSend: auditSend(), writeStage })).toEqual(PASSED);
+    expect(decide(facts('POST', `${APP_ORIGIN}/api/save`), { auditSend: auditSend(), writeStage: { ...writeStage, submissionWindowOpen: false } })).toEqual(PASSED);
   });
 
   describe('together with the audit stage of a script login audit', () => {
@@ -140,15 +129,6 @@ describe('AS-a: the audit send policy of the request policy (classifyPassiveRequ
       expect(decide(facts('POST', `${APP_ORIGIN}/api/save`), { auditSend: auditSend(), auditStage: auditStage(true) })).toEqual(PASSED);
     });
 
-    it('keeps the detailed audit stage reason on the over-limit decision', () => {
-      expect(decide(facts('POST', `${APP_ORIGIN}/api/save`), { auditSend: auditSend(0), auditStage: auditStage() }))
-        .toEqual({ action: 'BLOCK', category: 'REQUEST', reason: 'AUDIT_SEND_OVER_LIMIT', auditStageBlock: 'UNREGISTERED_NON_READ' });
-    });
-  });
-
-  it('adds AUDIT_SEND_OVER_LIMIT to the blocked request reasons with a description', () => {
-    expect(BLOCKED_REQUEST_REASONS).toContain('AUDIT_SEND_OVER_LIMIT');
-    expect(BLOCKED_REQUEST_REASON_DESCRIPTIONS.AUDIT_SEND_OVER_LIMIT.length).toBeGreaterThan(0);
   });
 });
 
@@ -160,14 +140,8 @@ describe('AS-a: the audit send option of the Guard (PassiveRequestGuardOptions.a
   });
   const fakeContext = {} as BrowserContext;
 
-  it('accepts only the PASS_EXCEPT_DELETE shape with a limit up to the named constant', () => {
-    expect(AUDIT_SEND_MAX_PASSED_PER_CONTEXT).toBe(60);
+  it('accepts only the PASS_EXCEPT_DELETE shape', () => {
     expect(isGuardAuditSend(VALID)).toBe(true);
-    expect(isGuardAuditSend({ ...VALID, maxPassedPerContext: 1 })).toBe(true);
-    expect(isGuardAuditSend({ ...VALID, maxPassedPerContext: AUDIT_SEND_MAX_PASSED_PER_CONTEXT })).toBe(true);
-    expect(isGuardAuditSend({ ...VALID, maxPassedPerContext: AUDIT_SEND_MAX_PASSED_PER_CONTEXT + 1 })).toBe(false);
-    expect(isGuardAuditSend({ ...VALID, maxPassedPerContext: 0 })).toBe(false);
-    expect(isGuardAuditSend({ ...VALID, maxPassedPerContext: 1.5 })).toBe(false);
     expect(isGuardAuditSend({ ...VALID, policy: 'READ_ONLY' })).toBe(false);
     expect(isGuardAuditSend({ ...VALID, approvedServiceOrigins: [1] })).toBe(false);
     expect(isGuardAuditSend({ ...VALID, dangerousTerms: undefined })).toBe(false);
@@ -222,7 +196,7 @@ describe('AS-a: the passed audit send requests of the Safety Ledger', () => {
 
   it('is accepted by the checkpoint schema of the Ledger snapshot as an optional property, and rejects values in it', () => {
     const ajv = new Ajv({ allErrors: true, strict: true });
-    for (const name of ['run', 'audit', 'page', 'finding', 'checkpoint', 'checkpoint-page', 'site-unavailable-diagnostic']) {
+    for (const name of ['run', 'audit', 'page', 'finding', 'checkpoint', 'checkpoint-page']) {
       ajv.addSchema(JSON.parse(readFileSync(new URL(`../../schemas/${name}.schema.json`, import.meta.url), 'utf8')) as object);
     }
     const validateSnapshot = ajv.getSchema('urn:beaksight:schema:checkpoint:1.0#/$defs/safetyLedgerSnapshot');
@@ -235,7 +209,8 @@ describe('AS-a: the passed audit send requests of the Safety Ledger', () => {
     expect(validateSnapshot?.(withQuery)).toBe(false);
   });
 
-  it('keeps counting after the row limit, without making the record incomplete', () => {
+  // LZ-3a: 一覧の行の数の上限（前は 256）は撤廃した。前の上限を超える行も残らず一覧に入れる。
+  it('keeps every row beyond the former limit, without making the record incomplete', () => {
     const ledger = new SafetyLedger();
     const rows = 300;
     for (let index = 0; index < rows; index += 1) {
@@ -244,8 +219,8 @@ describe('AS-a: the passed audit send requests of the Safety Ledger', () => {
     const snapshot = ledger.snapshot();
     expect(snapshot.passedAuditSendRequests?.count).toBe(rows);
     expect(snapshot.passedAuditSendRequests?.byMethod).toEqual({ POST: rows });
-    expect(snapshot.passedAuditSendRequests?.requests.length).toBe(256);
-    expect(snapshot.passedAuditSendRequests?.unlisted).toBe(rows - 256);
+    expect(snapshot.passedAuditSendRequests?.requests.length).toBe(rows);
+    expect(snapshot.passedAuditSendRequests?.unlisted).toBe(0);
     expect(snapshot.recordLimits.truncated).toBe(false);
   });
 });

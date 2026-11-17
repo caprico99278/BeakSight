@@ -11,8 +11,6 @@ import {
   DEFAULT_MAX_CREATES_PER_RUN,
   DEFAULT_MAX_CUMULATIVE_CREATES,
   EXECUTION_GRANT_TTL_MS,
-  MAX_SCENARIO_FIELD_NAMES,
-  MAX_SCENARIO_READ_CHECKS,
   REVOCATION_REASONS,
   APPROVAL_RECEIPT_KINDS,
   SCENARIO_KINDS,
@@ -28,8 +26,6 @@ import {
   validateScenarioDraft,
   type ScenarioDraftValidationResult,
 } from '../../src/control/approval/scenario-policy.js';
-import { MAX_CANDIDATE_FIELDS } from '../../src/discovery/candidate-contracts.js';
-import { MAX_READ_CHECK_DEFINITIONS_PER_PROFILE } from '../../src/discovery/read-check-contracts.js';
 import {
   ALL_CONFIRMED,
   BOUND_CANDIDATE,
@@ -58,8 +54,6 @@ describe('scenario contracts and defaults (T28a)', () => {
     expect(EXECUTION_GRANT_TTL_MS).toBe(5 * MINUTE_MS);
     expect(APPROVAL_TTL_DAY_MS).toBe(HOURS_PER_DAY * MINUTES_PER_HOUR * MINUTE_MS);
     expect(APPROVER_LOCAL_OPERATOR).toBe('LOCAL_OPERATOR');
-    expect(MAX_SCENARIO_FIELD_NAMES).toBe(MAX_CANDIDATE_FIELDS);
-    expect(MAX_SCENARIO_READ_CHECKS).toBe(MAX_READ_CHECK_DEFINITIONS_PER_PROFILE);
   });
 
   it('has the frozen closed lists (EXPIRED is not stored)', () => {
@@ -114,12 +108,10 @@ describe('scenario contracts and defaults (T28a)', () => {
       'SCENARIO_READ_CHECK_CANCELED',
       'SCENARIO_READ_CHECK_REVISION_MISMATCH',
       // T30a: 検証の指定（2 つの結果の条件の重なり（fix round 1）、照合の READ の結び付けと期待の欄）。
-      'SCENARIO_VERIFICATION_CONDITIONS_AMBIGUOUS',
       'SCENARIO_VERIFICATION_PARAMETER_UNKNOWN',
       'SCENARIO_VERIFICATION_FIELD_NOT_SENT',
       'SCENARIO_LIMIT_ABOVE_DEFAULT',
-      'SCENARIO_LIMIT_INCONSISTENT',
-      'SCENARIO_TTL_ABOVE_DEFAULT',
+      // LZ-3c: 累積の件数と期限の日数の理由（`SCENARIO_LIMIT_INCONSISTENT`・`SCENARIO_TTL_ABOVE_DEFAULT`）は捨てた。
       // T37d fix round 1: 照合の READ に、画面の path を読む定義を選んだ。
       'SCENARIO_VERIFICATION_READ_CHECK_PAGE_TARGET',
       // T38b: API のシナリオの下書き（`scenario-api-draft.test.ts` で確かめる）。
@@ -144,6 +136,19 @@ describe('scenario contracts and defaults (T28a)', () => {
       // T41a（`scenario-api-update-contract.test.ts`）: API の更新のページが決める鍵、台帳の ID と filter の結び付け。
       'SCENARIO_API_PAGE_KEY_NOT_IDENTIFIABLE',
       'SCENARIO_API_FILTER_NOT_BOUND_TO_LEDGER_ID',
+      // ARR-2（`def-226-array-key-approval.test.ts`）: 登録の一覧の鍵。
+      'SCENARIO_API_ARRAY_NESTED',
+      'SCENARIO_API_ARRAY_OVER_LIMIT',
+      'SCENARIO_API_ARRAY_ELEMENT_TYPE_MISMATCH',
+      'SCENARIO_API_ARRAY_ELEMENT_COUNT_MISMATCH',
+      // ARR-3（`arr-3-array-rows.test.ts`）: 欄の印が 2 つ以上入る一覧の鍵。
+      'SCENARIO_API_ARRAY_MULTIPLE_FIELDS',
+      // ARR-5（`arr-5-array-object-rows.test.ts`）: object の一覧の、行ごとに違う中の鍵の集合と、扱えない中の鍵の名前。
+      'SCENARIO_API_ARRAY_ROW_KEYS_MISMATCH',
+      'SCENARIO_API_ARRAY_INNER_KEY_NOT_ALLOWED',
+      // ARR-5 fix round 1（SREV-ARR2 の M1・M2）: 一覧の位置の道の重なりと、本文の同じ鍵の 2 回。
+      'SCENARIO_API_ARRAY_PATH_CONFLICT',
+      'SCENARIO_API_BODY_KEY_DUPLICATE',
     ]);
     expect(Object.isFrozen(SCENARIO_DRAFT_REJECTION_REASONS)).toBe(true);
   });
@@ -171,7 +176,8 @@ describe('scenario draft validation (T28a)', () => {
         limits: { maxCreatesPerRun: 1, maxCumulativeCreates: 20 },
         approvalTtlDays: 30,
         // T30a: 下書きに検証の指定がなければ、すべて未指定（形の確かめは `scenario-verification-spec.test.ts`）。
-        verification: UNSPECIFIED_VERIFICATION,
+        // PL-6a: 結果の判定のしかたの印は、下書きの確かめが送り方から付ける（form は構造の判定）。ほかの項目は未指定。
+        verification: { ...UNSPECIFIED_VERIFICATION, resultJudgement: 'FORM_STRUCTURE' },
         // T31b: CREATE は UPDATE の指定を持たない（UPDATE の指定の確かめは `scenario-update-spec.test.ts`）。
         update: null,
       },
@@ -210,6 +216,13 @@ describe('scenario draft validation (T28a)', () => {
     expect(unconfirmedSideEffectsOf(ALL_CONFIRMED)).toEqual([]);
   });
 
+  // L4（COV-7）: READ の確かめの参照の数に上限を置かない（前の上限 20 を超えても、数の誤りにしない）。
+  it('does not limit the number of the READ check references (L4)', () => {
+    const readChecks = Array.from({ length: 25 }, (_value, index) => ({ readCheckId: `rc-${index}`, revision: 1 }));
+    const result = validateScenarioDraft(sampleDraft({ readChecks }), CREATE_CANDIDATE, READ_CHECK_FACTS);
+    expect(result.ok ? [] : result.errors.filter(({ detail }) => detail.includes('/readChecks must have at most'))).toEqual([]);
+  });
+
   it('sorts the READ check references by id and does not change the input', () => {
     const input = sampleDraft({ readChecks: [{ readCheckId: 'rc-2', revision: 1 }, { readCheckId: 'rc-1', revision: 2 }] });
     const snapshot = structuredClone(input);
@@ -227,13 +240,9 @@ describe('scenario draft validation (T28a)', () => {
     ['a non-string field name', sampleDraft({ fieldNames: ['name', 1] })],
     ['an empty field name', sampleDraft({ fieldNames: [''] })],
     ['a duplicate field name', sampleDraft({ fieldNames: ['name', 'name'] })],
-    ['too many field names', sampleDraft({ fieldNames: Array.from({ length: MAX_SCENARIO_FIELD_NAMES + 1 }, (_value, index) => `f${index}`) })],
     ['a bad READ check reference', sampleDraft({ readChecks: [{ readCheckId: 'rc-1' }] })],
     ['a zero READ check revision', sampleDraft({ readChecks: [{ readCheckId: 'rc-1', revision: 0 }] })],
     ['a duplicate READ check', sampleDraft({ readChecks: [{ readCheckId: 'rc-1', revision: 2 }, { readCheckId: 'rc-1', revision: 2 }] })],
-    ['too many READ checks', sampleDraft({
-      readChecks: Array.from({ length: MAX_SCENARIO_READ_CHECKS + 1 }, (_value, index) => ({ readCheckId: `rc-${index}`, revision: 1 })),
-    })],
     ['a missing side effect item', sampleDraft({ sideEffectConfirmations: { ...ALL_CONFIRMED, NOT_DESTRUCTIVE: undefined } })],
     ['an unknown side effect item', sampleDraft({ sideEffectConfirmations: { ...ALL_CONFIRMED, OTHER: true } })],
     ['a non-boolean side effect item', sampleDraft({ sideEffectConfirmations: { ...ALL_CONFIRMED, TEST_RECORDS_ONLY: 'yes' } })],
@@ -298,6 +307,14 @@ describe('scenario draft validation (T28a)', () => {
       expect(validateScenarioDraft(typedDraft(['name']), TYPED_CANDIDATE, READ_CHECK_FACTS).ok).toBe(true);
     });
 
+    // L13（N28・N30）: 送る欄の数と名前の長さに上限を置かない（前は 200 個・256 文字）。
+    it('accepts 201 fields and a long field name', () => {
+      const names = [...Array.from({ length: 201 }, (_value, index) => `f${String(index)}`), 'n'.repeat(300)];
+      const many = candidateOf(sampleForm({ submitterText: '登録', fields: names.map((name) => sampleField(name)) }));
+      const draft = sampleDraft({ candidateIdentityDigest: many.identityDigest, fieldNames: names, readChecks: [] });
+      expect(codesOf(validateScenarioDraft(draft, many, READ_CHECK_FACTS))).toEqual([]);
+    });
+
     it.each([
       ['a password field with a plain name', 'nickname'],
       ['a file field', 'attachment'],
@@ -338,30 +355,25 @@ describe('scenario draft validation (T28a)', () => {
     expect(result.ok ? [] : result.errors.map(({ code: errorCode, readCheckId: id }) => [errorCode, id])).toEqual([[code, readCheckId]]);
   });
 
-  it.each([
-    ['a per-run limit above the default', { maxCreatesPerRun: DEFAULT_MAX_CREATES_PER_RUN + 1, maxCumulativeCreates: 20 }, 30,
-      ['SCENARIO_LIMIT_ABOVE_DEFAULT']],
-    ['a cumulative limit above the default', { maxCreatesPerRun: 1, maxCumulativeCreates: DEFAULT_MAX_CUMULATIVE_CREATES + 1 }, 30,
-      ['SCENARIO_LIMIT_ABOVE_DEFAULT']],
-    ['both limits above the default', { maxCreatesPerRun: 2, maxCumulativeCreates: 21 }, 30,
-      ['SCENARIO_LIMIT_ABOVE_DEFAULT', 'SCENARIO_LIMIT_ABOVE_DEFAULT']],
-    ['a per-run limit above the cumulative limit', { maxCreatesPerRun: 2, maxCumulativeCreates: 1 }, 30,
-      ['SCENARIO_LIMIT_ABOVE_DEFAULT', 'SCENARIO_LIMIT_INCONSISTENT']],
-    ['a TTL above the default', { maxCreatesPerRun: 1, maxCumulativeCreates: 20 }, APPROVAL_TTL_DAYS + 1, ['SCENARIO_TTL_ABOVE_DEFAULT']],
-  ])('rejects %s', (_label, limits, approvalTtlDays, codes) => {
-    expect(codesOf(validateScenarioDraft(sampleDraft({ limits, approvalTtlDays }), CREATE_CANDIDATE, READ_CHECK_FACTS))).toEqual(codes);
+  it('rejects a per-run limit above the default (one write of a job)', () => {
+    const limits = { maxCreatesPerRun: DEFAULT_MAX_CREATES_PER_RUN + 1, maxCumulativeCreates: 20 };
+    expect(codesOf(validateScenarioDraft(sampleDraft({ limits, approvalTtlDays: 30 }), CREATE_CANDIDATE, READ_CHECK_FACTS))).toEqual(['SCENARIO_LIMIT_ABOVE_DEFAULT']);
   });
 
-  it('accepts the limits and the TTL exactly at the defaults and at the minimum', () => {
+  // LZ-3c（設計者の判断 (b)）: 累積の件数と承認の期限の日数は、判定に使わない名残（承認の digest の版を変えないために残す項目）。前の既定（20 件・30 日）を
+  // 超える値も、保存した値のまま受ける（前の「既定以下」「1 回の Run が累積以下」の確かめは捨てた）。
+  it('accepts a stored cumulative count and a TTL above the former defaults as they are (LZ-3c)', () => {
     for (const [limits, approvalTtlDays] of [
       [{ maxCreatesPerRun: DEFAULT_MAX_CREATES_PER_RUN, maxCumulativeCreates: DEFAULT_MAX_CUMULATIVE_CREATES }, APPROVAL_TTL_DAYS],
       [{ maxCreatesPerRun: 1, maxCumulativeCreates: 1 }, 1],
+      [{ maxCreatesPerRun: 1, maxCumulativeCreates: DEFAULT_MAX_CUMULATIVE_CREATES + 1 }, APPROVAL_TTL_DAYS + 1],
     ] as const) {
-      expect(validateScenarioDraft(sampleDraft({ limits, approvalTtlDays }), CREATE_CANDIDATE, READ_CHECK_FACTS).ok).toBe(true);
+      const result = validateScenarioDraft(sampleDraft({ limits, approvalTtlDays }), CREATE_CANDIDATE, READ_CHECK_FACTS);
+      expect(result.ok && [result.content.limits, result.content.approvalTtlDays]).toEqual([limits, approvalTtlDays]);
     }
   });
 
-  it('reports the errors in the order of the items (candidate, fields, READ checks, limits, TTL)', () => {
+  it('reports the errors in the order of the items (candidate, fields, READ checks, limits)', () => {
     const result = validateScenarioDraft(sampleDraft({
       fieldNames: ['API-Key'],
       readChecks: [{ readCheckId: 'rc-canceled', revision: 1 }],
@@ -373,7 +385,6 @@ describe('scenario draft validation (T28a)', () => {
       'SCENARIO_FIELD_SECRET_LIKE',
       'SCENARIO_READ_CHECK_CANCELED',
       'SCENARIO_LIMIT_ABOVE_DEFAULT',
-      'SCENARIO_TTL_ABOVE_DEFAULT',
     ]);
   });
 

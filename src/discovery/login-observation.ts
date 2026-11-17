@@ -3,9 +3,9 @@
 // （`src/safety/login-stage-blocked-requests.ts`）、ワーカー（`src/worker/login-stage-observation.ts`）、IPC の検証（`src/control/worker-protocol.ts`）、
 // 画面の登録の案が、同じ定義を使う（書き写さない）。
 // - 止めた要求の query（設計書 3 章「query の値は登録の案に入れない。例外は、プロトコルの決まった名前の閉じた一覧（今は `grant_type`）の値だけ」）:
-//   名前の一覧（値なし。重ならない名前で数え、上限 `MAX_LOGIN_OBSERVED_QUERY_NAMES`。値に見える名前（`isValueLikeText`）・長すぎる名前・書けない文字を
-//   含む名前は伏せた表記 `REDACTED_PATH_SEGMENT` にする）と、一覧に入れなかった名前の数と、閉じた一覧の名前の値（決まった形の短い語だけ。値に見える
-//   値、同じ名前が 2 回ある query の値は残さない）。名前の一覧は、値を残した名前を先に入れ、残りを UTF-16 のコード単位の順で入れ、並べて返す。
+//   名前の一覧（値なし。重ならない名前で数え、LZ-3a: 数の上限はない。値に見える名前（`isValueLikeText`）・長すぎる名前・書けない文字を
+//   含む名前は伏せた表記 `REDACTED_PATH_SEGMENT` にする）と、一覧に入れなかった名前の数（今は 0）と、閉じた一覧の名前の値（決まった形の短い語だけ。値に
+//   見える値、同じ名前が 2 回ある query の値は残さない）。名前の一覧は UTF-16 のコード単位の順に並べて返す。
 // - 成功の鍵の名前（設計書 4.4「ローカル ストレージの鍵の名前を、ログインの前と後で比べ、新しく出た名前を記録する（値は読まない）」）: 始めになく
 //   終わりにある名前の、接頭辞と接尾辞の案だけ（T43R-fix の C-1 (a)。名前の全体は残さない。下の「成功の鍵の名前」）。
 // - 成功の画面のセレクタ（ユーザーの判断「ログインの後の画面から提案する」）: ログアウトの語に当たる見えるリンクやボタン（`LOGOUT_CONTROL`）の、ログアウトの
@@ -32,8 +32,7 @@ import {
 export const LOGIN_OBSERVED_QUERY_VALUE_NAMES = Object.freeze(['grant_type'] as const);
 export type LoginObservedQueryValueName = (typeof LOGIN_OBSERVED_QUERY_VALUE_NAMES)[number];
 
-/** 1 行の query の名前の上限（認証の設定の必須の query の組の上限 `MAX_SCRIPT_LOGIN_REQUIRED_QUERY` と同じ数）。 */
-export const MAX_LOGIN_OBSERVED_QUERY_NAMES = 4;
+// LZ-3a: 1 行の query の名前の数の上限（前は `MAX_LOGIN_OBSERVED_QUERY_NAMES` 4）は撤廃した。名前は残らず残す（値は今どおり残さない）。
 /** query の名前の最大長（UTF-16 のコード単位。超える名前は伏せる）。 */
 export const MAX_LOGIN_OBSERVED_QUERY_NAME_LENGTH = 64;
 /** 残す値の最大長（UTF-16 のコード単位。超える値は残さない）。 */
@@ -85,35 +84,18 @@ export const isLoginObservedQueryValue = (name: string, value: string): boolean 
 /** 並べた写し。 */
 const sorted = (values: Iterable<string>): string[] => [...values].sort(compareCodeUnits);
 
-/** 上限までの名前（`first` を先に入れ、残りを並べた順で入れる。返す名前は並べる）と、入れなかった数。 */
-const cappedNamesOf = (
-  names: ReadonlySet<string>,
-  first: readonly string[],
-  limit: number,
-): { readonly names: readonly string[]; readonly omitted: number } => {
-  const kept = first.filter((name) => names.has(name)).slice(0, limit);
-  for (const name of sorted(names)) {
-    if (kept.length >= limit) {
-      break;
-    }
-    if (!kept.includes(name)) {
-      kept.push(name);
-    }
-  }
-  return { names: Object.freeze(sorted(kept)), omitted: names.size - kept.length };
-};
-
-/** query の記録を組み立てる（名前がなければ `null`）。 */
+/**
+ * query の記録を組み立てる（名前がなければ `null`）。名前は残らず、並べて入れる（LZ-3a）。`omitted` は前の記録の形のために残し、前の記録から合わせた
+ * 数（`extraOmitted`）だけを持つ。
+ */
 const queryRecordOf = (names: ReadonlySet<string>, values: readonly LoginObservedQueryValue[], extraOmitted: number): LoginObservedQuery | null => {
   if (names.size === 0) {
     return null;
   }
-  const capped = cappedNamesOf(names, values.map(({ name }) => name), MAX_LOGIN_OBSERVED_QUERY_NAMES);
-  const kept = values.filter(({ name }) => capped.names.includes(name));
   return Object.freeze({
-    names: capped.names,
-    omitted: capped.omitted + extraOmitted,
-    values: Object.freeze(kept.map((value) => Object.freeze({ ...value }))),
+    names: Object.freeze(sorted(names)),
+    omitted: extraOmitted,
+    values: Object.freeze(values.filter(({ name }) => names.has(name)).map((value) => Object.freeze({ ...value }))),
   });
 };
 
@@ -144,8 +126,8 @@ export const loginObservedQueryOf = (parameters: Iterable<readonly [string, stri
 };
 
 /**
- * 同じ行の 2 つの query の記録を合わせる（名前を足し合わせ、上限と入れなかった数を保つ。値は同じ行なので同じ。前の値を使う）。入れなかった数は、合わせた
- * 名前の上限を超えた数と、前の 2 つの入れなかった数の大きい方の和（下限の目安）。
+ * 同じ行の 2 つの query の記録を合わせる（名前を足し合わせる。値は同じ行なので同じ。前の値を使う）。入れなかった数は、前の 2 つの入れなかった数の大きい方
+ * （LZ-3a: 名前の数の上限はないので、今は 0）。
  */
 export const mergeLoginObservedQuery = (previous: LoginObservedQuery | null, next: LoginObservedQuery | null): LoginObservedQuery | null => {
   if (previous === null || next === null) {
@@ -167,8 +149,7 @@ export const mergeLoginObservedQuery = (previous: LoginObservedQuery | null, nex
 // 接頭辞か接尾辞の片側が空でも受ける）。両側とも当たらない名前、区切りのない名前、当たる端が短すぎる・長すぎる・値に見える・書けない文字を含む名前は、
 // 案にしない。
 
-/** 新しく出た鍵の名前の案（接頭辞と接尾辞の組）の上限。 */
-export const MAX_LOGIN_OBSERVED_STORAGE_KEY_NAMES = 4;
+// LZ-3a: 新しく出た鍵の名前の案（接頭辞と接尾辞の組）の数の上限（前は `MAX_LOGIN_OBSERVED_STORAGE_KEY_NAMES` 4）は撤廃した。
 /** 鍵の名前の区切り（閉じた一覧）。 */
 export const LOGIN_OBSERVED_KEY_SEPARATORS = Object.freeze(['.', ':', '_', '/', '-'] as const);
 /** 最初と最後の部分の最小の長さ（UTF-16 のコード単位。短すぎる部分は識別にならない）。 */
@@ -184,7 +165,7 @@ export interface LoginObservedStorageKeyShape {
   readonly suffix: string;
 }
 
-/** 新しく出た鍵の名前の案と、案にしなかった新しい名前の数（区切りが足りない・部分が受けられない・上限を超えた）。 */
+/** 新しく出た鍵の名前の案と、案にしなかった新しい名前の数（区切りが足りない・部分が受けられない・同じ案になった。LZ-3a: 数の上限はない）。 */
 export interface LoginObservedStorageKeyShapes {
   readonly shapes: readonly LoginObservedStorageKeyShape[];
   readonly omitted: number;
@@ -259,8 +240,7 @@ export const newStorageKeyShapesOf = (before: readonly string[], after: readonly
     return null;
   }
   const sortedShapes = [...shapes.values()].sort((left, right) => compareCodeUnits(left.prefix, right.prefix) || compareCodeUnits(left.suffix, right.suffix));
-  const kept = sortedShapes.slice(0, MAX_LOGIN_OBSERVED_STORAGE_KEY_NAMES);
-  return Object.freeze({ shapes: Object.freeze(kept), omitted: fresh.length - kept.length });
+  return Object.freeze({ shapes: Object.freeze(sortedShapes), omitted: fresh.length - sortedShapes.length });
 };
 
 // ---------------------------------------------------------------------------------------------------------------

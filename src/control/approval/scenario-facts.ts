@@ -15,6 +15,7 @@
 //   SELECT しない）。発見の根拠の写しは `schema-checked-copy.ts` の手順で確かめる。
 // - 読むだけ（SQL の書き込みの文を持たない。書き込みは `scenario-store.ts` だけ）。`connection` を受ける関数は、呼び出し側の `withWriteTransaction`・
 //   `withReadTransaction` の中から呼ぶ。
+import { isApprovedApiShapeOrigin, type ApiRequestOriginShape } from '../../core/api-request-shape.js';
 import { isSha256Fingerprint } from '../../core/ids.js';
 import { deepFreeze } from '../../core/immutable.js';
 import { compareCodeUnits } from '../../core/text.js';
@@ -30,7 +31,10 @@ import type { SqliteConnection } from '../store/sqlite-module.js';
 import { ControlStoreError, storedRowIntegrityError } from '../store/store-errors.js';
 import { withReadTransaction } from '../store/transaction.js';
 import { TARGET_CONFIG_SHA256_PATTERN } from '../worker-protocol.js';
-import { latestRuleSetReferenceIn } from '../data-rules/rule-set-facts.js';
+import { latestRuleSetIn, latestRuleSetReferenceIn } from '../data-rules/rule-set-facts.js';
+import { planRuleSet } from '../data-rules/field-evaluation.js';
+import { uniqueEachRunFieldNamesOf } from '../data-rules/varying-values.js';
+import { CREATE_SCENARIO_KIND } from '../../core/scenario-kind.js';
 import { computeApprovalDigest, type ApprovalDigestFacts } from './approval-digest.js';
 import {
   evaluateApprovalValidity,
@@ -51,6 +55,7 @@ import {
   updateLedgerScenarioIdOf,
 } from './scenario-contracts.js';
 import { assertStorableApprovalReceipt, storedScenarioRevisionOf } from './scenario-policy.js';
+import { discoveryProfileRevisionsIn } from './discovery-profile-freshness.js';
 
 // ---------------------------------------------------------------------------------------------------------------
 // 形
@@ -288,8 +293,25 @@ export const readCheckFactsIn = (connection: SqliteConnection, profileId: string
       targetKind: readCheckTargetKindOf(definition),
       // T38c: 画面の path の定義が `{id}` つきの型か（API のシナリオの照合の READ だけに使える）。
       ...(definition.targetPagePath === undefined ? {} : { pageTemplate: isReadCheckPageTemplatePath(definition.targetPagePath) }),
+      // OP-R（R1）: 画面の path の定義の path（API の登録の照合の READ に、一覧の画面の定義を使えるかを、下書きの確かめが見る）。
+      ...(definition.targetPagePath === undefined ? {} : { pagePath: definition.targetPagePath }),
     }))
     .sort((left, right) => compareCodeUnits(left.readCheckId, right.readCheckId)));
+
+/**
+ * LU-6（一覧の行の更新の設計書 5.4 の 2、fix round 1 の判断 3）: 登録のシナリオの、実行のたびに違う値になる欄の名前（入力の規則の最新の版から、値の生成の
+ * 持ち主の判定 `uniqueEachRunFieldNamesOf` で求める。開始の画面と書き込みの指定の組み立て（`audit-job-manager.ts`）と同じ求め方）。登録でない・規則が
+ * まだないときは null（一覧の行の更新の行を選ぶ欄の確かめは拒む側）。許可を出す時の確かめ直しは LU-8。
+ */
+const uniqueEachRunFieldNamesOfLedger = (
+  connection: SqliteConnection,
+  scenarioId: string,
+  scenario: ScenarioRevisionView['scenario'],
+  evidence: DiscoveryCandidate,
+): readonly string[] | null => {
+  const rules = scenario.kind === CREATE_SCENARIO_KIND ? latestRuleSetIn(connection, scenarioId) : null;
+  return rules === null ? null : uniqueEachRunFieldNamesOf(planRuleSet(rules.ruleSet, scenario, evidence));
+};
 
 /**
  * プロファイルのシナリオの事実（T31b。id・プロファイル・今の版の kind。id の順。下書きの確かめが台帳の参照を確かめる）。T31R-fix-1 の I-2: 今の版の
@@ -298,15 +320,39 @@ export const readCheckFactsIn = (connection: SqliteConnection, profileId: string
 export const scenarioKindFactsIn = (connection: SqliteConnection, profileId: string): readonly ScenarioKindFact[] =>
   Object.freeze((connection.prepare(SELECT_PROFILE_SCENARIO_REVISIONS_SQL).all(profileId) as unknown as (RevisionRow & { readonly scenario_id: string })[])
     .map((row) => {
-      const { scenario } = revisionViewOf(row);
+      const { scenario, evidence } = revisionViewOf(row);
       // T41a: API の登録の応答の鍵の取り方も入れる（API の UPDATE の filter の名前を台帳の ID に結ぶ確かめ）。T41R-fix-B: API の要求の送り先（Origin と
       // path の型。API の更新の台帳が同じ表の API の登録であることの確かめ）も入れる。
       const { api } = scenario;
       return Object.freeze({
         scenarioId: row.scenario_id, profileId, kind: scenario.kind, recordId: scenario.verification.recordId, apiRecordId: api?.recordId ?? null,
         apiRequest: api === undefined ? null : Object.freeze({ origin: api.request.origin, pathShape: api.request.pathShape }),
+        uniqueEachRunFieldNames: uniqueEachRunFieldNamesOfLedger(connection, row.scenario_id, scenario, evidence),
+        // DEF-203（設計書 5.10 の 2）: API の指定のページが決める鍵の名前（更新の欄と結びつかない鍵を台帳の値と照らしてよいかの確かめ）。
+        apiPageKeyNames: api === undefined ? null : Object.freeze(api.pageKeys.map(({ key }) => key)),
       });
     }));
+
+/**
+ * LU-8 fix round 1（一覧の行の更新の設計書 5.5 の最後の段、案 A）: 台帳の登録のシナリオの、今の入力の規則で実行のたびに違う値になる欄の名前（下書きの確かめと
+ * 同じ事実 `scenarioKindFactsIn` の `uniqueEachRunFieldNames`。求め方の owner は `uniqueEachRunFieldNamesOfLedger`）。台帳がプロファイルにない・登録でない・
+ * 規則がまだないときは null。書き込みの開始が、一覧の行の更新の行を選ぶ欄を確かめ直すのに使う。
+ */
+export const readLedgerUniqueEachRunFieldNames = (database: ControlDatabase, profileId: string, ledgerScenarioId: string): readonly string[] | null =>
+  withReadTransaction(database, (connection) =>
+    scenarioKindFactsIn(connection, profileId).find(({ scenarioId }) => scenarioId === ledgerScenarioId)?.uniqueEachRunFieldNames ?? null);
+
+/**
+ * PL-6a（設計書 `2026-10-26-beaksight-plain-ui-design.md` 8.1、設計者の判断 (f)）: プロファイルのシナリオの今の版のうち、照合の READ に照合の専用の印
+ * （`verificationOnly`）を持つものが参照する READ の定義の id（id の順。重なりなし）。単独の READ の確かめのジョブは、この定義を読まない（管理データの版を
+ * 上げずに、シナリオの文書の印で決める）。
+ */
+export const verificationOnlyReadCheckIdsIn = (connection: SqliteConnection, profileId: string): readonly string[] =>
+  Object.freeze([...new Set((connection.prepare(SELECT_PROFILE_SCENARIO_REVISIONS_SQL).all(profileId) as unknown as RevisionRow[])
+    .flatMap((row) => {
+      const read = revisionViewOf(row).scenario.verification.readVerification;
+      return read?.verificationOnly === true ? [read.readCheckId] : [];
+    }))].sort(compareCodeUnits));
 
 /**
  * 同じ台帳のシナリオの id（T31e。生成の履歴に使う。id の順）。台帳は、CREATE のシナリオと、どれかの版でそれを参照する UPDATE のシナリオの集まり。
@@ -364,13 +410,16 @@ const latestDiscoveryProfileRevisionIn = (connection: SqliteConnection, profileI
   return job === null || job.profileId !== profileId ? null : job.profileRevision;
 };
 
-/** シナリオの版の発見の根拠の、型の Origin の番号（T38R-fix の C-2。承認したサービスの Origin でない型と、API の probe のない根拠は null）。 */
-const apiShapeOriginIndexIn = (connection: SqliteConnection, scenario: ScenarioRevision): number | null => {
+/**
+ * シナリオの版の発見の根拠の、型の Origin の区分と番号（T38R-fix の C-2。承認した Origin でない型と、API の probe のない根拠は null）。DEF-220: 承認したテストの
+ * Origin の区分（`APPROVED_TEST`）も、区分ごと返す（番号を解くのは承認の有効性の判定。契約の 1 か所の部品で解く）。
+ */
+const apiShapeOriginIn = (connection: SqliteConnection, scenario: ScenarioRevision): ApiRequestOriginShape | null => {
   if (scenario.api === undefined) {
     return null;
   }
   const origin = revisionViewOf(revisionRowOf(connection, scenario.scenarioId, scenario.revision)).evidence.submissionProbe?.shape?.origin;
-  return origin?.kind === 'APPROVED_API' ? origin.index : null;
+  return origin !== undefined && isApprovedApiShapeOrigin(origin) ? origin : null;
 };
 
 /**
@@ -403,6 +452,7 @@ export const currentFactsIn = (
   if (stored === null) {
     throw integrityError('scenarios', 'the profile of the scenario does not exist');
   }
+  const latestDiscoveryRevision = latestDiscoveryProfileRevisionIn(connection, scenario.profileId, snapshot);
   return Object.freeze({
     profile: Object.freeze({
       profileId: stored.profile.profileId,
@@ -411,6 +461,8 @@ export const currentFactsIn = (
       mode: stored.profile.mode,
       // T38R-fix の C-2: 今の承認したサービスの Origin（API のシナリオの Origin が、型の番号の位置にあるか）。
       approvedServiceOrigins: Object.freeze([...(stored.profile.approvedServiceOrigins ?? [])]),
+      // DEF-220: 今の承認したテストの Origin（テスト用のサイト自身の API のシナリオの Origin が、型の番号の位置にあるか）。
+      approvedTestOrigins: Object.freeze([...stored.profile.approvedTestOrigins]),
     }),
     authSetupDigest: external.authSetupDigest,
     targetConfigDigest: external.targetConfigDigest,
@@ -421,8 +473,11 @@ export const currentFactsIn = (
     candidateShapeDigests: candidateShapeDigestsOf(snapshot, scenario.candidate.identityDigest),
     // T38R-fix: 鍵と欄の対応の digest の一覧（I-1）、根拠の型の Origin の番号と最新の発見のジョブの改訂（C-2）。
     candidateKeyFieldDigests: candidateKeyFieldDigestsOf(snapshot, scenario.candidate.identityDigest),
-    apiShapeOriginIndex: apiShapeOriginIndexIn(connection, scenario),
-    latestDiscoveryProfileRevision: latestDiscoveryProfileRevisionIn(connection, scenario.profileId, snapshot),
+    apiShapeOrigin: apiShapeOriginIn(connection, scenario),
+    latestDiscoveryProfileRevision: latestDiscoveryRevision,
+    // PL-U の修正の 1 回目（設計書 14.1 の U5）: その発見の改訂から今の改訂まで「書き込みも試す」の切り替えだけか（判定の 1 か所 `discovery-profile-freshness.ts`）。
+    latestDiscoverySwitchOnlySinceDiscovery: discoveryProfileRevisionsIn(connection, scenario.profileId, latestDiscoveryRevision, stored.profile.revision)
+      .switchOnlySinceDiscovery === true,
     // T29d: 入力の規則の今の参照は、規則の集まりの最新の版（シナリオ自身の参照ではない）。
     inputRuleReference: latestRuleSetReferenceIn(connection, scenario.scenarioId),
     readChecks: readCheckFactsIn(connection, scenario.profileId),

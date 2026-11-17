@@ -5,6 +5,8 @@
  * - `readCheckPageContextOf`: ターゲット設定の開始の URL と許可 Origin、プロファイルの承認したテストの Origin、保存した認証の設定の読まないパス・読む範囲・
  *   セッションの切れの path（ワーカーの実行の前の判定と同じ出どころ）。ターゲット設定を読めなければ null（保存の検証が拒む）。
  * - `readCheckPagePathsOf`: 直近の発見の結果の、読めた画面のうち、開始の URL と同じ Origin のもの（文書の順で重なりなし。読めなければ空）。
+ * - `auditLinkPagePathsOf`（OP-R。設計書 `2026-10-27-beaksight-one-pass-flow-design.md` 4.1.9 の R1）: 点検の段の成果物のリンクの URL のうち、開始の URL と同じ
+ *   Origin のものの path（見つけた順で重なりなし。読めない URL は使わない）。自動の下書きの一覧の画面の選び方に渡す。
  */
 import type { ReadCheckPageContext } from '../../../../src/control/read-check-policy.js';
 import { sessionLostPathPrefixOf } from '../../../../src/control/auth/auth-setup-policy.js';
@@ -51,6 +53,26 @@ export const readCheckPagePathsOf = (document: DiscoveryDocument | null, reading
     const location = page.state === 'READ' ? page.record.location : null;
     if (location !== null && location.origin === startOrigin) {
       paths.add(location.path);
+    }
+  }
+  return [...paths];
+};
+
+/** OP-R（R1）: 点検の段のリンクの URL のうち、開始の URL と同じ Origin のものの path（見つけた順で重なりなし）。 */
+export const auditLinkPagePathsOf = (urls: readonly string[], reading: ProfileStartReading): readonly string[] => {
+  const startOrigin = originOfUrl(reading.context?.targetConfig.site.startUrl);
+  if (startOrigin === null) {
+    return [];
+  }
+  const paths = new Set<string>();
+  for (const url of urls) {
+    try {
+      const parsed = new URL(url);
+      if (parsed.origin === startOrigin) {
+        paths.add(parsed.pathname);
+      }
+    } catch {
+      // 読めない URL は使わない。
     }
   }
   return [...paths];

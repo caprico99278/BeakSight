@@ -19,6 +19,7 @@
 //   （`json-value.ts`。判定が拒むので、判定の見込みを外れた値だけ。例: 絶対値が 0.000001 未満の数）、止めて `JSON_VALUE_TYPE_MISMATCH`。値を
 //   入れない欄（null）は確かめない。
 import { deepFreeze } from '../../core/immutable.js';
+import { apiKeyFieldValueTypeOf } from '../../core/json-value.js';
 import { sortedKeysJsonOf } from '../../core/sorted-keys-json.js';
 import { compareCodeUnits } from '../../core/text.js';
 import type { ScenarioApiSpec, ScenarioRevision } from '../approval/scenario-contracts.js';
@@ -33,9 +34,11 @@ import {
   SYNTHETIC_EMAIL_LOCAL_DIGITS,
   SYNTHETIC_PHONE_VARIABLE_DIGITS,
   maxNumberOfDigits,
+  SYNTHETIC_TEXT_DIGITS,
   phoneNumberDigitsOf,
   relationFieldNamesOf,
   syntheticEmailAddressOf,
+  syntheticTextOf,
   syntheticPhoneNumberOf,
   type FieldRelation,
   type FieldRuleProblem,
@@ -115,7 +118,8 @@ const jsonMismatchKeyOf = (values: Readonly<Record<string, string | null>>, api:
   }
   return api.keyFields.find(({ key, type }) => {
     const value = values[key];
-    return typeof value === 'string' && !isJsonValueConvertible(value, type);
+    // ARR-2: 一覧の鍵（array）の値は、要素の文字（`apiKeyFieldValueTypeOf`）。
+    return typeof value === 'string' && !isJsonValueConvertible(value, apiKeyFieldValueTypeOf(type));
   })?.key ?? null;
 };
 
@@ -254,6 +258,15 @@ const attemptOnce = (
       case 'DIGIT_CODE': {
         // FM2c: 番号・コード（桁ごとに 0〜9 を列から選ぶ。欄の制約に合わなければ作り直す）。
         const value = Array.from({ length: plan.digits }, () => String(stream.nextIntInclusive(0, MAX_DECIMAL_DIGIT))).join('');
+        if (plan.issueOf(value) !== null) {
+          return { kind: 'RETRY', report: report(fieldName, { code: 'NEEDS_RULE_INPUT', detail: 'PATTERN_UNSUPPORTED' }) };
+        }
+        values[fieldName] = value;
+        break;
+      }
+      case 'GENERIC_TEXT': {
+        // OP-2: 作り物の文字（数字の部分を列から選ぶ。欄の制約に合わなければ作り直す）。
+        const value = syntheticTextOf(stream.nextIntInclusive(0, maxNumberOfDigits(SYNTHETIC_TEXT_DIGITS)));
         if (plan.issueOf(value) !== null) {
           return { kind: 'RETRY', report: report(fieldName, { code: 'NEEDS_RULE_INPUT', detail: 'PATTERN_UNSUPPORTED' }) };
         }

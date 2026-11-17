@@ -16,11 +16,13 @@ import type { CliOutput } from '../../src/cli/output-stream.js';
 import type { AuditConfig } from '../../src/config/types.js';
 import { RUN_ARTIFACT_FILE_NAMES } from '../../src/core/artifact-layout.js';
 import { findingsOfAuditArtifact } from '../../src/core/audit-artifact-findings.js';
+import { decodePageRecord, type PageRecord } from '../../src/core/page-record-codec.js';
 import type { AuditRunResult, Finding, PageAuditResult, RunSummary } from '../../src/core/contracts.js';
 import { validateArtifact } from '../../src/core/schema-validator.js';
 import type { BrowserLauncher } from '../../src/orchestration/preflight.js';
 import { RunCoordinator, type RunCoordinatorDependencies } from '../../src/orchestration/run-coordinator.js';
 import { SafetyLedger } from '../../src/safety/safety-ledger.js';
+import { auditRunArrayOf } from './audit-run-fixture.js';
 import { launchHeadlessChromium } from './chromium.js';
 import { READ_METHODS } from './leak-places.js';
 import { createTestConfig, type TestConfigOverrides } from './test-config.js';
@@ -28,6 +30,15 @@ import { createTestConfig, type TestConfigOverrides } from './test-config.js';
 // ---------------------------------------------------------------------------------------------------------------
 // Run の設定
 // ---------------------------------------------------------------------------------------------------------------
+
+/**
+ * DEF-245 の A: Run の全体を流す結合テストの、進みの見張りの反応なしの長さ（ms。本番は 180 秒）。見張りで終わる段があっても、テストの時間の上限に収まる長さ。
+ */
+export const TEST_RUN_PROGRESS_QUIET_LIMIT_MS = 10_000;
+
+/** DEF-245 の A: 短い反応なしの長さ（`TEST_RUN_PROGRESS_QUIET_LIMIT_MS`）で Run Coordinator を作る（`executeAuditRun` の `createRunCoordinator` に渡す）。 */
+export const createQuietLimitedRunCoordinator = (dependencies: RunCoordinatorDependencies): RunCoordinator =>
+  new RunCoordinator({ ...dependencies, progressWatchQuietLimitMs: TEST_RUN_PROGRESS_QUIET_LIMIT_MS });
 
 /** 実行時間を抑える Run の設定（幅の走査とスクリーンショットをしない。Interaction の段階は既定のまま有効）。 */
 export const FAST_RUN_OVERRIDES: TestConfigOverrides = Object.freeze({
@@ -120,7 +131,7 @@ export interface CoordinatorRunOptions {
 
 /** Run Coordinator で Run を行う（時計は実際の時刻）。 */
 export async function runWithCoordinator(options: CoordinatorRunOptions): Promise<AuditRunResult> {
-  return await new RunCoordinator({
+  return await auditRunArrayOf(await new RunCoordinator({
     config: options.config,
     launchBrowser: options.launchBrowser,
     createSafetyLedger: options.createSafetyLedger ?? (() => new SafetyLedger()),
@@ -128,7 +139,7 @@ export async function runWithCoordinator(options: CoordinatorRunOptions): Promis
     now: () => Date.now(),
     outputDirectory: options.outputDirectory,
     ...(options.deadlines === undefined ? {} : { deadlines: options.deadlines }),
-  }).run();
+  }).run());
 }
 
 // ---------------------------------------------------------------------------------------------------------------
@@ -220,18 +231,24 @@ export async function readJson(path: string): Promise<unknown> {
 }
 
 /**
- * Run のディレクトリの audit.json（ページの結果と、Run の Finding の一覧）を読む。T44f: audit.json の最上位の `findings` はページに入っていない Finding だけ
- * なので、`findings` は、読む側の決まり（`findingsOfAuditArtifact`）で、Run のすべての Finding にして返す。
+ * Run のディレクトリの audit.json（目録）から、ページの結果と、Run の Finding の一覧を読む。REC-2: audit.json はページを写さないので、ページは目録のパスの
+ * page.json から読む。T44f: audit.json の最上位の `findings` はページに入っていない Finding だけなので、`findings` は、読む側の決まり
+ * （`findingsOfAuditArtifact`）で、Run のすべての Finding にして返す。
  */
 export async function readRunAudit(runDirectory: string): Promise<{
   readonly pages: readonly PageAuditResult[];
   readonly findings: readonly Finding[];
 }> {
   const audit = await readJson(join(runDirectory, RUN_ARTIFACT_FILE_NAMES.audit)) as {
-    readonly pages: readonly PageAuditResult[];
+    readonly pages: readonly string[];
     readonly findings: readonly Finding[];
   };
-  return { pages: audit.pages, findings: findingsOfAuditArtifact(audit) };
+  const pages: PageAuditResult[] = [];
+  for (const path of audit.pages) {
+    // REC-3: page.json はディスクの形なので、メモリの形に戻す。
+    pages.push(decodePageRecord(await readJson(join(runDirectory, path)) as PageRecord));
+  }
+  return { pages, findings: findingsOfAuditArtifact({ pages, findings: audit.findings }) };
 }
 
 /** 書き出した artifact の1つ（ZIP の中のファイルは `<ZIP の相対パス>!/<項目の名前>`）。 */

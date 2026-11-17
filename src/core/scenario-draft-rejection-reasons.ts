@@ -37,12 +37,10 @@ export const SCENARIO_DRAFT_REJECTION_REASONS = Object.freeze([
   'SCENARIO_READ_CHECK_NOT_FOUND',
   'SCENARIO_READ_CHECK_CANCELED',
   'SCENARIO_READ_CHECK_REVISION_MISMATCH',
-  'SCENARIO_VERIFICATION_CONDITIONS_AMBIGUOUS',
   'SCENARIO_VERIFICATION_PARAMETER_UNKNOWN',
   'SCENARIO_VERIFICATION_FIELD_NOT_SENT',
   'SCENARIO_LIMIT_ABOVE_DEFAULT',
-  'SCENARIO_LIMIT_INCONSISTENT',
-  'SCENARIO_TTL_ABOVE_DEFAULT',
+  // LZ-3c: 累積の件数と期限の日数の確かめ（前の `SCENARIO_LIMIT_INCONSISTENT`・`SCENARIO_TTL_ABOVE_DEFAULT`）は捨てた（画面に返すだけの理由で、残らない）。
   // T37d fix round 1: 照合の READ に、画面の path を読む定義を選んだ（開始の拒否 `WRITE_READ_VERIFICATION_PAGE_TARGET` と同じ意味。重ねの守り）。
   'SCENARIO_VERIFICATION_READ_CHECK_PAGE_TARGET',
   // T38b（Task 38 の設計書 3.2）: API のシナリオの下書き（説明は `scenario-policy.ts` の API の確かめの節）。
@@ -63,11 +61,26 @@ export const SCENARIO_DRAFT_REJECTION_REASONS = Object.freeze([
   'SCENARIO_API_PAGE_KEY_NOT_SCALAR',
   'SCENARIO_API_RECORD_ID_KEY_SECRET_LIKE',
   // T40R-fix-B（Task 40 の設計書 7 章の「T40R」の行の I-2 (a)）: `{id}` の照合の READ に、生成した値と比べる期待がない（行の数だけ）。T40R2-fix: (b) の
-  // 画面から ID を取る型が書き込みの画面に当たる場合は拒まず、画面の注意（core の `recordIdPatternMatchesPagePath`）にしたので、一覧から外した。
+  // 画面から ID を取る型が書き込みの画面に当たる場合は拒まないことにしたので、一覧から外した。
   'SCENARIO_API_READ_VERIFICATION_NOT_BOUND',
   // T41a（Task 41 の設計書 3.1、3.3 のページが決める鍵）: 更新の画面の欄として識別できないページが決める鍵（UPDATE）、台帳の ID の鍵が filter の名前と違う。
   'SCENARIO_API_PAGE_KEY_NOT_IDENTIFIABLE',
   'SCENARIO_API_FILTER_NOT_BOUND_TO_LEDGER_ID',
+  // ARR-2（設計書 `2026-11-08-beaksight-api-array-keys-design.md` 3.1）: 登録の一覧の鍵（array）の、入れ子・上限の超過・欄の一覧の要素の型と数の違い。
+  // 更新の一覧の鍵と、要素の情報のない古い型は、今のまま `SCENARIO_API_PAGE_KEY_NOT_SCALAR`。
+  'SCENARIO_API_ARRAY_NESTED',
+  'SCENARIO_API_ARRAY_OVER_LIMIT',
+  'SCENARIO_API_ARRAY_ELEMENT_TYPE_MISMATCH',
+  'SCENARIO_API_ARRAY_ELEMENT_COUNT_MISMATCH',
+  // ARR-3（設計書 `2026-11-09-beaksight-api-array-rows-design.md` 2.2 の 3、2.5）: 欄の印が 2 つ以上入る一覧の鍵（ページが決める一覧として受けない。段 A2 まで
+  // 対応できない形）。
+  'SCENARIO_API_ARRAY_MULTIPLE_FIELDS',
+  // ARR-5（設計書 2.4 の 2・3・4）: object の一覧の、行ごとに違う中の鍵の集合と、伏せた・秘密に見える・状態の語の中の鍵。
+  'SCENARIO_API_ARRAY_ROW_KEYS_MISMATCH',
+  'SCENARIO_API_ARRAY_INNER_KEY_NOT_ALLOWED',
+  // ARR-5 fix round 1（SREV-ARR2 の M1・M2）: 一覧の位置の道が、ほかの鍵・ほかの道と重なる。本文の object に同じ鍵が 2 回ある。
+  'SCENARIO_API_ARRAY_PATH_CONFLICT',
+  'SCENARIO_API_BODY_KEY_DUPLICATE',
 ] as const);
 export type ScenarioDraftRejectionReason = (typeof SCENARIO_DRAFT_REJECTION_REASONS)[number];
 

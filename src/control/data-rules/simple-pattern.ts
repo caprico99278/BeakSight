@@ -6,11 +6,10 @@
 //   - 区切り: `-`、`\-`（そのまま 1 文字と一致）。
 //   - 量: なし（1 回）、`+`（1 回以上）、`{n}`、`{n,m}`（`n` ≤ `m` ≤ `MAX_SIMPLE_PATTERN_REPEAT`）。
 //   - 先頭の `^` と末尾の `$` は読み飛ばす（HTML の pattern は、値の全体に当たる）。
-//   - T29R-fix-1（M-3）: 回数が決まらない量の部品は `MAX_SIMPLE_PATTERN_VARIABLE_QUANTIFIERS` 個まで。当てる値は
-//     `MAX_SIMPLE_PATTERN_VALUE_LENGTH` 文字まで（長い値は当たらない）。
+//   - T29R-fix-1（M-3）: 回数が決まらない量の部品は `MAX_SIMPLE_PATTERN_VARIABLE_QUANTIFIERS` 個まで。LZ-2: 当てる値の長さの上限は置かない。
 // - 当て方: 部品ごとに、値の中で届く位置の集まりを進める（バックトラックなし）。T29R-fix-1（M-3）: 位置ごとに「その位置から部品の文字が続く長さ」
 //   を後ろから 1 回で求め、届く位置の区間を差分の配列で足し合わせる（部品 1 つにつき値の長さに比例する手間。全体で値の長さ × 部品の数）。
-import { MAX_OPTION_VALUE_LENGTH, type CandidateFieldConstraints } from '../../discovery/candidate-contracts.js';
+import type { CandidateFieldConstraints } from '../../discovery/candidate-contracts.js';
 
 /** 受ける pattern の最大長（UTF-16 のコード単位）。 */
 export const MAX_SIMPLE_PATTERN_LENGTH = 64;
@@ -27,8 +26,8 @@ export const MAX_SIMPLE_PATTERN_TOKENS = 16;
  */
 export const MAX_SIMPLE_PATTERN_VARIABLE_QUANTIFIERS = 4;
 
-/** 当てる値の最大長（UTF-16 のコード単位。T29R-fix-1 の M-3）。人の固定の値 1 つの最大長と同じ。これより長い値は当たらない。 */
-export const MAX_SIMPLE_PATTERN_VALUE_LENGTH = MAX_OPTION_VALUE_LENGTH;
+// LZ-2: 当てる値の長さの上限（前は `MAX_SIMPLE_PATTERN_VALUE_LENGTH` 256。長い値は当たらなかった）は撤廃した。当てる手間は値の長さ × 部品の数
+// に比例する（バックトラックなし）ので、長い値でも止まらない。
 
 type CodeUnitRange = readonly [number, number];
 
@@ -198,9 +197,6 @@ const inRanges = (ranges: readonly CodeUnitRange[], code: number): boolean => ra
 
 /** 値の全体が、解釈した pattern に当たるか（届く位置の集まりを進める。バックトラックなし）。 */
 export const matchesSimplePattern = (pattern: SimplePattern, value: string): boolean => {
-  if (value.length > MAX_SIMPLE_PATTERN_VALUE_LENGTH) {
-    return false;
-  }
   const { length } = value;
   /** 届く位置（0 から値の長さまで。1 は届く）。 */
   let reachable = new Uint8Array(length + 1);

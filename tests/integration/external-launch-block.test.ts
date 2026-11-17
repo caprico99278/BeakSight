@@ -1,6 +1,7 @@
 // EL-12（設計書 `2026-10-24-beaksight-external-launch-block-design.md` 3.3〜3.5・5 章。DEF-171）: 外部スキームへの移動を、Guard を付けた Context
-// （Passive と、凍結の後の Interaction）が、両方の Chromium（テストの既定の headless shell と、本番と同じ起動の部品の CLI の Chromium）で今と同じ形で
-// 記録し、閉じることを確かめる。CLI の Chromium は一時のプロファイルの設定で移動そのものを止め（OS のアプリへ渡さない）、Guard は CDP の事象で検出する。
+// （Passive と、凍結の後の Interaction）が、両方の Chromium（テストの既定の headless shell と、本番と同じ起動の部品の CLI の Chromium）で 1 回だけ記録する
+// ことを確かめる（SAFE-2 の 4 から、違反にせず、Context も閉じない）。CLI の Chromium は一時のプロファイルの設定で移動そのものを止め（OS のアプリへ渡さない）、
+// Guard は CDP の事象で検出する。
 // - 経路: BeakSight の goto、`location.href`、click、iframe、302 の main と frame、`window.open`、`a target=_blank`、`form target=_blank`、OOPIF の
 //   スクリプトの移動。
 // - CLI の Chromium では、設定が効いていること（守りのない Context の、登録のない独自のスキームへの移動が `ERR_BLOCKED_BY_ADMINISTRATOR` になる）と、
@@ -9,9 +10,6 @@
 // 厳守事項: Chromium は headless だけで起動する。外部スキームの宛先は、実在しないもの（`fixtures/external-scheme-targets.ts`）だけ。守りのない Context で
 // 移動させるのは、設定ありの CLI の Chromium の、登録のない独自のスキーム（`custom`）だけ（設定なしの Chromium に `mailto:` などを流さない。EL-0 の手違い）。
 import { existsSync } from 'node:fs';
-import { mkdir, writeFile } from 'node:fs/promises';
-import { tmpdir } from 'node:os';
-import { join } from 'node:path';
 import type { Browser, LaunchOptions, Page } from 'playwright';
 import { afterAll, beforeAll, describe, expect, it } from 'vitest';
 import { startFixtureServer, type FixtureServer } from '../../fixtures/server.js';
@@ -27,15 +25,16 @@ import { BrowserContextFactory } from '../../src/browser/context-factory.js';
 import type { Viewport } from '../../src/config/types.js';
 import { wait } from '../../src/core/deadline.js';
 import { CHROMIUM_PDF_VIEWER_EXTENSION_ID, type ExternalSchemeNavigationEvent } from '../../src/core/evidence-types.js';
-import { externalSchemeNavigationViolationMessage, isPassiveRequestGuardClosed, WriteStageMonitor } from '../../src/safety/passive-request-guard.js';
+import { isPassiveRequestGuardClosed, WriteStageMonitor } from '../../src/safety/passive-request-guard.js';
 import { SafetyLedger } from '../../src/safety/safety-ledger.js';
 import {
+  chromiumRunsOf,
   launchCliChromium,
-  launchCliChromiumWithoutExternalLaunchBlock,
   launchTestDefaultChromium,
   SITE_PER_PROCESS_ARGS,
   testContextsOf,
 } from '../helpers/chromium.js';
+import { withTestOnlyNoInternetArgs } from '../helpers/test-chromium-args.js';
 import {
   crossSiteFramePath,
   EXTERNAL_SCHEME_TARGETS,
@@ -51,8 +50,6 @@ import { startLoopbackHttpServer, type LoopbackHttpServer } from '../helpers/loo
 import { createTestConfig, TEST_FACTORY_OPTIONS } from '../helpers/test-config.js';
 
 const viewport: Viewport = Object.freeze({ width: 800, height: 600 });
-const ATTEMPTED = 'EXTERNAL_SCHEME_NAVIGATION_ATTEMPTED';
-const FRAME_CLASSIFICATION_FAILED = 'FRAME_CLASSIFICATION_FAILED';
 const KEY: ExternalSchemeKey = 'mailto';
 
 /** ページのスクリプトで移動を試みる経路（凍結の前後で同じ）。`frame` は記録の frame（`null` は popup で、frame の種類が分からない）。 */
@@ -106,30 +103,29 @@ const SCRIPT_ROUTES = Object.freeze([
 /** 経路の移動の記録の URL（form の GET の送信は、空のクエリの `?` が付く）。 */
 const recordedUrlOf = (name: string, url: string): string => (name === 'a form with target _blank' ? `${url}?` : url);
 
-/** 違反の文（今の形）。 */
-const attemptedViolation = (scheme: string): { readonly code: string; readonly message: string } => ({
-  code: ATTEMPTED,
-  message: externalSchemeNavigationViolationMessage(scheme),
-});
+/** popup の移動の記録（frame の種類が分からないので、frame の判定の失敗の記録 `frameClassificationFailures` に残る）に、`url` があるか。 */
+const frameFailureRecorded = (ledger: SafetyLedger, url: string): boolean =>
+  ledger.snapshot().frameClassificationFailures?.events.some((event) => event.url === url) ?? false;
 
-/** 移動の試みの後、Context が閉じるまで待ち、違反が 1 回だけ、記録が `expected`（popup は空で、frame の分類の失敗の違反つき）であることを確かめる。 */
+/**
+ * 移動の試みが記録されたことを確かめる。SAFE-2 の 4（違反の区分の (3)。設計者の判断）: 前は、違反（`EXTERNAL_SCHEME_NAVIGATION_ATTEMPTED`・
+ * `FRAME_CLASSIFICATION_FAILED`）を記録して Context を閉じた。今は、記録だけを残す（外から見える結果は記録）。`expected` が `null` の popup は、frame の判定の失敗の
+ * 記録（`popupUrl`）に残り、外部スキームの記録はない。ほかは、外部スキームの記録が `expected` の 1 件だけ。
+ */
 async function expectRecordedOnce(
   ledger: SafetyLedger,
-  isClosed: () => boolean,
   expected: ExternalSchemeNavigationEvent | null,
+  popupUrl: string = EXTERNAL_SCHEME_TARGETS[KEY].url,
 ): Promise<void> {
-  await expect.poll(isClosed).toBe(true);
-  await wait(QUIET_PERIOD_MS);
-  const snapshot = ledger.snapshot();
-  const { scheme } = EXTERNAL_SCHEME_TARGETS[KEY];
-  expect(snapshot.invariantViolations.filter(({ code }) => code === ATTEMPTED)).toEqual([attemptedViolation(scheme)]);
   if (expected === null) {
-    expect(snapshot.externalSchemeNavigations).toEqual([]);
-    expect(snapshot.invariantViolations.map(({ code }) => code)).toContain(FRAME_CLASSIFICATION_FAILED);
+    await expect.poll(() => frameFailureRecorded(ledger, popupUrl)).toBe(true);
+    await wait(QUIET_PERIOD_MS);
+    expect(ledger.snapshot().externalSchemeNavigations).toEqual([]);
     return;
   }
-  expect(snapshot.externalSchemeNavigations).toEqual([expected]);
-  expect(snapshot.invariantViolations).toEqual([attemptedViolation(scheme)]);
+  await expect.poll(() => ledger.snapshot().externalSchemeNavigations.length).toBeGreaterThan(0);
+  await wait(QUIET_PERIOD_MS);
+  expect(ledger.snapshot().externalSchemeNavigations).toEqual([expected]);
 }
 
 /** 移動を試みる（Guard が先に閉じると `evaluate` が失敗することがあるので、その失敗は受ける）。 */
@@ -164,10 +160,10 @@ afterAll(async () => {
   await server?.close();
 });
 
-describe.each([
+describe.each(chromiumRunsOf([
   { kind: 'the headless shell (test default)', cli: false, launch: () => launchTestDefaultChromium({ args: SITE_PER_PROCESS_ARGS }) },
   { kind: 'the CLI Chromium (the launch component)', cli: true, launch: () => launchCliChromium({ args: SITE_PER_PROCESS_ARGS }) },
-])('EL-12: the Guard records an external scheme navigation once and closes the Context, with $kind', ({ cli, launch }) => {
+]))('EL-12: the Guard records an external scheme navigation once (SAFE-2: without closing the Context), with $kind', ({ cli, launch }) => {
   let browser: Browser;
   let factory: BrowserContextFactory;
   const pageUrl = (): string => `${server.origin}${NAVIGATION_TARGET_PAGE}`;
@@ -183,12 +179,12 @@ describe.each([
   });
 
   it.each(SCRIPT_ROUTES)('Passive: $name', async ({ name, frame, run }) => {
-    await withGuardedPassivePage(factory, viewport, async (page, context, ledger) => {
+    await withGuardedPassivePage(factory, viewport, async (page, _context, ledger) => {
       await page.goto(pageUrl(), { waitUntil: 'load' });
       await attempt(page, run, targetUrl);
-      await expectRecordedOnce(ledger, () => isPassiveRequestGuardClosed(context), frame === null ? null : {
+      await expectRecordedOnce(ledger, frame === null ? null : {
         url: recordedUrlOf(name, targetUrl), scheme, frame, phase: 'PASSIVE', reason: 'EXTERNAL_SCHEME_NAVIGATION',
-      });
+      }, recordedUrlOf(name, targetUrl));
     });
   });
 
@@ -198,9 +194,9 @@ describe.each([
       await session.page.goto(pageUrl(), { waitUntil: 'load' });
       await session.activateInteractionFreeze();
       await attempt(session.page, run, targetUrl);
-      await expectRecordedOnce(session.ledger, () => session.isClosed(), frame === null ? null : {
+      await expectRecordedOnce(session.ledger, frame === null ? null : {
         url: recordedUrlOf(name, targetUrl), scheme, frame, phase: 'INTERACTION', reason: 'EXTERNAL_SCHEME_NAVIGATION',
-      });
+      }, recordedUrlOf(name, targetUrl));
     } finally {
       if (!session.isClosed()) await session.close().catch(() => undefined);
     }
@@ -208,7 +204,7 @@ describe.each([
 
   // EL-F（EL-R の I1）: 凍結の後に開いたポップアップ（Guard の page の準備を付けない頁）を、`about:blank` で開いてから外部スキームへ移す。opener の
   // `Page.windowOpen` は `about:blank` で、設定ありの Chromium では `request` も来ないので、直す前は記録 0 だった。宛先は登録のない独自のスキーム。
-  it('Interaction (after the freeze): a popup opened as about:blank and then sent to the external scheme is recorded once and closes the session', async () => {
+  it('Interaction (after the freeze): a popup opened as about:blank and then sent to the external scheme is recorded once', async () => {
     const session = await factory.createInteractionSession(viewport);
     const custom = EXTERNAL_SCHEME_TARGETS.custom;
     try {
@@ -220,13 +216,8 @@ describe.each([
           if (opened !== null) opened.location.href = target;
         }, 300);
       }, custom.url).catch(() => undefined);
-      await expect.poll(() => session.isClosed(), { timeout: 10_000 }).toBe(true);
-      await wait(QUIET_PERIOD_MS);
-      const snapshot = session.ledger.snapshot();
-      expect(snapshot.invariantViolations.filter(({ code }) => code === ATTEMPTED)).toEqual([attemptedViolation(custom.scheme)]);
-      expect(snapshot.externalSchemeNavigations).toEqual([
-        { url: custom.url, scheme: custom.scheme, frame: 'MAIN', phase: 'INTERACTION', reason: 'EXTERNAL_SCHEME_NAVIGATION' },
-      ]);
+      await expectRecordedOnce(session.ledger,
+        { url: custom.url, scheme: custom.scheme, frame: 'MAIN', phase: 'INTERACTION', reason: 'EXTERNAL_SCHEME_NAVIGATION' });
     } finally {
       if (!session.isClosed()) await session.close().catch(() => undefined);
     }
@@ -240,36 +231,30 @@ describe.each([
     if (opened !== null) opened.location.href = url;
   }, target).catch(() => undefined);
 
-  /** ポップアップの移動の記録が 1 回だけあり、Context が閉じたこと。 */
-  const expectSyncPopupRecorded = async (ledger: SafetyLedger, isClosed: () => boolean, phase: ExternalSchemeNavigationEvent['phase']): Promise<void> => {
+  /** ポップアップの移動の記録が 1 回だけあること（SAFE-2 の 4 から、違反にせず、Context も閉じない）。 */
+  const expectSyncPopupRecorded = async (ledger: SafetyLedger, phase: ExternalSchemeNavigationEvent['phase']): Promise<void> => {
     const custom = EXTERNAL_SCHEME_TARGETS.custom;
-    await expect.poll(isClosed, { timeout: 10_000 }).toBe(true);
-    await wait(QUIET_PERIOD_MS);
-    const snapshot = ledger.snapshot();
-    expect(snapshot.invariantViolations.filter(({ code }) => code === ATTEMPTED)).toEqual([attemptedViolation(custom.scheme)]);
-    expect(snapshot.externalSchemeNavigations).toEqual([
-      { url: custom.url, scheme: custom.scheme, frame: 'MAIN', phase, reason: 'EXTERNAL_SCHEME_NAVIGATION' },
-    ]);
+    await expectRecordedOnce(ledger, { url: custom.url, scheme: custom.scheme, frame: 'MAIN', phase, reason: 'EXTERNAL_SCHEME_NAVIGATION' });
   };
 
-  it('Passive: a popup sent to the external scheme right after window.open is recorded once and closes the Context', async () => {
-    await withGuardedPassivePage(factory, viewport, async (page, context, ledger) => {
+  it('Passive: a popup sent to the external scheme right after window.open is recorded once', async () => {
+    await withGuardedPassivePage(factory, viewport, async (page, _context, ledger) => {
       await page.goto(pageUrl(), { waitUntil: 'load' });
       await syncPopupAssign(page, EXTERNAL_SCHEME_TARGETS.custom.url);
-      await expectSyncPopupRecorded(ledger, () => isPassiveRequestGuardClosed(context), 'PASSIVE');
+      await expectSyncPopupRecorded(ledger, 'PASSIVE');
     });
   });
 
   it.each([
     ['before the freeze', false, 'PASSIVE'],
     ['after the freeze', true, 'INTERACTION'],
-  ] as const)('Interaction (%s): a popup sent to the external scheme right after window.open is recorded once and closes the session', async (_label, frozen, phase) => {
+  ] as const)('Interaction (%s): a popup sent to the external scheme right after window.open is recorded once', async (_label, frozen, phase) => {
     const session = await factory.createInteractionSession(viewport);
     try {
       await session.page.goto(pageUrl(), { waitUntil: 'load' });
       if (frozen) await session.activateInteractionFreeze();
       await syncPopupAssign(session.page, EXTERNAL_SCHEME_TARGETS.custom.url);
-      await expectSyncPopupRecorded(session.ledger, () => session.isClosed(), phase);
+      await expectSyncPopupRecorded(session.ledger, phase);
     } finally {
       if (!session.isClosed()) await session.close().catch(() => undefined);
     }
@@ -278,7 +263,7 @@ describe.each([
   it.each([
     ['the manual login stage', true],
     ['the automated login stage', false],
-  ] as const)('%s: a popup sent to the external scheme right after window.open is recorded once and closes the Context', async (_label, manual) => {
+  ] as const)('%s: a popup sent to the external scheme right after window.open is recorded once', async (_label, manual) => {
     const context = await factory.createLoginStageContext(viewport, {
       loginPostEndpoints: [{ origin: server.origin, path: '/login' }],
       maxLoginPosts: 1,
@@ -288,13 +273,13 @@ describe.each([
       const page = await factory.createPassivePage(context);
       await page.goto(pageUrl(), { waitUntil: 'load' });
       await syncPopupAssign(page, EXTERNAL_SCHEME_TARGETS.custom.url);
-      await expectSyncPopupRecorded(factory.getSafetyLedger(context), () => isPassiveRequestGuardClosed(context), 'PASSIVE');
+      await expectSyncPopupRecorded(factory.getSafetyLedger(context), 'PASSIVE');
     } finally {
       await factory.closePassiveContext(context).catch(() => undefined);
     }
   });
 
-  it('the write stage: a popup sent to the external scheme right after window.open is recorded once and closes the Context', async () => {
+  it('the write stage: a popup sent to the external scheme right after window.open is recorded once', async () => {
     const writeFactory = new BrowserContextFactory(browser, createTestConfig(server.origin, '/'), () => new SafetyLedger(), {
       ...TEST_FACTORY_OPTIONS,
       authentication: {
@@ -316,7 +301,7 @@ describe.each([
       const page = await writeFactory.createPassivePage(context);
       await page.goto(pageUrl(), { waitUntil: 'load' });
       await syncPopupAssign(page, EXTERNAL_SCHEME_TARGETS.custom.url);
-      await expectSyncPopupRecorded(writeFactory.getSafetyLedger(context), () => isPassiveRequestGuardClosed(context), 'PASSIVE');
+      await expectSyncPopupRecorded(writeFactory.getSafetyLedger(context), 'PASSIVE');
     } finally {
       await writeFactory.closePassiveContext(context).catch(() => undefined);
       await writeFactory.close().catch(() => undefined);
@@ -325,30 +310,29 @@ describe.each([
 
   // EL-F2（EL-R2 の N2）: PDF の表示の拡張の頁でも、`window.open` で開くのは今どおり外部スキームへの移動の試み（除くのは PDF の頁の sub frame だけ）。
   it('Passive: window.open of the PDF viewer extension page is still an external scheme navigation', async () => {
-    await withGuardedPassivePage(factory, viewport, async (page, context, ledger) => {
+    await withGuardedPassivePage(factory, viewport, async (page, _context, ledger) => {
       await page.goto(pageUrl(), { waitUntil: 'load' });
+      const extensionUrl = `chrome-extension://${CHROMIUM_PDF_VIEWER_EXTENSION_ID}/index.html`;
       await page.evaluate((url) => {
         window.open(url);
-      }, `chrome-extension://${CHROMIUM_PDF_VIEWER_EXTENSION_ID}/index.html`).catch(() => undefined);
-      await expect.poll(() => isPassiveRequestGuardClosed(context), { timeout: 10_000 }).toBe(true);
-      await wait(QUIET_PERIOD_MS);
-      expect(ledger.snapshot().invariantViolations.filter(({ code }) => code === ATTEMPTED)).toEqual([attemptedViolation('chrome-extension')]);
+      }, extensionUrl).catch(() => undefined);
+      await expectRecordedOnce(ledger, null, extensionUrl);
     });
   });
 
-  it('Passive: a goto by BeakSight to the external scheme fails, is recorded once, and closes the Context', async () => {
-    await withGuardedPassivePage(factory, viewport, async (page, context, ledger) => {
+  it('Passive: a goto by BeakSight to the external scheme fails and is recorded once', async () => {
+    await withGuardedPassivePage(factory, viewport, async (page, _context, ledger) => {
       await expect(page.goto(targetUrl)).rejects.toThrow();
-      await expectRecordedOnce(ledger, () => isPassiveRequestGuardClosed(context), {
+      await expectRecordedOnce(ledger, {
         url: targetUrl, scheme, frame: 'MAIN', phase: 'PASSIVE', reason: 'EXTERNAL_SCHEME_NAVIGATION',
       });
     });
   });
 
-  it('Passive: a script navigation inside an OOPIF is recorded once as a sub frame and closes the Context', async () => {
-    await withGuardedPassivePage(factory, viewport, async (page, context, ledger) => {
+  it('Passive: a script navigation inside an OOPIF is recorded once as a sub frame', async () => {
+    await withGuardedPassivePage(factory, viewport, async (page, _context, ledger) => {
       await page.goto(`${server.origin}${crossSiteFramePath(externalSchemeFixturePath('location-href', KEY))}`).catch(() => undefined);
-      await expectRecordedOnce(ledger, () => isPassiveRequestGuardClosed(context), {
+      await expectRecordedOnce(ledger, {
         url: targetUrl, scheme, frame: 'SUB', phase: 'PASSIVE', reason: 'EXTERNAL_SCHEME_NAVIGATION',
       });
     });
@@ -377,14 +361,12 @@ describe.each([
       await page.goto(`${pdfServer.origin}${path}`).catch(() => undefined);
       await wait(PDF_SETTLE_MS);
       expect(ledger.snapshot().externalSchemeNavigations).toEqual([]);
+      expect(ledger.snapshot().frameClassificationFailures).toBeUndefined();
       if (!cli && path === '/pdf') {
         // テストの既定の headless shell には PDF の表示の拡張がなく、main frame の PDF はダウンロードとして取り消される（今の扱い。外部スキームとは別）。
         // 本番の Chromium（CLI の組）でだけ、続けて読み込めることまで確かめる。
-        expect(ledger.snapshot().invariantViolations.map(({ code }) => code)).not.toContain(ATTEMPTED);
         return;
       }
-      expect(ledger.snapshot().invariantViolations).toEqual([]);
-      expect(isPassiveRequestGuardClosed(context)).toBe(false);
       await expect(page.goto(`${pdfServer.origin}/`, { waitUntil: 'load' })).resolves.not.toBeNull();
       expect(isPassiveRequestGuardClosed(context)).toBe(false);
     });
@@ -406,8 +388,9 @@ describe.each([
 });
 
 /**
- * EL-3: 起動の部品の後片付けで、一時のプロファイルが残らない（通常の close、予期しない切断、自己検査の不合格、起動の失敗）。プロファイルの置き場所は、
- * 本番の依存の作り方を包んで覚える（作り方そのものは本番のまま）。
+ * EL-3: 起動の部品の後片付けで、一時のプロファイルが残らない。プロファイルの置き場所は、本番の依存の作り方を包んで覚える（作り方そのものは本番のまま）。
+ * SAFE-B5: 通常の close・予期しない切断・起動の失敗の後片付けの順は、単体 `tests/unit/chromium-launch.test.ts`（偽の persistent の Chromium）が確かめるので、
+ * 本物の Chromium とファイルでは、自己検査の不合格（Preferences を置かない起動。EL-12 の自己検査の不合格の場面を兼ねる）の 1 場面だけにした。
  */
 describe('EL-3: the launch component leaves no temporary profile behind', () => {
   const recordingDependencies = (overrides: Partial<ChromiumLaunchDependencies> = {}): {
@@ -428,31 +411,13 @@ describe('EL-3: the launch component leaves no temporary profile behind', () => 
       },
     };
   };
-  const cliOptions = (): LaunchOptions => chromiumLaunchOptions({ headless: true });
+  // RB-4 fix（M-1）: テストだけの外へ出ない引数を足す。
+  const cliOptions = (): LaunchOptions => {
+    const options = chromiumLaunchOptions({ headless: true });
+    return { ...options, args: [...withTestOnlyNoInternetArgs(options.args ?? [])] };
+  };
 
-  it('removes the profile once browser.close() returns', async () => {
-    const { dependencies, directories } = recordingDependencies();
-    const browser = await launchChromiumWith(cliOptions(), dependencies);
-    expect(directories).toHaveLength(1);
-    expect(existsSync(directories[0] ?? '')).toBe(true);
-
-    await browser.close();
-
-    expect(existsSync(directories[0] ?? '')).toBe(false);
-  });
-
-  it('removes the profile after an unexpected disconnect (Chromium closed from outside)', async () => {
-    const { dependencies, directories } = recordingDependencies();
-    const browser = await launchChromiumWith(cliOptions(), dependencies);
-    const session = await browser.newBrowserCDPSession();
-
-    await session.send('Browser.close').catch(() => undefined);
-
-    await expect.poll(() => browser.isConnected(), { timeout: 10_000 }).toBe(false);
-    await expect.poll(() => existsSync(directories[0] ?? ''), { timeout: 10_000 }).toBe(false);
-  });
-
-  it('removes the profile when the self-check refuses (no Preferences, an unregistered custom scheme only)', async () => {
+  it('refuses with EXTERNAL_LAUNCH_BLOCK_UNAVAILABLE and removes the profile when the self-check fails (no Preferences, an unregistered custom scheme only)', async () => {
     const { dependencies, directories } = recordingDependencies({ writeProfilePreferences: async () => undefined });
 
     const failure = await launchChromiumWith(cliOptions(), dependencies).then(async (browser) => {
@@ -461,45 +426,14 @@ describe('EL-3: the launch component leaves no temporary profile behind', () => 
     }, (error: unknown) => error);
 
     expect(isChromiumLaunchRefused(failure, 'EXTERNAL_LAUNCH_BLOCK_UNAVAILABLE')).toBe(true);
-    expect(existsSync(directories[0] ?? '')).toBe(false);
-  });
-
-  it('removes the profile when Chromium cannot be launched', async () => {
-    const { dependencies, directories } = recordingDependencies();
-    const { channel: _channel, ...withoutChannel } = cliOptions();
-
-    await expect(launchChromiumWith({ ...withoutChannel, executablePath: join(tmpdir(), 'beaksight-no-such-chromium.exe') }, dependencies))
-      .rejects.toThrow();
-
     expect(directories).toHaveLength(1);
     expect(existsSync(directories[0] ?? '')).toBe(false);
   });
 });
 
-// EL-F（EL-R の M1・M2）: 本物の CLI の Chromium で、自己検査が許した種類の止まり（許す一覧の上書き）も断ることと、既定の Context からどこへも要求が
-// 出ないこと。
-describe('EL-F: the self-check also checks the allowed schemes, and the default Context sends nothing', () => {
-  it('refuses when the allow list of the profile does not allow http and https (an overridden allow list)', async () => {
-    const dependencies: ChromiumLaunchDependencies = {
-      ...PRODUCTION_CHROMIUM_LAUNCH_DEPENDENCIES,
-      writeProfilePreferences: async (profileDirectory) => {
-        await mkdir(join(profileDirectory, 'Default'), { recursive: true });
-        await writeFile(
-          join(profileDirectory, 'Default', 'Preferences'),
-          JSON.stringify({ policy: { url_blocklist: ['*'], url_allowlist: ['about:*', 'data:*', 'blob:*'] } }),
-        );
-      },
-    };
-
-    const failure = await launchChromiumWith(chromiumLaunchOptions({ headless: true }), dependencies).then(async (browser) => {
-      await browser.close();
-      return null;
-    }, (error: unknown) => error);
-
-    expect(isChromiumLaunchRefused(failure, 'EXTERNAL_LAUNCH_BLOCK_UNAVAILABLE')).toBe(true);
-    expect(String(failure)).toContain('an allowed scheme (http:)');
-  });
-
+// EL-F（EL-R の M2）: 本物の CLI の Chromium で、既定の Context からどこへも要求が出ないこと。SAFE-B5: 許す一覧の上書き（M1）を断る場面は、単体
+// `tests/unit/chromium-launch.test.ts` の「an allowed scheme (http, https) is blocked」が確かめるので、ここからは外した。
+describe('EL-F: the default Context of the launch component sends nothing', () => {
   it('blocks every request of the default Context (a page opened there reaches no server)', async () => {
     let hits = 0;
     const target = await startLoopbackHttpServer((_request, response) => {
@@ -520,15 +454,8 @@ describe('EL-F: the self-check also checks the allowed schemes, and the default 
   });
 });
 
+// SAFE-B5: 自己検査の不合格（Preferences を置かない起動）は、EL-3 の場面が、プロファイルの後片付けと一緒に確かめる。
 describe('EL-12: the self-check of the launch component', () => {
-  it('refuses with EXTERNAL_LAUNCH_BLOCK_UNAVAILABLE when the profile has no Preferences (the CLI Chromium, an unregistered custom scheme)', async () => {
-    const failure = await launchCliChromiumWithoutExternalLaunchBlock().then(async (browser) => {
-      await browser.close();
-      return null;
-    }, (error: unknown) => error);
-    expect(isChromiumLaunchRefused(failure, 'EXTERNAL_LAUNCH_BLOCK_UNAVAILABLE')).toBe(true);
-  });
-
   it('passes with the Preferences and keeps no page in the default Context (headless)', async () => {
     const browser = await launchCliChromium();
     try {

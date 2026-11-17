@@ -17,6 +17,17 @@
             "statusMessage": "git commit / push の禁止を確認中"
           }
         ]
+      },
+      {
+        "matcher": "Write|Edit|MultiEdit|NotebookEdit|mcp__plugin_desktop-commander_desktop-commander__write_file|mcp__plugin_desktop-commander_desktop-commander__edit_block",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "node \"$CLAUDE_PROJECT_DIR/.claude/hooks/block-secret-terms.mjs\"",
+            "timeout": 10,
+            "statusMessage": "Git に載せない語を確認中"
+          }
+        ]
       }
     ]
   }

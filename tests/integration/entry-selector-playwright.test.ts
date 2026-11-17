@@ -1,19 +1,15 @@
 // T43R-fix の M-4（Task 43 の設計書 7 章の T43R の行）: 入口の確かめの一意な CSS の部品（`entrySelectorCandidatesOf`）と、成功の画面のセレクタの案の部品
 // （`successSelectorCandidatesOf`）が作る CSS は、認証の設定の欄として受ける形（`isAcceptedEntrySelector`）で、Playwright の `css=` の locator（自動ログインと
 // 成功の確かめが使う `loginStageLocator` と同じ引き方）でも解釈でき、読んだ要素だけにちょうど 1 つ当たる。解釈できない形（`#\-` など）は案にしない。
-// 23 通りの属性の値（レビュー T43R の確かめと同じ）を、テストの既定の Chromium と CLI の Chromium の両方で確かめる。
+// 23 通りの属性の値（レビュー T43R の確かめと同じ）を、テストの既定の Chromium で確かめる（TEST-POLICY の 3）。
 import type { Browser } from 'playwright';
 import { afterAll, beforeAll, describe, expect, it } from 'vitest';
 import { isAcceptedEntrySelector } from '../../src/control/entry-check.js';
 import { entrySelectorCandidatesOf } from '../../src/discovery/entry-check-selectors.js';
 import { successSelectorCandidatesOf } from '../../src/discovery/login-observation.js';
 import { loginStageLocator } from '../../src/worker/login-stage-checks.js';
-import { launchCliChromium, launchHeadlessChromium } from '../helpers/chromium.js';
+import { DEFAULT_CHROMIUM_LAUNCHERS } from '../helpers/chromium.js';
 
-const LAUNCHERS: readonly (readonly [string, () => Promise<Browser>])[] = [
-  ['the default test Chromium', () => launchHeadlessChromium()],
-  ['the CLI Chromium', () => launchCliChromium()],
-];
 const TEST_TIMEOUT_MS = 120_000;
 
 /** id の値（18 通り）と name の値（5 通り）。 */
@@ -22,7 +18,7 @@ const NAMES = ['a"b', 'login[password]', 'a\\"b', "it's", 'x\ny'];
 /** ログアウトの要素の属性の値（成功の画面のセレクタの案）。 */
 const LOGOUT_IDS = ['logout', 'logout-btn', 'btnLogout', 'sign-out-link', '-logout', 'logout:button'];
 
-describe.each(LAUNCHERS)('T43R-fix M-4: the CSS of the proposals works with the Playwright css= locator (%s)', (_label, launch) => {
+describe.each(DEFAULT_CHROMIUM_LAUNCHERS)('T43R-fix M-4: the CSS of the proposals works with the Playwright css= locator (%s)', (_label, launch) => {
   let browser: Browser | undefined;
 
   beforeAll(async () => {

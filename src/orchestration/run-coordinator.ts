@@ -1,10 +1,16 @@
 import type { Browser } from 'playwright';
 import { evaluateCrossPageRules } from '../audit/cross-page-rules.js';
+import {
+  crossPageFactsOfSummary,
+  runPageSummaryOf,
+  runPageSummaryWithLeadingEvidence,
+  type RunPageSummary,
+} from '../audit/run-page-summary.js';
 import type { BrowserContextFactory, SafetyLedgerFactory } from '../browser/context-factory.js';
 import type { MainFrameLoadObservation } from '../browser/main-frame-load.js';
 import { ResourceCache } from '../browser/resource-delivery.js';
 import type { AuditConfig } from '../config/types.js';
-import { createRunArtifactDirectory, type RunArtifactDirectoryCreation } from '../core/artifact-layout.js';
+import { createRunArtifactDirectoryForStart, revisitIndexOfScreenshotPath, type RunArtifactDirectoryCreation } from '../core/artifact-layout.js';
 import { auditSendPolicyOf } from '../core/audit-send-policy.js';
 import type {
   AuditRunResult,
@@ -15,11 +21,13 @@ import type {
   IncompleteReasonCode,
   PageAuditOutcome,
   PageAuditResult,
+  PageAuditStatus,
   PageId,
   PageIncompleteReasonCount,
   RunCheckpointState,
   RunEnvironment,
   RunExecution,
+  RunExecutionAutomaticRelogin,
   RunExecutionEndReason,
   RunId,
   RunLoad,
@@ -29,12 +37,15 @@ import type {
   RunSummary,
   ViewportAuditResult,
 } from '../core/contracts.js';
+import { CHECKED_WRITE_SCREENS_SCOPE, type RunPageScopeRecord } from '../core/audit-page-scope.js';
 import { resolveTimeoutMs, wait } from '../core/deadline.js';
 import type { NormalizedHttpUrlEvidence, SessionLossEvidence, SitemapEvidence } from '../core/evidence-types.js';
 import { safeErrorMessage } from '../core/errors.js';
 import { isRecord } from '../core/guards.js';
 import { deepFreeze } from '../core/immutable.js';
-import { BROWSER_CLOSE_TIMEOUT_MS, MAX_ERROR_MESSAGE_LENGTH } from '../core/limits.js';
+import type { ObservationWindows } from '../core/observation-windows.js';
+import { createRunPageStore, forEachRunPage, type RunPages, type RunPageStore } from '../core/run-page-store.js';
+import { BROWSER_CLOSE_TIMEOUT_MS } from '../core/limits.js';
 import { lastRunExecutionOf } from '../core/run-executions.js';
 import { validateArtifact } from '../core/schema-validator.js';
 import {
@@ -44,7 +55,8 @@ import {
   unhandledFailureReason,
   type RunStatusInput,
 } from '../core/status.js';
-import { internalNavigableUrlsOf } from '../crawl/internal-navigable-links.js';
+import { crawlableLinkUrlsOf } from '../crawl/internal-navigable-links.js';
+import { crawlUrlHasDestructiveWord } from '../discovery/destructive-action.js';
 import { createLoadMeter, type RunLoadMeter } from '../crawl/load-meter.js';
 import { createNavigationPacer, type NavigationPacer, type NavigationPacerSnapshot } from '../crawl/navigation-pacer.js';
 import { normalizeUrl } from '../crawl/normalize-url.js';
@@ -60,6 +72,7 @@ import {
   authenticatedRunConfig,
   authSessionLostReason,
   isExcludedCrawlCandidate,
+  isOutsideRunAuditScope,
   runCheckpointAuthenticationOf,
   type RunAuthentication,
 } from './authenticated-run.js';
@@ -67,8 +80,9 @@ import {
   SERVICE_REQUEST_LIMIT_SKIP_REASON,
   auditStageCountsOf,
   hasServiceRequestLimitRefusal,
-  isServiceRequestLimitReached,
   resumedAuditStageCounts,
+  serviceUnauthorizedCountOf,
+  serviceUnauthorizedSessionLostDetailOf,
   sessionKeyLostDetailOf,
   auditStageFactoryOptions,
   createAuditStageRunState,
@@ -82,23 +96,22 @@ import {
 } from './audit-stage-run.js';
 import { auditSendOptionsOf } from './audit-send-options.js';
 import { CrawlFrontier, type CrawlUrlEntry } from './crawl-frontier.js';
+import { auditPageOutcomeOf } from './audit-page-structure.js';
+import { classifyUrl } from '../crawl/admission-policy.js';
 import {
   collectRunEnvironment as collectRunEnvironmentDefault,
   readToolVersion as readToolVersionDefault,
 } from './environment.js';
 import { IdAllocator } from './id-allocator.js';
-import {
-  PageAuditor,
-  SAFETY_VIOLATION_ABORT_REASON,
-  type PageAuditorDependencies,
-} from './page-auditor.js';
+import { PageAuditor, type PageAuditorDependencies } from './page-auditor.js';
+import { SAFETY_VIOLATION_ABORT_REASON } from './page-audit-plan.js';
 import { navigationFailureDetail } from './page-navigation.js';
 import {
   resolvePassiveSessionDeadlines,
   type PassiveSessionDeadlineOptions,
   type ResolvedPassiveSessionDeadlines,
 } from './passive-session-open.js';
-import { closeBrowserBeforeDeadline, runPreflight as runPreflightDefault, type BrowserLauncher } from './preflight.js';
+import { endPreflightBrowser, runPreflight as runPreflightDefault, type BrowserLauncher, type BrowserLease } from './preflight.js';
 import {
   checkRunCheckpointConsistency,
   closeInterruptedRunExecutions,
@@ -118,22 +131,26 @@ import {
   type RunCheckpointPage,
   type RunCheckpointSiteMetadata,
 } from './run-checkpoint.js';
-import {
-  RUN_CHECKPOINT_SESSION_RESUME_FAILURE_REASONS,
-  RunLockLostError,
-  type RunCheckpointSession,
-  type RunCheckpointSessionStart,
-} from './run-checkpoint-session.js';
+import type { RunCheckpointSession } from './run-checkpoint-session.js';
 import {
   countInteractionOutcomes,
   countPagesByStatus,
   countPartialViewports,
   countPagesByIncompleteReason,
   countViewportPages,
-  summarizeRunSafety,
+  RunSafetyTotals,
   viewportEvidenceOfType,
 } from './run-aggregation.js';
 import { createRunIdFromTime } from './run-id.js';
+import {
+  keepsRevisit,
+  needsRevisit,
+  pageRevisitFactOf,
+  readAgainAfterRevisit,
+  resumesAfterRunTimeLimit,
+  revisitOrderOf,
+  type PageRevisitFact,
+} from './resume-revisit.js';
 import {
   SITE_UNAVAILABLE_RECHECK_DELAYS_MS,
   SITE_UNAVAILABLE_SKIP_REASON,
@@ -151,15 +168,8 @@ export type RunPageAuditor = Pick<PageAuditor, 'audit'>;
 /**
  * Run Coordinator が使う、再開のための保存のセッションの操作（中断した Run の再開の設計書 4.3、4.3.1）。始める、ページの保存、
  * 状態の保存だけである。最後の状態の書き出し（`finish`）と、やめること（`abandon`）は、CLI が呼ぶ。
- * DEF-170: ロックを失ったときの印（`lockLostSignal`。`RunCheckpointSession` が持つ。包んだセッションでは省略できる）が付いたら、すぐに読み込みを止め、
- * Run のディレクトリに何も書かずに `RunLockLostError` で reject する（`RunCoordinator.run` の説明）。
  */
-export type RunCoordinatorCheckpointSession = Pick<RunCheckpointSession, 'start' | 'savePage' | 'saveState'>
-  & {
-    readonly lockLostSignal?: AbortSignal | undefined;
-    /** DEF-172: ロックのファイルを読んで、今も自分のものかを確かめる（読み込みとスクリーンショットの書き出しの直前。省略できる）。 */
-    readonly confirmLockHeld?: (() => Promise<boolean>) | undefined;
-  };
+export type RunCoordinatorCheckpointSession = Pick<RunCheckpointSession, 'start' | 'savePage' | 'saveState'>;
 
 /**
  * Run の後に、CLI が行う保存の終わり方（中断した Run の再開の設計書 4.3.2。`RunCoordinator.checkpointConclusion()` の値）。
@@ -190,16 +200,99 @@ export interface RunCoordinatorResumeInput {
   readonly runDirectory: string;
   /** 再開に使う状態の保存（`checkpoint/state.json` か `state.prev.json` の値）。 */
   readonly checkpoint: RunCheckpoint;
-  /** 終わったページの保存（`checkpoint.completedPageIds` の順）。 */
-  readonly pages: readonly RunCheckpointPage[];
+  /**
+   * 終わったページの保存（`checkpoint.completedPageIds` の順）。MEM-3c（DEF-266）: CLI は、保存を読みながら作った置き場所（`RestoredRunPages`。
+   * `restoredRunPagesCollector` で `ArtifactWriter.readCheckpointCollected` から作る）を渡す。配列（テスト）は、Run の初めに置き場所に入れる。
+   */
+  readonly pages: readonly RunCheckpointPage[] | RestoredRunPages;
+}
+
+/** 印（`RestoredRunPages` を配列や、ほかの値と見分ける）。 */
+const RESTORED_RUN_PAGES_KIND = 'RESTORED_RUN_PAGES';
+
+/**
+ * MEM-3c（DEF-266）: 再開の入力の、終わったページ（保存を読みながら、1 ページずつ置き場所に入れたもの）。
+ * - `results`・`pages`: Run の途中と同じ（`storeRunPage`。要約と、再試行の前の試行の Evidence を加えた本体を圧縮したもの）。
+ * - `safety`: ページの保存の Safety Ledger の snapshot を、終わった順に足し込んだもの（D7。snapshot そのものは持たない）。
+ */
+export interface RestoredRunPages {
+  readonly kind: typeof RESTORED_RUN_PAGES_KIND;
+  readonly results: Map<string, number>;
+  readonly pages: RunPageStore<RunPageSummary>;
+  readonly safety: RunSafetyTotals;
+  /** EV-5: 読み直す候補のページ（URL を鍵に。`needsRevisit` のページだけ）。 */
+  readonly revisits: Map<string, RevisitCandidate>;
 }
 
 /**
- * サイトの不調で止めたときの診断の記録の `schemaVersion`（`schemas/site-unavailable-diagnostic.schema.json`。サイトの不調で止めたときの
- * 診断の記録の設計書 2.3）。1.1（2026-10-07 の改訂）: ビューポートごとの観察の結果に、幅の走査の幅ごとと Interaction の候補ごとの観察を
- * 加えた（1.0 の形は、Passive の観察の結果そのものだった）。
+ * EV-5（設計書 `2026-11-16-beaksight-finding-evidence-design.md` 3.5）: 保存から戻した、読み直す候補のページ。読み直しの前の事実（`resume-revisit.ts`）、前の結果の状態
+ * （読み直しを捨てたときに戻す）、ページの保存の Safety Ledger の snapshot（読み直した後のページの保存にも残す。前の読み込みの記録を、後の再開で落とさないため）。
  */
-export const SITE_UNAVAILABLE_DIAGNOSTIC_SCHEMA_VERSION = 'site-unavailable-diagnostic-schema/1.1';
+interface RevisitCandidate {
+  readonly fact: PageRevisitFact;
+  readonly status: PageAuditStatus;
+  readonly safetyLedgerSnapshots: readonly SafetyLedgerSnapshot[];
+  /**
+   * 設計者の判断（2026-11-16）: この読み直しの画像を置く番号（`pages/<pageId>/revisit-<番号>/`）。前の結果が指す画像の読み直しの番号より 1 大きい（前の結果の画像を
+   * 上書きしない。捨てた・途中で終わった読み直しの画像は、どの結果も指さないので、同じ番号で上書きしてよい）。
+   */
+  readonly revisitIndex: number;
+}
+
+/** 設計者の判断（2026-11-16）: 次の読み直しの番号（その結果の画像が指す読み直しの番号のいちばん大きいものより 1 大きい。読み直しの画像がなければ 1）。 */
+const nextRevisitIndexOf = (result: PageAuditResult): number =>
+  Math.max(0, ...result.evidence.flatMap((record) => {
+    const index = record.type === 'screenshot' ? revisitIndexOfScreenshotPath(record.payload.relativePath) : null;
+    return index === null ? [] : [index];
+  })) + 1;
+
+const isRestoredRunPages = (value: unknown): value is RestoredRunPages => isRecord(value) && value.kind === RESTORED_RUN_PAGES_KIND;
+
+/**
+ * MEM-3c（DEF-266）: 保存のページを 1 つずつ置き場所に入れる口（`ArtifactWriter.readCheckpointCollected` に渡す）。ページの保存の値は、入れたら捨てる。
+ */
+export function restoredRunPagesCollector(): {
+  begin(): { add(page: RunCheckpointPage): Promise<void>; finish(): RestoredRunPages };
+} {
+  return {
+    begin: () => {
+      const restored: RestoredRunPages = {
+        kind: RESTORED_RUN_PAGES_KIND,
+        results: new Map(),
+        pages: createRunPageStore<RunPageSummary>(),
+        safety: new RunSafetyTotals(),
+        revisits: new Map(),
+      };
+      const retryEvidence = new Map<string, readonly EvidenceRecord[]>();
+      return {
+        add: async ({ url, result, retryEvidence: earlier, safetyLedgerSnapshots }) => {
+          await storeRunPage({ results: restored.results, pages: restored.pages, retryEvidence }, url, result, earlier);
+          for (const snapshot of safetyLedgerSnapshots) {
+            restored.safety.add(snapshot);
+          }
+          // EV-5: 読み直す候補のページだけ、事実と Ledger の snapshot を持つ（読み直すかは、再開の実行が決める）。
+          const fact = pageRevisitFactOf(result);
+          if (needsRevisit(fact)) {
+            restored.revisits.set(url, { fact, status: result.status, safetyLedgerSnapshots, revisitIndex: nextRevisitIndexOf(withLeadingEvidence(result, earlier)) });
+          }
+        },
+        finish: () => restored,
+      };
+    },
+  };
+}
+
+/** ページの保存の配列（テスト）を、置き場所に入れる。 */
+async function restoredRunPagesOf(pages: readonly RunCheckpointPage[] | RestoredRunPages): Promise<RestoredRunPages> {
+  if (!Array.isArray(pages)) {
+    return pages as RestoredRunPages;
+  }
+  const collection = restoredRunPagesCollector().begin();
+  for (const page of pages as readonly RunCheckpointPage[]) {
+    await collection.add(page);
+  }
+  return collection.finish();
+}
 
 /**
  * サイトの不調の確かめ直しの待ちの段階と、減速の倍率と上限（DEF-136 で、ジョブと共有するために判定の owner `site-availability.ts` へ移した。今までの
@@ -210,9 +303,6 @@ export {
   SITE_UNAVAILABLE_SLOWDOWN_FACTOR,
   SITE_UNAVAILABLE_SLOWDOWN_MAX_FACTOR,
 } from './site-availability.js';
-
-/** サイトの不調で捨てた、1 回目の試行の番号（診断の記録のファイルの名前に使う。設計書 3.5.2）。確かめ直しの試行は、この次から数える。 */
-const SITE_UNAVAILABLE_FIRST_ATTEMPT = 1;
 
 /**
  * Run Coordinator の、実行中の知らせ（サイトが応答しないときに Run を止める設計書 3.5.4、3.6.2）。進み具合（`RunProgressReport`）とは別の口
@@ -254,39 +344,14 @@ export type RunNotice =
     readonly sessionLoss?: SessionLossEvidence;
   };
 
-/**
- * サイトの不調で止めたときの診断の記録（サイトの不調で止めたときの診断の記録の設計書 2.3）。Run Coordinator が組み立て、注入された書き出しの口
- * （`RunCoordinatorDependencies.writeSiteUnavailableDiagnostic`）に渡す。形は `schemas/site-unavailable-diagnostic.schema.json` が決め、
- * 書き出しは `ArtifactWriter.writeSiteUnavailableDiagnostic` が、そのスキーマで検証してから行う。監査の結果（`run.json`、`audit.json`、
- * ページの結果）とは別の、付けたしの情報である。
- */
-export interface SiteUnavailableDiagnosticRecord {
-  readonly schemaVersion: typeof SITE_UNAVAILABLE_DIAGNOSTIC_SCHEMA_VERSION;
-  readonly runId: RunId;
-  /** 記録を書いた実行の番号（1から。再開した実行は、前の回の実行の数 + 1。`run.json` の `executions` の何件目か）。 */
-  readonly executionNumber: number;
-  /** 書いた時刻（ISO 8601。注入した時計で、記録を組み立てた時点に読む）。 */
-  readonly writtenAt: string;
-  readonly pageId: PageId;
-  /** ページの URL（クロールのキューの、正規化した URL。ページの結果の `pageUrl` と同じ値）。 */
-  readonly url: NormalizedHttpUrlEvidence;
-  /** そのページで最初に検知したサイトの不調の詳細（`PageAuditOutcome.siteUnavailableDetail`。例: `desktop:passive:TIMEOUT`）。 */
-  readonly siteUnavailableDetail: string;
-  /** そのページの最終の試行の監査の結果（ページのスキーマのまま。捨てたページでは、捨てた試行の Evidence を含む）。 */
-  readonly page: PageAuditResult;
-  /**
-   * その試行の、各ビューポートの、ページ本体の要求の観察の結果（`PageAuditOutcome.navigationDiagnostics`。Passive と、幅の走査の幅ごと、
-   * Interaction の候補ごと）。Page Auditor の値をそのまま写す。
-   */
-  readonly navigationDiagnostics: PageAuditOutcome['navigationDiagnostics'];
-}
-
 /** `RunCoordinator` に注入するもの（Task 14〜17 の設計書 5.6.1）。 */
 export interface RunCoordinatorDependencies {
   /** `loadConfig` で検証済みの設定。 */
   readonly config: AuditConfig;
   /** Chromium を起動する関数（本番では `chromium.launch`）。 */
   readonly launchBrowser: BrowserLauncher;
+  /** RB-5: ワーカーの Browser の lease（あれば PREFLIGHT が `launchBrowser` を呼ばずに借り、Run の終わりに返す）。CLI は渡さない。 */
+  readonly browserLease?: BrowserLease | undefined;
   /** Context ごとに新しい `SafetyLedger` を作る関数。 */
   readonly createSafetyLedger: SafetyLedgerFactory;
   /** 時刻（`startedAt`、`finishedAt`、`runId`、Evidence の `observedAt`）に使う時計。 */
@@ -295,7 +360,8 @@ export interface RunCoordinatorDependencies {
   readonly now: () => number;
   /**
    * 出力先の根のディレクトリ。Run の artifact は、この下の `<runId>` のディレクトリ（`runArtifactDirectory`）に置く。
-   * そのディレクトリは、Run の開始の時点で、Run Coordinator が排他的に作る（`createRunArtifactDirectory`。DEF-009）。
+   * そのディレクトリは、Run の開始の時点で、Run Coordinator が排他的に作る（`createRunArtifactDirectoryForStart`。DEF-009。DEF-281: 同じ秒の名前が
+   * すでにあれば 2 桁の連番を足した Run の ID にする）。
    * PREFLIGHT は、そのディレクトリに書けることを確かめる。スクリーンショットも、そのディレクトリの下に置く。
    */
   readonly outputDirectory: string;
@@ -303,6 +369,16 @@ export interface RunCoordinatorDependencies {
   readonly createPageAuditor?: (dependencies: PageAuditorDependencies) => RunPageAuditor;
   /** robots.txt と sitemap.xml の取得（テスト用の差し替え口）。省略すると `collectSiteMetadata`。 */
   readonly collectSiteMetadata?: typeof collectSiteMetadataDefault;
+  /**
+   * DEF-245: 進みの見張りの反応なしの長さ（ms。テスト用の注入口）。渡すと、Page Auditor と robots.txt・sitemap.xml の取得の見張りへ渡す。省略すると、本番の
+   * 長さ（`PROGRESS_WATCH_QUIET_LIMIT_MS`）。
+   */
+  readonly progressWatchQuietLimitMs?: number | undefined;
+  /**
+   * RB-2（TEST-TIME-B。SLIM-2 の閉じる前の待ちを寄せた）: 観察の窓の一式（テスト用の注入口）。渡すと、Run の factory（閉じる前の待ち）と Page Auditor（落ち着きと
+   * スクロールの待ち）に渡す。省略すると本番の値。CLI とワーカーの本番の入口は渡さない。
+   */
+  readonly observationWindows?: ObservationWindows | undefined;
   /** PREFLIGHT（テスト用の差し替え口）。省略すると `runPreflight`。 */
   readonly runPreflight?: typeof runPreflightDefault;
   /** 環境の事実の収集（テスト用の差し替え口）。省略すると `collectRunEnvironment`。 */
@@ -335,8 +411,15 @@ export interface RunCoordinatorDependencies {
    */
   readonly onProgress?: ((report: RunProgressReport) => void) | undefined;
   /**
+   * L0（設計書 `2026-11-09-beaksight-remove-limits-design.md` 5 の 1・6 の L0）: ページを始めた知らせの受け手。省略すると、何もしない。ページの監査を
+   * 始める前（再試行と確かめ直しを除く）に、その時点の進み具合の事実に、そのページの URL（`currentPageUrl`）を足して渡す（止まったページが記録に
+   * 残るようにするため。ワーカーは `PROGRESS` で送る）。`onProgress`（CLI の 1 行）とは別の口なので、CLI の出力は変わらない。受け手の例外と reject は
+   * 握りつぶす（`onProgress` と同じ）。関数でない値は、コンストラクタが `TypeError` を投げる。
+   */
+  readonly onPageStarted?: ((report: RunProgressReport) => void) | undefined;
+  /**
    * 実行中の知らせの受け手（サイトが応答しないときに Run を止める設計書 3.5.4）。省略すると、何もしない。進み具合とは別の口である。
-   * サイトの不調でページを捨てた後、確かめ直しのために待つ前に（捨てた試行の診断の記録を渡した後に）、知らせ（`RunNotice`）を渡す。
+   * サイトの不調でページを捨てた後、確かめ直しのために待つ前に、知らせ（`RunNotice`）を渡す。
    * 受け手は待たない。受け手の例外（と、受け手が返した Promise の reject）は、握りつぶす。Run を止めず、Run の理由にもしない（表示の
    * 失敗で監査を止めないため）。関数でない値は、コンストラクタが `TypeError` を投げる。
    */
@@ -365,6 +448,17 @@ export interface RunCoordinatorDependencies {
    */
   readonly checkpointSession?: RunCoordinatorCheckpointSession | undefined;
   /**
+   * DEF-200（設計書 `2026-11-04-beaksight-login-session-design.md` 3.4 の 5）: この実行が、ログインの切れの後に自動ログインでログインし直して自動で始めた実行なら、
+   * その印と回数（ワーカーだけが渡す）。この実行の記録（保存と `run.json`）に任意の項目として残す。省略は今のまま（項目を書かない）。
+   */
+  readonly automaticRelogin?: RunExecutionAutomaticRelogin | undefined;
+  /**
+   * WSO: 「チェックした画面だけ」の点検で読む画面の URL（ワーカーだけが渡す。1 件以上）。渡すと、開始の URL の代わりに、この画面だけを渡した順に待ち行列に入れ、
+   * 読んだ画面の辺（リンク・SPA の経路など）は、この画面のどれかに当たるものだけを入れる（ほかの画面へ広げない）。巡回の候補の除外（読まないパス・危険な語）と
+   * 許可 Origin の外は、今どおり読まない。範囲は、この実行の記録（保存と `run.json`）に `pageScope` として残す。省略は今のまま（開始の URL から全部の画面）。
+   */
+  readonly pageScope?: readonly string[] | undefined;
+  /**
    * 保存からの再開の入力（中断した Run の再開の設計書 3.1、4.1）。省略すると、新しい Run を始める（今のまま）。渡すと、`run()` は、
    * 保存から Run の状態を作り直し、中断したところから監査を続ける。渡す場合は、`checkpointSession` も必須である（ないなら、コンストラクタが
    * `TypeError` を投げる）。形が不正な値（オブジェクトでない、Run のディレクトリが空、保存がオブジェクトでない、ページの保存が配列でない）
@@ -379,21 +473,6 @@ export interface RunCoordinatorDependencies {
    * `AbortSignal` でない値は、コンストラクタが `TypeError` を投げる。
    */
   readonly stopSignal?: AbortSignal | undefined;
-  /**
-   * サイトの不調で止めたときの診断の記録の書き出しの口（サイトの不調で止めたときの診断の記録の設計書 2.3）。省略すると、何もしない（今のまま）。
-   * CLI は、`ArtifactWriter.writeSiteUnavailableDiagnostic` を渡す。Run Coordinator は、次の場合に、Run のディレクトリと記録と、その実行の中で
-   * そのページを監査した試行の番号（1 回目が 1。捨てた後の確かめ直しの試行は 2〜5。同 3.5.2、3.6.2。ファイルの名前に使う）を渡して1回呼ぶ。
-   * - サイトの不調でページを捨てた場合（サイトが応答しないときに Run を止める設計書 3.2）。捨てた試行ごとに、捨てた後の状態の保存の後に呼ぶ
-   *   （確かめ直しのために待つ前）。
-   * - 前の実行のきっかけのページが、また不調で、普通の結果として保存した場合（同 3.2.1）。ページの保存と状態の保存の後に呼ぶ。
-   * 違反でページを捨てなかった場合（違反の優先）と、robots.txt と sitemap.xml の段階で止めた場合は、呼ばない。
-   * 書き終わる（返した Promise が決まる）まで待ってから、次の処理（確かめ直しの待ち、次のページの前の確かめ、Browser を閉じる処理）に進む。
-   * 口の例外と、返した Promise の reject は、握りつぶす（Run の理由、未処理の失敗の件数、標準エラーには何も残さない。診断は付けたしの
-   * 情報のため）。関数でない値は、コンストラクタが `TypeError` を投げる。
-   */
-  readonly writeSiteUnavailableDiagnostic?:
-    | ((runDirectory: string, record: SiteUnavailableDiagnosticRecord, attemptNumber: number) => Promise<void>)
-    | undefined;
   /**
    * 認証つきの Run の指定（Task 25 の設計書 3 章、4.3、4.7。T25c。`src/orchestration/authenticated-run.ts`）。省略すると、今と完全に同じ
    * （公開監査）。呼び出し側（ワーカー。T25d）が、ログインの段の後に渡す。渡すと、次のとおりにする。
@@ -414,7 +493,8 @@ export interface RunCoordinatorDependencies {
    *   `run()` を始めた時点の記録からの差だけを数える（ログインの段の読み込みは、Run の記録に入れない）。
    * - 再開（`resumeFrom`）: 使わない。今どおり、保存の記録から自分で作る（最後の読み込みの開始の時刻は、保存の値と、この実行の開始の時刻の遅い方。
    *   この実行の開始は、呼ぶ側が先に終えたログインの段の後なので、ログインの段の最後の要求からも、設定の間隔以上空く）。
-   * `beforeNavigation`・`snapshot`・`raiseMinimumInterval`・`recordDocumentRequestSent` の関数を持たない値は、コンストラクタが `TypeError` を投げる。
+   * `beforeNavigation`・`waitUntilNextNavigationDue`（DEF-236）・`snapshot`・`raiseMinimumInterval`・`recordDocumentRequestSent` の関数を持たない値は、コンストラクタが
+   * `TypeError` を投げる。
    */
   readonly navigationPacer?: NavigationPacer | undefined;
   /**
@@ -427,7 +507,9 @@ export interface RunCoordinatorDependencies {
 }
 
 /** 外から渡す pacer が持つべき操作の名前（CCX-22）。 */
-const NAVIGATION_PACER_OPERATION_NAMES = Object.freeze(['beforeNavigation', 'snapshot', 'raiseMinimumInterval', 'recordDocumentRequestSent'] as const);
+const NAVIGATION_PACER_OPERATION_NAMES = Object.freeze([
+  'beforeNavigation', 'waitUntilNextNavigationDue', 'snapshot', 'raiseMinimumInterval', 'recordDocumentRequestSent',
+] as const);
 
 /**
  * 再試行の対象の、Desktop の `NAVIGATION_FAILED` の理由の `detail` の一覧（Task 14〜17 の設計書 5.2、5.6.4）。
@@ -447,6 +529,12 @@ export const RETRYABLE_NAVIGATION_FAILURE_DETAILS: readonly string[] = Object.fr
 ]);
 
 /**
+ * MEM-3b（DEF-266）: Run Coordinator が確定した Run。ページの結果は、圧縮して持つ置き場所（`RunPageStore`）に、発見の順に入っている。要約は
+ * `RunPageSummary`（評価の形から作ったもの）。
+ */
+export type StoredAuditRunResult = AuditRunResult<RunPageStore<RunPageSummary>>;
+
+/**
  * Run のディレクトリを、Run の開始の時点で作れなかった（DEF-009。Task 18 の前の整理の設計書 第6章）。`RunCoordinator.run()` が、
  * これで reject する。
  * - `result` は、確定した Run である。PREFLIGHT の失敗と同じく、対象のサイトにアクセスせず、Browser も起動せずに確定したもので、
@@ -456,21 +544,21 @@ export const RETRYABLE_NAVIGATION_FAILURE_DETAILS: readonly string[] = Object.fr
  * - `alreadyExists` は、同じ名前の Run のディレクトリがすでにあった（`EEXIST`）場合に真。出力先を作れなかった場合などは偽。
  */
 export class RunDirectoryUnavailableError extends Error {
-  /** 確定した Run（Run Status は `FAILED`）。 */
-  readonly result: AuditRunResult;
+  /** 確定した Run（Run Status は `FAILED`。ページは置き場所か配列）。 */
+  readonly result: AuditRunResult<RunPages>;
   /** 作ろうとした Run のディレクトリ。 */
   readonly runDirectory: string;
   /** 同じ名前の Run のディレクトリが、すでにあったか。 */
   readonly alreadyExists: boolean;
 
   constructor(input: {
-    readonly result: AuditRunResult;
+    readonly result: AuditRunResult<RunPages>;
     readonly runDirectory: string;
     readonly alreadyExists: boolean;
     readonly cause: unknown;
   }) {
     super(
-      `run directory could not be created: ${input.runDirectory}: ${safeErrorMessage(input.cause, MAX_ERROR_MESSAGE_LENGTH)}`,
+      `run directory could not be created: ${input.runDirectory}: ${safeErrorMessage(input.cause)}`,
       { cause: input.cause },
     );
     this.name = 'RunDirectoryUnavailableError';
@@ -523,14 +611,9 @@ export type RunNotResumableDetail = (typeof RUN_NOT_RESUMABLE_DETAILS)[number];
 
 /**
  * 再開のときに、保存のセッションを始められなかった理由の閉じた一覧（中断した Run の再開の設計書 4.4）。
- * - `LOCK_HELD_BY_ACTIVE_RUN`・`LOCK_TAKEN_OVER_CONCURRENTLY`: セッションの再開の始め方の結果の理由
- *   （`RUN_CHECKPOINT_SESSION_RESUME_FAILURE_REASONS`）。別のプロセスが、この Run を実行している。
- * - `CHECKPOINT_STORE_FAILED`: 始め方が reject した（ロックや後始末を、書けなかった、消せなかった）。
+ * - `CHECKPOINT_STORE_FAILED`: 始め方が reject した（後始末を消せなかった。出力先のロックを作れなかった）。
  */
-export const RUN_RESUME_UNAVAILABLE_REASONS = Object.freeze([
-  ...RUN_CHECKPOINT_SESSION_RESUME_FAILURE_REASONS,
-  'CHECKPOINT_STORE_FAILED',
-] as const);
+export const RUN_RESUME_UNAVAILABLE_REASONS = Object.freeze(['CHECKPOINT_STORE_FAILED'] as const);
 export type RunResumeUnavailableReason = (typeof RUN_RESUME_UNAVAILABLE_REASONS)[number];
 
 /**
@@ -538,8 +621,7 @@ export type RunResumeUnavailableReason = (typeof RUN_RESUME_UNAVAILABLE_REASONS)
  * 起動もせず、Run を確定せずに（出力を作らずに）、これで reject する。Run のディレクトリを作れなかった場合（`RunDirectoryUnavailableError`）
  * と同じく、CLI が文言と終了コードを示す（R5）。
  * - `reason`: 始められなかった理由（`RUN_RESUME_UNAVAILABLE_REASONS`）。
- * - `existingLock`: セッションが判定したロックの中身（`CHECKPOINT_STORE_FAILED` では `null`）。
- * - `cause`: `CHECKPOINT_STORE_FAILED` では、始め方の reject の値。
+ * - `cause`: 始め方の reject の値。
  */
 export class RunResumeUnavailableError extends Error {
   /** 保存の Run の ID。 */
@@ -547,16 +629,14 @@ export class RunResumeUnavailableError extends Error {
   /** 再開の入力の Run のディレクトリ。 */
   readonly runDirectory: string;
   readonly reason: RunResumeUnavailableReason;
-  readonly existingLock: unknown;
 
   constructor(input: {
     readonly runId: RunId;
     readonly runDirectory: string;
     readonly reason: RunResumeUnavailableReason;
-    readonly existingLock: unknown;
     readonly cause?: unknown;
   }) {
-    const causeMessage = 'cause' in input ? `: ${safeErrorMessage(input.cause, MAX_ERROR_MESSAGE_LENGTH)}` : '';
+    const causeMessage = 'cause' in input ? `: ${safeErrorMessage(input.cause)}` : '';
     super(
       `run could not be resumed: ${input.runDirectory}: ${input.reason}${causeMessage}`,
       'cause' in input ? { cause: input.cause } : undefined,
@@ -565,7 +645,6 @@ export class RunResumeUnavailableError extends Error {
     this.runId = input.runId;
     this.runDirectory = input.runDirectory;
     this.reason = input.reason;
-    this.existingLock = input.existingLock;
   }
 }
 
@@ -628,9 +707,6 @@ const NONE_CHECKPOINT_CONCLUSION: RunCoordinatorCheckpointConclusion = Object.fr
 /** 保存の終わり方の `ABANDON`（保存の状態を変えない。設計書 4.3.2）。 */
 const ABANDON_CHECKPOINT_CONCLUSION: RunCoordinatorCheckpointConclusion = Object.freeze({ action: 'ABANDON' });
 
-/** 保存のセッションを始められなかった理由の `detail`（ロックのファイルが、すでにあった。設計書 4.4）。 */
-const CHECKPOINT_LOCK_EXISTS_DETAIL = 'checkpoint lock already exists';
-
 /** 保存のセッションの操作の名前（`RunCoordinatorCheckpointSession`）。 */
 const CHECKPOINT_SESSION_OPERATION_NAMES = Object.freeze([
   'start',
@@ -653,6 +729,8 @@ interface RunCheckpointContext {
   readonly executions: readonly [RunCheckpointExecution, ...RunCheckpointExecution[]];
   /** 保存に記録する Run の種類（T25g-2。認証つきの Run だけ。公開監査では `null` で、保存に項目を書かない）。 */
   readonly authentication: RunCheckpointAuthentication | null;
+  /** WSO: 保存に記録する点検の範囲（「チェックした画面だけ」の Run だけ。サイトの全部の画面では `null` で、保存に項目を書かない）。 */
+  readonly pageScope: RunPageScopeRecord | null;
 }
 
 /**
@@ -674,6 +752,8 @@ interface RunCrawlRecord {
   readonly outsidePageSnapshots: readonly SafetyLedgerSnapshot[];
   /** 監査を終え、ページの保存を書いたページの ID（終わった順）。 */
   readonly completedPageIds: readonly PageId[];
+  /** EV-5: 時間切れの後の再開で読み直しを終えたページの ID（読み直した順。前の回までの分を含む）。 */
+  readonly revisitedPageIds: readonly PageId[];
 }
 
 /** `#crawl` の結果のうち、Run の後の保存の終わり方に使うもの（設計書 4.3.2。R4b2）。 */
@@ -690,7 +770,7 @@ interface RunCrawlOutcome {
 
 /** `#finalize` の結果。 */
 interface RunFinalization {
-  readonly result: AuditRunResult;
+  readonly result: StoredAuditRunResult;
   /** SKIPPED のページの理由のコードの集まり（実行の終わり方と、保存の終わり方の判定の入力。設計書 4.3.2、4.8）。 */
   readonly skipReasonCodes: ReadonlySet<IncompleteReasonCode>;
   /** この実行の記録（`run.json` の実行の記録の最後のもの。終わりの時刻は `run.json` の `finishedAt`）。 */
@@ -707,20 +787,12 @@ type RunSiteMetadata = Pick<SiteMetadataResult, 'records' | 'sitemap'>;
 
 /**
  * 1つの URL の監査の結果（`#auditWithRetry`）。最終の試行のページの結果と、その試行のサイトの不調の印（不調を検知しなければ `null`。
- * サイトが応答しないときに Run を止める設計書 3.2、3.3）と、その試行のページ本体の要求の観察の結果（診断の記録に使う。サイトの不調で
- * 止めたときの診断の記録の設計書 2.2、2.3）。
+ * サイトが応答しないときに Run を止める設計書 3.2、3.3）。
  */
 type RunPageAudit = Pick<
   PageAuditOutcome,
-  'result' | 'siteUnavailableDetail' | 'navigationDiagnostics' | 'authSessionLostDetail' | 'authSessionLoss'
+  'result' | 'siteUnavailableDetail' | 'authSessionLostDetail' | 'authSessionLoss'
 >;
-
-/** 診断の記録に入れる、この実行の値（`#crawl` に渡す。サイトの不調で止めたときの診断の記録の設計書 2.3）。 */
-interface RunDiagnosticIdentity {
-  readonly runId: RunId;
-  /** この実行の番号（1から。再開した実行は、前の回の実行の数 + 1）。 */
-  readonly executionNumber: number;
-}
 
 /** 1回の `run()` の途中の状態。 */
 interface RunProgress {
@@ -731,8 +803,9 @@ interface RunProgress {
    * Ledger の snapshot（状態の保存のもの）と、終わったページの Ledger の snapshot（ページの保存のもの。終わった順）を、この順に並べたもの。
    * Ledger は作り直さず、この実行の Ledger（`safetyLedgers`）とは別に持つ。違反の確かめ（`#safetyViolationRecorded`）と、Run の Safety の
    * 集計（`#finalize`）は、この snapshot を、この実行の Ledger より前のものとして扱う（Ledger を作った順と同じ）。
+   * MEM-3c（DEF-266。D7）: snapshot そのものは持たず、この順に足し込んだもの（`RunSafetyTotals`）と、違反を持つ snapshot があったかだけを持つ。
    */
-  readonly savedSafetyLedgerSnapshots: readonly SafetyLedgerSnapshot[];
+  readonly savedSafety: RunSafetyTotals;
   /**
    * この Run（この実行）で作ったすべての Safety Ledger の登録（作った順。設計書 5.6.5、R15 の I2）。注入された `createSafetyLedger` を包んだ
    * factory が、作るたびに加える。PREFLIGHT、環境の事実、metadata の取得、各ページ（Passive、Interaction、幅の走査）、再試行の前の
@@ -770,10 +843,22 @@ interface RunProgress {
    * 監査の段の口のない Run では `null`。上限に届いたら次のページを始めず、鍵がなくなったらセッションの切れにする。
    */
   readonly auditStage: AuditStageRunState | null;
-  /** 監査した URL の、最終の試行の結果。 */
-  readonly results: Map<string, PageAuditResult>;
-  /** 再試行した URL の、再試行の前の試行の Evidence（最終のページの `evidence` に残す。設計書 5.6.4、R15 の Minor-6）。 */
+  /**
+   * 監査した URL の、ページの置き場所（`pages`）の中の添字。MEM-3b（DEF-266）: 最終の試行の結果は生で持たず、終えたときに `pages` に入れる（`#storePage`）。
+   */
+  readonly results: Map<string, number>;
+  /**
+   * MEM-3b: 監査したページの置き場所（終えた順）。本体は、再試行の前の試行の Evidence を先頭に加えた形（出力の形。開始の URL のページの metadata の Evidence は、
+   * Run の終わりに加える）を圧縮して持つ。要約（`RunPageSummary`）は、評価の形（最終の試行の Evidence だけ）から作る。
+   */
+  readonly pages: RunPageStore<RunPageSummary>;
+  /**
+   * 再試行している URL の、再試行の前の試行の Evidence（最終のページの `evidence` に残す。設計書 5.6.4、R15 の Minor-6）。MEM-3b: ページを `pages` に入れるときに、
+   * 本体に加えて消す。
+   */
   readonly retryEvidence: Map<string, readonly EvidenceRecord[]>;
+  /** EV-5: 保存から戻した、読み直す候補のページ（再開した Run だけ。URL を鍵に）。 */
+  readonly revisits: ReadonlyMap<string, RevisitCandidate>;
   /**
    * 実行時間の上限を超えたか（設計書 5.6.3）。ページとページの間でだけ確かめるので、最後のページで超え、監査していない URL が
    * 残らない場合も、事実として `crawlLimits.maxRuntimeReached` に記録する（その場合は、Run の理由は付けない。R15 の Minor-4）。
@@ -816,12 +901,17 @@ interface RunProgress {
 export class RunCoordinator {
   readonly #config: AuditConfig;
   readonly #launchBrowser: BrowserLauncher;
+  readonly #browserLease: BrowserLease | undefined;
   readonly #createSafetyLedger: SafetyLedgerFactory;
   readonly #clock: () => Date;
   readonly #now: () => number;
   readonly #outputDirectory: string;
   readonly #createPageAuditor: (dependencies: PageAuditorDependencies) => RunPageAuditor;
   readonly #collectSiteMetadata: typeof collectSiteMetadataDefault;
+  /** DEF-245: 進みの見張りの反応なしの長さ（テスト用。省略は `undefined`）。 */
+  readonly #progressWatchQuietLimitMs: number | undefined;
+  /** RB-2: 観察の窓の一式の注入（`RunCoordinatorDependencies.observationWindows`）。なければ factory と Page Auditor の本番の値。 */
+  readonly #observationWindows: ObservationWindows | undefined;
   readonly #runPreflight: typeof runPreflightDefault;
   readonly #collectRunEnvironment: typeof collectRunEnvironmentDefault;
   readonly #readToolVersion: typeof readToolVersionDefault;
@@ -829,18 +919,38 @@ export class RunCoordinator {
   readonly #deadlines: ResolvedPassiveSessionDeadlines;
   readonly #sleep: (ms: number) => Promise<void>;
   readonly #onProgress: ((report: RunProgressReport) => void) | undefined;
+  /** L0: ページを始めた知らせの受け手。 */
+  readonly #onPageStarted: ((report: RunProgressReport) => void) | undefined;
   readonly #onNotice: ((notice: RunNotice) => void) | undefined;
   readonly #onFinalizing: (() => void) | undefined;
   readonly #checkpointSession: RunCoordinatorCheckpointSession | undefined;
   readonly #resumeFrom: RunCoordinatorResumeInput | undefined;
   readonly #stopSignal: AbortSignal | undefined;
-  readonly #diagnosticWriter: RunCoordinatorDependencies['writeSiteUnavailableDiagnostic'];
   /** 認証つきの Run の指定（T25c）。公開監査では `null`。 */
   readonly #authentication: RunAuthentication | null;
   /** 外から渡した pacer（CCX-22）。渡さなければ `null`（自分で作る）。 */
   readonly #externalNavigationPacer: NavigationPacer | null;
   /** FM2d: まとめて実行の段の持ち越し（`RunCoordinatorDependencies.stageCarry`）。渡さなければ `null`（今のまま）。 */
   readonly #stageCarry: RunStageCarry | null;
+  /** DEF-200: この実行のログインし直しの印と回数（なければ `null`）。 */
+  readonly #automaticRelogin: RunExecutionAutomaticRelogin | null;
+  /** WSO: 「チェックした画面だけ」の点検で読む画面（正規化した URL。渡した順。範囲がなければ `null`）。 */
+  readonly #pageScope: readonly NormalizedHttpUrlEvidence[] | null;
+
+  /** WSO: 保存と `run.json` に足す範囲の部分（範囲がなければ空）。 */
+  #pageScopePart(): { readonly pageScope?: RunPageScopeRecord } {
+    return this.#pageScope === null ? {} : { pageScope: { kind: CHECKED_WRITE_SCREENS_SCOPE, pageCount: this.#pageScope.length } };
+  }
+
+  /** WSO: 辺の URL を待ち行列に入れてよいか（範囲がなければ、どれでもよい。範囲があれば、範囲の画面だけ）。 */
+  #inPageScope(url: string): boolean {
+    return this.#pageScope === null || this.#pageScope.includes(url as NormalizedHttpUrlEvidence);
+  }
+
+  /** DEF-200: 実行の記録に足す、ログインし直しの印の部分（なければ空）。 */
+  #automaticReloginPart(): { readonly automaticRelogin?: RunExecutionAutomaticRelogin } {
+    return this.#automaticRelogin === null ? {} : { automaticRelogin: this.#automaticRelogin };
+  }
   /** 保存に記録する Run の種類（T25g-2。`runCheckpointAuthenticationOf`）。公開監査では `null`。 */
   readonly #checkpointAuthentication: RunCheckpointAuthentication | null;
   /** 最後に終わった `run()` の後の保存の終わり方（`run()` が終わるまでは `null`）。 */
@@ -875,9 +985,9 @@ export class RunCoordinator {
       ['readToolVersion', dependencies.readToolVersion],
       ['sleep', dependencies.sleep],
       ['onProgress', dependencies.onProgress],
+      ['onPageStarted', dependencies.onPageStarted],
       ['onNotice', dependencies.onNotice],
       ['onFinalizing', dependencies.onFinalizing],
-      ['writeSiteUnavailableDiagnostic', dependencies.writeSiteUnavailableDiagnostic],
     ] as const) {
       if (value !== undefined && typeof value !== 'function') {
         throw new TypeError(`RunCoordinator ${name} must be a function when given`);
@@ -898,7 +1008,7 @@ export class RunCoordinator {
         || typeof resumeFrom.runDirectory !== 'string'
         || resumeFrom.runDirectory.length === 0
         || !isRecord(resumeFrom.checkpoint)
-        || !Array.isArray(resumeFrom.pages)
+        || !(Array.isArray(resumeFrom.pages) || isRestoredRunPages(resumeFrom.pages))
       ) {
         throw new TypeError('RunCoordinator resumeFrom must have a run directory, a checkpoint and the list of page checkpoints when given');
       }
@@ -933,28 +1043,36 @@ export class RunCoordinator {
       throw new TypeError('RunCoordinator stageCarry must have a service request window and a record function when given');
     }
     this.#stageCarry = stageCarry ?? null;
+    this.#automaticRelogin = dependencies.automaticRelogin === undefined ? null : Object.freeze({ count: dependencies.automaticRelogin.count });
     this.#authentication = authentication ?? null;
+    // REV-WSO の M-1: 範囲は、読める画面だけにする（読まない画面は数えない）。
+    this.#pageScope = dependencies.pageScope === undefined
+      ? null
+      : readablePageScope(config, this.#authentication, normalizedPageScope(config, dependencies.pageScope));
     this.#checkpointAuthentication = authentication === undefined ? null : runCheckpointAuthenticationOf(authentication);
     // T25c: 認証つきの Run では、Interaction を行わないことを、有効な設定で記録する（Task 25 の設計書 4.7）。公開監査は、設定のまま。
     this.#config = authentication === undefined ? config : authenticatedRunConfig(config);
     this.#launchBrowser = launchBrowser;
+    this.#browserLease = dependencies.browserLease;
     this.#createSafetyLedger = createSafetyLedger;
     this.#clock = clock;
     this.#now = now;
     this.#outputDirectory = outputDirectory;
     this.#createPageAuditor = dependencies.createPageAuditor ?? ((pageAuditorDependencies) => new PageAuditor(pageAuditorDependencies));
     this.#collectSiteMetadata = dependencies.collectSiteMetadata ?? collectSiteMetadataDefault;
+    this.#progressWatchQuietLimitMs = dependencies.progressWatchQuietLimitMs;
+    this.#observationWindows = dependencies.observationWindows;
     this.#runPreflight = dependencies.runPreflight ?? runPreflightDefault;
     this.#collectRunEnvironment = dependencies.collectRunEnvironment ?? collectRunEnvironmentDefault;
     this.#readToolVersion = dependencies.readToolVersion ?? readToolVersionDefault;
     this.#sleep = dependencies.sleep ?? wait;
     this.#onProgress = dependencies.onProgress;
+    this.#onPageStarted = dependencies.onPageStarted;
     this.#onNotice = dependencies.onNotice;
     this.#onFinalizing = dependencies.onFinalizing;
     this.#checkpointSession = dependencies.checkpointSession;
     this.#resumeFrom = dependencies.resumeFrom;
     this.#stopSignal = dependencies.stopSignal;
-    this.#diagnosticWriter = dependencies.writeSiteUnavailableDiagnostic;
     // 期限の値の検証は、期限の部品と同じもので行う（正の安全な整数でなければ `RangeError`）。
     this.#browserCloseTimeoutMs = resolveTimeoutMs(dependencies.browserCloseTimeoutMs, BROWSER_CLOSE_TIMEOUT_MS);
     // 作成・終了の期限は、ここで検証し、既定値で埋めたものを下へ渡す（RP18 の指摘2）。
@@ -983,8 +1101,6 @@ export class RunCoordinator {
    *    保存のセッションがあれば、robots.txt と sitemap.xml の後と、各ページの後に、保存を頼む（`#crawl`。中断した Run の再開の設計書 4.3）。
    *    ページの結果にサイトの不調の印があれば、再試行せず、そのページを捨てて（再開で監査し直す）、新しいページを始めずに、残りの URL を
    *    理由 `SITE_UNAVAILABLE` の SKIPPED にする（`#crawl`。サイトが応答しないときに Run を止める設計書 3.2、3.2.1、3.3）。
-   *    書き出しの口（`writeSiteUnavailableDiagnostic`）が注入されていれば、そのページの診断の記録を渡す（サイトの不調で止めたときの
-   *    診断の記録の設計書 2.3。口の失敗は、Run を変えない）。
    * 7. Browser を閉じる（閉じる処理の失敗は、Run の理由に加える）。
    * 8. Cross-page rule を評価する。評価の失敗は、Run の理由に加える。
    * 9. すべてのページと Finding を、スキーマで確かめる。
@@ -1035,11 +1151,8 @@ export class RunCoordinator {
    * この実行の分（開始の時刻、`run.json` の `finishedAt` と同じ終わりの時刻、`decideRunExecutionEndReason` の終わり方）を加えたもの。
    *
    * 終わった後（reject した場合も）に、CLI が行う保存の終わり方を決め、`checkpointConclusion()` で返せるようにする（設計書 4.3.2）。
-   *
-   * DEF-170: 保存のセッションがロックを失ったら（`lockLostSignal`）、次の読み込み（ページ、ビューポート、幅、候補）を始めず、Browser を閉じ、集計も
-   * 診断の記録も書かずに、`RunLockLostError` で reject する（保存の終わり方は `NONE`。Run のディレクトリに何も書かない）。
    */
-  async run(): Promise<AuditRunResult> {
+  async run(): Promise<StoredAuditRunResult> {
     this.#checkpointConclusion = null;
     const session: RunSessionStatus = { started: false };
     try {
@@ -1075,7 +1188,7 @@ export class RunCoordinator {
 
   /** `run()` の本体（設計書 5.6.1）。確定した Run と、保存の終わり方を返す。保存のセッションを始めたら、`session.started` を真にする。 */
   async #execute(session: RunSessionStatus): Promise<{
-    readonly result: AuditRunResult;
+    readonly result: StoredAuditRunResult;
     readonly conclusion: RunCoordinatorCheckpointConclusion;
   }> {
     const config = this.#config;
@@ -1134,16 +1247,11 @@ export class RunCoordinator {
     const auditStage = auditStageRequests === undefined
       ? null
       // FM2d: まとめて実行の段なら、前の段の 1 分の窓から始める（持ち越しがなければ空。今のまま）。
-      : createAuditStageRunState(auditStageRequests, this.#now, resumedCounts ?? undefined, this.#stageCarry?.serviceRequestWindowMs ?? []);
+      : createAuditStageRunState(this.#now, resumedCounts ?? undefined, this.#stageCarry?.serviceRequestWindowMs ?? []);
     // DEF-141（設計書 `2026-10-20-beaksight-service-request-pacing-design.md` 2.2、2.4）: 監査の段の口がある Run だけ、承認したサービスの Origin への要求の
     // 1 分あたりの上限で、次の読み込み（ページ・ビューポート・幅）の前に待つ（発見・READ の確かめと共用する部品。待ちは注入した `sleep`。待つたびに
     // 知らせる）。口がなければ、今の pacer のまま。
-    // DEF-170: ロックを失った後は、読み込みを始めない（待ちの後、読み込みの直前に確かめる。Page Auditor の次のビューポート・幅・候補の読み込みも止まる）。
-    const navigationPacer = runLockGuardedNavigationPacer(
-      serviceRequestPacedNavigationPacer(intervalPacer, auditStage, this.#sleep, (notice) => this.#notify(notice)),
-      () => this.#throwIfRunLockLost(runId, runDirectory),
-      async () => await this.#confirmRunLockOrThrow(runId, runDirectory),
-    );
+    const navigationPacer = serviceRequestPacedNavigationPacer(intervalPacer, auditStage, this.#sleep, (notice) => this.#notify(notice));
     const loadMeter = createLoadMeter({
       allowedOrigins: config.site.allowedOrigins,
       now: this.#now,
@@ -1159,7 +1267,8 @@ export class RunCoordinator {
     const resourceCache = new ResourceCache();
     // この実行の開始の時刻（時計）。再開のときは、Run の ID、BeakSight の版、Run の開始の時刻（最初の実行の開始）は、保存のものを使う。
     const executionStartedAt = this.#clock();
-    const runId = saved === undefined ? createRunIdFromTime(executionStartedAt) : saved.runId;
+    // DEF-281: 新しい Run の ID は、下の 1. で Run のディレクトリを作るときに決め直す（同じ秒の名前がすでにあれば 2 桁の連番を足す）。
+    let runId = saved === undefined ? createRunIdFromTime(executionStartedAt) : saved.runId;
     const executionStartedAtIso = executionStartedAt.toISOString();
     const runStartedAt = saved === undefined ? executionStartedAtIso : saved.startedAt;
     const toolVersion = saved === undefined ? await this.#readToolVersion() : saved.toolVersion;
@@ -1167,7 +1276,7 @@ export class RunCoordinator {
     const progress: RunProgress = {
       // 再開のときは、理由、再試行の記録、違反のフラグ、未処理の失敗の件数、保存した Safety Ledger の snapshot、終わったページの結果と
       // 再試行の前の Evidence を、保存から作り直す（`restoredRunProgress`）。PREFLIGHT の失敗と Guard の有無は、この実行の PREFLIGHT で決める。
-      ...restoredRunProgress(resume),
+      ...await restoredRunProgress(resume),
       safetyLedgers: [],
       pageLedgerStart: 0,
       navigationPacer,
@@ -1182,7 +1291,7 @@ export class RunCoordinator {
       guardEnabled: false,
       // 再開のときは、採番器、巡回の記録、開始の URL、robots.txt と sitemap.xml の Evidence も、ここで（PREFLIGHT の前に、PREFLIGHT の結果に
       // よらず）保存から作り直す（`restoredCrawlProgress`。設計書 4.10 の DEF-022）。新しい Run では、`#crawl` が作る。
-      ...restoredCrawlProgress(config, saved),
+      ...restoredCrawlProgress(config, saved, this.#pageScope !== null),
     };
 
     // この Run の Ledger は、すべて、この factory で作る（PREFLIGHT が作る Context の factory も、これを使う）。作った Ledger は、
@@ -1199,7 +1308,9 @@ export class RunCoordinator {
     let runDirectory: string;
     let checkpointStartFailure: IncompleteReason | null = null;
     if (resume === undefined) {
-      created = await createRunArtifactDirectory(this.#outputDirectory, runId);
+      const start = await createRunArtifactDirectoryForStart(this.#outputDirectory, runId);
+      ({ runId } = start);
+      created = start;
       runDirectory = created.runDirectory;
       // 1a. 保存のセッションを、作った Run のディレクトリで始める（中断した Run の再開の設計書 4.3.1）。
       checkpointStartFailure = created.ok ? await this.#startCheckpointSession(runDirectory) : null;
@@ -1220,16 +1331,23 @@ export class RunCoordinator {
       ? await this.#runPreflight({
         config,
         launchBrowser: this.#launchBrowser,
+        ...(this.#browserLease === undefined ? {} : { browserLease: this.#browserLease }),
         createSafetyLedger,
         outputDirectory: runDirectory,
         deadlines: { ...this.#deadlines, browserCloseTimeoutMs: this.#browserCloseTimeoutMs },
         // Run のすべての Context の要求の終わりの事象を、この Run の meter に渡させる（設計書 4.5。PREFLIGHT は中身を見ない）。
         // 応答は、この Run のキャッシュに渡させ、読み込み直しの Context では、キャッシュから返させる（設計書 4.6、4.7）。
         contextFactoryOptions: {
+          // RB-4 fix（REV-RB4 の C-1）: 監査の PRIMARY は凍結しないので、観察の口を付けない（Worker の中のリアルタイムの通信を止めない）。
+          pageAuditRun: true,
           loadMeter,
           resourceCache,
           // DEF-100 fix: Run の pacer に、Guard が main frame の文書の要求を送った時刻を記録させる（サイトに届く間隔を設定以上にする）。
           navigationPacer,
+          // DEF-245: Guard が閉じるときの作業の待ちにも、同じ見張りの長さを渡す（省略は本番の長さ）。
+          ...(this.#progressWatchQuietLimitMs === undefined ? {} : { progressWatchQuietLimitMs: this.#progressWatchQuietLimitMs }),
+          // RB-2: 観察の窓の一式の注入（テストだけ。省略は本番の値）。
+          ...(this.#observationWindows === undefined ? {} : { observationWindows: this.#observationWindows }),
           // T25c: 認証つきの Run だけ、状態の注入と Guard の監査の段の除外を、factory に渡す（Task 25 の設計書 4.3）。
           ...(this.#authentication === null ? {} : { authentication: authenticatedContextOptions(this.#authentication) }),
           // T35c: スクリプトで送るログインの監査の Run だけ、上限の部品、監査の段の記録、401 と鍵の消失の知らせを、factory に渡す。
@@ -1281,7 +1399,9 @@ export class RunCoordinator {
         // 保存のセッションは、ここに来た時点で始まっている（始められなかった場合は、PREFLIGHT を行わず、Browser もない）。
         // 実行の記録は、前の回までの記録（再開のとき。前の回のプロセスが途中で終わった実行は、閉じたもの。R4b1）に、この実行の分を
         // 1件加えたもの（設計書 4.8）。この実行の分の終わりの時刻と終わり方は、実行の途中なので `null`（最後の状態の保存で決める）。
-        const execution: RunCheckpointExecution = { startedAt: executionStartedAtIso, finishedAt: null, endReason: null, environment };
+        const execution: RunCheckpointExecution = {
+          startedAt: executionStartedAtIso, finishedAt: null, endReason: null, environment, ...this.#automaticReloginPart(),
+        };
         const checkpoint: RunCheckpointContext | null = checkpointSession === undefined
           ? null
           : {
@@ -1291,11 +1411,9 @@ export class RunCoordinator {
             startedAt: runStartedAt,
             executions: executionsEndingWith(previousExecutions, execution),
             authentication: this.#checkpointAuthentication,
+            pageScope: this.#pageScopePart().pageScope ?? null,
           };
-        // 診断の記録の実行の番号は、前の回までの実行の数 + 1（`run.json` の実行の記録の、この実行の位置。サイトの不調で止めたときの
-        // 診断の記録の設計書 2.3）。
-        const diagnosticIdentity: RunDiagnosticIdentity = { runId, executionNumber: previousExecutions.length + 1 };
-        crawl = await this.#crawl(factory, runDirectory, startedAtMs, progress, checkpoint, saved ?? null, diagnosticIdentity);
+        crawl = await this.#crawl(factory, runDirectory, startedAtMs, progress, checkpoint, saved ?? null, runId);
         crawlEndContent = crawl.crawlEndContent;
       } else {
         // 巡回を始めなかった（PREFLIGHT の失敗など）。
@@ -1310,6 +1428,7 @@ export class RunCoordinator {
             pagesStarted: saved.progress.pagesStarted,
             outsidePageSnapshots: outsidePageLedgerSnapshots(saved.safetyLedgerSnapshots, progress.safetyLedgers, new Set()),
             completedPageIds: saved.completedPageIds,
+            revisitedPageIds: saved.revisitedPageIds ?? [],
           };
         if (restoredCrawl !== null) {
           for (const entry of restoredCrawl.frontier.drain()) {
@@ -1323,7 +1442,9 @@ export class RunCoordinator {
           // robots.txt と sitemap.xml はなし、ページの外の Ledger は、この実行のすべての Ledger にした中身。
           crawlEndContent = runCheckpointContent({
             config,
-            identity: { runId, toolVersion, startedAt: runStartedAt, authentication: this.#checkpointAuthentication },
+            identity: {
+              runId, toolVersion, startedAt: runStartedAt, authentication: this.#checkpointAuthentication, pageScope: this.#pageScopePart().pageScope ?? null,
+            },
             progress,
             crawl: restoredCrawl,
           });
@@ -1332,9 +1453,9 @@ export class RunCoordinator {
     } finally {
       // DEF-143: ここから「Run の終わり」の段（Browser を閉じる処理、集計、CLI が行う成果物の書き出し、止めたときの片付け）。入る前に 1 回だけ知らせる。
       this.#notifyFinalizing();
-      // 7. Browser を閉じる。閉じる処理の失敗と、期限（`BROWSER_CLOSE_TIMEOUT_MS`）を過ぎたことは、Run の理由にする（R15 の Minor-2）。
-      if (browser !== null) {
-        const closeFailure = await closeBrowserBeforeDeadline(browser, { timeoutMs: this.#browserCloseTimeoutMs });
+      // 7. Browser を閉じる（RB-5: lease から借りた Browser は返す）。閉じる処理の失敗と、期限（`BROWSER_CLOSE_TIMEOUT_MS`）を過ぎたことは、Run の理由にする（R15 の Minor-2）。
+      if (preflight?.ok === true) {
+        const closeFailure = await endPreflightBrowser(preflight, { timeoutMs: this.#browserCloseTimeoutMs });
         if (closeFailure !== null) {
           progress.reasons.push(unhandledFailureReason(RUN_FAILURE_LABELS.browserClose, closeFailure.error));
         }
@@ -1346,8 +1467,6 @@ export class RunCoordinator {
       });
     }
 
-    // DEF-170: 巡回の途中か、終わった後にロックを失っていたら、集計も成果物の書き出しもせずに終える（Browser は上で閉じた）。
-    this.#throwIfRunLockLost(runId, runDirectory);
     // `run.json` の環境は、最初の実行のもの（中断した Run の再開の設計書 4.8。版が同じでなければ再開しないので、主な値は変わらない）。
     const finalized = await this.#finalize({
       runId,
@@ -1357,6 +1476,7 @@ export class RunCoordinator {
       progress,
       previousExecutions: previousRunExecutions,
       executionStartedAt: executionStartedAtIso,
+      automaticRelogin: this.#automaticRelogin,
     });
     const { result } = finalized;
     if (directoryFailure !== null) {
@@ -1398,10 +1518,7 @@ export class RunCoordinator {
    * 後の状態の保存の `siteMetadata` は `null` になり、再開のときに取得し直す）、止まっていれば残す（保存し、次の再開では取得し直さない）。
    * 保存のセッションがあれば、巡回の終わり（残りの URL を SKIPPED にした後。例外で止まった経路でも、SKIPPED にした後）の値を、最後の
    * 状態の保存の中身として写して返す（設計書 4.3.2。R4b2）。この後の Browser を閉じる処理と `#finalize` で加わる理由、件数、Finding の
-   * ID の採番は、中身に入らない。
-   * 不調のページを捨てた場合と、前の実行のきっかけのページを普通の結果として保存した場合は、そのページの保存の後に、診断の記録を書き出しの
-   * 口に渡す（`#passSiteUnavailableDiagnostic`。`diagnosticIdentity` は、記録の Run の ID と実行の番号。サイトの不調で止めたときの診断の
-   * 記録の設計書 2.3）。
+   * ID の採番は、中身に入らない。`runId` は、ロックの確かめに使う。
    * 不調のページを捨てた後、その実行でそのページを確かめ直した回数が上限（`SITE_UNAVAILABLE_RECHECK_DELAYS_MS` の数）に達していなければ、
    * 知らせてから次の段階の待ち（60 秒、2 分、4 分、8 分）で待ち（止める印で打ち切る）、待った後に止める印がなく、実行時間の上限にも達して
    * いなければ、同じページ（同じ `pageId`）を監査し直す（サイトが応答しないときに Run を止める設計書 3.5.2、3.6.2。`#waitBeforeRecheck`）。
@@ -1416,27 +1533,31 @@ export class RunCoordinator {
     progress: RunProgress,
     checkpoint: RunCheckpointContext | null,
     saved: RunCheckpoint | null,
-    diagnosticIdentity: RunDiagnosticIdentity,
+    runId: RunId,
   ): Promise<RunCrawlOutcome> {
     const config = this.#config;
-    const runtimeLimitReached = (): boolean => this.#now() - startedAtMs >= config.crawl.maxRuntimeMs;
-    // 巡回の候補から外す URL の判定（T25c。認証つきの Run だけ。公開監査では `null`）。Link の候補と、robots.txt と sitemap.xml の取得の
-    // 両方に、同じ判定を使う（T25c round 3）。
+    // L14 の後の段（設計書 `2026-11-09-beaksight-remove-limits-design.md` 6.1）: Run の時間とページの数の上限は、利用者が指定したときだけ確かめる。
+    const { maxRuntimeMs, maxPages } = config.crawl;
+    const runtimeLimitReached = (): boolean => maxRuntimeMs !== undefined && this.#now() - startedAtMs >= maxRuntimeMs;
+    // 巡回の候補から外す URL の判定（T25c）。Link の候補と、robots.txt と sitemap.xml の取得の両方に、同じ判定を使う（T25c round 3）。
+    // SD-1（設計書 `2026-11-16-beaksight-action-based-delete-guard-design.md` 2.3）: 公開監査にも、巡回の移る先の URL の語（`crawlUrlHasDestructiveWord`）を
+    // 当てる（認証つきの Run は `isExcludedCrawlCandidate` の中で当てる）。
     const crawlAllowedOrigins: ReadonlySet<string> = new Set(config.site.allowedOrigins);
     const runAuthentication = this.#authentication;
-    const excludedCrawlCandidate = runAuthentication === null
-      ? null
-      : (url: string): boolean => isExcludedCrawlCandidate(url, crawlAllowedOrigins, runAuthentication);
+    const excludedCrawlCandidate = excludedCrawlCandidateOf(config, runAuthentication);
     // 保存（中断した Run の再開の設計書 4.1、4.3）。保存のセッションがなければ、何もしない。保存に1回失敗したら、それより後は
     // 保存しない（新しいページも始めない）。終わったページの ID は、終わった順に並べる。ページの中で作った Ledger の snapshot は、
     // そのページの保存に入れ、状態の保存には、ページの外で作った Ledger の snapshot だけを入れる。
     // 再開のときは、監査を始めたページの数、終わったページの ID、ページの外の Ledger の snapshot を、保存した分から続ける（次の保存で、
     // 前の回の分が消えないようにする）。この実行のページの中の Ledger は、`pageLedgers` で区別する。
     let pagesStarted = saved?.progress.pagesStarted ?? 0;
+    const pageLimitReached = (): boolean => maxPages !== undefined && pagesStarted >= maxPages;
     let checkpointFailed = false;
     // 最後に書けた状態の保存（設計書 4.3.2。この実行で書けた値。書けていなければ、再開の入力の保存）。
     let lastWritten: RunCheckpoint | null = saved;
     const completedPageIds: PageId[] = [...(saved?.completedPageIds ?? [])];
+    // EV-5: 時間切れの後の再開で読み直しを終えたページ（前の回までの分から続ける。後の再開では読み直さない）。
+    const revisitedPageIds: PageId[] = [...(saved?.revisitedPageIds ?? [])];
     const savedOutsidePageSnapshots: readonly SafetyLedgerSnapshot[] = saved?.safetyLedgerSnapshots ?? [];
     const pageLedgers = new Set<SafetyLedger>();
     const outsidePageSnapshots = (): SafetyLedgerSnapshot[] =>
@@ -1449,7 +1570,13 @@ export class RunCoordinator {
     const previousStoppedAtSiteMetadata = stoppedAtSiteMetadataBefore(saved);
     try {
       // 開始の URL（再開のときは、PREFLIGHT の前に作った値。`restoredCrawlProgress`）。
-      const startUrl = progress.startUrl ?? normalizedStartUrl(config);
+      // WSO: 「チェックした画面だけ」の点検は、開始の URL の代わりに、範囲の画面のうち読めるもの（許可 Origin の中で、巡回の候補の除外に当たらないもの。
+      // `readablePageScope`）を渡した順に入れる（最初の画面に robots.txt の Evidence を置く）。読めるものが 1 つもなければ、開始の URL を読まずに Run の失敗にする。
+      const scopeSeeds = this.#pageScope;
+      if (saved === null && scopeSeeds !== null && scopeSeeds.length === 0) {
+        throw new Error('no screen of the page scope can be read');
+      }
+      const startUrl = progress.startUrl ?? scopeSeeds?.[0] ?? normalizedStartUrl(config);
       progress.startUrl = startUrl;
 
       // 4. 採番器を作り、開始の URL のページの ID を採番する（metadata の取得の前）。再開のときは、PREFLIGHT の前に保存から作り直した採番器と
@@ -1460,7 +1587,9 @@ export class RunCoordinator {
       const frontier = progress.frontier ?? new CrawlFrontier(config.crawl.maxDepth, allocator);
       progress.frontier = frontier;
       if (saved === null) {
-        frontier.discover(startUrl, 0);
+        for (const url of scopeSeeds ?? [startUrl]) {
+          frontier.discover(url, 0);
+        }
       }
       const [startEntry] = frontier.entries();
       if (startEntry === undefined) {
@@ -1495,8 +1624,11 @@ export class RunCoordinator {
           // 各ファイルの読み込みの前に、Run で1つの pacer で間隔を守る（サイトへの負荷の制御の設計書 4.1）。不調を残した後は、待たない。
           beforeNavigation: hooks.beforeNavigation,
           afterNavigation: hooks.afterNavigation,
-          // T25c round 3: 認証つきの Run では、巡回の候補と同じ判定で除外に当たるファイルを取りに行かない（Evidence は `EXCLUDED`）。
-          ...(excludedCrawlCandidate === null ? {} : { isExcludedUrl: excludedCrawlCandidate }),
+          ...(this.#progressWatchQuietLimitMs === undefined ? {} : { quietLimitMs: this.#progressWatchQuietLimitMs }),
+          // T25c round 3: 巡回の候補と同じ判定で除外に当たるファイルを取りに行かない（Evidence は `EXCLUDED`）。
+          isExcludedUrl: excludedCrawlCandidate,
+          // WSO（REV-WSO の I-2）: 「チェックした画面だけ」の点検は、sitemap.xml を取りに行かない（サイトの全部を巡回しないので、比べない）。
+          skipSitemap: this.#pageScope !== null,
         });
         // metadata の取得の Ledger は、Context の factory が作ったもので、すでに登録にある（`ledgerSnapshot` は集計に使わない）。
         // サイトの不調を検知し、Run の初めからの Ledger に違反がなければ、この実行の不調の詳細を残す（次のページを始めない。設計書 3.2）。
@@ -1526,7 +1658,7 @@ export class RunCoordinator {
             // 保存の時刻は、その値を作る時点の時計の値（R4b1。設計書 4.1）。
             savedAt: this.#clock().toISOString(),
             progress,
-            crawl: { frontier, allocator, pagesStarted, outsidePageSnapshots: outsidePageSnapshots(), completedPageIds },
+            crawl: { frontier, allocator, pagesStarted, outsidePageSnapshots: outsidePageSnapshots(), completedPageIds, revisitedPageIds },
           });
           await context.session.saveState(state);
           lastWritten = state;
@@ -1554,20 +1686,24 @@ export class RunCoordinator {
         deadlines: this.#deadlines,
         // metadata の取得と同じ、Run で1つの pacer（サイトへの負荷の制御の設計書 4.1）。
         navigationPacer: progress.navigationPacer,
+        ...(this.#progressWatchQuietLimitMs === undefined ? {} : { progressWatchQuietLimitMs: this.#progressWatchQuietLimitMs }),
+        ...(this.#observationWindows === undefined ? {} : { observationWindows: this.#observationWindows }),
+        // L0: Run の時間の上限（`maxRuntimeMs`。この実行の開始から）を、ページの途中でも効かせる。
+        // L14 の後の段: 指定がなければ期限なし（進みの見張りで待つ）。
+        ...(maxRuntimeMs === undefined ? {} : { runDeadlineAtMs: startedAtMs + maxRuntimeMs }),
         // ページの中（次のビューポート、幅の走査の次の幅、Interaction の次の候補の前）の確かめ。今のページで作った Ledger を調べる
         // （それより前の Ledger は、ページを始める前に調べた）。
         safetyViolationRecorded: () => this.#safetyViolationRecorded(progress, progress.pageLedgerStart),
-        // DEF-172: スクリーンショットを Run のディレクトリに書く直前に、Run のロックが今も自分のものかを確かめる。
-        mayWriteScreenshots: async () => {
-          try {
-            await this.#confirmRunLockOrThrow(diagnosticIdentity.runId, runDirectory);
-            return true;
-          } catch {
-            return false;
-          }
-        },
+        // DEF-236 の修正: 次の読み込みの前に見せたまま待つかを決める確かめ。同じ Ledger を調べるが、止めたことは記録しない。
+        safetyViolationDetected: () => this.#detectSafetyViolation(progress, progress.pageLedgerStart),
+        // COV-4 の区切り 3: 開いた状態の構造の鍵を、Run の巡回の記録（checkpoint に残る）で 1 回だけ受け付ける。
+        acceptOpenedStructure: (structureKey) => frontier.acceptOpenedStructure(structureKey),
+        // COV-4 の区切り 3（入れ子の開いた状態）: 開いた状態の中で押した組も、巡回の記録（checkpoint に残る）で 1 回だけ受け付ける。
+        acceptOpenedPress: (press) => frontier.acceptOpenedPress(press),
         // T25c: 認証つきの Run だけ、セッションの切れを確かめさせる（Task 25 の設計書 4.3）。
         ...(this.#authentication === null ? {} : { sessionLostPathPrefix: this.#authentication.sessionLostPathPrefix }),
+        // SD-2（設計書 `2026-11-16-beaksight-action-based-delete-guard-design.md` 2.4）: 点検の範囲の外へ移った画面は点検しない。
+        isOutsideAuditScope: (url: string): boolean => isOutsideRunAuditScope(url, crawlAllowedOrigins, runAuthentication),
         // DEF-138: セッションの切れの証拠の Origin の区別に、承認したサービスの Origin を渡す（スクリプトで送るログインの Run だけ）。
         ...(this.#authentication?.auditStage === undefined ? {} : { approvedServiceOrigins: this.#authentication.auditStage.approvedServiceOrigins }),
       });
@@ -1578,8 +1714,8 @@ export class RunCoordinator {
       let pagesFinished = saved?.completedPageIds.length ?? 0;
       // 段階的に確かめ直す（サイトが応答しないときに Run を止める設計書 3.5.2、3.6.2）。不調で捨てたページを、待った後にもう 1 回監査する
       // ときは、待ち行列を通さずに、その記録（`recheckEntry`）を次に監査する。URL ごとの確かめ直しの回数（`recheckedUrls`）は、1 つの実行の
-      // 中で同じ URL につき `SITE_UNAVAILABLE_RECHECK_DELAYS_MS` の数（4 回）までにするためと、診断の記録の試行の番号のために持つ（最後の
-      // 確かめ直しの試行でまた不調なら、今までどおり止める）。
+      // 中で同じ URL につき `SITE_UNAVAILABLE_RECHECK_DELAYS_MS` の数（4 回）までにするために持つ（最後の確かめ直しの試行でまた不調なら、
+      // 今までどおり止める）。
       let recheckEntry: CrawlUrlEntry | null = null;
       const recheckedUrls = new Map<string, number>();
       // この実行の、pacer の今の最小の間隔（設計書 3.6.2。確かめ直しで通るたびに、`SITE_UNAVAILABLE_SLOWDOWN_FACTOR` 倍にする。上限は設定の
@@ -1597,25 +1733,44 @@ export class RunCoordinator {
         progress.navigationPacer.raiseMinimumInterval(raisedMs);
         this.#notify(Object.freeze({ kind: 'SITE_UNAVAILABLE_SLOWDOWN', minIntervalMs: raisedMs }));
       };
-      const nextEntry = (): CrawlUrlEntry | undefined => {
+      // EV-5（設計書 `2026-11-16-beaksight-finding-evidence-design.md` 2 章・3.5）: 時間切れで止まった Run を続けるときは、終えたページのうち、一部だけ終わった
+      // ページと確かめを待つ指摘のあるページ（`revisitOrderOf` の順。前の回までに読み直しを終えたページは除く）を、まだ見ていないページより先に読み直す。
+      // 読み直しは今のページの読み込みと同じ流れ（移動の間隔の守りの中）で、確かめを待つ指摘が減らなくなったら終える（`readAgainAfterRevisit`）。
+      const revisitQueue: { readonly entry: CrawlUrlEntry; readonly candidate: RevisitCandidate }[] = saved !== null && resumesAfterRunTimeLimit(saved.executions)
+        ? [...revisitOrderOf(frontier.entries()
+          .filter(({ state, pageId }) => (state === 'AUDITED' || state === 'FAILED') && !revisitedPageIds.includes(pageId))
+          .flatMap((entry) => {
+            const candidate = progress.revisits.get(entry.url);
+            return candidate === undefined ? [] : [{ entry, candidate, fact: candidate.fact }];
+          }))]
+        : [];
+      // 次に監査する記録と、それが読み直しなら、その候補（ほかは `null`）。
+      const nextEntry = (): { readonly entry: CrawlUrlEntry; readonly revisiting: RevisitCandidate | null } | undefined => {
         if (recheckEntry === null) {
-          return frontier.next();
+          const queued = revisitQueue.shift();
+          if (queued !== undefined) {
+            return { entry: queued.entry, revisiting: queued.candidate };
+          }
+          const entry = frontier.next();
+          return entry === undefined ? undefined : { entry, revisiting: null };
         }
         const entry = recheckEntry;
         recheckEntry = null;
-        return entry;
+        return { entry, revisiting: null };
       };
-      for (let entry = nextEntry(); entry !== undefined; entry = nextEntry()) {
+      for (let next = nextEntry(); next !== undefined; next = nextEntry()) {
+        // EV-5: 読み直すページ（終えたページ）は、止める理由があれば、記録を変えずに飛ばす（前の結果のまま）。ページ数の上限は、新しいページの数なので見ない。
+        const { entry, revisiting } = next;
         // この記録を、この実行で何回確かめ直したか（0 なら 1 回目の試行）。1 回以上なら、待った後の確かめ直し（`requeueForRecheck` で
         // `AUDITING` に戻してある）。
         const recheckCount = recheckedUrls.get(entry.url) ?? 0;
         const rechecking = recheckCount > 0;
-        // DEF-170: ロックを失ったら、次のページを始めず、すぐに終える（Run のディレクトリに書かない。ほかの理由より先）。
-        this.#throwIfRunLockLost(diagnosticIdentity.runId, runDirectory);
         // 違反を検出した後は、新しいページを始めない（Task 19 の前の整理の設計書 4.5）。ページを始める前に、Run の間に作ったすべての
         // Ledger を調べる。違反の後の URL は、保存の失敗と上限より先に、理由 `SAFETY_VIOLATION_ABORT` の SKIPPED にする。
         if (stopReason === null && this.#safetyViolationRecorded(progress, 0)) {
-          frontier.markSkipped(entry.url, SAFETY_VIOLATION_ABORT_REASON);
+          if (revisiting === null) {
+            frontier.markSkipped(entry.url, SAFETY_VIOLATION_ABORT_REASON);
+          }
           continue;
         }
         // 次のページを始める前に、毎回、保存の失敗（中断した Run の再開の設計書 4.3）、サイトの不調（この実行で不調を検知した。サイトが
@@ -1628,11 +1783,8 @@ export class RunCoordinator {
             stopReason = SITE_UNAVAILABLE_SKIP_REASON;
           } else if (progress.authSessionLostDetail !== null) {
             stopReason = AUTH_SESSION_LOST_SKIP_REASON;
-          } else if (isServiceRequestLimitReached(progress.auditStage)) {
-            // T35c（Task 35 の設計書 3.4）: 承認したサービスの Origin への要求の上限に届いた。次のページを始めない（PARTIAL。再開は新しい予算）。
-            // T37a: 判定は、発見と READ の確かめのジョブと共有する 1 か所（`isServiceRequestLimitReached`）。
-            stopReason = SERVICE_REQUEST_LIMIT_SKIP_REASON;
-          } else if (pagesStarted >= config.crawl.maxPages) {
+            // LZ-3c: 承認したサービスの Origin への要求の上限で次のページを始めない分岐（前の T35c）は、L11 から届かない（上限がない）ので捨てた。
+          } else if (revisiting === null && pageLimitReached()) {
             stopReason = crawlLimitReason('MAX_PAGES_REACHED');
           } else if (runtimeLimitReached()) {
             stopReason = crawlLimitReason('MAX_RUNTIME_REACHED');
@@ -1641,32 +1793,84 @@ export class RunCoordinator {
           }
         }
         if (stopReason !== null) {
-          frontier.markSkipped(entry.url, stopReason);
+          if (revisiting === null) {
+            frontier.markSkipped(entry.url, stopReason);
+          }
           continue;
         }
-        pagesStarted += 1;
+        // EV-5: 読み直しは、新しいページとして数えない（ページ数の上限と進み具合）。前の結果の再試行の記録は、読み直しを残すときに消す（捨てるときは戻す）。
+        const earlierRetries = revisiting === null ? [] : progress.retries.filter(({ url }) => url === entry.url);
+        // EV-5: 読み直しを捨てる（前の結果のまま終えた記録に戻し、前の再試行の記録を戻して、状態を保存する）。前の結果・画像・ページの保存（Ledger の snapshot を
+        // 含む）は変えない。この読み直しの Ledger はページの Ledger に入れないので、ページの外の Ledger として保存と Run の集計に入る。
+        const dropRevisit = async (candidate: RevisitCandidate): Promise<void> => {
+          frontier.markFinished(entry.url, candidate.status);
+          removeRetryRecordsOf(progress.retries, entry.url);
+          progress.retries.push(...earlierRetries);
+          progress.retryEvidence.delete(entry.url);
+          if (checkpoint !== null && !checkpointFailed) {
+            await saveState(checkpoint);
+          }
+        };
+        if (revisiting === null) {
+          pagesStarted += 1;
+        } else {
+          removeRetryRecordsOf(progress.retries, entry.url);
+        }
         progress.pageLedgerStart = progress.safetyLedgers.length;
         // 確かめ直しの記録は、捨てたときに `AUDITING` に戻してある（`requeueForRecheck`）。
-        if (!rechecking) {
+        if (revisiting !== null) {
+          frontier.reopenForRevisit(entry.url);
+          this.#reportProgress(progress, { pagesFinished, pagesDiscovered: frontier.discoveredCount, startedAtMs }, entry.url);
+        } else if (!rechecking) {
           frontier.markAuditing(entry.url);
+          // L0: 始めたページの URL を知らせる（止まったページが、最後の進み具合の記録に残る）。
+          this.#reportProgress(progress, { pagesFinished, pagesDiscovered: frontier.discoveredCount, startedAtMs }, entry.url);
         }
+        // DEF-233: 読み込みの前の、承認したサービスの Origin からの 401 の数（後と比べて、このページの 401 を見分ける）。
+        const unauthorizedBefore = serviceUnauthorizedCountOf(progress.auditStage);
         const {
           result,
           siteUnavailableDetail,
-          navigationDiagnostics,
           authSessionLostDetail: pathSessionLostDetail,
           authSessionLoss,
         } = await this.#auditWithRetry(
           auditor,
           entry,
           progress,
+          // DEF-236（設計書 `2026-11-09-beaksight-visible-pacing-wait-design.md` 3.1 の 4）: このページの後に次のページを読み込むか（最後のビューポートを閉じる前に、
+          // 前の画面を見せたまま待つかを決める）。次のページを始める前の確かめ（下のループの先頭）と同じ理由で始めないなら偽。待ち行列か、このページの Link に、
+          // これから監査する URL があれば真。
+          (evidence) => {
+            if (
+              checkpointFailed
+              || progress.siteUnavailableDetail !== null
+              || progress.authSessionLostDetail !== null
+              || pageLimitReached()
+              || runtimeLimitReached()
+              || this.#stopSignal?.aborted === true
+            ) {
+              return false;
+            }
+            const known = frontier.entries();
+            if (known.some(({ state }) => state === 'QUEUED')) {
+              return true;
+            }
+            const knownUrls = new Set<string>(known.map(({ url }) => url));
+            const { maxDepth } = config.crawl;
+            return (maxDepth === undefined || entry.depth + 1 <= maxDepth)
+              && desktopLinkUrlsOf(evidence).some((url) => !knownUrls.has(url) && !excludedCrawlCandidate(url) && this.#inPageScope(url));
+          },
+          // EV-5: 読み直しの画像は、前の結果の画像と別の場所（読み直しの番号のディレクトリ）に置く。
+          revisiting?.revisitIndex ?? null,
         );
-        // DEF-170: ページの途中でロックを失ったら、そのページの結果を保存せずに終える。
-        this.#throwIfRunLockLost(diagnosticIdentity.runId, runDirectory);
         // T35c（Task 35 の設計書 3.5）: ログインの状態の鍵がなくなった（factory が状態を読み直したときに見た）なら、そのページでセッションが切れたと
         // みなす（今の `AUTH_SESSION_LOST` の流れ。場所は `SESSION_KEY_LOST_DETAIL` で、path の切れと区別する）。T37a: 判定は、発見と READ の確かめの
         // ジョブと共有する 1 か所（`sessionKeyLostDetailOf`）。
-        const authSessionLostDetail = pathSessionLostDetail ?? sessionKeyLostDetailOf(progress.auditStage);
+        // DEF-233（設計書 `2026-11-09-beaksight-discovery-token-refresh-design.md` 2.3）: このページの間に承認したサービスの Origin から 401 を受けたら、
+        // セッションが切れたとみなす（場所は `SERVICE_UNAUTHORIZED`。判定は操作さがし・READ の確かめと共有する 1 か所。監査では 401 そのものを描けなかった印とする）。
+        const authSessionLostDetail = pathSessionLostDetail
+          ?? sessionKeyLostDetailOf(progress.auditStage)
+          ?? serviceUnauthorizedSessionLostDetailOf(progress.auditStage, unauthorizedBefore, true, this.#authentication?.automatedRelogin === true);
         // T25c: 認証つきの Run で、セッションの切れを検知した（Task 25 の設計書 4.3）。そのページの Ledger に違反がなければ、ページを捨てる
         // （ログインの画面を管理画面として監査しない。結果、ページの保存、Link、進み具合には入れない。監査を始めたページの数からも外す）。巡回の
         // 記録で、理由 `AUTH_SESSION_LOST`（`detail` は当たった場所）の SKIPPED にし（再開のときに待ち行列に戻す）、この実行の印を残して、
@@ -1681,39 +1885,34 @@ export class RunCoordinator {
           // DEF-138: path の切れの証拠（Page Auditor が組み立てたもの）を、この実行の記録に残す（最初の 1 件。鍵の消失は証拠を持たない）。
           const sessionLoss = pathSessionLostDetail === undefined || pathSessionLostDetail === null ? null : authSessionLoss ?? null;
           progress.authSessionLoss ??= sessionLoss;
-          pagesStarted -= 1;
-          frontier.markSkipped(entry.url, authSessionLostReason(authSessionLostDetail));
+          // EV-5: 読み直しなら、読み直しを捨て、前の結果のまま終えた記録に戻す。
+          if (revisiting === null) {
+            pagesStarted -= 1;
+            frontier.markSkipped(entry.url, authSessionLostReason(authSessionLostDetail));
+          } else {
+            frontier.markFinished(entry.url, revisiting.status);
+          }
           // T25d: 止まったページを、観測の口に知らせる（URL の伏せ字は `#notify` が 1 か所で通す。T25f）。DEF-138: 証拠も渡す。
           this.#notify(Object.freeze({ kind: 'AUTH_SESSION_LOST', url: entry.url, ...(sessionLoss === null ? {} : { sessionLoss }) }));
           removeRetryRecordsOf(progress.retries, entry.url);
+          progress.retries.push(...earlierRetries);
           progress.retryEvidence.delete(entry.url);
           if (checkpoint !== null && !checkpointFailed) {
             await saveState(checkpoint);
           }
           continue;
         }
-        // 診断の記録（サイトの不調で止めたときの診断の記録の設計書 2.3）。不調で止めたページ（捨てたページと、普通の結果として保存した
-        // 前の実行のきっかけのページ）だけに、そのページの保存の後に渡す。違反でページを捨てなかった場合は、渡さない。試行の番号は、
-        // 1 回目が 1、n 回目の確かめ直しが 1 + n（ファイルの名前に使う。設計書 3.5.2、3.6.2）。
-        let diagnosticDetail: string | null = null;
-        const passDiagnostic = (detail: string): Promise<void> => this.#passSiteUnavailableDiagnostic(
-          runDirectory,
-          () => this.#siteUnavailableDiagnostic({
-            identity: diagnosticIdentity,
-            entry,
-            siteUnavailableDetail: detail,
-            page: result,
-            navigationDiagnostics,
-          }),
-          SITE_UNAVAILABLE_FIRST_ATTEMPT + recheckCount,
-        );
         // サイトの不調の印（サイトが応答しないときに Run を止める設計書 3.2、3.2.1）。まず、そのページの Ledger の違反を確かめる。違反が
         // あれば、ページを捨てずに、今のとおり普通の結果として保存し、違反で止める（違反の Evidence をページに残すため。違反の優先）。
         // 違反がなければ、この実行の不調の詳細を残し（次のページを始めない）、前の実行のきっかけのページでなければ、ページを捨てる。前の実行の
         // きっかけのページなら、捨てずに、普通の結果として保存する（同じページで止まり続けないため。設計書 3.2.1）。
         if (siteUnavailableDetail !== null && !this.#detectSafetyViolation(progress, progress.pageLedgerStart)) {
           progress.siteUnavailableDetail ??= siteUnavailableDetail;
-          diagnosticDetail = siteUnavailableDetail;
+          // EV-5: 読み直しなら、読み直しを捨て、前の結果のまま終えた記録に戻す（確かめ直しはしない。次のページは始めない）。
+          if (revisiting !== null) {
+            await dropRevisit(revisiting);
+            continue;
+          }
           if (!previousTriggerUrls.has(entry.url)) {
             // ページを捨てる。巡回の記録で、理由 `SITE_UNAVAILABLE`（`detail` は不調の詳細。止まるきっかけのページの印）の SKIPPED にする
             // （再開のときに、待ち行列に戻す）。結果、ページの保存、終わったページの ID、Link、進み具合には入れない。監査を始めたページの数
@@ -1729,7 +1928,6 @@ export class RunCoordinator {
             if (checkpoint !== null && !checkpointFailed) {
               await saveState(checkpoint);
             }
-            await passDiagnostic(siteUnavailableDetail);
             // 段階的に確かめ直す（設計書 3.5.2、3.6.2）。この実行でこのページを確かめ直した回数が上限（待ちの段階の数）に達しておらず、状態を
             // 保存できていれば（保存に失敗した後は、新しいページを始めないので、待たず、確かめ直さない）、知らせてから次の段階の待ちで待ち、
             // 待った後に止める印がなく、実行時間の上限にも達していなければ、この実行の不調の詳細を消し（このページを始める前は `null`
@@ -1749,20 +1947,38 @@ export class RunCoordinator {
             continue;
           }
         }
+        // REV-EV5 の I-1: 読み直しが時間切れで途中になり、前の結果より見たビューポートが少ないなら、読み直しを捨てて前の結果を残す（`keepsRevisit`）。違反があれば、
+        // 今のとおり普通の結果として残す（違反の Evidence をページに残すため。違反の優先）。読み直しを終えたページには入れない（次の時間切れの再開で読み直す）。
+        if (
+          revisiting !== null
+          && !keepsRevisit(revisiting.fact, pageRevisitFactOf(result))
+          && !this.#detectSafetyViolation(progress, progress.pageLedgerStart)
+        ) {
+          await dropRevisit(revisiting);
+          continue;
+        }
         // 確かめ直しで通った（その試行に不調の印がない）ので、減速して続ける（設計書 3.6.2。何回目の確かめ直しで通ったかによらず 1 回）。
         if (rechecking && siteUnavailableDetail === null) {
           slowDownAfterRecheckPassed();
         }
-        progress.results.set(entry.url, result);
+        // MEM-3b: ページの結果は、ここで置き場所に入れる（再試行の前の試行の Evidence は、本体に加えて消す。保存には、下で同じ値を渡す）。
+        const pageRetryEvidence = progress.retryEvidence.get(entry.url) ?? [];
+        await storeRunPage(progress, entry.url, result, pageRetryEvidence);
         frontier.markFinished(entry.url, result.status);
         // Link は、Desktop の `link` の Evidence から取り、`INTERNAL_NAVIGABLE` のものだけをキューに入れる（ARCH03）。
         // T25c: 認証つきの Run では、監査の段の除外に当たる URL と、セッションの切れの path の URL を入れない（Task 25 の設計書 4.2、4.7）。
-        for (const url of internalNavigableLinks(result)) {
-          if (excludedCrawlCandidate !== null && excludedCrawlCandidate(url)) {
-            continue;
-          }
-          frontier.discover(url, entry.depth + 1);
-        }
+        // SD-1: 公開監査でも、削除の語の URL とリンクを入れない。
+        // COV-4（網羅の設計書 3.2）: 読んだページの構造の鍵と辺（リンクと同じ Origin の frame）を、待ち行列（`CoverageQueue`）に渡す。待ち行列が、まだ見ていない
+        // 場所を入れ、終わりのない続きを閉じる。
+        const outcome = auditPageOutcomeOf(result);
+        // COV-4 の区切り 3: 操作の後の URL の辺（SPA の経路・query の変化）も、受け入れの判定の唯一の入口（`classifyUrl`）で許可 Origin の中のものだけにする。
+        const admission = { allowedOrigins: new Set(config.site.allowedOrigins) };
+        frontier.completePage(entry.url, {
+          structureKey: outcome.structureKey,
+          // WSO: 「チェックした画面だけ」の点検は、範囲の画面への辺だけを入れる（ほかの画面へ広げない）。
+          edges: outcome.edges.filter(({ url }) => classifyUrl(new URL(url), admission).kind === 'INTERNAL_NAVIGABLE'
+            && !excludedCrawlCandidate(url) && this.#inPageScope(url)),
+        });
         // そのページの保存（先）と、状態の保存（後）。状態の `completedPageIds` には、そのページを含める（設計書 4.3）。そのページの
         // すべての Context は、Page Auditor の中で閉じている（そのページの Ledger は、Context を閉じた後のもの）。
         if (checkpoint !== null && !checkpointFailed) {
@@ -1774,22 +1990,42 @@ export class RunCoordinator {
           for (const ledger of ledgers) {
             pageLedgers.add(ledger);
           }
-          completedPageIds.push(entry.pageId);
-          const retryEvidence = progress.retryEvidence.get(entry.url) ?? [];
+          // EV-5: 読み直したページは、終わったページの ID にすでにある。ページの保存には、前の読み込みの Ledger の snapshot も残す。
+          if (revisiting === null) {
+            completedPageIds.push(entry.pageId);
+          }
+          const earlierSnapshots = revisiting?.safetyLedgerSnapshots ?? [];
           checkpointFailed = !await this.#requestCheckpoint(progress, async () => checkpoint.session.savePage(createRunCheckpointPage({
             result,
-            retryEvidence,
-            safetyLedgerSnapshots: ledgers.map((ledger) => ledger.snapshot()),
-          }), { keptUrls: crawlKnownUrlsOf(frontier, progress.results) }));
-          if (!checkpointFailed) {
-            await saveState(checkpoint);
+            retryEvidence: pageRetryEvidence,
+            safetyLedgerSnapshots: [...earlierSnapshots, ...ledgers.map((ledger) => ledger.snapshot())],
+          }), { keptUrls: crawlKnownUrlsOf(frontier, progress.pages.summaries()) }));
+        }
+        // EV-5: 読み直した後の事実で、もう 1 回読み直すかを決める（確かめを待つ指摘が減ったときだけ。列の先に戻す）。読み直さず、一部だけで終わったのでもなければ、
+        // 読み直しを終えたページとして残す（後の再開では読み直さない）。
+        if (revisiting !== null) {
+          const after = pageRevisitFactOf(result);
+          if (readAgainAfterRevisit(revisiting.fact, after)) {
+            revisitQueue.unshift({
+              entry,
+              candidate: {
+                fact: after,
+                status: result.status,
+                safetyLedgerSnapshots: [...revisiting.safetyLedgerSnapshots, ...progress.safetyLedgers.slice(progress.pageLedgerStart).map((ledger) => ledger.snapshot())],
+                // 採った読み直しの画像を上書きしないよう、次の番号に置く。
+                revisitIndex: revisiting.revisitIndex + 1,
+              },
+            });
+          } else if (!after.cutByRunTimeLimit && !revisitedPageIds.includes(entry.pageId)) {
+            revisitedPageIds.push(entry.pageId);
           }
         }
-        // 前の実行のきっかけのページを、また不調で、普通の結果として保存した（設計書 3.2.1）。保存の後に、診断の記録を渡す。
-        if (diagnosticDetail !== null) {
-          await passDiagnostic(diagnosticDetail);
+        if (checkpoint !== null && !checkpointFailed) {
+          await saveState(checkpoint);
         }
-        pagesFinished += 1;
+        if (revisiting === null) {
+          pagesFinished += 1;
+        }
         this.#reportProgress(progress, { pagesFinished, pagesDiscovered: frontier.discoveredCount, startedAtMs });
       }
       // 実行時間の上限を超えたかを、事実として記録する。最後のページで超え、監査していない URL が残らない場合も含む
@@ -1829,14 +2065,14 @@ export class RunCoordinator {
           progress,
           crawl: frontier === null || allocator === null
             ? null
-            : { frontier, allocator, pagesStarted, outsidePageSnapshots: outsidePageSnapshots(), completedPageIds },
+            : { frontier, allocator, pagesStarted, outsidePageSnapshots: outsidePageSnapshots(), completedPageIds, revisitedPageIds },
         }),
     };
   }
 
   /**
-   * 保存のセッションを、Run のディレクトリで始める（中断した Run の再開の設計書 4.3.1、4.4。新しい Run）。セッションがなければ、
-   * 何もせずに `null` を返す。始められなかった場合（ロックのファイルがすでにあった、書けなかった）は、Run の理由
+   * 保存のセッションを、Run のディレクトリで始める（中断した Run の再開の設計書 4.3.1。新しい Run）。セッションがなければ、
+   * 何もせずに `null` を返す。始められなかった場合（始め方が reject した。出力先のロックを作れなかったときを含む）は、Run の理由
    * `CHECKPOINT_WRITE_FAILED` を返す（`detail` は、失敗のメッセージ）。
    */
   async #startCheckpointSession(runDirectory: string): Promise<IncompleteReason | null> {
@@ -1845,17 +2081,16 @@ export class RunCoordinator {
       return null;
     }
     try {
-      const started = await session.start(runDirectory, { mode: 'NEW_RUN' });
-      return started.ok ? null : checkpointWriteFailedReason(CHECKPOINT_LOCK_EXISTS_DETAIL);
+      await session.start(runDirectory, { mode: 'NEW_RUN' });
+      return null;
     } catch (error) {
-      return checkpointWriteFailedReason(safeErrorMessage(error, MAX_ERROR_MESSAGE_LENGTH));
+      return checkpointWriteFailedReason(safeErrorMessage(error));
     }
   }
 
   /**
    * 保存のセッションを、再開の始め方（`RESUME`。終わったページの ID は、保存の `completedPageIds`）で、前の回の Run のディレクトリで始める
-   * （中断した Run の再開の設計書 4.4、4.5。古いロックの作り直しと読み直し、後始末は、セッションが行う）。始められなかった場合
-   * （動いている Run のロックがある、別のプロセスが同時にロックを作り直した、始め方が reject した）は、`RunResumeUnavailableError` を投げる。
+   * （中断した Run の再開の設計書 4.5。後始末は、セッションが行う）。始め方が reject した場合は、`RunResumeUnavailableError` を投げる。
    */
   async #resumeCheckpointSession(resume: RunCoordinatorResumeInput, runId: RunId): Promise<void> {
     const session = this.#checkpointSession;
@@ -1864,30 +2099,11 @@ export class RunCoordinator {
       throw new TypeError('RunCoordinator resumeFrom requires a checkpointSession');
     }
     const { runDirectory } = resume;
-    let started: RunCheckpointSessionStart;
     try {
-      // SR-1-F5（SR-1R3 の M3）: ロックを取った後に、状態の保存が再開を選んだときと同じかを、セッションに確かめさせる（`expectedState`）。
-      started = await session.start(runDirectory, {
-        mode: 'RESUME',
-        completedPageIds: resume.checkpoint.completedPageIds,
-        expectedState: resume.checkpoint,
-      });
+      await session.start(runDirectory, { mode: 'RESUME', completedPageIds: resume.checkpoint.completedPageIds });
     } catch (error) {
-      throw new RunResumeUnavailableError({ runId, runDirectory, reason: 'CHECKPOINT_STORE_FAILED', existingLock: null, cause: error });
+      throw new RunResumeUnavailableError({ runId, runDirectory, reason: 'CHECKPOINT_STORE_FAILED', cause: error });
     }
-    if (started.ok) {
-      return;
-    }
-    // 再開の始め方の結果は、始めなかった理由を持つ。持たない結果（新しい Run の始め方の形）は、セッションの誤りとして扱う。
-    throw new RunResumeUnavailableError('reason' in started
-      ? { runId, runDirectory, reason: started.reason, existingLock: started.existingLock }
-      : {
-        runId,
-        runDirectory,
-        reason: 'CHECKPOINT_STORE_FAILED',
-        existingLock: started.existingLock,
-        cause: new Error('the checkpoint session did not resume and gave no reason'),
-      });
   }
 
   /**
@@ -1900,7 +2116,7 @@ export class RunCoordinator {
       await save();
       return true;
     } catch (error) {
-      progress.reasons.push(checkpointWriteFailedReason(safeErrorMessage(error, MAX_ERROR_MESSAGE_LENGTH)));
+      progress.reasons.push(checkpointWriteFailedReason(safeErrorMessage(error)));
       return false;
     }
   }
@@ -1911,27 +2127,34 @@ export class RunCoordinator {
    * 要求の実績と直近の1分の件数は meter から取る。事実は、深く凍結する。
    * 事実の組み立ての例外（注入した `now` が不正な時刻を返した場合など）、受け手の例外、受け手が返した Promise の reject は、握りつぶす
    * （Run を止めず、Run の理由にもしない。表示の失敗で監査を止めないため。受け手の有無で Run を変えないため）。
+   * L0: `currentPageUrl` を渡すと、ページを始めた知らせ（`onPageStarted`）として、URL を足して渡す（認証つきの Run では `#notify` と同じ伏せ字の後）。
    */
   #reportProgress(
     progress: RunProgress,
     facts: { readonly pagesFinished: number; readonly pagesDiscovered: number; readonly startedAtMs: number },
+    currentPageUrl?: string,
   ): void {
-    const onProgress = this.#onProgress;
+    const onProgress = currentPageUrl === undefined ? this.#onProgress : this.#onPageStarted;
     if (onProgress === undefined) {
       return;
     }
     try {
+      const urlPart = currentPageUrl === undefined
+        ? {}
+        : { currentPageUrl: this.#authentication === null ? currentPageUrl : redactUrlSecrets(currentPageUrl) };
       const pacer = progress.navigationPacer.snapshot();
       const report: RunProgressReport = deepFreeze({
         pagesFinished: facts.pagesFinished,
         pagesDiscovered: facts.pagesDiscovered,
-        maxPages: this.#config.crawl.maxPages,
+        // L14 の後の段: ページの上限は、指定したときだけ持つ。
+        ...(this.#config.crawl.maxPages === undefined ? {} : { maxPages: this.#config.crawl.maxPages }),
         // 時計が戻っても、経過時間を負にしない。
         elapsedMs: Math.max(0, this.#now() - facts.startedAtMs),
         navigationCount: pacer.navigationCount,
         pacingWaitMs: pacer.totalWaitMs,
         requests: progress.loadMeter.snapshot(),
         recentPerMinute: progress.loadMeter.recentPerMinute(),
+        ...urlPart,
       });
       // 型は `void` を返す関数だが、async の関数も渡せるので、返った Promise の reject も握りつぶす（扱われない reject にしない）。
       const returned: unknown = onProgress(report);
@@ -1940,30 +2163,6 @@ export class RunCoordinator {
       }
     } catch {
       // 表示の失敗で、監査を止めない（Run の理由にもしない）。
-    }
-  }
-
-  /**
-   * 診断の記録を組み立て（`build`）、注入された書き出しの口に、Run のディレクトリと合わせて渡す（サイトの不調で止めたときの診断の記録の
-   * 設計書 2.3）。口がなければ、何もしない（記録も組み立てない）。口が書き終わる（返した Promise が決まる）まで待つ（次のページの前の
-   * 確かめと、Browser を閉じる処理の前に終える）。
-   * 記録の組み立ての例外（注入した時計が不正な時刻を返した場合など）、口の例外、口が返した Promise の reject は、握りつぶす（Run を止めず、
-   * Run の理由、未処理の失敗の件数、標準エラーにも残さない。診断は付けたしの情報で、口の有無で Run を変えないため）。
-   */
-  async #passSiteUnavailableDiagnostic(
-    runDirectory: string,
-    build: () => SiteUnavailableDiagnosticRecord,
-    attemptNumber: number,
-  ): Promise<void> {
-    const write = this.#diagnosticWriter;
-    // DEF-170: ロックを失った後は、Run のディレクトリに書かない。
-    if (write === undefined || this.#runLockLost()) {
-      return;
-    }
-    try {
-      await write(runDirectory, build(), attemptNumber);
-    } catch {
-      // 診断の記録の失敗で、監査を変えない（設計書 2.3）。
     }
   }
 
@@ -2038,30 +2237,6 @@ export class RunCoordinator {
     return !this.#stopRequested() && !runtimeLimitReached();
   }
 
-  /** DEF-170: 保存のセッションが、ロックを失ったか（`lockLostSignal`。セッションがない、印を持たないなら偽）。 */
-  #runLockLost(): boolean {
-    return this.#checkpointSession?.lockLostSignal?.aborted === true;
-  }
-
-  /** DEF-170: ロックを失っていれば、`RunLockLostError` を投げる（読み込みを止め、Run のディレクトリに書かずに終えるため）。 */
-  #throwIfRunLockLost(runId: RunId, runDirectory: string): void {
-    if (this.#runLockLost()) {
-      throw new RunLockLostError({ runId, runDirectory });
-    }
-  }
-
-  /**
-   * DEF-172: ロックのファイルを読んで、今も自分のものかを確かめる（保存のセッションの `confirmLockHeld`。持たないセッションでは印だけ）。違えば
-   * `RunLockLostError` を投げる。
-   */
-  async #confirmRunLockOrThrow(runId: RunId, runDirectory: string): Promise<void> {
-    this.#throwIfRunLockLost(runId, runDirectory);
-    const confirm = this.#checkpointSession?.confirmLockHeld;
-    if (confirm !== undefined && !(await confirm.call(this.#checkpointSession))) {
-      throw new RunLockLostError({ runId, runDirectory });
-    }
-  }
-
   /** 止める印（`stopSignal`）が付いているか（印がなければ偽）。待ちの前後で読み直す（型の絞り込みを待ちの後に持ち越さないため）。 */
   #stopRequested(): boolean {
     return this.#stopSignal?.aborted === true;
@@ -2074,31 +2249,6 @@ export class RunCoordinator {
   async #sleepUnlessStopped(ms: number): Promise<void> {
     // DEF-136: ジョブと共有する部品（`sleepUnlessStopped`）。
     await sleepUnlessStopped(this.#sleep, ms, this.#stopSignal);
-  }
-
-  /**
-   * 診断の記録を組み立てる（サイトの不調で止めたときの診断の記録の設計書 2.3）。書いた時刻は、注入した時計で、ここで読む。ページの結果と
-   * 観察の結果は、そのページの最終の試行のもの（`#auditWithRetry` の結果）を、そのまま入れる。記録の最上位は凍結する（中身は、Page Auditor が
-   * 凍結した値）。
-   */
-  #siteUnavailableDiagnostic(input: {
-    readonly identity: RunDiagnosticIdentity;
-    readonly entry: Pick<CrawlUrlEntry, 'url' | 'pageId'>;
-    readonly siteUnavailableDetail: string;
-    readonly page: PageAuditResult;
-    readonly navigationDiagnostics: PageAuditOutcome['navigationDiagnostics'];
-  }): SiteUnavailableDiagnosticRecord {
-    return Object.freeze({
-      schemaVersion: SITE_UNAVAILABLE_DIAGNOSTIC_SCHEMA_VERSION,
-      runId: input.identity.runId,
-      executionNumber: input.identity.executionNumber,
-      writtenAt: this.#clock().toISOString(),
-      pageId: input.entry.pageId,
-      url: input.entry.url,
-      siteUnavailableDetail: input.siteUnavailableDetail,
-      page: input.page,
-      navigationDiagnostics: input.navigationDiagnostics,
-    });
   }
 
   /**
@@ -2117,7 +2267,7 @@ export class RunCoordinator {
   #detectSafetyViolation(progress: RunProgress, fromIndex: number): boolean {
     if (!progress.safetyViolationDetected) {
       const hasViolation = (snapshot: SafetyLedgerSnapshot): boolean => snapshot.invariantViolationCount > 0;
-      progress.safetyViolationDetected = (fromIndex === 0 && progress.savedSafetyLedgerSnapshots.some(hasViolation))
+      progress.safetyViolationDetected = (fromIndex === 0 && progress.savedSafety.hasInvariantViolation)
         || progress.safetyLedgers.slice(fromIndex).some((ledger) => hasViolation(ledger.snapshot()));
     }
     return progress.safetyViolationDetected;
@@ -2141,10 +2291,15 @@ export class RunCoordinator {
    * `pages/<pageId>/retry-<n>/<ビューポート>/` に置かれる。DEF-007）。最初の試行は `retries` に記録し、その Evidence は、最終のページの `evidence` に残すために取っておく。
    * 最初の試行の Finding は残さない。その試行の Ledger は登録にあるので、Safety の集計に入る。
    * 試行の結果にサイトの不調の印（`siteUnavailableDetail`）があれば、再試行しない（再試行の判断を呼ばずに終える。サイトが応答しないときに
-   * Run を止める設計書 3.3。最初の1回で止める）。最終の試行のページの結果と、その試行の不調の印と、その試行のページ本体の要求の観察の結果
-   * （診断の記録に使う。サイトの不調で止めたときの診断の記録の設計書 2.3）を返す。
+   * Run を止める設計書 3.3。最初の1回で止める）。最終の試行のページの結果と、その試行の不調の印を返す。
    */
-  async #auditWithRetry(auditor: RunPageAuditor, entry: CrawlUrlEntry, progress: RunProgress): Promise<RunPageAudit> {
+  async #auditWithRetry(
+    auditor: RunPageAuditor,
+    entry: CrawlUrlEntry,
+    progress: RunProgress,
+    nextPageFollows: (evidence: readonly EvidenceRecord[]) => boolean,
+    revisit: number | null = null,
+  ): Promise<RunPageAudit> {
     let outcome: PageAuditOutcome | undefined;
     const earlierEvidence: EvidenceRecord[] = [];
     for (let attempt = 1; attempt <= MAX_NAVIGATION_ATTEMPTS; attempt += 1) {
@@ -2158,6 +2313,10 @@ export class RunCoordinator {
       outcome = await auditor.audit(entry.url, entry.pageId, {
         attempt,
         precedesRetry: (desktop) => retryAfter(desktop) !== null,
+        // DEF-236: 再試行は Page Auditor が Desktop の後に知る。次のページは、ここで決める。
+        nextPageFollows,
+        // EV-5: 読み直しなら、画像を前の結果と別の場所（`revisit-<番号>/`）に置く。
+        ...(revisit === null ? {} : { revisit }),
       });
       // サイトの不調の印があれば、再試行しない（設計書 3.3）。再試行の判断（`retryAfter`）より先に確かめ、判断を呼ばない。
       // T25c: セッションの切れの印があっても、再試行しない（ページを捨てて Run を止める）。
@@ -2200,25 +2359,46 @@ export class RunCoordinator {
     readonly previousExecutions: readonly RunExecution[];
     /** この実行の開始の時刻（ISO 8601）。 */
     readonly executionStartedAt: string;
+    /** DEF-200: この実行のログインし直しの印と回数（なければ `null`）。 */
+    readonly automaticRelogin: RunExecutionAutomaticRelogin | null;
   }): Promise<RunFinalization> {
     const config = this.#config;
     const { progress } = input;
 
     // 監査しなかった URL にも結果を作り、発見の順に並べる。metadata の Evidence は、開始の URL のページに置く。
-    // `evaluatedPages` は、最終の試行の Evidence だけを持つ（Cross-page rule と件数の入力。設計書 5.6.4）。`pages`（出力）は、
-    // それに、再試行の前の試行の Evidence を加えたものである。Evidence は、metadata、再試行の前の試行、最終の試行の順に並べる。
-    const evaluatedPages: PageAuditResult[] = [];
-    const pages: PageAuditResult[] = [];
+    // Cross-page rule と件数の入力は、最終の試行の Evidence だけ（設計書 5.6.4。要約が持つ）。`pages`（出力）は、それに再試行の前の試行の Evidence を
+    // 加えたものである。Evidence は、metadata、再試行の前の試行、最終の試行の順に並べる。
+    // MEM-3b（DEF-266）: ページの本体は置き場所（`progress.pages`）に圧縮したまま、発見の順に並べ直す（`ordered`。圧縮し直さない）。監査しなかった URL の結果は、
+    // ここで作って入れる（再試行が例外で終わった URL は、再試行の前の試行の Evidence も加える）。開始の URL のページだけを戻し、metadata の Evidence を加えて
+    // 入れ替える。Run の Finding、Cross-page rule、件数は、評価の形から作った要約（`RunPageSummary`）だけから作る。
+    const order: number[] = [];
+    let startPosition = -1;
     for (const entry of progress.frontier?.entries() ?? []) {
-      const result = progress.results.get(entry.url)
-        ?? skippedPageResult(entry.url, entry.pageId, entry.skipReason ?? EXECUTION_INCOMPLETE_REASON);
-      const metadataRecords = entry.url === progress.startUrl && progress.metadata !== null ? progress.metadata.records : [];
-      evaluatedPages.push(withLeadingEvidence(result, metadataRecords));
-      pages.push(withLeadingEvidence(result, [...metadataRecords, ...(progress.retryEvidence.get(entry.url) ?? [])]));
+      if (!progress.results.has(entry.url)) {
+        const skipped = skippedPageResult(entry.url, entry.pageId, entry.skipReason ?? EXECUTION_INCOMPLETE_REASON);
+        await storeRunPage(progress, entry.url, skipped, progress.retryEvidence.get(entry.url) ?? []);
+      }
+      if (entry.url === progress.startUrl) {
+        startPosition = order.length;
+      }
+      order.push(progress.results.get(entry.url) ?? -1);
     }
+    const pages = progress.pages.ordered(order);
+    if (startPosition >= 0 && progress.metadata !== null && progress.metadata.records.length > 0) {
+      const metadataRecords = progress.metadata.records;
+      const startSummary = pages.summaries()[startPosition];
+      if (startSummary !== undefined) {
+        await pages.replace(
+          startPosition,
+          withLeadingEvidence(await pages.decode(startPosition), metadataRecords),
+          runPageSummaryWithLeadingEvidence(startSummary, metadataRecords),
+        );
+      }
+    }
+    const summaries = pages.summaries();
 
     // 8. Cross-page rule。
-    const findings: Finding[] = pages.flatMap((page) => page.findings);
+    const findings: Finding[] = summaries.flatMap((page) => page.findings);
     let unverifiedInternalLinkCount = 0;
     if (!progress.preflightFailed && progress.allocator !== null) {
       try {
@@ -2227,8 +2407,10 @@ export class RunCoordinator {
           firstFindingSequence: progress.allocator.nextFindingSequence,
           allowedOrigins: config.site.allowedOrigins,
           allowedQueryParameters: config.crawl.allowedQueryParameters,
-          pages: evaluatedPages,
-          sitemap: sitemapOf(progress.metadata),
+          pages: summaries.map(crossPageFactsOfSummary),
+          // WSO（REV-WSO の I-2）: 「チェックした画面だけ」の点検は、sitemap と比べず、全部を巡回した前提の判定をしない。
+          sitemap: this.#pageScope === null ? sitemapOf(progress.metadata) : null,
+          crawlCoversSite: this.#pageScope === null,
         });
         progress.allocator.advanceFindingSequence(crossPage.nextFindingSequence);
         findings.push(...crossPage.findings);
@@ -2253,7 +2435,7 @@ export class RunCoordinator {
     }
 
     // 上限への到達（設計書 5.6.3）。
-    const skipCodes = new Set(pages.flatMap((page) => (page.status === 'SKIPPED' ? page.incompleteReasons.map(({ code }) => code) : [])));
+    const skipCodes = new Set(summaries.flatMap((page) => (page.status === 'SKIPPED' ? page.incompleteReasons.map(({ code }) => code) : [])));
     const reached = (code: CrawlLimitReasonCode): boolean => skipCodes.has(code);
     const crawlLimits: CrawlLimitState = {
       maxPagesReached: reached('MAX_PAGES_REACHED'),
@@ -2297,16 +2479,16 @@ export class RunCoordinator {
     // Safety の集計（設計書 5.6.5）。この Run で作ったすべての Ledger の、Browser を閉じた後の snapshot からだけ集計する。再開した Run では、
     // 保存した snapshot（前の回までの Ledger）と、この実行の Ledger の snapshot を、この順に渡す（Ledger を作った順と同じ。
     // 中断した Run の再開の設計書 4.1）。
-    const runSafety = summarizeRunSafety({
+    // MEM-3c（D7）: 保存した snapshot は足し込んだもの（`savedSafety`）で持つ。要約は、snapshot を並べて `summarizeRunSafety` に渡したときと同じ。
+    const runSafety = progress.savedSafety.summary({
       guardEnabled: progress.guardEnabled,
-      snapshots: [...progress.savedSafetyLedgerSnapshots, ...progress.safetyLedgers.map((ledger) => ledger.snapshot())],
       // AS-b: 実効の監査の段の送信の扱い（項目のない設定は `READ_ONLY` と読む）。
       auditSendPolicy: auditSendPolicyOf(this.#config),
-    });
+    }, progress.safetyLedgers.map((ledger) => ledger.snapshot()));
 
     // Run Status の入力（設計書 5.6.6）。Finding の件数は渡さない。件数は、最終の試行の結果から数える。
-    const pageCounts = countPagesByStatus(evaluatedPages);
-    const interactions = countInteractionOutcomes(evaluatedPages);
+    const pageCounts = countPagesByStatus(summaries);
+    const interactions = countInteractionOutcomes(summaries);
     const statusInput: RunStatusInput = {
       preflightFailed: progress.preflightFailed,
       safetyInvariantViolations: runSafety.invariantViolationCount,
@@ -2322,7 +2504,7 @@ export class RunCoordinator {
       notObservedRequiredWork: 0,
       notVerifiedRequiredWork: interactions.checkNotCompleted,
       failedRequiredWork: pageCounts.failed + interactions.executionFailed,
-      incompleteCollectorCount: countPartialViewports(evaluatedPages),
+      incompleteCollectorCount: countPartialViewports(summaries),
     };
 
     // この実行の記録（中断した Run の再開の設計書 4.8）。終わりの時刻は `run.json` の `finishedAt` と同じ値（時計を1回だけ読む）。終わり方は、
@@ -2333,6 +2515,8 @@ export class RunCoordinator {
       startedAt: input.executionStartedAt,
       finishedAt,
       endReason: decideRunExecutionEndReason({ runStatus, skipReasonCodes: skipCodes }),
+      // DEF-200: ログインし直して自動で始めた実行の印と回数（あるときだけ）。
+      ...(input.automaticRelogin === null ? {} : { automaticRelogin: input.automaticRelogin }),
     });
     const run: RunSummary = {
       schemaVersion: 'run-schema/1.0',
@@ -2350,10 +2534,12 @@ export class RunCoordinator {
       partialPageCount: pageCounts.partial,
       failedPageCount: pageCounts.failed,
       skippedPageCount: pageCounts.skipped,
-      viewportPageCounts: countViewportPages(evaluatedPages),
+      viewportPageCounts: countViewportPages(summaries),
       environment: input.environment,
       // 注入した設定そのものを凍結しないよう、写しを記録する。
       effectiveConfig: structuredClone(config),
+      // WSO: 「チェックした画面だけ」の Run だけ、範囲を記録する（サイトの全部の画面の `run.json` の形は変えない）。
+      ...this.#pageScopePart(),
       safety: runSafety,
       unverifiedInteractionCount: interactions.unverified,
       unverifiedInternalLinkCount,
@@ -2361,7 +2547,7 @@ export class RunCoordinator {
       crawlLimits,
       incompleteReasons: reasons,
       // T44c（Task 44 の設計書 P1-4）: ページの未完了の理由ごとのページ数（理由を持つページがあるときだけ。ほかの Run の `run.json` は変えない）。
-      ...pageIncompleteReasonCountsPartOf(evaluatedPages),
+      ...pageIncompleteReasonCountsPartOf(summaries),
       load: runLoad(config, progress),
       // T35c（Task 35 の設計書 3.7）: スクリプトで送るログインの監査の Run だけ、監査の段の数を記録する（ほかの Run の `run.json` は変えない）。
       // DEF-138: この実行がセッションの切れで止まったら、その証拠も記録する（監査の段の数のない Run は、証拠だけ）。
@@ -2373,7 +2559,9 @@ export class RunCoordinator {
 }
 
 /** T44c: `run.json` の `pageIncompleteReasonCounts`（理由を持つページがなければ項目を持たない）。 */
-function pageIncompleteReasonCountsPartOf(pages: readonly PageAuditResult[]): { readonly pageIncompleteReasonCounts?: readonly PageIncompleteReasonCount[] } {
+function pageIncompleteReasonCountsPartOf(
+  pages: readonly RunPageSummary[],
+): { readonly pageIncompleteReasonCounts?: readonly PageIncompleteReasonCount[] } {
   const counts = countPagesByIncompleteReason(pages);
   return counts.length === 0 ? {} : { pageIncompleteReasonCounts: counts };
 }
@@ -2394,11 +2582,11 @@ function runAuthenticationRecordOf(
 }
 
 /**
- * Run のディレクトリを作れなかった理由（DEF-009）。`detail` は、失敗した作成の例外のメッセージ（`MAX_ERROR_MESSAGE_LENGTH` 以内）。
+ * Run のディレクトリを作れなかった理由（DEF-009）。`detail` は、失敗した作成の例外のメッセージ（切り詰めない）。
  * 結果は凍結する。
  */
 function runDirectoryUnavailableReason(error: unknown): IncompleteReason {
-  return Object.freeze({ code: 'RUN_DIRECTORY_UNAVAILABLE', detail: safeErrorMessage(error, MAX_ERROR_MESSAGE_LENGTH) });
+  return Object.freeze({ code: 'RUN_DIRECTORY_UNAVAILABLE', detail: safeErrorMessage(error) });
 }
 
 /** クロールの上限に達した後の URL の理由（`detail` は `null`。設計書 5.6.3）。結果は凍結する。 */
@@ -2504,44 +2692,55 @@ function removeRetryRecordsOf(retries: RunRetryRecord[], url: string): void {
  * 再開の入力から、`RunProgress` のうち保存から作り直すものを作る（中断した Run の再開の設計書 4.1、4.2）。新しい Run（入力なし）では、空の
  * 値にする。理由、再試行の記録、違反のフラグ、未処理の失敗の件数は、状態の保存の値の写し。保存した Safety Ledger の snapshot は、ページの外の
  * Ledger のもの（状態の保存）と、終わったページの Ledger のもの（ページの保存。終わった順）を、この順に並べたもの。終わったページの結果と
- * 再試行の前の Evidence は、URL を鍵にする（新しい Run と同じく、再試行の前の Evidence は、再試行したページだけに持つ）。
+ * 再試行の前の Evidence は、URL を鍵にする（新しい Run と同じく、再試行の前の Evidence は、再試行したページだけに持つ）。MEM-3b: 終わったページの結果は、
+ * ページの置き場所に入れる（`storeRunPage`。再試行の前の Evidence も、本体に加える）。
  */
-function restoredRunProgress(resume: RunCoordinatorResumeInput | undefined): Pick<
+async function restoredRunProgress(resume: RunCoordinatorResumeInput | undefined): Promise<Pick<
   RunProgress,
   | 'reasons'
   | 'retries'
-  | 'savedSafetyLedgerSnapshots'
+  | 'savedSafety'
   | 'safetyViolationDetected'
   | 'stoppedBySafetyViolation'
   | 'unhandledFailures'
   | 'results'
+  | 'pages'
   | 'retryEvidence'
-> {
+  | 'revisits'
+>> {
   if (resume === undefined) {
     return {
       reasons: [],
       retries: [],
-      savedSafetyLedgerSnapshots: [],
+      savedSafety: new RunSafetyTotals(),
       safetyViolationDetected: false,
       stoppedBySafetyViolation: false,
       unhandledFailures: 0,
       results: new Map(),
+      pages: createRunPageStore<RunPageSummary>(),
       retryEvidence: new Map(),
+      revisits: new Map(),
     };
   }
-  const { checkpoint, pages } = resume;
+  const { checkpoint } = resume;
+  const restored = await restoredRunPagesOf(resume.pages);
+  // 状態の保存の snapshot（ページの外の Ledger）を先に、ページの保存の snapshot（終わった順）をその後に足す（並べていたときと同じ順）。
+  const savedSafety = new RunSafetyTotals();
+  for (const snapshot of checkpoint.safetyLedgerSnapshots) {
+    savedSafety.add(snapshot);
+  }
+  savedSafety.addTotals(restored.safety);
   return {
     reasons: [...checkpoint.progress.reasons],
     retries: [...checkpoint.progress.retries],
-    savedSafetyLedgerSnapshots: [
-      ...checkpoint.safetyLedgerSnapshots,
-      ...pages.flatMap(({ safetyLedgerSnapshots }) => safetyLedgerSnapshots),
-    ],
+    savedSafety,
     safetyViolationDetected: checkpoint.progress.safetyViolationDetected,
     stoppedBySafetyViolation: checkpoint.progress.stoppedBySafetyViolation,
     unhandledFailures: checkpoint.progress.unhandledFailures,
-    results: new Map(pages.map(({ url, result }) => [url, result])),
-    retryEvidence: new Map(pages.filter(({ retryEvidence }) => retryEvidence.length > 0).map(({ url, retryEvidence }) => [url, retryEvidence])),
+    results: restored.results,
+    pages: restored.pages,
+    retryEvidence: new Map(),
+    revisits: restored.revisits,
   };
 }
 
@@ -2567,6 +2766,51 @@ function normalizedStartUrl(config: AuditConfig): NormalizedHttpUrlEvidence {
 }
 
 /**
+ * 巡回の候補の除外の判定（T25c。認証つきの Run は、監査の段の除外・セッションの切れの path・危険な語。SD-1: 公開監査は削除の語）。巡回と、WSO の範囲の画面の
+ * 読めるかの判定が使う（同じ 1 つの判定）。
+ */
+function excludedCrawlCandidateOf(config: AuditConfig, authentication: RunAuthentication | null): (url: string) => boolean {
+  const crawlAllowedOrigins: ReadonlySet<string> = new Set(config.site.allowedOrigins);
+  return authentication === null
+    ? (url: string): boolean => crawlUrlHasDestructiveWord(url)
+    : (url: string): boolean => isExcludedCrawlCandidate(url, crawlAllowedOrigins, authentication);
+}
+
+/**
+ * WSO: 「チェックした画面だけ」の点検で読む画面のうち、読めるもの（許可 Origin の中で、巡回の候補の除外に当たらないもの。REV-WSO の M-1: 報告の数も、この数）。
+ */
+function readablePageScope(
+  config: AuditConfig,
+  authentication: RunAuthentication | null,
+  urls: readonly NormalizedHttpUrlEvidence[],
+): readonly NormalizedHttpUrlEvidence[] {
+  const excluded = excludedCrawlCandidateOf(config, authentication);
+  const admission = { allowedOrigins: new Set(config.site.allowedOrigins) };
+  return Object.freeze(urls.filter((url) => classifyUrl(new URL(url), admission).kind === 'INTERNAL_NAVIGABLE' && !excluded(url)));
+}
+
+/**
+ * WSO: 「チェックした画面だけ」の点検で読む画面を、開始の URL と同じ正規化の owner の `normalizeUrl` で正規化する（渡した順。同じ URL は 1 つ）。空・正規化できない
+ * ものがあれば `TypeError`（親が確かめた値なので、ふつうは起きない）。
+ */
+function normalizedPageScope(config: AuditConfig, urls: readonly string[]): readonly NormalizedHttpUrlEvidence[] {
+  if (!Array.isArray(urls) || urls.length === 0) {
+    throw new TypeError('RunCoordinator pageScope must have one URL or more when given');
+  }
+  const normalized: NormalizedHttpUrlEvidence[] = [];
+  for (const url of urls) {
+    const result = typeof url === 'string' ? normalizeUrl(url, url, new Set(config.crawl.allowedQueryParameters)) : null;
+    if (result === null || !result.ok) {
+      throw new TypeError('RunCoordinator pageScope must have URLs that can be normalized');
+    }
+    if (!normalized.includes(result.url)) {
+      normalized.push(result.url);
+    }
+  }
+  return Object.freeze(normalized);
+}
+
+/**
  * 再開の入力の保存から、`RunProgress` のうち巡回の値（採番器、巡回の記録、開始の URL、robots.txt と sitemap.xml の取得の結果）を作り直す
  * （中断した Run の再開の設計書 4.2、4.10 の DEF-022。R7b）。Run Coordinator は、再開した実行の初め（PREFLIGHT の前）に、PREFLIGHT の結果に
  * よらず呼ぶ。PREFLIGHT に失敗して巡回を行わない実行でも、その出力と最後の状態の保存に、前の回までのページが入るようにするためである。
@@ -2580,15 +2824,18 @@ function normalizedStartUrl(config: AuditConfig): NormalizedHttpUrlEvidence {
 function restoredCrawlProgress(
   config: AuditConfig,
   saved: RunCheckpoint | undefined,
+  /** WSO: 「チェックした画面だけ」の点検か（開始の URL は、巡回の記録の最初の画面。新しい Run と同じ）。 */
+  scoped: boolean,
 ): Pick<RunProgress, 'frontier' | 'allocator' | 'startUrl' | 'metadata'> {
   if (saved === undefined) {
     return { frontier: null, allocator: null, startUrl: null, metadata: null };
   }
   const { allocator, frontier } = restoreRunCheckpointCrawl(saved);
+  const [firstEntry] = frontier.entries();
   return {
     frontier,
     allocator,
-    startUrl: normalizedStartUrl(config),
+    startUrl: scoped && firstEntry !== undefined ? firstEntry.url : normalizedStartUrl(config),
     metadata: saved.siteMetadata === null ? null : restoredSiteMetadata(saved.siteMetadata),
   };
 }
@@ -2622,6 +2869,7 @@ function runScopedNavigationPacer(pacer: NavigationPacer): NavigationPacer {
   const baseline = pacer.snapshot();
   return Object.freeze({
     beforeNavigation: () => pacer.beforeNavigation(),
+    waitUntilNextNavigationDue: () => pacer.waitUntilNextNavigationDue(),
     snapshot: (): NavigationPacerSnapshot => {
       const current = pacer.snapshot();
       return Object.freeze({
@@ -2689,7 +2937,7 @@ function runCheckpointState(input: {
  */
 function runCheckpointContent(input: {
   readonly config: AuditConfig;
-  readonly identity: Pick<RunCheckpointContext, 'runId' | 'toolVersion' | 'startedAt' | 'authentication'>;
+  readonly identity: Pick<RunCheckpointContext, 'runId' | 'toolVersion' | 'startedAt' | 'authentication' | 'pageScope'>;
   readonly progress: RunProgress;
   readonly crawl: RunCrawlRecord | null;
 }): RunCheckpointContentValues {
@@ -2726,8 +2974,12 @@ function runCheckpointContent(input: {
       ...serviceOriginLoadOf(progress),
     },
     completedPageIds: crawl === null ? [] : [...crawl.completedPageIds],
+    // EV-5: 読み直しを終えたページがあるときだけ（ない保存の形は変えない）。
+    ...(crawl === null || crawl.revisitedPageIds.length === 0 ? {} : { revisitedPageIds: [...crawl.revisitedPageIds] }),
     // T25g-2: 認証つきの Run だけ、Run の種類を記録する（公開監査の保存の形は変えない）。
     ...(identity.authentication === null ? {} : { authentication: identity.authentication }),
+    // WSO: 「チェックした画面だけ」の Run だけ、範囲を記録する（サイトの全部の画面の保存の形は変えない）。
+    ...(identity.pageScope === null ? {} : { pageScope: identity.pageScope }),
   };
 }
 
@@ -2809,11 +3061,12 @@ function executionsEndingWith<TExecution>(earlier: readonly TExecution[], last: 
  * で防いでいるので、起きない）。
  */
 function runExecutionRecord(execution: RunCheckpointExecution): RunExecution {
-  const { startedAt, finishedAt, endReason } = execution;
+  const { startedAt, finishedAt, endReason, automaticRelogin } = execution;
   if (finishedAt === null || endReason === null) {
     throw new TypeError('an earlier execution of the checkpoint is not closed: its finishedAt or endReason is null');
   }
-  return Object.freeze({ startedAt, finishedAt, endReason });
+  // DEF-200: ログインし直して自動で始めた実行の印は、前の回の記録にも残す（あるときだけ）。
+  return Object.freeze({ startedAt, finishedAt, endReason, ...(automaticRelogin === undefined ? {} : { automaticRelogin }) });
 }
 
 /**
@@ -2823,33 +3076,7 @@ function runExecutionRecord(execution: RunCheckpointExecution): RunExecution {
 function isRunUnavailableError(error: unknown): boolean {
   return error instanceof RunDirectoryUnavailableError
     || error instanceof RunResumeUnavailableError
-    || error instanceof RunNotResumableError
-    // DEF-170: ロックを失った Run は、保存のセッションに何も頼まない（書かない。今の持ち主のもの）。
-    || error instanceof RunLockLostError;
-}
-
-/**
- * DEF-170: 読み込みの前に、ロックを失っていないかを確かめる pacer（`pacer` を包む）。待つ前に印（`throwIfLost`）を、待ちの後、読み込みの直前に
- * ロックのファイル（`confirmOrThrow`。DEF-172）を確かめる（失っていれば `RunLockLostError` を投げ、読み込みを始めない）。ほかの操作は、そのまま
- * `pacer` に渡す。
- */
-function runLockGuardedNavigationPacer(
-  pacer: NavigationPacer,
-  throwIfLost: () => void,
-  confirmOrThrow: () => Promise<void>,
-): NavigationPacer {
-  return Object.freeze({
-    beforeNavigation: async (): Promise<number> => {
-      throwIfLost();
-      const waitedMs = await pacer.beforeNavigation();
-      // DEF-172: 読み込みの直前に、印だけでなくロックのファイルを読んで、自分のものかを確かめる。
-      await confirmOrThrow();
-      return waitedMs;
-    },
-    snapshot: (): NavigationPacerSnapshot => pacer.snapshot(),
-    raiseMinimumInterval: (minIntervalMs: number): void => pacer.raiseMinimumInterval(minIntervalMs),
-    recordDocumentRequestSent: (): void => pacer.recordDocumentRequestSent(),
-  });
+    || error instanceof RunNotResumableError;
 }
 
 /**
@@ -2861,7 +3088,8 @@ function runLoad(config: AuditConfig, progress: RunProgress): RunLoad {
   const serviceOriginRequests = progress.loadMeter.serviceOriginRequests();
   return {
     minNavigationIntervalMs: config.crawl.minNavigationIntervalMs,
-    maxInteractionsPerPage: config.crawl.maxInteractionsPerPage,
+    // L14: 利用者が指定したときだけ書く（ないときは上限なし）。
+    ...(config.crawl.maxInteractionsPerPage === undefined ? {} : { maxInteractionsPerPage: config.crawl.maxInteractionsPerPage }),
     navigationCount: pacer.navigationCount,
     pacingWaitMs: pacer.totalWaitMs,
     requests: progress.loadMeter.snapshot(),
@@ -2896,9 +3124,9 @@ function retryableNavigationFailure(
  * T44R3 の M-2: 巡回が知っている URL（待ち行列のすべての URL と、監査したページの URL・最終の URL）。保存のページを書くとき、書き手が記録した要求の URL を
  * 値で照らす段で照らさない値（あとで監査するページの URL を、続けて終えた Run と同じく伏せない）。
  */
-function crawlKnownUrlsOf(frontier: CrawlFrontier, results: ReadonlyMap<string, PageAuditResult>): string[] {
+function crawlKnownUrlsOf(frontier: CrawlFrontier, results: readonly Pick<PageAuditResult, 'pageUrl' | 'viewports'>[]): string[] {
   const urls = new Set<string>(frontier.entries().map(({ url }) => url));
-  for (const result of results.values()) {
+  for (const result of results) {
     urls.add(result.pageUrl);
     for (const { finalUrl } of Object.values(result.viewports)) {
       if (finalUrl !== null) {
@@ -2910,11 +3138,33 @@ function crawlKnownUrlsOf(frontier: CrawlFrontier, results: ReadonlyMap<string, 
 }
 
 /**
- * ページの Desktop の `link` の Evidence のうち、`INTERNAL_NAVIGABLE` のリンクの正規化した URL（文書の順。取り出しは
- * `src/crawl/internal-navigable-links.ts` の `internalNavigableUrlsOf`。CC-070）。
+ * DEF-236: Evidence（ページの途中の Evidence も）の、Desktop の Link のうち、待ち行列に入れうる URL（読んだページの辺 `auditPageOutcomeOf` と同じ 1 つの選び方
+ * `crawlableLinkUrlsOf`。SD-1: 削除の語のリンクを除く）。
  */
-function internalNavigableLinks(result: PageAuditResult): NormalizedHttpUrlEvidence[] {
-  return viewportEvidenceOfType(result, 'link', ['desktop']).flatMap(({ payload }) => internalNavigableUrlsOf(payload.links));
+function desktopLinkUrlsOf(evidence: readonly EvidenceRecord[]): NormalizedHttpUrlEvidence[] {
+  return viewportEvidenceOfType({ evidence }, 'link', ['desktop']).flatMap(({ payload }) => crawlableLinkUrlsOf(payload.links));
+}
+
+/**
+ * MEM-3b（DEF-266）: 監査した URL の最終の試行の結果（`result`。評価の形）を、ページの置き場所に入れる。要約は評価の形から作り、本体は再試行の前の試行の Evidence
+ * （`retryEvidence`）を先頭に加えた形で圧縮する。同じ URL の結果がすでにあれば、入れ替える（添字は変えない）。再試行の前の試行の Evidence は消す。
+ */
+async function storeRunPage(
+  progress: Pick<RunProgress, 'results' | 'pages' | 'retryEvidence'>,
+  url: string,
+  result: PageAuditResult,
+  retryEvidence: readonly EvidenceRecord[],
+): Promise<void> {
+  const body = withLeadingEvidence(result, retryEvidence);
+  const summary = runPageSummaryOf(result);
+  const index = progress.results.get(url);
+  if (index === undefined) {
+    await progress.pages.add(body, summary);
+    progress.results.set(url, progress.pages.length - 1);
+  } else {
+    await progress.pages.replace(index, body, summary);
+  }
+  progress.retryEvidence.delete(url);
 }
 
 /**
@@ -2934,7 +3184,7 @@ function sitemapOf(metadata: RunSiteMetadata | null): SitemapEvidence | null {
  * 理由の組み立ては `requiredArtifactInvalidReason` だけで行う（CC-022。`ArtifactWriter` と同じ理由になり、重複を除ける）。
  */
 async function invalidArtifactReasons(
-  pages: readonly PageAuditResult[],
+  pages: RunPages,
   findings: readonly Finding[],
 ): Promise<IncompleteReason[]> {
   const reasons: IncompleteReason[] = [];
@@ -2944,9 +3194,10 @@ async function invalidArtifactReasons(
       reasons.push(requiredArtifactInvalidReason(schema, id, validation.errors));
     }
   };
-  for (const page of pages) {
+  // MEM-3b: ページは、置き場所から 1 つずつ戻して確かめる。
+  await forEachRunPage(pages, async (page) => {
     await check('page', page.pageId, page);
-  }
+  });
   for (const finding of findings) {
     await check('finding', finding.findingId, finding);
   }

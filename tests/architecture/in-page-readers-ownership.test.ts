@@ -54,7 +54,6 @@ const COMPOSED_FILES: readonly string[] = [
   'src/crawl/discover-links.ts',
   'src/discovery/probe.ts',
   'src/discovery/read-executor.ts',
-  'src/evidence/color-collector.ts',
   'src/evidence/dom-collector.ts',
   'src/evidence/layout-collector.ts',
   'src/interaction/discover-candidates.ts',

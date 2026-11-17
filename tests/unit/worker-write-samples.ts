@@ -35,9 +35,8 @@ export const sampleStartWrite = (origin: string, overrides: Record<string, unkno
     sampleWriteField('_method', 'hidden')],
   values: { name: 'サンプル 太郎', email: 'sample0001@example.invalid', newsletter: null },
   verification: {
-    successCondition: { pathPrefix: '/members/', selector: '.registered' },
-    inputErrorCondition: { pathPrefix: '/members/new', selector: '.error' },
-    recordId: { source: 'URL_PATH_PATTERN', pathPattern: '/members/{id}' },
+    resultJudgement: 'FORM_STRUCTURE',
+    recordId: { source: 'URL_PATH_PATTERNS', pathPatterns: ['/members/{id}'] },
   },
   readVerification: {
     readCheckId: 'rc-verify',
@@ -97,8 +96,7 @@ export const sampleStartApiWrite = (origin: string, overrides: Record<string, un
   // T40a-fix: API の書き込みの指定は、成否の条件と入力の誤りの条件を持たない（null）。ID の取り方は検証の指定の `recordId`（API の `recordId` が
   // あれば null でもよい）。
   verification: {
-    successCondition: null,
-    inputErrorCondition: null,
+    resultJudgement: null,
     recordId: { source: 'URL_PATH_PATTERN', pathPattern: '/admin/members/{id}/edit' },
   },
   readVerification: {

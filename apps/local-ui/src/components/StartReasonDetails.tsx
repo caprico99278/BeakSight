@@ -3,6 +3,8 @@
  * 切り出した）。理由の説明と手順、プロファイルの検証の誤り、設定のファイルの誤り、認証の設定の誤り、案内のリンク。
  * - T26e（Task 26 の設計書 4.5、4.6）: 自動ログインの上限で止めているときは、次に始められる日時を出す。資格情報の理由と、止めている理由には、
  *   資格情報の画面とログインの確かめの画面へのリンクを出す。
+ * - PL-3（設計書 `2026-10-26-beaksight-plain-ui-design.md` 3 章の 1）: 直す道のリンクは二次の見た目（主のボタンは、画面ごとに要点のパネルの 1 つだけ。始め
+ *   られないときは主のボタンを出さず、理由の 1 行と、このリンクを出す）。
  */
 import { Link } from '@tanstack/react-router';
 import { formatDateTime } from '../../../../src/presentation/format.js';
@@ -72,21 +74,21 @@ export function StartReasonDetails({
       <p>{text.action}</p>
       {AUTH_SETUP_REASONS.has(reason) ? (
         <div className="button-row">
-          <Link to="/auth-setup/$profileId" params={{ profileId }} className="button button--primary" data-testid={`${testIdPrefix}-open-auth-setup`}>
+          <Link to="/auth-setup/$profileId" params={{ profileId }} className="button" data-testid={`${testIdPrefix}-open-auth-setup`}>
             {LOCAL_UI_AUTH_TEXT.start.openSetup}
           </Link>
         </div>
       ) : null}
       {CREDENTIAL_REASONS.has(reason) ? (
         <div className="button-row">
-          <Link to="/credentials/$profileId" params={{ profileId }} className="button button--primary" data-testid={`${testIdPrefix}-open-credentials`}>
+          <Link to="/credentials/$profileId" params={{ profileId }} className="button" data-testid={`${testIdPrefix}-open-credentials`}>
             {LOCAL_UI_LOGIN_CHECK_TEXT.openCredentials}
           </Link>
         </div>
       ) : null}
       {showLoginCheckLink && HOLD_REASONS.has(reason) ? (
         <div className="button-row">
-          <Link to="/login-check/$profileId" params={{ profileId }} className="button button--primary" data-testid={`${testIdPrefix}-open-login-check`}>
+          <Link to="/login-check/$profileId" params={{ profileId }} className="button" data-testid={`${testIdPrefix}-open-login-check`}>
             {LOCAL_UI_AUTH_TEXT.start.openLoginCheck}
           </Link>
         </div>

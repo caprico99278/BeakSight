@@ -2,7 +2,7 @@
 // `sessionLossEvidenceOf`・`observeSessionLossNavigation`）の表を固定する。
 // - 頼んだ URL と行き着いた先は path と query の名前だけ（値に見える区切りと名前は伏せる）。行き着いた先は判定と同じ順（main frame の最後の URL、Guard が
 //   止めた main frame の移動の先）。
-// - 経路は main frame の文書の要求だけを、上限つきで記録する。止めた要求は形ごとに数え、上限を超えた行は数だけ。
+// - 経路は main frame の文書の要求だけを記録する。止めた要求は形ごとに数える（LZ-3a: どちらも数の上限はない）。
 // - 鍵の名前の違いは、許可 Origin と承認したサービスの Origin の、ローカル ストレージの鍵と Cookie の名前の違いを、ログインの段の観察と同じ決まりの
 //   接頭辞と接尾辞の案と数で残す。値（token、Cookie の値、query の値）はどこにも出ない（目印の値で確かめる）。
 // 例の値は、匿名の値（`example.com`）だけを使う。
@@ -10,22 +10,18 @@ import { EventEmitter } from 'node:events';
 import type { Page } from 'playwright';
 import { describe, expect, it } from 'vitest';
 import type { AuthenticatedContextStateNames } from '../../src/browser/context-factory.js';
-import {
-  MAX_SESSION_LOSS_BLOCKED_REQUESTS,
-  MAX_SESSION_LOSS_KEY_SHAPES,
-  MAX_SESSION_LOSS_REDIRECT_PATHS,
-  MAX_SESSION_LOSS_STORAGE_KEY_CHANGES,
-} from '../../src/core/evidence-types.js';
-import { MAX_LOGIN_OBSERVED_STORAGE_KEY_NAMES } from '../../src/discovery/login-observation.js';
+import { MAX_SESSION_LOSS_STORAGE_KEY_CHANGES } from '../../src/core/evidence-types.js';
 import {
   observeSessionLossNavigation,
   sessionLossEvidenceOf,
   type SessionLossEvidenceInput,
 } from '../../src/orchestration/authenticated-run.js';
-import { MAX_LOGIN_STAGE_BLOCKED_REQUESTS } from '../../src/safety/login-stage-blocked-requests.js';
 import { SafetyLedger } from '../../src/safety/safety-ledger.js';
 import { fakePlaywrightRequest } from '../helpers/fake-playwright-request.js';
 
+/** LZ-3a: 撤廃した経路の段と止めた要求の行の数の上限（前の `MAX_SESSION_LOSS_REDIRECT_PATHS`・`MAX_SESSION_LOSS_BLOCKED_REQUESTS`）の写し。 */
+const FORMER_MAX_SESSION_LOSS_REDIRECT_PATHS = 10;
+const FORMER_MAX_SESSION_LOSS_BLOCKED_REQUESTS = 8;
 const APP = 'https://app.example.com';
 const API = 'https://api.example.com';
 const OTHER = 'https://other.example.com';
@@ -85,41 +81,43 @@ describe('DEF-138: sessionLossEvidenceOf (the evidence of the load where the ses
     expect(sessionLossEvidenceOf(baseInput({ page: pageAt('about:blank') })).landedPath).toBeNull();
   });
 
-  it('records the route of the main frame documents with the origin kinds, redacts value-like segments, and counts the omitted steps', () => {
+  // LZ-3a: 経路の段の数の上限（前は 10）は撤廃した。前の上限を超える段も残らず残す（`redirectPathsOmitted` は前の記録の形のために残し、0）。
+  it('records every step of the route of the main frame documents with the origin kinds, and redacts value-like segments', () => {
     const urls = [
       `${APP}/admin/members`,
       `${OTHER}/sso/${TOKEN_VALUE}`,
       `${API}/session/refresh`,
-      ...Array.from({ length: MAX_SESSION_LOSS_REDIRECT_PATHS }, (_value, index) => `${APP}/step/${index}`),
+      ...Array.from({ length: FORMER_MAX_SESSION_LOSS_REDIRECT_PATHS }, (_value, index) => `${APP}/step/${index}`),
     ];
-    const evidence = sessionLossEvidenceOf(baseInput({ navigation: { urls: urls.slice(0, MAX_SESSION_LOSS_REDIRECT_PATHS), omitted: 3 } }));
+    const evidence = sessionLossEvidenceOf(baseInput({ navigation: { urls, omitted: 0 } }));
     expect(evidence.redirectPaths.slice(0, 3)).toEqual([
       { originKind: 'ALLOWED', path: '/admin/members' },
       { originKind: 'OTHER', path: '/sso/[REDACTED]' },
       { originKind: 'SERVICE', path: '/session/refresh' },
     ]);
-    expect(evidence.redirectPaths).toHaveLength(MAX_SESSION_LOSS_REDIRECT_PATHS);
-    expect(evidence.redirectPathsOmitted).toBe(3);
+    expect(evidence.redirectPaths).toHaveLength(urls.length);
+    expect(evidence.redirectPathsOmitted).toBe(0);
     expectNoMarkers(evidence);
   });
 
-  it('aggregates the requests blocked by the Guard by the shape, and counts the rows over the limit', () => {
+  // LZ-3a: 行の数の上限（前は 8）は撤廃した。前の上限を超える行も残らず残す。
+  it('aggregates the requests blocked by the Guard by the shape, and keeps every row beyond the former limit', () => {
     const ledger = new SafetyLedger();
     ledger.recordBlockedRequest({
       method: 'POST', url: `${API}/token?grant_type=refresh_token&refresh_token=${TOKEN_VALUE}`, reason: 'NON_READ_METHOD', resourceType: 'fetch', phase: 'LOAD',
     });
     ledger.recordBlockedRequest({ method: 'POST', url: `${API}/token?grant_type=refresh_token`, reason: 'NON_READ_METHOD', resourceType: 'fetch', phase: 'LOAD' });
     ledger.recordBlockedNavigation({ method: 'GET', url: `${OTHER}/sso?ticket=${QUERY_VALUE}`, reason: 'EXTERNAL_MAIN_FRAME_NAVIGATION', phase: 'LOAD' });
-    for (let index = 0; index < MAX_SESSION_LOSS_BLOCKED_REQUESTS + 2; index += 1) {
+    for (let index = 0; index < FORMER_MAX_SESSION_LOSS_BLOCKED_REQUESTS + 2; index += 1) {
       ledger.recordBlockedRequest({ method: 'POST', url: `${APP}/beacon/${index}`, reason: 'NON_READ_METHOD', resourceType: 'ping', phase: 'LOAD' });
     }
     const evidence = sessionLossEvidenceOf(baseInput({ ledger }));
-    expect(evidence.blockedRequests).toHaveLength(MAX_SESSION_LOSS_BLOCKED_REQUESTS);
-    // main frame の移動を止めた記録と監査の段の除外を先に、ページが出した要求を後に並べる（上限で落とすのは後の行）。
+    // 2 行（/token と /sso）と、/beacon の 10 行。
+    expect(evidence.blockedRequests).toHaveLength(FORMER_MAX_SESSION_LOSS_BLOCKED_REQUESTS + 4);
+    // main frame の移動を止めた記録と監査の段の除外を先に、ページが出した要求を後に並べる。
     expect(evidence.blockedRequests[0]).toEqual({ method: 'GET', originKind: 'OTHER', path: '/sso', reason: 'EXTERNAL_MAIN_FRAME_NAVIGATION', count: 1 });
     expect(evidence.blockedRequests[1]).toEqual({ method: 'POST', originKind: 'SERVICE', path: '/token', reason: 'NON_READ_METHOD', count: 2 });
-    // 2 行（/token と /sso）と、上限までの /beacon の 6 行。残りの /beacon の 4 回は数だけ。
-    expect(evidence.blockedRequestsUnlisted).toBe(MAX_SESSION_LOSS_BLOCKED_REQUESTS + 2 - (MAX_SESSION_LOSS_BLOCKED_REQUESTS - 2));
+    expect(evidence.blockedRequestsUnlisted).toBe(0);
     expectNoMarkers(evidence);
   });
 
@@ -165,11 +163,6 @@ describe('DEF-138: sessionLossEvidenceOf (the evidence of the load where the ses
     ]);
     expect(MAX_SESSION_LOSS_STORAGE_KEY_CHANGES).toBe(3 * 3 * 2);
   });
-
-  it('uses the same limits as the login stage records', () => {
-    expect(MAX_SESSION_LOSS_BLOCKED_REQUESTS).toBe(MAX_LOGIN_STAGE_BLOCKED_REQUESTS);
-    expect(MAX_SESSION_LOSS_KEY_SHAPES).toBe(MAX_LOGIN_OBSERVED_STORAGE_KEY_NAMES);
-  });
 });
 
 describe('DEF-138: observeSessionLossNavigation (the route of the main frame documents of a load)', () => {
@@ -184,21 +177,22 @@ describe('DEF-138: observeSessionLossNavigation (the route of the main frame doc
     return { page, emit };
   };
 
-  it('records only the main frame navigation requests, up to the limit, and stops after dispose', () => {
+  // LZ-3a: 段の数の上限（前は 10）は撤廃した。
+  it('records every main frame navigation request beyond the former limit, and stops after dispose', () => {
     const { page, emit } = fakePage();
     const observer = observeSessionLossNavigation(page);
     emit(`${APP}/admin`, true, true);
     emit(`${APP}/app.js`, true, false);
     emit(`${APP}/frame`, false, true);
-    for (let index = 0; index < MAX_SESSION_LOSS_REDIRECT_PATHS + 1; index += 1) {
+    for (let index = 0; index < FORMER_MAX_SESSION_LOSS_REDIRECT_PATHS + 1; index += 1) {
       emit(`${APP}/step/${index}`, true, true);
     }
     observer.dispose();
     emit(`${APP}/after`, true, true);
     const record = observer.snapshot();
     expect(record.urls[0]).toBe(`${APP}/admin`);
-    expect(record.urls).toHaveLength(MAX_SESSION_LOSS_REDIRECT_PATHS);
-    expect(record.omitted).toBe(2);
+    expect(record.urls).toHaveLength(FORMER_MAX_SESSION_LOSS_REDIRECT_PATHS + 2);
+    expect(record.omitted).toBe(0);
     expect(record.urls).not.toContain(`${APP}/after`);
   });
 });

@@ -1,11 +1,9 @@
 // T35R-fix（T35R の C-1・I-1・I-2。Task 35 の設計書の履歴の T35R の行）: スクリプトで送るログインの監査の Run（`executeAuditRun` に、監査の段の口つきの
 // 認証の指定を渡す。ワーカーと同じ形）を、幅の走査ありで流す。自前の 127.0.0.1 のサーバ 2 つ（アプリと、承認したサービスの Origin）。Chromium はテストの
-// 既定の headless と、CLI の起動の設定の両方。レビュー担当の実験（T35R の `run.t35r.test.ts`）を写して、確かめの形にした。
+// 既定の headless と、CLI の起動の設定の両方（どの場面も安全の漏れの確かめ）。レビュー担当の実験（T35R の `run.t35r.test.ts`）を写して、確かめの形にした。
 // - C-1: 管理画面は、サービスの Origin の iframe（sub frame の文書）と fetch を出す。幅の走査と Interaction（`REVISIT`）の読み込みでは、サービスの Origin
-//   に何も届かない（届くのは、Desktop と Mobile の最初の読み込みの分だけ）。止めた理由 `SERVICE_ORIGIN_REVISIT` が成果物に残る。小さな上限
-//   （`perRun: 2`）では、届いた数が上限を超えない。
-// - I-2: 上限で止めた要求が 1 つでもあれば、残りのページがなくても Run は PARTIAL で、未完了の理由 `SERVICE_REQUEST_LIMIT_REACHED` が残る（実行の終わり方
-//   は、残りのページがないので `COMPLETED`）。
+//   に何も届かない（届くのは、Desktop と Mobile の最初の読み込みの分だけ）。止めた理由 `SERVICE_ORIGIN_REVISIT` が成果物に残る。
+// - L11: 要求の上限の撤廃は単体 `service-request-budget.test.ts`・`service-request-limit-run.test.ts` が確かめる。
 // - I-1・M-2・M-3: 文の中の前置きつきの URL（`url=`・`next=`・`(`・`[`・`{url:`・`x,`）、サービスのホストへの WebSocket の URL、fragment、iframe と
 //   リンクの query の値が、成果物（ZIP の中身を含む）に出ない。
 // 届いた数は、サーバの記録で数える（事前確認を除く）。各 Run の後に、名前つきの時間（`LATE_REQUEST_WAIT_MS`）だけ待ってから数え直す。
@@ -14,7 +12,6 @@ import { readFileSync } from 'node:fs';
 import { mkdtemp, rm } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import type { Browser } from 'playwright';
 import { afterAll, beforeAll, describe, expect, it } from 'vitest';
 import { wait } from '../../src/core/deadline.js';
 import type { AuditStageServiceRequests } from '../../src/browser/context-factory.js';
@@ -25,16 +22,12 @@ import { filterAuthenticatedState } from '../../src/control/auth/authenticated-s
 import type { RunSummary } from '../../src/core/contracts.js';
 import type { RunAuthentication } from '../../src/orchestration/authenticated-run.js';
 import { hasSuccessStorageKey } from '../../src/worker/login-stage-checks.js';
-import { launchCliChromium, launchHeadlessChromium } from '../helpers/chromium.js';
+import { BOTH_CHROMIUM_LAUNCHERS } from '../helpers/chromium.js';
 import { filesUnder, placesWithMarkers } from '../helpers/leak-places.js';
 import { LOADED_RESOURCE_SETTLING_TIMEOUT_MS } from '../helpers/loaded-deadline.js';
 import { startLoopbackHttpServer, type LoopbackHttpServer } from '../helpers/loopback-server.js';
 import { fastRunConfig } from '../helpers/run-harness.js';
 
-const LAUNCHERS: readonly (readonly [string, () => Promise<Browser>])[] = [
-  ['the default test Chromium', () => launchHeadlessChromium()],
-  ['the CLI Chromium', () => launchCliChromium()],
-];
 const TEST_TIMEOUT_MS = 240_000;
 /** 各 Run の後に、遅れて届く要求を待つ時間（ms）。 */
 const LATE_REQUEST_WAIT_MS = 1_500;
@@ -45,8 +38,6 @@ const PRIMARY_LOADS_PER_PAGE = 2;
 /** 管理画面の 1 回の読み込みが、サービスの Origin に送る要求の数（iframe の文書と fetch）。 */
 const SERVICE_REQUESTS_PER_LOAD = 2;
 const MAX_PAGES = 1;
-const DEFAULT_LIMITS = Object.freeze({ perMinute: 120, perRun: 600 });
-const SMALL_LIMITS = Object.freeze({ perMinute: 120, perRun: 2 });
 const STORAGE_KEY = 'fixture-auth-token';
 const FIXTURE_KEY = Object.freeze({ prefix: 'fixture', suffix: '-auth-token' });
 const ADMIN_PATH = '/admin';
@@ -99,7 +90,7 @@ try { new WebSocket('${ws}/realtime/v1/websocket?tenant=${MARKERS.wsTenant}'); }
 ${mode === 'limit' ? limitBody : leakBody}</main></body></html>`;
 };
 
-describe.each(LAUNCHERS)('T35R-fix: the service origin requests on the width scan with %s', (_label, launch) => {
+describe.each(BOTH_CHROMIUM_LAUNCHERS)('T35R-fix: the service origin requests on the width scan with %s', (_label, launch) => {
   let app: LoopbackHttpServer;
   let service: LoopbackHttpServer;
   let workDirectory = '';
@@ -144,14 +135,13 @@ describe.each(LAUNCHERS)('T35R-fix: the service origin requests on the width sca
   });
 
   /** 幅の走査ありで、管理画面だけを監査する。届いた要求（この Run の分）と `run.json` を返す。 */
-  const audit = async (pageMode: PageMode, limits: { readonly perMinute: number; readonly perRun: number }) => {
+  const audit = async (pageMode: PageMode) => {
     mode = pageMode;
     runCount += 1;
     const auditStage: AuditStageServiceRequests = {
       approvedServiceOrigins: [service.origin],
       auditReadRequests: [],
       scriptLogin: { origin: service.origin, path: '/auth/v1/token', requiredQuery: [{ name: 'grant_type', value: 'password' }] },
-      serviceRequestLimits: limits,
     };
     const authentication: RunAuthentication = {
       initialState: { cookies: [], origins: [{ origin: app.origin, localStorage: [{ name: STORAGE_KEY, value: 'stored-session' }] }] },
@@ -185,7 +175,7 @@ describe.each(LAUNCHERS)('T35R-fix: the service origin requests on the width sca
   };
 
   it('sends nothing to the service origin on the width scan loads, and records the reason', async () => {
-    const { arrived, run, runDirectory } = await audit('limit', DEFAULT_LIMITS);
+    const { arrived, run, runDirectory } = await audit('limit');
     // 幅の走査の読み込み直しがあった（アプリの管理画面を、最初の読み込みより多く読んだ）。
     expect(arrived.filter(({ server, path }) => server === 'app' && path === ADMIN_PATH).length).toBeGreaterThan(PRIMARY_LOADS_PER_PAGE);
     // サービスの Origin に届いたのは、Desktop と Mobile の最初の読み込みの分だけ。
@@ -194,18 +184,8 @@ describe.each(LAUNCHERS)('T35R-fix: the service origin requests on the width sca
     expect(placesWithMarkers(filesUnder(runDirectory), ['SERVICE_ORIGIN_REVISIT']).length).toBeGreaterThan(0);
   }, TEST_TIMEOUT_MS);
 
-  it('keeps the arrivals within perRun, and ends PARTIAL with the reason even without a remaining page', async () => {
-    const { arrived, run } = await audit('limit', SMALL_LIMITS);
-    expect(arrived.filter(({ server }) => server === 'service').length).toBeLessThanOrEqual(SMALL_LIMITS.perRun);
-    expect(run.runStatus).toBe('PARTIAL');
-    expect(run.incompleteReasons.map(({ code }) => code)).toContain('SERVICE_REQUEST_LIMIT_REACHED');
-    expect(run.authentication?.serviceRequestLimitReached).toBe(true);
-    // 残りのページがない（1 ページだけ）ので、実行の終わり方は COMPLETED。
-    expect(run.executions.at(-1)?.endReason).toBe('COMPLETED');
-  }, TEST_TIMEOUT_MS);
-
   it('leaks no service origin URL value after a prefix, of a WebSocket, or in a fragment to the artifacts', async () => {
-    const { runDirectory } = await audit('leak', DEFAULT_LIMITS);
+    const { runDirectory } = await audit('leak');
     const markers = Object.values(MARKERS).flatMap((marker) => [marker, encodeURIComponent(marker)]);
     expect(placesWithMarkers(filesUnder(runDirectory), markers)).toEqual([]);
   }, TEST_TIMEOUT_MS);

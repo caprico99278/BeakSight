@@ -6,6 +6,10 @@
   "required": ["profileId", "expectedRevision"],
   "properties": {
     "profileId": { "$ref": "urn:beaksight:schema:control:profile:1#/properties/profileId" },
-    "expectedRevision": { "$ref": "urn:beaksight:schema:control:profile:1#/properties/revision" }
+    "expectedRevision": { "$ref": "urn:beaksight:schema:control:profile:1#/properties/revision" },
+    "thenStartAudit": {
+      "description": "OP-1 (one pass flow design 4.1.3 3): start the audit (the chained run) right after the entry check (the button of the creation screen). The job manager decides whether it starts.",
+      "type": "boolean"
+    }
   }
 }

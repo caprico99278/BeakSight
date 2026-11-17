@@ -109,6 +109,23 @@ export const toneClassName = (tone: DisplayTone): string => `tone-${tone}`;
 /** 余白の段階（rem）。 */
 const SPACING_SCALE = Object.freeze([0.25, 0.5, 1, 1.5, 2] as const);
 
+/**
+ * PL-R（設計書 `doc/design/2026-10-26-beaksight-plain-ui-design.md` 14 章、13 章の 2）: 読みやすさの値の 1 か所。本文の最大幅（約 50rem。1 行が長すぎない）、
+ * 行の高さ、表の文字（前は small の 0.875rem = 14px。15px にした）、見出しの段（h1 26・h2 20・h3 17・h4 16px。画面の見出しの段と同じ）。
+ */
+const READING = Object.freeze({
+  mainMaxWidthRem: 50,
+  lineHeight: 1.75,
+  tableFontSizeRem: 0.9375,
+  headingFontSizeRem: Object.freeze({ h1: 1.625, h2: 1.25, h3: 1.0625, h4: 1 }),
+} as const);
+
+/** 見出しの段ごとの文字の大きさ（上の段ほど大きい）。 */
+const headingRules = (): string =>
+  (Object.entries(READING.headingFontSizeRem) as [string, number][])
+    .map(([heading, size]) => `${heading} {\n  font-size: ${size}rem;\n}`)
+    .join('\n');
+
 /** 色の CSS カスタムプロパティの宣言（`--bs-color-*` と `--bs-tone-*-{fg,bg,border}`）。 */
 const colorCustomProperties = (scheme: ColorScheme): string => {
   const base = REPORT_COLOR_TOKENS.base[scheme];
@@ -145,17 +162,18 @@ const names = REPORT_CLASS_NAMES;
 
 /** レポートの唯一のスタイルシート。`<style>` の中に、そのまま入れる。 */
 export const REPORT_STYLESHEET: string = [
-  `:root {\n  color-scheme: light dark;\n${colorCustomProperties('light')}\n${spacingCustomProperties()}\n  --bs-font-size-base: 1rem;\n  --bs-font-size-small: 0.875rem;\n  --bs-radius: 0.375rem;\n  --bs-line-height: 1.6;\n}`,
+  `:root {\n  color-scheme: light dark;\n${colorCustomProperties('light')}\n${spacingCustomProperties()}\n  --bs-font-size-base: 1rem;\n  --bs-font-size-small: 0.875rem;\n  --bs-font-size-table: ${READING.tableFontSizeRem}rem;\n  --bs-radius: 0.375rem;\n  --bs-line-height: ${READING.lineHeight};\n}`,
   `@media (prefers-color-scheme: dark) {\n:root {\n${colorCustomProperties('dark')}\n}\n}`,
   `body {\n  margin: 0;\n  color: var(--bs-color-text);\n  background: var(--bs-color-background);\n  font-family: system-ui, -apple-system, "Segoe UI", "Hiragino Sans", "Noto Sans JP", "Yu Gothic UI", Meiryo, sans-serif;\n  font-size: var(--bs-font-size-base);\n  line-height: var(--bs-line-height);\n}`,
-  `main {\n  max-width: 80rem;\n  margin: 0 auto;\n  padding: var(--bs-space-4) var(--bs-space-3);\n}`,
+  `main {\n  max-width: ${READING.mainMaxWidthRem}rem;\n  margin: 0 auto;\n  padding: var(--bs-space-4) var(--bs-space-3);\n}`,
   `h1, h2, h3, h4 {\n  line-height: 1.3;\n  margin: var(--bs-space-5) 0 var(--bs-space-3);\n}`,
+  headingRules(),
   `a {\n  color: var(--bs-color-link);\n}`,
   `a:focus-visible {\n  outline: 3px solid var(--bs-color-focus);\n  outline-offset: 2px;\n}`,
   `code, .${names.identifier} {\n  font-family: ui-monospace, SFMono-Regular, Consolas, "Liberation Mono", monospace;\n  font-size: var(--bs-font-size-small);\n  overflow-wrap: anywhere;\n}`,
   `.${names.section} {\n  margin-bottom: var(--bs-space-5);\n}`,
   `.${names.tableWrapper} {\n  overflow-x: auto;\n}`,
-  `.${names.table} {\n  width: 100%;\n  border-collapse: collapse;\n  font-size: var(--bs-font-size-small);\n}`,
+  `.${names.table} {\n  width: 100%;\n  border-collapse: collapse;\n  font-size: var(--bs-font-size-table);\n}`,
   `.${names.table} caption {\n  text-align: left;\n  font-weight: 600;\n  padding: var(--bs-space-2) 0;\n}`,
   `.${names.table} th, .${names.table} td {\n  border: 1px solid var(--bs-color-border);\n  padding: var(--bs-space-2);\n  text-align: left;\n  vertical-align: top;\n}`,
   `.${names.table} thead th {\n  background: var(--bs-color-surface);\n}`,

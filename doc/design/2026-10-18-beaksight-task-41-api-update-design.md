@@ -1,5 +1,7 @@
 # Task 41 設計書 — API の更新（UPDATE）
 
+> SPEC-4（2026-11-15）で画面の道を外した。設計書 `2026-11-14-beaksight-slim-and-simplify-design.md` 5.1
+
 状態: ユーザー承認済み（2026-10-18。7 章の 4 点すべて推奨のとおり）。G41 承認済み（2026-10-18。T41R4 で Critical 0・Important 0・Minor 0）
 作成: 2026-10-18（設計者）
 ロードマップ: `2026-10-16-beaksight-task-33-42-roadmap.md` の Program E の Task 41 と D4。Task 31（form の更新）、Task 38（承認）、Task 39（Guard と送り手）、Task 40（API の登録）の結果。

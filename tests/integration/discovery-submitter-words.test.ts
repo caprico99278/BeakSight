@@ -1,6 +1,6 @@
 // T27R-fix-2（T27R-fix-1 の報告の発見事項 3）: 発見の入口（`discoverPageCandidates`）が、送信ボタンの文言を `input` の `value` と画像の送信ボタン
 // （`input type=image`）の `alt` から読み、分類の語（`submitterWords`）に変えることを、本物の factory の Passive の Context（Guard つき）と、127.0.0.1
-// の fixture のサーバ（`tests/helpers/submitter-words-fixture.ts`）で確かめる。Chromium は headless だけ（テストの既定と、CLI の起動の設定の両方）。
+// の fixture のサーバ（`tests/helpers/submitter-words-fixture.ts`）で確かめる。Chromium はテストの既定だけ（TEST-POLICY の 3）。
 // - DEF-086 の後、候補は文言を持たないので、語のある文言を置いた所（`value`、`alt`）から語が出ることで、probe がその所を読んだことを確かめる。
 // - 対照: 語を probe が読まない属性（`data-label`、`name`、submit の `alt`、image の `value`）にだけ置いた form は、語が 0 件になる（語が別の所から
 //   出ていないこと）。
@@ -12,22 +12,18 @@ import type { DiscoveryCandidate } from '../../src/discovery/candidate-contracts
 import { discoverPageCandidates } from '../../src/discovery/discover-page.js';
 import { InFlightRequestCounter } from '../../src/discovery/settle.js';
 import { SafetyLedger } from '../../src/safety/safety-ledger.js';
-import { launchCliChromium, launchHeadlessChromium } from '../helpers/chromium.js';
+import { DEFAULT_CHROMIUM_LAUNCHERS } from '../helpers/chromium.js';
 import { READ_METHODS } from '../helpers/leak-places.js';
 import { closePassiveResources } from '../helpers/passive-cleanup.js';
 import { SUBMITTER_WORDS_FIXTURE_PATHS, startSubmitterWordsFixture, type SubmitterWordsFixture } from '../helpers/submitter-words-fixture.js';
 import { createTestConfig, TEST_FACTORY_OPTIONS } from '../helpers/test-config.js';
 
-const LAUNCHERS = [
-  ['the default test Chromium', () => launchHeadlessChromium()],
-  ['the CLI launch settings', () => launchCliChromium()],
-] as const;
 
 /** 候補の、比べる項目（種類、送信先の path、語、分類）。 */
 const summaryOf = (candidate: DiscoveryCandidate): readonly unknown[] =>
   [candidate.kind, candidate.action?.path ?? null, candidate.submitterWords, candidate.classification];
 
-describe.each(LAUNCHERS)('T27R-fix-2: the submitter words read from an input value and an image alt (%s)', (_name, launch) => {
+describe.each(DEFAULT_CHROMIUM_LAUNCHERS)('T27R-fix-2: the submitter words read from an input value and an image alt (%s)', (_name, launch) => {
   let browser: Browser;
   let fixture: SubmitterWordsFixture;
   const resources: { factory: BrowserContextFactory; context: BrowserContext }[] = [];

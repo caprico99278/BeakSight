@@ -13,7 +13,6 @@
       "allowedOrigins": ["https://admin.example.test"]
     },
     "crawl": {
-      "maxPages": 3,
       "minNavigationIntervalMs": 10000
     },
     "output": { "directory": "artifacts" }

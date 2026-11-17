@@ -5,17 +5,16 @@
  * - URL の判定の部品（http(s) か、userinfo を持つか、Origin の正規の形か）は、`validateConfig` と同じ `src/crawl/normalize-url.ts` の部品を使う。
  *   fragment を持たないことは、認証の設定の URL の決まり（`auth-setup-policy.ts`）と同じ `src/core/url-fragment.ts` の `hasUrlFragment` で判定する。
  * - 作るファイルの中身は、`target.id`・`site`・負荷（`crawl`）・出力（`output`）。負荷は、最初の読み込みのための控えめな値
- *   （`GENERATED_TARGET_CRAWL_LIMITS`。T43b fix round 2）のほかは既定値（`defaults.ts` の `DEFAULT_CONFIG`）の複製、出力は既定値の複製で、
+ *   （`GENERATED_TARGET_CRAWL_LIMITS`。T43b fix round 2）だけ（L14: 既定値の複製を書かない。隠れた既定を書き込まない）、出力は既定値の複製で、
  *   作るときには画面から負荷を変えない（作った後は、プロファイルの画面から 3 つの値だけを変えられる。T44d）。ブラウザの設定・画面の大きさ・監査の項目は書かない（`loadConfig` が既定値を合わせる）。
  * - 作るファイルの場所は `local/targets/<id>.json` の形だけ（`id` はプロファイルの ID の形。任意のパスに書かない。組み立ては画面の
  *   `display/start-url-draft.ts`）。サーバは、書く前に `isAcceptedTargetConfigPath`（`src/control/profile-policy.ts`）も通す。
  * - 利用者に見せる文は、`src/presentation/messages.ts` の `TARGET_SITE_PROBLEM_DESCRIPTIONS` と `TARGET_CONFIG_CREATION_FAILURE_DESCRIPTIONS`
  *   が、コードごとに持つ（すべてのコードを持つことは、画面の `display/catalog-coverage.ts` が型で確かめる）。
  */
-import { MAX_URL_LENGTH } from '../core/limits.js';
 import { hasUrlFragment } from '../core/url-fragment.js';
 import { isWindowsReservedDeviceName } from '../core/windows-reserved-names.js';
-import { canonicalHttpOriginOf, hasUrlCredentials, isHttpProtocol, isOriginInAllowedOrigins } from '../crawl/normalize-url.js';
+import { canonicalHttpOriginOf, hasUrlCredentials, isHttpProtocol, isOriginInAllowedOrigins, normalizeUrl } from '../crawl/normalize-url.js';
 import { DEFAULT_CONFIG } from './defaults.js';
 import type { AuditConfig } from './types.js';
 
@@ -25,8 +24,6 @@ export const TARGET_SITE_PROBLEMS = Object.freeze([
   'START_URL_REQUIRED',
   /** 開始の URL が、解析できないか、http(s) でない。 */
   'START_URL_INVALID',
-  /** 開始の URL が長すぎる（解析した後の形が `MAX_URL_LENGTH` を超える）。 */
-  'START_URL_TOO_LONG',
   /** 開始の URL が userinfo（ユーザー名・パスワード）を持つ。 */
   'START_URL_HAS_CREDENTIALS',
   /** 開始の URL が fragment（`#`）を持つ。 */
@@ -35,8 +32,6 @@ export const TARGET_SITE_PROBLEMS = Object.freeze([
   'ALLOWED_ORIGINS_REQUIRED',
   /** 許可 Origin に、http(s) の Origin の正規の形（例: `https://example.test`）でない値がある。 */
   'ALLOWED_ORIGIN_INVALID',
-  /** 許可 Origin が多すぎる（`MAX_GENERATED_ALLOWED_ORIGINS` を超える）。 */
-  'ALLOWED_ORIGINS_TOO_MANY',
   /** 許可 Origin に、開始の URL の Origin がない。 */
   'ALLOWED_ORIGINS_MISSING_START',
 ] as const);
@@ -68,8 +63,13 @@ const CREATION_FAILURE_SET: ReadonlySet<string> = new Set(TARGET_CONFIG_CREATION
  */
 export const TARGET_CRAWL_LIMIT_FIELDS = Object.freeze(['maxPages', 'maxRuntimeMs', 'minNavigationIntervalMs'] as const);
 export type TargetCrawlLimitField = (typeof TARGET_CRAWL_LIMIT_FIELDS)[number];
-/** 変えられる負荷の値（ページの数と、ms）。 */
-export type TargetCrawlLimits = Readonly<Record<TargetCrawlLimitField, number>>;
+/**
+ * 変えられる負荷の値（ページの数と、ms）。L14 の後の段: ページの上限と時間の上限は、利用者が指定したときだけ持つ（ないときは上限なし。画面は「指定なし」）。
+ * 読み込みの間隔はいつも持つ（サイトへの負荷の守り）。
+ */
+export type TargetCrawlLimits = Readonly<
+  Partial<Record<Exclude<TargetCrawlLimitField, 'minNavigationIntervalMs'>, number>> & { readonly minNavigationIntervalMs: number }
+>;
 
 /** T44d: 負荷の値の欄の誤り（閉じた一覧。欄に出す）。 */
 export const TARGET_CRAWL_LIMIT_PROBLEMS = Object.freeze([
@@ -77,8 +77,6 @@ export const TARGET_CRAWL_LIMIT_PROBLEMS = Object.freeze([
   'NOT_POSITIVE_INTEGER',
   /** 0 以上の整数でない（読み込みの間隔）。 */
   'NOT_NON_NEGATIVE_INTEGER',
-  /** T44R（Task 44 のレビューの M-3）: ページの上限が、設定の検証の上限（`MAX_CRAWL_MAX_PAGES`）を超える。 */
-  'ABOVE_MAX_PAGES',
   /** 読み込みの間隔が、今の下限（許可 Origin にループバックでないものがあれば 1 秒）より短い。 */
   'BELOW_NAVIGATION_INTERVAL_FLOOR',
 ] as const);
@@ -116,8 +114,7 @@ export const isTargetConfigCreationFailure = (value: string): value is TargetCon
  */
 export const isReservedTargetConfigName = (targetId: string): boolean => isWindowsReservedDeviceName(targetId);
 
-/** 作るファイルの許可 Origin の最大の件数（作成の入力のスキーマ `ui-profile-create` の `maxItems` と一致する）。 */
-export const MAX_GENERATED_ALLOWED_ORIGINS = 16;
+// LZ-3a: 作るファイルの許可 Origin の件数の上限（前は `MAX_GENERATED_ALLOWED_ORIGINS` 16）は撤廃した（作成の入力のスキーマにも maxItems を置かない）。
 
 // 作るファイルの場所（`local/targets/<プロファイルの ID>.json`）は、置き場所の owner（`src/control/target-config-locations.ts`）の定数と、プロファイルの
 // ID の形（`src/control/contracts.ts` の `PROFILE_ID_PATTERN`）で、画面の `display/start-url-draft.ts` の `generatedTargetConfigPathOf` が組み立てる
@@ -147,9 +144,7 @@ const startUrlReadingOf = (raw: string): { readonly url: URL } | { readonly prob
   if (hasUrlFragment(value)) {
     return { problem: 'START_URL_HAS_FRAGMENT' };
   }
-  if (url.href.length > MAX_URL_LENGTH) {
-    return { problem: 'START_URL_TOO_LONG' };
-  }
+  // L14（INV-LIMITS の表 A の N23）: 長さでは拒まない。
   return { url };
 };
 
@@ -174,13 +169,23 @@ export const startUrlHostnameOf = (raw: string): string | undefined => acceptedS
 /** 開始の URL の path（認証の設定の監査の path と成功の画面の path の案）。受けない開始の URL では `undefined`。 */
 export const startUrlPathOf = (raw: string): string | undefined => acceptedStartUrlOf(raw)?.pathname;
 
+/**
+ * MI-C（MI-1 の報告。設計者の判断）: 設定のファイルの開始の URL が、入れた開始の URL `raw` と同じか。比べる形は、監査の開始が開始の URL を読むときと同じ
+ * 正規化（`normalizeUrl` と、そのファイルの `crawl.allowedQueryParameters`。`run-coordinator.ts`・`entry-check-run.ts` と同じ呼び方）。入れた値の前後の
+ * 空白は除く（貼り付けの空白）。どちらかが正規化できなければ、同じとしない。画面のサーバの作成の自動の選び方（既にあるファイルを使うか）が使う。
+ */
+export const startsAtSameUrl = (config: Pick<AuditConfig, 'site'> & { readonly crawl: Pick<AuditConfig['crawl'], 'allowedQueryParameters'> }, raw: string): boolean => {
+  const allowedQueryParameters: ReadonlySet<string> = new Set(config.crawl.allowedQueryParameters);
+  const fileStart = normalizeUrl(config.site.startUrl, config.site.startUrl, allowedQueryParameters);
+  const entered = trimmedOf(raw);
+  const enteredStart = normalizeUrl(entered, entered, allowedQueryParameters);
+  return fileStart.ok && enteredStart.ok && fileStart.url === enteredStart.url;
+};
+
 /** 許可 Origin の誤り（受けるなら `null`）。値は 1 つずつ、http(s) の Origin の正規の形でなければならない。 */
 export const allowedOriginsProblemOf = (origins: readonly string[], startUrl: string): TargetSiteProblem | null => {
   if (origins.length === 0) {
     return 'ALLOWED_ORIGINS_REQUIRED';
-  }
-  if (origins.length > MAX_GENERATED_ALLOWED_ORIGINS) {
-    return 'ALLOWED_ORIGINS_TOO_MANY';
   }
   if (origins.some((origin) => canonicalHttpOriginOf(origin) === undefined)) {
     return 'ALLOWED_ORIGIN_INVALID';
@@ -202,12 +207,11 @@ export const targetSiteProblemsOf = (site: TargetSiteInput): readonly TargetSite
 };
 
 /**
- * 作るファイルの、最初の読み込みのための控えめな負荷（T43b fix round 2。Task 43 の設計書 7 章の最後の行。設計者の既定）。ページの上限は 3、
- * ページの読み込みの最小の間隔は 10 秒。ほかの負荷の項目と出力は既定値（`DEFAULT_CONFIG`）のまま。CLI の既定値は変えない。広げるときは、
- * プロファイルの画面の「監査の負荷」で変える（T44d。`TARGET_CRAWL_LIMIT_FIELDS`）か、作ったファイルを直す。
+ * 作るファイルの、最初の読み込みのための控えめな負荷（T43b fix round 2。Task 43 の設計書 7 章の最後の行。設計者の既定）。ページの読み込みの最小の間隔は
+ * 10 秒。ほかの負荷の項目と出力は既定値（`DEFAULT_CONFIG`）のまま。L14 の後の段（設計書 `2026-11-09-beaksight-remove-limits-design.md` 6.1）: ページの
+ * 上限 3 は書かない（利用者がプロファイルの画面の「監査の負荷」で指定したときだけ効く。T44d。`TARGET_CRAWL_LIMIT_FIELDS`）。
  */
 export const GENERATED_TARGET_CRAWL_LIMITS = Object.freeze({
-  maxPages: 3,
   minNavigationIntervalMs: 10_000,
 } as const satisfies Partial<AuditConfig['crawl']>);
 
@@ -215,7 +219,8 @@ export const GENERATED_TARGET_CRAWL_LIMITS = Object.freeze({
 export interface GeneratedTargetConfigDocument {
   readonly target: AuditConfig['target'];
   readonly site: AuditConfig['site'];
-  readonly crawl: AuditConfig['crawl'];
+  /** L14: 最初の読み込みの値（`GENERATED_TARGET_CRAWL_LIMITS`）だけを書く（隠れた既定の値を書かない。ほかは `loadConfig` が既定値を合わせる）。 */
+  readonly crawl: Partial<AuditConfig['crawl']>;
   readonly output: AuditConfig['output'];
 }
 
@@ -231,15 +236,16 @@ export interface GeneratedTargetConfigInput extends TargetSiteInput {
 export const targetConfigDocumentOf = (input: GeneratedTargetConfigInput): GeneratedTargetConfigDocument => ({
   target: { id: input.targetId },
   site: { startUrl: acceptedStartUrlOf(input.startUrl)?.href ?? trimmedOf(input.startUrl), allowedOrigins: [...input.allowedOrigins] },
-  crawl: { ...structuredClone(DEFAULT_CONFIG.crawl), ...GENERATED_TARGET_CRAWL_LIMITS },
+  crawl: { ...GENERATED_TARGET_CRAWL_LIMITS },
   output: structuredClone(DEFAULT_CONFIG.output),
 });
 
 /**
- * `validateConfig` に渡す、既定値を合わせた設定（`loadConfig` が読んだときと同じ値）。作るファイルは、持つ節（`target`・`site`・`crawl`・
- * `output`）をすべての項目で持つので、節ごとの置き換えが `loadConfig` の深い合わせと同じ結果になる。
+ * `validateConfig` に渡す、既定値を合わせた設定（`loadConfig` が読んだときと同じ値）。作るファイルは、`target`・`site`・`output` をすべての項目で持つので
+ * 節ごとに置き換え、`crawl`（L14: 最初の読み込みの値だけ）は既定値に項目ごとに重ねる（`loadConfig` の深い合わせと同じ結果）。
  */
 export const effectiveConfigInputOf = (document: GeneratedTargetConfigDocument): Readonly<Record<string, unknown>> => ({
   ...structuredClone(DEFAULT_CONFIG),
   ...structuredClone(document),
+  crawl: { ...structuredClone(DEFAULT_CONFIG.crawl), ...structuredClone(document.crawl) },
 });

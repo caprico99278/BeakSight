@@ -1,6 +1,6 @@
 // DEF-102 fix（サイトへの負荷の手順書 `doc/spec/site-load.md` の「ページの読み込みの間隔」）: 自動ログインの段（`runAutomatedLoginStage`）の
 // 読み込みも、ジョブと同じ読み込みの間隔の部品（`NavigationPacer`）を通る。127.0.0.1 の fixture のサーバ（`automated-login-fixture.ts`。届いた時刻を
-// 記録する）と、偽の暗号化の部品の資格情報で、両方の Chromium（テストの既定と CLI の起動の設定）で確かめる。
+// 記録する）と、偽の暗号化の部品の資格情報で、テストの既定の Chromium で確かめる（TEST-SLIM）。
 // - ログインの画面の GET と、ログインの POST が、サーバに届く間隔は、設定の間隔以上である（POST の前にも間隔の待ちを通す）。
 // - ログインの直後の最初の読み込み（ジョブと同じ順: 同じ pacer を渡した factory で Context を作り、間隔の待ちを通してから読み込む）が、
 //   サーバに届くのは、ログインの段の最後の要求（ログインの POST と、その応答のリダイレクトの先の画面）が届いてから、設定の間隔以上後である
@@ -30,14 +30,10 @@ import {
   type AutomatedLoginFixture,
   type AutomatedLoginFixtureRequest,
 } from '../helpers/automated-login-fixture.js';
-import { BROWSER_DEFAULT_FAVICON_PATH, launchCliChromium, launchHeadlessChromium } from '../helpers/chromium.js';
+import { BROWSER_DEFAULT_FAVICON_PATH, DEFAULT_CHROMIUM_LAUNCHERS } from '../helpers/chromium.js';
 import { createTestConfig, TEST_FACTORY_OPTIONS } from '../helpers/test-config.js';
 import { createTestCredentialStore, type TestCredentialStore } from '../helpers/test-credential-store.js';
 
-const LAUNCHERS = [
-  ['the default test Chromium', () => launchHeadlessChromium()],
-  ['the CLI launch settings', () => launchCliChromium()],
-] as const;
 const PROFILE_ID = 'pacing-auth';
 /**
  * ページの読み込みの最小の間隔（ms）。ログインの画面を読んでから送るまで（フォームの確かめ、値の入力、送信の窓の待ち）と、ログインの段を閉じて
@@ -49,7 +45,7 @@ const TEST_TIMEOUT_MS = 60_000;
 const RUN_TEST_TIMEOUT_MS = 120_000;
 const p = AUTOMATED_LOGIN_FIXTURE_PATHS;
 
-describe.each(LAUNCHERS)('DEF-102 fix: the automated login stage goes through the navigation pacing (%s)', (_name, launch) => {
+describe.each(DEFAULT_CHROMIUM_LAUNCHERS)('DEF-102 fix: the automated login stage goes through the navigation pacing (%s)', (_name, launch) => {
   const username = `u${randomBytes(12).toString('hex')}`;
   const password = `p${randomBytes(12).toString('hex')}`;
   let fixture: AutomatedLoginFixture;
@@ -204,6 +200,6 @@ describe.each(LAUNCHERS)('DEF-102 fix: the automated login stage goes through th
     expect(loginNavigations).toBe(2);
     expect(result.run.load.navigationCount).toBe(runRequests.length);
     expect(pacer.snapshot().navigationCount).toBe(loginNavigations + runRequests.length);
-    expect(result.pages.map((page) => page.status)).toEqual(['AUDITED']);
+    expect(result.pages.summaries().map((page) => page.status)).toEqual(['AUDITED']);
   }, RUN_TEST_TIMEOUT_MS);
 });

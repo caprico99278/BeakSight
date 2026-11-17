@@ -8,8 +8,8 @@
  * 3. 止める要求が先に来ていれば、読み込まずに `STOPPED`。
  * 4. 開始の URL（`normalizeUrl`）を、Guard の付いた新しい Context で **1 回だけ** 読み込む（`visitGuardedPage`。PRIMARY の viewport。読み込みの直前に
  *    読み込みの間隔を待つ。読み込み直さない）。
- *    - 許可 Origin の外へ移ろうとした（Guard が止めた main frame の移動。Safety Ledger の `blockedNavigations`）: 移ろうとした Origin だけを記録し、
- *      読まない（`LEFT_ALLOWED_ORIGINS`）。読み込みの後に、ページの JS が外へ移ろうとした場合も同じ（読んだ事実は残し、案は作らない）。
+ *    - 許可 Origin の外へ移った（SD-2 から Guard は止めず、今の main frame の URL で見る。前の記録の形の Safety Ledger の `blockedNavigations` も見る）: 移った
+ *      Origin だけを記録し、読まない（`LEFT_ALLOWED_ORIGINS`）。読み込みの後に、ページの JS が外へ移った場合も同じ（読んだ事実は残し、案は作らない）。
  *    - 読み込みが失敗した: `NAVIGATION_FAILED`。
  *    - 読み込めた: 落ち着いたら凍結し、isolated world で読む（`entry-check-page.ts`）。凍結できない・読めなければ `READ_FAILED`。
  * 5. Safety Ledger の不変条件の違反があれば `SAFETY_VIOLATION`。
@@ -39,9 +39,9 @@ import { formatCompactUtcTimestamp } from '../core/utc-timestamp.js';
 import { createNavigationPacer, type NavigationPacer } from '../crawl/navigation-pacer.js';
 import { normalizeUrl } from '../crawl/normalize-url.js';
 import type { DiscoverySettlePolicy } from '../discovery/settle.js';
-import { closeBrowserBeforeDeadline, runPreflight, type BrowserLauncher } from '../orchestration/preflight.js';
+import { endPreflightBrowser, runPreflight, type BrowserLauncher, type BrowserLease } from '../orchestration/preflight.js';
 import { ArtifactWriter } from '../report/artifact-writer.js';
-import { isPageLoadLimitReached, pageRequestCountsOf, type PageRequestCounts } from '../safety/passive-request-guard.js';
+import { isPageLoadLimitReached } from '../safety/passive-request-guard.js';
 import { SafetyLedger } from '../safety/safety-ledger.js';
 import { readEntryPage } from './entry-check-page.js';
 import { endWorkerRun, startWorkerRun, visitGuardedPage } from './worker-run-session.js';
@@ -56,6 +56,8 @@ export interface EntryCheckRunRequest {
   /** 入口の確かめのジョブの ID（成果物に書き、親が照らし合わせる）。 */
   readonly jobId: string;
   readonly launchBrowser: BrowserLauncher;
+  /** RB-5: ワーカーの Browser の lease（あれば `launchBrowser` を呼ばずに借りる。`runPreflight` の `browserLease`）。 */
+  readonly browserLease?: BrowserLease | undefined;
   readonly clock: () => Date;
   readonly now: () => number;
   /** 止める印（読み込みの前だけ見る。読み込んだ後は、その画面を読み終えてから終わる）。 */
@@ -90,7 +92,7 @@ export type EntryCheckRunOutcome =
     readonly exitCode: number;
     readonly summary: EntryCheckSummary;
   }
-  | { readonly kind: 'RUN_ACTIVE'; readonly activeRunId: RunId | null; readonly exitCode: number }
+  | { readonly kind: 'RUN_ACTIVE'; readonly exitCode: number }
   | {
     readonly kind: 'RUN_DIRECTORY_UNAVAILABLE';
     readonly runId: RunId;
@@ -105,21 +107,25 @@ interface EntryVisit {
   readonly landing: EntryCheckLocation | null;
   readonly facts: EntryCheckFacts | null;
   readonly blockedRequests: number;
-  /** DEF-129: Guard が通した main frame の文書の要求の数、T37R2-fix で子の frame の文書の要求の数、DEF-130-fix で文書でない要求の数。 */
-  readonly requestCounts: PageRequestCounts;
 }
-
-/** DEF-129: 読み込まなかった（か、読み込みの事実のない）結果の要求の数。 */
-const NO_REQUESTS: PageRequestCounts = Object.freeze({ documentRequests: 0, childFrameDocumentRequests: 0, subresourceRequests: 0 });
 
 /** 読み込まずに終わった結果。 */
 const unvisited = (endReason: EntryCheckEndReason): EntryVisit => ({
-  endReason, landing: null, facts: null, blockedRequests: 0, requestCounts: NO_REQUESTS,
+  endReason, landing: null, facts: null, blockedRequests: 0,
 });
 
-/** Guard が止めた、main frame の許可 Origin の外への移動の、最初の Origin（なければ `null`）。 */
-const blockedExternalLandingOf = (ledger: SafetyLedger, allowedOrigins: readonly string[]): EntryCheckLocation | null => {
-  for (const { url } of ledger.snapshot().blockedNavigations) {
+/**
+ * 許可 Origin の外へ移った先（なければ `null`）。Guard が止めた main frame の移動（前の記録の形）か、SD-2（設計書
+ * `2026-11-16-beaksight-action-based-delete-guard-design.md` 2.4。Guard は main frame の移動を止めない）で移った今の main frame の URL。
+ */
+const externalLandingOf = (ledger: SafetyLedger, page: { url(): string }, allowedOrigins: readonly string[]): EntryCheckLocation | null => {
+  let current = '';
+  try {
+    current = page.url();
+  } catch {
+    // 閉じた page は、今の URL を読まない。
+  }
+  for (const url of [...ledger.snapshot().blockedNavigations.map((navigation) => navigation.url), current]) {
     const location = entryCheckLocationOf(url, allowedOrigins);
     if (location !== null && !location.inAllowedOrigins) {
       return location;
@@ -141,20 +147,23 @@ async function visitStart(
     throw new RangeError('the start URL of the configuration cannot be normalized');
   }
   const { allowedOrigins } = config.site;
-  const visit = await visitGuardedPage(factory, pacer, start.url, { config, allowedQueryParameters }, async ({ page, ledger, counter, navigation }) => {
-    const external = blockedExternalLandingOf(ledger, allowedOrigins);
+  // DEF-236: 入口の確かめは 1 画面だけ読むので、その画面の後に読み込みの間隔を待たずに閉じる（`pacingWaitBeforeClose`）。
+  // REV-SD の I-1: 読み込みの後に点検の範囲の外へ移った画面は、ここで扱う（許可 Origin の外なら移った先を伝え、同じ Origin の範囲の外なら読めなかったとする）。
+  const visitOptions = { config, allowedQueryParameters, pacingWaitBeforeClose: false, outsideAuditScopeHandledByCaller: true as const };
+  const visit = await visitGuardedPage(factory, pacer, start.url, visitOptions, async ({ page, ledger, counter, navigation, outsideAuditScope }) => {
+    const external = externalLandingOf(ledger, page, allowedOrigins);
     if (navigation.navigationOutcome !== 'OK') {
       return external === null
         ? { endReason: 'NAVIGATION_FAILED' as const, landing: null, facts: null }
         : { endReason: 'LEFT_ALLOWED_ORIGINS' as const, landing: external, facts: null };
     }
     const reading = await readEntryPage(page, counter, allowedOrigins, settlePolicy);
-    // 読み込みの後に、ページの JS が許可 Origin の外へ移ろうとした（Guard が止めた）なら、移ろうとした Origin を移った先にする（案は作らない）。
-    const leftAfterLoad = blockedExternalLandingOf(ledger, allowedOrigins);
+    // 読み込みの後に、ページの JS が許可 Origin の外へ移った（SD-2 の前は Guard が止めた）なら、移った Origin を移った先にする（案は作らない）。
+    const leftAfterLoad = externalLandingOf(ledger, page, allowedOrigins);
     const read = reading.location === null ? null : entryCheckLocationOf(`${reading.location.origin}${reading.location.path}`, allowedOrigins);
     const finalUrl = navigation.finalUrl === null ? null : entryCheckLocationOf(navigation.finalUrl, allowedOrigins);
     const landing = leftAfterLoad ?? read ?? finalUrl;
-    if (reading.kind !== 'READ') {
+    if (reading.kind !== 'READ' || (leftAfterLoad === null && outsideAuditScope() !== null)) {
       return { endReason: leftAfterLoad === null ? 'READ_FAILED' as const : 'LEFT_ALLOWED_ORIGINS' as const, landing, facts: null };
     }
     return { endReason: leftAfterLoad === null ? 'READ' as const : 'LEFT_ALLOWED_ORIGINS' as const, landing, facts: reading.facts };
@@ -163,7 +172,6 @@ async function visitStart(
     case 'VISITED': {
       const { landing, facts } = visit.value;
       // DEF-129: ページが始めた読み込み（main frame か、T37R2-fix で子の frame）を Guard が上限で止めた画面は、読み切れない（読んだ事実も案も残さない）。
-      // DEF-130-fix: 文書でない要求を上限で止めた画面も同じ。
       const endReason = isPageLoadLimitReached(visit.pageLoad) && visit.value.endReason === 'READ' ? 'READ_FAILED' : visit.value.endReason;
       return {
         endReason: visit.violation ? 'SAFETY_VIOLATION' : endReason,
@@ -171,13 +179,11 @@ async function visitStart(
         // 事実は、読んだ（`READ`）ときだけ残す（スキーマの決まり）。
         facts: endReason === 'READ' && !visit.violation ? facts : null,
         blockedRequests: visit.blockedRequests,
-        requestCounts: pageRequestCountsOf(visit.pageLoad),
       };
     }
     case 'FAILED':
       return {
         endReason: visit.violation ? 'SAFETY_VIOLATION' : 'READ_FAILED', landing: null, facts: null, blockedRequests: visit.blockedRequests,
-        requestCounts: NO_REQUESTS,
       };
     case 'NOT_OPENED':
       return unvisited(visit.violation ? 'SAFETY_VIOLATION' : 'NAVIGATION_FAILED');
@@ -185,7 +191,6 @@ async function visitStart(
       // 認証の指定を渡さないので起きない（fail-closed に、読まなかったとする）。
       return {
         endReason: visit.violation ? 'SAFETY_VIOLATION' : 'READ_FAILED', landing: null, facts: null, blockedRequests: visit.blockedRequests,
-        requestCounts: NO_REQUESTS,
       };
   }
 }
@@ -197,6 +202,7 @@ async function check(request: EntryCheckRunRequest, outputDirectory: string): Pr
   const preflight = await runPreflight({
     config,
     launchBrowser: request.launchBrowser,
+    browserLease: request.browserLease,
     createSafetyLedger: () => new SafetyLedger(),
     outputDirectory,
     contextFactoryOptions: { navigationPacer: pacer },
@@ -204,14 +210,14 @@ async function check(request: EntryCheckRunRequest, outputDirectory: string): Pr
   if (!preflight.ok) {
     return unvisited('PREFLIGHT_FAILED');
   }
-  const { browser, factory } = preflight;
+  const { factory } = preflight;
   try {
     if (request.stopSignal.aborted) {
       return unvisited('STOPPED');
     }
     return await visitStart(factory, pacer, config, request.settlePolicy);
   } finally {
-    await closeBrowserBeforeDeadline(browser);
+    await endPreflightBrowser(preflight);
   }
 }
 
@@ -223,13 +229,14 @@ export async function executeEntryCheckRun(request: EntryCheckRunRequest, observ
   const { config } = request;
   const outputDirectory = resolve(config.output.directory);
   const writer = new ArtifactWriter({ urlSecretRedaction: true });
-  const run = await startWorkerRun(writer, outputDirectory, request.clock, request.now);
+  const run = await startWorkerRun(outputDirectory, request.clock);
   if (run.kind !== 'STARTED') {
     return run;
   }
   const { runId, runDirectory, startedAt } = run;
-  observer.onRunStarted({ runId, runDirectory });
   try {
+    // 知らせの口の例外でも、監査中の印を離す（finally の `endWorkerRun`）。
+    observer.onRunStarted({ runId, runDirectory });
     const visit = await check(request, outputDirectory);
     // T44g（P4-5）: ここから成果物を組み立てて書く段。入る前に 1 回だけ知らせる（発見・READ の確かめと同じ）。
     observer.onFinalizing?.();
@@ -246,11 +253,10 @@ export async function executeEntryCheckRun(request: EntryCheckRunRequest, observ
       facts: visit.facts,
       proposal: visit.landing === null || visit.facts === null ? null : entryCheckProposalOf(visit.landing, visit.facts),
       blockedRequests: visit.blockedRequests,
-      ...visit.requestCounts,
     };
     await writer.writeEntryCheck(runDirectory, document);
     return { kind: 'RAN', runId, runDirectory, runStatus, exitCode: EXIT_CODES[runStatus], summary: entryCheckSummaryOf(document) };
   } finally {
-    await endWorkerRun(writer, run);
+    await endWorkerRun(run);
   }
 }

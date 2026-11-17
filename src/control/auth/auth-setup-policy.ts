@@ -45,24 +45,10 @@ import {
   AUTH_SETUP_SCHEMA_NAME,
   AUTOMATED_LOGIN_FAILURE_CONDITION_KINDS,
   AUTOMATED_LOGIN_MAX_LOGIN_ATTEMPTS,
-  MAX_ALLOWED_IDP_ORIGINS,
-  MAX_AUTH_SETUP_PATH_LIST_ITEMS,
-  MAX_AUTH_SETUP_URL_LENGTH,
   MAX_LOGIN_ATTEMPTS,
-  MAX_LOGIN_POST_ENDPOINTS,
-  MAX_AUDIT_READ_REQUESTS,
-  MAX_AUDIT_READ_REQUESTS_PER_PAGE_LOAD,
-  MAX_LOGIN_SIDE_REQUESTS,
-  MAX_LOGIN_SIDE_REQUESTS_PER_LOGIN_STAGE,
-  MAX_SERVICE_REQUESTS_PER_MINUTE,
-  MAX_SERVICE_REQUESTS_PER_RUN,
   MIN_AUDIT_READ_REQUESTS_PER_PAGE_LOAD,
   MIN_SERVICE_REQUESTS_PER_MINUTE,
   MIN_SERVICE_REQUESTS_PER_RUN,
-  MAX_SCRIPT_LOGIN_QUERY_PART_LENGTH,
-  MAX_SCRIPT_LOGIN_REQUIRED_QUERY,
-  MAX_SUCCESS_SELECTOR_LENGTH,
-  MAX_SUCCESS_STORAGE_KEY_PART_LENGTH,
   MIN_LOGIN_ATTEMPTS,
   MIN_LOGIN_SIDE_REQUESTS_PER_LOGIN_STAGE,
   SCRIPT_REQUEST_TRANSPORT,
@@ -199,82 +185,37 @@ const rejected = (errors: readonly AuthSetupValidationError[]): AuthSetupValidat
 /** 写しの自身のプロパティの値（オブジェクトでないか、プロパティがなければ `undefined`）。 */
 const ownFieldOf = (value: unknown, key: string): unknown => (isRecord(value) && Object.hasOwn(value, key) ? value[key] : undefined);
 
-/** 文字列が長さの上限（UTF-16 のコード単位）を超えるか（文字列でなければ、形の誤りとしてスキーマに任せる）。 */
-const isTooLong = (value: unknown, maxLength: number): boolean => typeof value === 'string' && value.length > maxLength;
-
 /** 配列の値（配列でなければ空。形の誤りはスキーマに任せる）。 */
 const arrayOf = (value: unknown): readonly unknown[] => (Array.isArray(value) ? value : []);
 
-/** 文字列の項目の長さの誤り。 */
-const lengthErrorsOf = (location: FieldLocation, value: unknown, maxLength: number): readonly AuthSetupValidationError[] =>
-  isTooLong(value, maxLength)
-    ? [errorOf('AUTH_SETUP_LIMIT_EXCEEDED', `${location.label} must be at most ${maxLength} UTF-16 code units`, location.pointer)]
-    : [];
+// LZ-2: 文字列の項目の長さの上限（成功・自動ログイン・失敗の条件のセレクタ 256、必須の query の名前と値 256、成功の鍵の接頭辞と接尾辞 256）は撤廃した。
 
-/** 配列の項目の件数の誤り。 */
-const itemCountErrorsOf = (location: FieldLocation, items: readonly unknown[], maxItems: number): readonly AuthSetupValidationError[] =>
-  items.length > maxItems
-    ? [errorOf('AUTH_SETUP_LIMIT_EXCEEDED', `${location.label} must have at most ${maxItems} items`, location.pointer)]
-    : [];
+// LZ-3a: 配列の項目の件数の上限（前は除く path と監査の path の 50）は撤廃した。URL-LEN: 各項目（path）の長さの上限（前は 2,048）もない。
 
-/** 配列の項目の件数と、各項目の長さの誤り。 */
-const listLimitErrorsOf = (location: FieldLocation, value: unknown, maxItems: number): readonly AuthSetupValidationError[] => {
-  const items = arrayOf(value);
-  return [
-    ...itemCountErrorsOf(location, items, maxItems),
-    ...items.slice(0, maxItems).flatMap((item, index) => lengthErrorsOf(childOf(location, index), item, MAX_AUTH_SETUP_URL_LENGTH)),
-  ];
-};
-
-/** 自動ログインの設定の長さの誤り（T26b。3 つのセレクタと、失敗の条件の path とセレクタ）。 */
-const automatedLoginLimitErrorsOf = (automatedLogin: unknown): readonly AuthSetupValidationError[] => {
-  const failureConditions = ownFieldOf(automatedLogin, 'failureConditions');
-  return [
-    ...AUTOMATED_LOGIN_SELECTOR_FIELDS.flatMap((field) =>
-      lengthErrorsOf(childOf(AUTOMATED_LOGIN_LOCATION, field), ownFieldOf(automatedLogin, field), MAX_SUCCESS_SELECTOR_LENGTH)),
-    ...AUTOMATED_LOGIN_FAILURE_CONDITION_KINDS.flatMap((kind) => {
-      const condition = ownFieldOf(failureConditions, kind);
-      const location = childOf(FAILURE_CONDITIONS_LOCATION, kind);
-      return [
-        ...lengthErrorsOf(childOf(location, 'pathPrefix'), ownFieldOf(condition, 'pathPrefix'), MAX_AUTH_SETUP_URL_LENGTH),
-        ...lengthErrorsOf(childOf(location, 'selector'), ownFieldOf(condition, 'selector'), MAX_SUCCESS_SELECTOR_LENGTH),
-      ];
-    }),
-  ];
-};
-
-/** 整数の値が、下限と上限の外か（整数でない値は、形の誤りとしてスキーマに任せる）。 */
-const isIntegerOutside = (value: unknown, minimum: number, maximum: number): boolean =>
-  Number.isInteger(value) && ((value as number) < minimum || (value as number) > maximum);
-
-/** 範囲の外の整数の誤り（`AUTH_SETUP_LIMIT_EXCEEDED`）。範囲の中か、整数でなければ空。 */
-const rangeErrorsOf = (location: FieldLocation, value: unknown, minimum: number, maximum: number): readonly AuthSetupValidationError[] =>
-  (isIntegerOutside(value, minimum, maximum)
-    ? [errorOf('AUTH_SETUP_LIMIT_EXCEEDED', `${location.label} must be from ${minimum} to ${maximum}`, location.pointer)]
+/** L11: 整数の値の下限の誤り（上限のない回数・要求の数の項目。整数でない値は、形の誤りとしてスキーマに任せる）。 */
+const minimumErrorsOf = (location: FieldLocation, value: unknown, minimum: number): readonly AuthSetupValidationError[] =>
+  (Number.isInteger(value) && (value as number) < minimum
+    ? [errorOf('AUTH_SETUP_LIMIT_EXCEEDED', `${location.label} must be at least ${minimum}`, location.pointer)]
     : []);
 
 /**
- * 版 3 の任意の項目の上限の誤り（T35a。Task 35 の設計書 3.1）: 監査の段の読み取りの手続きの呼び出し（件数、Origin・path の長さ、1 回の読み込みあたりの
- * 上限）と、承認したサービスの Origin への要求の上限（1 分あたり、1 回の Run あたり）。
+ * 版 3 の任意の項目の上限の誤り（T35a。Task 35 の設計書 3.1）: 監査の段の読み取りの手続きの呼び出し（1 回の読み込みあたりの回数の下限）と、承認した
+ * サービスの Origin への要求の上限（1 分あたり、1 回の Run あたり）。
  */
 const auditStageLimitErrorsOf = (copy: unknown): readonly AuthSetupValidationError[] => {
+  // L11（設計書 `2026-11-09-beaksight-remove-limits-design.md` 4。設計者の判断 (b)）: 件数の上限と、回数・要求の上限の範囲の最大は撤廃した（下限だけを確かめる。
+  // 回数と要求の上限の値は、Guard と上限の部品が使わない）。URL-LEN: Origin・path の長さの上限（前は 2,048）も撤廃した。
   const reads = arrayOf(ownFieldOf(copy, AUDIT_READ_REQUESTS_LABEL));
-  const errors: AuthSetupValidationError[] = [...itemCountErrorsOf(AUDIT_READ_REQUESTS_LOCATION, reads, MAX_AUDIT_READ_REQUESTS)];
-  reads.slice(0, MAX_AUDIT_READ_REQUESTS).forEach((read, index) => {
-    const location = childOf(AUDIT_READ_REQUESTS_LOCATION, index);
-    errors.push(
-      ...lengthErrorsOf(childOf(location, 'origin'), ownFieldOf(read, 'origin'), MAX_AUTH_SETUP_URL_LENGTH),
-      ...lengthErrorsOf(childOf(location, 'path'), ownFieldOf(read, 'path'), MAX_AUTH_SETUP_URL_LENGTH),
-      ...rangeErrorsOf(childOf(location, 'maxPerPageLoad'), ownFieldOf(read, 'maxPerPageLoad'),
-        MIN_AUDIT_READ_REQUESTS_PER_PAGE_LOAD, MAX_AUDIT_READ_REQUESTS_PER_PAGE_LOAD),
-    );
+  const errors: AuthSetupValidationError[] = [];
+  reads.forEach((read, index) => {
+    errors.push(...minimumErrorsOf(
+      childOf(childOf(AUDIT_READ_REQUESTS_LOCATION, index), 'maxPerPageLoad'), ownFieldOf(read, 'maxPerPageLoad'), MIN_AUDIT_READ_REQUESTS_PER_PAGE_LOAD,
+    ));
   });
   const limits = ownFieldOf(copy, SERVICE_REQUEST_LIMITS_LABEL);
   errors.push(
-    ...rangeErrorsOf(childOf(SERVICE_REQUEST_LIMITS_LOCATION, 'perMinute'), ownFieldOf(limits, 'perMinute'),
-      MIN_SERVICE_REQUESTS_PER_MINUTE, MAX_SERVICE_REQUESTS_PER_MINUTE),
-    ...rangeErrorsOf(childOf(SERVICE_REQUEST_LIMITS_LOCATION, 'perRun'), ownFieldOf(limits, 'perRun'),
-      MIN_SERVICE_REQUESTS_PER_RUN, MAX_SERVICE_REQUESTS_PER_RUN),
+    ...minimumErrorsOf(childOf(SERVICE_REQUEST_LIMITS_LOCATION, 'perMinute'), ownFieldOf(limits, 'perMinute'), MIN_SERVICE_REQUESTS_PER_MINUTE),
+    ...minimumErrorsOf(childOf(SERVICE_REQUEST_LIMITS_LOCATION, 'perRun'), ownFieldOf(limits, 'perRun'), MIN_SERVICE_REQUESTS_PER_RUN),
   );
   return errors;
 };
@@ -285,73 +226,28 @@ const auditStageLimitErrorsOf = (copy: unknown): readonly AuthSetupValidationErr
  * 形の誤りは、スキーマに任せる。
  */
 const version3LimitErrorsOf = (copy: unknown): readonly AuthSetupValidationError[] => {
-  const scriptLogin = ownFieldOf(copy, SCRIPT_LOGIN_LABEL);
-  const queries = arrayOf(ownFieldOf(scriptLogin, 'requiredQuery'));
-  const errors: AuthSetupValidationError[] = [
-    ...lengthErrorsOf(childOf(SCRIPT_LOGIN_LOCATION, 'origin'), ownFieldOf(scriptLogin, 'origin'), MAX_AUTH_SETUP_URL_LENGTH),
-    ...lengthErrorsOf(childOf(SCRIPT_LOGIN_LOCATION, 'path'), ownFieldOf(scriptLogin, 'path'), MAX_AUTH_SETUP_URL_LENGTH),
-    ...itemCountErrorsOf(REQUIRED_QUERY_LOCATION, queries, MAX_SCRIPT_LOGIN_REQUIRED_QUERY),
-    ...queries.slice(0, MAX_SCRIPT_LOGIN_REQUIRED_QUERY).flatMap((query, index) => [
-      ...lengthErrorsOf(childOf(childOf(REQUIRED_QUERY_LOCATION, index), 'name'), ownFieldOf(query, 'name'), MAX_SCRIPT_LOGIN_QUERY_PART_LENGTH),
-      ...lengthErrorsOf(childOf(childOf(REQUIRED_QUERY_LOCATION, index), 'value'), ownFieldOf(query, 'value'), MAX_SCRIPT_LOGIN_QUERY_PART_LENGTH),
-    ]),
-  ];
+  // URL-LEN: 送信先・ログインに伴う送信・成功の鍵の Origin と path の長さの上限（前は 2,048）は撤廃した。L11: 必須の query の件数の上限も撤廃した。
+  // LZ-2: 必須の query の名前と値、成功の鍵の接頭辞と接尾辞の長さの上限（前は 256）も撤廃した。
+  const errors: AuthSetupValidationError[] = [];
   const sideRequests = arrayOf(ownFieldOf(copy, LOGIN_SIDE_REQUESTS_LABEL));
-  errors.push(...itemCountErrorsOf(LOGIN_SIDE_REQUESTS_LOCATION, sideRequests, MAX_LOGIN_SIDE_REQUESTS));
-  sideRequests.slice(0, MAX_LOGIN_SIDE_REQUESTS).forEach((sideRequest, index) => {
-    const location = childOf(LOGIN_SIDE_REQUESTS_LOCATION, index);
-    errors.push(
-      ...lengthErrorsOf(childOf(location, 'origin'), ownFieldOf(sideRequest, 'origin'), MAX_AUTH_SETUP_URL_LENGTH),
-      ...lengthErrorsOf(childOf(location, 'path'), ownFieldOf(sideRequest, 'path'), MAX_AUTH_SETUP_URL_LENGTH),
-    );
-    const limit = ownFieldOf(sideRequest, 'maxPerLoginStage');
-    if (Number.isInteger(limit)
-      && ((limit as number) < MIN_LOGIN_SIDE_REQUESTS_PER_LOGIN_STAGE || (limit as number) > MAX_LOGIN_SIDE_REQUESTS_PER_LOGIN_STAGE)) {
-      const limitLocation = childOf(location, 'maxPerLoginStage');
-      errors.push(errorOf(
-        'AUTH_SETUP_LIMIT_EXCEEDED',
-        `${limitLocation.label} must be from ${MIN_LOGIN_SIDE_REQUESTS_PER_LOGIN_STAGE} to ${MAX_LOGIN_SIDE_REQUESTS_PER_LOGIN_STAGE}`,
-        limitLocation.pointer,
-      ));
-    }
+  // L11: ログインに伴う送信の件数の上限と、ログインの段 1 回あたりの回数の範囲の最大は撤廃した（下限だけ。回数は Guard が使わない）。
+  sideRequests.forEach((sideRequest, index) => {
+    errors.push(...minimumErrorsOf(
+      childOf(childOf(LOGIN_SIDE_REQUESTS_LOCATION, index), 'maxPerLoginStage'), ownFieldOf(sideRequest, 'maxPerLoginStage'),
+      MIN_LOGIN_SIDE_REQUESTS_PER_LOGIN_STAGE,
+    ));
   });
   errors.push(...auditStageLimitErrorsOf(copy));
-  const storageKey = ownFieldOf(copy, SUCCESS_STORAGE_KEY_LABEL);
-  errors.push(
-    ...lengthErrorsOf(childOf(SUCCESS_STORAGE_KEY_LOCATION, 'origin'), ownFieldOf(storageKey, 'origin'), MAX_AUTH_SETUP_URL_LENGTH),
-    ...lengthErrorsOf(childOf(SUCCESS_STORAGE_KEY_LOCATION, 'prefix'), ownFieldOf(storageKey, 'prefix'), MAX_SUCCESS_STORAGE_KEY_PART_LENGTH),
-    ...lengthErrorsOf(childOf(SUCCESS_STORAGE_KEY_LOCATION, 'suffix'), ownFieldOf(storageKey, 'suffix'), MAX_SUCCESS_STORAGE_KEY_PART_LENGTH),
-  );
   return errors;
 };
 
-/** 上限の誤り（設計書 4.1。長さ・件数・回数）。 */
+/**
+ * 上限の誤り（設計書 4.1。長さ・件数・回数）。URL-LEN: 開始の URL・送信先・条件の path・除く path・IdP の Origin の長さの上限（前は 2,048）は撤廃した。
+ * L11: ログインの送信先と IdP の Origin の件数の上限も撤廃済み（IdP の Origin の空だけを受ける決まりは別の確かめ）。LZ-3a: 除く path と監査の path の
+ * 件数の上限も撤廃した。
+ */
 const limitErrorsOf = (copy: unknown): readonly AuthSetupValidationError[] => {
-  const errors: AuthSetupValidationError[] = [
-    ...lengthErrorsOf(LOGIN_START_URL_LOCATION, ownFieldOf(copy, 'loginStartUrl'), MAX_AUTH_SETUP_URL_LENGTH),
-  ];
-  const endpoints = arrayOf(ownFieldOf(copy, 'loginPostEndpoints'));
-  errors.push(...itemCountErrorsOf(LOGIN_POST_ENDPOINTS_LOCATION, endpoints, MAX_LOGIN_POST_ENDPOINTS));
-  endpoints.slice(0, MAX_LOGIN_POST_ENDPOINTS).forEach((endpoint, index) => {
-    const location = childOf(LOGIN_POST_ENDPOINTS_LOCATION, index);
-    errors.push(
-      ...lengthErrorsOf(childOf(location, 'origin'), ownFieldOf(endpoint, 'origin'), MAX_AUTH_SETUP_URL_LENGTH),
-      ...lengthErrorsOf(childOf(location, 'path'), ownFieldOf(endpoint, 'path'), MAX_AUTH_SETUP_URL_LENGTH),
-    );
-  });
-  const success = ownFieldOf(copy, SUCCESS_CONDITION_LABEL);
-  errors.push(
-    ...lengthErrorsOf(SUCCESS_PATH_PREFIX_LOCATION, ownFieldOf(success, 'pathPrefix'), MAX_AUTH_SETUP_URL_LENGTH),
-    ...lengthErrorsOf(SUCCESS_SELECTOR_LOCATION, ownFieldOf(success, 'selector'), MAX_SUCCESS_SELECTOR_LENGTH),
-    ...lengthErrorsOf(
-      SESSION_LOST_PATH_PREFIX_LOCATION,
-      ownFieldOf(ownFieldOf(copy, 'sessionLostCondition'), 'pathPrefix'),
-      MAX_AUTH_SETUP_URL_LENGTH,
-    ),
-    ...listLimitErrorsOf(EXCLUDED_PATHS_LOCATION, ownFieldOf(copy, 'excludedPaths'), MAX_AUTH_SETUP_PATH_LIST_ITEMS),
-    ...listLimitErrorsOf(AUDIT_PATH_PREFIXES_LOCATION, ownFieldOf(copy, 'auditPathPrefixes'), MAX_AUTH_SETUP_PATH_LIST_ITEMS),
-    ...listLimitErrorsOf(ALLOWED_IDP_ORIGINS_LOCATION, ownFieldOf(copy, 'allowedIdpOrigins'), MAX_ALLOWED_IDP_ORIGINS),
-  );
+  const errors: AuthSetupValidationError[] = [];
   const attempts = ownFieldOf(copy, 'maxLoginAttempts');
   if (Number.isInteger(attempts) && ((attempts as number) < MIN_LOGIN_ATTEMPTS || (attempts as number) > MAX_LOGIN_ATTEMPTS)) {
     errors.push(errorOf(
@@ -360,7 +256,7 @@ const limitErrorsOf = (copy: unknown): readonly AuthSetupValidationError[] => {
       MAX_LOGIN_ATTEMPTS_LOCATION.pointer,
     ));
   }
-  errors.push(...automatedLoginLimitErrorsOf(ownFieldOf(copy, AUTOMATED_LOGIN_LABEL)), ...version3LimitErrorsOf(copy));
+  errors.push(...version3LimitErrorsOf(copy));
   return errors;
 };
 
@@ -934,6 +830,10 @@ const profileBindingErrorsOf = (
   return errors;
 };
 
+/** OP-1: 成功の条件が空か（path が空で、セレクタもない。この条件は、ログインの段で成功にしない）。 */
+export const isEmptySuccessCondition = (setup: Pick<AuthSetup, 'successCondition'>): boolean =>
+  setup.successCondition.pathPrefix.length === 0 && setup.successCondition.selector === null;
+
 /** 値の規則の誤り（すべて）。 */
 const ruleErrorsOf = (
   setup: AuthSetup,
@@ -944,14 +844,17 @@ const ruleErrorsOf = (
   const approved = stringsOf(ownFieldOf(profileSide.copy, 'approvedTestOrigins'));
   // T34a: 承認したサービスの Origin（項目がなければ空）。版 3 のスクリプトの送信先とログインに伴う送信が使う。
   const services = stringsOf(ownFieldOf(profileSide.copy, 'approvedServiceOrigins'));
+  // OP-1（設計書 `2026-10-27-beaksight-one-pass-flow-design.md` 4.1 の D3。DEF-181）: 手動のログインのプロファイルだけ、成功の条件を空（path もセレクタもない）にして
+  // よい（手でのログインの後に、観察した成功の画面の path が埋める。空の条件は、ログインの段で成功にしない）。
+  const deferredSuccess = ownFieldOf(profileSide.copy, 'auth') === MANUAL_STRATEGY && isEmptySuccessCondition(setup);
   const errors: AuthSetupValidationError[] = [
     ...profileSide.errors,
     ...profileBindingErrorsOf(setup, profileSide.copy, context),
     ...loginStartUrlErrorsOf(setup.loginStartUrl, approved),
     ...endpointErrorsOf(setup, approved),
-    ...pathErrorsOf(SUCCESS_PATH_PREFIX_LOCATION, setup.successCondition.pathPrefix),
+    ...(deferredSuccess ? [] : pathErrorsOf(SUCCESS_PATH_PREFIX_LOCATION, setup.successCondition.pathPrefix)),
     ...optionalSelectorErrorsOf(SUCCESS_SELECTOR_LOCATION, setup.successCondition.selector),
-    ...successAmbiguityErrorsOf(setup),
+    ...(deferredSuccess ? [] : successAmbiguityErrorsOf(setup)),
     ...strategyErrorsOf(setup, profileSide.copy),
     ...(setup.automatedLogin === null ? [] : automatedLoginContentErrorsOf(setup, setup.automatedLogin)),
     ...(setup.sessionLostCondition.pathPrefix === null

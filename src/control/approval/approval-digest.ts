@@ -27,26 +27,34 @@
 //   になり、再承認が要る（意図した変化。`approval-validity.ts`）。
 // - T41a（Task 41 の設計書 3.1）: v4 は未公開なので、印の版を上げずに、保つ鍵の項目（`apiKeptKeys`。登録は null）を一覧の末尾に足した。受けたページが
 //   決める鍵の欄の識別は `apiPageKeys` の 1 件に、画面の path を型にした識別の digest は `apiLedger` に入れる（どちらも UPDATE だけ。登録の値は変えない）。
+// - PL-6a（設計書 `2026-10-26-beaksight-plain-ui-design.md` 8.1、設計者の判断 (e)）: 検証の指定の成功の条件と入力の誤りの条件の 2 項目を、結果の判定の
+//   しかたの印の 1 項目（`verificationResultJudgement`）に置き換え、印の版を `/5` に上げた（今までの承認は、digest が合わないので、すべて承認し直しになる。
+//   `approval-validity.ts` の `SCENARIO_REVISION_CHANGED`）。登録の ID の取り方は form の ID の型の一覧（当てる順のまま）も表し、照合の READ は照合の専用の
+//   印（真のときだけ）も並べる。
+// - LU-6（設計書 `2026-11-02-beaksight-list-row-update-design.md` 5.4 の 5、K5）: 一覧の行の更新の行の選び方（`listRow`。一覧の画面の path、開き手の識別の
+//   digest、行を選ぶ欄）を、API の台帳の参照（`apiLedger`）と form の更新の画面の path の型（`updateFormPathTemplate`）の値の末尾に、印つきの組で入れ、
+//   印の版を `/6` に上げた（項目の一覧は変えない。`listRow` のないシナリオも版が変わるので、今までの承認はすべて承認し直しになる。意図した変化）。
 import { apiFieldIdentityValueOf } from '../../core/api-field-identity.js';
 import { createSha256Fingerprint } from '../../core/ids.js';
 import { deepFreeze } from '../../core/immutable.js';
 import { compareCodeUnits } from '../../core/text.js';
 import {
   SIDE_EFFECT_CONFIRMATIONS,
+  apiKeyFieldDigestEntryOf,
   scenarioTransportOf,
   type ApprovalBoundFacts,
   type ReadCheckReference,
   type ScenarioApiKeyField,
   type ScenarioApiPageKey,
   type ScenarioApiSpec,
-  type ScenarioRecordIdSpec,
-  type ScenarioResultCondition,
+  type ScenarioListRow,
   type ScenarioRevision,
+  type ScenarioVerificationRecordId,
   type VerificationExpectation,
 } from './scenario-contracts.js';
 
 /** 承認の digest の入力の形の印（版つき）。 */
-export const APPROVAL_DIGEST_FORMAT = 'beaksight-approval/4';
+export const APPROVAL_DIGEST_FORMAT = 'beaksight-approval/6';
 
 /** 承認の digest が縛る、シナリオの外の事実（承認の時点の値）。 */
 export interface ApprovalDigestFacts {
@@ -97,9 +105,8 @@ export const APPROVAL_DIGEST_ITEMS = Object.freeze([
   'approvalTtlDays',
   'inputRuleReference',
   'readChecks',
-  // T30a: 検証の指定。
-  'verificationSuccessCondition',
-  'verificationInputErrorCondition',
+  // T30a: 検証の指定（PL-6a: 成否の条件の 2 項目を、結果の判定のしかたの印に置き換えた）。
+  'verificationResultJudgement',
   'verificationRecordId',
   'verificationRead',
   // T31b: UPDATE の指定。
@@ -129,14 +136,13 @@ export type ApprovalDigestValue = string | number | boolean | null | readonly Ap
 /** 照らす READ の定義の参照の 1 件の形（`[id, 版]` の JSON）。 */
 const readCheckEntryOf = (reference: ReadCheckReference): string => JSON.stringify([reference.readCheckId, reference.revision]);
 
-/** 結果の条件の値（`[path の前方一致, セレクタ]`。未指定なら null）。 */
-const resultConditionEntryOf = (condition: ScenarioResultCondition | null): ApprovalDigestValue =>
-  condition === null ? null : [condition.pathPrefix, condition.selector];
-
-/** 登録の ID の取り方の値（`[取り方, path の型かセレクタ]`。未指定なら null）。 */
-const recordIdEntryOf = (spec: ScenarioRecordIdSpec | null): ApprovalDigestValue => {
+/** 登録の ID の取り方の値（`[取り方, path の型かセレクタ]`。PL-6a: form は `[取り方, 型の一覧（当てる順）]`。未指定なら null）。 */
+const recordIdEntryOf = (spec: ScenarioVerificationRecordId | null): ApprovalDigestValue => {
   if (spec === null) {
     return null;
+  }
+  if (spec.source === 'URL_PATH_PATTERNS') {
+    return [spec.source, [...spec.pathPatterns]];
   }
   return spec.source === 'URL_PATH_PATTERN' ? [spec.source, spec.pathPattern] : [spec.source, spec.selector];
 };
@@ -153,7 +159,10 @@ const verificationExpectationEntryOf = (expectation: VerificationExpectation): s
   }
 };
 
-/** 照合の READ の値（`[id, 版, 結び付け, 期待]`。結び付けと期待は並べ替えた JSON の一覧。未指定なら null）。 */
+/**
+ * 照合の READ の値（`[id, 版, 結び付け, 期待]`。結び付けと期待は並べ替えた JSON の一覧。未指定なら null）。PL-6a: 照合の専用の印が真なら、末尾に `true` を
+ * 足す（印のない照合の READ の値は変えない）。
+ */
 const verificationReadEntryOf = (scenario: ApprovalDigestScenario): ApprovalDigestValue => {
   const read = scenario.verification.readVerification;
   return read === null ? null : [
@@ -161,22 +170,42 @@ const verificationReadEntryOf = (scenario: ApprovalDigestScenario): ApprovalDige
     read.revision,
     read.bindings.map(({ parameterName, fieldName }) => JSON.stringify([parameterName, fieldName])).sort(compareCodeUnits),
     read.expectations.map(verificationExpectationEntryOf).sort(compareCodeUnits),
+    ...(read.verificationOnly === true ? [true] : []),
   ];
 };
 
 /** 鍵と欄の対応 1 件の形（`[鍵, JSON の型, 欄の識別の種類, 名前か CSS, 欄の型]` の JSON。T38c。欄の型は T38R2-fix の M-2）。 */
-const apiKeyFieldEntryOf = ({ key, type, field, fieldType }: ScenarioApiKeyField): string =>
-  JSON.stringify([key, type, field.kind, apiFieldIdentityValueOf(field), fieldType]);
+// ARR-3（設計書 `2026-11-09-beaksight-api-array-rows-design.md` 2.2 の 5）: 位置の役を持つ欄の一覧の鍵だけ、末尾に位置の役を足す（鍵と欄の対応の digest と
+// 同じ値の作り方 `apiKeyFieldDigestEntryOf`。持たない鍵の形は変えない）。
+const apiKeyFieldEntryOf = (keyField: ScenarioApiKeyField): string => JSON.stringify(apiKeyFieldDigestEntryOf(keyField));
 
 /** 並べ替えた写し（UTF-16 のコード単位の順）。 */
 const sortedOf = (values: readonly string[]): readonly string[] => [...values].sort(compareCodeUnits);
 
+/** ARR-2: ページが決める一覧の鍵の要素の形の印（`[鍵, JSON の型, [印, 要素の型…], 要素の数]`。印で、欄の識別の形と取り違えない）。 */
+const ARRAY_ELEMENTS_ENTRY_MARK = 'ARRAY_ELEMENTS';
+
 /**
  * ページが決める鍵 1 件の形（`[鍵, JSON の型]` の JSON。T41a: UPDATE の欄の識別を持つ鍵は `[鍵, JSON の型, 欄の識別の種類, 名前か CSS]`。登録の形は
- * 変えない）。
+ * 変えない）。ARR-2（設計書 `2026-11-08-beaksight-api-array-keys-design.md` 3.3 の 2）: 要素の形を持つ一覧の鍵だけ、要素の型の集合と数を足す（一覧のない
+ * シナリオの digest は変えない）。
  */
-const apiPageKeyEntryOf = ({ key, type, field }: ScenarioApiPageKey): string =>
-  JSON.stringify(field === undefined ? [key, type] : [key, type, field.kind, apiFieldIdentityValueOf(field)]);
+const apiPageKeyEntryOf = ({ key, type, field, elements }: ScenarioApiPageKey): string => {
+  if (elements !== undefined) {
+    return JSON.stringify([key, type, [ARRAY_ELEMENTS_ENTRY_MARK, ...sortedOf(elements.types)], elements.count]);
+  }
+  return JSON.stringify(field === undefined ? [key, type] : [key, type, field.kind, apiFieldIdentityValueOf(field)]);
+};
+
+/** LU-6: 一覧の行の更新の行の選び方の値（`[印, 一覧の画面の path, 開き手の識別の digest, 行を選ぶ欄]`。印で、ほかの値と取り違えない）。 */
+const LIST_ROW_ENTRY_MARK = 'LIST_ROW';
+const listRowEntryOf = ({ listPagePath, openerIdentityDigest, rowKeyField }: ScenarioListRow): ApprovalDigestValue =>
+  [LIST_ROW_ENTRY_MARK, listPagePath, openerIdentityDigest, rowKeyField];
+
+/** DEF-198: 更新のほかの filter の名前の値の印（`[番号の filter の名前, [印, 名前…]]`。印で、ほかの値と取り違えない）。 */
+const OTHER_FILTERS_ENTRY_MARK = 'OTHER_FILTERS';
+/** DEF-203: 台帳の登録の値と照らす鍵の名前の値の印（`[ページが決める鍵の値, [印, 名前…]]`。印で、ほかの値と取り違えない）。 */
+const LEDGER_PAGE_KEYS_ENTRY_MARK = 'LEDGER_PAGE_KEYS';
 
 /** API の指定の項目の値（T38c。API の指定がなければ、どれも null）。 */
 const apiEntriesOf = (api: ScenarioApiSpec | undefined): Pick<Record<ApprovalDigestItem, ApprovalDigestValue>,
@@ -192,13 +221,23 @@ const apiEntriesOf = (api: ScenarioApiSpec | undefined): Pick<Record<ApprovalDig
     apiShapeDigest: api.shapeDigest,
     apiRequest: [request.method, request.origin, request.pathShape, sortedOf(request.queryNames), request.contentType, sortedOf(request.prefer)],
     apiKeyFields: sortedOf(api.keyFields.map(apiKeyFieldEntryOf)),
-    apiPageKeys: sortedOf(api.pageKeys.map(apiPageKeyEntryOf)),
+    // DEF-203（設計書 `2026-11-02-beaksight-list-row-update-design.md` 5.10 の 2）: 台帳の登録の値と照らす鍵の名前は、あるときだけ印つきで足す（ない版は今の形のまま。
+    // 今の承認は、そのまま有効）。
+    apiPageKeys: api.ledgerPageKeys === undefined || api.ledgerPageKeys.length === 0
+      ? sortedOf(api.pageKeys.map(apiPageKeyEntryOf))
+      : [sortedOf(api.pageKeys.map(apiPageKeyEntryOf)), [LEDGER_PAGE_KEYS_ENTRY_MARK, ...sortedOf(api.ledgerPageKeys)]],
     apiHeaderNames: sortedOf(api.headerNames),
-    apiFilterName: api.filterName,
+    // DEF-198（設計書 `2026-11-02-beaksight-list-row-update-design.md` 5.9 の 2）: ほかの filter の名前は、あるときだけ印つきで足す（ない版は今の形のまま。今の
+    // 承認は、そのまま有効）。
+    apiFilterName: api.otherFilterNames === undefined || api.otherFilterNames.length === 0
+      ? api.filterName
+      : [api.filterName, [OTHER_FILTERS_ENTRY_MARK, ...sortedOf(api.otherFilterNames)]],
     apiRecordId: recordId === null ? null : [recordId.source, recordId.key],
     // T41a: UPDATE の画面の path を型にした識別の digest は、台帳の画面の path の型から決まるので、台帳の参照の項目に入れる（持たなければ今の形）。
+    // LU-6: 一覧の行の更新は、行の選び方を末尾に足す（持たなければ今の形）。
     apiLedger: ledger === null ? null : [ledger.targetCreateScenarioId, ledger.formPathTemplate,
-      ...(templatedIdentityDigest === undefined ? [] : [templatedIdentityDigest])],
+      ...(templatedIdentityDigest === undefined ? [] : [templatedIdentityDigest]),
+      ...(ledger.listRow === undefined ? [] : [listRowEntryOf(ledger.listRow)])],
     // T41a: 保つ鍵（鍵と欄の対応と同じ形。登録は持たないので null）。
     apiKeptKeys: keptKeys === undefined ? null : sortedOf(keptKeys.map(apiKeyFieldEntryOf)),
   };
@@ -231,12 +270,13 @@ export const approvalDigestEntriesOf = (
     approvalTtlDays: scenario.approvalTtlDays,
     inputRuleReference: inputRuleReference === null ? null : [inputRuleReference.ruleSetId, inputRuleReference.revision, inputRuleReference.digest],
     readChecks: scenario.readChecks.map(readCheckEntryOf).sort(compareCodeUnits),
-    verificationSuccessCondition: resultConditionEntryOf(scenario.verification.successCondition),
-    verificationInputErrorCondition: resultConditionEntryOf(scenario.verification.inputErrorCondition),
+    verificationResultJudgement: scenario.verification.resultJudgement,
     verificationRecordId: recordIdEntryOf(scenario.verification.recordId),
     verificationRead: verificationReadEntryOf(scenario),
     updateTargetCreateScenarioId: update?.targetCreateScenarioId ?? null,
-    updateFormPathTemplate: update?.formPathTemplate ?? null,
+    // LU-6: 一覧の行の更新（形 B）は、更新の画面の path の型と行の選び方の組（持たなければ今の形の文字列）。
+    updateFormPathTemplate: update === null ? null
+      : (update.listRow === undefined ? update.formPathTemplate : [update.formPathTemplate, listRowEntryOf(update.listRow)]),
     updateActionPathTemplate: update?.actionPathTemplate ?? null,
     updateKeepFieldNames: update === null ? null : [...update.keepFieldNames].sort(compareCodeUnits),
     updateTemplatedIdentityDigest: update?.templatedIdentityDigest ?? null,

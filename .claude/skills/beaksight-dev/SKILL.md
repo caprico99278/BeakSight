@@ -146,6 +146,14 @@ Blockerやfix roundのときは、新しい実装者を起動するのではな�
 
 テストの既定の `chromium.launch({ headless: true })` は `chrome-headless-shell` で、CLIの本番の起動（`channel: 'chromium'` の `chrome.exe`）とは振る舞いが違います（DEF-030）。先読み、ページを閉じるときの送信、Chromium自身の通信などで違いが出ました。安全の不具合のREDとGREENは、`tests/helpers/chromium.ts` の既定と、CLIの起動の設定（`launchCliChromium`）の両方で確かめるよう指示してください。
 
+2つのChromiumの組は、入口 `chromiumRunsOf`（と `BOTH_CHROMIUM_LAUNCHERS`）から受け取ります。遅い組と区切りでは、CLIの起動の設定の1つだけで流れます（2026-11-15 ユーザーの判断）。両方に広げるのは、次の束だけです。
+
+- 安全の不具合を直す束: `node tests/run-suite.mjs related --with-safety` を指示する。
+- Guard・中継・Chromiumの起動の部品を変えた束: `related --both-chromium` を指示する。
+- Chromium（Playwright）の版を上げるとき: `related --both-chromium` を指示する。
+
+ファイルを1つだけ両方で流すときは、`BEAKSIGHT_TEST_BOTH_CHROMIUM=both` を付けます。新しく2つのChromiumの組を書くときは、配列をそのまま `.each` に渡さず、`chromiumRunsOf([既定の回, CLIの回])` に通すよう指示してください（Architecture Gate が確かめます）。
+
 #### 競争のある安全のテストの条件
 
 ブラウザの内部の順序に左右される場面（閉じる途中、ポップアップ、Workerなど）では、「毎回この記録が残る」のような条件は満たせないことがあります。安全のテストの条件は、次の組み合わせにします。

@@ -9,7 +9,7 @@
  * - 要求の件数と1分あたりの最大の組み立て（`formatRequestsWithPeak`。L7）は、ここだけで行う。
  */
 import type { RunLoadOriginRequests } from '../core/contracts.js';
-import { MILLISECONDS_PER_SECOND, MINUTES_PER_HOUR, SECONDS_PER_MINUTE } from '../core/time-units.js';
+import { HOURS_PER_DAY, MILLISECONDS_PER_SECOND, MINUTES_PER_HOUR, SECONDS_PER_MINUTE } from '../core/time-units.js';
 import {
   FORMAT_UNIT_TEXT,
   NOT_OBSERVED_TEXT,
@@ -33,6 +33,18 @@ const PERCENT_SCALE = 100;
 export const formatDecimal = (value: number, maxFractionDigits: number = DEFAULT_MAX_FRACTION_DIGITS): string => {
   const scale = 10 ** maxFractionDigits;
   return String(Math.round(value * scale) / scale);
+};
+
+/** EV-1: 比の値を書くときの小数の桁数（コントラスト比の `4.49` の形）。 */
+const RATIO_FRACTION_DIGITS = 2;
+
+/**
+ * EV-1: 比の値を、小数 2 桁で切り捨てて書く（例: 4.4999 → `4.49`。末尾の 0 は書く）。基準に届かない値を、丸めで基準の値（`4.50`）に見せないため。浮動小数点の
+ * 誤差で 1 つ下の値にならないよう、ごく小さな値を足してから切り捨てる。
+ */
+export const formatRatioFloor = (value: number): string => {
+  const scale = 10 ** RATIO_FRACTION_DIGITS;
+  return (Math.floor(value * scale + 1e-9) / scale).toFixed(RATIO_FRACTION_DIGITS);
 };
 
 /** px の値を、`formatDecimal` の書式に単位を付けて書く（例: `390 px`）。 */
@@ -110,6 +122,24 @@ export const formatDateTime = (isoTimestamp: string | null): string => {
 };
 
 /**
+ * OP-3（設計書 `doc/design/2026-10-27-beaksight-one-pass-flow-design.md` 4.1 の D12）: ふだんの画面の本文の日時を、`Asia/Tokyo` の「月 日 時:分」で書く
+ * （例: `10 月 27 日 15:30`。年・秒・時間帯の略称は書かない。月・日・時は 0 を前に付けない）。詳しい内容と報告の記録は `formatDateTime` のまま。
+ * `null` は「未観測」、解析できない文字列は記録されたまま（`formatDateTime` と同じ）。
+ */
+export const formatPlainDateTime = (isoTimestamp: string | null): string => {
+  if (isoTimestamp === null) {
+    return formatNotObserved();
+  }
+  const time = Date.parse(isoTimestamp);
+  if (!Number.isFinite(time)) {
+    return isoTimestamp;
+  }
+  const parts = new Map(DATE_TIME_PARTS_FORMAT.formatToParts(time).map((part) => [part.type, part.value]));
+  const number = (type: Intl.DateTimeFormatPartTypes): string => String(Number(parts.get(type) ?? ''));
+  return `${number('month')} ${FORMAT_UNIT_TEXT.monthOfYear} ${number('day')} ${FORMAT_UNIT_TEXT.dayOfMonth} ${number('hour')}:${parts.get('minute') ?? ''}`;
+};
+
+/**
  * 時間（ミリ秒）を書く。1秒未満は整数の ms（例: `850 ms`）、1秒以上は小数1桁までの秒（例: `1.5秒`）。
  * 観測できなかった値は「未観測」。
  */
@@ -172,8 +202,9 @@ export const formatTimes = (count: number | null): string => {
 };
 
 /**
- * 経過時間（ミリ秒）を、時間・分・秒で書く（例: `40秒`、`24分10秒`、`1時間5分`。サイトへの負荷の制御の設計書 4.8）。
- * - 1分未満は秒だけ、1時間未満は分と秒、1時間以上は時間と分（秒は省く）で書く。0 の下位の単位は書かない（例: `1分`、`1時間`）。
+ * 経過時間（ミリ秒）を、日・時間・分・秒で書く（例: `40秒`、`24分10秒`、`1時間5分`、`1日`。サイトへの負荷の制御の設計書 4.8）。
+ * - 1分未満は秒だけ、1時間未満は分と秒、1日未満は時間と分（秒は省く）、1日以上は日と時間（分と秒は省く）で書く。0 の下位の単位は書かない
+ *   （例: `1分`、`1時間`、`1日`）。PL-4: 日の単位を足した（自動ログインの回数の決まりの 24 時間を「1日」と書くため。前は `24時間`）。
  * - 端数は切り捨てる（経過した分だけを示す。例: 59.9秒は `59秒`）。
  * - 観測できなかった値は「未観測」。
  * 時間の長さの書式（`formatDuration`）とは別のもの（あちらは、小数1桁までの秒で書く）。
@@ -184,10 +215,15 @@ export const formatElapsedTime = (milliseconds: number | null): string => {
   }
   const totalSeconds = Math.floor(milliseconds / MILLISECONDS_PER_SECOND);
   const totalMinutes = Math.floor(totalSeconds / SECONDS_PER_MINUTE);
-  const hours = Math.floor(totalMinutes / MINUTES_PER_HOUR);
+  const totalHours = Math.floor(totalMinutes / MINUTES_PER_HOUR);
+  const days = Math.floor(totalHours / HOURS_PER_DAY);
+  const hours = totalHours % HOURS_PER_DAY;
   const minutes = totalMinutes % MINUTES_PER_HOUR;
   const seconds = totalSeconds % SECONDS_PER_MINUTE;
   const part = (value: number, unit: string): string => `${String(value)}${unit}`;
+  if (days > 0) {
+    return `${part(days, FORMAT_UNIT_TEXT.days)}${hours > 0 ? part(hours, FORMAT_UNIT_TEXT.hours) : ''}`;
+  }
   if (hours > 0) {
     return `${part(hours, FORMAT_UNIT_TEXT.hours)}${minutes > 0 ? part(minutes, FORMAT_UNIT_TEXT.minutes) : ''}`;
   }

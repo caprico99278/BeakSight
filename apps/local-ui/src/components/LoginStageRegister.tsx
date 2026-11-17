@@ -14,6 +14,7 @@ import {
   type LoginStageRowProposalView,
   type LoginStageRowRejectionReason,
 } from '../server/login-stage-registration-functions';
+import { httpMethodLabel } from '../display/labels';
 import { ConfirmDialog } from './ConfirmDialog';
 import { Notice } from './Notice';
 
@@ -40,7 +41,7 @@ function AddedItem({ added }: Readonly<{ added: Proposal['added'] }>) {
   }
   return (
     <p data-testid="login-stage-register-added" data-kind={added.kind}>
-      {text.sideRequest}: {LOCAL_UI_MANUAL_LOGIN_TEXT.sideRequestValue(added.method, `${added.origin}${added.path}`, formatCount(added.maxPerLoginStage))}
+      {text.sideRequest}: {LOCAL_UI_MANUAL_LOGIN_TEXT.sideRequestValue(httpMethodLabel(added.method), `${added.origin}${added.path}`, formatCount(added.maxPerLoginStage))}
     </p>
   );
 }
@@ -104,6 +105,7 @@ export function LoginStageRegisterButton({ target, registration }: Readonly<{ ta
           body={text.dialogBody}
           confirmLabel={busy ? text.saving : text.confirm}
           cancelLabel={text.cancel}
+          confirmTone="danger"
           busy={busy}
           onConfirm={save}
           onCancel={close}

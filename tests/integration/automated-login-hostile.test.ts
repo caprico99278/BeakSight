@@ -1,14 +1,14 @@
 // T26g-1（Task 26 の設計書 4.4、変更履歴の「T26R」の行の C1、「Blocker: T26g-1」の行）: ログインの段で、ページの JS が入力の値を、許した POST の
 // ほかの要求で送ろうとする形（レビューの実験の 23 の形を写した fixture）を、自動ログインの段（`runAutomatedLoginStage`）と手動のログインの段
 // （`runLoginStage`）で確かめる。127.0.0.1 の fixture のサーバ（A と、別の Origin のサーバ C）だけ。Chromium は headless だけ（テストの既定と、
-// CLI の起動の設定（`launchCliChromium`）の両方）。資格情報の目印は、実行ごとのランダムな値。
+// CLI の起動の設定（`launchCliChromium`）。入口 `BOTH_CHROMIUM_LAUNCHERS` で選ぶ）。資格情報の目印は、実行ごとのランダムな値。
 // - 自動ログイン: どの形でも、目印は、A にも C にも、許した POST の本文のほかに届かない。値が入った時点で送ろうとする形は、押す前に
 //   `UNEXPECTED_LOGIN_REQUEST`（送信 `NO`。POST 0 回）、押したときに GET に変える形は `UNEXPECTED_LOGIN_REQUEST`（送信 `UNKNOWN`）で、成功を偽装
 //   しない。値を運べない favicon（path がちょうど `/favicon.ico`）は理由に数えず、正当なログインは成功する。
 // - 手動のログインの段: 許可 Origin の外（C）への要求は届かない（人の入力の代わりに、テストだけの口 `onLoginPageReady` で入れる）。
 import { randomBytes } from 'node:crypto';
-import type { Browser, Page } from 'playwright';
-import { afterAll, afterEach, beforeAll, describe, expect, it } from 'vitest';
+import type { Page } from 'playwright';
+import { afterAll, beforeAll, describe, expect, it } from 'vitest';
 import { wait } from '../../src/core/deadline.js';
 import { FORM_NAVIGATION_SETUP_ITEMS } from '../helpers/auth-setup-samples.js';
 import {type AuthSetup } from '../../src/control/auth/auth-setup-contracts.js';
@@ -17,21 +17,16 @@ import { runAutomatedLoginStage, type AutomatedLoginStageResult } from '../../sr
 import {
   AUTOMATED_LOGIN_FIXTURE_CONDITIONS,
   AUTOMATED_LOGIN_FIXTURE_SELECTORS,
-  AUTOMATED_LOGIN_INPUT_LEAK_VARIANTS,
   AUTOMATED_LOGIN_SUBMIT_LEAK_VARIANTS,
   startAutomatedLoginFixture,
   type AutomatedLoginFixture,
   type AutomatedLoginFixtureRequest,
   type AutomatedLoginFormVariant,
 } from '../helpers/automated-login-fixture.js';
-import { launchCliChromium, launchHeadlessChromium } from '../helpers/chromium.js';
+import { BOTH_CHROMIUM_LAUNCHERS, useSharedRunBrowser } from '../helpers/chromium.js';
 import { READ_METHODS } from '../helpers/leak-places.js';
 import { createTestConfig } from '../helpers/test-config.js';
 
-const LAUNCHERS = [
-  ['the default test Chromium', () => launchHeadlessChromium()],
-  ['the CLI launch settings', () => launchCliChromium()],
-] as const;
 const OUTCOME = 'success';
 const RESULT_TIMEOUT_MS = 3_000;
 const POLL_INTERVAL_MS = 100;
@@ -43,29 +38,20 @@ const QUIET_PERIOD_MS = 500;
 const TEST_TIMEOUT_MS = 60_000;
 const marker = (prefix: string): string => `${prefix}${randomBytes(12).toString('hex')}`;
 
-describe.each(LAUNCHERS)('T26g-1: hostile login pages (%s)', (_name, launch) => {
+describe.each(BOTH_CHROMIUM_LAUNCHERS)('T26g-1: hostile login pages (%s)', (_name, launch) => {
   const username = marker('u');
   const password = marker('p');
   let fixture: AutomatedLoginFixture;
-  const browsers: Browser[] = [];
+  // SLIM-2（X7）: 場面ごとに Chromium を起こし直さない（段は、自分の Context だけを閉じて終わる）。
+  const launcher = useSharedRunBrowser(() => launch());
 
   beforeAll(async () => {
     fixture = await startAutomatedLoginFixture({ username, password });
   });
 
-  afterEach(async () => {
-    await Promise.all(browsers.splice(0).map((browser) => browser.close().catch(() => undefined)));
-  });
-
   afterAll(async () => {
     await fixture?.close();
   });
-
-  const launcher = async (): Promise<Browser> => {
-    const browser = await launch();
-    browsers.push(browser);
-    return browser;
-  };
 
   const setupFor = (variant: AutomatedLoginFormVariant): AuthSetup => ({
     ...FORM_NAVIGATION_SETUP_ITEMS,
@@ -145,7 +131,10 @@ describe.each(LAUNCHERS)('T26g-1: hostile login pages (%s)', (_name, launch) => 
     expect(leaksIn(requests)).toEqual([]);
   }, TEST_TIMEOUT_MS);
 
-  it.each(AUTOMATED_LOGIN_INPUT_LEAK_VARIANTS)('stops %s in the submission window before the click (UNEXPECTED_LOGIN_REQUEST, NO)', async (variant) => {
+  // SLIM-GROUP L-4（設計書 5.4。ユーザーの判断）: 値が入った時点で送ろうとする 13 の通り道（`AUTOMATED_LOGIN_INPUT_LEAK_VARIANTS`）は、1 つの画面
+  // （`leak-input-all`）に全部載せて 1 回で確かめる（落ちたときは、通り道ごとの形 `leak-*` を 1 つずつ流して特定する）。TEST-SLIM: `scripted`（サブ frame から
+  // 送信先への POST、beacon と fetch の POST）は、`automated-login.test.ts` から移した。
+  it.each(['leak-input-all', 'scripted'] as const)('stops %s in the submission window before the click (UNEXPECTED_LOGIN_REQUEST, NO)', async (variant) => {
     const { result, requests } = await runAutomated(variant);
     expect(leaksIn(requests)).toEqual([]);
     expect(requests.filter(({ site }) => site === 'C')).toEqual([]);

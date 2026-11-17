@@ -1,5 +1,5 @@
 // T27e（Task 27 の設計書 4.5、4.6）: ワーカーの流れの、READ の確かめのジョブ（`READ_CHECK`）の扱いを、偽の IPC の口と偽のログインの段と偽の
-// READ の確かめの流れで確かめる（本物の子 process と Chromium は `discovery-job-fork.test.ts` の「T27e」の describe）。発見のジョブの確かめ
+// READ の確かめの流れで確かめる（本物の Chromium は `read-check-run.test.ts`、子 process の端から端は画面の `full-flow.test.ts`）。発見のジョブの確かめ
 // （`audit-worker-session-discovery.test.ts`）と同じ形。
 // - ログインの段（手動）の後に、監査の中核を呼ばずに、READ の確かめの流れを、ジョブの ID・設定・ログインの状態つきの認証の指定・`START` の定義の
 //   一覧・止める印で呼ぶ。
@@ -221,11 +221,11 @@ describe('audit worker session (T27e): the READ check job', () => {
   });
 
   it('sends FINISHED without the counts when the READ check did not start a Run (RUN_ACTIVE)', async () => {
-    const run = await runWorker({ executeReadCheck: async () => ({ kind: 'RUN_ACTIVE', activeRunId: RUN_ID, exitCode: EXIT_CODES.RUN_UNAVAILABLE }) });
+    const run = await runWorker({ executeReadCheck: async () => ({ kind: 'RUN_ACTIVE', exitCode: EXIT_CODES.RUN_UNAVAILABLE }) });
     expect(meaningful(run).at(-1)).toEqual({
       protocol: WORKER_PROTOCOL_VERSION,
       type: 'FINISHED',
-      outcome: { kind: 'RUN_ACTIVE', exitCode: EXIT_CODES.RUN_UNAVAILABLE, runId: RUN_ID, runDirectory: null, runStatus: null },
+      outcome: { kind: 'RUN_ACTIVE', exitCode: EXIT_CODES.RUN_UNAVAILABLE, runId: null, runDirectory: null, runStatus: null },
     });
     expect(run.exitCode).toBe(EXIT_CODES.RUN_UNAVAILABLE);
   });

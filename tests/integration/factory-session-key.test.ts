@@ -1,7 +1,7 @@
 // T35c（Task 35 の設計書 3.5）: 認証つきの factory が Context の状態を読み直したときに、ログインの状態の鍵がなくなっていたら知らせる
 // （`AuthenticatedContextOptions.sessionKeyPresent` と `BrowserContextFactoryOptions.onSessionKeyLost`）。値は読まない（判定は鍵の名前だけ）。
 // 承認したサービスの Origin からの 401 の応答も知らせる（`onServiceUnauthorizedResponse`。応答の本文を読まない画面でも数える）。
-// 通す部品は本物の factory と Guard、fixture（`startSpaAuthSite`）。Chromium はテストの既定の headless と、CLI の起動の設定の両方。
+// 通す部品は本物の factory と Guard、fixture（`startSpaAuthSite`）。Chromium はテストの既定の headless だけ（TEST-SLIM）。
 import type { Browser } from 'playwright';
 import { afterAll, afterEach, beforeAll, describe, expect, it } from 'vitest';
 import { BrowserContextFactory } from '../../src/browser/context-factory.js';
@@ -10,7 +10,7 @@ import { filterAuthenticatedState } from '../../src/control/auth/authenticated-s
 import { createServiceRequestBudget } from '../../src/crawl/service-request-budget.js';
 import { SafetyLedger } from '../../src/safety/safety-ledger.js';
 import { hasSuccessStorageKey } from '../../src/worker/login-stage-checks.js';
-import { launchCliChromium, launchHeadlessChromium } from '../helpers/chromium.js';
+import { DEFAULT_CHROMIUM_LAUNCHERS } from '../helpers/chromium.js';
 import { fastRunConfig } from '../helpers/run-harness.js';
 import {
   SPA_APP_PATHS,
@@ -24,17 +24,12 @@ import {
 } from '../helpers/spa-auth-site-fixture.js';
 import { TEST_FACTORY_OPTIONS } from '../helpers/test-config.js';
 
-const LAUNCHERS: readonly (readonly [string, () => Promise<Browser>])[] = [
-  ['the default test Chromium', () => launchHeadlessChromium()],
-  ['the CLI Chromium', () => launchCliChromium()],
-];
 const TEST_TIMEOUT_MS = 120_000;
 const UI_TIMEOUT_MS = 15_000;
 const EXPIRED_TOKEN_LIFETIME_MS = 1;
 const FIXTURE_KEY = Object.freeze({ prefix: 'fixture', suffix: '-auth-token' });
-const SERVICE_REQUEST_LIMITS = Object.freeze({ perMinute: 120, perRun: 600 });
 
-describe.each(LAUNCHERS)('T35c: the factory notices of the login state key and the 401 responses with %s', (_label, launch) => {
+describe.each(DEFAULT_CHROMIUM_LAUNCHERS)('T35c: the factory notices of the login state key and the 401 responses with %s', (_label, launch) => {
   let browser: Browser;
   let spa: SpaAuthSite | undefined;
   const factories: BrowserContextFactory[] = [];
@@ -70,13 +65,11 @@ describe.each(LAUNCHERS)('T35c: the factory notices of the login state key and t
         auditStage: {
           approvedServiceOrigins: [site.backendOrigin],
           auditReadRequests: [],
-          scriptLogin: { origin: site.tokenOrigin, path: SPA_BACKEND_PATHS.token, requiredQuery: [{ name: 'grant_type', value: SPA_GRANT_TYPES.password }] },
-          serviceRequestLimits: SERVICE_REQUEST_LIMITS,
-        },
+          scriptLogin: { origin: site.tokenOrigin, path: SPA_BACKEND_PATHS.token, requiredQuery: [{ name: 'grant_type', value: SPA_GRANT_TYPES.password }] },        },
         sessionKeyPresent: (state) => hasSuccessStorageKey(state, { origin: site.appOrigin, ...FIXTURE_KEY }),
       },
       // T35R2-fix（T35R2 の C-1 の (a)）: 監査の段の口がある factory は、上限の部品がなければ Context を作らない（意図して足した）。
-      serviceRequestBudget: createServiceRequestBudget({ ...SERVICE_REQUEST_LIMITS, now: () => Date.now() }),
+      serviceRequestBudget: createServiceRequestBudget({ now: () => Date.now() }),
       onSessionKeyLost: () => { notices.keyLost += 1; },
       onServiceUnauthorizedResponse: () => { notices.unauthorized += 1; },
     });

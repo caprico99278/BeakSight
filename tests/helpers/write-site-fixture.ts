@@ -35,11 +35,15 @@
 //   `js-enable-disabled` で、送信の前にページの JS が、それぞれをチェックする・選び直す・有効にして値を入れる（T31R2 の E8 の形）。
 //   `setSecretHiddenFields(true)` の間は、秘密に見える名前の一覧に当たる一般の名前の hidden（`code`・`key`）も出す。readonly の `code` は、秘密に
 //   見える名前なので `serial` に変えた。
+// - PL-6a（設計書 `2026-10-26-beaksight-plain-ui-design.md` 8.1。FV-0 の自前のサイトの場面を足した。既存の画面は変えない）: 登録せずに同じ登録の form を
+//   誤りの文と一緒に返す形（`input-error-form`・`input-error-form-422`・`input-error-form-cleared`・`input-error-form-js`）、一覧が 503 を返す形
+//   （`list-unavailable`）、更新せずに同じ更新の form を返す形（`setUpdateMode` の `input-error-form`）。
 // - ログイン（本物のワーカーの手動のログインの段のため。T30f）: GET `/login` はログインの form（欄 `#user`・`#pass`、送るボタン `#go`）。POST `/login`
 //   は、fixture が作った仮の資格情報（`fillCredentials` で入れる）に合えば、セッションの Cookie を付けて一覧（`/members`）へ 303。合わなければ
 //   ログインの画面へ 303。
 import { randomBytes } from 'node:crypto';
 import type { IncomingMessage, ServerResponse } from 'node:http';
+import type { ScenarioVerification } from '../../src/control/approval/scenario-contracts.js';
 import { startLoopbackHttpServer } from './loopback-server.js';
 import { LOOPBACK_TEST_CERTIFICATE, LOOPBACK_TEST_KEY } from './tls-test-certificate.js';
 
@@ -48,6 +52,8 @@ const STATUS_OK = 200;
 const STATUS_SEE_OTHER = 303;
 const STATUS_TEMPORARY_REDIRECT = 307;
 const STATUS_TOO_MANY_REQUESTS = 429;
+const STATUS_UNPROCESSABLE_CONTENT = 422;
+const STATUS_SERVICE_UNAVAILABLE = 503;
 const STATUS_INTERNAL_SERVER_ERROR = 500;
 const STATUS_NOT_FOUND = 404;
 /** 最初の登録の ID。 */
@@ -62,6 +68,22 @@ export const WRITE_SITE_PATHS = Object.freeze({
   list: '/members',
   done: '/members/done',
 } as const);
+
+/** 照合の READ の定義の id（一覧の検索。`write-job-harness.ts` と `write-stage-parent-spec.test.ts` が作る）。 */
+export const WRITE_JOB_READ_CHECK_ID = 'rc-fork';
+
+/** このサイトの登録の検証の指定（PL-6a: 結果は構造の判定、ID は URL のパスの型から、照合は一覧の検索）。 */
+export const WRITE_JOB_VERIFICATION: ScenarioVerification = Object.freeze<ScenarioVerification>({
+  // PL-6a: 成否の条件の代わりに、結果の判定のしかたの印（form の構造の判定）。ID の取り方は ID の型の一覧。
+  resultJudgement: 'FORM_STRUCTURE',
+  recordId: { source: 'URL_PATH_PATTERNS', pathPatterns: [`${WRITE_SITE_PATHS.create}/{id}`] },
+  readVerification: {
+    readCheckId: WRITE_JOB_READ_CHECK_ID,
+    revision: 1,
+    bindings: [{ parameterName: 'q', fieldName: 'name' }],
+    expectations: [{ kind: 'ROW_COUNT_EQUALS', count: 1 }],
+  },
+});
 
 /** セッションの Cookie の名前。 */
 export const WRITE_SITE_SESSION_COOKIE = 'sid';
@@ -104,7 +126,55 @@ export const WRITE_SITE_MODES = Object.freeze([
   // T40R-fix-A2（設計書 7 章の「T40R-fix-A・B の報告」）: 登録の後に書き込みの画面（`/members/new`）へ戻し、その画面に登録の印（`.registered`）を出す
   // （成功の条件に当たる画面が書き込みの画面のままで、その path が ID の型 `/members/{id}` に当たる形）。
   'stay-on-form',
+  // PL-6a（設計書 `2026-10-26-beaksight-plain-ui-design.md` 8.1。FV-0 の自前のサイトの場面）: 登録せずに、同じ登録の form を誤りの文と一緒に返す形。
+  // `input-error-form` は 200 で送った値を保ち、`input-error-form-422` は 422 で送った値を保ち、`input-error-form-cleared` は 200 で値を消す。
+  // `input-error-form-js` は 200 の空の画面を返し、ページの JS が同じ Origin の GET（`WRITE_SITE_ERROR_FRAGMENT_PATH`）で、送った値を保った form を
+  // 後から描く。
+  'input-error-form',
+  'input-error-form-422',
+  'input-error-form-cleared',
+  'input-error-form-js',
+  // PL-6a: 一覧（照合の READ の対象）が 503 を返す形（送る前の答え合わせを判定できない）。
+  'list-unavailable',
+  // LU-SFIX2-B（LU-SREV2 の Important-1）: 登録の画面のページの JS が、入れた名前を localStorage に保存し、一覧の画面のページの JS が、検索の語に当たる
+  // 保存の名前の行を（サーバの行になければ）描く形。`local-echo` は登録し、`local-echo-not-registered` は登録しない（サーバの状態は変わらない）。
+  'local-echo',
+  'local-echo-not-registered',
+  // L12b（設計書 `2026-11-09-beaksight-remove-limits-design.md` 6.2）: `slow-success` は、登録してから `WRITE_SITE_SLOWER_RESPONSE_MS` 遅れて成功の 303 を返す（前の
+  // 結果の待ちの上限を超える遅い応答）。`navigate-after-created` は、登録して ID の型に当たらない画面（`/members/x/registered`）へ 303 で移し、その画面のページの JS が
+  // `WRITE_SITE_NAVIGATE_AFTER_CREATED_MS` の後に登録の画面（`/members/<id>`）へ自分で移る（結果は最後の画面で判定する）。
+  'slow-success',
+  'navigate-after-created',
+  // L12b: 登録の画面の path の ID を、前の上限（64 文字）より長い形（番号に `WRITE_SITE_LONG_RECORD_ID_SUFFIX` を足した形）にする。
+  'long-record-id',
 ] as const);
+
+/** L12b: `long-record-id` の、番号に足す数字（番号と合わせて 65 文字を超える。番号の形のまま）。 */
+export const WRITE_SITE_LONG_RECORD_ID_SUFFIX = '0'.repeat(70);
+
+/** L12b: `slow-success` の応答の遅れ（ms）。 */
+export const WRITE_SITE_SLOWER_RESPONSE_MS = 4_000;
+/**
+ * L12b: `navigate-after-created` で、移った画面からページの JS がもう一度移るまで（ms）。TEST-TIME-B: テストの押した後の静まりの窓（`TEST_PRESS_QUIET_WINDOW_MS`）
+ * より短く、落ち着きの待ちの静まりの窓（500ms）より長い。
+ */
+export const WRITE_SITE_NAVIGATE_AFTER_CREATED_MS = 800;
+
+/** LU-SFIX2-B: `local-echo` の、ページの JS が名前を保存する localStorage の鍵。 */
+export const WRITE_SITE_LOCAL_ECHO_KEY = 'member_draft_name';
+/** LU-SFIX2-B: `local-echo` の登録の画面の JS（名前の欄の入力で、値を localStorage に保存する）。 */
+const WRITE_SITE_LOCAL_ECHO_SAVE_SCRIPT = "document.getElementById('name').addEventListener('input', (ev) => {"
+  + ` try { localStorage.setItem('${WRITE_SITE_LOCAL_ECHO_KEY}', ev.target.value); } catch (e) {} });`;
+/** LU-SFIX2-B: `local-echo` の一覧の画面の JS（検索の語に当たる保存の名前が表の行になければ、その行を足す）。 */
+const WRITE_SITE_LOCAL_ECHO_LIST_SCRIPT = `(() => { let saved = null; try { saved = localStorage.getItem('${WRITE_SITE_LOCAL_ECHO_KEY}'); } catch (e) {}`
+  + " const q = new URLSearchParams(location.search).get('q') || ''; if (!saved || q === '' || !saved.includes(q)) return;"
+  + " const body = document.querySelector('table tbody');"
+  + " if (!body || [...body.querySelectorAll('tr td:nth-child(2)')].some((td) => td.textContent === saved)) return;"
+  + " const tr = document.createElement('tr'); const a = document.createElement('td'); a.textContent = '0'; const b = document.createElement('td');"
+  + ' b.textContent = saved; tr.append(a, b); body.append(tr); })();';
+
+/** PL-6a: `input-error-form-js` の、ページの JS が後から読む誤りの form の path（GET）。 */
+export const WRITE_SITE_ERROR_FRAGMENT_PATH = '/members/error-form';
 
 /** T30R2-fix-1（M-b）: `js-navigate-slow` の応答の遅れ（ms。結果を待つ上限より短く、ページの JS の移動より十分長い）。 */
 export const WRITE_SITE_SLOW_RESPONSE_MS = 1_500;
@@ -138,8 +208,17 @@ export const WRITE_SITE_UPDATE_MODES = Object.freeze([
   'js-hidden-checkbox',
   'js-hidden-select',
   'js-enable-disabled',
+  // PL-6a（設計書 8.1）: 更新せずに、同じ更新の form を、送った値を保って誤りの文と一緒に 200 で返す形。
+  'input-error-form',
+  // LU-SFIX3-B（LU-SREV3 の Important-2）: 更新の画面を読み込むと、ページの JS が、同じ表のほかの会員（`WRITE_SITE_OTHER_RECORD_OFFSET` を足した番号）と表の path
+  // （`/members`）と別の表（`WRITE_SITE_OTHER_TABLE_PATH`）へ POST を送る形（値を入れる前。N2）。
+  'js-sends-on-load',
 ] as const);
 export type WriteSiteUpdateMode = (typeof WRITE_SITE_UPDATE_MODES)[number];
+
+/** LU-SFIX3-B: `js-sends-on-load` の、別の表の path と、ほかの会員の番号の差。 */
+export const WRITE_SITE_OTHER_TABLE_PATH = '/notes/1';
+export const WRITE_SITE_OTHER_RECORD_OFFSET = 1000;
 
 /** T31g-2: 更新の画面の path（`/members/<id>/edit`）と、更新の送信先の path（`/members/<id>`）。 */
 export const writeSiteEditPathOf = (id: number | string): string => `${WRITE_SITE_PATHS.create}/${id}/edit`;
@@ -211,6 +290,8 @@ export interface WriteSite {
    * 読み取りでない要求は判定に使い、照合の READ は判定できない。同じ Origin への要求は数えて残すだけで、判定には使わない（設計書 8 章の最後の行）。
    */
   setListDataRequest(enabled: boolean, origin?: string): void;
+  /** TEST-TIME-B: 受けている途中の要求が 0 になるまで待つ（`loopback-server.ts` の `settleLateDeliveries` に渡す）。 */
+  whenIdle(limitMs?: number): Promise<void>;
   close(): Promise<void>;
 }
 
@@ -237,9 +318,18 @@ function sendHtml(response: ServerResponse, body: string, status = STATUS_OK): v
 /** `startWriteSite` の指定（DEF-099 fix: `tls` なら https で待つ。テストだけの自前の証明書）。 */
 export interface WriteSiteOptions {
   readonly tls?: boolean | undefined;
+  /**
+   * NL-2（設計書 `2026-11-06-beaksight-no-login-test-site-design.md` 7 章）: ログインのないサイト（セッションを求めない）。一覧に、ログインの画面に似た path
+   * （`/login`。ログインの form の画面のまま）と危険な語の path（`WRITE_SITE_DANGEROUS_PATH`）へのリンクを出す。
+   */
+  readonly noLogin?: boolean | undefined;
 }
 
+/** NL-2: ログインのないサイトの一覧がリンクする、危険な語（`remove`）の path（BeakSight は読まない）。 */
+export const WRITE_SITE_DANGEROUS_PATH = '/members/remove-all';
+
 export async function startWriteSite(options: WriteSiteOptions = {}): Promise<WriteSite> {
+  const noLogin = options.noLogin === true;
   const csrfMarker = `csrf${randomValue()}`;
   const readonlyMarker = `ro${randomValue()}`;
   const sessions = new Set<string>();
@@ -297,7 +387,9 @@ export async function startWriteSite(options: WriteSiteOptions = {}): Promise<Wr
       'js-enable-disabled': "document.getElementById('f').addEventListener('submit', () => { const x = document.getElementById('c-parent'); x.disabled = false; x.value = 'p-9'; });",
       'js-navigate-slow': "document.getElementById('f').addEventListener('submit', () => { setTimeout(() => { "
         + `location.href = '${p.create}/${nextId}'; }, ${JS_NAVIGATE_DELAY_MS}); });`,
-      'js-submit-on-input': "let autoSent = false; for (const id of ['name', 'email']) { document.getElementById(id).addEventListener('input', () => {"
+      'local-echo': WRITE_SITE_LOCAL_ECHO_SAVE_SCRIPT,
+      'local-echo-not-registered': WRITE_SITE_LOCAL_ECHO_SAVE_SCRIPT,
+      'js-submit-on-input':"let autoSent = false; for (const id of ['name', 'email']) { document.getElementById(id).addEventListener('input', () => {"
         + " if (!autoSent && document.getElementById('name').value !== '' && document.getElementById('email').value !== '') { autoSent = true;"
         + " document.getElementById('f').submit(); } }); }",
     } as Partial<Record<WriteSiteMode, string>>)[mode] ?? '';
@@ -330,6 +422,19 @@ export async function startWriteSite(options: WriteSiteOptions = {}): Promise<Wr
       + (script === '' ? '' : `<script>${script}</script>`)
       + (serviceReads.origin === null ? ''
         : `<script>for (let i = 0; i < ${serviceReads.count}; i += 1) fetch('${serviceReads.origin}/rest/v1/m' + i).catch(() => 0);</script>`);
+  };
+
+  /** PL-6a: `input-error-form-js` で、ページの JS が後から読む誤りの form の値（最後に受けた登録の本文）。 */
+  let lastRejectedBody = '';
+  /**
+   * PL-6a: 登録の form（既定の画面と同じ form）を、誤りの文と一緒に作る。`fields` があれば、名前とメールの欄に送った値を入れる（保つ）。既定の画面は
+   * 変えない（文字列を差し替えた写しを作る）。
+   */
+  const errorFormHtml = (fields: URLSearchParams | null): string => {
+    const valueOf = (name: string): string => (fields === null ? '' : ` value="${escapeHtml(fields.get(name) ?? '')}"`);
+    return '<p class="error">入力に誤りがあります</p>' + formHtml(false)
+      .replace('<input name="name" id="name" required>', `<input name="name" id="name" required${valueOf('name')}>`)
+      .replace('<input type="email" name="email" id="email">', `<input type="email" name="email" id="email"${valueOf('email')}>`);
   };
 
   const newMember = (id: number, name: string, email: string | null = null): (typeof members)[number] => ({
@@ -379,12 +484,21 @@ export async function startWriteSite(options: WriteSiteOptions = {}): Promise<Wr
       + '<input type="hidden" name="parent_id" id="u-parent" value="" disabled>'
       + secretHiddenHtml()
       + '<button id="update" type="submit">更新</button></form>'
-      + (script === undefined ? '' : `<script>document.getElementById('f').addEventListener('submit', () => { ${script} });</script>`);
+      + (script === undefined ? '' : `<script>document.getElementById('f').addEventListener('submit', () => { ${script} });</script>`)
+      + (updateMode === 'js-sends-on-load'
+        ? `<script>for (const path of ['${writeSiteRecordPathOf(member.id + WRITE_SITE_OTHER_RECORD_OFFSET)}', '${p.create}', '${WRITE_SITE_OTHER_TABLE_PATH}'])`
+          + " fetch(path, { method: 'POST', headers: { 'content-type': 'application/x-www-form-urlencoded' }, body: 'x=1' }).catch(() => 0);</script>"
+        : '');
   };
 
   /** T31g-2: 更新の送信先の応答（送った値で会員を書き換え、形に応じてサーバが別の欄も変える）。 */
   const update = (response: ServerResponse, member: (typeof members)[number], body: string): void => {
     const fields = new URLSearchParams(body);
+    if (updateMode === 'input-error-form') {
+      // PL-6a: 更新せずに、同じ更新の form を、送った名前を保って誤りの文と一緒に返す（写しで描く。会員の値は変えない）。
+      sendHtml(response, `<p class="error">入力に誤りがあります</p>${updateFormHtml({ ...member, name: fields.get('name') ?? member.name })}`);
+      return;
+    }
     member.name = fields.get('name') ?? member.name;
     member.email = fields.get('email') ?? member.email;
     member.note = fields.get('note') ?? member.note;
@@ -413,7 +527,10 @@ export async function startWriteSite(options: WriteSiteOptions = {}): Promise<Wr
       + rows.map((member) => `<tr><td>${member.id}</td><td>${escapeHtml(member.name)}</td></tr>`).join('')
       + `</tbody></table><p>該当 ${rows.length} 件</p><p><a href="${p.form}">会員の登録へ</a></p>`
       + (updatePages ? `<p>${members.map((member) => `<a href="${writeSiteRecordPathOf(member.id)}">会員 ${member.id}</a>`).join(' ')}</p>` : '')
-      + (listDataRequest ? `<script>fetch('${listDataOrigin}${WRITE_SITE_LIST_DATA_PATH}', { method: 'POST', headers: { 'content-type': 'application/json' }, body: '{}' }).catch(() => 0);</script>` : '');
+      + (mode === 'local-echo' || mode === 'local-echo-not-registered' ? `<script>${WRITE_SITE_LOCAL_ECHO_LIST_SCRIPT}</script>` : '')
+      + (listDataRequest ? `<script>fetch('${listDataOrigin}${WRITE_SITE_LIST_DATA_PATH}', { method: 'POST', headers: { 'content-type': 'application/json' }, body: '{}' }).catch(() => 0);</script>` : '')
+      // NL-2: ログインのないサイトの一覧は、ログインの画面に似た path（`/login`）と、危険な語の path（`WRITE_SITE_DANGEROUS_PATH`）へのリンクも出す。
+      + (noLogin ? `<p><a href="${p.login}">ログイン</a> <a href="${WRITE_SITE_DANGEROUS_PATH}">まとめて消す</a></p>` : '');
   };
 
   /** 登録の送信先の応答（ファイルの先頭の説明）。 */
@@ -422,7 +539,7 @@ export async function startWriteSite(options: WriteSiteOptions = {}): Promise<Wr
     const register = (): number => {
       const id = nextId;
       nextId += 1;
-      if (mode !== 'read-mismatch') {
+      if (mode !== 'read-mismatch' && mode !== 'local-echo-not-registered') {
         members.push(newMember(id, name, new URLSearchParams(body).get('email')));
       }
       return id;
@@ -430,6 +547,20 @@ export async function startWriteSite(options: WriteSiteOptions = {}): Promise<Wr
     switch (mode) {
       case 'input-error':
         sendHtml(response, '<h1>会員の登録</h1><p class="error">入力に誤りがあります</p>');
+        return;
+      case 'input-error-form':
+        sendHtml(response, errorFormHtml(new URLSearchParams(body)));
+        return;
+      case 'input-error-form-422':
+        sendHtml(response, errorFormHtml(new URLSearchParams(body)), STATUS_UNPROCESSABLE_CONTENT);
+        return;
+      case 'input-error-form-cleared':
+        sendHtml(response, errorFormHtml(null));
+        return;
+      case 'input-error-form-js':
+        lastRejectedBody = body;
+        sendHtml(response, '<div id="slot"></div><script>fetch(' + `'${WRITE_SITE_ERROR_FRAGMENT_PATH}'`
+          + ").then((r) => r.text()).then((html) => { document.getElementById('slot').innerHTML = html; });</script>");
         return;
       case 'rate-limited':
         sendHtml(response, '<p>too many requests</p>', STATUS_TOO_MANY_REQUESTS);
@@ -485,6 +616,26 @@ export async function startWriteSite(options: WriteSiteOptions = {}): Promise<Wr
         response.writeHead(STATUS_TEMPORARY_REDIRECT, { location: `${p.create}?again=1` });
         response.end();
         return;
+      case 'slow-success': {
+        const id = register();
+        setTimeout(() => {
+          response.writeHead(STATUS_SEE_OTHER, { location: `${p.create}/${id}` });
+          response.end();
+        }, WRITE_SITE_SLOWER_RESPONSE_MS);
+        return;
+      }
+      case 'long-record-id': {
+        const id = register();
+        response.writeHead(STATUS_SEE_OTHER, { location: `${p.create}/${id}${WRITE_SITE_LONG_RECORD_ID_SUFFIX}` });
+        response.end();
+        return;
+      }
+      case 'navigate-after-created': {
+        const id = register();
+        response.writeHead(STATUS_SEE_OTHER, { location: `${p.create}/x/registered?next=${id}` });
+        response.end();
+        return;
+      }
       default: {
         const id = register();
         response.writeHead(STATUS_SEE_OTHER, { location: `${p.create}/${id}` });
@@ -528,7 +679,8 @@ export async function startWriteSite(options: WriteSiteOptions = {}): Promise<Wr
     if (request.method === 'POST') {
       postBodies.push(body);
     }
-    if (!hasSession(request)) {
+    // NL-2: ログインのないサイト（`noLogin`）は、セッションを求めない（どの画面もログインなしで開ける）。
+    if (!noLogin && !hasSession(request)) {
       response.writeHead(STATUS_SEE_OTHER, { location: p.login });
       response.end();
       return;
@@ -565,11 +717,28 @@ export async function startWriteSite(options: WriteSiteOptions = {}): Promise<Wr
       }
     }
     if (request.method === 'GET' && url.pathname === p.list) {
+      // PL-6a: `list-unavailable` の間は、一覧（照合の READ の対象）が 503 を返す。
+      if (mode === 'list-unavailable') {
+        sendHtml(response, '<p>unavailable</p>', STATUS_SERVICE_UNAVAILABLE);
+        return;
+      }
       sendHtml(response, listHtml(url));
+      return;
+    }
+    if (request.method === 'GET' && url.pathname === WRITE_SITE_ERROR_FRAGMENT_PATH) {
+      // PL-6a: `input-error-form-js` のページの JS が読む、送った値を保った誤りの form（HTML の断片）。
+      response.writeHead(STATUS_OK, { 'content-type': 'text/html; charset=utf-8', 'cache-control': 'no-store' });
+      response.end(errorFormHtml(new URLSearchParams(lastRejectedBody)));
       return;
     }
     if (request.method === 'GET' && url.pathname === p.done) {
       sendHtml(response, '<h1>受け付けました</h1>');
+      return;
+    }
+    if (request.method === 'GET' && url.pathname === `${p.create}/x/registered` && url.searchParams.has('next')) {
+      // L12b: `navigate-after-created` の、ID の型に当たらない画面（ページの JS が、少し後に登録の画面へ自分で移る）。
+      const next = `${p.create}/${encodeURIComponent(url.searchParams.get('next') ?? '')}`;
+      sendHtml(response, `<p>処理中です</p><script>setTimeout(() => { location.assign(${JSON.stringify(next)}); }, ${String(WRITE_SITE_NAVIGATE_AFTER_CREATED_MS)});</script>`);
       return;
     }
     if (request.method === 'GET' && url.pathname.startsWith(`${p.create}/`)) {
@@ -655,6 +824,7 @@ export async function startWriteSite(options: WriteSiteOptions = {}): Promise<Wr
         published: member.published,
       };
     },
+    whenIdle: (limitMs) => loopback.whenIdle(limitMs),
     close: () => loopback.close(),
   };
 }

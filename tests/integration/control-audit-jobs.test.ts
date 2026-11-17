@@ -88,6 +88,8 @@ const managerWith = (
     readonly timing?: Partial<AuditJobTiming>;
     /** DEF-146: 結果の前に終わったワーカーの終わり方の受け手。 */
     readonly onUnexpectedWorkerExit?: AuditJobManagerOptions['onUnexpectedWorkerExit'];
+    /** RB-2: ジョブの管理の時計。 */
+    readonly now?: AuditJobManagerOptions['now'];
   } = {},
 ): AuditJobManager => {
   manager = createFakeWorkerJobManager({
@@ -98,6 +100,7 @@ const managerWith = (
     forkWorker: options.forkWorker ?? countingFork,
     ...(options.timing === undefined ? {} : { timing: options.timing }),
     ...(options.onUnexpectedWorkerExit === undefined ? {} : { onUnexpectedWorkerExit: options.onUnexpectedWorkerExit }),
+    ...(options.now === undefined ? {} : { now: options.now }),
   });
   return manager;
 };
@@ -175,15 +178,17 @@ describe('audit jobs: the checks right before the start (I08)', () => {
   });
 
   // T25d: 認証つきの読み取りの監査（`TEST_AUTH_PASSIVE`）は実行できるモードになった（その開始の確かめは `control-audit-jobs-auth.test.ts`）。
-  // まだ実行できないモードの例を、書き込みの監査（`TEST_APPROVED_WRITE`）に替えた。
-  it('rejects a mode that cannot run yet (TEST_APPROVED_WRITE), without reading the target configuration', async () => {
+  // まだ実行できないモードの例を、書き込みの監査（`TEST_APPROVED_WRITE`）に替えた。MI-5（設計書 `2026-10-26-beaksight-minimal-input-ux-design.md`
+  // 3 章の判断 1、4.5）: 書き込みのモードの監査も始められるようになり、保存できるモードで監査を始められないものはなくなった。書き込みのモードの監査は、
+  // 認証つきの読み取りの監査と同じ確かめ（認証の設定がなければ、ターゲット設定を読む前に `AUTH_SETUP_MISSING`）になることを確かめる。
+  it('checks the audit of a write mode profile (TEST_APPROVED_WRITE) like the authenticated audit, without reading the target configuration (MI-5)', async () => {
     const testProfileId = 'example-test-write';
     const writeProfile = { ...testAuthProfile(testProfileId, MIN_PROFILE_REVISION), mode: 'TEST_APPROVED_WRITE' as const };
     expect(createProfile(database, writeProfile, { resolveContext: resolveTestContext }).ok).toBe(true);
     const jobManager = managerWith(fakeWorker('hold'));
 
     expect(await jobManager.startAuditJob({ ...START_REQUEST, profileId: testProfileId }))
-      .toMatchObject({ ok: false, reason: 'MODE_NOT_EXECUTABLE' });
+      .toMatchObject({ ok: false, reason: 'AUTH_SETUP_MISSING' });
     expect(resolverCalls).toEqual([]);
     expect(forks.count()).toBe(0);
   });
@@ -279,14 +284,19 @@ describe('audit jobs: one job at a time', () => {
     expect(await jobManager.startAuditJob(START_REQUEST)).toMatchObject({ ok: false, reason: 'JOB_ALREADY_ACTIVE' });
   }, TEST_TIMEOUT_MS);
 
-  it('accepts the next start after the job ended', async () => {
-    const jobManager = managerWith(fakeWorker('finish'));
+  it('accepts the next start after the job ended, and passes the end of the previous worker on the clock of the job manager (RB-2)', async () => {
+    const clockMs = Date.UTC(2030, 0, 1);
+    const worker = fakeWorker('finish');
+    const jobManager = managerWith(worker, { now: () => new Date(clockMs) });
     const first = await startedJob(jobManager);
     await waitForJob(jobManager, first.jobId, isJobEnded);
     await expectWorkersExited(children, { requireExitEvent: true });
 
     const second = await jobManager.startAuditJob(START_REQUEST);
     expect(second.ok).toBe(true);
+    await waitForJob(jobManager, second.ok ? second.job.jobId : '', isJobEnded);
+    const starts = worker.received().filter((message) => message['type'] === 'START');
+    expect(starts.at(-1)?.['previousNavigationAtMs']).toBe(clockMs);
   }, TEST_TIMEOUT_MS);
 
   it('allows only one job manager in a process', async () => {
@@ -326,8 +336,8 @@ describe('audit jobs: the messages of the worker', () => {
     expect(worker.received()).toEqual([{
       protocol: WORKER_PROTOCOL_VERSION, type: 'START', jobId: job.jobId, jobKind: 'AUDIT', targetConfigPath: PUBLIC_TARGET_PATH, startNew: true,
       targetConfigSha256: targetConfigDigestOf(new TextEncoder().encode(TARGET_CONFIG_TEXT)), showJobBrowser: true,
-      // AS-b: 監査の段の送信の扱い（既定は読み取りだけ）も、ジョブの開始のときに読んで入れる。
-      auditSendPolicy: 'READ_ONLY',
+      // AS-b: 監査の段の送信の扱いも、ジョブの開始のときに読んで入れる。OP-I（I1）: 行のないサイトの既定は、サイトの通信を止めない（`PASS_EXCEPT_DELETE`）。
+      auditSendPolicy: 'PASS_EXCEPT_DELETE',
       // PRE42-BN: 監査のジョブは、プロファイルの名前（画面の「名前（profileId）」）を入れる（ChatGPT 用バンドルのファイル名だけに使う）。
       profileName: PROFILE_ID,
     }]);
@@ -346,14 +356,15 @@ describe('audit jobs: the messages of the worker', () => {
   }, TEST_TIMEOUT_MS);
 
   // AS-b（設計書 `2026-10-19-beaksight-audit-send-policy-design.md` 2.1）: 監査の段の送信の扱いを切り替えたプロファイルの監査のジョブは、`START` でその扱いを渡す。
-  it('sends START with the audit send policy of the profile (PASS_EXCEPT_DELETE)', async () => {
-    expect(saveProfileDisplaySettings(database, PROFILE_ID, { showJobBrowser: false, auditSendPolicy: 'PASS_EXCEPT_DELETE' }).ok).toBe(true);
+  // OP-I（I1）: 既定が通す側になったので、人が詳しい内容で選んだ読み取りだけを渡すことを確かめる。
+  it('sends START with the audit send policy of the profile (READ_ONLY chosen by a person)', async () => {
+    expect(saveProfileDisplaySettings(database, PROFILE_ID, { showJobBrowser: false, auditSendPolicy: 'READ_ONLY' }).ok).toBe(true);
     const worker = fakeWorker('finish');
     const jobManager = managerWith(worker);
     const job = await startedJob(jobManager);
     await waitForJob(jobManager, job.jobId, isJobEnded);
     const start = worker.received().find((message) => message['type'] === 'START');
-    expect(start?.['auditSendPolicy']).toBe('PASS_EXCEPT_DELETE');
+    expect(start?.['auditSendPolicy']).toBe('READ_ONLY');
     expect(start?.['showJobBrowser']).toBe(false);
     await expectWorkersExited(children, { requireExitEvent: true });
   }, TEST_TIMEOUT_MS);

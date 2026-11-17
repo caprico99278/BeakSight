@@ -12,9 +12,8 @@ import { afterAll, beforeAll, describe, expect, it } from 'vitest';
 import { startFixtureServer, type FixtureServer } from '../../fixtures/server.js';
 import { BrowserContextFactory, type InteractionGuardedSession } from '../../src/browser/context-factory.js';
 import { EXIT_CODES, exitCodeForRunStatus } from '../../src/cli/exit-codes.js';
-import type { AuditConfig, Viewport } from '../../src/config/types.js';
+import type { Viewport } from '../../src/config/types.js';
 import { RUN_ARTIFACT_FILE_NAMES, bundleFileName } from '../../src/core/artifact-layout.js';
-import type { AuditRunResult } from '../../src/core/contracts.js';
 import { wait } from '../../src/core/deadline.js';
 import { REDACTED } from '../../src/core/redaction.js';
 import {
@@ -32,9 +31,10 @@ import { SafetyLedger } from '../../src/safety/safety-ledger.js';
 import { browserOpeningPageAfterNewContext } from '../helpers/browser-opening-page.js';
 import { browserFailingNewContext, browserStallingContextClose } from '../helpers/browser-proxies.js';
 import {
+  BOTH_CHROMIUM_LAUNCHERS,
   BROWSER_DEFAULT_FAVICON_PATH,
+  CLI_CHROMIUM_RUN_LABEL,
   isCliChromiumSelected,
-  launchCliChromium,
   launchHeadlessChromium,
   oopifTargetUrls,
   SITE_PER_PROCESS_ARGS,
@@ -50,7 +50,6 @@ import {
   EXTERNAL_SCHEME_NAVIGATION_PAGE,
   EXTERNAL_SCHEME_REDIRECT_FRAME_PAGE,
   EXTERNAL_SCHEME_REDIRECT_PATH,
-  EXTERNAL_SCHEME_ROUTES,
   EXTERNAL_SCHEME_TARGETS,
   externalSchemeAttemptRecord,
   externalSchemeFixturePath,
@@ -63,6 +62,8 @@ import {
   SELF_NAVIGATING_FRAME_PAGE,
   selfNavigatingFramePath,
   stoppedRedirectRecord,
+  type ExternalSchemeKey,
+  type ExternalSchemeRoute,
 } from '../helpers/external-scheme-fixture.js';
 import {
   attemptPostNavigationAndFetch,
@@ -114,12 +115,10 @@ import {
   cliTargetConfig,
   createRunLauncher,
   expectOnlyReadRequests,
-  fastRunConfig,
   findTextOccurrences,
   isPageJsonArtifact,
   readRunArtifactFiles,
   runCliInProcess,
-  runWithCoordinator,
   writtenPageResults,
   type CliRunOutcome,
   type RunLauncher,
@@ -164,11 +163,13 @@ const COUNT_CLICKS_SCRIPT = `globalThis.__gateClicks = 0;
 document.addEventListener('click', () => { globalThis.__gateClicks += 1; }, { capture: true });`;
 
 /**
- * TS-f（7c）: ファイルの中の `describe.each` で、テストの既定の headless shell と CLI の Chromium の両方を流す組（DEF-044・DEF-049）は、
- * CLI の回（`BEAKSIGHT_TEST_DEFAULT_CHROMIUM=cli`）では飛ばす。CLI の回では、既定の Chromium も CLI の Chromium になるので、同じ CLI の
- * Chromium を 2 回流すだけで、新しく確かめるものがないためである（両方の Chromium は、既定の回で、このファイルの中で確かめる）。
+ * TS-f（7c）・SAFE-B5: ファイルの中の `describe.each` で、2 つの Chromium の組（`BOTH_CHROMIUM_LAUNCHERS`）を流す場面（DEF-044・DEF-049）の組。
+ * CLI の回（`BEAKSIGHT_TEST_DEFAULT_CHROMIUM=cli`）では、CLI の Chromium の 1 つだけを流す（前は CLI の回で飛ばした。遅い組は safety-gates を CLI の回で
+ * 流すので、飛ばすと DEF-044・DEF-049 が遅い組から消える）。ほかの回は `BOTH_CHROMIUM_LAUNCHERS` のまま（両方に広げる束では 2 つ）。
  */
-const describeBothChromiums = describe.skipIf(isCliChromiumSelected());
+const SAFETY_GATE_CHROMIUM_LAUNCHERS = isCliChromiumSelected()
+  ? BOTH_CHROMIUM_LAUNCHERS.filter(([label]) => label === CLI_CHROMIUM_RUN_LABEL)
+  : BOTH_CHROMIUM_LAUNCHERS;
 
 /**
  * page の中の `navigator.serviceWorker.register` の呼び出しを数えるスクリプト（S08。R18 の M2）。
@@ -451,13 +452,9 @@ describe('GATE-S01 / GATE-S02: non-read methods never reach the server (Passive 
    * テストの既定の headless shell と、CLI の起動の設定（`chromiumLaunchOptions`）の両方で、Passive の Context と凍結の前の Interaction の
    * session で、Shared Worker が作れず（`typeof SharedWorker === 'undefined'`）、fetch・XHR・keepalive の POST が届かず、違反 0（factory の
    * 自己検査 `SHARED_WORKER_OBSERVED` も出ない）ことを確かめる。対照（引数を外した Chromium で届く）は `gate-fixtures.test.ts`。
-   * TS-f（7c）: 両方の Chromium をこの中で流すので、CLI の回では飛ばす（`describeBothChromiums`）。
+   * TS-f（7c）・SAFE-B5: 組は `SAFETY_GATE_CHROMIUM_LAUNCHERS`（CLI の回では CLI の Chromium の 1 つ）。
    */
-  describeBothChromiums.each([
-    { name: 'the headless shell (test default)', launch: (): Promise<Browser> => launchHeadlessChromium() },
-    // EL-12: 製品と同じ起動の部品（`launchCliChromium`。外部のアプリの起動を止める一時のプロファイルと自己検査）で起動する。
-    { name: 'the CLI Chromium (chromiumLaunchOptions, headless)', launch: (): Promise<Browser> => launchCliChromium() },
-  ])('GATE-S01 Shared Worker (DEF-044), with $name', ({ launch }) => {
+  describe.each(SAFETY_GATE_CHROMIUM_LAUNCHERS)('GATE-S01 Shared Worker (DEF-044), with %s', (_name, launch) => {
     let sharedWorkerBrowser: Browser;
     let sharedWorkerFactory: BrowserContextFactory;
 
@@ -490,7 +487,7 @@ describe('GATE-S01 / GATE-S02: non-read methods never reach the server (Interact
     ['GATE-S01', 'POST', '/mutation-button.html', 'Attempt mutation'],
     ['GATE-S02', 'PUT', '/put-request.html', 'Send PUT'],
     ['GATE-S02', 'PATCH', '/patch-request.html', 'Send PATCH'],
-    ['GATE-S02', 'DELETE', '/delete-request.html', 'Send DELETE'],
+    ['GATE-S02', 'DELETE', '/delete-request.html', 'Send request'],
   ] as const)('%s Interaction: %s sent by the clicked control does not reach the server', async (
     _gate,
     method,
@@ -551,54 +548,61 @@ describe('GATE-S03: mailto:, tel: and external application launches are not perf
 // C18b（DEF-012。Task 19 の前の整理の設計書 4.2）: ページのスクリプトによる外部スキーム（`tel:`、`mailto:`、独自のスキーム）への
 // 移動の試みは、Guard が Safety Ledger の `externalSchemeNavigations` に記録する。数え方は、ほかの Gate と同じく、サーバの境界の
 // 差分である（Ledger は記録の確認）。
-// R7d（中断した Run の再開の設計書 4.10）: CLI の Chromium は、headless でも通常の Chromium の本体を使うので、外部のアプリが
-// 起動しうる。そのため、headed と headless を問わず、この移動の試みは安全の不変条件の違反（`EXTERNAL_SCHEME_NAVIGATION_ATTEMPTED`）
-// になり、Guard が Context を閉じる。Run は `ABORTED_BY_SAFETY` になる。Guard は headed かどうかを受け取らない。
+// R7d（中断した Run の再開の設計書 4.10）の後: 前は、この移動の試みを安全の不変条件の違反（`EXTERNAL_SCHEME_NAVIGATION_ATTEMPTED`）にし、Guard が Context を
+// 閉じ、Run を `ABORTED_BY_SAFETY` にした。SAFE-2 の 4（違反の区分の (3)。設計者の判断）: 本番の Chromium は一時のプロファイルの設定で外部スキームへの移動を
+// 止め、外部のアプリへ渡さない（EL-12。起動の部品の自己検査で、効いていることを確かめてから始める）。外へは何も渡っていないので、違反にせず、Context も
+// 閉じず、Run も止めない。記録（`externalSchemeNavigations`）は今どおり残す。外へ何も渡っていないこと（サーバにはページの GET だけ）は、今どおり確かめる。
 // 対照の確認（Guard のない Context で、同じ fixture が、その外部スキームの URL への移動のリクエストを出す）は、
 // `tests/integration/gate-fixtures.test.ts` の C18b に置く。
 // 厳守事項: Chromium は headless だけで起動する。宛先は実在しない。
 
-/** 外部スキームへの移動の試みの、不変条件の違反のコード（R7d。中断した Run の再開の設計書 4.10）。 */
-const EXTERNAL_SCHEME_ATTEMPTED_VIOLATION_CODE = 'EXTERNAL_SCHEME_NAVIGATION_ATTEMPTED';
-
-/** ボタンのページで、ボタンを押す（`button-click` の経路の Passive の段階）。 */
-const clickExternalSchemeButton = async (page: Page): Promise<void> => {
-  await page.getByRole('button', { name: EXTERNAL_SCHEME_BUTTON_NAME }).click();
+/**
+ * DEF-247: 外部スキームへの移動の後の page の URL を確かめる。テストの既定の Chromium では、移動は起きず、元の page の URL のまま。CLI の回（本番の Chromium の起動の
+ * 設定）では、一時のプロファイルの設定が外部スキームへの移動を止めて誤りの画面に替える（EL-12 の守りの結果。外へは何も渡らない）ので、元の URL か誤りの画面の
+ * どちらか（URL を読む時点と替わる時点の前後による。子の frame の移動では main frame は替わらない）。
+ */
+const CLI_EXTERNAL_SCHEME_ERROR_PAGE_URL = 'chrome-error://chromewebdata/';
+const expectPageUrlAfterExternalScheme = (actual: string | null, path: string): void => {
+  if (isCliChromiumSelected()) {
+    expect([urlOf(path), CLI_EXTERNAL_SCHEME_ERROR_PAGE_URL]).toContain(actual);
+  } else {
+    expect(actual).toBe(urlOf(path));
+  }
 };
 
-describe('GATE-S03: navigations to external schemes by the page are recorded as invariant violations, and nothing but the page reaches the server', () => {
-  const cases = EXTERNAL_SCHEME_ROUTES.flatMap((route) => EXTERNAL_SCHEME_KEYS.map((key) => [route, key] as const));
+describe('GATE-S03: navigations to external schemes by the page are recorded (not violations since SAFE-2), and nothing but the page reaches the server', () => {
+  /**
+   * SAFE-B5: 前は経路 7 × スキーム 3 の 21 件。経路の網羅は `external-launch-block.test.ts`（EL-12。`location.href`・a の click・iframe・`window.open`・
+   * target=_blank の a と form・goto・OOPIF・302、Passive と凍結の後の Interaction）が持つ。ここには、そこにない経路（`location.assign`・meta refresh・
+   * 同じ窓の form の送信）を、スキーム 3 つに 1 つずつ割り当てた代表 3 件を残す（`button-click` の経路は、下の Interaction の 3 件が同じ fixture の本物の
+   * click で確かめる）。
+   */
+  const cases: readonly (readonly [ExternalSchemeRoute, ExternalSchemeKey])[] = [
+    ['location-assign', 'tel'],
+    ['meta-refresh', 'custom'],
+    ['form-action', 'mailto'],
+  ];
 
-  it.each(cases)('GATE-S03 Passive: %s to %s is recorded, is an invariant violation, the Guard closes the Context, and only the page GET reaches the server', async (
+  it.each(cases)('GATE-S03 Passive: %s to %s is recorded, is not a violation, the Context stays open, and only the page GET reaches the server', async (
     route,
     key,
   ) => {
     const path = externalSchemeFixturePath(route, key);
 
-    const { window, ledger, pageUrl, guardClosed } = await openGuardedPassivePage(
+    const { window, ledger, pageUrl } = await openGuardedPassivePage(
       path,
-      async (page) => isPassiveRequestGuardClosed(page.context()),
-      route === 'button-click' ? { act: clickExternalSchemeButton } : {},
+      async (_page, ledger) => ledger.snapshot().externalSchemeNavigations.length > 0,
     );
 
-    // 補助の確認（RC18a の指摘4）: 「サーバには、そのページへの GET だけが届く」と「page の URL は変わらない」は、Guard がなくても
-    // 同じ結果になる（外部スキームはネットワークを通らず、テストの headless のブラウザは外部スキームへ移動しない）。Guard の働きを
-    // 見分けているのは、下の Ledger の記録と違反、Context を閉じたことの確認である。
-    // サーバには、そのページへの GET だけが届く。
+    // 外へ何も渡っていない: サーバには、そのページへの GET だけが届き、page の URL は変わらない。Guard の働きを見分けるのは、Ledger の記録である。
     expect(window.requestLines()).toEqual([`GET ${externalSchemeFixturePathname(route)}`]);
     expectOnlyReadRequests(window.counters(), window.observations());
-    // page の URL は変わらない。
-    expect(pageUrl).toBe(urlOf(path));
-    // Ledger に、そのスキームと経路の記録と、違反がある。Guard は Context を閉じた（Guard の働きを見分ける確認）。
-    expect(guardClosed).toBe(true);
-    const snapshot = ledger.snapshot();
-    expect(snapshot.externalSchemeNavigations).toEqual([externalSchemeAttemptRecord(route, key, 'PASSIVE')]);
-    expect(snapshot.invariantViolations).toEqual([
-      expect.objectContaining({ code: EXTERNAL_SCHEME_ATTEMPTED_VIOLATION_CODE }),
-    ]);
+    expect(ledger.snapshot().externalSchemeNavigations).toEqual([externalSchemeAttemptRecord(route, key, 'PASSIVE')]);
+    expect(ledger.snapshot().invariantViolations).toEqual([]);
+    expectPageUrlAfterExternalScheme(pageUrl, path);
   });
 
-  it.each(EXTERNAL_SCHEME_KEYS)('GATE-S03 Interaction: the clicked button that navigates to %s is recorded, is an invariant violation, the result is BLOCKED_BY_SAFETY, and only the page GET reaches the server', async (
+  it.each(EXTERNAL_SCHEME_KEYS)('GATE-S03 Interaction: the clicked button that navigates to %s is recorded, is not a violation, the result is BLOCKED_BY_SAFETY, and only the page GET reaches the server', async (
     key,
   ) => {
     const path = externalSchemeFixturePath('button-click', key);
@@ -611,26 +615,17 @@ describe('GATE-S03: navigations to external schemes by the page are recorded as 
       },
     });
 
-    // click は行われた（候補は、方針で拒否されていない）。fixture のボタンは、押されたときにだけ外部スキームへ移動するので、
-    // 凍結の後の移動の試みの記録が、click が行われたことを示す（Guard が session の Context を閉じるので、page の中で数えた
-    // click の数は、閉じた後には読めない）。
-    expect(result.status).not.toBe('REJECTED_UNSAFE');
+    // 凍結の後の移動の試みの記録が残り（click が行われたことも示す）、結果は BLOCKED_BY_SAFETY になる（記録で決める。C18a）。
     expect(result.safety.externalSchemeNavigations).toEqual([externalSchemeAttemptRecord('button-click', key, 'INTERACTION')]);
-    // 凍結の後の外部スキームへの移動の試みなので、結果は BLOCKED_BY_SAFETY になる。移動の試みは違反になり、Guard が session の
-    // Context を閉じる（その後の owner の close は、無効にした Context の close の失敗として記録される）。
     expect(result.status).toBe('BLOCKED_BY_SAFETY');
-    expect(result.reason).toBe('SAFETY_FREEZE_BLOCKED');
-    expect(result.safety.invariantViolations).toEqual([
-      expect.objectContaining({ code: EXTERNAL_SCHEME_ATTEMPTED_VIOLATION_CODE }),
-      expect.objectContaining({ code: 'INTERACTION_OWNER_CLOSE_FAILED' }),
-    ]);
-    // page の URL は変わらず、サーバには、そのページへの GET だけが届く。
-    expect(observed.pageUrl).toBe(urlOf(path));
+    // サーバには、そのページへの GET だけが届く。page の URL は、既定の Chromium では変わらず、CLI の回では誤りの画面（DEF-247）。
     expect(window.requestLines()).toEqual([`GET ${EXTERNAL_SCHEME_BUTTON_PAGE}`]);
     expectOnlyReadRequests(window.counters(), window.observations());
+    expect(result.safety.invariantViolations).toEqual([]);
+    expectPageUrlAfterExternalScheme(observed.pageUrl, path);
   });
 
-  it('GATE-S03 CLI Run (headless): the page navigation to an external scheme ends with ABORTED_BY_SAFETY and exit code 3, and the written page.json keeps the record', async () => {
+  it('GATE-S03 CLI Run (headless): the page navigation to an external scheme does not abort the Run (SAFE-2), and the written page.json keeps the record', async () => {
     const route = 'location-href';
     const key = 'mailto';
     const window = openServerWindow(server);
@@ -642,11 +637,9 @@ describe('GATE-S03: navigations to external schemes by the page are recorded as 
     });
 
     expect(cliRun.stderr).toBe('');
-    // headless でも、違反として Run を止める（R7d）。
-    expect(cliRun.run.runStatus).toBe('ABORTED_BY_SAFETY');
-    expect(cliRun.code).toBe(EXIT_CODES.ABORTED_BY_SAFETY);
-    expect(cliRun.run.safety.invariantViolations.map((violation) => violation.code))
-      .toEqual([EXTERNAL_SCHEME_ATTEMPTED_VIOLATION_CODE]);
+    // SAFE-2 の 4: Run は止まらない（前は R7d で ABORTED_BY_SAFETY と終了コード 3）。
+    expect(cliRun.run.runStatus, JSON.stringify(cliRun.run.safety)).not.toBe('ABORTED_BY_SAFETY');
+    expect(cliRun.code).not.toBe(EXIT_CODES.ABORTED_BY_SAFETY);
     // 書き出した page.json の Safety の Evidence に、外部スキームへの移動の記録が残る。
     const pages = writtenPageResults(await readRunArtifactFiles(cliRun.runDirectory));
     // 監査したページは、その fixture の1つだけである（page の identity の URL は、正規化でクエリの名前の順に並ぶ）。
@@ -656,7 +649,7 @@ describe('GATE-S03: navigations to external schemes by the page are recorded as 
     const recorded = safetyExternalSchemeNavigations(pages);
     expect(recorded).toContainEqual(externalSchemeAttemptRecord(route, key, 'PASSIVE'));
     expect(recorded.every((event) => event.url === EXTERNAL_SCHEME_TARGETS[key].url)).toBe(true);
-    // 補助: 記録した試みは、Finding にもなる（C18a の Rule）。
+    // 補助: 記録した試みは、止めた記録の区分の指摘にもなる（C18a の Rule）。
     expect(pages.flatMap((page) => page.findings.map((finding) => finding.ruleId)))
       .toContain('SAFETY_EXTERNAL_SCHEME_NAVIGATION_ATTEMPTED');
     // サーバの境界: GET・HEAD 以外のリクエストは届かない。
@@ -1278,38 +1271,8 @@ describe('GATE-S07: WebSockets during Interaction are blocked', () => {
     ))).toBe(true);
   });
 
-  /**
-   * DEF-040 の Passive（設計書 2.2。NP3）: Passive の段階で、読み込みのときに Worker（blob、http の script、Shared、module、入れ子、srcdoc の
-   * iframe）の中で開く WebSocket の接続も、同じ CSP で止まり、サーバに届かない。Dedicated の Worker は `blockedWebSockets` に理由
-   * `WORKER_CONNECT_POLICY` で残る。Worker の script の GET は、今までどおり届く（Guard は script を止めず、応答にヘッダを加えるだけ）。
-   * DEF-044（NP5）: テストの Chromium は Shared Worker を無効にして起動するので、Shared の場面は、Shared Worker が作れず（fixture が
-   * `unavailable` を残す）、接続も script の GET も起きず、違反 0 であることを確かめる（`expectedWorkerWebSocketState`）。
-   * TS-f（B11）: `guard-worker-websocket.test.ts` の Passive の場面（`WORKER_WEBSOCKET_ROUNDS` 回のくり返し、製品の手順で閉じた後と、全部の回の後の
-   * 待ちの後の確かめ）を、ここにまとめた。CLI の Chromium では、CLI の回で確かめる。
-   */
-  it.each(WORKER_WEBSOCKET_KINDS)('GATE-S07 Passive: the WebSocket upgrade from inside the %s Worker never reaches the server, and Dedicated Workers are recorded as WORKER_CONNECT_POLICY (DEF-040)', async (kind) => {
-    const socketUrl = urlOf('/socket').replace(/^http/, 'ws');
-    const expectedRequestLines = [`GET ${WORKER_WEBSOCKET_PASSIVE_PAGE}`, ...workerWebSocketScriptRequestLines(kind)];
-    const result = await runGuardedWorkerWebSocketRounds(() => openGuardedPassiveSession(factory, viewport), server, kind);
-    logWorkerWebSocketRounds(`GATE-S07 Passive ${kind}`, result);
-
-    // 回ごとに、Upgrade が届かず、記録が残るはずの種類では記録があり、違反 0、閉じる処理の失敗 0（`failedRounds` の条件）。
-    expect(result.failedRounds).toEqual([]);
-    expect(result.allRoundsWindow.counters().webSocketUpgrade).toBe(0);
-    expect(result.allRoundsWindow.nonReadCounters()).toEqual(NO_NON_READ_REQUESTS);
-    // サーバに届いたのは、どの回も、ページと Worker の script の GET だけ（全部の回の後の待ちの後に、ブラウザ自身の要求も除かずに確かめる）。
-    expect(result.allRoundsWindow.requestLines()).toEqual(result.rounds.flatMap(() => expectedRequestLines));
-    expect(result.rounds.map((round) => round.requestLines)).toEqual(result.rounds.map(() => expectedRequestLines));
-    expect(result.rounds).toHaveLength(WORKER_WEBSOCKET_ROUNDS);
-    expect(result.rounds.every((round) => round.workerState === expectedWorkerWebSocketState(kind))).toBe(true);
-    if (RECORDED_WORKER_WEBSOCKET_KINDS.includes(kind)) {
-      expect(result.rounds.every((round) => round.blockedWebSockets.length > 0)).toBe(true);
-    }
-    // 残った記録は、どの種類でも、理由と URL が同じ形である。
-    expect(result.rounds.every((round) => round.blockedWebSockets.every((entry) => (
-      entry.url === socketUrl && entry.reason === 'WORKER_CONNECT_POLICY'
-    )))).toBe(true);
-  }, WORKER_WEBSOCKET_TEST_TIMEOUT_MS);
+  // RB-4b: Passive の段階の Worker の中の WebSocket の止め（前の DEF-040 の Passive の場面）は外した（READ_ONLY でもリアルタイムの通信を止めない。
+  // ユーザーの判断 2026-11-15）。止める先がないので、別の所の確かめはない。Interaction の Worker の中の WebSocket は、上の場面が確かめる。
 });
 
 // ---------------------------------------------------------------------------------------------------------------
@@ -1377,13 +1340,9 @@ describe('GATE-S08: a Service Worker cannot bypass the blocking', () => {
    * UPG-SW: Playwright 1.64.1（Chromium 156）の `serviceWorkers: 'block'` は、インスタンスではなく `ServiceWorkerContainer.prototype.register` を
    * 置き換える（microsoft/playwright の PR #43134）。その後に Guard の初期化のスクリプトが原型を固定するので、迂回も Guard の拒否になる
    * （`rejected:NotSupportedError:<文言>`。同期では投げない。形は T44R2 の M-2 で Chromium に寄せた）。
-   * TS-f（7c）: 両方の Chromium をこの中で流すので、CLI の回では飛ばす（`describeBothChromiums`）。
+   * TS-f（7c）・SAFE-B5: 組は `SAFETY_GATE_CHROMIUM_LAUNCHERS`（CLI の回では CLI の Chromium の 1 つ）。
    */
-  describeBothChromiums.each([
-    { name: 'the headless shell (test default)', launch: (): Promise<Browser> => launchHeadlessChromium() },
-    // EL-12: 製品と同じ起動の部品（`launchCliChromium`。外部のアプリの起動を止める一時のプロファイルと自己検査）で起動する。
-    { name: 'the CLI Chromium (chromiumLaunchOptions, headless)', launch: (): Promise<Browser> => launchCliChromium() },
-  ])('GATE-S08 bypass of the instance override (DEF-049), with $name', ({ name, launch }) => {
+  describe.each(SAFETY_GATE_CHROMIUM_LAUNCHERS)('GATE-S08 bypass of the instance override (DEF-049), with %s', (name, launch) => {
     let bypassBrowser: Browser;
     let bypassFactory: BrowserContextFactory;
 
@@ -1506,46 +1465,18 @@ function escapeRegExp(text: string): string {
 // ---------------------------------------------------------------------------------------------------------------
 
 describe('GATE-S10: when the Guard cannot be initialized, the target site is never touched', () => {
-  /** Run Coordinator を、実際の Chromium（`wrap` で差し替える）で実行する。 */
-  async function runCoordinator(
-    wrap: (real: Browser) => Browser,
-    config: AuditConfig = fastRunConfig(server.origin, '/short-content.html'),
-  ): Promise<{ readonly result: AuditRunResult; readonly launcher: RunLauncher }> {
-    const launcher = createRunLauncher(wrap);
-    launchers.push(launcher);
-    const outputDirectory = await mkdtemp(join(workDirectory, 'coordinator-'));
-    return { result: await runWithCoordinator({ config, launchBrowser: launcher.launcher, outputDirectory }), launcher };
-  }
+  // SAFE-B5: 前は Run Coordinator（`runWithCoordinator`）の 2 件と CLI の 2 件で、同じ失敗を 2 回ずつ流した。CLI の Run は同じ Run Coordinator を通るので、
+  // Coordinator の 2 件の確かめ（PREFLIGHT_FAILED の理由、監査したページが 0、Browser を閉じた）を、CLI の 2 件に寄せた。
 
   const expectNoRequestAtAll = (window: ServerWindow): void => {
     expect(window.observations()).toEqual([]);
     expect(Object.values(window.counters()).every((value) => value === 0)).toBe(true);
   };
 
-  it('GATE-S10 Run Coordinator: a Guard installation failure with a violation is ABORTED_BY_SAFETY and no request reaches the server', async () => {
-    const window = openServerWindow(server);
-
-    const { result, launcher } = await runCoordinator((real) => browserOpeningPageAfterNewContext(real));
-
-    expectNoRequestAtAll(window);
-    expect(result.run.runStatus).toBe('ABORTED_BY_SAFETY');
-    expect(result.run.incompleteReasons).toContainEqual({ code: 'PREFLIGHT_FAILED', detail: 'PASSIVE_GUARD' });
-    expect(result.run.safety.invariantViolations.map((violation) => violation.code)).toContain('GUARD_INSTALLATION_FAILED');
-    expect(result.pages.every((page) => page.status !== 'AUDITED')).toBe(true);
-    expect(launcher.browsers.every((real) => !real.isConnected())).toBe(true);
-  }, RUN_TEST_TIMEOUT_MS);
-
-  it('GATE-S10 Run Coordinator: a Context creation failure without a violation is FAILED and no request reaches the server', async () => {
-    const window = openServerWindow(server);
-
-    const { result, launcher } = await runCoordinator((real) => browserFailingNewContext(real));
-
-    expectNoRequestAtAll(window);
-    expect(result.run.runStatus).toBe('FAILED');
-    expect(result.run.incompleteReasons).toContainEqual({ code: 'PREFLIGHT_FAILED', detail: 'PASSIVE_GUARD' });
-    expect(result.run.safety.invariantViolationCount).toBe(0);
-    expect(launcher.browsers.every((real) => !real.isConnected())).toBe(true);
-  }, RUN_TEST_TIMEOUT_MS);
+  /** 直前の `runGateCli` が起動した Browser が、どれも閉じている。 */
+  const expectLastRunBrowsersClosed = (): void => {
+    expect(launchers.at(-1)?.browsers.every((real) => !real.isConnected())).toBe(true);
+  };
 
   it('GATE-S10 CLI: a Guard installation failure ends with ABORTED_BY_SAFETY and exit code 3, with no request to the server', async () => {
     const window = openServerWindow(server);
@@ -1558,7 +1489,10 @@ describe('GATE-S10: when the Guard cannot be initialized, the target site is nev
     expect(cliRun.code).toBe(EXIT_CODES.ABORTED_BY_SAFETY);
     expect(cliRun.code).toBe(3);
     expect(cliRun.stderr).toBe('');
+    expect(cliRun.run.incompleteReasons).toContainEqual({ code: 'PREFLIGHT_FAILED', detail: 'PASSIVE_GUARD' });
     expect(cliRun.run.safety.invariantViolations.map((violation) => violation.code)).toContain('GUARD_INSTALLATION_FAILED');
+    expect(cliRun.run.auditedPageCount).toBe(0);
+    expectLastRunBrowsersClosed();
   }, RUN_TEST_TIMEOUT_MS);
 
   it('GATE-S10 CLI: a Context creation failure without a violation ends with FAILED and exit code 1, with no request to the server', async () => {
@@ -1569,7 +1503,9 @@ describe('GATE-S10: when the Guard cannot be initialized, the target site is nev
     expectNoRequestAtAll(window);
     expect(cliRun.run.runStatus).toBe('FAILED');
     expect(cliRun.code).toBe(EXIT_CODES.FAILED);
+    expect(cliRun.run.incompleteReasons).toContainEqual({ code: 'PREFLIGHT_FAILED', detail: 'PASSIVE_GUARD' });
     expect(cliRun.run.safety.invariantViolationCount).toBe(0);
+    expectLastRunBrowsersClosed();
   }, RUN_TEST_TIMEOUT_MS);
 
   it('GATE-S10 control: with an unmodified Browser, the same CLI Run reaches the server and exits with the code of its Run Status', async () => {

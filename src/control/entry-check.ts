@@ -10,14 +10,12 @@
 //   - 自動ログインの 3 つのセレクタ: 欄ごとに、候補がちょうど 1 つで一意な CSS があるときだけ。
 // - 埋めた値は保存されていない案（設計書 3 章）。利用者が確かめて保存したものだけが通る。
 import type { RunStatus } from '../core/contracts.js';
-import { MAX_URL_LENGTH } from '../core/limits.js';
 import { deriveRunStatus } from '../core/status.js';
 import { hasRedactedPathSegment, redactValueLikePathSegments } from '../core/url-path-redaction.js';
 import { canonicalHttpOriginOf, isOriginInAllowedOrigins } from '../crawl/normalize-url.js';
 import {
   FORM_NAVIGATION_TRANSPORT,
   LOGIN_TRANSPORTS,
-  MAX_SUCCESS_SELECTOR_LENGTH,
   SCRIPT_REQUEST_TRANSPORT,
   type LoginTransport,
 } from './auth/auth-setup-contracts.js';
@@ -29,7 +27,7 @@ export const ENTRY_CHECK_ARTIFACT_SCHEMA_VERSION = 'entry-check-schema/1.0';
 /**
  * 入口の確かめの終わり方（閉じた一覧。スキーマの enum と一致する）。
  * - `READ`: 開始の URL を読み、落ち着いた後に凍結して読んだ。
- * - `LEFT_ALLOWED_ORIGINS`: 許可 Origin の外へ移ろうとした（Guard が止めた。移ろうとした Origin だけを記録し、読まない）。
+ * - `LEFT_ALLOWED_ORIGINS`: 許可 Origin の外へ移った（SD-2 の前は Guard が止めた。移った Origin だけを記録し、読まない）。
  * - `READ_FAILED`: 読み込めたが、凍結できない・読めなかった（読んでいない）。
  * - `NAVIGATION_FAILED`: 読み込みが失敗した（時間切れを含む）。
  * - `PREFLIGHT_FAILED`: Run の前の確認が失敗した（読み込んでいない）。
@@ -121,13 +119,11 @@ export interface EntryCheckDocument {
   /** Guard が止めた、ページ自身の要求の数。 */
   readonly blockedRequests: number;
   /**
-   * DEF-129: Guard が通した（サーバへ送った）main frame の文書の要求の数（BeakSight 自身の読み込み、リダイレクトの続き、ページが始めた読み込みを含む）。
-   * 今の書き手は必ず書く。ページが始めた読み込みが上限を超えたら、その画面は読まない（`READ_FAILED`）。
+   * DEF-129・T37R2-fix・DEF-130-fix: Guard が通した main frame の文書・子の frame の文書・文書でない要求の数。SPEC-1 で書くのをやめた（どの表示も
+   * 読まなかった）。前の書き手の成果物を読むために型だけ残す。
    */
   readonly documentRequests?: number;
-  /** T37R2-fix: Guard が通した子の frame の文書の要求の数（別の数）。今の書き手は必ず書く。子の frame の読み込みの上限も、上の `READ_FAILED` と同じ。 */
   readonly childFrameDocumentRequests?: number;
-  /** DEF-130-fix: Guard が通した文書でない要求の数（別の数）。今の書き手は必ず書く。上限で止めたら、その画面は読まない（`READ_FAILED`）。 */
   readonly subresourceRequests?: number;
 }
 
@@ -165,8 +161,8 @@ export const entryCheckRunStatusOf = (endReason: EntryCheckEndReason): RunStatus
 });
 
 /**
- * URL の場所（http(s) の URL でなければ `null`）。許可 Origin の中なら、query と fragment を除き、値に見える区切りを伏せた path（上限の長さを
- * 超えたら `null`）。外なら Origin だけ。
+ * URL の場所（http(s) の URL でなければ `null`）。許可 Origin の中なら、query と fragment を除き、値に見える区切りを伏せた path（URL-LEN: 長さでは
+ * `null` にしない。前は 2,048 を超えたら `null`）。外なら Origin だけ。
  */
 export const entryCheckLocationOf = (url: string, allowedOrigins: readonly string[]): EntryCheckLocation | null => {
   let parsed: URL;
@@ -181,12 +177,12 @@ export const entryCheckLocationOf = (url: string, allowedOrigins: readonly strin
   }
   const inAllowedOrigins = isOriginInAllowedOrigins(allowedOrigins, origin);
   const path = inAllowedOrigins ? redactValueLikePathSegments(parsed.pathname) : null;
-  return { origin, path: path !== null && path.length <= MAX_URL_LENGTH ? path : null, inAllowedOrigins };
+  return { origin, path, inAllowedOrigins };
 };
 
-/** 案のセレクタとして受けるか（認証の設定の検証と同じ形: 空白だけでない、制御文字なし、標準の CSS、上限の長さまで）。 */
+/** 案のセレクタとして受けるか（認証の設定の検証と同じ形: 空白だけでない、制御文字なし、標準の CSS。LZ-2: 長さの上限は置かない）。 */
 export const isAcceptedEntrySelector = (selector: string): boolean =>
-  selector.length <= MAX_SUCCESS_SELECTOR_LENGTH && isAcceptedSelector(selector) && isStandardCssSelectorShape(selector);
+  isAcceptedSelector(selector) && isStandardCssSelectorShape(selector);
 
 /** 使える path（許可 Origin の中で、伏せた区切りがない）。 */
 const usablePathOf = (location: EntryCheckLocation): string | null =>

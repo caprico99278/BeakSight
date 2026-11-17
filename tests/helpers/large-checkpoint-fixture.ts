@@ -35,7 +35,8 @@ const pagePath = (n: number): string => `/heavy/p${n}.html`;
 /** 重いページの HTML（`rows` 行）。 */
 const heavyPageHtml = (index: number, pageCount: number, rows: number): string => {
   const linkCount = index === 1 ? pageCount : Math.min(OTHER_PAGE_LINKS, pageCount);
-  const links = Array.from({ length: linkCount }, (_, i) => `<a href="${pagePath(i + 1)}">ページ ${i + 1}</a>`).join(' ');
+  // DEF-264: リンクを行の途中で折り返さない（折り返したリンクの外枠が、同じ並びのリンクと重なりの候補になり、雛形の 1 ページの保存が膨らむため）。
+  const links = Array.from({ length: linkCount }, (_, i) => `<a href="${pagePath(i + 1)}" style="display:inline-block">ページ ${i + 1}</a>`).join(' ');
   const body = Array.from({ length: rows }, (_, row) => [
     `<tr id="row-${row}">`,
     `<td><span style="color:#bbb;background:#ccc">行 ${row} の項目 ${index}</span></td>`,
@@ -124,7 +125,7 @@ export async function inflateCheckpoint(runDirectory: string, templatePageId: Pa
     const text = template
       .split(templatePageId).join(entry.pageId)
       .split(JSON.stringify(templateUrl)).join(JSON.stringify(entry.url))
-      .replace(/EV-([A-Z]+)-(\d{6,})/gu, (_, type: string, sequence: string) => `EV-${type}-${sequenceText(Number(sequence) + shift * EVIDENCE_SEQUENCE_STRIDE)}`)
+      .replace(/EV-([A-Z0-9]+)-(\d{6,})/gu, (_, type: string, sequence: string) => `EV-${type}-${sequenceText(Number(sequence) + shift * EVIDENCE_SEQUENCE_STRIDE)}`)
       .replace(/FIND-(\d{6,})/gu, (_, sequence: string) => `FIND-${sequenceText(Number(sequence) + shift * FINDING_SEQUENCE_STRIDE)}`);
     await writeFile(join(runDirectory, checkpointPageArtifactRelativePath(entry.pageId)), text, 'utf8');
     const bytes = Buffer.byteLength(text, 'utf8');

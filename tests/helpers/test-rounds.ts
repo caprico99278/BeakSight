@@ -20,8 +20,6 @@ export interface TestRounds {
  * 2026-10-24 の測り（PRE42-TEST）では、証拠を確かめる場面（DEF-085・DEF-036）は、どの回にも証拠が残った（20/20、40/40、10/10）。
  */
 export const TEST_ROUNDS = Object.freeze({
-  /** DEF-060（`stale-lock-takeover-processes`）: 古いロックの場面ごとの回数。例の 20 → 3。1 回が 2 つの CLI の process で重い。 */
-  staleLockTakeoverPerScenario: Object.freeze({ regular: 3, full: 20 }),
   /** DEF-085（`guard-popup-close-race`）の burst の場面。例の 20 → 3。 */
   popupCloseRaceBurst: Object.freeze({ regular: 3, full: 20 }),
   /** DEF-085（`guard-popup-close-race`）の storm の場面。例の 40 → 5。 */

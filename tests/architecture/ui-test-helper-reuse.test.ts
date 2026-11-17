@@ -17,14 +17,7 @@ const HELPERS_DIRECTORY = `${TESTS_DIRECTORY}/helpers`;
 const PAGE_KIT_FILE = `${HELPERS_DIRECTORY}/ui-page.ts`;
 
 /** 同じ名前で別の意味の関数（ファイルの名前 → 名前と理由）。 */
-const ALLOWED_REDEFINITIONS: Readonly<Record<string, Readonly<Record<string, string>>>> = Object.freeze({
-  'auth-secret-markers.test.ts': Object.freeze({
-    credentialsOf: '認証つきの fixture のサイト（AuthenticatedSite）の資格情報で、目印の一覧にも足す（発見の fixture のサイトの credentialsOf とは別の fixture）',
-  }),
-  'auth-ui-flows.test.ts': Object.freeze({
-    credentialsOf: '認証つきの fixture のサイト（AuthenticatedSite）の資格情報（発見の fixture のサイトの credentialsOf とは別の fixture）',
-  }),
-});
+const ALLOWED_REDEFINITIONS: Readonly<Record<string, Readonly<Record<string, string>>>> = Object.freeze({});
 
 interface SourceText {
   readonly name: string;

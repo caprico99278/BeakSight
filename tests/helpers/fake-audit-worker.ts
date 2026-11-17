@@ -44,18 +44,20 @@
  *     送らずに終了コード 1 で終える（巡回の途中でワーカーが落ちた）。
  *   - `read-check`（T27e）: `START` の後に `AUTH_STATE`（`AUTHENTICATED`）と `RUN_STARTED` を送り、`START` の定義の一覧から `read-evidence.json` を
  *     組み立てて書き、`FINISHED`（件数の要約つき）を送って終了コード 0 で終える（値は `readCheck`）。
- *   - `write`（T30e）: `START` の後に `AUTH_STATE`（`AUTHENTICATED`）と `RUN_STARTED` を送り、`write.recheck` の回数だけ `WRITE_RECHECK_REQUEST` を
- *     送る（0 なら送らずに続ける）。最初の結果を受けたら（または送らないとき）、許されなければ `write.onReject`（`report` なら `NOT_SENT` の報告）の後に
- *     待つ（`STOP` で終わる）。許されれば、`write.submission` の報告（null なら送らない）、`action-run.json`（`write.actionRunText`。null なら書かない）
- *     を `<write.outputDirectory>/<Run の ID>/` に書き、`write.end`（`finish`: `FINISHED`（COMPLETE）で終了コード 0、`crash`: 終了コード 1、`wait`:
- *     待つ）。T31f: 更新の書き込み（`WRITE_UPDATE`）も同じ動き。`action-run.json` の印 `"__START_TARGET_RECORD_ID__"` は、`START` の UPDATE の指定の
- *     対象の ID に置き換える（UPDATE の指定がなければ null）。T31h-2: 印 `"__START_JOB_ID__"`・`"__START_GRANT_ID__"` は、`START` のジョブの id と
- *     書き込みの指定の許可の id に置き換える（画面から始めたジョブの id と許可の id は、テストが前もって知らないため）。T32e: `write.report` が
- *     あれば、`action-run.json` の前に、書き込みの報告の `approval-summary.json`（`START` の承認の要約の事実から）と `action-evidence.json` も書く。
+ *   - 書き込みの段（T30e。SLIM W-1 から、`chain` の `NEXT_STAGE`（書き込みの指定つき）だけ）: `RUN_STARTED` を送り、`write.recheck` の回数だけ
+ *     `WRITE_RECHECK_REQUEST` を送る（0 なら送らずに続ける。`write.recheckGate` のファイルがあれば、できるまで待ってから送る）。最初の結果を受けたら
+ *     （または送らないとき）、許されなければ `write.onReject`（`report` なら `NOT_SENT` の報告）の後に待つ（`STOP` で終わる）。許されれば、
+ *     `write.submission` の報告（null なら送らない）、`action-run.json`（`write.actionRunText`。null なら書かない）を `<write.outputDirectory>/<Run の ID>/`
+ *     に書き、`write.end`（`finish`: `FINISHED`（COMPLETE）を送って親の次の指定を待つ、`crash`: 終了コード 1）。Run の ID は、書き込みの段の順に
+ *     `write.runIds`（省略は `runId`）。T31f: 更新の書き込み（`WRITE_UPDATE`）も同じ動き。`action-run.json` の印 `"__START_TARGET_RECORD_ID__"` は、
+ *     書き込みの指定の UPDATE の対象の ID に置き換える（UPDATE の指定がなければ null）。T31h-2: 印 `"__START_JOB_ID__"`・`"__START_GRANT_ID__"` は、
+ *     段のジョブの id と書き込みの指定の許可の id に置き換える（テストが前もって知らないため）。T32e: `write.report` があれば、`action-run.json` の前に、
+ *     書き込みの報告の `approval-summary.json`（書き込みの指定の承認の要約の事実から）と `action-evidence.json` も書く。
  *   - `entry-check`（T43c）: `START` の後に `RUN_STARTED` を送り、`entry-check.json` を書いて、`FINISHED`（件数の要約つき）を送って終了コード 0 で
  *     終える（値は `entryCheck`）。
  *   - `chain`（FM2d）: まとめて実行の `START` の後に、ログインの段の `AUTH_STATE`（`AUTHENTICATED`。`loginStage` の項目つき）を 1 回送り、段ごとに
  *     `RUN_STARTED` と `FINISHED`（未完了の理由のコードつき）を送る。途中の段の後は `NEXT_STAGE`（次の段を行う）・`CHAIN_END`（終える）を待つ。値は `chain`。
+ *     `START` の `chain` に書き込みの段の印があれば、最後の読み取りの段の後も終わらずに待つ（書き込みの段は上の動き。値は `write`）。
  * 親が止める（kill する）まで待つ動きは、その間ずっと動いている（親との IPC がある間）。
  */
 import { readFileSync, writeFileSync } from 'node:fs';
@@ -106,7 +108,6 @@ export const FAKE_WORKER_MODES = Object.freeze([
   'auto-login-success', 'auto-login-failure', 'auto-login-crash', 'auto-login-wait', 'auto-login-no-report', 'auto-login-run-started',
   'discovery', 'discovery-crash',
   'read-check',
-  'write',
   'entry-check',
   'chain',
 ] as const);
@@ -148,6 +149,11 @@ export interface FakeWorkerValues {
     /** `FINISHED` の件数の要約（`null` なら付けない）。 */
     readonly summary: Readonly<Record<string, unknown>> | null;
     readonly runStatus: string;
+    /**
+     * DEF-200: 連鎖の操作さがしの段の、回ごと（0 から。セッションの切れで終えた回とやり直しの回を通して数える）の `discovery.json` の中身と件数の要約。ない回は
+     * `documentText`・`summary`。
+     */
+    readonly attempts?: readonly { readonly documentText: string; readonly summary: Readonly<Record<string, unknown>> }[];
   };
   /**
    * `read-check` の値（T27e）。`START` の定義の一覧から `read-evidence.json` を組み立てて `<outputDirectory>/<Run の ID>/` に書き（`document` が
@@ -174,11 +180,15 @@ export interface FakeWorkerValues {
     readonly summary: Readonly<Record<string, unknown>> | null;
     readonly runStatus: string;
   };
-  /** `write` の値（T30e）。 */
+  /** 書き込みの段の値（T30e）。 */
   readonly write?: {
     readonly outputDirectory: string;
+    /** 書き込みの段の順の Run の ID（省略か足りない分は `runId`）。 */
+    readonly runIds?: readonly string[];
     /** 送る確かめ直しの依頼の回数（0〜2）。 */
     readonly recheck: number;
+    /** このファイルができるまで、確かめ直しの依頼を送らずに待つ（テストが、依頼の前に管理データを変えるため。省略は待たない）。 */
+    readonly recheckGate?: string;
     /** 許されなかったときの動き（`report`: `NOT_SENT` の報告を送って待つ、`wait`: 何も送らずに待つ）。 */
     readonly onReject: 'report' | 'wait';
     /** 送信の報告（null なら送らない）。 */
@@ -186,10 +196,14 @@ export interface FakeWorkerValues {
     /** 書く `action-run.json` の中身（null なら書かない）。 */
     readonly actionRunText: string | null;
     /**
-     * T41g: 更新の書き込みの START（`write.update` を持つ）に書く `action-run.json` の中身（省略すると `actionRunText`）。1 つの入口で、登録のジョブと続けて
-     * 始まる更新のジョブの両方に答えるため。
+     * T41g: 更新の書き込みの段（書き込みの指定が `update` を持つ）だけで替える値（省略した項目は上の値）。1 つの点検で、登録の段と続けて始まる更新の段の
+     * 両方に答えるため。
      */
-    readonly actionRunTextForUpdate?: string;
+    readonly updateStage?: {
+      readonly submission?: { readonly submission: string; readonly blockReason: string | null } | null;
+      readonly actionRunText?: string | null;
+      readonly end?: 'finish' | 'crash';
+    };
     /**
      * T32e: 書き込みの報告の 2 つの JSON も書く（省略か null なら書かない）。`approval-summary.json` は、`START` の `write.approvalFacts` に版の印
      * （`approvalSummarySchemaVersion`）・ジョブ・Run を足したもの。`action-evidence.json` は `actionEvidenceText` の印を `action-run.json` と同じく
@@ -211,7 +225,7 @@ export interface FakeWorkerValues {
        */
       readonly bundle?: { readonly name: string; readonly fflateUrl: string; readonly tamper?: 'manifest' | 'disk' } | null;
     } | null;
-    readonly end: 'finish' | 'crash' | 'wait';
+    readonly end: 'finish' | 'crash';
   };
   /**
    * FM2d: `chain` の値。段の Run の ID（`runIds` の順）、段ごとの Run の状態（`runStatuses`。省略は `COMPLETE`）と未完了の理由のコード（`reasonCodes`。省略は空）、
@@ -224,11 +238,34 @@ export interface FakeWorkerValues {
     readonly reasonCodes?: readonly (readonly string[])[];
     readonly holdStage?: number;
     readonly finishDelayMs?: number;
+    /**
+     * DEF-200: 段ごと（0 から）の、セッションの切れで終える回数（その回数だけ、`PROGRESS`・`AUTH_STATE`（`SESSION_LOST`）・`FINISHED`（PARTIAL、理由
+     * `AUTH_SESSION_LOST`）を送って親の指定を待つ。`RELOGIN_STAGE` を受けたら、自動ログインの成功の結果つきの `AUTH_STATE` を送って同じ段をやり直す）。省略は 0。
+     * 監査の段のやり直しは同じ Run の ID（続き）、ほかの段は `reloginRunIds` の順の Run の ID。`stallAfterRelogin` なら、ログインし直した後は読まずに切れる
+     * （監査は終えたページの数を増やさず、READ の確かめは確かめた定義を 0 にする）。
+     */
+    readonly sessionLosses?: readonly number[];
+    readonly reloginRunIds?: readonly string[];
+    readonly stallAfterRelogin?: boolean;
+    /**
+     * OP-1（設計書 `2026-10-27-beaksight-one-pass-flow-design.md` 4.1.3 の 1）: `START` の `loginRegistration` があるときの、値の受け取りのふり。`carriedBy` があれば
+     * 「受け取った」と知らせ、親の `CREDENTIAL_SAVE_ALLOWED` を受けたら、`credentialMarkerPath` に目印のファイルを書いて（資格情報のファイルを書いたふり。値は
+     * 書かない）、`saved` の値（省略は真。偽のときは理由のコード `CREDENTIAL_STORAGE_UNSAFE`）で `CREDENTIAL_SAVED` を送る。`LOGIN_REGISTERED`・`LOGIN_REGISTRATION_SKIPPED` を受けたら、最初の段を始める。
+     * OP-F（安全のレビューの I-1）: `exitAfterWriting` なら、目印を書いた直後に `CREDENTIAL_SAVED` を送らずに終わる（落ちたふり）。`savedDelayMs` なら、目印を
+     * 書いてから、その時間だけ待って `CREDENTIAL_SAVED` を送る（親の待つ上限を過ぎるふり）。
+     */
+    readonly capture?: {
+      readonly carriedBy: { readonly origin: string; readonly path: string } | null;
+      readonly credentialMarkerPath: string;
+      readonly saved?: boolean;
+      readonly exitAfterWriting?: boolean;
+      readonly savedDelayMs?: number;
+    };
   };
 }
 
 const SCRIPT = String.raw`
-import { appendFileSync, mkdirSync, writeFileSync } from 'node:fs';
+import { appendFileSync, existsSync, mkdirSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 // T44-UIFIX: 本物の部品の TypeScript のソースを読み込めるよう、解決できない相対の ".js" の指定子を、同じ名前の ".ts" に読み替える。
 __TYPESCRIPT_SOURCE_RESOLVE_HOOK__
@@ -312,22 +349,32 @@ const writeReadEvidence = (jobId, readChecks, runId) => {
     : readCheck.summary;
 };
 // FM2d: まとめて実行（chain）。段ごとに RUN_STARTED と FINISHED（理由のコードつき）を送り、途中の段の後は NEXT_STAGE・CHAIN_END を待つ。
-const chainState = { stages: [], index: 0, exitCode: 0, holding: null };
+const chainState = { stages: [], index: 0, exitCode: 0, holding: null, firstStage: null, attempts: {}, pages: 0, reloginRunIndex: 0, automated: false, discoveryRuns: 0,
+  writeStages: false, writes: 0, writing: null };
+// DEF-200: 操作さがしの段の回ごとの成果物（なければ既定の値）。
+const discoveryOf = () => {
+  const discovery = VALUES.discovery;
+  const attempt = discovery.attempts?.[chainState.discoveryRuns];
+  chainState.discoveryRuns += 1;
+  return attempt === undefined ? { documentText: discovery.documentText, summary: discovery.summary } : attempt;
+};
 const chainFinish = (kind, jobId, readChecks, runId, runStatus, codes) => {
   const exitCode = runStatus === 'COMPLETE' ? VALUES.exitCodes.complete : VALUES.exitCodes.partial;
   chainState.exitCode = exitCode;
   let extra = {};
   if (kind === 'DISCOVERY') {
     const discovery = VALUES.discovery;
+    const written = discoveryOf();
     mkdirSync(join(discovery.outputDirectory, runId), { recursive: true });
     writeFileSync(join(discovery.outputDirectory, runId, FILES.discovery),
-      discovery.documentText.split('__JOB_ID__').join(jobId).split('__RUN_ID__').join(runId), 'utf8');
-    extra = { discovery: discovery.summary };
+      written.documentText.split('__JOB_ID__').join(jobId).split('__RUN_ID__').join(runId), 'utf8');
+    extra = { discovery: written.summary };
   } else if (kind === 'READ_CHECK') {
     extra = { readCheck: writeReadEvidence(jobId, readChecks, runId) };
   }
   const message = { protocol: P, type: 'FINISHED', outcome: { kind: 'RAN', exitCode, runId, runDirectory: runId, runStatus }, ...extra, incompleteReasonCodes: codes };
-  if (chainState.index >= chainState.stages.length - 1) {
+  // OP-2: 書き込みの段の印のある連鎖は、最後の読み取りの段の後も親の指定を待つ。
+  if (chainState.index >= chainState.stages.length - 1 && !chainState.writeStages) {
     exitAfter(message, exitCode);
   } else {
     send(message);
@@ -336,8 +383,33 @@ const chainFinish = (kind, jobId, readChecks, runId, runStatus, codes) => {
 const chainRun = (kind, jobId, readChecks) => {
   const chain = VALUES.chain;
   const index = chainState.index;
-  const runId = chain.runIds[index];
-  send({ ...runStarted, runId, runDirectory: runId });
+  const attempt = chainState.attempts[index] ?? 0;
+  // DEF-200: 監査の段のやり直しは同じ Run（続き）。ほかの段は新しい Run。
+  // 操作さがしも同じ Run の続き。READ の確かめは新しい Run。
+  const runId = attempt === 0 || kind === 'AUDIT' || kind === 'DISCOVERY' ? chain.runIds[index] : chain.reloginRunIds[chainState.reloginRunIndex++];
+  send({ ...runStarted, runId, runDirectory: runId, ...(attempt > 0 && kind === 'AUDIT' ? { resumeDecision: { kind: 'RESUME', completedPages: chainState.pages } } : {}) });
+  if (attempt < (chain.sessionLosses?.[index] ?? 0)) {
+    const stalled = attempt > 0 && chain.stallAfterRelogin === true;
+    if (!stalled) {
+      chainState.pages += 1;
+    }
+    send({ protocol: P, type: 'PROGRESS', report: { ...progress, pagesFinished: chainState.pages } });
+    send({ protocol: P, type: 'AUTH_STATE', state: 'SESSION_LOST', sessionLostUrl: 'https://example.com/admin/lost' });
+    chainState.attempts[index] = attempt + 1;
+    chainState.exitCode = VALUES.exitCodes.partial;
+    const lostDiscovery = kind === 'DISCOVERY' ? discoveryOf() : null;
+    const extra = kind === 'READ_CHECK'
+      ? { readCheck: { ...writeReadEvidence(jobId, readChecks, runId), ...(stalled ? { executed: 0 } : {}) } }
+      : lostDiscovery !== null ? { discovery: lostDiscovery.summary } : {};
+    if (lostDiscovery !== null) {
+      mkdirSync(join(VALUES.discovery.outputDirectory, runId), { recursive: true });
+      writeFileSync(join(VALUES.discovery.outputDirectory, runId, FILES.discovery),
+        lostDiscovery.documentText.split('__JOB_ID__').join(jobId).split('__RUN_ID__').join(runId), 'utf8');
+    }
+    send({ protocol: P, type: 'FINISHED', outcome: { kind: 'RAN', exitCode: VALUES.exitCodes.partial, runId, runDirectory: runId, runStatus: 'PARTIAL' },
+      ...extra, incompleteReasonCodes: ['AUTH_SESSION_LOST'] });
+    return;
+  }
   if (chain.holdStage === index) {
     chainState.holding = { kind, jobId, readChecks, runId };
     return;
@@ -346,7 +418,9 @@ const chainRun = (kind, jobId, readChecks) => {
 };
 process.on('message', (message) => {
   appendFileSync(LOG, JSON.stringify(message) + '\n');
-  if (message && message.type === 'START') {
+  // OP-2: まとめて実行の書き込みの段（書き込みの指定つきの NEXT_STAGE）も、ここで受ける（下の「書き込みの段」）。
+  const writeStage = MODE === 'chain' && message && message.type === 'NEXT_STAGE' && message.write !== undefined;
+  if (message && (message.type === 'START' || writeStage)) {
     if (MODE === 'malformed') {
       send(runStarted);
       send({ protocol: P, type: 'PROGRESS', report: { ...progress, pagesFinished: -1 } });
@@ -458,11 +532,24 @@ process.on('message', (message) => {
       exitAfter(entryCheck.summary === null ? done : { ...done, entryCheck: entryCheck.summary }, VALUES.exitCodes.complete);
       return;
     }
-    if (MODE === 'chain') {
+    if (MODE === 'chain' && !writeStage) {
       // FM2d: まとめて実行の最初の段（ログインの段の知らせは 1 回だけ）。
       chainState.stages = message.chain.stages;
-      send({ ...authState('AUTHENTICATED'), ...(VALUES.loginStage ?? {}) });
-      chainRun(message.chain.stages[0], message.jobId, undefined);
+      chainState.writeStages = message.chain.writeStages === true;
+      // OP-1: ログインの直後の登録を待つときは、値のない受け取りのメタデータも載せ、親の返事を待ってから最初の段を始める。
+      const registration = message.authentication?.loginRegistration;
+      const carriedBy = registration?.credentialRoot ? (VALUES.chain.capture?.carriedBy ?? null) : null;
+      send({
+        ...authState('AUTHENTICATED'), ...(VALUES.loginStage ?? {}),
+        ...(registration === undefined ? {} : { credentialCapture: { captured: carriedBy !== null, carriedBy } }),
+        // DEF-200: 自動ログインの連鎖は、ログインの段の結果を添える。
+        ...(message.authentication?.automatedLogin === undefined ? {} : { automatedLogin: succeeded }),
+      });
+      if (registration === undefined) {
+        chainRun(message.chain.stages[0], message.jobId, undefined);
+      } else {
+        chainState.firstStage = { kind: message.chain.stages[0], jobId: message.jobId };
+      }
       return;
     }
     if (MODE === 'read-check') {
@@ -474,10 +561,17 @@ process.on('message', (message) => {
       setTimeout(() => exitAfter(summary === null ? done : { ...done, readCheck: summary }, VALUES.exitCodes.complete), readCheck.delayMs ?? 0);
       return;
     }
-    if (MODE === 'write') {
-      const write = VALUES.write;
-      send(authState('AUTHENTICATED'));
-      send(runStarted);
+    if (writeStage) {
+      // 書き込みの段（OP-2）: 段の Run を始め、確かめ直しの依頼と送信の報告と成果物を、値の指定のとおりに送る・書く。
+      const write = message.write.update !== undefined && VALUES.write.updateStage !== undefined
+        ? { ...VALUES.write, ...VALUES.write.updateStage }
+        : VALUES.write;
+      chainState.index += 1;
+      const runId = write.runIds?.[chainState.writes] ?? VALUES.runId;
+      chainState.writes += 1;
+      chainState.writing = runId;
+      globalThis.recheckAnswered = false;
+      send({ ...runStarted, runId, runDirectory: runId });
       globalThis.afterRecheck = async (result) => {
         if (result !== null && !result.allowed) {
           if (write.onReject === 'report') {
@@ -501,7 +595,7 @@ process.on('message', (message) => {
           .split('"__START_GRANT_ID__"').join(JSON.stringify(message.write.grantId))
           // T40R2-fix: 印 "__START_VALUES__" は、START の送る値（値を入れない null の欄を除く）に置き換える（生成した値が実行のたびに変わるため）。
           .split('"__START_VALUES__"').join(JSON.stringify(Object.fromEntries(Object.entries(message.write.values).filter(([, value]) => value !== null))));
-        const runDirectory = join(write.outputDirectory, VALUES.runId);
+        const runDirectory = join(write.outputDirectory, runId);
         // T32e: 書き込みの報告の 2 つの JSON（本物のワーカーと同じく、action-run.json より先に書く）。承認の要約は、START の承認の要約の事実に、
         // 版の印・ジョブ・Run を足したもの（受けた値をそのまま書く。T32g: approvalFactsOverride の項目で上書きできる）。
         // T32g: HTML の報告（reportHtml）と書き込みのバンドル（bundle。中身は書いたファイルのバイト列と、その sha256 の目録。tamper で目録の sha256 か
@@ -514,7 +608,7 @@ process.on('message', (message) => {
             files.push([name, Buffer.from(text, 'utf8')]);
           };
           put(FILES.approvalSummary, JSON.stringify({ ...message.write.approvalFacts, ...(write.report.approvalFactsOverride ?? {}),
-            schemaVersion: write.report.approvalSummarySchemaVersion, jobId: message.jobId, runId: VALUES.runId }));
+            schemaVersion: write.report.approvalSummarySchemaVersion, jobId: message.jobId, runId }));
           if (write.report.actionEvidenceText !== null) {
             put(FILES.actionEvidence, fillStartMarks(write.report.actionEvidenceText));
           }
@@ -565,17 +659,18 @@ process.on('message', (message) => {
             }
           }
         }
-        // T41g: 更新の START には、更新の記録の中身があればそれを書く（登録してから更新する、の 2 つのジョブに 1 つの入口で答える）。
-        const runText = message.write.update !== undefined && typeof write.actionRunTextForUpdate === 'string'
-          ? write.actionRunTextForUpdate
-          : write.actionRunText;
+        const runText = write.actionRunText;
         if (runText !== null) {
           mkdirSync(runDirectory, { recursive: true });
           writeFileSync(join(runDirectory, FILES.actionRun), fillStartMarks(runText), 'utf8');
         }
         if (write.end === 'finish') {
-          exitAfter(finished('COMPLETE', VALUES.exitCodes.complete), VALUES.exitCodes.complete);
-        } else if (write.end === 'crash') {
+          // 段を終えて、親の次の指定（次の書き込みの段か CHAIN_END）を待つ。
+          chainState.writing = null;
+          chainState.exitCode = VALUES.exitCodes.complete;
+          send({ protocol: P, type: 'FINISHED', outcome: { kind: 'RAN', exitCode: VALUES.exitCodes.complete, runId, runDirectory: runId, runStatus: 'COMPLETE' },
+            incompleteReasonCodes: [] });
+        } else {
           setTimeout(() => process.exit(VALUES.exitCodes.failure ?? 1), 50);
         }
       };
@@ -583,9 +678,16 @@ process.on('message', (message) => {
         globalThis.afterRecheck(null);
         return;
       }
-      for (let index = 0; index < write.recheck; index += 1) {
-        send({ protocol: P, type: 'WRITE_RECHECK_REQUEST' });
-      }
+      const requestRechecks = () => {
+        if (write.recheckGate !== undefined && !existsSync(write.recheckGate)) {
+          setTimeout(requestRechecks, 20);
+          return;
+        }
+        for (let index = 0; index < write.recheck; index += 1) {
+          send({ protocol: P, type: 'WRITE_RECHECK_REQUEST' });
+        }
+      };
+      requestRechecks();
       return;
     }
     if (MODE === 'fail') {
@@ -604,7 +706,7 @@ process.on('message', (message) => {
     }
     return;
   }
-  if (message && message.type === 'WRITE_RECHECK_RESULT' && MODE === 'write' && !globalThis.recheckAnswered) {
+  if (message && message.type === 'WRITE_RECHECK_RESULT' && MODE === 'chain' && chainState.writing !== null && !globalThis.recheckAnswered) {
     globalThis.recheckAnswered = true;
     globalThis.afterRecheck(message);
     return;
@@ -614,8 +716,39 @@ process.on('message', (message) => {
     send(runStarted);
     return;
   }
+  if (message && MODE === 'chain' && message.type === 'CREDENTIAL_SAVE_ALLOWED') {
+    const capture = VALUES.chain.capture;
+    const saved = capture?.saved !== false;
+    if (saved && capture !== undefined) {
+      writeFileSync(capture.credentialMarkerPath, 'written', 'utf8');
+    }
+    if (capture?.exitAfterWriting === true) {
+      process.exit(1);
+    }
+    // OP-L（L2）: 書けなかったふりのときは、資格情報の場所が安全でない理由のコードを送る。
+    const sendSaved = () => send({ protocol: P, type: 'CREDENTIAL_SAVED', saved, credentialRevision: saved ? 1 : null, failureCode: saved ? null : 'CREDENTIAL_STORAGE_UNSAFE' });
+    if (capture?.savedDelayMs !== undefined) {
+      setTimeout(sendSaved, capture.savedDelayMs);
+    } else {
+      sendSaved();
+    }
+    return;
+  }
+  if (message && MODE === 'chain' && (message.type === 'LOGIN_REGISTERED' || message.type === 'LOGIN_REGISTRATION_SKIPPED') && chainState.firstStage) {
+    const first = chainState.firstStage;
+    chainState.firstStage = null;
+    chainRun(first.kind, first.jobId, undefined);
+    return;
+  }
   if (message && MODE === 'chain' && message.type === 'NEXT_STAGE') {
     chainState.index += 1;
+    chainRun(message.jobKind, message.jobId, message.readChecks);
+    return;
+  }
+  if (message && MODE === 'chain' && message.type === 'RELOGIN_STAGE') {
+    // DEF-200: ログインし直した（自動ログインの成功の結果つき）後に、同じ段をやり直す。
+    send({ protocol: P, type: 'AUTH_STATE', state: 'AUTHENTICATED', sessionLostUrl: null,
+      automatedLogin: { result: 'SUCCEEDED', submitted: 'YES', retryAfterUntil: null, formInvalidReason: null } });
     chainRun(message.jobKind, message.jobId, message.readChecks);
     return;
   }
@@ -623,6 +756,16 @@ process.on('message', (message) => {
     process.exit(chainState.exitCode);
   }
   if (message && MODE === 'chain' && message.type === 'STOP') {
+    // 書き込みの段の途中（確かめ直しを拒まれて待っている）: 段を PARTIAL で終えて終わる。
+    if (chainState.writing !== null) {
+      const runId = chainState.writing;
+      if (message.force) {
+        process.exit(VALUES.exitCodes.interrupted);
+      }
+      exitAfter({ protocol: P, type: 'FINISHED', outcome: { kind: 'RAN', exitCode: VALUES.exitCodes.partial, runId, runDirectory: runId, runStatus: 'PARTIAL' },
+        incompleteReasonCodes: ['RUN_INTERRUPTED'] }, VALUES.exitCodes.partial);
+      return;
+    }
     // 止める要求: 待っている段を PARTIAL（RUN_INTERRUPTED）で終え、次の段を待たずに終える（本物のワーカーと同じ）。
     const holding = chainState.holding;
     if (holding !== null) {

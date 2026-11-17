@@ -17,6 +17,7 @@ import {
   type PassiveSessionDeadlineOptions,
   type ResolvedPassiveSessionDeadlines,
 } from './passive-session-open.js';
+import { OPEN_ENDED_STAGE_MS } from './stage-deadline.js';
 
 export interface CollectRunEnvironmentOptions {
   /** `loadConfig` で検証済みの設定。User-Agent を読むビューポートの大きさに使う。 */
@@ -172,8 +173,10 @@ async function readUserAgent(
     if (page !== undefined) {
       // ナビゲーションと読み取りを合わせて、`crawl.navigationTimeoutMs` までに終える（R15 の Minor-2）。読み取りが期限を過ぎた場合と、
       // 失敗した場合は `null` にする。期限を過ぎた後に遅れて返る結果と例外は、封じ込める（`awaitBeforeDeadline`）。
-      const deadlineAtMs = Date.now() + config.crawl.navigationTimeoutMs;
-      await page.goto(USER_AGENT_PAGE_URL, { timeout: config.crawl.navigationTimeoutMs });
+      // L14: 期限を指定していなければ切らない（読むのはサイトではなく BeakSight の中の頁。`OPEN_ENDED_STAGE_MS`）。
+      const timeoutMs = config.crawl.navigationTimeoutMs ?? OPEN_ENDED_STAGE_MS;
+      const deadlineAtMs = Date.now() + timeoutMs;
+      await page.goto(USER_AGENT_PAGE_URL, { timeout: timeoutMs });
       const read = await awaitBeforeDeadline(page.evaluate(() => navigator.userAgent), deadlineAtMs);
       const value: unknown = read.status === 'FULFILLED' ? read.value : null;
       userAgent = typeof value === 'string' && value.length > 0 ? value : null;

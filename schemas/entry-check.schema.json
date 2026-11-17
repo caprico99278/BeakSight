@@ -49,9 +49,9 @@
   "$defs": {
     "compactUtcTimestamp": { "type": "string", "pattern": "^[0-9]{14}$" },
     "count": { "type": "integer", "minimum": 0, "maximum": 9007199254740991 },
-    "origin": { "type": "string", "maxLength": 2048, "pattern": "^https?://[^/?#]+$" },
-    "path": { "type": "string", "maxLength": 2048, "pattern": "^/[^?#]*$" },
-    "selector": { "type": ["string", "null"], "minLength": 1, "maxLength": 256 },
+    "origin": { "type": "string", "pattern": "^https?://[^/?#]+$" },
+    "path": { "type": "string", "pattern": "^/[^?#]*$" },
+    "selector": { "type": ["string", "null"], "minLength": 1 },
     "location": {
       "type": "object",
       "additionalProperties": false,
@@ -105,7 +105,7 @@
       "additionalProperties": false,
       "required": ["loginStartUrl", "sessionLostPathPrefix", "loginTransport", "loginPostEndpoint", "selectors"],
       "properties": {
-        "loginStartUrl": { "type": ["string", "null"], "maxLength": 4096 },
+        "loginStartUrl": { "type": ["string", "null"] },
         "sessionLostPathPrefix": { "anyOf": [{ "$ref": "#/$defs/path" }, { "type": "null" }] },
         "loginTransport": { "enum": ["FORM_NAVIGATION", "SCRIPT_REQUEST", null] },
         "loginPostEndpoint": {

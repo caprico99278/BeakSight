@@ -1,13 +1,12 @@
 import { Link, createFileRoute, notFound } from '@tanstack/react-router';
-import { formatCount, formatDateTime, formatInteger } from '../../../../../src/presentation/format.js';
-import { LOCAL_UI_LEDGER_TEXT } from '../../../../../src/presentation/messages.js';
+import { formatCount, formatInteger, formatPlainDateTime } from '../../../../../src/presentation/format.js';
+import { LOCAL_UI_LEDGER_TEXT, LOCAL_UI_WRITE_SCREENS_TEXT, LOCAL_UI_WRITE_STAGE_TEXT } from '../../../../../src/presentation/messages.js';
+import { AdvancedSettings } from '../../components/AdvancedSettings';
 import { Notice } from '../../components/Notice';
-import { PageFrame } from '../../components/PageFrame';
-import { ProfileSummary } from '../../components/ProfileSummary';
+import { PageFrame, siteTrail } from '../../components/PageFrame';
 import {
   actionResultDisplay,
   readCheckResultDisplay,
-  scenarioKindDisplay,
   submissionStateDisplay,
   toneClass,
   type DisplayValue,
@@ -26,6 +25,7 @@ export const Route = createFileRoute('/ledger/$profileId')({
 });
 
 const text = LOCAL_UI_LEDGER_TEXT;
+const stageText = LOCAL_UI_WRITE_STAGE_TEXT.ledger;
 
 /** 値があればラベル（色つき）、なければ「なし」。 */
 function Badge({ display }: Readonly<{ display: DisplayValue | null }>) {
@@ -44,38 +44,34 @@ function Verification({ entry }: Readonly<{ entry: LedgerEntryView }>) {
 }
 
 /**
- * 監査済みデータの台帳（T32g。Task 32 の設計書 4.1 の「監査済みデータの台帳」。ロードマップ 13.4）。プロファイルの詳細から開く。BeakSight が
- * 作ったかもしれないデータ（CREATE の書き込み。送らずに止めた回を除く）の、登録の ID、シナリオと版、seed の記録（許可の ID と規則の digest）、
- * ジョブと Run、照合の状態、その ID への UPDATE の回数と最後の結果、シナリオごとの累計の件数と上限。「削除も復元もしない」の注記を出す。
- * 書き出しのファイルは作らない。書き込みのモードでないプロファイルには、行を出さずに理由を出す。
+ * 作ったデータの一覧（監査済みデータの台帳。T32g。PL-5 で設計書 `2026-10-26-beaksight-plain-ui-design.md` 3 章の形に作り直した）。上から: 要点のパネル（作ったデータの
+ * 数、「消さない」の注記、行は「何を作ったか・いつ・書き換えたか」。SPEC-4 で「書き換えを試す」を外した）→ 詳しい内容 1 つ（データの ID と答え合わせの結果、
+ * 書き込みの手順ごとの累計の件数）。許可の ID・digest・作業と点検の回の ID・書き込みの手順の ID と版は出さない（3 章の 2）。
  */
 function LedgerPage() {
   const page = Route.useLoaderData();
+  /** OP-G（指示書の 7）: 登録の手順（画面）ごとの、一覧に出た順の番号（1 から）。 */
+  const screenNumbers = new Map([...new Set(page.entries.map(({ scenarioId }) => scenarioId))].map((scenarioId, index) => [scenarioId, index + 1]));
+  const screenNumberOf = (scenarioId: string): number => screenNumbers.get(scenarioId) ?? 1;
   const { profile } = page;
-  const columns = text.columns;
   return (
-    <PageFrame title={text.pages.ledger}>
-      <ProfileSummary profile={profile} testId="ledger-profile" />
+    <PageFrame title={text.pages.ledger} trail={siteTrail(profile.profileId)}>
       {page.eligible ? (
         <>
-          <Notice kind="caution">
-            <p data-testid="ledger-note">{text.note}</p>
-          </Notice>
           <section className="panel" data-testid="ledger">
-            <h2 className="panel-heading">{text.entriesHeading}</h2>
-            <p className="muted">{text.entriesNote}</p>
+            <h2 className="panel-heading">{LOCAL_UI_WRITE_STAGE_TEXT.summaryHeading}</h2>
+            <p data-testid="ledger-count">{page.entries.length === 0 ? stageText.none : stageText.count(formatCount(page.entries.length))}</p>
+            <Notice kind="caution">
+              <p data-testid="ledger-note">{text.note}</p>
+            </Notice>
             {page.entries.length === 0 ? <p data-testid="ledger-empty">{text.noEntries}</p> : (
               <div className="table-wrap">
                 <table>
                   <thead>
                     <tr>
-                      <th scope="col">{columns.recordId}</th>
-                      <th scope="col">{columns.scenario}</th>
-                      <th scope="col">{columns.seed}</th>
-                      <th scope="col">{columns.job}</th>
-                      <th scope="col">{columns.verification}</th>
-                      <th scope="col">{columns.updates}</th>
-                      <th scope="col">{columns.recordedAt}</th>
+                      <th scope="col">{stageText.columns.what}</th>
+                      <th scope="col">{stageText.columns.at}</th>
+                      <th scope="col">{stageText.columns.updated}</th>
                     </tr>
                   </thead>
                   <tbody>
@@ -83,44 +79,17 @@ function LedgerPage() {
                       <tr key={entry.jobId} data-testid="ledger-entry" data-job-id={entry.jobId} data-record-id={entry.recordId ?? ''}
                         data-scenario-id={entry.scenarioId} data-update-count={String(entry.updates.count)}
                         data-last-update-result={entry.updates.lastResult ?? ''}>
-                        <th scope="row">{entry.recordId === null ? text.notObtained : <code>{entry.recordId}</code>}</th>
-                        <td className="cell-break">
-                          <code>{entry.scenarioId}</code>
-                          <br />
-                          {text.revisionValue(formatInteger(entry.scenarioRevision))}
-                          <br />
+                        <th scope="row">
                           <Link to="/scenarios/$profileId/$scenarioId" params={{ profileId: profile.profileId, scenarioId: entry.scenarioId }}
                             data-testid="ledger-open-scenario">
-                            {text.openScenario}
+                            {/* OP-G（指示書の 7）: 英字の path の語を出さず、登録の画面ごとの順の番号の、やさしい形（「登録の画面（1）」）。 */}
+                            {entry.pagePath === null
+                              ? text.openScenario
+                              : stageText.what(LOCAL_UI_WRITE_SCREENS_TEXT.unnamedScreen(formatInteger(screenNumberOf(entry.scenarioId))))}
                           </Link>
-                        </td>
-                        <td className="cell-break">
-                          {entry.seed === null ? text.notApplicable : (
-                            <>
-                              <code>{entry.seed.executionGrantId}</code>
-                              <br />
-                              <code>{entry.seed.ruleSetDigest}</code>
-                            </>
-                          )}
-                        </td>
-                        <td className="cell-break">
-                          <Link to="/jobs/$jobId" params={{ jobId: entry.jobId }} data-testid="ledger-open-job">{entry.jobId}</Link>
-                          <br />
-                          {entry.runId === null ? text.notApplicable : <code>{entry.runId}</code>}
-                        </td>
-                        <td><Verification entry={entry} /></td>
-                        <td>
-                          {text.updateCountValue(formatCount(entry.updates.count))}
-                          {entry.updates.lastJobId === null ? null : (
-                            <>
-                              <br />
-                              {text.lastUpdateLabel}
-                              {' '}
-                              <Badge display={entry.updates.lastResult === null ? null : actionResultDisplay(entry.updates.lastResult)} />
-                            </>
-                          )}
-                        </td>
-                        <td>{formatDateTime(entry.recordedAt)}</td>
+                        </th>
+                        <td>{formatPlainDateTime(entry.recordedAt)}</td>
+                        <td>{entry.updates.count === 0 ? stageText.updatedNo : stageText.updatedYes(formatCount(entry.updates.count))}</td>
                       </tr>
                     ))}
                   </tbody>
@@ -128,39 +97,55 @@ function LedgerPage() {
               </div>
             )}
           </section>
-          <section className="panel" data-testid="ledger-scenarios">
-            <h2 className="panel-heading">{text.scenariosHeading}</h2>
-            {page.scenarios.length === 0 ? <p>{text.noScenarios}</p> : (
-              <>
+          <section className="panel">
+            <AdvancedSettings testId="ledger-advanced">
+              {page.entries.length === 0 ? null : (
                 <div className="table-wrap">
-                  <table>
+                  <table data-testid="ledger-details">
                     <thead>
                       <tr>
-                        <th scope="col">{text.scenarioColumns.scenario}</th>
-                        <th scope="col">{text.scenarioColumns.kind}</th>
-                        <th scope="col">{text.scenarioColumns.revision}</th>
-                        <th scope="col">{text.scenarioColumns.cumulative}</th>
+                        <th scope="col">{text.columns.recordId}</th>
+                        <th scope="col">{text.columns.verification}</th>
+                        <th scope="col">{text.columns.updates}</th>
                       </tr>
                     </thead>
                     <tbody>
-                      {page.scenarios.map((scenario) => {
-                        const kind = scenarioKindDisplay(scenario.kind);
-                        return (
-                          <tr key={scenario.scenarioId} data-testid="ledger-scenario" data-scenario-id={scenario.scenarioId}
-                            data-used={String(scenario.used)} data-limit={String(scenario.limit)}>
-                            <th scope="row"><code>{scenario.scenarioId}</code></th>
-                            <td><span className={toneClass(kind.tone)}>{kind.label}</span></td>
-                            <td>{text.revisionValue(formatInteger(scenario.revision))}</td>
-                            <td>{text.cumulativeValue(formatCount(scenario.used), formatCount(scenario.limit))}</td>
-                          </tr>
-                        );
-                      })}
+                      {page.entries.map((entry) => (
+                        <tr key={entry.jobId} data-testid="ledger-entry-detail" data-job-id={entry.jobId}>
+                          <th scope="row">{entry.recordId ?? text.notObtained}</th>
+                          <td><Verification entry={entry} /></td>
+                          <td>
+                            {text.updateCountValue(formatCount(entry.updates.count))}
+                            {entry.updates.lastJobId === null ? null : (
+                              <>
+                                <br />
+                                {text.lastUpdateLabel}
+                                {' '}
+                                <Badge display={entry.updates.lastResult === null ? null : actionResultDisplay(entry.updates.lastResult)} />
+                              </>
+                            )}
+                          </td>
+                        </tr>
+                      ))}
                     </tbody>
                   </table>
                 </div>
+              )}
+              <section data-testid="ledger-scenarios">
+                <h3>{text.scenariosHeading}</h3>
+                {page.scenarios.length === 0 ? <p>{text.noScenarios}</p> : (
+                  <ul>
+                    {page.scenarios.map((scenario) => (
+                      <li key={scenario.scenarioId} data-testid="ledger-scenario" data-scenario-id={scenario.scenarioId}
+                        data-used={String(scenario.used)}>
+                        {text.cumulativeValue(formatCount(scenario.used))}
+                      </li>
+                    ))}
+                  </ul>
+                )}
                 <p className="muted">{text.cumulativeNote}</p>
-              </>
-            )}
+              </section>
+            </AdvancedSettings>
           </section>
         </>
       ) : (
@@ -168,9 +153,6 @@ function LedgerPage() {
           <p data-testid="ledger-not-eligible">{text.notEligible}</p>
         </Notice>
       )}
-      <div className="button-row">
-        <Link to="/profiles/$profileId" params={{ profileId: profile.profileId }} className="button">{text.backToProfile}</Link>
-      </div>
     </PageFrame>
   );
 }

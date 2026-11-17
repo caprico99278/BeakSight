@@ -2,23 +2,20 @@ import type { Browser, BrowserContext, Page } from 'playwright';
 import { afterEach, describe, expect, it } from 'vitest';
 import { BrowserContextFactory } from '../../src/browser/context-factory.js';
 import { controlledScroll } from '../../src/browser/controlled-scroll.js';
-import {
-  ACCESSIBILITY_LIMITS,
-  collectAccessibilityEvidence,
-} from '../../src/evidence/accessibility-collector.js';
+import { collectAccessibilityEvidence } from '../../src/evidence/accessibility-collector.js';
 import { LAYOUT_RULES } from '../../src/audit/layout-rules.js';
 import type { FindingDraft } from '../../src/audit/rule.js';
 import type { Viewport } from '../../src/config/types.js';
 import type { EvidenceRecord } from '../../src/core/contracts.js';
 import { createEvidenceId, createPageId } from '../../src/core/ids.js';
-import { COLOR_LIMITS, collectColorEvidence } from '../../src/evidence/color-collector.js';
 import { collectDomEvidence } from '../../src/evidence/dom-collector.js';
-import type {
-  LayoutCollectionResult,
-  LayoutEvidence,
-  NormalizedHttpUrlEvidence,
+import {
+  VISUALLY_HIDDEN_MAX_DIMENSION_PX,
+  type LayoutCollectionResult,
+  type LayoutEvidence,
+  type NormalizedHttpUrlEvidence,
 } from '../../src/core/evidence-types.js';
-import { LAYOUT_THRESHOLDS, collectLayoutEvidence } from '../../src/evidence/layout-collector.js';
+import { LAYOUT_COLLECTION_PART_SIZE, LAYOUT_THRESHOLDS, collectLayoutEvidence } from '../../src/evidence/layout-collector.js';
 import { SafetyLedger } from '../../src/safety/safety-ledger.js';
 import { startFixtureServer, type FixtureServer } from '../../fixtures/server.js';
 import { useHeadlessChromium } from '../helpers/chromium.js';
@@ -34,6 +31,9 @@ let server: FixtureServer | undefined;
 
 /** fixture のページを開く、既定のビューポート。 */
 const DEFAULT_FIXTURE_VIEWPORT: Viewport = Object.freeze({ width: 400, height: 300 });
+
+/** COV-6 の前の、候補 1 つの中で走査したテキストのノードと子孫の要素の数の上限（いまは打ち切らない）。前の上限を超える形を作るために使う。 */
+const FORMER_NODE_SCAN_LIMIT = 256;
 
 /**
  * fixture のサーバの `pathname` を、Guard の付いた Passive の page で開いて `run` に渡す。
@@ -114,7 +114,7 @@ describe('layout evidence', () => {
     });
   });
 
-  it('retains late horizontal and fixed offscreen candidates ahead of ordinary vertical flow', async () => {
+  it('lists late horizontal and fixed offscreen candidates, and not the ordinary vertical flow (REC-1)', async () => {
     await withFixture('overflow.html', DEFAULT_FIXTURE_VIEWPORT, async (fixturePage) => {
 
       const evidence = completeLayout(await collectLayoutEvidence(fixturePage, { width: 400, height: 300 }));
@@ -122,7 +122,10 @@ describe('layout evidence', () => {
 
       expect(selectors).toContain('#priority-horizontal');
       expect(selectors).toContain('#priority-fixed-offscreen');
-      expect(evidence.boxesOutsideViewport.length).toBeLessThanOrEqual(LAYOUT_THRESHOLDS.maxOutsideViewportCandidates);
+      // REC-1: 縦だけにはみ出す要素（画面の下に続く要素）は、読む Rule がないので一覧に入れない。
+      expect(evidence.boxesOutsideViewport.filter((box) => !box.outside.left && !box.outside.right)).toEqual([]);
+      // COV-6: 件数の上限で打ち切らない。
+      expect(evidence.truncation.omittedOutsideViewportCount).toBe(0);
     });
   });
 
@@ -187,7 +190,7 @@ describe('layout evidence', () => {
         candidate.overlaySelector === '#fixed-banner' && candidate.headingSelector === '#covered-heading'
       ));
       expect(overlap?.intersection.area).toBeGreaterThanOrEqual(LAYOUT_THRESHOLDS.minOcclusionAreaPx2);
-      expect(evidence.boxesOutsideViewport.length).toBeLessThanOrEqual(LAYOUT_THRESHOLDS.maxOutsideViewportCandidates);
+      expect(evidence.truncation.omittedOutsideViewportCount).toBe(0);
       expect(Object.isFrozen(evidence)).toBe(true);
       expect(Object.isFrozen(evidence.fixedHeadingOverlaps[0]?.intersection)).toBe(true);
       expect(JSON.stringify(evidence)).not.toMatch(/finding|fingerprint|evidenceId/i);
@@ -278,7 +281,219 @@ describe('layout evidence', () => {
           text: expect.stringContaining('deliberately long'),
         }),
       ]));
-      expect(evidence.clippedText[0]?.text.length).toBeLessThanOrEqual(LAYOUT_THRESHOLDS.maxClippedTextLength);
+    });
+  });
+
+  // LZ-3b: 前の見切れのテキストの上限（256）より長いテキストも、切り詰めずに記録する。
+  it('records clipped text longer than the former length limit without truncating it', async () => {
+    const text = `Clipped ${'x'.repeat(256)}`;
+    await withFixture('overflow.html', DEFAULT_FIXTURE_VIEWPORT, async (fixturePage) => {
+      await fixturePage.evaluate((value) => {
+        const clipped = document.createElement('div');
+        clipped.textContent = value;
+        clipped.style.cssText = 'width:40px;height:20px;overflow:hidden;white-space:nowrap;';
+        document.body.prepend(clipped);
+      }, text);
+
+      const layout = completeLayout(await collectLayoutEvidence(fixturePage, DEFAULT_FIXTURE_VIEWPORT));
+
+      expect(layout.clippedText.find((candidate) => candidate.text.startsWith('Clipped '))).toMatchObject({ text, truncated: false });
+    });
+  });
+});
+
+describe('element overlap evidence (V5)', () => {
+  it('records bounded overlap candidates between visible primary elements with their layout facts', async () => {
+    const viewport = { width: 800, height: 600 };
+    await withFixture('element-overlap.html', viewport, async (fixturePage) => {
+
+      const layout = completeLayout(await collectLayoutEvidence(fixturePage, viewport));
+      const pairs = layout.elementOverlaps.map((overlap) => (
+        [overlap.first.selector, overlap.second.selector].sort().join('|')
+      ));
+
+      expect(pairs.sort()).toEqual([
+        '#colliding-heading|#colliding-paragraph',
+        '#consent-banner|#under-banner-link',
+        '#far-heading|#far-paragraph',
+        '#overlapped-button|#overlapping-image',
+      ]);
+      const collision = layout.elementOverlaps.find((overlap) => (
+        [overlap.first.selector, overlap.second.selector].includes('#colliding-paragraph')
+      ));
+      const paragraph = collision?.first.selector === '#colliding-paragraph' ? collision.first : collision?.second;
+      const heading = collision?.first.selector === '#colliding-heading' ? collision.first : collision?.second;
+      expect(paragraph).toMatchObject({
+        kind: 'paragraph',
+        position: 'absolute',
+        zIndex: '2',
+        overflowX: 'hidden',
+        overflowY: 'hidden',
+        fixedOrStickyAncestor: false,
+        area: 300 * 40,
+        visibility: expect.objectContaining({ visible: true, visibility: 'visible' }),
+      });
+      expect(heading).toMatchObject({ kind: 'heading', zIndex: 'auto', overflowX: 'visible' });
+      expect(collision?.intersection).toMatchObject({ width: 280, height: 20, area: 280 * 20 });
+
+      const imageButton = layout.elementOverlaps.find((overlap) => (
+        [overlap.first.selector, overlap.second.selector].includes('#overlapping-image')
+      ));
+      expect([imageButton?.first.kind, imageButton?.second.kind].sort()).toEqual(['button', 'image']);
+
+      const banner = layout.elementOverlaps.find((overlap) => (
+        [overlap.first.selector, overlap.second.selector].includes('#consent-banner')
+      ));
+      const bannerFacts = banner?.first.selector === '#consent-banner' ? banner.first : banner?.second;
+      const linkFacts = banner?.first.selector === '#under-banner-link' ? banner.first : banner?.second;
+      expect(bannerFacts).toMatchObject({ kind: 'other', position: 'fixed', zIndex: '50' });
+      expect(linkFacts).toMatchObject({ kind: 'link', position: 'absolute' });
+
+      expect(layout.fixedElements).toEqual([
+        expect.objectContaining({
+          selector: '#consent-banner',
+          position: 'fixed',
+          zIndex: '50',
+          area: 800 * 300,
+          viewportIntersectionArea: 800 * 300,
+          viewportArea: 800 * 600,
+          viewportAreaRatio: 0.5,
+        }),
+      ]);
+      expect(layout.truncation).toMatchObject({
+        omittedElementOverlapCount: 0,
+        omittedFixedElementCount: 0,
+        overlapComparisonLimitReached: false,
+      });
+      expect(Object.isFrozen(layout.elementOverlaps[0]?.first)).toBe(true);
+      expect(Object.isFrozen(layout.fixedElements[0])).toBe(true);
+      expect(JSON.stringify(layout)).not.toMatch(/finding|fingerprint|evidenceId/i);
+    });
+  });
+
+  it('excludes elements whose area is clipped away by an ancestor overflow (R4 M3)', async () => {
+    const viewport = { width: 800, height: 600 };
+    await withFixture('element-overlap.html', viewport, async (fixturePage) => {
+      await fixturePage.evaluate(() => {
+        // 高さ0で overflow:hidden の要素の中の見出しは、見える面積が0なので重なりの候補にしない。
+        const collapsed = document.createElement('div');
+        collapsed.id = 'collapsed-panel';
+        collapsed.style.cssText = 'position:absolute;left:600px;top:400px;width:180px;height:0;overflow:hidden;';
+        collapsed.innerHTML = '<h4 id="clipped-heading" style="margin:0;height:40px;">Clipped heading</h4>';
+        // 切り取られていない見出しは、比べるための対照として候補に残る。
+        const shown = document.createElement('div');
+        shown.id = 'shown-panel';
+        shown.style.cssText = 'position:absolute;left:600px;top:500px;width:180px;height:60px;overflow:hidden;';
+        shown.innerHTML = '<h4 id="shown-heading" style="margin:0;height:40px;">Shown heading</h4>';
+        const overlay = (id: string, top: number): HTMLParagraphElement => {
+          const paragraph = document.createElement('p');
+          paragraph.id = id;
+          paragraph.textContent = id;
+          paragraph.style.cssText = `position:absolute;left:610px;top:${top}px;width:100px;height:30px;margin:0;`;
+          return paragraph;
+        };
+        const main = document.querySelector('main') as HTMLElement;
+        main.append(collapsed, shown, overlay('over-clipped', 400), overlay('over-shown', 500));
+      });
+
+      const layout = completeLayout(await collectLayoutEvidence(fixturePage, viewport));
+      const pairs = layout.elementOverlaps.map((overlap) => (
+        [overlap.first.selector, overlap.second.selector].sort().join('|')
+      ));
+
+      expect(pairs).toContain('#over-shown|#shown-heading');
+      expect(pairs.some((pair) => pair.includes('#clipped-heading'))).toBe(false);
+    });
+  });
+
+  it('marks descendants of a fixed container', async () => {
+    const viewport = { width: 800, height: 600 };
+    await withFixture('element-overlap.html', viewport, async (fixturePage) => {
+      await fixturePage.evaluate(() => {
+        const link = document.createElement('a');
+        link.id = 'banner-link';
+        link.href = '#banner';
+        link.textContent = 'Banner link';
+        link.style.cssText = 'display:block;position:absolute;left:10px;top:60px;width:200px;height:30px;';
+        document.querySelector('#consent-banner')?.append(link);
+      });
+
+      const layout = completeLayout(await collectLayoutEvidence(fixturePage, viewport));
+      const overlap = layout.elementOverlaps.find((candidate) => (
+        [candidate.first.selector, candidate.second.selector].includes('#banner-link')
+        && [candidate.first.selector, candidate.second.selector].includes('#under-banner-link')
+      ));
+
+      const bannerLink = overlap?.first.selector === '#banner-link' ? overlap.first : overlap?.second;
+      expect(bannerLink).toMatchObject({ kind: 'link', position: 'absolute', fixedOrStickyAncestor: true });
+      expect(layout.elementOverlaps.some((candidate) => (
+        [candidate.first.selector, candidate.second.selector].sort().join('|') === '#banner-link|#consent-banner'
+      ))).toBe(false);
+    });
+  });
+});
+
+describe('layout candidates collected in parts without a count limit (COV-6)', () => {
+  it('collects every fixed element and overlap candidate beyond the former limit of 100, reading the overlaps in parts', async () => {
+    const viewport = { width: 800, height: 600 };
+    await withFixture('element-overlap.html', viewport, async (fixturePage) => {
+      const fixedCount = 120;
+      await fixturePage.evaluate(({ fixedCount }) => {
+        const container = document.createElement('div');
+        for (let index = 0; index < fixedCount; index += 1) {
+          const element = document.createElement('div');
+          element.textContent = `Fixed ${index}`;
+          element.style.cssText = `position:fixed;left:${index % 700}px;top:0;width:40px;height:20px;`;
+          container.append(element);
+        }
+        document.body.append(container);
+      }, { fixedCount });
+
+      const layout = completeLayout(await collectLayoutEvidence(fixturePage, viewport));
+
+      // 追加した固定要素と、もとの #consent-banner の分。
+      expect(layout.fixedElements).toHaveLength(fixedCount + 1);
+      expect(layout.truncation).toMatchObject({ omittedFixedElementCount: 0, omittedElementOverlapCount: 0 });
+      // 重なりの組は分け方の単位を超えるので、続きの位置から読み直して全部を集める。
+      expect(layout.elementOverlaps.length).toBeGreaterThan(LAYOUT_COLLECTION_PART_SIZE);
+      expect(layout.collectedInParts).toBe(Math.ceil(layout.elementOverlaps.length / LAYOUT_COLLECTION_PART_SIZE));
+      expect(new Set(layout.elementOverlaps.map((overlap) => `${overlap.first.selector}|${overlap.second.selector}`)).size)
+        .toBe(layout.elementOverlaps.length);
+    });
+  });
+
+  it('compares every overlap pair beyond the former limit of 200,000 pairs, and finds a pair compared after it (COV-6)', async () => {
+    // 比べる組だけを増やし、重なる組は増やさない（横に 2px ずつずらした幅 1px の段落。縦の範囲は重なるので、比べる組にはなる）。
+    // その後ろ（上端の順で後）に、重なる 2 つの段落を置く。この組は、前の上限の組の数を超えた後で比べる。
+    const viewport = { width: 800, height: 600 };
+    await withFixture('element-overlap.html', viewport, async (fixturePage) => {
+      const formerComparisonLimit = 200_000;
+      const stackedCount = Math.ceil(Math.sqrt(formerComparisonLimit * 2)) + 10;
+      await fixturePage.evaluate((count) => {
+        const container = document.createElement('div');
+        for (let index = 0; index < count; index += 1) {
+          const paragraph = document.createElement('p');
+          paragraph.textContent = `Stacked ${index}`;
+          paragraph.style.cssText = `position:absolute;left:${index * 2}px;top:2000px;width:1px;height:20px;margin:0;overflow:hidden;`;
+          container.append(paragraph);
+        }
+        for (const id of ['late-first', 'late-second']) {
+          const paragraph = document.createElement('p');
+          paragraph.id = id;
+          paragraph.textContent = id;
+          paragraph.style.cssText = 'position:absolute;left:4000px;top:2010px;width:100px;height:20px;margin:0;';
+          container.append(paragraph);
+        }
+        document.body.append(container);
+      }, stackedCount);
+
+      const layout = completeLayout(await collectLayoutEvidence(fixturePage, viewport));
+
+      // 前は、比べる組の上限（200,000）で止めて PARTIAL にしていた。いまは上限を撤廃し、すべての組を比べて COMPLETE になる。
+      expect(layout.truncation.overlapComparisonLimitReached).toBe(false);
+      const pairs = layout.elementOverlaps.map((overlap) => [overlap.first.selector, overlap.second.selector].sort().join('|'));
+      expect(pairs).toContain('#late-first|#late-second');
+      expect(new Set(pairs).size).toBe(pairs.length);
     });
   });
 });
@@ -396,7 +611,7 @@ describe('layout evidence that avoids false positives (RT12 I1, I2, I3)', () => 
     ]);
   });
 
-  it('gives up the text line check at the text node limit and records it (I2)', async () => {
+  it('checks every text node of a candidate, beyond the former limit of 256 nodes (I2, COV-6)', async () => {
     await withFixture('layout-rule-cases.html', DEFAULT_FIXTURE_VIEWPORT, async (fixturePage) => {
       await fixturePage.evaluate((limit) => {
         // 空白だけのテキストのノード（走査の数には入り、行の判定はしない）の後に、箱の境界をまたぐ行を置く。
@@ -410,16 +625,16 @@ describe('layout evidence that avoids false positives (RT12 I1, I2, I3)', () => 
           element.append(document.createTextNode('x'.repeat(200)));
           return element;
         };
-        // 上限の中に、またぐ行がある箱（対照）と、またぐ行が上限の外にある箱。
-        document.querySelector('main')?.prepend(box('within-text-node-limit', limit - 1), box('many-text-nodes', limit));
-      }, LAYOUT_THRESHOLDS.maxClippedTextNodeScan);
+        // 前の上限（256）の中に、またぐ行がある箱（対照）と、またぐ行が前の上限の外にある箱。COV-6 の後は、どちらも見切れを見つける。
+        document.querySelector('main')?.prepend(box('within-text-node-limit', limit - 1), box('many-text-nodes', limit * 4));
+      }, FORMER_NODE_SCAN_LIMIT);
 
       const evidence = completeLayout(await collectLayoutEvidence(fixturePage, { width: 400, height: 300 }));
       const bySelector = (selector: string) => evidence.clippedText.find((candidate) => candidate.selector === selector);
 
       expect(bySelector('#within-text-node-limit')).toMatchObject({ widthClipped: true, partiallyClippedText: true });
-      expect(bySelector('#many-text-nodes')).toMatchObject({ widthClipped: true, partiallyClippedText: false });
-      expect(evidence.truncation.clippedTextNodeScanLimitReachedCount).toBe(1);
+      expect(bySelector('#many-text-nodes')).toMatchObject({ widthClipped: true, partiallyClippedText: true });
+      expect(evidence.truncation.clippedTextNodeScanLimitReachedCount).toBe(0);
     });
   });
 
@@ -438,7 +653,7 @@ describe('layout evidence that avoids false positives (RT12 I1, I2, I3)', () => 
     });
   });
 
-  it('gives up the rendered descendant check at the descendant limit and records it (I3)', async () => {
+  it('checks every descendant of a zero-size control, beyond the former limit of 256 elements (I3, COV-6)', async () => {
     await withFixture('layout-rule-cases.html', DEFAULT_FIXTURE_VIEWPORT, async (fixturePage) => {
       await fixturePage.evaluate((limit) => {
         // 描画されない子孫の後に、描画された子孫（float の画像）を置いたリンク。
@@ -457,19 +672,19 @@ describe('layout evidence that avoids false positives (RT12 I1, I2, I3)', () => 
           element.append(image);
           return element;
         };
-        // 上限の中に描画された子孫があるリンク（対照）と、それが上限の外にあるリンク。
+        // 前の上限（256）の中に描画された子孫があるリンク（対照）と、それが前の上限の外にあるリンク。COV-6 の後は、どちらも子孫を見つける。
         document.querySelector('main')?.prepend(
           link('within-descendant-limit', limit - 1),
-          link('many-descendants-link', limit),
+          link('many-descendants-link', limit * 4),
         );
-      }, LAYOUT_THRESHOLDS.maxRenderedDescendantScan);
+      }, FORMER_NODE_SCAN_LIMIT);
 
       const evidence = completeLayout(await collectLayoutEvidence(fixturePage, { width: 400, height: 300 }));
       const bySelector = (selector: string) => evidence.zeroSizeInteractive.find((candidate) => candidate.selector === selector);
 
       expect(bySelector('#within-descendant-limit')).toMatchObject({ hasRenderedDescendant: true });
-      expect(bySelector('#many-descendants-link')).toMatchObject({ hasRenderedDescendant: false });
-      expect(evidence.truncation.renderedDescendantScanLimitReachedCount).toBe(1);
+      expect(bySelector('#many-descendants-link')).toMatchObject({ hasRenderedDescendant: true });
+      expect(evidence.truncation.renderedDescendantScanLimitReachedCount).toBe(0);
     });
   });
 });
@@ -583,9 +798,9 @@ describe('layout evidence corrected after the RT12r review (N1, N3, N4, N5)', ()
       const evidence = completeLayout(await collectLayoutEvidence(fixturePage, { width: 400, height: 300 }));
       const clippedCandidates = evidence.boxesOutsideViewport.filter((box) => box.horizontalClipAncestor === 'CLIPPED');
 
-      // カルーセルの中の横にはみ出す候補だけで、件数の上限を超える。
-      expect(clippedCandidates.length + evidence.truncation.omittedOutsideViewportCount)
-        .toBeGreaterThan(LAYOUT_THRESHOLDS.maxOutsideViewportCandidates);
+      // カルーセルの中の横にはみ出す候補だけで、前の件数の上限（100）を超える。COV-6 の後は、全部を集める。
+      expect(clippedCandidates.length).toBeGreaterThan(100);
+      expect(evidence.truncation.omittedOutsideViewportCount).toBe(0);
       expect(evidence.boxesOutsideViewport.find((box) => box.selector === '#late-wide-image')).toMatchObject({
         kind: 'image',
         horizontalClipAncestor: 'NONE',
@@ -613,6 +828,32 @@ describe('layout evidence corrected after the RT12r review (N1, N3, N4, N5)', ()
       expect(evidence.zeroSizeInteractive.find((candidate) => candidate.selector === '#visually-hidden-label-link'))
         .toMatchObject({ hasRenderedDescendant: false });
       expect(layoutRuleSelectors('ZERO_SIZE_INTERACTIVE_ELEMENT', evidence)).toEqual(['#visually-hidden-label-link']);
+    });
+  });
+});
+
+describe('visually hidden elements by clip and clip-path (DEF-205)', () => {
+  it('records the zero area of clip and clip-path, and does not report them as clipped text or outside the viewport', async () => {
+    await withFixture('layout-clip-hidden-text.html', DEFAULT_FIXTURE_VIEWPORT, async (fixturePage) => {
+
+      const evidence = completeLayout(await collectLayoutEvidence(fixturePage, { width: 400, height: 300 }));
+      const clipped = (selector: string) => evidence.clippedText.find((candidate) => candidate.selector === selector);
+
+      // スマホの幅の最小の大きさで、隠したリンクが 1 × 1 px より大きくなり、文字が箱からはみ出す（DEF-205 の前提）。
+      for (const selector of ['#skip-rect', '#skip-rect-comma', '#skip-inset']) {
+        expect(clipped(selector)?.rect.width).toBeGreaterThan(VISUALLY_HIDDEN_MAX_DIMENSION_PX);
+        expect(clipped(selector)?.partiallyClippedText).toBe(true);
+        expect(clipped(selector)?.visibility.clippedToZeroArea).toBe(true);
+      }
+      expect(clipped('#hidden-ancestor-cut')?.visibility.clippedToZeroArea).toBe(true);
+      expect(clipped('#really-cut')?.visibility.clippedToZeroArea).toBe(false);
+      expect(clipped('#partly-inset')?.visibility.clippedToZeroArea).toBe(false);
+      expect(evidence.boxesOutsideViewport.find((box) => box.selector === '#hidden-wide-button')?.visibility.clippedToZeroArea)
+        .toBe(true);
+
+      // 隠した要素は数えず、隠していない本当の見切れと、はみ出しは数える。
+      expect(layoutRuleSelectors('TEXT_CLIPPING', evidence)).toEqual(['#really-cut', '#partly-inset']);
+      expect(layoutRuleSelectors('ELEMENT_OUTSIDE_VIEWPORT', evidence)).toEqual(['#visible-wide-button']);
     });
   });
 });
@@ -834,7 +1075,7 @@ describe('the horizontal overflow of the viewport and DOCUMENT_HORIZONTAL_OVERFL
   });
 });
 
-describe('accessibility and CSS color evidence', () => {
+describe('accessibility evidence', () => {
   it('keeps all axe violations including color contrast with bounded immutable node snippets', async () => {
     await withFixture('bad-contrast.html', { width: 800, height: 600 }, async (fixturePage) => {
 
@@ -844,132 +1085,18 @@ describe('accessibility and CSS color evidence', () => {
       expect(evidence.violations.some((violation) => violation.ruleId === 'image-alt')).toBe(true);
       const contrastNode = evidence.violations.find((violation) => violation.ruleId === 'color-contrast')?.nodes[0];
       expect(contrastNode?.targetSelectors.flat()).toContain('#poor-contrast');
-      expect(contrastNode?.htmlSnippet.length).toBeLessThanOrEqual(ACCESSIBILITY_LIMITS.maxHtmlSnippetLength);
       expect(Object.isFrozen(evidence.violations)).toBe(true);
       expect(Object.isFrozen(contrastNode?.targetSelectors)).toBe(true);
       expect(JSON.stringify(evidence)).not.toMatch(/finding|fingerprint|evidenceId/i);
     });
   });
 
-  it('collects bounded area-weighted foreground and explicit usable or ambiguous background facts', async () => {
-    await withFixture('bad-contrast.html', { width: 800, height: 600 }, async (fixturePage) => {
-
-      const evidence = await collectColorEvidence(fixturePage);
-
-      const opaque = evidence.textSamples.find((sample) => sample.selector === '#opaque-sample');
-      const ambiguous = evidence.textSamples.find((sample) => sample.selector === '#image-ambiguous');
-      const ancestorHidden = evidence.textSamples.find((sample) => sample.selector === '#not-visible-sample');
-      expect(opaque).toMatchObject({
-        text: 'Opaque color sample.',
-        foreground: { status: 'OBSERVED', color: { css: 'rgba(20, 40, 60, 1)' } },
-        background: { status: 'OBSERVED', color: { css: 'rgba(240, 240, 240, 1)' } },
-        contrast: { status: 'OBSERVED' },
-      });
-      expect(opaque?.contrast.status === 'OBSERVED' ? opaque.contrast.ratio : undefined).toBeGreaterThan(1);
-      expect(ambiguous?.background).toEqual({ status: 'UNAVAILABLE', reason: 'BACKGROUND_IMAGE' });
-      expect(ambiguous?.contrast).toEqual({ status: 'UNAVAILABLE', reason: 'BACKGROUND_IMAGE' });
-      expect(ancestorHidden).toBeUndefined();
-      expect(evidence.textSamples.length).toBeLessThanOrEqual(COLOR_LIMITS.maxTextSamples);
-      expect(evidence.foregroundDistribution.length).toBeLessThanOrEqual(COLOR_LIMITS.maxDistributionEntries);
-      expect(evidence.foregroundDistribution.reduce((sum, item) => sum + item.area, 0)).toBeGreaterThan(0);
-      expect(Object.isFrozen(evidence.textSamples)).toBe(true);
-      expect(Object.isFrozen(opaque?.foreground)).toBe(true);
-      expect(Object.isFrozen(opaque?.foreground.status === 'OBSERVED' ? opaque.foreground.color : undefined)).toBe(true);
-      expect(Object.isFrozen(evidence.foregroundDistribution[0])).toBe(true);
-      expect(JSON.stringify(evidence)).not.toMatch(/baseline|finding|aesthetic|fingerprint/i);
-    });
-  });
-
-  it('marks element and ancestor partial opacity contrast as unavailable', async () => {
-    await withFixture('bad-contrast.html', { width: 800, height: 600 }, async (fixturePage) => {
-
-      const evidence = await collectColorEvidence(fixturePage);
-
-      expect(evidence.textSamples.find((sample) => sample.selector === '#partial-opacity')?.contrast).toEqual({
-        status: 'UNAVAILABLE',
-        reason: 'PARTIAL_OPACITY',
-      });
-      expect(evidence.textSamples.find((sample) => sample.selector === '#ancestor-partial-sample')?.contrast).toEqual({
-        status: 'UNAVAILABLE',
-        reason: 'PARTIAL_OPACITY',
-      });
-    });
-  });
-
-  it('weights colors by viewport and overflow-ancestor clipped visible area', async () => {
-    await withFixture('bad-contrast.html', { width: 800, height: 600 }, async (fixturePage) => {
-
-      const evidence = await collectColorEvidence(fixturePage);
-      const overflowClipped = evidence.textSamples.find((sample) => sample.selector === '#overflow-clipped-color');
-      const viewportClipped = evidence.textSamples.find((sample) => sample.selector === '#viewport-clipped-color');
-
-      expect(overflowClipped).toMatchObject({ boundingArea: 8_000, visibleArea: 2_000 });
-      expect(viewportClipped).toMatchObject({ boundingArea: 4_000, visibleArea: 1_000 });
-      expect(evidence.textSamples.some((sample) => sample.selector === '#fully-clipped-color')).toBe(false);
-      const clippedDistribution = evidence.foregroundDistribution.find((entry) => (
-        entry.color.css === 'rgba(30, 60, 90, 1)'
-      ));
-      expect(clippedDistribution?.area).toBe(2_000);
-    });
-  });
-
-  it('samples visible text across the whole document and records the collection scroll position', async () => {
-    await withFixture('fixed-header-scroll.html', { width: 800, height: 600 }, async (fixturePage) => {
-
-      const evidence = await collectColorEvidence(fixturePage);
-      const belowFold = evidence.textSamples.find((sample) => sample.selector === '#below-fold-text');
-
-      expect(belowFold).toMatchObject({
-        foreground: { status: 'OBSERVED', color: { css: 'rgba(90, 30, 120, 1)' } },
-        boundingArea: 8_000,
-        visibleArea: 8_000,
-      });
-      expect(evidence.textSamples.some((sample) => sample.selector === '#fixed-header')).toBe(true);
-      expect(evidence.scrollPosition).toEqual({ scrollX: 0, scrollY: 0 });
-      expect(Object.isFrozen(evidence.scrollPosition)).toBe(true);
-    });
-  });
-
-  it('samples text below the fold of a scrolling body', async () => {
-    await withFixture('body-scroll.html', { width: 800, height: 600 }, async (fixturePage) => {
-
-      const evidence = await collectColorEvidence(fixturePage);
-      const belowFold = evidence.textSamples.find((sample) => sample.selector === '#below-fold-color');
-
-      expect(belowFold?.foreground).toEqual({
-        status: 'OBSERVED',
-        color: expect.objectContaining({ css: 'rgba(90, 30, 120, 1)' }),
-      });
-      expect(belowFold?.visibleArea).toBeGreaterThan(0);
-      expect(belowFold?.visibleArea).toBe(belowFold?.boundingArea);
-      expect(evidence.scrollPosition).toEqual({ scrollX: 0, scrollY: 0 });
-    });
-  });
-
-  it('samples a visibility:visible child of a visibility:hidden ancestor (V7 B)', async () => {
-    // レビュー V7 (B) の再現条件: 祖先が visibility:hidden で子が visible の場合に、配色の標本が0件になっていた。
+  it('keeps aria-hidden but visible text in the DOM visible text (V7 C)', async () => {
+    // レビュー V7 (C) の再現条件: <main aria-hidden="true"> を、DOM は除外していた。
     await withFixture('visibility-override.html', { width: 800, height: 600 }, async (fixturePage) => {
 
-      const evidence = await collectColorEvidence(fixturePage);
-      const selectors = evidence.textSamples.map((sample) => sample.selector);
-
-      expect(evidence.textSamples.find((sample) => sample.selector === '#override-visible-text')).toMatchObject({
-        text: 'Visible despite a hidden parent',
-        foreground: { status: 'OBSERVED', color: { css: 'rgba(10, 90, 40, 1)' } },
-      });
-      expect(selectors).not.toContain('#inherited-hidden-text');
-      expect(selectors).not.toContain('#inherited-hidden-outside');
-    });
-  });
-
-  it('keeps aria-hidden but visible text in both DOM visible text and color samples (V7 C)', async () => {
-    // レビュー V7 (C) の再現条件: <main aria-hidden="true"> を、DOM は除外し、配色は含めていた。
-    await withFixture('visibility-override.html', { width: 800, height: 600 }, async (fixturePage) => {
-
-      const color = await collectColorEvidence(fixturePage);
       const dom = await collectDomEvidence(fixturePage, createPageId(1));
 
-      expect(color.textSamples.map((sample) => sample.selector)).toContain('#aria-hidden-color');
       expect(dom.visibleText.text).toContain('ARIA hidden but visible text');
       expect(dom.visibleText.text).toContain('Visible despite a hidden parent');
       expect(dom.visibleText.text).not.toContain('Inherited hidden text');
@@ -979,95 +1106,58 @@ describe('accessibility and CSS color evidence', () => {
     });
   });
 
-  it('takes no color samples from a transparent body (V7 A)', async () => {
+  it('takes no visible text from a transparent body (V7 A)', async () => {
     await withFixture('bad-contrast.html', { width: 800, height: 600 }, async (fixturePage) => {
       await fixturePage.evaluate(() => {
         document.body.style.opacity = '0';
       });
 
-      const color = await collectColorEvidence(fixturePage);
       const dom = await collectDomEvidence(fixturePage, createPageId(2));
 
-      expect(color.textSamples).toEqual([]);
       expect(dom.visibleText.text).toBe('');
     });
   });
+});
 
-  it('marks text samples and distribution entries cut by the limits (V9)', async () => {
-    await withFixture('bad-contrast.html', { width: 800, height: 600 }, async (fixturePage) => {
+describe('AUD-4a: 意図した省略の事実（ellipsis・行数の省略・閉じた折りたたみ）', () => {
+  it('見切れの候補ごとに省略の書き方・見える行の数・閉じた折りたたみを記録し、意図した省略だけを Rule が外す', async () => {
+    await withFixture('layout-intended-clipping.html', DEFAULT_FIXTURE_VIEWPORT, async (fixturePage) => {
 
-      const bounded = await collectColorEvidence(fixturePage);
+      const evidence = completeLayout(await collectLayoutEvidence(fixturePage, { width: 400, height: 300 }));
+      const bySelector = (selector: string) => evidence.clippedText.find((candidate) => candidate.selector === selector);
 
-      expect(bounded.textSamplesTruncated).toBe(false);
-      expect(bounded.omittedDistributionEntryCount).toBe(0);
-
-      const extraColors = COLOR_LIMITS.maxDistributionEntries + 5;
-      await fixturePage.evaluate(({ sampleCount, colorCount }) => {
-        const container = document.createElement('div');
-        for (let index = 0; index < sampleCount; index += 1) {
-          const paragraph = document.createElement('p');
-          paragraph.textContent = `Generated sample ${index}`;
-          paragraph.style.color = `rgb(${index % colorCount}, 0, 0)`;
-          paragraph.style.margin = '0';
-          container.append(paragraph);
-        }
-        document.querySelector('main')?.prepend(container);
-      }, { sampleCount: COLOR_LIMITS.maxTextSamples + 1, colorCount: extraColors });
-
-      const truncated = await collectColorEvidence(fixturePage);
-
-      expect(truncated.textSamples).toHaveLength(COLOR_LIMITS.maxTextSamples);
-      expect(truncated.textSamplesTruncated).toBe(true);
-      expect(truncated.foregroundDistribution).toHaveLength(COLOR_LIMITS.maxDistributionEntries);
-      expect(truncated.omittedDistributionEntryCount).toBe(5);
-    });
-  });
-
-  it('marks a sample whose text was cut to the length limit (V9)', async () => {
-    await withFixture('bad-contrast.html', { width: 800, height: 600 }, async (fixturePage) => {
-      await fixturePage.evaluate((length) => {
-        const element = document.querySelector<HTMLElement>('#opaque-sample');
-        if (element !== null) {
-          element.textContent = 'y'.repeat(length + 10);
-        }
-      }, COLOR_LIMITS.maxTextLength);
-
-      const evidence = await collectColorEvidence(fixturePage);
-
-      expect(evidence.textSamples.find((sample) => sample.selector === '#opaque-sample')).toMatchObject({
-        truncated: true,
+      expect(bySelector('#clamp-two')).toMatchObject({
+        heightClipped: true,
+        partiallyClippedText: true,
+        clippingStyle: expect.objectContaining({ webkitLineClamp: '2', webkitBoxOrient: 'vertical' }),
+        lineHeightPx: 20,
+        lineClampCount: 2,
+        collapsedByControl: false,
+        intendedClipping: 'LINE_CLAMP',
       });
-      expect(evidence.textSamples.find((sample) => sample.selector === '#image-ambiguous')).toMatchObject({
-        truncated: false,
+      expect(bySelector('#clamp-two')?.visibleLineCount).toBeCloseTo(2, 1);
+      expect(bySelector('#clamp-half')).toMatchObject({
+        clippingStyle: expect.objectContaining({ maxHeight: '30px' }),
+        lineClampCount: 2,
+        intendedClipping: 'LINE_CLAMP',
       });
-    });
-  });
-
-  it('retains an explicit bounded invalid foreground without aborting other samples', async () => {
-    await withFixture('bad-contrast.html', { width: 800, height: 600 }, async (fixturePage) => {
-      await fixturePage.evaluate(() => {
-        const element = document.querySelector<HTMLElement>('#modern-color');
-        if (element !== null) {
-          element.style.color = 'oklch(50% 0.2 20)';
-        }
+      expect(bySelector('#clamp-half')?.visibleLineCount).toBeCloseTo(1.5, 1);
+      expect(bySelector('#ellipsis-line')).toMatchObject({
+        widthClipped: true,
+        clippingStyle: expect.objectContaining({ textOverflow: 'ellipsis', whiteSpace: 'nowrap' }),
+        lineClampCount: null,
+        intendedClipping: 'INTENDED_ELLIPSIS',
       });
-
-      const evidence = await collectColorEvidence(fixturePage);
-      const modern = evidence.textSamples.find((sample) => sample.selector === '#modern-color');
-
-      expect(modern).toMatchObject({
-        foreground: {
-          status: 'UNAVAILABLE',
-          reason: 'INVALID_COLOR',
-          serialized: expect.stringContaining('oklch'),
-        },
-        contrast: { status: 'UNAVAILABLE', reason: 'INVALID_COLOR' },
+      expect(bySelector('#nowrap-cut')).toMatchObject({
+        widthClipped: true,
+        clippingStyle: expect.objectContaining({ textOverflow: 'clip', whiteSpace: 'nowrap' }),
+        intendedClipping: null,
       });
-      expect(
-        modern?.foreground.status === 'UNAVAILABLE' ? modern.foreground.serialized.length : Number.POSITIVE_INFINITY,
-      ).toBeLessThanOrEqual(COLOR_LIMITS.maxColorSerializationLength);
-      expect(evidence.textSamples.some((sample) => sample.selector === '#opaque-sample')).toBe(true);
-      expect(evidence.foregroundDistribution.reduce((sum, entry) => sum + entry.proportion, 0)).toBeCloseTo(1);
+      expect(bySelector('#collapsed-panel')).toMatchObject({ collapsedByControl: true, intendedClipping: 'COLLAPSED' });
+      expect(bySelector('#collapsed-inner')).toMatchObject({ collapsedByControl: true, intendedClipping: 'COLLAPSED' });
+      expect(bySelector('#open-panel-cut')).toMatchObject({ collapsedByControl: false, intendedClipping: null });
+
+      expect(layoutRuleSelectors('TEXT_CLIPPING', evidence)).toEqual(['#clamp-half', '#nowrap-cut', '#open-panel-cut']);
     });
   });
 });

@@ -5,7 +5,8 @@
 //   ページが移った後は、読めない（`FAILED`）。
 // - (c) `elementHandleOf`: 位置の Locator（自前の selector engine `ELEMENT_PATH_ENGINE_NAME`。Playwright の utility world で、標準の getter で
 //   位置をたどる）で ElementHandle を得て、得た後に、isolated world で同じ backendNodeId を指すことを
-//   確かめ直す。同じ位置の要素が差し替わっていれば、handle を返さない。`backendNodeIdsAtPaths` は位置の要素の backendNodeId。
+//   確かめ直す。同じ位置の要素が差し替わっていれば、handle を返さない。LU-SFIX2-A fix round 1: (a) の `argumentElements`（番号で渡した要素そのものを読む）と
+//   `choose`（読んだ値で、参照を返す要素を選ぶ）。位置で番号を引く `backendNodeIdsAtPaths` は、使う所がなくなったので除いた。
 // - ページの JS の偽り（`Function.prototype.call`、`getOwnPropertyDescriptor`、prototype の getter、`bind`、`Object.prototype` の getter、
 //   走査の偽り、DOM clobbering）の下でも正しく読み、読む間にページの JS が走らない（CSP あり・なし）。
 // Chromium は headless だけ（テストの既定と、CLI の起動の設定の両方）。サーバは 127.0.0.1 のテストの中のサーバだけ。
@@ -19,21 +20,20 @@ import {
   newElementPathSignal,
 } from '../../src/browser/element-path-engine.js';
 import {
-  backendNodeIdsAtPaths,
   elementHandleOf,
   readElementInIsolatedWorld,
   readElementsInIsolatedWorld,
   withSignaledElements,
 } from '../../src/discovery/isolated-read.js';
-import { launchCliChromium, launchHeadlessChromium } from '../helpers/chromium.js';
+import { chromiumRunsOf, launchCliChromium, launchHeadlessChromium } from '../helpers/chromium.js';
 import { PAGE_FORGERY_KINDS, PAGE_FORGERY_SCRIPT_PATH, pageForgeryHtml, pageForgeryInstalled, pageForgeryScript, readPageHits, type PageForgeryKind } from '../helpers/page-forgery.js';
 import { startLoopbackHttpServer, type LoopbackHttpServer } from '../helpers/loopback-server.js';
 import { roundsOf } from '../helpers/test-rounds.js';
 
-const LAUNCHERS = [
+const LAUNCHERS = chromiumRunsOf([
   ['the default test Chromium', () => launchHeadlessChromium()],
   ['the CLI launch settings', () => launchCliChromium()],
-] as const;
+]);
 
 /** 読み取りの期限（ms）。 */
 const READ_DEADLINE_MS = 5_000;
@@ -57,6 +57,14 @@ const readTargets = composeInPage((R: StandardReaders, input: { readonly id: str
 const readIdAndConnected = composeInPage((R: StandardReaders, element: Element, _input: null) => ({
   id: R.standardGetter<string>(Element.prototype, 'id')(element),
   connected: R.standardGetter<boolean>(Node.prototype, 'isConnected')(element),
+}));
+/** LU-SFIX2-A fix round 1: 番号で渡した要素（2 つ目の引数）の id と、つながっているか（要素の参照は返さない）。 */
+const readGivenIds = composeInPage((R: StandardReaders, _input: null, given?: readonly Element[]) => ({
+  value: (given ?? []).map((element) => ({
+    id: R.standardGetter<string>(Element.prototype, 'id')(element),
+    connected: R.standardGetter<boolean>(Node.prototype, 'isConnected')(element),
+  })),
+  elements: [],
 }));
 /** 文書の最初の form を読む（値はなし、要素は form）。 */
 const readForm = composeInPage((_R: StandardReaders, _input: null) => {
@@ -85,7 +93,9 @@ const SWAP_TARGET_FOREVER = (): void => {
   channel.port2.postMessage(0);
 };
 
-describe.each(LAUNCHERS)('T32j-4: the isolated element bridge (%s)', (_label, launch) => {
+describe.each(LAUNCHERS)('T32j-4: the isolated element bridge (%s)', (label, launch) => {
+  // TEST-TIME-B: ブラウザの違いに左右されない場面（純粋な組み立て、時間の測りの記録）は、既定の Chromium だけ。偽りの下の読み取りは 2 つのまま。
+  const itOnDefault = it.runIf(label === LAUNCHERS[0]?.[0]);
   let browser: Browser;
   let server: LoopbackHttpServer;
 
@@ -119,7 +129,7 @@ describe.each(LAUNCHERS)('T32j-4: the isolated element bridge (%s)', (_label, la
     return page;
   };
 
-  it('builds the element path selector of a path with a signal, and makes signals of the closed shape', () => {
+  itOnDefault('builds the element path selector of a path with a signal, and makes signals of the closed shape', () => {
     const signal = newElementPathSignal();
     expect(isElementPathSignal(signal)).toBe(true);
     expect(newElementPathSignal()).not.toBe(signal);
@@ -139,9 +149,16 @@ describe.each(LAUNCHERS)('T32j-4: the isolated element bridge (%s)', (_label, la
       expect(outcome.elements[0]?.path).toEqual([0, 1, 0, 1, 0]);
       expect(outcome.elements[1]?.path).toBeNull();
       expect(outcome.elements.every(({ backendNodeId }) => Number.isSafeInteger(backendNodeId))).toBe(true);
-      const ids = await backendNodeIdsAtPaths(page, [[0, 1, 0, 1, 0]], Date.now() + READ_DEADLINE_MS);
-      expect(ids).toEqual([outcome.elements[0]?.backendNodeId]);
-      expect(await backendNodeIdsAtPaths(page, [[0, 1, 9]], Date.now() + READ_DEADLINE_MS)).toBeNull();
+      // LU-SFIX2-A fix round 1: `choose` で選んだ要素だけの参照を、同じ読み取りから返す。範囲の外を選べば読めない。
+      const chosen = await readElementsInIsolatedWorld(page, readTargets, { id: 'target' }, Date.now() + READ_DEADLINE_MS, { choose: () => [1] });
+      expect(chosen.status === 'READ' ? chosen.elements : null).toEqual([outcome.elements[1]]);
+      expect(await readElementsInIsolatedWorld(page, readTargets, { id: 'target' }, Date.now() + READ_DEADLINE_MS, { choose: () => [2] }))
+        .toEqual({ status: 'FAILED' });
+      // `argumentElements` で渡した番号の要素そのものを読む（位置で引き直さない）。
+      const given = await readElementsInIsolatedWorld(page, readGivenIds, null, Date.now() + READ_DEADLINE_MS, {
+        argumentElements: outcome.elements.map(({ backendNodeId }) => backendNodeId),
+      });
+      expect(given).toEqual({ status: 'READ', value: [{ id: 'target', connected: true }, { id: 'inner', connected: true }], elements: [] });
     } finally { await page.close(); }
   });
 
@@ -230,6 +247,83 @@ describe.each(LAUNCHERS)('T32j-4: the isolated element bridge (%s)', (_label, la
     } finally { await page.close(); }
   }, SWAP_TEST_TIMEOUT_MS);
 
+  // DEF-237（設計書 `2026-11-09-beaksight-element-identity-design.md` 2 の 1）: 同じ要素かは backendNodeId で決め、位置の道は探す手がかりにとどめる。
+  // ページが同じ親の前の位置に要素を足して道がずれても、合図の受け手の要素（確かめの時の要素）を返し、道の今の要素（別の要素）は返さない。
+  it('finds the armed element by its signal after the page adds an element before it under the same parent (DEF-237)', async () => {
+    const page = await open();
+    try {
+      const outcome = await readElementsInIsolatedWorld(page, readTargets, { id: 'target' }, Date.now() + READ_DEADLINE_MS);
+      if (outcome.status !== 'READ') throw new Error('not read');
+      const reference = outcome.elements[0];
+      if (reference?.path === null || reference === undefined) throw new Error('no reference');
+      const path = reference.path;
+      await page.evaluate(() => {
+        const added = document.createElement('button');
+        added.id = 'added';
+        added.textContent = 'added';
+        document.getElementById('target')?.before(added);
+      });
+      const seen = await withSignaledElements(page, [reference.backendNodeId], Date.now() + READ_DEADLINE_MS, async ([signal]) => {
+        const locator = page.locator(elementPathSelectorOf(path, signal ?? ''));
+        const count = await locator.count();
+        return { count, id: count === 1 ? await locator.getAttribute('id') : null };
+      });
+      expect(seen).toEqual({ status: 'DONE', value: { count: 1, id: 'target' } });
+      const handle = await elementHandleOf(page, reference, Date.now() + READ_DEADLINE_MS);
+      expect(handle).not.toBeNull();
+      expect(await handle?.getAttribute('id')).toBe('target');
+      await handle?.dispose();
+    } finally { await page.close(); }
+  });
+
+  /** 大きな画面の要素の数（行 1,000 × 要素 5 つ）。 */
+  const LARGE_ROWS = 1_000;
+  /** 道を外したときの全部の要素の走査の時間の上限（ms。測った値の記録のための、ゆるい上限）。 */
+  const FULL_SCAN_LIMIT_MS = 2_000;
+  itOnDefault('measures the time of the full scan on a large page when the path no longer points to the armed element (DEF-237)', async () => {
+    const page = await open();
+    try {
+      await page.evaluate((rows) => {
+        const box = document.createElement('div');
+        box.id = 'large';
+        const parts: string[] = [];
+        for (let index = 0; index < rows; index += 1) {
+          parts.push(`<div class="row"><span>row ${String(index)}</span><label>name <input name="n${String(index)}"></label><button type="button">go</button></div>`);
+        }
+        box.innerHTML = parts.join('');
+        document.body.append(box);
+      }, LARGE_ROWS);
+      const elementCount = await page.evaluate(() => document.querySelectorAll('*').length);
+      expect(elementCount).toBeGreaterThanOrEqual(LARGE_ROWS * 5);
+      const outcome = await readElementsInIsolatedWorld(page, readTargets, { id: 'target' }, Date.now() + READ_DEADLINE_MS);
+      if (outcome.status !== 'READ') throw new Error('not read');
+      const reference = outcome.elements[0];
+      if (reference?.path === null || reference === undefined) throw new Error('no reference');
+      const path = reference.path;
+      const timed = async (): Promise<{ readonly count: number; readonly ms: number }> => {
+        const result = await withSignaledElements(page, [reference.backendNodeId], Date.now() + READ_DEADLINE_MS, async ([signal]) => {
+          const locator = page.locator(elementPathSelectorOf(path, signal ?? ''));
+          const started = performance.now();
+          const count = await locator.count();
+          return { count, ms: performance.now() - started };
+        });
+        if (result.status !== 'DONE') throw new Error('not armed');
+        return result.value;
+      };
+      const onPath = await timed();
+      // 的の要素を、大きな箱の後ろ（文書の終わり）へ移す（道は別の要素を指し、全部の要素を走査して見つける）。
+      await page.evaluate(() => {
+        const target = document.getElementById('target');
+        if (target !== null) document.body.append(target);
+      });
+      const scanned = await timed();
+      console.info(`DEF-237 full scan: ${String(elementCount)} elements; on the path ${onPath.ms.toFixed(1)} ms, full scan ${scanned.ms.toFixed(1)} ms`);
+      expect(onPath.count).toBe(1);
+      expect(scanned.count).toBe(1);
+      expect(scanned.ms).toBeLessThan(FULL_SCAN_LIMIT_MS);
+    } finally { await page.close(); }
+  });
+
   it('keeps the signal and its receiver out of reach of the page JS (main world) while the element is armed', async () => {
     const page = await open();
     try {
@@ -272,7 +366,8 @@ describe.each(LAUNCHERS)('T32j-4: the isolated element bridge (%s)', (_label, la
           if (reference === undefined) throw new Error('no reference');
           expect(await readElementInIsolatedWorld(page, reference.backendNodeId, readIdAndConnected, null, Date.now() + READ_DEADLINE_MS))
             .toEqual({ status: 'READ', value: { id: 'target', connected: true } });
-          expect(await backendNodeIdsAtPaths(page, [reference.path ?? []], Date.now() + READ_DEADLINE_MS)).toEqual([reference.backendNodeId]);
+          expect(await readElementsInIsolatedWorld(page, readGivenIds, null, Date.now() + READ_DEADLINE_MS, { argumentElements: [reference.backendNodeId] }))
+            .toEqual({ status: 'READ', value: [{ id: 'target', connected: true }], elements: [] });
           expect(await readPageHits(page)).toBe(before);
           // 操作に使う handle も、同じ要素を指す（Playwright の utility world の部品で id を読む）。handle を得る所では、Playwright の main world の部品が組み込みを呼びうるので（`bind` の偽りなど）、ページの JS の回数は読み取りの間だけを数える。
           const handle = await elementHandleOf(page, reference, Date.now() + READ_DEADLINE_MS);

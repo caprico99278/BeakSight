@@ -27,7 +27,7 @@ import { isPositiveSafeInteger } from './guards.js';
 
 /**
  * 読むファイルの大きさの既定の上限（バイト）。値の根拠: 256 MiB。成果物でいちばん大きくなりうるのは ChatGPT 用バンドルの ZIP で、
- * スクリーンショットだけで最大 64 MiB（`CHATGPT_BUNDLE_SCREENSHOT_BUDGET_BYTES`）に JSON などが加わる。それを十分に超え、
+ * AUD-1d: 部ごとに 64 MiB を目安に分ける（`CHATGPT_BUNDLE_PART_SIZE_BYTES`。第 1 部は JSON の全部を分けずに入れるので、目安を超えうる）。それを十分に超え、
  * 読み取りでメモリを使い過ぎない値（T24b の仮の値。設計者の確認待ち）。
  */
 export const DEFAULT_CONTAINED_ARTIFACT_FILE_MAX_BYTES = 256 * 1024 * 1024;
@@ -113,7 +113,8 @@ const LINK_OPEN_CODE = 'ELOOP';
 
 // ファイルシステムの失敗の `code` の取り出し（`errorCodeOf`。なければ `null`）は、`./errors.ts` に移した（CC-062。CCX-11）。
 
-const failure = (reason: ContainedArtifactReadFailureReason): ContainedArtifactFileReading => Object.freeze({ ok: false, reason });
+const failure = (reason: ContainedArtifactReadFailureReason): { readonly ok: false; readonly reason: ContainedArtifactReadFailureReason } =>
+  Object.freeze({ ok: false, reason });
 
 /** `path` が、`directory` の中（`directory` そのものを除く）にあるか（どちらも絶対パス。区切りは実行している環境のもの）。 */
 export const isInsideDirectory = (directory: string, path: string): boolean => {
@@ -209,10 +210,101 @@ export async function readContainedArtifactFile(
   if (!isPositiveSafeInteger(maxBytes)) {
     throw new RangeError(`max bytes must be a positive safe integer: ${String(maxBytes)}`);
   }
+  const opened = await openContainedArtifactFile(root, relativePath, maxBytes, options.fileSystem ?? NODE_CONTAINED_ARTIFACT_FILE_SYSTEM);
+  if (!opened.ok) {
+    return opened;
+  }
+  try {
+    const bytes = await readUpTo(opened.handle, maxBytes);
+    return bytes === null ? failure('TOO_LARGE') : Object.freeze({ ok: true, bytes });
+  } finally {
+    await opened.handle.close();
+  }
+}
+
+/** AUD-1d: `streamContainedArtifactFile` の結果。送れる場合は、大きさ（確かめた時点のバイト数）と、中身を少しずつ読む流れ。 */
+export type ContainedArtifactFileStreaming =
+  | { readonly ok: true; readonly size: number; readonly stream: ReadableStream<Uint8Array> }
+  | { readonly ok: false; readonly reason: ContainedArtifactReadFailureReason };
+
+/**
+ * AUD-1d（設計者の判断 2026-11-09 の案 3。ユーザーの方針「BeakSight の都合で落とせないファイルを作らない」）: `readContainedArtifactFile` と同じ確かめ（安全な相対パス、
+ * `root` の中、リンクでない、ファイルである、開いたものが確かめたものと同じ）を通したファイルを、大きさの上限を当てずに、メモリに全部載せず少しずつ読む流れにする。
+ * 画面のサーバが、ChatGPT 用バンドルの部を送るときだけ使う（ほかの成果物は、上限つきの `readContainedArtifactFile`）。
+ * - 流れは、確かめた時点の大きさ（`size`）のバイトまでを `READ_CHUNK_BYTES` ずつ読み、読み終えるか、途中で取り消されるか、失敗したら、ファイルを閉じる。
+ *   確かめた後に縮んだ場合は、流れを誤りで終える（`Content-Length` と合わない応答を正常に終えない）。
+ * - 通らない場合は、理由を返す（`TOO_LARGE` は返さない）。上の理由に当たらない入出力の失敗は、その例外をそのまま投げる。
+ */
+export async function streamContainedArtifactFile(
+  root: string,
+  relativePath: string,
+  options: Pick<ContainedArtifactFileReadOptions, 'fileSystem'> = {},
+): Promise<ContainedArtifactFileStreaming> {
+  const opened = await openContainedArtifactFile(root, relativePath, null, options.fileSystem ?? NODE_CONTAINED_ARTIFACT_FILE_SYSTEM);
+  if (!opened.ok) {
+    return opened;
+  }
+  const { handle } = opened;
+  if (opened.size > BigInt(Number.MAX_SAFE_INTEGER)) {
+    await handle.close();
+    return failure('TOO_LARGE');
+  }
+  const size = Number(opened.size);
+  let sent = 0;
+  let closed = false;
+  const close = async (): Promise<void> => {
+    if (!closed) {
+      closed = true;
+      await handle.close();
+    }
+  };
+  const stream = new ReadableStream<Uint8Array>({
+    async pull(controller) {
+      try {
+        if (sent >= size) {
+          await close();
+          controller.close();
+          return;
+        }
+        const chunk = Buffer.alloc(Math.min(READ_CHUNK_BYTES, size - sent));
+        const { bytesRead } = await handle.read(chunk, 0, chunk.length, null);
+        if (bytesRead === 0) {
+          await close();
+          controller.error(new Error(`the artifact file became shorter while it was sent: ${relativePath}`));
+          return;
+        }
+        sent += bytesRead;
+        controller.enqueue(new Uint8Array(chunk.buffer, chunk.byteOffset, bytesRead));
+      } catch (error) {
+        await close();
+        controller.error(error);
+      }
+    },
+    async cancel() {
+      await close();
+    },
+  });
+  return Object.freeze({ ok: true, size, stream });
+}
+
+/** 確かめて開いたファイル（閉じるのは呼び出し側）。 */
+type OpenedArtifactFile =
+  | { readonly ok: true; readonly handle: FileHandle; readonly size: bigint }
+  | { readonly ok: false; readonly reason: ContainedArtifactReadFailureReason };
+
+/**
+ * ファイルを、このファイルの先頭の説明の順に確かめて開く（`readContainedArtifactFile` と `streamContainedArtifactFile` の共通の確かめ。確かめを 1 か所にする）。
+ * `maxBytes` が `null` なら、大きさの上限を当てない（ChatGPT 用バンドルの部を送るときだけ）。
+ */
+async function openContainedArtifactFile(
+  root: string,
+  relativePath: string,
+  maxBytes: number | null,
+  fileSystem: ContainedArtifactFileSystem,
+): Promise<OpenedArtifactFile> {
   if (!isPortableRelativeArtifactPath(relativePath)) {
     return failure('UNSAFE_PATH');
   }
-  const fileSystem = options.fileSystem ?? NODE_CONTAINED_ARTIFACT_FILE_SYSTEM;
   const realRoot = await realDirectoryOrNull(root, fileSystem);
   if (realRoot === null) {
     return failure('NOT_FOUND');
@@ -241,7 +333,7 @@ export async function readContainedArtifactFile(
   if (!isInsideDirectory(realRoot, realPath)) {
     return failure('OUTSIDE_ROOT');
   }
-  if (entry.stats.size > BigInt(maxBytes)) {
+  if (maxBytes !== null && entry.stats.size > BigInt(maxBytes)) {
     return failure('TOO_LARGE');
   }
   let handle: FileHandle;
@@ -260,14 +352,16 @@ export async function readContainedArtifactFile(
   try {
     const opened = await handle.stat({ bigint: true });
     if (opened.dev !== entry.stats.dev || opened.ino !== entry.stats.ino) {
+      await handle.close();
       return failure('CHANGED');
     }
     if (!opened.isFile()) {
+      await handle.close();
       return failure('NOT_A_FILE');
     }
-    const bytes = await readUpTo(handle, maxBytes);
-    return bytes === null ? failure('TOO_LARGE') : Object.freeze({ ok: true, bytes });
-  } finally {
+    return { ok: true, handle, size: opened.size };
+  } catch (error) {
     await handle.close();
+    throw error;
   }
 }

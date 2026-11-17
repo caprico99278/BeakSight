@@ -1,20 +1,10 @@
-import type { WebVitalsEvidence } from '../core/evidence-types.js';
 import { formatDecimal, formatMilliseconds } from '../presentation/format.js';
+import { judgedWebVitalsOf, POOR_WEB_VITAL_THRESHOLDS } from './performance-observation.js';
 import type { AuditRule, FindingDraft, PageRuleInput } from './rule.js';
 import { evidenceOfType } from './rule-helpers.js';
 
-/**
- * Web Vitals の「poor」の境界（Task 12・13 の設計書 5.2）。値がこの境界を超えると、その指標の Rule が WARN を作る。
- * web-vitals の `rating` は保存していないので、しきい値に照らした評価は、ここの値だけで行う。
- * CLS は単位のない値、それ以外はミリ秒。
- */
-export const POOR_WEB_VITAL_THRESHOLDS = Object.freeze({
-  LCP: 4000,
-  FCP: 3000,
-  CLS: 0.25,
-  TTFB: 1800,
-  INP: 500,
-} as const satisfies Readonly<Record<keyof WebVitalsEvidence, number>>);
+// AUD-6c: 「poor」の境界の値は、表示用モデルも使うので `performance-observation.ts` に移した（値は変えない）。今までの名前のまま公開し直す。
+export { POOR_WEB_VITAL_THRESHOLDS };
 
 type WebVitalName = keyof typeof POOR_WEB_VITAL_THRESHOLDS;
 
@@ -34,17 +24,19 @@ const RULE_VERSION = 1;
  * 観測できなかった指標（`NOT_OBSERVED`・`UNSUPPORTED`）と、Web Vitals を収集できなかった Evidence からは、Finding を作らない。
  * 収集が `PARTIAL` でも、観測できた値は判定に使う。
  */
-const poorWebVitalRule = (ruleId: string, metric: WebVitalName): AuditRule => ({
+const poorWebVitalRule = (ruleId: string, metric: WebVitalName, plainMessage: string): AuditRule => ({
   ruleId,
   version: RULE_VERSION,
   category: 'PERFORMANCE',
   severity: 'WARN',
+  plainMessage,
   evaluate(input: PageRuleInput): readonly FindingDraft[] {
     const threshold = POOR_WEB_VITAL_THRESHOLDS[metric];
     const format = WEB_VITAL_FORMATS[metric];
     const drafts: FindingDraft[] = [];
     for (const record of evidenceOfType(input, 'performance')) {
-      const vital = record.payload.webVitals?.[metric];
+      // EV-1: LCP は、scroll の段の前に読んだ値があれば、その値で判定する（`judgedWebVitalsOf` の 1 か所。測り直しはしない）。
+      const vital = judgedWebVitalsOf(record.payload)?.[metric];
       if (vital === undefined || vital.status !== 'OBSERVED' || !Number.isFinite(vital.value) || vital.value <= threshold) {
         continue;
       }
@@ -65,9 +57,9 @@ const poorWebVitalRule = (ruleId: string, metric: WebVitalName): AuditRule => ({
 
 /** 性能の page rule（T12c）の一覧。登録は `RULE_CATALOG`（`./rule-catalog.ts`）がまとめて行う。 */
 export const PERFORMANCE_RULES: readonly AuditRule[] = Object.freeze([
-  poorWebVitalRule('POOR_LCP', 'LCP'),
-  poorWebVitalRule('POOR_FCP', 'FCP'),
-  poorWebVitalRule('POOR_CLS', 'CLS'),
-  poorWebVitalRule('POOR_TTFB', 'TTFB'),
-  poorWebVitalRule('POOR_INP', 'INP'),
+  poorWebVitalRule('POOR_LCP', 'LCP', 'ページのいちばん大きな中身が出るまでに、時間がかかりすぎています。見る人が、待たされます。'),
+  poorWebVitalRule('POOR_FCP', 'FCP', 'ページを開いてから、最初に何かが表示されるまでに、時間がかかりすぎています。見る人が、待たされます。'),
+  poorWebVitalRule('POOR_CLS', 'CLS', '表示の途中で、ページの部品が大きく動きます。読みにくかったり、押しまちがえたりすることがあります。'),
+  poorWebVitalRule('POOR_TTFB', 'TTFB', 'ページを開いてから、サイトが返事をするまでに、時間がかかりすぎています。見る人が、待たされます。'),
+  poorWebVitalRule('POOR_INP', 'INP', 'ボタンなどを押してから、画面が変わるまでに、時間がかかりすぎています。見る人が、うまく動かないと感じることがあります。'),
 ]);

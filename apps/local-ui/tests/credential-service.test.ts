@@ -33,7 +33,8 @@ import type { ProfileValidationContext } from '../../../src/control/profile-poli
 import { saveAuthSetup } from '../../../src/control/store/auth-setup-store.js';
 import { closeControlDatabase, openControlDatabase, type ControlDatabase } from '../../../src/control/store/control-database.js';
 import { resolveControlDatabasePath } from '../../../src/control/store/database-path.js';
-import { createProfile, retireProfile } from '../../../src/control/store/profile-store.js';
+import { saveProfileAndAuthSetup } from '../../../src/control/store/profile-auth-setup-store.js';
+import { createProfile, retireProfile, updateProfile } from '../../../src/control/store/profile-store.js';
 import { formatCompactUtcTimestamp } from '../../../src/core/utc-timestamp.js';
 import { createTestConfig } from '../../../tests/helpers/test-config.js';
 import { createTestCredentialProtector, createTestCredentialStore, type TestCredentialStore } from '../../../tests/helpers/test-credential-store.js';
@@ -213,6 +214,9 @@ describe('T26e: the credential page values', () => {
       currentLoginOrigin: TEST_ORIGIN,
       credential: null,
       originMatches: null,
+      // PL-4（意図して足した期待。設計書 `2026-10-26-beaksight-plain-ui-design.md` 3 章の 2）: 要点の「ログインする先」のホスト（資格情報がないときは、今の
+      // 認証の設定のログインの Origin のホスト。Origin の表記は出さない）。
+      loginHost: new URL(TEST_ORIGIN).host,
       readError: null,
       hold: null,
       inUse: false,
@@ -235,6 +239,8 @@ describe('T26e: the credential page values', () => {
         updatedAt: ISO_TIMESTAMP,
       },
       originMatches: true,
+      // PL-4: 保存した資格情報のログインの Origin のホスト。
+      loginHost: new URL(TEST_ORIGIN).host,
       hold: { reason: 'INVALID_CREDENTIALS', heldAt: '2026-10-11T08:31:00Z' },
     });
   });
@@ -341,7 +347,16 @@ describe('T26e: changing a credential', () => {
   });
 
   it('refuses a partial change when the login origin of the auth setup changed, and replaces both instead', async () => {
-    expect(saveAuthSetup(database, automatedSetupOf(OTHER_ORIGIN), { resolveContext })).toMatchObject({ ok: true });
+    // MI-F1（設計書 4.7.1 の 3）: 自動ログインのプロファイルのままでは、ログインの画面の URL（ログインの Origin）を変えられない。手動のログインへ戻し、
+    // 手動のログインから自動ログインへ切り替え直す保存（切り替えと同じ、手動から自動へのまとめて保存）で、ログインの Origin を変える。
+    expect(saveAuthSetup(database, automatedSetupOf(OTHER_ORIGIN), { resolveContext })).toMatchObject({ ok: false, reason: 'CREDENTIAL_DESTINATION_LOCKED' });
+    const manual = { ...profileOf(AUTO_PROFILE, 'MANUAL_SESSION'), revision: FIRST_REVISION + 1 };
+    expect(updateProfile(database, { profile: manual, expectedRevision: FIRST_REVISION }, { resolveContext }).ok).toBe(true);
+    expect(saveProfileAndAuthSetup(database, {
+      profile: { ...profileOf(AUTO_PROFILE, 'AUTOMATED_LOGIN'), revision: FIRST_REVISION + 2 },
+      expectedRevision: FIRST_REVISION + 1,
+      setup: automatedSetupOf(OTHER_ORIGIN, FIRST_REVISION + 2),
+    }, { resolveContext })).toMatchObject({ ok: true });
     expect(await kept(credentialPageOf(deps(), AUTO_PROFILE))).toMatchObject({
       currentLoginOrigin: OTHER_ORIGIN,
       credential: { loginOrigin: TEST_ORIGIN },

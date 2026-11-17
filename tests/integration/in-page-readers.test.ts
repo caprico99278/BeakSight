@@ -3,22 +3,14 @@
 //   （`standardGetter` は例外、ほかは `undefined`）。
 // - 組み立てた関数を、今までのページの中の関数と同じ 4 つの道（`page.evaluate`・`ElementHandle.evaluate`・`page.evaluateHandle`・
 //   `readInIsolatedWorld`）で動かせる（引数 0〜2 個、async の関数）。CSP（`script-src 'self'`、Trusted Types の `'none'`）のページでも動く。
-// - ページの JS の偽りへの強さが、今までの書き方（関数の中に読み方を書く形）より弱くならない: ページの JS が書き換えられる入口
-//   （`Function.prototype.call`・`bind`・`apply`、`Object.getOwnPropertyDescriptor`・`freeze`、配列の反復子）を通る回数が、同じ読み方を
-//   関数の中に書いた形と同じ。
 // - 入力と出力の型を保つ（型の誤りはコンパイルで止まる。`npm run typecheck` で確かめる）。
-// Chromium は headless だけ（テストの既定と、CLI の起動の設定の両方）。サーバは 127.0.0.1 のテストの中のサーバだけ。
+// Chromium は headless のテストの既定だけ。サーバは 127.0.0.1 のテストの中のサーバだけ。
 import type { Browser, Page } from 'playwright';
 import { afterAll, beforeAll, describe, expect, it } from 'vitest';
 import { composeInPage, type InPageReader, type StandardReaders } from '../../src/browser/in-page-readers.js';
 import { readInIsolatedWorld } from '../../src/discovery/isolated-read.js';
-import { launchCliChromium, launchHeadlessChromium } from '../helpers/chromium.js';
+import { DEFAULT_CHROMIUM_LAUNCHERS } from '../helpers/chromium.js';
 import { startLoopbackHttpServer, type LoopbackHttpServer } from '../helpers/loopback-server.js';
-
-const LAUNCHERS = [
-  ['the default test Chromium', () => launchHeadlessChromium()],
-  ['the CLI launch settings', () => launchCliChromium()],
-] as const;
 
 /** isolated world の読み取りの期限（ms）。 */
 const ISOLATED_READ_DEADLINE_MS = 5_000;
@@ -77,38 +69,6 @@ const readClobberedFacts: InPageReader<[TargetInput], ClobberedFacts> = (R, inpu
 };
 const composedClobberedFacts = composeInPage(readClobberedFacts);
 
-/** 同じ読み方を、関数の中に書いた形（今までの書き方。偽りへの強さの対照）。 */
-function inlineClobberedFacts(input: TargetInput): ClobberedFacts {
-  const standardGetter = <T>(prototype: object, name: string): ((target: unknown) => T) => {
-    const getter = Object.getOwnPropertyDescriptor(prototype, name)?.get;
-    if (getter === undefined) {
-      throw new Error(`Missing standard DOM getter: ${name}`);
-    }
-    return (target) => getter.call(target) as T;
-  };
-  const optionalStandardGetter = <T>(prototype: object, name: string): ((target: unknown) => T | undefined) => {
-    const getter = Object.getOwnPropertyDescriptor(prototype, name)?.get;
-    return (target) => getter?.call(target) as T | undefined;
-  };
-  const standardProperty = <T>(prototype: object, name: string, target: unknown): T =>
-    Object.getOwnPropertyDescriptor(prototype, name)?.get?.call(target) as T;
-  const documentProperty = <T>(name: string): T => standardProperty<T>(Document.prototype, name, document);
-  const form = Document.prototype.querySelector.call(document, input.selector);
-  const methodOf = standardGetter<string>(HTMLFormElement.prototype, 'method');
-  const localNameOf = optionalStandardGetter<string>(Element.prototype, 'localName');
-  const action = standardProperty<string>(HTMLFormElement.prototype, 'action', form);
-  return {
-    method: methodOf(form),
-    actionPath: new URL(action).pathname,
-    localName: localNameOf(form),
-    bodyName: documentProperty<HTMLElement>('body').localName,
-    documentElementName: documentProperty<HTMLElement>('documentElement').localName,
-    readyState: documentProperty<string>('readyState'),
-    clobbered: ((form as HTMLFormElement).method as unknown) instanceof Element
-      && (document as unknown as Record<string, unknown>)['body'] instanceof HTMLImageElement,
-  };
-}
-
 const EXPECTED_FACTS: ClobberedFacts = {
   method: 'post',
   actionPath: ACTION_PATH,
@@ -142,45 +102,6 @@ const readAfterFrame = composeInPage(async (R: StandardReaders, input: TargetInp
 /** CSP が効いているかの確かめ（inline の script が動かなかった）。 */
 const readTitle = composeInPage((R: StandardReaders) => R.documentProperty<string>('title'));
 
-/**
- * ページの JS が書き換えられる入口を、数える関数で置き換える（元の関数に渡す。結果は変えない）。`beaksightCounting` が真の間だけ数える。
- * 置き換えは、この関数の中で取った元の関数と `Reflect.apply` を使う（数える関数の中で、置き換えた入口を呼ばない）。
- */
-function installEntryCounters(): void {
-  const apply = Reflect.apply;
-  const counts: Record<string, number> = {};
-  const scope = globalThis as unknown as Record<string, unknown>;
-  scope['beaksightCounts'] = counts;
-  scope['beaksightCounting'] = false;
-  const wrap = (owner: object, name: PropertyKey, label: string): void => {
-    const original = (owner as Record<PropertyKey, unknown>)[name] as (...args: unknown[]) => unknown;
-    const replacement = function (this: unknown, ...args: unknown[]): unknown {
-      if (scope['beaksightCounting'] === true) {
-        counts[label] = (counts[label] ?? 0) + 1;
-      }
-      return apply(original, this, args);
-    };
-    Object.defineProperty(owner, name, { value: replacement, writable: true, configurable: true });
-  };
-  wrap(Function.prototype, 'call', 'call');
-  wrap(Function.prototype, 'apply', 'apply');
-  wrap(Function.prototype, 'bind', 'bind');
-  wrap(Object, 'getOwnPropertyDescriptor', 'getOwnPropertyDescriptor');
-  wrap(Object, 'freeze', 'freeze');
-  wrap(Array.prototype, Symbol.iterator, 'iterator');
-}
-const setCounting = (on: boolean): void => {
-  (globalThis as unknown as Record<string, unknown>)['beaksightCounting'] = on;
-};
-const takeCounts = (): Record<string, number> => {
-  const scope = globalThis as unknown as Record<string, unknown>;
-  const counts = { ...(scope['beaksightCounts'] as Record<string, number>) };
-  for (const key of Object.keys(scope['beaksightCounts'] as Record<string, number>)) {
-    delete (scope['beaksightCounts'] as Record<string, number>)[key];
-  }
-  return counts;
-};
-
 /** 型の確かめ（実行しない。`npm run typecheck` で、誤りがコンパイルで止まることを確かめる）。 */
 export function typeOnlyChecks(page: Page): void {
   const facts: Promise<ClobberedFacts> = page.evaluate(composedClobberedFacts, { selector: TARGET_SELECTOR });
@@ -194,7 +115,7 @@ export function typeOnlyChecks(page: Page): void {
   void composeInPage((_R: StandardReaders, first: number, second: number, third: number) => first + second + third);
 }
 
-describe.each(LAUNCHERS)('CC-068: the in-page readers and their typed composition (%s)', (_label, launch) => {
+describe.each(DEFAULT_CHROMIUM_LAUNCHERS)('CC-068: the in-page readers and their typed composition (%s)', (_label, launch) => {
   let browser: Browser;
   let server: LoopbackHttpServer;
 
@@ -262,26 +183,6 @@ describe.each(LAUNCHERS)('CC-068: the in-page readers and their typed compositio
       await expect(page.evaluate(throwMissing, MISSING_PROPERTY_NAME)).rejects.toThrow(`Missing standard DOM getter: ${MISSING_PROPERTY_NAME}`);
       const isolated = await readInIsolatedWorld(page, throwMissing, MISSING_PROPERTY_NAME, Date.now() + ISOLATED_READ_DEADLINE_MS);
       expect(isolated).toEqual({ status: 'FAILED' });
-    });
-  });
-
-  it('passes through the page-writable entry points as often as the same reads written inline', async () => {
-    await withPage(PLAIN_PATH, async (page) => {
-      await page.evaluate(installEntryCounters);
-      await page.evaluate(setCounting, true);
-      const composed = await page.evaluate(composedClobberedFacts, { selector: TARGET_SELECTOR });
-      await page.evaluate(setCounting, false);
-      const composedCounts = await page.evaluate(takeCounts);
-      await page.evaluate(setCounting, true);
-      const inline = await page.evaluate(inlineClobberedFacts, { selector: TARGET_SELECTOR });
-      await page.evaluate(setCounting, false);
-      const inlineCounts = await page.evaluate(takeCounts);
-      expect(composed).toEqual(EXPECTED_FACTS);
-      expect(inline).toEqual(EXPECTED_FACTS);
-      expect(composedCounts).toEqual(inlineCounts);
-      // 数える仕組みが働いた（部品は、今までと同じく記述子と `call` を通る）。
-      expect(composedCounts['getOwnPropertyDescriptor']).toBeGreaterThan(0);
-      expect(composedCounts['call']).toBeGreaterThan(0);
     });
   });
 });

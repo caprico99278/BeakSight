@@ -1,9 +1,7 @@
 // T39c（Task 39 の設計書 3.4、Task 40 の D3 の口）: API の書き込みの応答の本文から、登録の ID の取り方（`RESPONSE_BODY_KEY`）の鍵で ID を取り出す口
 // （`src/control/actions/api-record-id.ts` の `apiRecordIdOfResponseBody`）。メモリの中だけで扱い、使える形の ID（`isUsableRecordId`）だけを返す。
 import { describe, expect, it } from 'vitest';
-import { MAX_SAFE_RECORD_ID_LENGTH } from '../../src/control/actions/action-outcome.js';
 import {
-  MAX_API_RECORD_ID_BODY_BYTES,
   apiRecordIdOfResponseBody,
   apiResponseBodyShapeOf,
   apiResponseListLength,
@@ -11,6 +9,8 @@ import {
 } from '../../src/control/actions/api-record-id.js';
 
 const bodyOf = (value: unknown): Buffer => Buffer.from(JSON.stringify(value), 'utf8');
+/** L10: 撤廃した本文の大きさの上限（前の `MAX_API_RECORD_ID_BODY_BYTES`。1 MiB）の写し。 */
+const FORMER_MAX_API_RECORD_ID_BODY_BYTES = 1_048_576;
 
 describe('T39c: the record id from the response body of an API write', () => {
   it.each<[string, Buffer, string, string | null]>([
@@ -27,7 +27,8 @@ describe('T39c: the record id from the response body of an API write', () => {
     ['an id with a dot', bodyOf({ id: '..' }), 'id', null],
     ['an id with a space', bodyOf({ id: 'a b' }), 'id', null],
     ['an empty id', bodyOf({ id: '' }), 'id', null],
-    ['a too long id', bodyOf({ id: 'a'.repeat(MAX_SAFE_RECORD_ID_LENGTH + 1) }), 'id', null],
+    // L12b（設計者の判断 2）: 登録の ID の長さの上限（前は `MAX_SAFE_RECORD_ID_LENGTH`）は撤廃した。長い ID も取り出す。
+    ['an id of 300 characters', bodyOf({ id: 'a'.repeat(300) }), 'id', 'a'.repeat(300)],
     ['a negative number', bodyOf({ id: -1 }), 'id', null],
     ['a fraction', bodyOf({ id: 1.5 }), 'id', null],
     ['an unsafe integer', Buffer.from('{"id":12345678901234567890}', 'utf8'), 'id', null],
@@ -40,9 +41,13 @@ describe('T39c: the record id from the response body of an API write', () => {
     expect(apiRecordIdOfResponseBody(body, key)).toBe(expected);
   });
 
-  it('does not read a body over the limit', () => {
-    const padding = ' '.repeat(MAX_API_RECORD_ID_BODY_BYTES);
-    expect(apiRecordIdOfResponseBody(Buffer.from(`{"id":"rec"}${padding}`, 'utf8'), 'id')).toBeNull();
+  // L10（設計書 `2026-11-09-beaksight-remove-limits-design.md` 4。設計者の判断で L10 に入れた）: 本文の大きさの上限（前は 1 MiB の
+  // `MAX_API_RECORD_ID_BODY_BYTES` で、超えたら読まずに ID なし）は撤廃した。本文は全部読む。
+  it('reads a body over the former limit of 1 MiB (L10)', () => {
+    const padding = ' '.repeat(FORMER_MAX_API_RECORD_ID_BODY_BYTES);
+    expect(apiRecordIdOfResponseBody(Buffer.from(`{"id":"rec"}${padding}`, 'utf8'), 'id')).toBe('rec');
+    const filler = 'x'.repeat(FORMER_MAX_API_RECORD_ID_BODY_BYTES);
+    expect(apiRecordIdOfResponseBody(bodyOf([{ id: 42, note: filler }]), 'id')).toBe('42');
   });
 
   it('never throws on a wrong input', () => {
@@ -63,7 +68,9 @@ describe('CC-104: the shape of the response body of an API write (apiResponseBod
     ['spaces only', Buffer.from('  ', 'utf8'), { kind: 'UNREADABLE' }],
     ['not JSON', Buffer.from('updated', 'utf8'), { kind: 'UNREADABLE' }],
     ['not UTF-8', Buffer.from([0x5b, 0xff, 0x5d]), { kind: 'UNREADABLE' }],
-    ['over the limit', Buffer.alloc(MAX_API_RECORD_ID_BODY_BYTES + 1, 0x20), { kind: 'UNREADABLE' }],
+    // L10: 前の上限（1 MiB）を超える本文も読む（空白だけの本文は、今どおり JSON でないので読めない）。
+    ['spaces over the former limit', Buffer.alloc(FORMER_MAX_API_RECORD_ID_BODY_BYTES + 1, 0x20), { kind: 'UNREADABLE' }],
+    ['a list over the former limit', bodyOf([{ id: 1, note: 'x'.repeat(FORMER_MAX_API_RECORD_ID_BODY_BYTES) }]), { kind: 'LIST', length: 1 }],
     ['not bytes', null as unknown as Uint8Array, { kind: 'UNREADABLE' }],
   ])('%s', (_label, body, expected) => {
     expect(apiResponseBodyShapeOf(body)).toEqual(expected);

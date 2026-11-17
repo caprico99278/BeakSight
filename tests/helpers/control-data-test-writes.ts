@@ -1,4 +1,4 @@
-// T26f（Task 26 の設計書 4.7）: 資格情報の目印の検査（`apps/local-ui/tests/credential-secret-markers.test.ts`）が使う、管理データと SQLite への
+// T26f（Task 26 の設計書 4.7）: 資格情報の目印の検査（`apps/local-ui/tests/login-secret-markers.test.ts`）が使う、管理データと SQLite への
 // テストだけの書き込み。SQL の書き込みの文は、製品の画面のコード（`apps/local-ui/`）に置かない決まり（Gate `control-store-boundary` の (g)）なので、
 // ほかの結合テストと同じく `tests/` の下に置く。
 // - `shiftAutoLoginAttemptsBack`: 自動ログインどうしの最小の間隔を待たずに次の試しを始めるため、ジョブが動いていない間に、管理データの

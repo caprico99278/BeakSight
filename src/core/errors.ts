@@ -1,25 +1,18 @@
-import { isNonNegativeSafeInteger, isRecord } from './guards.js';
+import { isRecord } from './guards.js';
 
 /** エラーの値から文字列を安全に取り出せなかったときの代替文言。 */
 export const ERROR_MESSAGE_FALLBACK = 'Error could not be safely normalized';
 
 /**
- * 不明な値を、例外を投げずに、`maxLength` 以内の文字列にする。
+ * 不明な値を、例外を投げずに、文字列にする。
  *
  * - 文字列はそのまま、`Error` などのオブジェクトと関数は `Reflect.get` で読んだ文字列の `message` を使う。
  * - `toString` などの変換は呼ばない。読み取りが例外を投げた場合や、`message` が文字列でない場合は代替文言を使う。
- * - 代替文言は `fallback` で指定できる（省略時は `ERROR_MESSAGE_FALLBACK`）。代替文言も `maxLength` 以内に切り詰める。
- * - `maxLength` が0以上の安全な整数でない場合は、呼び出し側の誤りとして `RangeError` を投げる。
+ * - 代替文言は `fallback` で指定できる（省略時は `ERROR_MESSAGE_FALLBACK`）。
+ * - LZ-2（設計書 `2026-11-09-beaksight-remove-limits-design.md`）: 長さの上限（前は呼び出し側の `maxLength`）は置かない。切り詰めない。
  */
-export function safeErrorMessage(
-  error: unknown,
-  maxLength: number,
-  fallback: string = ERROR_MESSAGE_FALLBACK,
-): string {
-  if (!isNonNegativeSafeInteger(maxLength)) {
-    throw new RangeError('error message maximum length must be a non-negative safe integer');
-  }
-  return describeError(error, fallback).slice(0, maxLength);
+export function safeErrorMessage(error: unknown, fallback: string = ERROR_MESSAGE_FALLBACK): string {
+  return describeError(error, fallback);
 }
 
 function describeError(error: unknown, fallback: string): string {
@@ -56,8 +49,7 @@ function describeError(error: unknown, fallback: string): string {
 export const errorCodeOf = (error: unknown): string | null => (isRecord(error) && typeof error.code === 'string' ? error.code : null);
 
 /**
- * 誤りの値の文（PRE42-CC 組 5a。台帳の N1）。`Error` なら `message`、そうでなければ `String(error)`。長さは切り詰めない（上限が要るときは
- * `safeErrorMessage` を使う）。管理データの `quick_check` の誤りの文、管理データを開く誤りの詳細、画面のサーバの背後の処理の誤りのコンソールの出力が
+ * 誤りの値の文（PRE42-CC 組 5a。台帳の N1）。`Error` なら `message`、そうでなければ `String(error)`。長さは切り詰めない。管理データの `quick_check` の誤りの文、管理データを開く誤りの詳細、画面のサーバの背後の処理の誤りのコンソールの出力が
  * 共用する。画面の起動の部品（`apps/local-ui/launcher/`）は実行時に core を読めないので、使わない。
  */
 export const errorMessageOrString = (error: unknown): string => (error instanceof Error ? error.message : String(error));

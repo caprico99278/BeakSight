@@ -47,7 +47,6 @@ const RPC_READ: PassiveRequestDecision = {
 };
 /** 登録した読み取りの手続きの呼び出しを、通さない段（窓の中、form の書き込みの段）で止めた判定（共通の理由 `OVER_LIMIT` の写し）。 */
 const RPC_HELD: PassiveRequestDecision = { action: 'BLOCK', category: 'REQUEST', reason: 'NON_READ_METHOD', auditStageBlock: 'READ_REQUEST_OVER_LIMIT' };
-const IN_WINDOW: PassiveRequestDecision = { action: 'BLOCK', category: 'WRITE_STAGE', reason: 'SUBMISSION_WINDOW' };
 
 const script = (
   method: string,
@@ -110,7 +109,8 @@ describe('T39b: the API write branch of the request decision', () => {
     expect(classify(script('POST', RPC_READ_URL), API_SPENT)).toEqual(RPC_HELD);
     expect(classify(script('GET', `${API_URL}?select=*`), API_CLOSED)).toEqual(SERVICE_READ);
     expect(classify(script('GET', `${API_URL}?select=*`), API_OPEN)).toEqual(SERVICE_READ);
-    expect(classify(script('GET', `${APP_ORIGIN}/chunk.js`, { resourceType: 'script' }), API_OPEN)).toEqual(IN_WINDOW);
+    // RB-4b: 送信の窓の中のサイトの読み取りも止めない。
+    expect(classify(script('GET', `${APP_ORIGIN}/chunk.js`, { resourceType: 'script' }), API_OPEN)).toEqual({ action: 'ALLOW', delivery: 'DIRECT' });
   });
 
   it('keeps the form write stage (no API origin) as it was: no API write, the registered call blocked', () => {
@@ -123,5 +123,34 @@ describe('T39b: the API write branch of the request decision', () => {
     expect(classify(script('POST', `${APP_ORIGIN}/members`, { navigation: true, resourceType: 'document' }), form))
       .toEqual({ action: 'ALLOW', delivery: 'INSPECT_REDIRECTS' });
     expect(classify(script('POST', RPC_READ_URL), { ...form, submissionWindowOpen: false })).toEqual(RPC_HELD);
+  });
+});
+
+// LU-5（設計書 `2026-11-02-beaksight-list-row-update-design.md` 5.3 の 1・3、fix round 1 の案 A）: path の形の更新。照合へ回す判定は、照合へ回す要求の
+// path（`apiWritePath`。`{id}` を台帳の ID にした具体的な path）と完全一致で比べる。送信先（`writeEndpoint`）の path は型のまま。
+describe('LU-5: the API write branch with the path to check (the path shape update)', () => {
+  const ITEMS_URL = `${API_ORIGIN}/api/items`;
+  const PATH_OPEN: WriteStagePolicy = Object.freeze({
+    writeEndpoint: Object.freeze({ origin: API_ORIGIN, path: '/api/items/{id}' }),
+    remainingPosts: 1,
+    apiOrigin: API_ORIGIN,
+    apiWritePath: '/api/items/4',
+    submissionWindowOpen: true,
+  });
+  const TEMPLATE_ONLY: WriteStagePolicy = Object.freeze({ ...PATH_OPEN, apiWritePath: undefined });
+  it.each<[string, HttpRequestFacts, WriteStagePolicy, PassiveRequestDecision]>([
+    ['the PATCH to the concrete path', script('PATCH', `${ITEMS_URL}/4`), PATH_OPEN, API_WRITE],
+    ['the PATCH to the concrete path with a query (the check sees the query)', script('PATCH', `${ITEMS_URL}/4?select=*`), PATH_OPEN, API_WRITE],
+    ['the PATCH to another record id', script('PATCH', `${ITEMS_URL}/5`), PATH_OPEN, UNREGISTERED],
+    ['the PATCH under the concrete path', script('PATCH', `${ITEMS_URL}/4/x`), PATH_OPEN, UNREGISTERED],
+    ['the PATCH to the collection path', script('PATCH', ITEMS_URL), PATH_OPEN, UNREGISTERED],
+    ['the PATCH to the literal template', script('PATCH', `${ITEMS_URL}/%7Bid%7D`), PATH_OPEN, UNREGISTERED],
+    ['the DELETE to the concrete path', script('DELETE', `${ITEMS_URL}/4`), PATH_OPEN, UNREGISTERED],
+    ['the PATCH to the concrete path of another origin', script('PATCH', `${APP_ORIGIN}/api/items/4`), PATH_OPEN, UNREGISTERED],
+    ['the PATCH to the concrete path without the path to check (the template is compared as it is)', script('PATCH', `${ITEMS_URL}/4`), TEMPLATE_ONLY, UNREGISTERED],
+    ['the PATCH with an empty path to check (fail-closed)', script('PATCH', `${ITEMS_URL}/4`), { ...PATH_OPEN, apiWritePath: '' }, UNREGISTERED],
+    ['the PATCH outside the window', script('PATCH', `${ITEMS_URL}/4`), { ...PATH_OPEN, submissionWindowOpen: false }, UNREGISTERED],
+  ])('decides %s', (_label, facts, writeStage, expected) => {
+    expect(classify(facts, writeStage)).toEqual(expected);
   });
 });

@@ -2,14 +2,14 @@
 // - 登録の ID の取り方 `RESPONSE_BODY_KEY`（シナリオの `api.recordId.key`）の鍵で、応答の本文（JSON）の最上位の object か、要素が 1 つだけの array の
 //   その object（表現を返す応答の形）から、値を読む。値は文字列か、0 以上の安全な整数（10 進の文字列にする）だけ。
 // - 使える形の ID（`isUsableRecordId`。path の 1 区切りに入れて安全な閉じた形）だけを返し、ほかは null（ID なし）。
-// - 本文はメモリの中だけで扱い、記録しない。返すのは ID だけ。上限（`MAX_API_RECORD_ID_BODY_BYTES`）を超える本文、UTF-8 でない本文、JSON でない本文は
-//   読まない（null）。例外を投げない。
-// - CC-104: 応答の本文の解読（上限、UTF-8、JSON）は 1 つの手順（`decodedApiResponseBodyOf`）にまとめ、本文の形（`apiResponseBodyShapeOf`）、一覧の要素の
+// - 本文はメモリの中だけで扱い、記録しない。返すのは ID だけ。UTF-8 でない本文、JSON でない本文は読まない（null）。L10: 大きさの上限は撤廃した。
+//   例外を投げない。
+// - CC-104: 応答の本文の解読（UTF-8、JSON）は 1 つの手順（`decodedApiResponseBodyOf`）にまとめ、本文の形（`apiResponseBodyShapeOf`）、一覧の要素の
 //   数（`apiResponseListLength`）、登録の ID（`apiRecordIdOfResponseBody`）と、ワーカーの読めない本文の判定（`isUnreadableApiResponseBody`）が、その上に載る。
 import { usableRecordIdOf } from './action-outcome.js';
 
-/** 読む応答の本文の上限（bytes。1 件の登録・更新の表現に余裕を見た値。超えたら読まない）。 */
-export const MAX_API_RECORD_ID_BODY_BYTES = 1_048_576;
+// L10（設計書 `2026-11-09-beaksight-remove-limits-design.md` 4。設計者の判断で L10 に入れた）: 読む応答の本文の大きさの上限（前は 1 MiB の
+// `MAX_API_RECORD_ID_BODY_BYTES`。超えたら読まなかった）は撤廃した。本文は全部読む（メモリの中だけで扱い、記録しないのは今のまま）。
 
 /** 最上位の object（要素が 1 つだけの array なら、その要素の object）。なければ null。 */
 const recordObjectOf = (parsed: unknown): Readonly<Record<string, unknown>> | null => {
@@ -25,19 +25,19 @@ const idTextOf = (value: unknown): string | null => {
   return typeof value === 'number' && Number.isSafeInteger(value) && value >= 0 ? String(value) : null;
 };
 
-/** 応答の本文を解読した結果（`NONE`: 空の本文。`PARSED`: JSON の値。`UNREADABLE`: 上限を超える、バイト列でない、UTF-8・JSON でない）。 */
+/** 応答の本文を解読した結果（`NONE`: 空の本文。`PARSED`: JSON の値。`UNREADABLE`: バイト列でない、UTF-8・JSON でない）。 */
 type DecodedApiResponseBody = { readonly kind: 'NONE' } | { readonly kind: 'PARSED'; readonly value: unknown } | { readonly kind: 'UNREADABLE' };
 
 const NO_BODY = Object.freeze({ kind: 'NONE' } as const);
 const UNREADABLE_BODY = Object.freeze({ kind: 'UNREADABLE' } as const);
 
 /**
- * CC-104（T41R2-fix の発見事項 1）: 応答の本文の解読（上限 `MAX_API_RECORD_ID_BODY_BYTES`、UTF-8、JSON）の唯一の手順。本文はメモリの中だけで扱う。例外を
+ * CC-104（T41R2-fix の発見事項 1）: 応答の本文の解読（UTF-8、JSON。L10 で大きさの上限は撤廃した）の唯一の手順。本文はメモリの中だけで扱う。例外を
  * 投げない。
  */
 const decodedApiResponseBodyOf = (body: Uint8Array): DecodedApiResponseBody => {
   try {
-    if (!(body instanceof Uint8Array) || body.byteLength > MAX_API_RECORD_ID_BODY_BYTES) {
+    if (!(body instanceof Uint8Array)) {
       return UNREADABLE_BODY;
     }
     if (body.byteLength === 0) {
@@ -51,7 +51,7 @@ const decodedApiResponseBodyOf = (body: Uint8Array): DecodedApiResponseBody => {
 
 /**
  * CC-104: 応答の本文の形。`NONE` は空の本文（204 など）、`LIST` は一覧（`length` は要素の数）、`OTHER` は一覧でない JSON（object・scalar）、`UNREADABLE` は
- * 上限を超える、UTF-8・JSON でない本文（空白だけの本文を含む）。
+ * UTF-8・JSON でない本文（空白だけの本文を含む）。
  */
 export type ApiResponseBodyShape =
   | { readonly kind: 'NONE' }
@@ -70,7 +70,7 @@ export function apiResponseBodyShapeOf(body: Uint8Array): ApiResponseBodyShape {
 
 /**
  * T41d（Task 41 の設計書 3.4 の 3）・T41R-fix（設計書 8 章の「T41R の完全版」の I-2）: 応答の本文が一覧なら、その要素の数（表現を返す更新で、更新した行の
- * 数。0 は更新した行がない、2 以上は 2 行以上を更新した）。一覧でない本文、空の本文、上限を超える本文、UTF-8・JSON でない本文は null。CC-104: 本文の形
+ * 数。0 は更新した行がない、2 以上は 2 行以上を更新した）。一覧でない本文、空の本文、UTF-8・JSON でない本文は null。CC-104: 本文の形
  * （`apiResponseBodyShapeOf`）の上に載る。本文は記録しない。例外を投げない。
  */
 export function apiResponseListLength(body: Uint8Array): number | null {

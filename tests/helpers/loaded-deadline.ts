@@ -1,4 +1,4 @@
-import { DEFAULT_CONFIG } from '../../src/config/defaults.js';
+import { OLD_HIDDEN_CRAWL_DEFAULTS } from '../../src/config/load-config.js';
 import { BROWSER_CLOSE_TIMEOUT_MS } from '../../src/core/limits.js';
 
 /**
@@ -18,7 +18,8 @@ export const LOADED_DEADLINE_FACTOR = 6;
  * ページが `DOM_READINESS_FAILED: DEADLINE_EXCEEDED` の PARTIAL になった回がある。DF-2b で `cli-site-unavailable` から、ほかの結合のテストと共有する
  * ためにここへ移した（Run の結果が COMPLETE であることを確かめ、DOM の準備の期限そのものを確かめないテストが使う）。
  */
-export const LOADED_RESOURCE_SETTLING_TIMEOUT_MS = DEFAULT_CONFIG.crawl.resourceSettlingTimeoutMs * LOADED_DEADLINE_FACTOR;
+// L14: 既定の値は `DEFAULT_CONFIG` から外した（前の既定の値は `OLD_HIDDEN_CRAWL_DEFAULTS`）。
+export const LOADED_RESOURCE_SETTLING_TIMEOUT_MS = OLD_HIDDEN_CRAWL_DEFAULTS.resourceSettlingTimeoutMs * LOADED_DEADLINE_FACTOR;
 
 /**
  * Browser を閉じる処理を待つ期限（ms。Run Coordinator の `browserCloseTimeoutMs`。既定は `BROWSER_CLOSE_TIMEOUT_MS` の 10,000）に混雑の倍率を

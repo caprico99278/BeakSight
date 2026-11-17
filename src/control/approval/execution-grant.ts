@@ -6,10 +6,7 @@
 import { dateOfCompactUtcTimestamp, formatCompactUtcTimestamp } from '../../core/utc-timestamp.js';
 import {
   EXECUTION_GRANT_TTL_MS,
-  MAX_WRITES_PER_DAY,
-  MIN_WRITE_INTERVAL_MS,
   WRITE_JOB_CONCURRENCY,
-  WRITE_RATE_WINDOW_MS,
   type ScenarioLimits,
   type WriteReservationState,
 } from './scenario-contracts.js';
@@ -19,12 +16,12 @@ import {
  * - 発行: `GRANT_SCENARIO_NOT_FOUND`（シナリオがない）、`GRANT_REVISION_CONFLICT`（画面が読んだ版と今の版が違う）、`GRANT_APPROVAL_INVALID`
  *   （承認が有効でない。理由は再承認の判定の理由）、`NEEDS_RULE_INPUT`（入力の規則の参照がない）、`GRANT_ALREADY_OPEN`（このシナリオに、消費して
  *   いない有効な許可がある）、`GRANT_WRITE_CONCURRENCY_EXCEEDED`（書き込みの同時実行の枠がない）、`GRANT_RUN_LIMIT_EXCEEDED`（件数が 1 回の Run の
- *   上限を超える）、`GRANT_CUMULATIVE_LIMIT_REACHED`（累積の上限の残りが足りない）、`GRANT_FACTS_CHANGED`（確かめの間に発見のジョブが記録された）。
+ *   上限を超える）、`GRANT_FACTS_CHANGED`（確かめの間に発見のジョブが記録された）。
  *   T30a: `VERIFICATION_SPEC_MISSING`（シナリオの検証の指定のどれかが未指定。判定は `scenario-policy.ts` の `missingVerificationItemsOf`。発行の
  *   確かめに足すのは T30d）。
- *   T30d: `GRANT_ENVIRONMENT_EVIDENCE_MISSING`（プロファイルの環境の証跡の参照が空。`environmentEvidenceRejectionOf`）、
- *   `GRANT_WRITE_INTERVAL_NOT_ELAPSED`（同じシナリオの最後の書き込みから `MIN_WRITE_INTERVAL_MS` が経っていない）、`GRANT_DAILY_WRITE_LIMIT_REACHED`
- *   （同じシナリオの 24 時間の窓の中の書き込みが `MAX_WRITES_PER_DAY` 件。どちらも `writeRateRejectionOf`）。
+ *   T30d: `GRANT_ENVIRONMENT_EVIDENCE_MISSING`（プロファイルの環境の証跡の参照が空。`environmentEvidenceRejectionOf`）。
+ *   LZ-3c: 累積の上限（`GRANT_CUMULATIVE_LIMIT_REACHED`）と連続の上限（`GRANT_WRITE_INTERVAL_NOT_ELAPSED`・`GRANT_DAILY_WRITE_LIMIT_REACHED`）の理由は、
+ *   L12b で出さなくなったので捨てた（発行の結果は管理データ・成果物に残らない）。
  * - 消費と確かめ直し: `GRANT_NOT_FOUND`（ない id。偽造を含む）、`GRANT_MISMATCH`（別のシナリオ・ジョブ・プロファイル・版、または承認の記録が
  *   変わった）、`GRANT_EXPIRED`（許可の期限を過ぎた。無効にし予約を返す）、`GRANT_ALREADY_CONSUMED`（2 回目）、`GRANT_INVALIDATED`（撤回や期限切れで
  *   無効にした）、`GRANT_NOT_CONSUMED`（確かめ直しで、まだ消費していない）。消費と確かめ直しも、承認が有効でなければ `GRANT_APPROVAL_INVALID`。
@@ -44,12 +41,9 @@ export const EXECUTION_GRANT_REJECTION_REASONS = Object.freeze([
   'NEEDS_RULE_INPUT',
   'VERIFICATION_SPEC_MISSING',
   'GRANT_ENVIRONMENT_EVIDENCE_MISSING',
-  'GRANT_WRITE_INTERVAL_NOT_ELAPSED',
-  'GRANT_DAILY_WRITE_LIMIT_REACHED',
   'GRANT_ALREADY_OPEN',
   'GRANT_WRITE_CONCURRENCY_EXCEEDED',
   'GRANT_RUN_LIMIT_EXCEEDED',
-  'GRANT_CUMULATIVE_LIMIT_REACHED',
   'GRANT_FACTS_CHANGED',
   'GRANT_NOT_FOUND',
   'GRANT_MISMATCH',
@@ -72,6 +66,9 @@ export const EXECUTION_GRANT_REJECTION_REASONS = Object.freeze([
   // T41b（Task 41 の設計書 3.2）: 下書きの保存の後に台帳の登録の ID の取り方（応答の本文の鍵）が変わり、API の更新の filter の名前に結び付かなくなった
   // （下書きの理由と同じ名前。判定は `scenario-policy.ts` の `apiUpdateLedgerBindingRejectionOf`）。
   'SCENARIO_API_FILTER_NOT_BOUND_TO_LEDGER_ID',
+  // MI-F1（設計書 `2026-10-26-beaksight-minimal-input-ux-design.md` 4.7.1 の 5。MI-R の Minor 7）: 発行・消費・確かめ直しで、シナリオの今の版の副作用の確認に、
+  // まだ確かめていない項目がある（承認の不変条件に頼らない多重の守り。判定は `scenario-policy.ts` の `unconfirmedSideEffectsOf`。承認の理由と同じ名前）。
+  'SCENARIO_SIDE_EFFECTS_UNCONFIRMED',
 ] as const);
 export type ExecutionGrantRejectionReason = (typeof EXECUTION_GRANT_REJECTION_REASONS)[number];
 
@@ -126,6 +123,8 @@ export interface ExpiringGrant {
   readonly expiresAt: string;
   readonly consumedAt: string | null;
   readonly invalidatedAt: string | null;
+  /** L12b: 許可のジョブの行があるか（あれば、期限で古い許可にしない）。省略はない（今のまま期限で判定する）。 */
+  readonly jobExists?: boolean;
 }
 
 /**
@@ -134,95 +133,25 @@ export interface ExpiringGrant {
  */
 export const expiredOpenGrantIdsOf = (grants: readonly ExpiringGrant[], now: Date): ReadonlySet<string> =>
   new Set(grants
-    .filter((grant) => grant.consumedAt === null && grant.invalidatedAt === null && isExecutionGrantExpired(grant.expiresAt, now))
+    // L12b（設計書 6.2。S16）: 許可はジョブの中の予約で、期限で切らない。古い許可として捨てるのは、ジョブの行がない（ジョブが始まらなかった）まま、前の期限の
+    // 長さ（`EXECUTION_GRANT_TTL_MS`）を過ぎた許可だけ（発行の後に落ちた画面の取り残し。ジョブが動いている許可は、何分でも有効）。
+    .filter((grant) => grant.consumedAt === null && grant.invalidatedAt === null && grant.jobExists !== true
+      && isExecutionGrantExpired(grant.expiresAt, now))
     .map(({ grantId }) => grantId));
 
 /** 予約の件数の最小。 */
 const MIN_RESERVATION_COUNT = 1;
 
 /**
- * 予約の件数を上限で判定する。件数が 1 回の Run の上限の外（1 未満を含む）なら `GRANT_RUN_LIMIT_EXCEEDED`、累積の上限の残り（上限 − 使った件数）を
- * 超えるなら `GRANT_CUMULATIVE_LIMIT_REACHED`、受けるなら null。
+ * 予約の件数を判定する。件数が 1 回の Run の上限の外（1 未満を含む）なら `GRANT_RUN_LIMIT_EXCEEDED`、受けるなら null（1 つのジョブが送るのは承認した 1 回。
+ * 管理データの予約の件数も 1 に縛る）。L12b（設計書 `2026-11-09-beaksight-remove-limits-design.md` 6.2。S14）: 累積の件数（`limits.maxCumulativeCreates`）は当てない。
  */
-export const writeLimitRejectionOf = (
-  count: number,
-  limits: ScenarioLimits,
-  reservations: readonly CountedWriteReservation[],
-  excludedGrantIds: ReadonlySet<string> = NO_EXCLUDED_GRANTS,
-): 'GRANT_RUN_LIMIT_EXCEEDED' | 'GRANT_CUMULATIVE_LIMIT_REACHED' | null => {
-  if (!Number.isSafeInteger(count) || count < MIN_RESERVATION_COUNT || count > limits.maxCreatesPerRun) {
-    return 'GRANT_RUN_LIMIT_EXCEEDED';
-  }
-  return count > limits.maxCumulativeCreates - usedCumulativeWrites(reservations, excludedGrantIds) ? 'GRANT_CUMULATIVE_LIMIT_REACHED' : null;
+export const writeLimitRejectionOf = (count: number, limits: ScenarioLimits): 'GRANT_RUN_LIMIT_EXCEEDED' | null => {
+  return !Number.isSafeInteger(count) || count < MIN_RESERVATION_COUNT || count > limits.maxCreatesPerRun ? 'GRANT_RUN_LIMIT_EXCEEDED' : null;
 };
 
-/** 書き込みとして数える予約の状態（連続の上限。送った・送ったか分からない。T30d）。 */
-export const RATE_COUNTED_WRITE_RESERVATION_STATES = Object.freeze(['COMMITTED', 'UNKNOWN'] as const satisfies readonly WriteReservationState[]);
-
-/** 連続の上限の判定に要る、予約 1 件の項目。 */
-export interface RatedWriteReservation {
-  readonly state: WriteReservationState;
-  /** 締めた時刻（UTC の 14 桁。締めていなければ null）。 */
-  readonly settledAt: string | null;
-}
-
-/**
- * 連続の上限の判定（Task 30 の設計書 2 章のユーザーの判断 3、3 章の「連続の上限」。T30d）。同じシナリオの予約のうち、`COMMITTED`・`UNKNOWN` で締めた
- * ものを書き込みとして数える（`RELEASED` と、締めていない予約は数えない）。最後の書き込みの締めの時刻から `MIN_WRITE_INTERVAL_MS` が経っていなければ
- * （判定の時刻より後の時刻を含む）`GRANT_WRITE_INTERVAL_NOT_ELAPSED`、判定の時刻の `WRITE_RATE_WINDOW_MS` 前より後に締めた書き込みが
- * `MAX_WRITES_PER_DAY` 件以上なら `GRANT_DAILY_WRITE_LIMIT_REACHED`、受けるなら null。ちょうど 5 分は受け、ちょうど 24 時間前は窓の外。
- */
-export const writeRateRejectionOf = (
-  reservations: readonly RatedWriteReservation[],
-  now: Date,
-): 'GRANT_WRITE_INTERVAL_NOT_ELAPSED' | 'GRANT_DAILY_WRITE_LIMIT_REACHED' | null => {
-  const nowMs = now.getTime();
-  const writtenAt = writtenAtTimesOf(reservations);
-  if (writtenAt.some((time) => isWithinInterval(nowMs, time))) {
-    return 'GRANT_WRITE_INTERVAL_NOT_ELAPSED';
-  }
-  return writtenAt.filter((time) => isWithinRateWindow(nowMs, time)).length >= MAX_WRITES_PER_DAY ? 'GRANT_DAILY_WRITE_LIMIT_REACHED' : null;
-};
-
-/** 書き込みとして数える予約の、締めの時刻（ms。`COMMITTED`・`UNKNOWN` で締めたものだけ）。連続の上限と、その予定（`writeScheduleOf`）が共用する。 */
-const writtenAtTimesOf = (reservations: readonly RatedWriteReservation[]): readonly number[] => reservations
-  .filter((reservation) => (RATE_COUNTED_WRITE_RESERVATION_STATES as readonly WriteReservationState[]).includes(reservation.state))
-  .flatMap(({ settledAt }) => (settledAt === null ? [] : [dateOfCompactUtcTimestamp(settledAt).getTime()]));
-
-/** 書き込みから `MIN_WRITE_INTERVAL_MS` が経っていないか（判定の時刻より後の書き込みを含む。ちょうど経ったら経った）。 */
-const isWithinInterval = (nowMs: number, writtenAtMs: number): boolean => nowMs - writtenAtMs < MIN_WRITE_INTERVAL_MS;
-
-/** 書き込みが、判定の時刻の窓（`WRITE_RATE_WINDOW_MS`。ちょうど窓の長さの前は窓の外）の中か。 */
-const isWithinRateWindow = (nowMs: number, writtenAtMs: number): boolean => nowMs - writtenAtMs < WRITE_RATE_WINDOW_MS;
-
-/** 連続の上限の予定（T30g。画面の開始の確かめに出す。凍結）。 */
-export interface WriteSchedule {
-  /** 次に書き込める時刻（UTC の 14 桁。今書けるなら null）。この時刻の `writeRateRejectionOf` は null。 */
-  readonly nextWriteAllowedAt: string | null;
-  /** 判定の時刻の窓の中の、残りの書き込みの件数（0 以上。`MAX_WRITES_PER_DAY` − 窓の中の書き込み）。 */
-  readonly remainingInWindow: number;
-}
-
-/**
- * 連続の上限の予定（純粋。T30g。Task 30 の設計書 2 章のユーザーの判断 3）: `writeRateRejectionOf` と同じ数え方（`COMMITTED`・`UNKNOWN` で締めた予約、
- * `MIN_WRITE_INTERVAL_MS`、`WRITE_RATE_WINDOW_MS`、`MAX_WRITES_PER_DAY`）で、次に書き込める時刻と、窓の中の残りの件数を求める。次の時刻は、
- * 最後の書き込みから間隔が経つ時刻と、窓の中の件数が上限より少なくなる時刻の、遅い方（新しい書き込みがなければ、その後は件数が増えない）。
- */
-export const writeScheduleOf = (reservations: readonly RatedWriteReservation[], now: Date): WriteSchedule => {
-  const nowMs = now.getTime();
-  const writtenAt = writtenAtTimesOf(reservations);
-  const inWindow = writtenAt.filter((time) => isWithinRateWindow(nowMs, time)).sort((left, right) => left - right);
-  const intervalEndsAt = writtenAt.filter((time) => isWithinInterval(nowMs, time)).map((time) => time + MIN_WRITE_INTERVAL_MS);
-  const excess = inWindow.length - MAX_WRITES_PER_DAY;
-  // 窓の中の件数が上限以上なら、古い方から (excess + 1) 件目が窓を出る時刻に、件数が上限より少なくなる。
-  const windowFreesAt = excess < 0 ? [] : [(inWindow[excess] ?? nowMs) + WRITE_RATE_WINDOW_MS];
-  const candidates = [...intervalEndsAt, ...windowFreesAt];
-  const next = candidates.length === 0 ? null : Math.max(...candidates);
-  return Object.freeze({
-    nextWriteAllowedAt: next === null ? null : formatCompactUtcTimestamp(new Date(next), 'next write time'),
-    remainingInWindow: Math.max(0, MAX_WRITES_PER_DAY - inWindow.length),
-  });
-};
+// LZ-3c: 連続の上限（前の T30d の `writeRateRejectionOf`。最後の書き込みから 5 分・24 時間に 5 件）と、その予定（前の T30g の `writeScheduleOf`）は、
+// L12b（設計書 `2026-11-09-beaksight-remove-limits-design.md` 6.2）で当てなくなったので捨てた（理由も一覧から捨てた。管理データ・成果物に残らない）。
 
 /**
  * 環境の証跡の参照の判定（Task 30 の設計書 3 章の「外部への通知」、10 章の 4。T30d）。null、空、空白だけなら `GRANT_ENVIRONMENT_EVIDENCE_MISSING`、

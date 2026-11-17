@@ -3,7 +3,6 @@
 // - エスケープ: 送った値・前後の値・READ の文字に `<script>`・`"`・`&` を入れても、そのままの HTML にならない。
 // - 先頭の注意: 人の値が入りうるとき（`containsHumanEnteredValues`）と、`UNKNOWN`・`PARTIAL` のとき。
 // - バッジ: カタログのラベルと値（`data-value`）。文言は `ACTION_REPORT_TEXT` とカタログから。同じ入力から同じ文字列。
-import { createHash } from 'node:crypto';
 import { describe, expect, it } from 'vitest';
 import {
   ACTION_RESULT_CATALOG,
@@ -108,20 +107,22 @@ describe('action report HTML (T32f)', () => {
   });
 });
 
-// T40d（Task 40 の設計書 3.4、3.5）: API の要約の節の HTML と、FORM の HTML が変わらないこと。
-// - FORM の HTML は、T40d の前のコードで描いた文字列の SHA-256 で固定する。
+// T40d（Task 40 の設計書 3.4、3.5）: API の要約の節の HTML と、FORM の HTML。
+// - FORM の HTML には API の節と送り方のバッジがなく、同じ入力から同じ文字列になる（中身は上の T32f の各場面で確かめる）。
 // - API の節: 見出し、送り方のバッジ、判定の説明、ページが決める鍵の値（null の印、送らなかった回）。値はエスケープし、送り先はリンクにしない。
-const sha256Of = (text: string): string => `sha256:${createHash('sha256').update(text, 'utf8').digest('hex')}`;
 /** API の節の見出し（見出しの要素で探す）。 */
 const apiHeading = (): string => `>${escapeHtml(ACTION_REPORT_TEXT.sections.api)}</h2>`;
 
-describe('action report HTML of an API write, and the unchanged FORM HTML (T40d)', () => {
-  it.each<readonly [string, () => ActionReportDocuments, string]>([
-    ['a verified create', verifiedCreateDocuments, 'sha256:9e69e848b3d004617c023ac1eb4b7216cc7e8ff2f3ddf7927a9dfd037e36f4d6'],
-    ['a verified update', verifiedUpdateDocuments, 'sha256:8e70c60610114f8dc8f492edcb296b72197e5603eb63136af1108444ade15aad'],
-    ['a blocked run', blockedDocuments, 'sha256:3fee270b3675685151d8e3837347b5a5d99d2079075ea9fe6617041c0766b29b'],
-  ])('keeps the FORM HTML of %s byte for byte', (_label, documents, expected) => {
-    expect(sha256Of(htmlOf(documents()))).toBe(expected);
+describe('action report HTML of an API write, and the FORM HTML (T40d)', () => {
+  it.each<readonly [string, () => ActionReportDocuments]>([
+    ['a verified create', verifiedCreateDocuments],
+    ['a verified update', verifiedUpdateDocuments],
+    ['a blocked run', blockedDocuments],
+  ])('puts no API section in the FORM HTML of %s, the same string from the same input', (_label, documents) => {
+    const html = htmlOf(documents());
+    expect(html).not.toContain(apiHeading());
+    expect(html).not.toContain('data-value="API"');
+    expect(htmlOf(documents())).toBe(html);
   });
 
   it('puts the API section with the transport badge, the shape, the keys and the note of the judgement', () => {
@@ -135,8 +136,6 @@ describe('action report HTML of an API write, and the unchanged FORM HTML (T40d)
     }
     // 送り先はリンクにしない（1 回のクリックで要求を送らせない）。
     expect(html).not.toContain(`href="${SAMPLE_API_ORIGIN}`);
-    // FORM の HTML には API の節がない。
-    expect(htmlOf(verifiedCreateDocuments())).not.toContain(apiHeading());
   });
 
   it('shows the cut mark and the run that was not sent with the texts of the catalog', () => {

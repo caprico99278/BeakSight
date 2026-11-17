@@ -32,6 +32,8 @@ export type BeakSightBlockRelation = (typeof BEAKSIGHT_BLOCK_RELATIONS)[number];
  *   ないので、原因とは言い切らない）。
  * - `DISABLED_FEATURE`（`POSSIBLE`）: BeakSight が起動の引数で無効にした機能（SharedWorker）を、ページが呼んだ例外。
  * - `SENSITIVE_KIND_BLOCKED`（`POSSIBLE`）: 同じ読み込みの間（閉じ始める前。時点 `LOAD`。測りの後も含む）に、その Rule の結果を変えうる種類の要求を、BeakSight が止めた。
+ * - `APPROVED_SERVICE_UNAUTHORIZED`（`POSSIBLE`。DEF-206・AUD-7）: 同じ読み込みに、承認したサービスの Origin からの 401 がある（BeakSight の側のログインの事情の
+ *   見込み）。資源の誤り（`RESOURCE_4XX`）の指摘だけ。
  * - `NO_BLOCK_IN_LOAD`（`NONE`）: 結び付く読み込みの間（閉じ始める前）に、見える種類の遮断がない。
  * - `RULE_NOT_SENSITIVE`（`NONE`）: 遮断はあるが、その Rule の結果を変えうる種類ではない。
  */
@@ -44,6 +46,7 @@ export const BEAKSIGHT_BLOCK_RELATION_REASONS = Object.freeze([
   'FETCH_FAILED_WITH_DATA_BLOCK',
   'DISABLED_FEATURE',
   'SENSITIVE_KIND_BLOCKED',
+  'APPROVED_SERVICE_UNAUTHORIZED',
   'NO_BLOCK_IN_LOAD',
   'RULE_NOT_SENSITIVE',
 ] as const);
@@ -59,6 +62,7 @@ export const BEAKSIGHT_BLOCK_RELATION_OF_REASON = Object.freeze({
   FETCH_FAILED_WITH_DATA_BLOCK: 'POSSIBLE',
   DISABLED_FEATURE: 'POSSIBLE',
   SENSITIVE_KIND_BLOCKED: 'POSSIBLE',
+  APPROVED_SERVICE_UNAUTHORIZED: 'POSSIBLE',
   NO_BLOCK_IN_LOAD: 'NONE',
   RULE_NOT_SENSITIVE: 'NONE',
 } as const satisfies Record<BeakSightBlockRelationReason, BeakSightBlockRelation>);

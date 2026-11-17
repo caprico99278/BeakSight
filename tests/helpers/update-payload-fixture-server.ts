@@ -1,5 +1,5 @@
 // T31c（Task 31 の設計書 3 章の「欄の役割」「削除にあたる変更の遮断」の送る中身の照合、「同じ名前の hidden と checkbox の組」）: 更新の画面の
-// fixture のサーバ（テストの補助。`tests/integration/guard-update-payload.test.ts` が使う）。
+// fixture のサーバ（テストの補助。`tests/integration/guard-write-stage.test.ts` が使う）。
 // - 127.0.0.1 だけで待ち受ける（`startLoopbackHttpServer`）。
 // - 更新の画面（GET。query の `variant` で形を、`enctype` で送り方を選ぶ）は、Rails 型の形: `_method=PATCH` の hidden、CSRF の hidden（起動の
 //   たびに作る目印の値）、変える欄（`customer_name`）、保つ欄（`memo`。前の値は 2 行）、状態の名前の hidden（`active=1`）、同じ名前の hidden と

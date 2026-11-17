@@ -32,6 +32,10 @@
 // - T44c（Task 44 の設計書 P1-1〜P1-4 の測り。実テスト環境の形）: 任意の指定 `innerScrollList`（一覧の内側のスクロールの領域）、`serviceReadOnList`（一覧の後の
 //   サービスへの読み取り）、`closingBeacon`（閉じるときの計測の送信）、`crowdedEditScreen`（押す候補の多い更新の画面）、`createSaveInDialog`（登録の画面だけ
 //   ダイアログの中の保存）。指定のないときの画面と振る舞いは変えない。
+// - OP-K（K3。本物のテスト環境の形）: 任意の指定 `deferredLoginForm`（ログインの画面の欄を、遅れて答える画面の設定を読んだ後に描く）。指定のないときの画面と
+//   振る舞いは変えない。
+// - OP-O（O2。本物のテスト環境の形）: 切り替え `setMemberInputQuirk`（form のない会員の画面の、値を入れるときの振る舞い。`SPA_MEMBER_INPUT_QUIRKS`）。指定のない
+//   ときの画面と振る舞いは変えない。
 import { createHash } from 'node:crypto';
 import type { IncomingMessage, ServerResponse } from 'node:http';
 import type { Duplex } from 'node:stream';
@@ -74,6 +78,8 @@ export const SPA_APP_PATHS = Object.freeze({
   script: '/app.js',
   /** `rumBeacon`: 配信の側の計測の送信（アプリと同じ Origin への POST。204）。 */
   rum: '/cdn-cgi/rum',
+  /** OP-K（`deferredLoginForm`）: ログインの画面が、欄を描く前に読む画面の設定（GET。サーバは `SPA_DEFERRED_LOGIN_FORM_DELAY_MS` だけ遅らせて `{}` を返す）。 */
+  appConfig: '/app-config.json',
 } as const);
 
 /** アプリの更新の画面のパス（`/admin/members/<id>/edit`）。 */
@@ -91,7 +97,58 @@ export const SPA_BACKEND_PATHS = Object.freeze({
   /** `postLoginFunction`: ログインの成功の直後に出す、サーバの関数の呼び出し（状態を変える処理の形。Bearer が要る）。 */
   functionSyncAccess: '/functions/v1/sync_access',
   realtime: '/realtime/v1/websocket',
+  /** OP-M（`setMemberSideRequestsOnInput`）: 入力の事象で出す、入力の確かめの読み取りの手続きの呼び出し（POST。本文に入れた値を持つ）。 */
+  rpcCheckMemberEmail: '/rest/v1/rpc/check_member_email',
+  /** OP-Q（`setMemberDetailRpcRead`）: 会員の詳細の画面が、データを取る手続きの呼び出し（POST。本文に `{ id }`。本物のテスト環境の SPA の形）。 */
+  rpcGetMember: '/rest/v1/rpc/get_member',
 } as const);
+
+/** OP-M（`setMemberSideRequestsOnInput`）: 入力の事象で、承認していない Origin（`otherOrigin`）へ出す、使われ方の記録の path（GET）。 */
+export const SPA_OTHER_COLLECT_PATH = '/collect';
+
+/** DEF-220（`sameOriginBackend`）: アプリの Origin がバックエンドと同じ振る舞いで答える、データの path の頭。 */
+const SAME_ORIGIN_BACKEND_PATH_PREFIXES = Object.freeze(['/rest/', '/functions/'] as const);
+
+/**
+ * OP-N（`setMemberAutoRequests`）: form のない登録の画面のスクリプトが自動で出す通信の path（バックエンドの手続きの呼び出し・プレビューの片付けの DELETE、承認して
+ * いない Origin の外のスクリプト）。
+ */
+export const SPA_AUTO_REQUEST_PATHS = Object.freeze({
+  rpcStatus: '/rest/v1/rpc/auto_status',
+  previews: '/rest/v1/previews',
+  widget: '/widget.js',
+  /** OP-REV3（C-1・I-1）: 承認した送信先の、形を変えた path（末尾の `/`）。 */
+  membersTrailingSlash: `${SPA_BACKEND_PATHS.members}/`,
+  /** OP-REV3（C-1）: 承認していない Origin への、no-cors の POST の送り先。 */
+  outsideCollect: '/collect-post',
+  /** OP-REV3（C-2）: 押した後に、値をヘッダか Cookie に持って送る、アプリの Origin の送り先。 */
+  appSync: '/api/auto-sync',
+} as const);
+
+/** OP-REV3（C-2）: 押した後の要求で、入れた値を持たせるヘッダの名前と、Cookie の名前。 */
+export const SPA_AUTO_DRAFT_HEADER = 'x-client-draft';
+export const SPA_AUTO_DRAFT_COOKIE = 'client_draft';
+
+/**
+ * OP-N（設計書 `2026-10-27-beaksight-one-pass-flow-design.md` 4.1.7 の N1・N2。本物のテスト環境の形）: form のない登録の画面のスクリプトが自動で出す通信の形
+ * （`setMemberAutoRequests`）。
+ * - `AFTER_FILL_READS`: 3 つの欄がそろった入力の事象で、値を含まない読み取り（アプリの Origin の GET）と、realtime の WebSocket の張り直しを 1 回ずつ出す。
+ * - `AFTER_FILL_MARKER_POST`・`AFTER_FILL_PLAIN_POST`・`AFTER_FILL_MARKER_GET`: 同じ時機に、メールアドレスの値を本文に持つ POST、値のない POST、メールアドレスの
+ *   値を query に持つ GET を 1 回出す。
+ * - `BEFORE_FILL`: 画面を開いた直後（値を入れる前）に、手続きの呼び出しの POST、プレビューの片付けの DELETE、承認していない Origin の外のスクリプトを 1 回ずつ出す。
+ * - `AFTER_PRESS`: 保存の応答の 1 秒後（L12b）に、値のない手続きの呼び出しの POST、メールアドレスの値を本文に持つ POST、値をヘッダに持つ POST、値を Cookie に持つ POST を
+ *   1 回ずつ出す（OP-REV3 の C-2）。
+ * - `BEFORE_FILL_ENDPOINT`（OP-REV3 の C-1・I-1）: 画面を開いた直後に、承認した送信先の形を変えた path（末尾の `/`）への値のない POST と、承認していない Origin への
+ *   no-cors の POST を 1 回ずつ出す。
+ */
+export type SpaMemberAutoRequests =
+  | 'AFTER_FILL_READS'
+  | 'AFTER_FILL_MARKER_POST'
+  | 'AFTER_FILL_PLAIN_POST'
+  | 'AFTER_FILL_MARKER_GET'
+  | 'BEFORE_FILL'
+  | 'BEFORE_FILL_ENDPOINT'
+  | 'AFTER_PRESS';
 
 /** token の `grant_type`。 */
 export const SPA_GRANT_TYPES = Object.freeze({ password: 'password', refresh: 'refresh_token', other: 'pkce' } as const);
@@ -227,23 +284,12 @@ export const SPA_EXTRA_PRESS_PATH_PREFIX = '/rest/v1/extra_';
 /** T38a: 保存と同じ要求を送る、もう 1 つのボタンの ID（`secondSaveButton`）。 */
 export const SPA_SECOND_SAVE_BUTTON_ID = 'save-again';
 /**
- * DEF-142（`pressPriorityTargets`）: 画面の先頭に置く、文字のないボタン（アイコンのボタン。押しても何も送らない）の数と、保存のボタンの前に置く見えない
- * ボタン（`display:none`）の語（どれも登録の語。それぞれ別の識別の候補）と、見えないボタンを押したときの POST の path の頭（押せないので届かないはず）。
+ * T44c（`crowdedEditScreen`）: 最後に置く見えないボタン（`display:none`）の語（どれも登録の語。それぞれ別の識別の候補）と、見えないボタンを押したときの POST の
+ * path の頭（押せないので届かないはず）。
  */
-export const SPA_ICON_BUTTON_COUNT = 3;
 export const SPA_HIDDEN_PRESS_TARGET_WORDS = Object.freeze(['追加', '作成', '登録'] as const);
 export const SPA_HIDDEN_PRESS_PATH_PREFIX = '/rest/v1/hidden_';
-/**
- * DEF-144（`externalSchemeButton`）: 保存のボタンの前に置く、押すとページの JS が外部スキーム（`mailto:`）へ移るボタンの ID と語（登録の語。押す前の読み取りでは
- * 見分けられない形）。
- */
-export const SPA_EXTERNAL_SCHEME_BUTTON = Object.freeze({ id: 'mail-member', word: '追加', href: 'mailto:member@example.invalid' } as const);
-/**
- * DEF-147（`publicationStatusField`）: 公開の状態の欄（select。ID と name と本文の鍵は `status`）と、選択肢（空の選択肢、下書き、公開）。probe は空でない最初の
- * 選択肢を選ぶ。
- */
-export const SPA_PUBLICATION_STATUS_FIELD = Object.freeze({ id: 'status', options: ['', 'draft', 'published'] } as const);
-/** DEF-145（`saveInDialog`）: 押すと、欄と保存のボタンの入った閉じたダイアログを開くボタンの ID と文言（登録の語を含む）と、ダイアログの ID。 */
+/** T44c（`createSaveInDialog`）: 押すと、欄と保存のボタンの入った閉じたダイアログを開くボタンの ID と文言（登録の語を含む）と、ダイアログの ID。 */
 export const SPA_DIALOG_OPEN_BUTTON = Object.freeze({ id: 'open-member-dialog', text: '新規作成', dialogId: 'member-dialog' } as const);
 
 /**
@@ -254,6 +300,54 @@ export const SPA_DIALOG_OPEN_BUTTON = Object.freeze({ id: 'open-member-dialog', 
  */
 export const SPA_HOSTILE_MEMBER_INPUTS = Object.freeze(['duplicateName', 'duplicateSubmit', 'rewriteOnInput', 'hiddenField', 'linkWrappedSubmit'] as const);
 export type SpaHostileMemberInput = (typeof SPA_HOSTILE_MEMBER_INPUTS)[number];
+/**
+ * OP-O（O2。本物のテスト環境の、React などで作られているとみられる SPA の形）: form のない会員の画面のスクリプトが、値を入れるときに見せる振る舞い
+ * （`setMemberInputQuirk`。省略は今のまま）。
+ * - `rerenderOnFirstInput`: 最初の入力の事象で、欄を作り直す（React の再描画。値は保つ。保存のボタンは作り直さない）。
+ * - `rerenderOnEveryInput`: 入力の事象のたびに、欄を作り直す（入れ直しても落ち着かない形）。
+ * - `revertOnFirstInput`: 欄ごとに、最初の入力の事象の値を、ページの状態の値（空）に戻す（制御された入力。状態の準備の前の入力を受けない）。
+ * - `clearOnEveryInput`: 入力の事象のたびに、値を空に戻す（入れ直しても受けない形）。
+ * - `numberField`: 数の欄（`SPA_NUMBER_FIELD`。type=number、min・max・step）を足し、入力の事象のたびに値を数の形に整える（`String(Number(value))`）。
+ * OP-P（P1・P2。本物のテスト環境の形）: 3 つの欄（名前・メールアドレス・備考）がそろった入力の事象の後、`SPA_AFTER_FILL_RERENDER_MS` だけ遅れて、1 回だけ
+ * 作り直す（React の再描画。値を入れ終えた後、押す前に起きる）。
+ * - `rerenderSaveAfterFill`: 保存のボタンを作り直す（押せる状態への切り替え。同じ形のボタンに、同じ押したときの受け手を付ける）。欄は作り直さない。
+ * - `rerenderFieldsAfterFill`: 欄を作り直す（値は保つ）。保存のボタンは作り直さない。
+ * - `resetFieldsAfterFill`: 欄を作り直し、値を空にする（作り直しで値が消える形）。保存のボタンは作り直さない。
+ */
+export const SPA_MEMBER_INPUT_QUIRKS = Object.freeze([
+  'rerenderOnFirstInput', 'rerenderOnEveryInput', 'revertOnFirstInput', 'clearOnEveryInput', 'numberField',
+  'rerenderSaveAfterFill', 'rerenderFieldsAfterFill', 'resetFieldsAfterFill',
+] as const);
+export type SpaMemberInputQuirk = (typeof SPA_MEMBER_INPUT_QUIRKS)[number];
+/**
+ * DEF-198（一覧の行の更新の設計書 5.9。実テスト環境の形）: 所属の絞り込みの鍵の名前（番号の鍵 `id` より前に並ぶ名前にして、並び順で番号の絞り込みを選ばないことも
+ * 確かめる）と、ページが入れる所属の値（数）と、別の所属の値。
+ */
+export const SPA_MEMBER_TENANT_KEY = 'account_id';
+export const SPA_MEMBER_TENANT_VALUE = 900;
+export const SPA_OTHER_MEMBER_TENANT_VALUE = 901;
+/** DEF-198: 更新の画面のスクリプトの、所属の絞り込みのある保存の送り方（`setMemberTenantSaveMode`。省略はふつう）。 */
+export const SPA_MEMBER_TENANT_SAVE_MODES = Object.freeze([
+  // 絞り込み: 別の所属の値、neq、in.()、or= を足す、所属が 2 つ、番号が 2 つ、別の行の番号、所属の絞り込みがない、承認していない名前の絞り込みを足す。
+  'otherTenant', 'neqTenant', 'inTenant', 'orExtra', 'duplicateTenant', 'duplicateId', 'otherId', 'missingTenant', 'unapprovedFilter',
+  // 本文: 所属の鍵だけ別の値、番号の鍵だけ別の値、絞り込みと本文を揃えて別の所属。
+  'bodyOtherTenant', 'bodyOtherId', 'bothOtherTenant',
+] as const);
+/**
+ * DEF-203（一覧の行の更新の設計書 5.10。実テスト環境の形）: `memberTenantExtraKeys` で、登録と更新の本文にページが入れる、欄と結びつかない鍵（文字・真偽・null）と
+ * その値（登録と更新で同じ値）。
+ */
+export const SPA_MEMBER_EXTRA_KEY_VALUES = Object.freeze({ label: 'standard', pinned: false, picture: null } as const);
+/** DEF-203: 欄と結びつかない鍵の送り方の崩し（`setMemberTenantSaveMode`。真偽の反転、文字を別の値、null を文字、鍵を足す）。 */
+export const SPA_MEMBER_EXTRA_KEY_SAVE_MODES = Object.freeze(['extraFlippedBoolean', 'extraOtherString', 'extraNullToString', 'extraAddedKey'] as const);
+export type SpaMemberTenantSaveMode = (typeof SPA_MEMBER_TENANT_SAVE_MODES)[number] | (typeof SPA_MEMBER_EXTRA_KEY_SAVE_MODES)[number];
+/**
+ * OP-P: 値を入れ終えた後に作り直すまでの遅れ（ms）。値を入れた後の読み直しより後で、書き込みの段の値を入れた後の落ち着きの待ち
+ * （観察の窓の一式の `write.submissionWindowSettleMs`）より短い（押す前に作り直す）。
+ */
+export const SPA_AFTER_FILL_RERENDER_MS = 150;
+/** OP-O（`numberField`）: 足す数の欄（id と name、min・max・step）。本文には入れない（入力の部品の確かめだけに使う）。 */
+export const SPA_NUMBER_FIELD = Object.freeze({ id: 'display-order', name: 'display_order', min: '1', max: '100', step: '1' } as const);
 /** T39d: `duplicateSubmit` のもう 1 つのボタンの ID。 */
 export const SPA_DUPLICATE_SAVE_BUTTON_ID = 'save-copy';
 /** T39d: `rewriteOnInput` で、ページの JS が値の末尾に足す文字。 */
@@ -276,6 +370,8 @@ export const SPA_REWRITE_SUFFIX = '!';
  *   （敵対的ではない。ページが付けるヘッダの名前が変われば型の digest が変わることを確かめる）。
  * - T41d（Task 41 の設計書 3.6）: `keptValueRewrite`: ふつうの要求の本文の備考（保つ欄）を `SPA_REWRITTEN_NOTE` に書き換える。`filterRewrite`: 更新の
  *   filter の ID を別の会員（ID + 1）に替えて送る。
+ * - ARR-2（`memberArrayKeys` の画面）: `arrayCountChanged`: ページが決める `holders` を 2 つにする。`arrayTypeChanged`: `holders` の要素を数にする。
+ *   `arrayNested`: `holders` を入れ子にする。`arrayFieldExtra`: 欄の一覧 `labels` に別の値を足す。
  */
 export const SPA_HOSTILE_MEMBER_SAVES = Object.freeze([
   'deleteOnSave',
@@ -295,6 +391,21 @@ export const SPA_HOSTILE_MEMBER_SAVES = Object.freeze([
   'extraPageHeader',
   'keptValueRewrite',
   'filterRewrite',
+  // ARR-2（`memberArrayKeys` の画面）: ページが決める一覧の数・要素の型を変える、入れ子にする、欄の一覧に別の値を足す。
+  'arrayCountChanged',
+  'arrayTypeChanged',
+  'arrayNested',
+  'arrayFieldExtra',
+  // ARR-3（`memberArrayRows` の画面）: 行の一覧 `quals` を、足す・減らす・順を変える・別の値・空の位置を埋める・入れ子にする。
+  'rowsAdded',
+  'rowsDropped',
+  'rowsReordered',
+  'rowsOtherValue',
+  'rowsEmptyFilled',
+  'rowsNested',
+  // ARR-5（object の行の `memberArrayRows`）: 行の中の鍵を足す・減らす。
+  'rowsInnerKeyAdded',
+  'rowsInnerKeyRemoved',
 ] as const);
 export type SpaHostileMemberSave = (typeof SPA_HOSTILE_MEMBER_SAVES)[number];
 
@@ -398,6 +509,9 @@ export interface SpaMember {
   readonly deleted: boolean;
 }
 
+/** DEF-200: 画面にログインの状態を消させる応答のヘッダ（`clearSessionAtMemberReads`）。 */
+export const SPA_CLEAR_SESSION_HEADER = 'x-fixture-clear-session';
+
 /** 振る舞いの指定。 */
 export interface SpaAuthSiteOptions {
   /** 画面が token の更新を送るまでの時間（ms。`/admin` を開いてから 1 回。null か省略は送らない）。 */
@@ -418,6 +532,17 @@ export interface SpaAuthSiteOptions {
   readonly websocket?: boolean;
   /** 認証（token）の送り先を、API のバックエンドと別の Origin（`authOrigin`）にする。 */
   readonly separateAuthOrigin?: boolean;
+  /**
+   * DEF-182（OP-DEF 修正の 1 回目）: 認証（token）の送り先を、アプリと同じ Origin（`appOrigin` の `SPA_BACKEND_PATHS.token`）にする。アプリの Origin は、その path の
+   * 要求だけをバックエンドと同じ振る舞いで答える（記録の Origin は `app`）。`separateAuthOrigin` より優先する。指定のないときの振る舞いは変えない。
+   */
+  readonly sameOriginAuth?: boolean;
+  /**
+   * DEF-220（設計書 `2026-11-08-beaksight-same-origin-api-and-spa-routes-design.md` 6 章）: API のバックエンドのデータの path（`/rest/`・`/functions/` で始まる
+   * path）を、アプリと同じ Origin で答える（テスト用のサイト自身の API。記録の Origin は `app`）。画面のスクリプトはアプリの Origin へ送り、`backendOrigin` も
+   * アプリの Origin を返す。token の送り先（`tokenOrigin`）は変えない。指定のないときの振る舞いは変えない。
+   */
+  readonly sameOriginBackend?: boolean;
   /** token の有効期限（ms。既定は `SPA_DEFAULT_TOKEN_LIFETIME_MS`）。 */
   readonly tokenLifetimeMs?: number;
   /** 敵対的なログイン（省略はふつうのログイン）。 */
@@ -438,6 +563,11 @@ export interface SpaAuthSiteOptions {
    * ことの見分けを確かめる。ログアウトや期限の代わり）。
    */
   readonly clearSessionAfterList?: boolean;
+  /**
+   * DEF-200: 会員の一覧の読み取り（`GET /rest/v1/members`。認証の通ったもの）の、この番目（1 から）の応答で、画面にログインの状態を消させる（応答のヘッダ
+   * `SPA_CLEAR_SESSION_HEADER`。画面は鍵を消して、ログインの画面へ移る）。セッションを意図して切る場面。省略は消させない。
+   */
+  readonly clearSessionAtMemberReads?: readonly number[];
   /** T36b: token の送信への応答の振る舞い（`SPA_TOKEN_RESPONSE_MODES`。省略はふつうの応答）。 */
   readonly tokenResponse?: SpaTokenResponseMode;
   /** T36b: token の送信の前に、ログインの記録の POST を送る（`SPA_SIDE_REQUEST_BODIES`。省略は送らない）。 */
@@ -449,6 +579,12 @@ export interface SpaAuthSiteOptions {
   readonly nativeFormSubmit?: boolean;
   /** T36R-fix: ログインの画面の形（`SPA_LOGIN_LAYOUTS`。省略は今の `/auth`）。 */
   readonly loginLayout?: SpaLoginLayout;
+  /**
+   * OP-K（K3。本物のテスト環境の形）: ログインの画面の 3 つの欄（今の `/auth` の form）を、HTML に置かず、画面の設定（`SPA_APP_PATHS.appConfig`。サーバは
+   * `SPA_DEFERRED_LOGIN_FORM_DELAY_MS` だけ遅らせて答える）を読んだ後に、スクリプトが描く（読み込みの直後には、欄がない）。セレクタは `SPA_LOGIN_FIELDS` のまま。
+   * `loginLayout` とは一緒に使わない。指定のないときの画面と振る舞いは変えない。
+   */
+  readonly deferredLoginForm?: boolean;
   /** T37b: 会員の登録と更新の画面の形（`SPA_MEMBER_SCREEN_LAYOUTS`。省略は今の form の画面）。 */
   readonly memberScreenLayout?: SpaMemberScreenLayout;
   /** T37b: form のない会員の画面の、保存の敵対的な送り方（`SPA_HOSTILE_MEMBER_SAVES`。指定すると画面の形は `formless`）。 */
@@ -463,23 +599,6 @@ export interface SpaAuthSiteOptions {
    * 画面の形は `formless`）。同じ画面で 2 回押したときの型の digest を確かめる。
    */
   readonly secondSaveButton?: boolean;
-  /**
-   * DEF-142: form のない会員の画面の先頭に、文字のないボタン（`SPA_ICON_BUTTON_COUNT` 個。listener はあるが何も送らない）を置き、保存のボタンの前に
-   * 見えないボタン（`SPA_HIDDEN_PRESS_TARGET_WORDS`）を置く（省略は置かない。指定すると画面の形は `formless`）。probe の押す順を確かめる。
-   */
-  readonly pressPriorityTargets?: boolean;
-  /**
-   * DEF-144: form のない会員の画面の保存のボタンの前に、押すとページの JS が外部スキームへ移るボタン（`SPA_EXTERNAL_SCHEME_BUTTON`）を置く（省略は置かない。
-   * 指定すると画面の形は `formless`）。
-   */
-  readonly externalSchemeButton?: boolean;
-  /**
-   * DEF-145: form のない会員の画面の欄と保存のボタンを、閉じたダイアログ（`<dialog>`）の中に置き、その後ろに、押すとダイアログを開くボタン
-   * （`SPA_DIALOG_OPEN_BUTTON`。登録の語）を置く（省略は置かない。指定すると画面の形は `formless`）。
-   */
-  readonly saveInDialog?: boolean;
-  /** DEF-147: form のない会員の画面に、公開の状態の欄（`SPA_PUBLICATION_STATUS_FIELD`）を置き、保存の本文に入れる（指定すると画面の形は `formless`）。 */
-  readonly publicationStatusField?: boolean;
   /** T39d: form のない会員の画面の、入力と押下の部品への敵対的な形（`SPA_HOSTILE_MEMBER_INPUTS`。指定すると画面の形は `formless`）。 */
   readonly hostileMemberInput?: SpaHostileMemberInput;
   /**
@@ -488,6 +607,34 @@ export interface SpaAuthSiteOptions {
    * 描く（データを後から API で描く画面。読めなければ `data-state` を `error` にして何も描かない）。
    */
   readonly memberDetailPage?: boolean;
+  /**
+   * OP-R（設計書 `2026-10-27-beaksight-one-pass-flow-design.md` 4.1.9 の R1・R2）: 会員の一覧の画面（`SPA_MEMBER_LIST_PATH`。登録の画面の 1 つ上。本物のテスト環境の
+   * SPA の形）を出す（省略は出さない）。画面の骨組みは空の表で、スクリプトが手続きの呼び出し（`SPA_BACKEND_PATHS.rpcListMembers` への POST）で読んだ会員を、
+   * 行（番号・名前・メールアドレス）として後から描く。各行に「編集」のボタンがあり、押すとモーダル（`dialog`）が開いて名前の欄に値が入る。モーダルの「保存」で、
+   * `PATCH /rest/v1/members?id=eq.<番号>`（本文は名前だけ）を送る。
+   */
+  readonly memberListPage?: boolean;
+  /**
+   * DEF-190（一覧の行の更新の設計書 5.8。実テスト環境の形）: 会員の一覧の画面（`memberListPage` と同じ画面。指定すると一覧の画面を出し、会員の画面の形は
+   * `formless`）の「編集」のボタン（リンクでない）を押すと、モーダルを開かずに、ページのスクリプトが一覧の 1 つ下の編集の画面（`spaMemberDetailPathOf`。
+   * `/admin/members/<番号>`）へ `location.href` で移る。その画面は form のない更新の画面（保存のボタンは登録の画面と同じ語・同じ作り）で、保存で
+   * `PATCH /rest/v1/members?id=eq.<番号>` を送る。編集の画面へのリンクは、一覧の画面にない。省略は今のまま（モーダル）。`memberDetailPage` とは同時に使わない。
+   * DEF-208-3（設計書 `2026-11-05-beaksight-discovery-coverage-design.md` 3.5 の G）: `'NEW_TAB'` は、同じ編集の画面を `window.open` の別の page で開く（凍結の間は
+   * Guard が別の page を閉じ、一覧の画面の URL は変わらない）。
+   */
+  readonly memberListEditMovesAway?: boolean | 'NEW_TAB';
+  /**
+   * DEF-198（一覧の行の更新の設計書 5.9。実テスト環境の形）: form のない会員の画面の保存に、所属の絞り込みと本文の鍵を足す。登録の POST の本文に、ページが
+   * 入れる所属の鍵（`SPA_MEMBER_TENANT_KEY` = `SPA_MEMBER_TENANT_VALUE`）。更新の PATCH は `id=eq.<番号>&<所属の鍵>=eq.<所属の値>&select=…` で、本文に
+   * 番号の鍵 `id` と所属の鍵（ページが入れる値）。サーバは、行の所属（登録の本文の値。`addMember` の行は `SPA_MEMBER_TENANT_VALUE`）と、所属の絞り込みが
+   * ちょうど 1 つの `eq.` で一致し、番号の絞り込みがちょうど 1 つで、`or` がないときだけ更新する（ほかは空の一覧）。省略は今のまま。
+   */
+  readonly memberTenantFilter?: boolean;
+  /**
+   * DEF-203（一覧の行の更新の設計書 5.10）: `memberTenantFilter` の登録の POST と更新の PATCH の本文に、ページが入れる欄と結びつかない鍵
+   * （`SPA_MEMBER_EXTRA_KEY_VALUES`。登録と更新で同じ値）を足す。崩し方は `SPA_MEMBER_EXTRA_KEY_SAVE_MODES`。省略は足さない。
+   */
+  readonly memberTenantExtraKeys?: boolean;
   /**
    * T37d fix round 1: 管理画面が、一覧を描いた後に、一覧の手続きの呼び出し（`SPA_BACKEND_PATHS.rpcListMembers`。`rpcReads` のときだけ）をもう 1 回出す
    * （結果は見ない。登録した読み取りの手続きの呼び出しの、1 回の読み込みあたりの回数の上限を確かめる）。省略は出さない。
@@ -510,7 +657,7 @@ export interface SpaAuthSiteOptions {
   readonly sessionLossPage?: SpaSessionLossPage;
   /**
    * T44c（Task 44 の設計書 P1-4。実テスト環境の形）: 管理画面の一覧の表を、高さを決めた内側のスクロールの領域（`SPA_INNER_SCROLL_CONTAINER`）に入れ、その中に
-   * 背の高い余白を置く（文書は画面に収まり、内側の領域だけがスクロールできる。`INNER_SCROLL_CONTAINER_NOT_TRAVERSED` になる形）。省略は今の画面。
+   * 背の高い余白を置く（文書は画面に収まり、内側の領域だけがスクロールできる。DEF-207 の前は `INNER_SCROLL_CONTAINER_NOT_TRAVERSED` になった形）。省略は今の画面。
    */
   readonly innerScrollList?: boolean;
   /**
@@ -531,10 +678,91 @@ export interface SpaAuthSiteOptions {
   readonly crowdedEditScreen?: boolean;
   /**
    * T44c（実テスト環境の形）: form のない登録の画面だけ、欄と保存のボタンを閉じたダイアログの中に置き、その後ろに開くボタン（`SPA_DIALOG_OPEN_BUTTON`）を
-   * 置く（`saveInDialog` と同じ形を、登録の画面だけに当てる。指定すると画面の形は `formless`）。
+   * 置く（指定すると画面の形は `formless`）。
    */
   readonly createSaveInDialog?: boolean;
+  /**
+   * ARR-2（DEF-226。設計書 `2026-11-08-beaksight-api-array-keys-design.md` 7 章）: form のない登録の画面に札の欄（`SPA_ARRAY_KEYS.labelFieldId`）を置き、保存の
+   * 本文に一覧の鍵を 3 つ入れる（札の欄の文字がそのまま入る `labels: ["<値>"]`、ページが決める `holders: ["u-1"]` と空の `makers: []`）。指定すると画面の形は
+   * `formless`。更新の画面は変えない。
+   */
+  readonly memberArrayKeys?: boolean;
+  /**
+   * ARR-3（DEF-234。設計書 `2026-11-09-beaksight-api-array-rows-design.md` 6 章）: form のない登録の画面に、入力の行がいくつもある欄を置き、保存の本文に
+   * 行の値の一覧を入れる（`SPA_ARRAY_ROWS`。一般の文言）。指定すると画面の形は `formless`。更新の画面は変えない。
+   * - `real1`: 資格の行 1 つと免許の行 1 つ。本文は `quals: [<資格>, ""]`・`licenses: [<免許>, ""]`（後ろに空の行）。
+   * - `autoTrailBox`: 資格の行 1 つを行の入れ物（別の親）に置き、最後の行に文字を入れると空の行が足される。本文は `quals: [<行の値>…]`。
+   * - `twoBoth`: 資格の行 2 つ。本文は `quals: [<資格 1>, <資格 2>]`（欄の印が 2 つ入る一覧）。
+   * - ARR-4: `twoBothSkip`: `twoBoth` と同じ欄で、空の行を送らない（`quals` は空でない値だけ）。`four`: 得意の行 4 つ。本文は
+   *   `skills: [<得意 1>, …, <得意 4>, ""]`。崩した送り方は `four` では `skills`、ほかは `quals` を崩す。
+   * - ARR-5: `objRows`（職歴の行 2 つ。本文は `careers: [{ name, year }, …]`）、`objSkip`（行 3 つ。空の行を送らない）、`objAdd`（行 1 つと「追加」）、
+   *   `objTrail`（行 2 つと、後ろに空の行 `{ name: "", year: "" }`）。崩した送り方は `careers` を崩す（object の行は中の値ごと）。
+   * - DEF-237: `autoTrail`: 資格の行 1 つを、ほかの欄と同じ親に置き、最後の行に文字を入れると、同じ親の備考の欄の前に空の行が足される（後ろの欄と保存の
+   *   ボタンの位置の道がずれる）。本文は `certs: [<行の値>…]`（鍵は名前・メールアドレスより前に並ぶ名前にして、書き込みの段でも先に入れる）。崩した送り方は
+   *   `certs` を崩す。
+   */
+  readonly memberArrayRows?: SpaArrayRowsLayout;
 }
+
+/** ARR-2: `memberArrayKeys` の札の欄の ID と、ページが決める一覧の値。 */
+export const SPA_ARRAY_KEYS = Object.freeze({ labelFieldId: 'label', holderId: 'u-1', otherHolderId: 'u-2', extraLabel: 'extra' } as const);
+
+/** ARR-3: `memberArrayRows` の画面の形。 */
+export const SPA_ARRAY_ROWS_LAYOUTS = Object.freeze([
+  'real1', 'autoTrailBox', 'twoBoth', 'twoBothSkip', 'four', 'objRows', 'objSkip', 'objAdd', 'objTrail',
+  // ARR-5 fix round 1（SREV-ARR2 の C1）: 行の中に `purged: null`・`delete: ""` を入れる形（承認が拒む）。
+  'objPurged', 'objDelete',
+  // DEF-237: 入れると、同じ親の前の位置に行が足される形。
+  'autoTrail',
+] as const);
+export type SpaArrayRowsLayout = (typeof SPA_ARRAY_ROWS_LAYOUTS)[number];
+/** ARR-3: `memberArrayRows` の行の欄の ID と、ページが崩すときに入れる値。 */
+export const SPA_ARRAY_ROWS = Object.freeze({
+  qualFieldIds: ['qual-0', 'qual-1'],
+  licenseFieldId: 'lic-0',
+  skillFieldIds: ['sk-0', 'sk-1', 'sk-2', 'sk-3'],
+  addRowButtonId: 'add-row',
+  extraInnerKey: 'role',
+  otherValue: 'other-value',
+  filledValue: 'filled-by-page',
+} as const);
+
+/** ARR-3: `memberArrayRows` の行の欄（行の種類 `data-row`、最後の行に文字を入れると空の行を足す印 `data-auto`）。 */
+const arrayRowFieldOf = (id: string, row: string, label: string, auto = false): string =>
+  `<label>${label} <input id="${id}" name="${id}" data-row="${row}"${auto ? ' data-auto="1"' : ''}></label>`;
+
+/** ARR-3: `memberArrayRows` の行の欄の HTML（備考の欄の前に置く）。 */
+const arrayRowsHtmlOf = (layout: SpaArrayRowsLayout): string => {
+  const [qual0, qual1] = SPA_ARRAY_ROWS.qualFieldIds;
+  switch (layout) {
+    case 'real1':
+      return arrayRowFieldOf(qual0, 'qual', '資格') + arrayRowFieldOf(SPA_ARRAY_ROWS.licenseFieldId, 'lic', '免許');
+    case 'autoTrailBox':
+      return `<div id="qual-box">${arrayRowFieldOf(qual0, 'qual', '資格', true)}<div id="rows-end"></div></div>`;
+    // DEF-237: 行の入れ物を置かない（足される行は、ほかの欄と同じ親の、備考の欄の前に入る）。
+    case 'autoTrail':
+      return `${arrayRowFieldOf(qual0, 'qual', '資格', true)}<div id="rows-end"></div>`;
+    case 'twoBoth':
+    case 'twoBothSkip':
+      return arrayRowFieldOf(qual0, 'qual', '資格 1') + arrayRowFieldOf(qual1, 'qual', '資格 2');
+    case 'four':
+      return SPA_ARRAY_ROWS.skillFieldIds.map((id, index) => arrayRowFieldOf(id, 'skill', `得意 ${String(index + 1)}`)).join('');
+    // ARR-5: 職歴の行（名前と年。行ごとに `data-obj`）。objAdd は行 1 つと「追加」（押すと、行の入れ物の終わりの前に行を足す）。
+    case 'objRows':
+    case 'objTrail':
+    case 'objPurged':
+    case 'objDelete':
+      return [0, 1].map(careerRowOf).join('');
+    case 'objSkip':
+      return [0, 1, 2].map(careerRowOf).join('');
+    case 'objAdd':
+      return `${careerRowOf(0)}<button type="button" id="${SPA_ARRAY_ROWS.addRowButtonId}">追加</button><div id="rows-end"></div>`;
+  }
+};
+
+/** ARR-5: 職歴の行 1 つ（名前と年の欄）。 */
+const careerRowOf = (index: number): string => `<div data-obj="career"><label>職歴の名前 <input id="cn-${String(index)}" name="cn-${String(index)}" data-k="name"></label>`
+  + `<label>年 <input id="cy-${String(index)}" name="cy-${String(index)}" data-k="year"></label></div>`;
 
 /** T44c: `innerScrollList` の内側のスクロールの領域の ID、高さ（px）、中の余白の高さ（px）。 */
 export const SPA_INNER_SCROLL_CONTAINER = Object.freeze({ id: 'member-scroll', heightPx: 160, spacerPx: 3_000 } as const);
@@ -546,6 +774,11 @@ export const SPA_CLOSING_BEACON_EVENT = 'pagehide';
 export const SPA_CROWDED_ICON_BUTTON_COUNT = 6;
 /** T44c: `crowdedEditScreen` の、保存のボタンの後の道具のボタンの語（どれも登録・更新の語。保存と見えないボタンの語と重ならない。押しても何も送らない）。 */
 export const SPA_TOOLBAR_PRESS_WORDS = Object.freeze(['新規', '変更', '編集', '修正'] as const);
+
+/** OP-R: 会員の一覧の画面の path（`memberListPage` のときだけ出す。登録の画面 `SPA_APP_PATHS.memberNew` の 1 つ上）。 */
+export const SPA_MEMBER_LIST_PATH = '/admin/members';
+/** OP-R: 会員の一覧の画面の、行を描く表の ID と、モーダルの ID。 */
+export const SPA_MEMBER_LIST_ELEMENTS = Object.freeze({ table: 'member-list', dialog: 'member-edit-dialog' } as const);
 
 /** T37d: 会員の詳細の画面の path（`memberDetailPage` のときだけ出す）。 */
 export const spaMemberDetailPathOf = (id: number | string): string => `/admin/members/${id}`;
@@ -565,6 +798,8 @@ export interface SpaAuthSite {
   readonly tokenOrigin: string;
   /** 届いた要求（届いた順）。 */
   readonly requests: readonly SpaAuthSiteRequest[];
+  /** ARR-2: 届いた会員の登録（`POST /rest/v1/members`）の本文（JSON の object。届いた順）。 */
+  readonly memberCreateBodies: readonly Readonly<Record<string, unknown>>[];
   /** 正しい資格情報で token を出した回数（password）。 */
   readonly successfulLogins: number;
   /** token の更新に成功した回数。 */
@@ -615,6 +850,11 @@ export interface SpaAuthSite {
    * パスや危険な語に当たる場面を作る。
    */
   setMemberSaveRecordId(id: string | null): void;
+  /**
+   * L10: `markedRepresentation` の応答の本文の行に、この長さ（文字の数）の詰め物の項目を足す（null は足さない）。応答の本文が大きいときにも、登録の ID が
+   * 読めるかを確かめる。
+   */
+  setMemberSaveResponsePadding(length: number | null): void;
   /** T40b-2: 会員の詳細の画面の読み取りの形を替える（`SPA_MEMBER_DETAIL_RESPONSES`。null はふつうの画面）。 */
   setMemberDetailResponse(response: SpaMemberDetailResponse | null): void;
   /**
@@ -627,6 +867,23 @@ export interface SpaAuthSite {
    * `SPA_ABORTED_SAVE_RESPONSE_DELAY_MS` だけ遅らせる（初めは false。画面のスクリプトは次に読み込んだ画面から効く）。
    */
   setMemberSaveAborted(on: boolean): void;
+  /**
+   * OP-L（L1。本物のテスト環境の SPA の登録の画面の形）: form のない登録の画面が、欄と保存のボタンを、スクリプトの準備の後に `delayMs` だけ遅れて描く
+   * （null は遅らせない。初めは null。次に読み込んだ画面から効く）。描く前の画面には、欄も保存のボタンもない。
+   */
+  setMemberNewRenderDelay(delayMs: number | null): void;
+  /** OP-O（O2）: form のない会員の画面の、値を入れるときの振る舞い（`SPA_MEMBER_INPUT_QUIRKS`。null は今のまま。初めは null。次に読み込んだ画面から効く）。 */
+  setMemberInputQuirk(quirk: SpaMemberInputQuirk | null): void;
+  /** DEF-198: 所属の絞り込みのある保存の送り方（`SPA_MEMBER_TENANT_SAVE_MODES`。null はふつう。次に読み込んだ画面から効く）。 */
+  setMemberTenantSaveMode(mode: SpaMemberTenantSaveMode | null): void;
+  /**
+   * OP-M（本物のテスト環境の、値を入れた後に承認した送信のほかの要求が出た形）: form のない会員の画面のスクリプトが、3 つの欄がそろった入力の事象で、押されなくても
+   * 承認した送信のほかの要求を 1 回ずつ出す（初めは false。次に読み込んだ画面のスクリプトから効く）: 入力の確かめの読み取りの手続きの呼び出し（バックエンドへの
+   * POST。本文にメールアドレスの値）、使われ方の記録（アプリの Origin への `navigator.sendBeacon`。値を持たない）、承認していない Origin への使われ方の記録（GET）。
+   */
+  setMemberSideRequestsOnInput(on: boolean): void;
+  /** OP-N: form のない登録の画面のスクリプトが自動で出す通信の形（`SpaMemberAutoRequests`。null は出さない。初めは null。次に読み込んだ画面から効く）。 */
+  setMemberAutoRequests(mode: SpaMemberAutoRequests | null): void;
   /** T41d: form のない更新の画面のスクリプトが、更新の本文に読んだ値から変わった鍵だけを入れる（初めは false。次に読み込んだ画面から効く）。 */
   setMemberUpdateChangedOnly(on: boolean): void;
   /** T41d: サーバが、更新のたびに備考（保つ欄）を `SPA_SERVER_SIDE_EFFECT_NOTE` で始まる回ごとに違う値に変える（初めは false）。 */
@@ -640,6 +897,16 @@ export interface SpaAuthSite {
   setMemberValuesDelayed(on: boolean, delayMs?: number): void;
   /** T41R-fix: ID の絞り込みの読み取り（`GET /rest/v1/members?id=eq.<id>`）の応答を `delayMs` だけ遅らせる（null は遅らせない。初めは null）。 */
   setMemberDetailDelay(delayMs: number | null): void;
+  /**
+   * OP-Q（設計書 `2026-10-27-beaksight-one-pass-flow-design.md` 4.1.8 の Q1。本物のテスト環境の形）: 会員の詳細の画面が、項目を、GET の代わりにデータを取る手続きの
+   * 呼び出し（`SPA_BACKEND_PATHS.rpcGetMember` への POST）で読む（初めは false。次に読み込んだ画面のスクリプトから効く）。
+   */
+  setMemberDetailRpcRead(on: boolean): void;
+  /**
+   * OP-REV6 の I-1: 一覧の手続きの呼び出し（`SPA_BACKEND_PATHS.rpcListMembers`）が返す会員を、先頭からこの数までにする（null は全部）。新しい登録が一覧に
+   * まだ出ない場面を作る（一覧には前の登録だけが並ぶ）。
+   */
+  setMemberListRpcLimit(count: number | null): void;
   /** T41R-fix: 更新の画面で、名前の欄の入力の事象のたびに、ページが備考（保つ欄）を `SPA_REWRITTEN_NOTE` に書き換える（初めは false。次に読み込んだ画面から効く）。 */
   setMemberKeptRewriteOnInput(on: boolean): void;
   /**
@@ -661,6 +928,8 @@ export interface SpaAuthSite {
   setMemberPlaceholderEmail(delayMs: number | null): void;
   /** T41R3-fix: 会員の値を、画面と API を通さずに直接変える（BeakSight の外で値が変わったレコードの準備）。 */
   setMemberValues(id: number, values: { readonly name?: string; readonly email?: string; readonly note?: string }): void;
+  /** TEST-TIME-B: どのサーバも、受けている途中の要求が 0 になるまで待つ（`loopback-server.ts` の `settleLateDeliveries` に渡す）。 */
+  whenIdle(limitMs?: number): Promise<void>;
   close(): Promise<void>;
 }
 
@@ -684,6 +953,16 @@ const AUTH_PAGE = pageHtml('ログイン', '<h1>ログイン</h1><form id="login
   + '<label>メールアドレス <input id="email" name="email" type="email" autocomplete="username"></label>'
   + '<label>パスワード <input id="password" name="password" type="password" autocomplete="current-password"></label>'
   + '<button id="login" type="submit">ログイン</button></form><p id="login-error" data-state="hidden" hidden></p><p id="tenant" data-state="none"></p>');
+
+/** OP-K（`deferredLoginForm`）: 画面の設定の応答を遅らせる時間（ms。ログインの画面を開いた直後の読み取りより長く、落ち着きの待ちが待てる長さ）。 */
+export const SPA_DEFERRED_LOGIN_FORM_DELAY_MS = 1_500;
+/** OP-K（`deferredLoginForm`）: 欄を描く前のログインの画面（欄を描く場所 `login-root` だけ）と、スクリプトが描く欄（今の `/auth` の form と同じ）。 */
+const DEFERRED_AUTH_PAGE = pageHtml('ログイン', '<h1>ログイン</h1><div id="login-root"></div>'
+  + '<p id="login-error" data-state="hidden" hidden></p><p id="tenant" data-state="none"></p>');
+const DEFERRED_LOGIN_FORM_HTML = '<form id="login-form">'
+  + '<label>メールアドレス <input id="email" name="email" type="email" autocomplete="username"></label>'
+  + '<label>パスワード <input id="password" name="password" type="password" autocomplete="current-password"></label>'
+  + '<button id="login" type="submit">ログイン</button></form>';
 
 /** T36R-fix: ログインの画面の形ごとの HTML（セレクタは `SPA_LOGIN_FIELDS`）。 */
 const LAYOUT_EMAIL = '<label>メールアドレス <input id="email" name="email" type="email" autocomplete="username"></label>';
@@ -724,6 +1003,12 @@ const memberFormHtml = (title: string, edit: boolean): string => pageHtml(title,
 
 const MEMBER_NEW_PAGE = memberFormHtml('会員の登録', false);
 const MEMBER_EDIT_PAGE = memberFormHtml('会員の更新', true);
+/** OP-R: 会員の一覧の画面（行はスクリプトが後から描く。「編集」で開くモーダルの名前の欄と保存のボタン）。 */
+const MEMBER_LIST_PAGE = pageHtml('会員の一覧', `<h1>会員の一覧</h1><p><a href="${SPA_APP_PATHS.memberNew}">会員の登録</a></p>`
+  + `<table id="${SPA_MEMBER_LIST_ELEMENTS.table}" data-state="loading"><thead><tr><th>ID</th><th>名前</th><th>メールアドレス</th><th>操作</th></tr></thead>`
+  + '<tbody></tbody></table>'
+  + `<dialog id="${SPA_MEMBER_LIST_ELEMENTS.dialog}"><h2>会員の編集</h2><label>名前 <input id="list-edit-name" type="text"></label>`
+  + '<button id="list-edit-save" type="button">保存</button></dialog>');
 /** T37d: 会員の詳細の画面（項目はスクリプトが後から描く）。 */
 const MEMBER_DETAIL_PAGE = pageHtml('会員の詳細', `<h1>会員の詳細</h1><dl id="${SPA_MEMBER_DETAIL_ELEMENT}" data-state="loading"></dl>`
   + '<p><a href="/admin">一覧へ</a></p>');
@@ -875,6 +1160,11 @@ const pages = {
     sendRum();
     // T36b: 送信を止めない画面（ブラウザがフォームを既定の GET で送る）。
     if (C.nativeFormSubmit) return;
+    // OP-K（deferredLoginForm）: 画面の設定を読んだ後に、欄を描く（読み込みの直後には欄がない）。
+    if (C.deferredLoginForm !== null) {
+      await send(C.appOrigin + C.paths.appConfig, {});
+      byId('login-root').innerHTML = C.deferredLoginForm;
+    }
     // 送信の受け手を先に付ける（手続きの呼び出しを待つ間に押されても、フォームをそのまま送らない）。
     const tenantUsable = resolveTenant();
     // T36R-fix: form の要素のない画面の形では、送信の要素を押したときに送る（form の送信の受け手は付けない）。
@@ -920,6 +1210,8 @@ const pages = {
       ? await send(C.backendOrigin + C.rpcListPath, { method: 'POST', headers: jsonHeaders(session), body: '{}' })
       : await send(membersUrl('select=*'), { headers: apiHeaders(session) });
     if (!response.ok) { setState(C.states.members, 'error'); return; }
+    // DEF-200: サーバが消させたら、ログインの状態を消して、ログインの画面へ移る（セッションの切れ）。
+    if (response.headers.get(C.clearSessionHeader) === '1') { localStorage.removeItem(C.storageKey); location.replace(C.paths.auth); return; }
     const tbody = byId(C.states.members).querySelector('tbody');
     for (const member of await response.json()) {
       const row = document.createElement('tr');
@@ -998,11 +1290,48 @@ const pages = {
       location.href = C.paths.admin;
     });
   },
+  // OP-R: 会員の一覧（手続きの呼び出しで読んだ会員を、後から行として描く。「編集」でモーダルを開き、保存で PATCH を送る）。
+  memberList: async () => {
+    const session = stored();
+    if (session === null) { location.replace(C.paths.auth); return; }
+    const response = await send(C.backendOrigin + C.rpcListPath, { method: 'POST', headers: jsonHeaders(session), body: '{}' });
+    if (!response.ok) { setState(C.memberList.table, 'error'); return; }
+    const tbody = byId(C.memberList.table).querySelector('tbody');
+    const dialog = byId(C.memberList.dialog);
+    let editing = null;
+    for (const member of await response.json()) {
+      const row = document.createElement('tr');
+      for (const text of [String(member.id), member.name, member.email]) {
+        const cell = document.createElement('td'); cell.textContent = text; row.append(cell);
+      }
+      const button = document.createElement('button'); button.type = 'button'; button.textContent = '編集';
+      button.addEventListener('click', () => {
+        // DEF-190: 一覧の 1 つ下の編集の画面へ移る（リンクでない。モーダルを開かない）。
+        if (C.memberList.editOpensNewTab) { window.open(C.memberList.path + '/' + String(member.id), '_blank'); return; }
+        if (C.memberList.editMovesAway) { location.href = C.memberList.path + '/' + String(member.id); return; }
+        editing = member.id; byId('list-edit-name').value = member.name; dialog.showModal();
+      });
+      const cell = document.createElement('td'); cell.append(button); row.append(cell);
+      tbody.append(row);
+    }
+    byId('list-edit-save').addEventListener('click', async () => {
+      if (editing === null) return;
+      await send(membersUrl('id=eq.' + editing), {
+        method: 'PATCH', headers: apiHeaders(session, { 'content-type': 'application/json', [C.prefer.name]: C.prefer.value }),
+        body: JSON.stringify({ name: byId('list-edit-name').value }),
+      });
+      dialog.close();
+    });
+    setState(C.memberList.table, 'loaded');
+  },
   // T37d: 会員の詳細（読んだ値を、後から dl の項目として描く）。
   memberDetail: async (id) => {
     const session = stored();
     if (session === null) { location.replace(C.paths.auth); return; }
-    const response = await send(membersUrl('id=eq.' + id), { headers: apiHeaders(session) });
+    // OP-Q: 手続きの呼び出しで読む形（detailRpcRead）。
+    const response = C.detailRpcRead
+      ? await send(C.backendOrigin + C.rpcGetMemberPath, { method: 'POST', headers: jsonHeaders(session), body: JSON.stringify({ id: Number(id) }) })
+      : await send(membersUrl('id=eq.' + id), { headers: apiHeaders(session) });
     const [member] = response.ok ? await response.json() : [];
     if (member === undefined) { setState(C.detail.element, 'error'); return; }
     const list = byId(C.detail.element);
@@ -1019,6 +1348,7 @@ const edit = /^\\/admin\\/members\\/([0-9]+)\\/edit$/u.exec(path);
 const detail = /^\\/admin\\/members\\/([0-9]+)$/u.exec(path);
 const route = () => {
   if (detail !== null) void pages.memberDetail(detail[1]);
+  else if (C.memberList.enabled && path === C.memberList.path) void pages.memberList();
   else if (edit !== null) void pages.memberEdit(edit[1]);
   else if (path === C.paths.auth) void pages.auth();
   else if (path === C.paths.logout) pages.logout();
@@ -1053,22 +1383,19 @@ const formlessMemberPageHtml = (
   extraPressTargets = 0,
   secondSaveButton = false,
   hostileInput: SpaHostileMemberInput | null = null,
-  pressPriorityTargets = false,
-  externalSchemeButton = false,
   saveInDialog = false,
-  publicationStatusField = false,
   crowded = false,
 ): string =>
   `<!doctype html><html lang="ja"><head><meta charset="utf-8"><title>${escapeHtml(title)}</title><link rel="icon" href="data:,">`
   + `<script src="${SPA_FORMLESS_MEMBER_PATHS.script}" defer></script></head><body><main><h1>${escapeHtml(title)}</h1>`
   + `<div id="${SPA_FORMLESS_MEMBER_BOX}" data-state="loading">`
-  // DEF-142: 先頭の文字のないボタン（アイコンだけ。押しても何も送らない）。T44c: `crowdedEditScreen` は `SPA_CROWDED_ICON_BUTTON_COUNT` 個。
-  + (pressPriorityTargets || crowded
-    ? Array.from({ length: crowded ? SPA_CROWDED_ICON_BUTTON_COUNT : SPA_ICON_BUTTON_COUNT }, (_value, index) => `<button type="button" data-icon="${String(index + 1)}">`
+  // T44c: `crowdedEditScreen` の、先頭の文字のないボタン（アイコンだけ。押しても何も送らない。`SPA_CROWDED_ICON_BUTTON_COUNT` 個）。
+  + (crowded
+    ? Array.from({ length: SPA_CROWDED_ICON_BUTTON_COUNT }, (_value, index) => `<button type="button" data-icon="${String(index + 1)}">`
       + '<svg width="16" height="16" aria-hidden="true"><rect width="16" height="16"></rect></svg></button>').join('')
     : '')
-  // DEF-145: 欄と保存のボタンを閉じたダイアログの中に置き、その後ろに、ダイアログを開くボタン（登録の語）を置く（ダイアログが文書の先にある形。文書の順で
-  // 押すと、保存は開く前に見えないまま飛ばされる）。
+  // T44c（`createSaveInDialog`）: 欄と保存のボタンを閉じたダイアログの中に置き、その後ろに、ダイアログを開くボタン（登録の語）を置く（ダイアログが文書の先に
+  // ある形。文書の順で押すと、保存は開く前に見えないまま飛ばされる）。
   + (saveInDialog ? `<dialog id="${SPA_DIALOG_OPEN_BUTTON.dialogId}">` : '')
   + '<label>名前 <input id="name" name="name"></label>'
   + '<label>メールアドレス <input id="member-email" name="email" type="email"></label>'
@@ -1076,19 +1403,6 @@ const formlessMemberPageHtml = (
   + (hostileInput === 'hiddenField' ? '<label style="display:none">備考 <input id="note" name="note"></label>' : '<label>備考 <input id="note" name="note"></label>')
   // T39d: `duplicateName` は名前の欄と同じ name の欄をもう 1 つ持つ。
   + (hostileInput === 'duplicateName' ? '<label>名前（控え） <input id="name-copy" name="name"></label>' : '')
-  // DEF-147: 公開の状態の欄（select）。
-  + (publicationStatusField
-    ? `<label>公開の状態 <select id="${SPA_PUBLICATION_STATUS_FIELD.id}" name="${SPA_PUBLICATION_STATUS_FIELD.id}">`
-      + SPA_PUBLICATION_STATUS_FIELD.options.map((value) => `<option value="${value}">${value === '' ? '選んでください' : escapeHtml(value)}</option>`).join('')
-      + '</select></label>'
-    : '')
-  // DEF-142: 保存のボタンの前の、見えないボタン（登録の語）。
-  + (pressPriorityTargets
-    ? SPA_HIDDEN_PRESS_TARGET_WORDS.map((word, index) =>
-      `<button type="button" style="display:none" data-hidden-target="${String(index + 1)}">${escapeHtml(word)}</button>`).join('')
-    : '')
-  // DEF-144: 保存のボタンの前の、押すとページの JS が外部スキームへ移るボタン（登録の語）。
-  + (externalSchemeButton ? `<button id="${SPA_EXTERNAL_SCHEME_BUTTON.id}" type="button">${escapeHtml(SPA_EXTERNAL_SCHEME_BUTTON.word)}</button>` : '')
   // T39d: `linkWrappedSubmit` は保存のボタンを `href` のあるリンクで包む。
   + (hostileInput === 'linkWrappedSubmit'
     ? `<a href="${SPA_APP_PATHS.admin}"><button id="save" type="button">保存</button></a>`
@@ -1115,6 +1429,21 @@ const formlessMemberPageHtml = (
   + '</div><p id="member" data-state="idle"></p><p><a href="/admin">一覧へ</a></p></main></body></html>';
 
 const FORMLESS_MEMBER_NEW_PAGE = formlessMemberPageHtml('会員の登録', false);
+
+/** OP-L（L1）: 遅れて描く登録の画面の、欄と保存のボタンを入れておく template の id。 */
+const SPA_MEMBER_NEW_FIELDS_TEMPLATE_ID = 'member-new-fields';
+/** OP-L（L1）: 登録の画面の、欄の箱の中身を template に移した形（描く前の画面には、欄も保存のボタンもない）。 */
+const deferredMemberNewPageOf = (page: string): string => {
+  const open = `<div id="${SPA_FORMLESS_MEMBER_BOX}" data-state="loading">`;
+  const close = '</div><p id="member"';
+  const start = page.indexOf(open);
+  const end = page.indexOf(close, start);
+  if (start < 0 || end < 0) {
+    throw new Error('the formless create page has no member box');
+  }
+  const inner = page.slice(start + open.length, end);
+  return `${page.slice(0, start)}<template id="${SPA_MEMBER_NEW_FIELDS_TEMPLATE_ID}">${inner}</template>${open}${page.slice(end)}`;
+};
 const FORMLESS_MEMBER_EDIT_PAGE = formlessMemberPageHtml('会員の更新', true);
 
 /** T37b: form のない会員の画面のスクリプト（押すと `fetch` で送る。敵対的な送り方は `C.hostile`）。設定は、起動のたびに作る値を JSON で先頭に入れる。 */
@@ -1128,9 +1457,65 @@ const stored = () => { const text = localStorage.getItem(C.storageKey); return t
 const apiHeaders = (session, extra) => Object.assign({ [C.apiKeyHeader]: C.apiKey, authorization: 'Bearer ' + session.access_token }, extra || {});
 const writeHeaders = (session, prefer) => apiHeaders(session, { 'content-type': 'application/json', [C.prefer.name]: prefer || C.prefer.value });
 const urlOf = (origin, path, query) => origin + path + (query === undefined ? '' : '?' + query);
-// DEF-147: 公開の状態の欄（画面にあるときだけ）も本文に入れる。
+// ARR-2: 札の欄（画面にあるときだけ）は、文字がそのまま一覧に入る。ページが決める一覧を 2 つ足す。
+const arrayKeysBody = () => (byId(C.arrayKeys.labelFieldId) === null ? {} : {
+  labels: byId(C.arrayKeys.labelFieldId).value ? [byId(C.arrayKeys.labelFieldId).value] : [], holders: [C.arrayKeys.holderId], makers: [],
+});
+// ARR-3: 行の欄（画面にあるときだけ）の値の一覧。real1 は後ろに空の行を足す。
+const rowValues = (row) => Array.from(document.querySelectorAll('[data-row="' + row + '"]')).map((element) => element.value);
+const arrayRowsBody = () => {
+  switch (C.arrayRows) {
+    case 'real1': return { quals: rowValues('qual').concat(['']), licenses: rowValues('lic').concat(['']) };
+    case 'autoTrailBox': case 'twoBoth': return { quals: rowValues('qual') };
+    // DEF-237: 名前・メールアドレスより前に並ぶ鍵。
+    case 'autoTrail': return { certs: rowValues('qual') };
+    // ARR-4: 空の行を送らない形と、4 つの欄の後ろに空の行。
+    case 'twoBothSkip': return { quals: rowValues('qual').filter((value) => value !== '') };
+    case 'four': return { skills: rowValues('skill').concat(['']) };
+    // ARR-5: 職歴の行（名前と年の object）。objSkip は空の行を送らない、objTrail は後ろに空の行を足す。
+    case 'objRows': case 'objAdd': return { careers: careerRows() };
+    case 'objSkip': return { careers: careerRows().filter((row) => row.name !== '' || row.year !== '') };
+    case 'objTrail': return { careers: careerRows().concat([{ name: '', year: '' }]) };
+    // ARR-5 fix round 1（SREV-ARR2 の C1）: 行の中に論理削除・削除の語の鍵を空の値で入れる形。
+    case 'objPurged': return { careers: careerRows().map((row) => Object.assign({}, row, { purged: null })) };
+    case 'objDelete': return { careers: careerRows().map((row) => Object.assign({}, row, { delete: '' })) };
+    default: return {};
+  }
+};
+// ARR-5: 職歴の行の値（行ごとに名前と年）。
+const careerRows = () => Array.from(document.querySelectorAll('[data-obj="career"]'))
+  .map((row) => ({ name: row.querySelector('[data-k="name"]').value, year: row.querySelector('[data-k="year"]').value }));
+// ARR-3・ARR-4・ARR-5: ページが崩す行の一覧の鍵。
+const rowsKey = () => (C.arrayRows === 'four' ? 'skills' : C.arrayRows === 'autoTrail' ? 'certs' : String(C.arrayRows).startsWith('obj') ? 'careers' : 'quals');
+// ARR-5: objAdd の「追加」は、行の入れ物の終わりの前に職歴の行を足す（送らない）。
+if (C.arrayRows === 'objAdd') {
+  document.addEventListener('click', (event) => {
+    const target = event.target;
+    if (!target || target.id !== C.arrayRowValues.addRowButtonId) return;
+    const index = String(document.querySelectorAll('[data-obj="career"]').length);
+    byId('rows-end').insertAdjacentHTML('beforebegin', '<div data-obj="career"><label>職歴の名前 <input id="cn-a' + index + '" name="cn-a' + index
+      + '" data-k="name"></label><label>年 <input id="cy-a' + index + '" name="cy-a' + index + '" data-k="year"></label></div>');
+  });
+}
+// ARR-5: 行の値 1 つを崩す（object の行は中の値ごと）。
+const changedValue = (value, change) => (value !== null && typeof value === 'object' && !Array.isArray(value)
+  ? Object.fromEntries(Object.entries(value).map(([key, inner]) => [key, change(inner)]))
+  : change(value));
+// ARR-3: autoTrailBox は、最後の行に文字を入れると、行の入れ物の終わりの前に空の行を足す。DEF-237: autoTrail は、同じ親の備考の欄の前に足す。
+if (C.arrayRows === 'autoTrailBox' || C.arrayRows === 'autoTrail') {
+  document.addEventListener('input', (event) => {
+    const target = event.target;
+    if (!target || !target.dataset || target.dataset.auto !== '1' || target.value === '') return;
+    const rows = document.querySelectorAll('[data-row="qual"]');
+    if (rows[rows.length - 1] !== target) return;
+    const name = 'qual-t' + String(rows.length);
+    byId('rows-end').insertAdjacentHTML('beforebegin', '<label>資格 <input id="' + name + '" name="' + name + '" data-row="qual" data-auto="1"></label>');
+  });
+}
 const memberBody = () => Object.assign({ name: byId('name').value, email: byId('member-email').value, note: byId('note').value },
-  byId(C.publicationStatusFieldId) === null ? {} : { [C.publicationStatusFieldId]: byId(C.publicationStatusFieldId).value });
+  arrayKeysBody(), arrayRowsBody());
+// ARR-3: 行の一覧 quals を崩した本文。
+const rowsMutated = (change) => { const body = memberBody(); return Object.assign(body, { [rowsKey()]: change(body[rowsKey()] || []) }); };
 // T41d: 更新の画面で読んだ値（\`changedOnly\` の、変わった鍵だけを送る形に使う）。
 let loadedValues = null;
 const changedOnlyBody = (body) => (C.changedOnly && loadedValues !== null
@@ -1144,9 +1529,50 @@ const sendSave = (url, init) => {
   return fetch(url, Object.assign({}, init, { signal: controller.signal })).catch(() => NETWORK_FAILURE);
 };
 // ふつうの要求（登録は POST、更新は ID の filter の PATCH）。origin と本文を差し替えられる。
-const ordinary = (session, id, origin, body) => sendSave(urlOf(origin, C.membersPath, id === null ? undefined : 'id=eq.' + id), {
-  method: id === null ? 'POST' : 'PATCH', headers: writeHeaders(session), body: JSON.stringify(id === null ? body : changedOnlyBody(body)),
-});
+// DEF-198: 所属の絞り込みのある保存（\`C.tenantFilter\`）。登録の本文にページが所属の鍵を入れ、更新は番号と所属の絞り込みと本文の鍵（\`C.tenantMode\` で崩す）。
+const TENANT_SELECT = 'select=id,name,email,note';
+const tenantQueryOf = (id) => {
+  const own = C.tenantKey + '=eq.' + C.tenantValue;
+  switch (C.tenantMode) {
+    case 'otherTenant': case 'bothOtherTenant': return 'id=eq.' + id + '&' + C.tenantKey + '=eq.' + C.otherTenantValue + '&' + TENANT_SELECT;
+    case 'neqTenant': return 'id=eq.' + id + '&' + C.tenantKey + '=neq.' + C.tenantValue + '&' + TENANT_SELECT;
+    case 'inTenant': return 'id=eq.' + id + '&' + C.tenantKey + '=in.(' + C.tenantValue + ',' + C.otherTenantValue + ')&' + TENANT_SELECT;
+    case 'orExtra': return 'id=eq.' + id + '&' + own + '&or=(id.eq.' + id + ',id.eq.1)&' + TENANT_SELECT;
+    case 'duplicateTenant': return 'id=eq.' + id + '&' + own + '&' + C.tenantKey + '=eq.' + C.otherTenantValue + '&' + TENANT_SELECT;
+    case 'duplicateId': return 'id=eq.' + id + '&id=eq.1&' + own + '&' + TENANT_SELECT;
+    case 'otherId': return 'id=eq.1&' + own + '&' + TENANT_SELECT;
+    case 'missingTenant': return 'id=eq.' + id + '&' + TENANT_SELECT;
+    case 'unapprovedFilter': return 'id=eq.' + id + '&' + own + '&group_id=eq.5&' + TENANT_SELECT;
+    default: return 'id=eq.' + id + '&' + own + '&' + TENANT_SELECT;
+  }
+};
+// DEF-203: 欄と結びつかない鍵（\`C.extraKeys\`。更新では \`C.tenantMode\` で崩す）。
+const extraKeysOf = (update) => {
+  if (C.extraKeys === null) return {};
+  const extras = Object.assign({}, C.extraKeys);
+  if (!update) return extras;
+  switch (C.tenantMode) {
+    case 'extraFlippedBoolean': extras.pinned = !extras.pinned; break;
+    case 'extraOtherString': extras.label = extras.label + '-other'; break;
+    case 'extraNullToString': extras.picture = 'https://example.invalid/a.png'; break;
+    case 'extraAddedKey': extras.rank = 1; break;
+    default: break;
+  }
+  return extras;
+};
+const tenantBodyOf = (id, body) => (id === null
+  ? Object.assign({}, body, { [C.tenantKey]: C.tenantValue }, extraKeysOf(false))
+  : Object.assign({}, changedOnlyBody(body), {
+    id: C.tenantMode === 'bodyOtherId' ? Number(id) + 1 : Number(id),
+    [C.tenantKey]: C.tenantMode === 'bodyOtherTenant' || C.tenantMode === 'bothOtherTenant' ? C.otherTenantValue : C.tenantValue,
+  }, extraKeysOf(true)));
+const ordinary = (session, id, origin, body) => (C.tenantFilter
+  ? sendSave(urlOf(origin, C.membersPath, id === null ? undefined : tenantQueryOf(id)), {
+    method: id === null ? 'POST' : 'PATCH', headers: writeHeaders(session), body: JSON.stringify(tenantBodyOf(id, body)),
+  })
+  : sendSave(urlOf(origin, C.membersPath, id === null ? undefined : 'id=eq.' + id), {
+    method: id === null ? 'POST' : 'PATCH', headers: writeHeaders(session), body: JSON.stringify(id === null ? body : changedOnlyBody(body)),
+  }));
 const save = async (session, id) => {
   const filter = id === null ? undefined : 'id=eq.' + id;
   switch (C.hostile) {
@@ -1180,14 +1606,48 @@ const save = async (session, id) => {
     case 'filterRewrite': return send(urlOf(C.backendOrigin, C.membersPath, id === null ? undefined : 'id=eq.' + String(Number(id) + 1)), {
       method: id === null ? 'POST' : 'PATCH', headers: writeHeaders(session), body: JSON.stringify(memberBody()),
     });
+    // ARR-2: 一覧の数・要素の型・入れ子・欄の一覧の値を変えて送る。
+    case 'arrayCountChanged': return ordinary(session, id, C.backendOrigin, Object.assign(memberBody(), { holders: [C.arrayKeys.holderId, C.arrayKeys.otherHolderId] }));
+    case 'arrayTypeChanged': return ordinary(session, id, C.backendOrigin, Object.assign(memberBody(), { holders: [1] }));
+    case 'arrayNested': return ordinary(session, id, C.backendOrigin, Object.assign(memberBody(), { holders: [[C.arrayKeys.holderId]] }));
+    case 'arrayFieldExtra': return ordinary(session, id, C.backendOrigin,
+      Object.assign(memberBody(), { labels: [byId(C.arrayKeys.labelFieldId).value, C.arrayKeys.extraLabel] }));
+    // ARR-3: 行の一覧 quals に要素を足す・減らす・順を変える・欄の位置に別の値を入れる・空の位置を埋める・入れ子にする。
+    case 'rowsAdded': return ordinary(session, id, C.backendOrigin, rowsMutated((rows) => rows.concat([rows[0] === undefined ? '' : rows[0]])));
+    case 'rowsDropped': return ordinary(session, id, C.backendOrigin, rowsMutated((rows) => rows.slice(0, -1)));
+    case 'rowsReordered': return ordinary(session, id, C.backendOrigin, rowsMutated((rows) => rows.slice().reverse()));
+    case 'rowsOtherValue': return ordinary(session, id, C.backendOrigin, rowsMutated((rows) => rows.map((row) =>
+      changedValue(row, (value) => (value === '' ? value : C.arrayRowValues.otherValue)))));
+    case 'rowsEmptyFilled': return ordinary(session, id, C.backendOrigin, rowsMutated((rows) => rows.map((row) =>
+      changedValue(row, (value) => (value === '' ? C.arrayRowValues.filledValue : value)))));
+    case 'rowsNested': return ordinary(session, id, C.backendOrigin, rowsMutated((rows) => rows.map((row) => changedValue(row, (value) => [value]))));
+    // ARR-5: object の行の中の鍵を足す・減らす。
+    case 'rowsInnerKeyAdded': return ordinary(session, id, C.backendOrigin, rowsMutated((rows) => rows.map((row) =>
+      Object.assign({}, row, { [C.arrayRowValues.extraInnerKey]: '' }))));
+    case 'rowsInnerKeyRemoved': return ordinary(session, id, C.backendOrigin, rowsMutated((rows) => rows.map((row) =>
+      Object.fromEntries(Object.entries(row).slice(1)))));
     default: return ordinary(session, id, C.backendOrigin, memberBody());
   }
 };
+// OP-N: 登録の画面のスクリプトが自動で出す通信（\`C.autoRequests\`。登録の画面だけ）。
+const autoOnNew = (mode) => C.autoRequests === mode && location.pathname === C.memberNewPath;
 const run = async () => {
   const session = stored();
   if (session === null) { location.replace(C.authPath); return; }
-  const edit = /^\\/admin\\/members\\/([0-9]+)\\/edit$/u.exec(location.pathname);
+  // DEF-190: 一覧の 1 つ下の編集の画面（/admin/members/<番号>。memberListEditMovesAway のときだけ出す）も更新の画面。
+  const edit = /^\\/admin\\/members\\/([0-9]+)(?:\\/edit)?$/u.exec(location.pathname);
   const id = edit === null ? null : edit[1];
+  if (autoOnNew('BEFORE_FILL')) {
+    void send(urlOf(C.backendOrigin, C.autoPaths.rpcStatus), { method: 'POST', headers: writeHeaders(session), body: JSON.stringify({ event: 'open' }) });
+    void send(urlOf(C.backendOrigin, C.autoPaths.previews, 'id=eq.1'), { method: 'DELETE', headers: writeHeaders(session) });
+    const widget = document.createElement('script');
+    widget.src = C.otherOrigin + C.autoPaths.widget;
+    document.head.append(widget);
+  }
+  if (autoOnNew('BEFORE_FILL_ENDPOINT')) {
+    void send(urlOf(C.backendOrigin, C.autoPaths.membersTrailingSlash), { method: 'POST', headers: writeHeaders(session), body: JSON.stringify({}) });
+    void send(urlOf(C.otherOrigin, C.autoPaths.outsideCollect), { method: 'POST', mode: 'no-cors', body: 'event=open' });
+  }
   if (id !== null) {
     const response = await send(urlOf(C.backendOrigin, C.membersPath, 'id=eq.' + id), { headers: apiHeaders(session) });
     const [member] = response.ok ? await response.json() : [];
@@ -1211,15 +1671,124 @@ const run = async () => {
     // T41R-fix: \`keptRewriteOnInput\` は、名前の欄の入力の事象のたびに、備考（保つ欄）を書き換える（押す直前の読み直しで見つける形）。
     if (C.keptRewriteOnInput) { byId('name').addEventListener('input', () => { byId('note').value = C.rewrittenNote; }); }
   }
+  // OP-L（L1）: 登録の画面の欄と保存のボタンを、準備の後に遅れて描く（本物のテスト環境の SPA の形）。
+  if (id === null && C.newRenderDelayMs !== null) {
+    await new Promise((resolve) => { setTimeout(resolve, C.newRenderDelayMs); });
+    const template = byId(C.newFieldsTemplateId);
+    if (template !== null) byId(C.box).append(template.content.cloneNode(true));
+  }
+  // OP-O（O2）: 値を入れるときの振る舞い（React などの SPA の形）。どれも、箱の入力の事象を受けて動く（欄を作り直しても受けられる）。
+  if (C.inputQuirk === 'numberField') {
+    const label = document.createElement('label');
+    label.textContent = '表示順 ';
+    const field = document.createElement('input');
+    Object.assign(field, { id: C.numberField.id, name: C.numberField.name, type: 'number', min: C.numberField.min, max: C.numberField.max, step: C.numberField.step });
+    label.append(field);
+    byId('save').before(label);
+  }
+  if (C.inputQuirk !== null) {
+    const box = byId(C.box);
+    const fieldsOf = () => Array.from(box.querySelectorAll('input, textarea, select'));
+    let rerendered = false;
+    const reverted = new Set();
+    box.addEventListener('input', (event) => {
+      const target = event.target;
+      if (C.inputQuirk === 'rerenderOnEveryInput' || (C.inputQuirk === 'rerenderOnFirstInput' && !rerendered)) {
+        rerendered = true;
+        for (const field of fieldsOf()) { const copy = field.cloneNode(true); copy.value = field.value; field.replaceWith(copy); }
+      } else if (C.inputQuirk === 'clearOnEveryInput' || (C.inputQuirk === 'revertOnFirstInput' && !reverted.has(target.id))) {
+        reverted.add(target.id);
+        target.value = '';
+      } else if (C.inputQuirk === 'numberField' && target.type === 'number' && target.value !== '' && Number.isFinite(Number(target.value))) {
+        target.value = String(Number(target.value));
+      }
+    });
+  }
   setState(C.box, 'ready');
-  byId('save').addEventListener('click', async () => {
+  const onSave = async () => {
     // T41R-fix-2: \`keptRewriteOnPress\` は、押したとき（保存の要求を組み立てる前）に備考（保つ欄）を書き換える。
     if (C.keptRewriteOnPress && id !== null) { byId('note').value = C.rewrittenNote; }
     const response = await save(session, id);
+    // OP-N: \`AFTER_PRESS\` は、保存の応答の後に、値のない手続きの呼び出しと、メールアドレスの値を本文に持つ呼び出しを 1 回ずつ出す。
+    if (autoOnNew('AFTER_PRESS')) {
+      // L12b: 応答の後、1 秒遅れて出す（書き込みの流れが、ページの送信が静まるまで待ってから Context を閉じることの確かめ）。
+      await new Promise((resolve) => setTimeout(resolve, 1000));
+      await send(urlOf(C.backendOrigin, C.autoPaths.rpcStatus), { method: 'POST', headers: writeHeaders(session), body: JSON.stringify({ event: 'saved' }) });
+      await send(urlOf(C.backendOrigin, C.rpcCheckMemberEmailPath), { method: 'POST', headers: writeHeaders(session), body: JSON.stringify({ email: byId('member-email').value }) });
+      // OP-REV3（C-2）: 値をヘッダに持つ POST と、値を Cookie に持つ POST（本文と URL には値がない）。
+      await send(urlOf(C.appOrigin, C.autoPaths.appSync, 'via=header'), { method: 'POST', headers: { [C.autoDraftHeader]: byId('member-email').value }, body: 'event=saved' });
+      document.cookie = C.autoDraftCookie + '=' + encodeURIComponent(byId('member-email').value) + '; path=/';
+      await send(urlOf(C.appOrigin, C.autoPaths.appSync, 'via=cookie'), { method: 'POST', body: 'event=saved' });
+    }
     setState(C.member, response.ok ? 'saved' : 'error');
-  });
+  };
+  byId('save').addEventListener('click', onSave);
+  // OP-P（P1・P2）: 3 つの欄がそろった入力の事象の後、遅れて 1 回だけ、保存のボタンか欄を作り直す（React の再描画。押す前に起きる）。
+  if (C.inputQuirk === 'rerenderSaveAfterFill' || C.inputQuirk === 'rerenderFieldsAfterFill' || C.inputQuirk === 'resetFieldsAfterFill') {
+    const fieldIds = ['name', 'member-email', 'note'];
+    let scheduled = false;
+    byId(C.box).addEventListener('input', () => {
+      if (scheduled || fieldIds.some((fieldId) => byId(fieldId).value === '')) return;
+      scheduled = true;
+      setTimeout(() => {
+        if (C.inputQuirk === 'rerenderSaveAfterFill') {
+          const save = byId('save');
+          const copy = save.cloneNode(true);
+          copy.addEventListener('click', onSave);
+          save.replaceWith(copy);
+          return;
+        }
+        for (const fieldId of fieldIds) {
+          const field = byId(fieldId);
+          const copy = field.cloneNode(true);
+          copy.value = C.inputQuirk === 'resetFieldsAfterFill' ? '' : field.value;
+          field.replaceWith(copy);
+        }
+      }, C.afterFillRerenderMs);
+    });
+  }
+  // OP-N: \`AFTER_FILL_*\` は、3 つの欄がそろった入力の事象で、押されなくても、決めた形の通信を 1 回出す（値を入れた後の通信）。
+  if (typeof C.autoRequests === 'string' && C.autoRequests.startsWith('AFTER_FILL_') && location.pathname === C.memberNewPath) {
+    let autoFillSent = false;
+    for (const fieldId of ['name', 'member-email', 'note']) {
+      byId(fieldId).addEventListener('input', () => {
+        if (autoFillSent || byId('name').value === '' || byId('member-email').value === '' || byId('note').value === '') return;
+        autoFillSent = true;
+        const email = byId('member-email').value;
+        if (C.autoRequests === 'AFTER_FILL_READS') {
+          void send(urlOf(C.appOrigin, C.appConfigPath, 'event=input'));
+          try {
+            const socket = new WebSocket(C.realtimeUrl);
+            socket.addEventListener('error', () => undefined);
+          } catch {
+            // つなげない接続は捨てる。
+          }
+        } else if (C.autoRequests === 'AFTER_FILL_MARKER_POST') {
+          void send(urlOf(C.backendOrigin, C.rpcCheckMemberEmailPath), { method: 'POST', headers: writeHeaders(session), body: JSON.stringify({ draft: { email } }) });
+        } else if (C.autoRequests === 'AFTER_FILL_PLAIN_POST') {
+          void send(urlOf(C.backendOrigin, C.autoPaths.rpcStatus), { method: 'POST', headers: writeHeaders(session), body: JSON.stringify({ event: 'input' }) });
+        } else if (C.autoRequests === 'AFTER_FILL_MARKER_GET') {
+          void send(urlOf(C.appOrigin, C.appConfigPath, 'email=' + encodeURIComponent(email)));
+        }
+      });
+    }
+  }
   // T40R-fix-A: \`saveOnInput\` は、3 つの欄（名前・メールアドレス・備考）がそろった入力の事象で、押されなくても保存の要求を 1 回送る（ページが値を入れる間に
   // 承認どおりの要求を出す形）。
+  // OP-M: sideRequestsOnInput は、3 つの欄がそろった入力の事象で、押されなくても、承認した送信のほかの要求を 1 回ずつ出す（入力の確かめの手続きの呼び出し、
+  // 使われ方の記録の beacon、承認していない Origin への使われ方の記録）。
+  if (C.sideRequestsOnInput) {
+    let sideSent = false;
+    for (const fieldId of ['name', 'member-email', 'note']) {
+      byId(fieldId).addEventListener('input', () => {
+        if (sideSent || byId('name').value === '' || byId('member-email').value === '' || byId('note').value === '') return;
+        sideSent = true;
+        void send(urlOf(C.backendOrigin, C.rpcCheckMemberEmailPath), { method: 'POST', headers: writeHeaders(session), body: JSON.stringify({ email: byId('member-email').value }) });
+        navigator.sendBeacon(C.appOrigin + C.rumPath, JSON.stringify({ event: 'input' }));
+        void send(urlOf(C.otherOrigin, C.otherCollectPath, 'event=input'), { mode: 'no-cors' });
+      });
+    }
+  }
   if (C.saveOnInput) {
     let autoSent = false;
     for (const fieldId of ['name', 'member-email', 'note']) {
@@ -1233,11 +1802,6 @@ const run = async () => {
   const opener = byId(C.dialogOpenButton.id);
   if (opener !== null) {
     opener.addEventListener('click', () => { byId(C.dialogOpenButton.dialogId).showModal(); });
-  }
-  // DEF-144: 外部スキームへ移るボタン（あるときだけ）。
-  const mail = byId(C.externalSchemeButton.id);
-  if (mail !== null) {
-    mail.addEventListener('click', () => { location.href = C.externalSchemeButton.href; });
   }
   const copy = byId(C.duplicateSaveButtonId);
   if (copy !== null) {
@@ -1265,7 +1829,7 @@ const run = async () => {
       void send(urlOf(C.backendOrigin, C.extraPathPrefix + extra.dataset.extra), { method: 'POST', headers: writeHeaders(session), body: JSON.stringify(memberBody()) });
     });
   }
-  // DEF-142: 文字のないボタン（押しても何も送らない）と、見えないボタン（押せないはず。押されたら別の path へ POST）。
+  // T44c: 文字のないボタン（押しても何も送らない）と、見えないボタン（押せないはず。押されたら別の path へ POST）。
   for (const icon of Array.from(document.querySelectorAll('[data-icon]'))) {
     icon.addEventListener('click', () => { icon.dataset.pressed = 'true'; });
   }
@@ -1323,6 +1887,7 @@ export async function startSpaAuthSite(options: SpaAuthSiteOptions = {}): Promis
     + `&${SPA_SESSION_LOSS_QUERY_NAMES.from}=${sessionLossFrom}`;
   const lifetimeMs = options.tokenLifetimeMs ?? SPA_DEFAULT_TOKEN_LIFETIME_MS;
   const requests: SpaAuthSiteRequest[] = [];
+  const memberCreateBodies: Record<string, unknown>[] = [];
   /** 有効な access token と、その期限（ms）。 */
   const accessTokens = new Map<string, number>();
   /** 使える refresh token（使ったら消す）。 */
@@ -1340,16 +1905,24 @@ export async function startSpaAuthSite(options: SpaAuthSiteOptions = {}): Promis
   let reusedRefreshes = 0;
   /** サーバの関数の呼び出し（`postLoginFunction`）と、計測の送信（`rumBeacon`）が届いた回数。 */
   let functionCalls = 0;
+  /** DEF-200: 認証の通った会員の一覧の読み取りの数（`clearSessionAtMemberReads` の番目を数える）。 */
+  let memberListReads = 0;
   let rumBeacons = 0;
   /** T44c: 閉じるときの計測の送信（`closingBeacon`）が届いた回数。 */
   let closingBeacons = 0;
   const origins: Partial<Record<SpaSiteOrigin, string>> = {};
   const originOf = (origin: SpaSiteOrigin): string => origins[origin] ?? '';
+  /** DEF-220: 画面のスクリプトがデータを送る Origin（`sameOriginBackend` ならアプリの Origin、ほかはバックエンド）。 */
+  const dataOrigin = (): string => originOf(options.sameOriginBackend === true ? 'app' : 'backend');
+  /** DEF-190・DEF-208-3: 一覧の「編集」で、一覧の 1 つ下の編集の画面へ移るか（同じ page か、別の page）。 */
+  const editMovesAway = options.memberListEditMovesAway === true || options.memberListEditMovesAway === 'NEW_TAB';
   /** T37b: form のない会員の画面を出すか（敵対的な保存の指定も、この形にする）。 */
   const formlessMemberScreens = options.memberScreenLayout === 'formless' || options.hostileMemberSave !== undefined
     || (options.extraPressTargets ?? 0) > 0 || options.secondSaveButton === true || options.hostileMemberInput !== undefined
-    || options.pressPriorityTargets === true || options.externalSchemeButton === true || options.saveInDialog === true
-    || options.publicationStatusField === true || options.crowdedEditScreen === true || options.createSaveInDialog === true;
+    || options.crowdedEditScreen === true || options.createSaveInDialog === true
+    || options.memberArrayKeys === true || options.memberArrayRows !== undefined || editMovesAway;
+  /** DEF-190: 一覧の画面を出すか（`memberListEditMovesAway` も一覧の画面を出す）。 */
+  const memberListEnabled = options.memberListPage === true || editMovesAway;
   /** T38c: 今の保存の送り方（起動の指定が初め。`setHostileMemberSave` で替える）。 */
   let hostileMemberSave: SpaHostileMemberSave | null = options.hostileMemberSave ?? null;
   /** T38R2-fix: `duplicateSubmit` のもう 1 つのボタンが保存の要求を 2 回送るか（`setDuplicateSaveSendsTwice` で替える）。 */
@@ -1359,11 +1932,26 @@ export async function startSpaAuthSite(options: SpaAuthSiteOptions = {}): Promis
   const memberSaveResponseMarker = `m${randomSecretValue()}`;
   /** T40b-2: 応答の本文の `id` の差し替え（`setMemberSaveRecordId`）と、詳細の画面の読み取りの形（`setMemberDetailResponse`）。 */
   let memberSaveRecordId: string | null = null;
+  /** L12b: 差し替えた ID → その登録の番号（`idFilterOf` が読む）。 */
+  const memberSaveRecordAliases = new Map<string, number>();
+  /** L10: 応答の本文の行に足す詰め物の長さ（`setMemberSaveResponsePadding`。null は足さない）。 */
+  let memberSaveResponsePadding: number | null = null;
   let memberDetailResponse: SpaMemberDetailResponse | null = null;
   /** T40R-fix-A: 入力の事象で保存の要求を出すか（`setMemberSaveOnInput`）。 */
   let memberSaveOnInput = false;
+  /** OP-M: 入力の事象で、承認した送信のほかの要求を出すか（`setMemberSideRequestsOnInput`）。 */
+  let memberSideRequestsOnInput = false;
+  /** OP-N: 登録の画面のスクリプトが自動で出す通信の形（`setMemberAutoRequests`）。 */
+  let memberAutoRequests: SpaMemberAutoRequests | null = null;
   /** T40R-fix-A: ふつうの保存の要求をページが送った直後に取り消すか（`setMemberSaveAborted`）。 */
   let memberSaveAborted = false;
+  /** OP-L（L1）: 登録の画面の欄を遅れて描く時間（`setMemberNewRenderDelay`）。 */
+  let memberNewRenderDelayMs: number | null = null;
+  /** OP-O（O2）: 値を入れるときの振る舞い（`setMemberInputQuirk`）。 */
+  let memberInputQuirk: SpaMemberInputQuirk | null = null;
+  /** DEF-198: 所属の絞り込みのある保存の送り方（`setMemberTenantSaveMode`）と、行ごとの所属（登録の本文の値）。 */
+  let memberTenantSaveMode: SpaMemberTenantSaveMode | null = null;
+  const memberTenants = new Map<number, unknown>();
   /** T41d: 更新の切り替え（本文を変えた鍵だけにする、サーバの副作用、応答の形、値を遅れて入れる）。 */
   let memberUpdateChangedOnly = false;
   let memberUpdateSideEffect = false;
@@ -1375,6 +1963,10 @@ export async function startSpaAuthSite(options: SpaAuthSiteOptions = {}): Promis
   let memberValuesDelayMs = SPA_MEMBER_VALUES_DELAY_MS;
   /** T41R-fix: ID の絞り込みの読み取りの応答の遅れ（ms。null は遅らせない）。 */
   let memberDetailDelayMs: number | null = null;
+  /** OP-Q: 会員の詳細の画面が、手続きの呼び出しで項目を読むか（`setMemberDetailRpcRead`）。 */
+  let memberDetailRpcRead = false;
+  /** OP-REV6 の I-1: 一覧の手続きの呼び出しが返す会員の数の上限（`setMemberListRpcLimit`。null は全部）。 */
+  let memberListRpcLimit: number | null = null;
   /** T41R-fix: 更新の画面で、名前の欄の入力の事象のたびに、ページが備考（保つ欄）を書き換えるか。 */
   let memberKeptRewriteOnInput = false;
   /** T41R-fix-2: 更新の画面で、押したときにページが備考（保つ欄）を書き換えるか。 */
@@ -1424,10 +2016,16 @@ export async function startSpaAuthSite(options: SpaAuthSiteOptions = {}): Promis
     response.end();
   };
 
-  /** `id=eq.<id>` の指定の ID（なければ null）。 */
+  /**
+   * `id=eq.<id>` の指定の ID（なければ null）。L12b（設計者の判断 2）: 応答の本文の `id` を差し替えた登録（`setMemberSaveRecordId`）の ID は、その登録の
+   * 番号として読む（長い ID の登録の後の、詳細の画面の READ の確かめ用）。
+   */
   const idFilterOf = (url: URL): number | null => {
     const value = url.searchParams.get('id');
-    return value !== null && /^eq\.[0-9]+$/u.test(value) ? Number(value.slice('eq.'.length)) : null;
+    if (value === null || !value.startsWith('eq.')) return null;
+    const aliased = memberSaveRecordAliases.get(value.slice('eq.'.length));
+    if (aliased !== undefined) return aliased;
+    return /^eq\.[0-9]+$/u.test(value) ? Number(value.slice('eq.'.length)) : null;
   };
 
   const memberFrom = (id: number, body: Record<string, unknown>, base: SpaMember | null): SpaMember => ({
@@ -1520,6 +2118,8 @@ export async function startSpaAuthSite(options: SpaAuthSiteOptions = {}): Promis
         }
         return;
       case 'POST': {
+        // ARR-2: 届いた登録の本文を記録する（応答の形によらない）。
+        if (body !== null) memberCreateBodies.push(body);
         // T40b-1: 応答の形の切り替え（省略はふつうの応答）。
         switch (memberSaveResponse) {
           case 'clientError':
@@ -1541,6 +2141,8 @@ export async function startSpaAuthSite(options: SpaAuthSiteOptions = {}): Promis
             break;
         }
         const created = memberFrom(nextMemberId, body ?? {}, null);
+        // DEF-198: 行の所属は、登録の本文の所属の鍵の値（ページが入れた値）。
+        if (options.memberTenantFilter === true) memberTenants.set(created.id, (body ?? {})[SPA_MEMBER_TENANT_KEY]);
         if (memberSaveResponse === 'noRecordId') {
           nextMemberId += 1;
           members.push(created);
@@ -1550,8 +2152,11 @@ export async function startSpaAuthSite(options: SpaAuthSiteOptions = {}): Promis
         if (memberSaveResponse === 'markedRepresentation') {
           nextMemberId += 1;
           members.push(created);
+          // L12b: 差し替えた ID を、この登録の番号として覚える（`idFilterOf`）。
+          if (memberSaveRecordId !== null) memberSaveRecordAliases.set(memberSaveRecordId, created.id);
           const answer = (): void => sendJson(response, STATUS_CREATED, [{
             ...created, ...(memberSaveRecordId === null ? {} : { id: memberSaveRecordId }), [SPA_MEMBER_SAVE_RESPONSE_MARKER_KEY]: memberSaveResponseMarker,
+            ...(memberSaveResponsePadding === null ? {} : { padding: 'p'.repeat(memberSaveResponsePadding) }),
           }]);
           // T40R-fix-A: ページが保存の要求を取り消す形では、応答を取り消しの後まで遅らせる。
           if (memberSaveAborted) {
@@ -1568,7 +2173,11 @@ export async function startSpaAuthSite(options: SpaAuthSiteOptions = {}): Promis
         return;
       }
       case 'PATCH': {
-        const index = members.findIndex((member) => member.id === id);
+        // DEF-198: 所属の絞り込み（AND）。所属の絞り込みがちょうど 1 つの `eq.` で行の所属と同じ、番号の絞り込みがちょうど 1 つ、`or` がないときだけ行に当たる。
+        const tenantValues = url.searchParams.getAll(SPA_MEMBER_TENANT_KEY);
+        const tenantMiss = options.memberTenantFilter === true && (tenantValues.length !== 1 || url.searchParams.getAll('id').length !== 1
+          || url.searchParams.has('or') || tenantValues[0] !== `eq.${String(memberTenants.get(id ?? -1) ?? SPA_MEMBER_TENANT_VALUE)}`);
+        const index = tenantMiss ? -1 : members.findIndex((member) => member.id === id);
         const current = members[index];
         // T41d: `emptyRows` は、会員を変えずに空の一覧を返す（更新した行がない）。誤りの応答と応答なしも、会員を変えない。
         if (current === undefined || memberUpdateResponse === 'emptyRows') {
@@ -1661,11 +2270,25 @@ export async function startSpaAuthSite(options: SpaAuthSiteOptions = {}): Promis
         return;
       }
       if (url.pathname === SPA_BACKEND_PATHS.members) {
+        // DEF-200: 決めた番目の一覧の読み取りで、画面にログインの状態を消させる（ヘッダを画面が読めるように出す）。
+        if (request.method === 'GET') {
+          memberListReads += 1;
+          if (options.clearSessionAtMemberReads?.includes(memberListReads) === true) {
+            response.setHeader(SPA_CLEAR_SESSION_HEADER, '1');
+            response.setHeader('access-control-expose-headers', SPA_CLEAR_SESSION_HEADER);
+          }
+        }
         handleMembers(request, response, url, body);
         return;
       }
       if (request.method === 'POST' && url.pathname === SPA_BACKEND_PATHS.rpcListMembers) {
-        sendJson(response, STATUS_OK, members);
+        sendJson(response, STATUS_OK, memberListRpcLimit === null ? members : members.slice(0, memberListRpcLimit));
+        return;
+      }
+      // OP-Q: 会員の詳細の画面の、データを取る手続きの呼び出し（本文の `id` の行だけ）。
+      if (request.method === 'POST' && url.pathname === SPA_BACKEND_PATHS.rpcGetMember) {
+        const id = Number(body?.['id']);
+        sendJson(response, STATUS_OK, members.filter((member) => member.id === id));
         return;
       }
       if (request.method === 'POST' && url.pathname === SPA_BACKEND_PATHS.rpcLogLogin) {
@@ -1684,6 +2307,16 @@ export async function startSpaAuthSite(options: SpaAuthSiteOptions = {}): Promis
   /** アプリの Origin の振る舞い（画面の HTML と、設定を入れたスクリプト）。 */
   const appListener = (request: IncomingMessage, response: ServerResponse): void => {
     const url = new URL(request.url ?? '/', originOf('app'));
+    // DEF-182: `sameOriginAuth` のときだけ、アプリの Origin の token の path を、バックエンドと同じ振る舞いで答える。
+    if (options.sameOriginAuth === true && url.pathname === SPA_BACKEND_PATHS.token) {
+      backendListener('app')(request, response);
+      return;
+    }
+    // DEF-220: `sameOriginBackend` のときだけ、データの path をバックエンドと同じ振る舞いで答える。
+    if (options.sameOriginBackend === true && SAME_ORIGIN_BACKEND_PATH_PREFIXES.some((prefix) => url.pathname.startsWith(prefix))) {
+      backendListener('app')(request, response);
+      return;
+    }
     const record = (bodyKeys: readonly string[]): void => {
       requests.push({
         origin: 'app', method: request.method ?? '', path: `${url.pathname}${url.search}`, headerNames: Object.keys(request.headers).sort(),
@@ -1726,12 +2359,23 @@ export async function startSpaAuthSite(options: SpaAuthSiteOptions = {}): Promis
         tokenPath: SPA_BACKEND_PATHS.token,
         membersPath: SPA_BACKEND_PATHS.members,
         rpcListPath: SPA_BACKEND_PATHS.rpcListMembers,
+        // OP-Q: 会員の詳細の画面の、データを取る手続きの呼び出し。
+        rpcGetMemberPath: SPA_BACKEND_PATHS.rpcGetMember,
+        detailRpcRead: memberDetailRpcRead,
+        // OP-R: 会員の一覧の画面。
+        memberList: {
+          enabled: memberListEnabled, path: SPA_MEMBER_LIST_PATH, ...SPA_MEMBER_LIST_ELEMENTS,
+          // DEF-190: 「編集」で、一覧の 1 つ下の編集の画面へスクリプトで移る。
+          editMovesAway,
+          // DEF-208-3: 別の page（`window.open`）で開く。
+          editOpensNewTab: options.memberListEditMovesAway === 'NEW_TAB',
+        },
         logLoginPath: SPA_BACKEND_PATHS.rpcLogLogin,
         rpcResolveTenantPath: SPA_BACKEND_PATHS.rpcResolveTenant,
         functionSyncAccessPath: SPA_BACKEND_PATHS.functionSyncAccess,
         appOrigin: originOf('app'),
         realtimeUrl: `ws://${new URL(originOf('backend')).host}${SPA_BACKEND_PATHS.realtime}`,
-        backendOrigin: originOf('backend'),
+        backendOrigin: dataOrigin(),
         tokenOrigin: tokenOrigin(),
         otherOrigin: originOf('other'),
         grants: SPA_GRANT_TYPES,
@@ -1751,10 +2395,12 @@ export async function startSpaAuthSite(options: SpaAuthSiteOptions = {}): Promis
         rumBeacon: options.rumBeacon === true,
         emailFilterRead: options.emailFilterRead === true,
         clearSessionAfterList: options.clearSessionAfterList === true,
+        clearSessionHeader: SPA_CLEAR_SESSION_HEADER,
         repeatedListRpc: options.repeatedListRpc === true,
         sideRequestBeforeToken: options.sideRequestBeforeToken ?? null,
         nativeFormSubmit: options.nativeFormSubmit === true,
         loginLayout: options.loginLayout ?? null,
+        deferredLoginForm: options.deferredLoginForm === true ? DEFERRED_LOGIN_FORM_HTML : null,
         detail: { element: SPA_MEMBER_DETAIL_ELEMENT, terms: SPA_MEMBER_DETAIL_TERMS },
         // DEF-138: クライアントの側でログインの画面へ移る画面（`client` のときだけ）。
         sessionLossPath: options.sessionLossPage === 'client' ? SPA_SESSION_LOSS_PATH : null,
@@ -1782,7 +2428,7 @@ export async function startSpaAuthSite(options: SpaAuthSiteOptions = {}): Promis
         storageKey: SPA_AUTH_STORAGE_KEY,
         apiKeyHeader: SPA_API_KEY_HEADER,
         apiKey,
-        backendOrigin: originOf('backend'),
+        backendOrigin: dataOrigin(),
         otherOrigin: originOf('other'),
         membersPath: SPA_BACKEND_PATHS.members,
         rpcUpsertMemberPath: SPA_HOSTILE_SAVE_PATHS.rpcUpsertMember,
@@ -1799,6 +2445,33 @@ export async function startSpaAuthSite(options: SpaAuthSiteOptions = {}): Promis
         duplicateSaveButtonId: SPA_DUPLICATE_SAVE_BUTTON_ID,
         duplicateSendsTwice: duplicateSaveSendsTwice,
         saveOnInput: memberSaveOnInput,
+        // OP-M: 入力の事象で出す、承認した送信のほかの要求（入力の確かめの手続き、使われ方の記録の beacon、承認していない Origin への記録）。
+        sideRequestsOnInput: memberSideRequestsOnInput,
+        // OP-N: 登録の画面のスクリプトが自動で出す通信の形と、その送り先。
+        autoRequests: memberAutoRequests,
+        autoPaths: SPA_AUTO_REQUEST_PATHS,
+        autoDraftHeader: SPA_AUTO_DRAFT_HEADER,
+        autoDraftCookie: SPA_AUTO_DRAFT_COOKIE,
+        memberNewPath: SPA_APP_PATHS.memberNew,
+        appConfigPath: SPA_APP_PATHS.appConfig,
+        realtimeUrl: `ws://${new URL(originOf('backend')).host}${SPA_BACKEND_PATHS.realtime}`,
+        appOrigin: originOf('app'),
+        rumPath: SPA_APP_PATHS.rum,
+        rpcCheckMemberEmailPath: SPA_BACKEND_PATHS.rpcCheckMemberEmail,
+        otherCollectPath: SPA_OTHER_COLLECT_PATH,
+        // OP-L（L1）: 登録の画面の欄を遅れて描く時間と、描く中身の template。
+        newRenderDelayMs: memberNewRenderDelayMs,
+        newFieldsTemplateId: SPA_MEMBER_NEW_FIELDS_TEMPLATE_ID,
+        // OP-O（O2）: 値を入れるときの振る舞いと、足す数の欄。
+        inputQuirk: memberInputQuirk,
+        tenantFilter: options.memberTenantFilter === true,
+        tenantKey: SPA_MEMBER_TENANT_KEY,
+        tenantValue: SPA_MEMBER_TENANT_VALUE,
+        otherTenantValue: SPA_OTHER_MEMBER_TENANT_VALUE,
+        tenantMode: memberTenantSaveMode,
+        extraKeys: options.memberTenantExtraKeys === true ? SPA_MEMBER_EXTRA_KEY_VALUES : null,
+        numberField: SPA_NUMBER_FIELD,
+        afterFillRerenderMs: SPA_AFTER_FILL_RERENDER_MS,
         abortSave: memberSaveAborted,
         abortSaveAfterMs: SPA_SAVE_ABORT_AFTER_MS,
         changedOnly: memberUpdateChangedOnly,
@@ -1820,41 +2493,57 @@ export async function startSpaAuthSite(options: SpaAuthSiteOptions = {}): Promis
         box: SPA_FORMLESS_MEMBER_BOX,
         member: SPA_STATE_ELEMENTS.member,
         hostile: hostileMemberSave,
-        // DEF-144: 外部スキームへ移るボタン（画面にあるときだけ使う）。
-        externalSchemeButton: { id: SPA_EXTERNAL_SCHEME_BUTTON.id, href: SPA_EXTERNAL_SCHEME_BUTTON.href },
         // DEF-145: ダイアログを開くボタン（画面にあるときだけ使う）。
         dialogOpenButton: { id: SPA_DIALOG_OPEN_BUTTON.id, dialogId: SPA_DIALOG_OPEN_BUTTON.dialogId },
-        // DEF-147: 公開の状態の欄の ID（本文の鍵の名前と同じ。画面にあるときだけ使う）。
-        publicationStatusFieldId: SPA_PUBLICATION_STATUS_FIELD.id,
+        // ARR-2: 札の欄の ID とページが決める一覧の値（画面に札の欄があるときだけ使う）。
+        arrayKeys: SPA_ARRAY_KEYS,
+        // ARR-3: 行の欄の画面の形（null は行の欄なし）と、ページが崩すときの値。
+        arrayRows: options.memberArrayRows ?? null,
+        arrayRowValues: SPA_ARRAY_ROWS,
       }));
       return;
     }
     const secondSaveButton = options.secondSaveButton === true;
     const hostileInput = options.hostileMemberInput ?? null;
-    const pressPriorityTargets = options.pressPriorityTargets === true;
-    const externalSchemeButton = options.externalSchemeButton === true;
-    const saveInDialog = options.saveInDialog === true;
-    const publicationStatusField = options.publicationStatusField === true;
     // T44c: 押す候補の多い更新の画面と、登録の画面だけのダイアログ。
     const crowdedEditScreen = options.crowdedEditScreen === true;
     const createSaveInDialog = options.createSaveInDialog === true;
-    const plainFormless = extraPressTargets === 0 && !secondSaveButton && hostileInput === null && !pressPriorityTargets && !externalSchemeButton
-      && !saveInDialog && !publicationStatusField && !crowdedEditScreen && !createSaveInDialog;
+    const plainFormless = extraPressTargets === 0 && !secondSaveButton && hostileInput === null && !crowdedEditScreen && !createSaveInDialog;
     if (formlessMemberScreens && url.pathname === SPA_APP_PATHS.memberNew) {
-      return html(plainFormless
+      // OP-L（L1）: 遅れて描く指定のときは、欄と保存のボタンを template に入れ、スクリプトが遅れて描く。
+      if (plainFormless && memberNewRenderDelayMs !== null) {
+        return html(deferredMemberNewPageOf(FORMLESS_MEMBER_NEW_PAGE));
+      }
+      const newPage = plainFormless
         ? FORMLESS_MEMBER_NEW_PAGE
-        : formlessMemberPageHtml('会員の登録', false, extraPressTargets, secondSaveButton, hostileInput, pressPriorityTargets, externalSchemeButton,
-          saveInDialog || createSaveInDialog, publicationStatusField));
+        : formlessMemberPageHtml('会員の登録', false, extraPressTargets, secondSaveButton, hostileInput, createSaveInDialog);
+      // ARR-2: 札の欄を、備考の欄の前に置く（登録の画面だけ）。ARR-3: 行の欄も、備考の欄の前に置く。
+      const rowsPage = options.memberArrayRows === undefined ? newPage : newPage.replace('<label>備考', `${arrayRowsHtmlOf(options.memberArrayRows)}<label>備考`);
+      return html(options.memberArrayKeys === true
+        ? rowsPage.replace('<label>備考', `<label>札 <input id="${SPA_ARRAY_KEYS.labelFieldId}" name="${SPA_ARRAY_KEYS.labelFieldId}"></label><label>備考`)
+        : rowsPage);
     }
-    if (formlessMemberScreens && /^\/admin\/members\/[0-9]+\/edit$/u.test(url.pathname)) {
+    // DEF-190: 一覧の 1 つ下の編集の画面（`memberListEditMovesAway` のときだけ）。form のない更新の画面と同じ HTML。
+    if (formlessMemberScreens && (/^\/admin\/members\/[0-9]+\/edit$/u.test(url.pathname)
+      || (editMovesAway && /^\/admin\/members\/[0-9]+$/u.test(url.pathname)))) {
       return html(plainFormless
         ? FORMLESS_MEMBER_EDIT_PAGE
-        : formlessMemberPageHtml('会員の更新', true, extraPressTargets, secondSaveButton, hostileInput, pressPriorityTargets, externalSchemeButton,
-          saveInDialog, publicationStatusField, crowdedEditScreen));
+        : formlessMemberPageHtml('会員の更新', true, extraPressTargets, secondSaveButton, hostileInput, false, crowdedEditScreen));
     }
     // T43d: `sharedHeaderLink` のときは、ログインの画面と管理画面の両方に、同じ見出しのリンク（`SPA_SHARED_HEADER_LINK`）を出す。
     const shared = (page: string): string => (options.sharedHeaderLink === true ? withSharedHeaderLink(page) : page);
-    if (url.pathname === SPA_APP_PATHS.auth) return html(shared(options.loginLayout === undefined ? AUTH_PAGE : LOGIN_LAYOUT_PAGES[options.loginLayout]));
+    if (url.pathname === SPA_APP_PATHS.auth) {
+      // OP-K: `deferredLoginForm` は、欄を描く前の画面。
+      const authPage = options.deferredLoginForm === true ? DEFERRED_AUTH_PAGE : AUTH_PAGE;
+      return html(shared(options.loginLayout === undefined ? authPage : LOGIN_LAYOUT_PAGES[options.loginLayout]));
+    }
+    if (options.deferredLoginForm === true && url.pathname === SPA_APP_PATHS.appConfig) {
+      setTimeout(() => {
+        response.writeHead(STATUS_OK, { 'content-type': 'application/json; charset=utf-8', 'cache-control': 'no-store' });
+        response.end('{}');
+      }, SPA_DEFERRED_LOGIN_FORM_DELAY_MS);
+      return;
+    }
     if (url.pathname === SPA_APP_PATHS.logout) return html(LOGOUT_PAGE);
     // DEF-138: セッションの切れの画面へのリンクを、管理画面の最初のリンクにする（指定のあるときだけ）。
     const lossLinked = (page: string): string => (options.sessionLossPage === undefined ? page : withSessionLossLink(page));
@@ -1875,6 +2564,8 @@ export async function startSpaAuthSite(options: SpaAuthSiteOptions = {}): Promis
     }
     if (url.pathname === SPA_APP_PATHS.memberNew) return html(MEMBER_NEW_PAGE);
     if (/^\/admin\/members\/[0-9]+\/edit$/u.test(url.pathname)) return html(MEMBER_EDIT_PAGE);
+    // OP-R: 会員の一覧の画面（指定のあるときだけ）。
+    if (memberListEnabled && url.pathname === SPA_MEMBER_LIST_PATH) return html(MEMBER_LIST_PAGE);
     // T37d: 会員の詳細の画面（指定のあるときだけ）。T40b-2: `serverError` は 500。
     if (options.memberDetailPage === true && /^\/admin\/members\/[0-9]+$/u.test(url.pathname)) {
       if (memberDetailResponse === 'serverError') {
@@ -1899,7 +2590,7 @@ export async function startSpaAuthSite(options: SpaAuthSiteOptions = {}): Promis
   const backend = await start('backend');
   await start('auth');
   await start('other');
-  const tokenOrigin = (): string => originOf(options.separateAuthOrigin === true ? 'auth' : 'backend');
+  const tokenOrigin = (): string => originOf(options.sameOriginAuth === true ? 'app' : options.separateAuthOrigin === true ? 'auth' : 'backend');
 
   // WebSocket（バックエンドの `SPA_BACKEND_PATHS.realtime` だけ受け入れる。ほかの path は切る）。
   backend.server.on('upgrade', (request: IncomingMessage, socket: Duplex) => {
@@ -1920,11 +2611,12 @@ export async function startSpaAuthSite(options: SpaAuthSiteOptions = {}): Promis
 
   return {
     appOrigin: originOf('app'),
-    backendOrigin: originOf('backend'),
+    backendOrigin: dataOrigin(),
     authOrigin: originOf('auth'),
     otherOrigin: originOf('other'),
     tokenOrigin: tokenOrigin(),
     requests,
+    memberCreateBodies,
     get successfulLogins() {
       return successfulLogins;
     },
@@ -1974,14 +2666,32 @@ export async function startSpaAuthSite(options: SpaAuthSiteOptions = {}): Promis
     setMemberSaveRecordId: (id) => {
       memberSaveRecordId = id;
     },
+    setMemberSaveResponsePadding: (length) => {
+      memberSaveResponsePadding = length;
+    },
     setMemberDetailResponse: (mode) => {
       memberDetailResponse = mode;
     },
     setMemberSaveOnInput: (on) => {
       memberSaveOnInput = on;
     },
+    setMemberSideRequestsOnInput: (on) => {
+      memberSideRequestsOnInput = on;
+    },
+    setMemberAutoRequests: (mode) => {
+      memberAutoRequests = mode;
+    },
     setMemberSaveAborted: (on) => {
       memberSaveAborted = on;
+    },
+    setMemberNewRenderDelay: (delayMs) => {
+      memberNewRenderDelayMs = delayMs;
+    },
+    setMemberTenantSaveMode: (mode) => {
+      memberTenantSaveMode = mode;
+    },
+    setMemberInputQuirk: (quirk) => {
+      memberInputQuirk = quirk;
     },
     setMemberUpdateChangedOnly: (on) => {
       memberUpdateChangedOnly = on;
@@ -1995,6 +2705,12 @@ export async function startSpaAuthSite(options: SpaAuthSiteOptions = {}): Promis
     setMemberValuesDelayed: (on, delayMs = SPA_MEMBER_VALUES_DELAY_MS) => {
       memberValuesDelayed = on;
       memberValuesDelayMs = delayMs;
+    },
+    setMemberDetailRpcRead: (on) => {
+      memberDetailRpcRead = on;
+    },
+    setMemberListRpcLimit: (count) => {
+      memberListRpcLimit = count;
     },
     setMemberDetailDelay: (delayMs) => {
       memberDetailDelayMs = delayMs;
@@ -2019,6 +2735,9 @@ export async function startSpaAuthSite(options: SpaAuthSiteOptions = {}): Promis
       const current = members[index];
       if (current === undefined) throw new Error(`no member ${String(id)}`);
       members[index] = memberFrom(id, { ...values }, current);
+    },
+    whenIdle: async (limitMs) => {
+      await Promise.all(servers.map((server) => server.whenIdle(limitMs)));
     },
     close: async () => {
       // T41R2-fix: 開いたままの応答を終えてから閉じる。

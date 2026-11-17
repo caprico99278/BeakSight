@@ -11,23 +11,14 @@ import { computeApprovalDigest } from '../../src/control/approval/approval-diges
 import {
   APPROVAL_RECEIPT_KINDS,
   APPROVAL_RECEIPT_SCHEMA_VERSION,
-  APPROVAL_TTL_DAYS,
   APPROVER_LOCAL_OPERATOR,
   DEFAULT_MAX_CREATES_PER_RUN,
-  DEFAULT_MAX_CUMULATIVE_CREATES,
-  MAX_SCENARIO_FIELD_NAMES,
-  MAX_SCENARIO_READ_CHECKS,
   MIN_APPROVAL_TTL_DAYS,
   MIN_SCENARIO_LIMIT,
   MIN_SCENARIO_REVISION,
-  MAX_RECORD_ID_PATH_PATTERN_LENGTH,
-  MAX_RESULT_CONDITION_PATH_LENGTH,
-  MAX_VERIFICATION_BINDINGS,
-  MAX_VERIFICATION_EXPECTATIONS,
-  MAX_VERIFICATION_ROW_COUNT,
-  MAX_VERIFICATION_SELECTOR_LENGTH,
   MIN_VERIFICATION_ROW_COUNT,
   RECORD_ID_SOURCES,
+  RETIRED_SCENARIO_VERIFICATION_ITEMS,
   SCENARIO_FORM_METHOD,
   SCENARIO_ID_PATTERN,
   SCENARIO_SCHEMA_VERSION,
@@ -44,8 +35,6 @@ import {
 import { CONTROL_SCHEMA_NAMES, validateControlDocument } from '../../src/control/control-schema-validator.js';
 import { PROFILE_ID_PATTERN } from '../../src/control/contracts.js';
 import { TARGET_CONFIG_SHA256_PATTERN } from '../../src/control/worker-protocol.js';
-import { MAX_CANDIDATE_URL_PART_LENGTH, MAX_FIELD_NAME_LENGTH } from '../../src/discovery/candidate-contracts.js';
-import { MAX_READ_CHECK_DETAIL_FIELD_LENGTH } from '../../src/discovery/read-check-contracts.js';
 import {
   AUTH_SETUP_DIGEST,
   CREATE_CANDIDATE,
@@ -90,57 +79,70 @@ describe('scenario and approval receipt schemas (T28a)', () => {
     expect(prop(scenarioSchema, 'scenarioId').pattern).toBe(SCENARIO_ID_PATTERN.source);
     expect(prop(scenarioSchema, 'profileId').pattern).toBe(PROFILE_ID_PATTERN.source);
     expect(prop(scenarioSchema, 'revision').minimum).toBe(MIN_SCENARIO_REVISION);
+    // L13（N28・N30）: 送る欄の数と名前の長さに上限を置かない（前は 200・256）。
     const fieldNames = prop(scenarioSchema, 'fieldNames');
-    expect(fieldNames.maxItems).toBe(MAX_SCENARIO_FIELD_NAMES);
-    expect(fieldNames.items?.maxLength).toBe(MAX_FIELD_NAME_LENGTH);
-    expect(prop(scenarioSchema, 'readChecks').maxItems).toBe(MAX_SCENARIO_READ_CHECKS);
+    expect(fieldNames.maxItems).toBeUndefined();
+    expect(fieldNames.items?.maxLength).toBeUndefined();
+    // L4（COV-7）: READ の確かめの参照の数に上限を置かない。
+    expect(prop(scenarioSchema, 'readChecks').maxItems).toBeUndefined();
     expect(prop(scenarioDefs.readCheckReference, 'readCheckId').pattern).toBe(SCENARIO_ID_PATTERN.source);
     expect(prop(scenarioDefs.readCheckReference, 'revision').minimum).toBe(MIN_SCENARIO_REVISION);
     const request = scenarioDefs.request;
     expect(prop(request, 'formMethod').const).toBe(SCENARIO_FORM_METHOD);
-    expect(prop(request, 'origin').maxLength).toBe(MAX_CANDIDATE_URL_PART_LENGTH);
-    expect(prop(request, 'path').maxLength).toBe(MAX_CANDIDATE_URL_PART_LENGTH);
+    // URL-LEN: 送信先の Origin と path の長さの上限（前は 2,048）はない。
+    expect(prop(request, 'origin').maxLength).toBeUndefined();
+    expect(prop(request, 'path').maxLength).toBeUndefined();
     const sideEffects = prop(scenarioSchema, 'sideEffectConfirmations');
     expect(sideEffects.required).toEqual(SIDE_EFFECT_CONFIRMATIONS);
     expect(Object.keys(sideEffects.properties ?? {})).toEqual(SIDE_EFFECT_CONFIRMATIONS);
     const limits = prop(scenarioSchema, 'limits');
     expect([prop(limits, 'maxCreatesPerRun').minimum, prop(limits, 'maxCreatesPerRun').maximum]).toEqual([MIN_SCENARIO_LIMIT, DEFAULT_MAX_CREATES_PER_RUN]);
-    expect([prop(limits, 'maxCumulativeCreates').minimum, prop(limits, 'maxCumulativeCreates').maximum])
-      .toEqual([MIN_SCENARIO_LIMIT, DEFAULT_MAX_CUMULATIVE_CREATES]);
+    // LZ-3c（設計者の判断 (b)）: 累積の件数と期限の日数は、判定に使わない名残（下限だけ。最大はない）。
+    expect([prop(limits, 'maxCumulativeCreates').minimum, prop(limits, 'maxCumulativeCreates').maximum]).toEqual([MIN_SCENARIO_LIMIT, undefined]);
     const ttl = prop(scenarioSchema, 'approvalTtlDays');
-    expect([ttl.minimum, ttl.maximum]).toEqual([MIN_APPROVAL_TTL_DAYS, APPROVAL_TTL_DAYS]);
+    expect([ttl.minimum, ttl.maximum]).toEqual([MIN_APPROVAL_TTL_DAYS, undefined]);
     expect(prop(scenarioDefs.inputRuleReference, 'ruleSetId').pattern).toBe(SCENARIO_ID_PATTERN.source);
   });
 
   it('matches the verification spec shapes and limits with the named constants (T30a)', () => {
     expect(scenarioSchema.required).toContain('verification');
     const verification = scenarioDefs.verification;
-    expect(verification?.required).toEqual(SCENARIO_VERIFICATION_ITEMS);
-    expect(Object.keys(verification?.properties ?? {})).toEqual(SCENARIO_VERIFICATION_ITEMS);
+    // PL-6a（設計者の判断 (c)）: 結果の判定のしかたの印は、前に保存した文書が持たないので必須にしない（読むときに null）。前の文書の成否の条件の項目は、
+    // 受けて捨てるために残す（書く前の確かめが拒む）。
+    expect(verification?.required).toEqual(SCENARIO_VERIFICATION_ITEMS.filter((item) => item !== 'resultJudgement'));
+    expect(Object.keys(verification?.properties ?? {})).toEqual(['resultJudgement', ...RETIRED_SCENARIO_VERIFICATION_ITEMS, 'recordId', 'readVerification']);
     const condition = scenarioDefs.resultCondition;
-    expect(prop(condition, 'pathPrefix').maxLength).toBe(MAX_RESULT_CONDITION_PATH_LENGTH);
-    expect((prop(condition, 'selector').anyOf ?? [])[0]?.maxLength).toBe(MAX_VERIFICATION_SELECTOR_LENGTH);
-    const sources = (scenarioDefs.recordId?.oneOf ?? []).map((branch) => prop(branch, 'source').const);
+    // URL-LEN: path の前方一致・path の型の長さの上限（前は 2,048）はない。
+    expect(prop(condition, 'pathPrefix').maxLength).toBeUndefined();
+    // LZ-2: セレクタの長さの上限（前は 256）もない。
+    expect((prop(condition, 'selector').anyOf ?? [])[0]?.maxLength).toBeUndefined();
+    // PL-6a: API の画面の取り方（型・要素）と、form の ID の型の一覧。
+    const sources = [...(scenarioDefs.pageRecordId?.oneOf ?? []), scenarioDefs.formRecordId].map((branch) => prop(branch, 'source').const);
     expect(sources).toEqual(RECORD_ID_SOURCES);
-    const [pathBranch, elementBranch] = scenarioDefs.recordId?.oneOf ?? [];
-    expect(prop(pathBranch, 'pathPattern').maxLength).toBe(MAX_RECORD_ID_PATH_PATTERN_LENGTH);
-    expect(prop(elementBranch, 'selector').maxLength).toBe(MAX_VERIFICATION_SELECTOR_LENGTH);
+    // LZ-3c: form の ID の型の数の上限（前は `MAX_FORM_RECORD_ID_PATTERNS` 2）はない。
+    expect(prop(scenarioDefs.formRecordId, 'pathPatterns').maxItems).toBeUndefined();
+    const [pathBranch, elementBranch] = scenarioDefs.pageRecordId?.oneOf ?? [];
+    expect(prop(pathBranch, 'pathPattern').maxLength).toBeUndefined();
+    expect(prop(elementBranch, 'selector').maxLength).toBeUndefined();
     const read = scenarioDefs.readVerification;
     expect(prop(read, 'readCheckId').pattern).toBe(SCENARIO_ID_PATTERN.source);
     expect(prop(read, 'revision').minimum).toBe(MIN_SCENARIO_REVISION);
     // T38c（T38c の Blocker の判断（案 A））: 結び付けの最小は 0（API のシナリオの `{id}` つきの画面の READ だけ。FORM のシナリオは、根の条件で 1 件以上。
     // 下の「a READ verification without a binding」）。
-    expect([prop(read, 'bindings').minItems, prop(read, 'bindings').maxItems]).toEqual([0, MAX_VERIFICATION_BINDINGS]);
-    expect([prop(read, 'expectations').minItems, prop(read, 'expectations').maxItems]).toEqual([1, MAX_VERIFICATION_EXPECTATIONS]);
-    expect(prop(scenarioDefs.binding, 'parameterName').maxLength).toBe(MAX_FIELD_NAME_LENGTH);
-    expect(prop(scenarioDefs.binding, 'fieldName').maxLength).toBe(MAX_FIELD_NAME_LENGTH);
+    // LZ-3a: 結び付けと期待の数の上限（前は 50・10）は置かない。
+    expect([prop(read, 'bindings').minItems, prop(read, 'bindings').maxItems]).toEqual([0, undefined]);
+    expect([prop(read, 'expectations').minItems, prop(read, 'expectations').maxItems]).toEqual([1, undefined]);
+    // L13（N30）: 欄の名前の長さに上限を置かない（前は 256）。
+    expect(prop(scenarioDefs.binding, 'parameterName').maxLength).toBeUndefined();
+    expect(prop(scenarioDefs.binding, 'fieldName').maxLength).toBeUndefined();
     const expectationBranches = scenarioDefs.verificationExpectation?.oneOf ?? [];
     expect(expectationBranches.map((branch) => prop(branch, 'kind').const)).toEqual(VERIFICATION_EXPECTATION_KINDS);
     const count = prop(expectationBranches[0], 'count');
-    expect([count.minimum, count.maximum]).toEqual([MIN_VERIFICATION_ROW_COUNT, MAX_VERIFICATION_ROW_COUNT]);
-    expect(prop(expectationBranches[1], 'fieldName').maxLength).toBe(MAX_FIELD_NAME_LENGTH);
-    expect(prop(expectationBranches[2], 'field').maxLength).toBe(MAX_READ_CHECK_DETAIL_FIELD_LENGTH);
-    expect(prop(expectationBranches[2], 'fieldName').maxLength).toBe(MAX_FIELD_NAME_LENGTH);
+    // LZ-3a: 行の数の上限（前は 100,000）は置かない。
+    expect([count.minimum, count.maximum]).toEqual([MIN_VERIFICATION_ROW_COUNT, undefined]);
+    expect(prop(expectationBranches[1], 'fieldName').maxLength).toBeUndefined();
+    expect(prop(expectationBranches[2], 'field').maxLength).toBeUndefined();
+    expect(prop(expectationBranches[2], 'fieldName').maxLength).toBeUndefined();
   });
 
   it('matches the receipt branches, the approver and the digest shapes with the named constants', () => {
@@ -162,6 +164,10 @@ describe('scenario and approval receipt schemas (T28a)', () => {
     expect(validateControlDocument('scenario', sampleScenario({ verification: UNSPECIFIED_VERIFICATION }))).toEqual({ ok: true });
     expect(validateControlDocument('scenario', sampleScenario({
       verification: { ...FULL_VERIFICATION, recordId: { source: 'ELEMENT', selector: '#record-id' } },
+    }))).toEqual({ ok: true });
+    // LZ-2: 前の上限（256）より長い要素のセレクタも受ける。
+    expect(validateControlDocument('scenario', sampleScenario({
+      verification: { ...FULL_VERIFICATION, recordId: { source: 'ELEMENT', selector: `#${'r'.repeat(256)}` } },
     }))).toEqual({ ok: true });
     expect(validateControlDocument('approval-receipt', sampleApproval(DIGEST))).toEqual({ ok: true });
     expect(validateControlDocument('approval-receipt', sampleApproval(DIGEST, {
@@ -186,8 +192,8 @@ describe('scenario and approval receipt schemas (T28a)', () => {
     ['a stored state', { ...sampleScenario(), state: 'APPROVED' }],
     ['a READ kind', sampleScenario({ kind: 'READ' as never })],
     ['a per-run limit above the default', sampleScenario({ limits: { maxCreatesPerRun: 2, maxCumulativeCreates: 20 } })],
-    ['a cumulative limit above the default', sampleScenario({ limits: { maxCreatesPerRun: 1, maxCumulativeCreates: 21 } })],
-    ['a TTL above the default', sampleScenario({ approvalTtlDays: 31 })],
+    // LZ-3c: 累積の件数と期限の日数は、前の既定を超えても受ける（`approval-digest-differences.test.ts` の読み直しの場面）。0 は形の誤り。
+    ['a zero cumulative count', sampleScenario({ limits: { maxCreatesPerRun: 1, maxCumulativeCreates: 0 } })],
     ['a GET request', sampleScenario({ request: { ...sampleScenario().request, formMethod: 'GET' as never } })],
     ['a DELETE override', sampleScenario({ request: { ...sampleScenario().request, methodOverride: 'DELETE' as never } })],
     ['a duplicate field name', sampleScenario({ fieldNames: ['name', 'name'] })],
@@ -197,7 +203,7 @@ describe('scenario and approval receipt schemas (T28a)', () => {
     // T30a: 検証の指定。
     ['no verification spec', (({ verification: _omitted, ...rest }) => rest)(sampleScenario())],
     ['a null verification spec', { ...sampleScenario(), verification: null }],
-    ['a missing verification item', { ...sampleScenario(), verification: { successCondition: null, inputErrorCondition: null, recordId: null } }],
+    ['a missing verification item', { ...sampleScenario(), verification: { resultJudgement: null, recordId: null } }],
     ['a condition with a status code', { ...sampleScenario(), verification: { ...FULL_VERIFICATION, successCondition: { pathPrefix: '/a', selector: null, status: 200 } } }],
     ['an unknown record id source', { ...sampleScenario(), verification: { ...FULL_VERIFICATION, recordId: { source: 'QUERY', name: 'id' } } }],
     ['an element source with a path pattern', { ...sampleScenario(), verification: { ...FULL_VERIFICATION, recordId: { source: 'ELEMENT', pathPattern: '/{id}' } } }],
@@ -234,7 +240,7 @@ describe('scenario and approval receipt schemas (T28a)', () => {
     const receipt = assertStorableApprovalReceipt(sampleApproval(DIGEST));
     expect(receipt).toEqual(sampleApproval(DIGEST));
     expect(Object.isFrozen(receipt)).toBe(true);
-    expect(() => assertStorableScenarioRevision(sampleScenario({ approvalTtlDays: 31 }))).toThrow(RangeError);
+    expect(() => assertStorableScenarioRevision(sampleScenario({ approvalTtlDays: 0 }))).toThrow(RangeError);
     expect(() => assertStorableApprovalReceipt(sampleApproval('sha256:xyz'))).toThrow(RangeError);
   });
 });

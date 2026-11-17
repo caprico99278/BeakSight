@@ -1,6 +1,5 @@
 import { AUDIT_SEND_POLICIES, isAuditSendPolicyName } from '../core/audit-send-policy.js';
 import { isNonNegativeSafeInteger, isPositiveSafeInteger, isRecord } from '../core/guards.js';
-import { INTERACTION_TIMEOUT_COUNT_PER_CANDIDATE, MAX_CRAWL_MAX_PAGES, MIN_INTERACTION_TIMEOUT_EXCLUSIVE_MS } from '../core/limits.js';
 import {
   LOOPBACK_HOSTNAMES,
   canonicalizeAllowedOrigins,
@@ -9,7 +8,6 @@ import {
   isLoopbackUrl,
   normalizeUrl,
 } from '../crawl/normalize-url.js';
-import { INTERACTION_CANDIDATE_LIMITS } from '../safety/interaction-policy.js';
 import type { AuditConfig, ConfigValidationResult, Viewport } from './types.js';
 
 type UnknownRecord = Record<string, unknown>;
@@ -17,6 +15,10 @@ type UnknownRecord = Record<string, unknown>;
 const unknownKeys = (value: UnknownRecord, keys: readonly string[]): readonly string[] => Object.keys(value).filter((key) => !keys.includes(key));
 
 const hasExactKeys = (value: UnknownRecord, keys: readonly string[]): boolean => unknownKeys(value, keys).length === 0 && keys.every((key) => Object.hasOwn(value, key));
+
+/** `value` から `keys` の項目を除いた写し（任意の項目を、決まった項目の確かめから外すため）。 */
+const withoutKeys = (value: UnknownRecord, keys: readonly string[]): UnknownRecord =>
+  Object.fromEntries(Object.entries(value).filter(([key]) => !keys.includes(key)));
 
 const isStringArray = (value: unknown): value is readonly string[] => Array.isArray(value) && value.every((item) => typeof item === 'string');
 
@@ -32,14 +34,14 @@ const validateHttpUrl = (value: string): URL | undefined => {
 /**
  * 正の整数だけを受け付ける crawl の設定値。件数・深さと、時間（ms）。
  * 時間は、Page Auditor が期限の計算に使い、`auditInteraction` などが正の整数を要求するので、正の整数に限る
- * （Task 14〜17 の設計書 4.5.7）。`schemas/run.schema.json` の `effectiveConfig.crawl` も、正の整数の規則は同じにする。ただし、ページの上限の上限
- * （`MAX_CRAWL_MAX_PAGES`。T44R の M-3）はスキーマに足さない（前の Run の文書の読み込みを変えないため。検証は、設定の読み込みのここで行う）。
+ * （Task 14〜17 の設計書 4.5.7）。`schemas/run.schema.json` の `effectiveConfig.crawl` も、正の整数の規則は同じにする（LZ-3a: ページの上限の上限はない）。
  * 0 を許す `minNavigationIntervalMs` は、この一覧に入れず、`validateNavigationInterval` で確かめる。
+ * L14（設計書 `2026-11-09-beaksight-remove-limits-design.md` 6.1）: どれも利用者が指定したときだけ持つ（ないときは上限・期限なし）。
  */
-const crawlIntegerKeys = [
+const optionalCrawlIntegerKeys = [
   'maxPages',
-  'maxDepth',
   'maxRuntimeMs',
+  'maxDepth',
   'navigationTimeoutMs',
   'overallPageTimeoutMs',
   'resourceSettlingTimeoutMs',
@@ -115,7 +117,7 @@ const validateSite = (site: UnknownRecord, allowedQueryParameters: ReadonlySet<s
   } else if (hasUrlCredentials(startUrl)) {
     errors.push('site.startUrl must not contain credentials');
   } else {
-    // 実行時と同じ正規化で受け入れられない開始URL（例: 正規化した後に `MAX_URL_LENGTH` を超える）は、設定のエラーにする（R'2 の m5）。
+    // 実行時と同じ正規化で受け入れられない開始URL は、設定のエラーにする（R'2 の m5。L14: 長さでは拒まない）。
     const normalized = normalizeUrl(rawStartUrl, rawStartUrl, allowedQueryParameters);
     if (!normalized.ok) {
       errors.push(`site.startUrl is rejected by URL normalization: ${normalized.reason}`);
@@ -140,29 +142,8 @@ const validateSite = (site: UnknownRecord, allowedQueryParameters: ReadonlySet<s
   }
 };
 
-/**
- * Interaction が有効なら、ページの期限（`crawl.overallPageTimeoutMs`）が、Interaction の候補1つの予算
- * （`crawl.navigationTimeoutMs` + `INTERACTION_TIMEOUT_COUNT_PER_CANDIDATE` × `crawl.interactionTimeoutMs`）以上かを確かめる
- * （Task 14〜17 の設計書 4.5.7、R14 の m2）。満たさない設定では、Page Auditor が候補を1つも監査できず、除外される候補も記録されない。
- * 3つの時間のどれかが正の整数でない場合は、別のエラーとして報告するので、ここでは確かめない。
- */
-const validateInteractionCandidateBudget = (crawl: UnknownRecord, audit: unknown, errors: string[]): void => {
-  if (!isRecord(audit) || audit.interactions !== true) {
-    return;
-  }
-  const { navigationTimeoutMs, interactionTimeoutMs, overallPageTimeoutMs } = crawl;
-  if (!isPositiveSafeInteger(navigationTimeoutMs) || !isPositiveSafeInteger(interactionTimeoutMs)
-    || !isPositiveSafeInteger(overallPageTimeoutMs)) {
-    return;
-  }
-  const candidateBudgetMs = navigationTimeoutMs + INTERACTION_TIMEOUT_COUNT_PER_CANDIDATE * interactionTimeoutMs;
-  if (overallPageTimeoutMs < candidateBudgetMs) {
-    errors.push(
-      `crawl.overallPageTimeoutMs must be at least crawl.navigationTimeoutMs + ${INTERACTION_TIMEOUT_COUNT_PER_CANDIDATE} `
-        + `x crawl.interactionTimeoutMs (${candidateBudgetMs} ms) when audit.interactions is enabled`,
-    );
-  }
-};
+// SPEC-1: ページの期限（`crawl.overallPageTimeoutMs`）と Interaction の候補1つの予算を比べる検査は撤廃した（L1 でページの期限を撤廃したため）。
+// 前の設定のファイルを読めるよう、項目は正の整数の検査（`optionalCrawlIntegerKeys`）にだけ残す。
 
 /**
  * ページの読み込みの最小の間隔（`crawl.minNavigationIntervalMs`）の下限（ms）。許可 Origin（`site.allowedOrigins`）に、読めた Origin で
@@ -239,33 +220,20 @@ export const validateConfig = (input: unknown): ConfigValidationResult => {
     validateSite(site, allowedQueryParameters, errors);
   }
 
-  const crawlKeys = [...crawlIntegerKeys, 'minNavigationIntervalMs', 'allowedQueryParameters'];
-  if (!isRecord(crawl) || !hasExactKeys(crawl, crawlKeys)) {
+  const crawlKeys = ['minNavigationIntervalMs', 'allowedQueryParameters'];
+  if (!isRecord(crawl) || !hasExactKeys(withoutKeys(crawl, optionalCrawlIntegerKeys), crawlKeys)) {
     errors.push('crawl must be an object with only supported settings');
   } else {
-    for (const key of crawlIntegerKeys) {
-      if (!isPositiveSafeInteger(crawl[key])) {
+    for (const key of optionalCrawlIntegerKeys) {
+      if (Object.hasOwn(crawl, key) && !isPositiveSafeInteger(crawl[key])) {
         errors.push(`crawl.${key} must be a positive integer`);
       }
     }
-    // T44R（Task 44 のレビューの M-3）: ページの上限の上限（サービスの Origin への要求の 1 回の Run の上限の既定が、安全な整数を超えないように）。
-    if (isPositiveSafeInteger(crawl.maxPages) && crawl.maxPages > MAX_CRAWL_MAX_PAGES) {
-      errors.push(`crawl.maxPages must be at most ${MAX_CRAWL_MAX_PAGES}`);
-    }
-    if (isPositiveSafeInteger(crawl.interactionTimeoutMs) && crawl.interactionTimeoutMs <= MIN_INTERACTION_TIMEOUT_EXCLUSIVE_MS) {
-      errors.push(
-        `crawl.interactionTimeoutMs must be greater than ${MIN_INTERACTION_TIMEOUT_EXCLUSIVE_MS} ms `
-          + '(the pre-freeze stability check and the post-condition persistence check)',
-      );
-    }
-    if (isPositiveSafeInteger(crawl.maxInteractionsPerPage) && crawl.maxInteractionsPerPage > INTERACTION_CANDIDATE_LIMITS.maxCandidates) {
-      errors.push(
-        `crawl.maxInteractionsPerPage must be at most ${INTERACTION_CANDIDATE_LIMITS.maxCandidates} `
-          + '(the number of Interaction candidates discovered on a page)',
-      );
-    }
+    // LZ-3a: ページの上限の上限（前は `MAX_CRAWL_MAX_PAGES` 100,000）は撤廃した。利用者が指定した正の整数をそのまま受ける。
+    // SPEC-5: `crawl.interactionTimeoutMs` の下限（前は、安定と持続の窓の和の 1,000ms を超えること）は、窓をやめたので撤廃した（正の整数なら受ける）。
+    // L10（設計書 `2026-11-09-beaksight-remove-limits-design.md` 4。INV-LIMITS の N3・N4）: 候補の数の上限（前は 100）と比べる確かめは撤廃した（利用者の指定は、
+    // 1 以上の整数なら受ける）。
     validateNavigationInterval(crawl, site, errors);
-    validateInteractionCandidateBudget(crawl, audit, errors);
     if (!isStringArray(crawl.allowedQueryParameters)) {
       errors.push('crawl.allowedQueryParameters must be a string array');
     }

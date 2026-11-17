@@ -15,7 +15,6 @@ import type { AuditConfig } from '../../src/config/types.js';
 import {
   FINDING_CATEGORIES,
   INCOMPLETE_REASON_CODES,
-  NAVIGATION_DIAGNOSTICS_STATUSES,
   OBSERVATION_STATUSES,
   PAGE_AUDIT_STAGES,
   PARTIAL_FAILURE_REASONS,
@@ -28,15 +27,7 @@ import {
   type FindingCategory,
   type IncompleteReason,
   type IncompleteReasonCode,
-  type InteractionCandidateNavigationDiagnostics,
-  type NavigationDiagnostics,
-  type NavigationDiagnosticsStatus,
-  type NavigationDocumentLoadingFailure,
-  type NavigationDocumentRequestDiagnostics,
-  type NavigationDocumentRequestHop,
-  type NotObservedNavigationDiagnostics,
   type ObservationStatus,
-  type ObservedNavigationDiagnostics,
   type PageAuditOutcome,
   type PageAuditResult,
   type PageAuditStage,
@@ -47,9 +38,7 @@ import {
   type RunSummary,
   type SafetyBlockedActionCounts,
   type SafetyInvariantViolationSummary,
-  type StressWidthNavigationDiagnostics,
   type ViewportAuditResult,
-  type ViewportNavigationDiagnostics,
   type ViewportProfile,
 } from '../../src/core/contracts.js';
 import {
@@ -100,7 +89,6 @@ import { discoverLinks } from '../../src/crawl/discover-links.js';
 import type { NormalizedHttpUrl, NormalizedUrlResult } from '../../src/crawl/normalize-url.js';
 import { collectAccessibilityEvidence } from '../../src/evidence/accessibility-collector.js';
 import type { CollectorHandle } from '../../src/evidence/collector-handle.js';
-import { collectColorEvidence } from '../../src/evidence/color-collector.js';
 import { ConsoleCollector } from '../../src/evidence/console-collector.js';
 import { collectDomEvidence } from '../../src/evidence/dom-collector.js';
 import { collectInteractionChangeEvidence } from '../../src/evidence/interaction-collector.js';
@@ -109,6 +97,7 @@ import { NetworkCollector } from '../../src/evidence/network-collector.js';
 import type { PerformanceCollector } from '../../src/evidence/performance-collector.js';
 import { captureScreenshots } from '../../src/evidence/screenshot-collector.js';
 import type { InteractionAuditResult } from '../../src/interaction/isolated-auditor.js';
+import type { PageAuditCollectors } from '../../src/orchestration/page-auditor.js';
 import type { InteractionCandidate, InteractionRejectionReason } from '../../src/safety/interaction-policy.js';
 import { SafetyLedger, safetyEventsEvidenceFromSnapshot } from '../../src/safety/safety-ledger.js';
 import {
@@ -405,6 +394,12 @@ describe('C8: incomplete reason codes', () => {
     'PAGE_NAVIGATION_LIMIT_REACHED',
     // DEF-130-fix: ページが出す文書でない要求を上限で止めたビューポート。
     'PAGE_SUBRESOURCE_LIMIT_REACHED',
+    // DEF-210: 通知の枠の閉じる押下で、ページが移ろうとして止めたビューポート。
+    'NOTIFICATION_DISMISSAL_NAVIGATION_BLOCKED',
+    // DEF-250 の c: 点検の途中で、画面が外部スキームへ移ろうとしたか、誤りの画面に替わったので、そのビューポートを終えた。
+    'DOCUMENT_LEFT_DURING_AUDIT',
+    // DEF-225: 開くとファイルのダウンロードになったビューポート。
+    'DOWNLOAD_RESPONSE',
     'PREFLIGHT_FAILED',
     // P18d（DEF-009）: Run のディレクトリを作れなかった（同じ名前のものがすでにある場合を含む）。Run Status の入力は `preflightFailed`。
     'RUN_DIRECTORY_UNAVAILABLE',
@@ -438,6 +433,9 @@ describe('C8: incomplete reason codes', () => {
     'AUTH_SESSION_LOST',
     // T35a（Task 35 の設計書 3.4）: 承認したサービスの Origin への要求の上限に届いたため、その後の監査を始めなかった。
     'SERVICE_REQUEST_LIMIT_REACHED',
+    // L0（設計書 `2026-11-09-beaksight-remove-limits-design.md` 5 の 1）: 進みの見張りが、応答しなかった段・静まらなかった段を終えた。
+    'STAGE_UNRESPONSIVE',
+    'STAGE_NEVER_QUIET',
   ] as const;
 
   it('defines one frozen closed list that covers collector partial reasons and every Run Status input', () => {
@@ -491,7 +489,6 @@ describe('C8: evidence payload types', () => {
   const repositoryRoot = resolve(fileURLToPath(new URL('../..', import.meta.url)));
   const collectorFiles = [
     'src/evidence/accessibility-collector.ts',
-    'src/evidence/color-collector.ts',
     'src/evidence/console-collector.ts',
     'src/evidence/dom-collector.ts',
     'src/evidence/interaction-collector.ts',
@@ -537,13 +534,15 @@ describe('C8: evidence payload types', () => {
     expectTypeOf<EvidencePayloadByType['scroll']>().toEqualTypeOf<ScrollEvidence>();
     expectTypeOf<EvidencePayloadByType['safety']>().toEqualTypeOf<SafetyEventsEvidence>();
 
-    expectTypeOf(NetworkCollector.attach).returns.toEqualTypeOf<CollectorHandle<NetworkEvidence>>();
+    // L1b: network の手綱の写しは、見張りの指定を受ける（`NetworkCollectorHandle`。`CollectorHandle` として使える）。
+    expectTypeOf(NetworkCollector.attach).returns.toExtend<CollectorHandle<NetworkEvidence>>();
     expectTypeOf(ConsoleCollector.attach).returns.toEqualTypeOf<CollectorHandle<ConsoleEvidence>>();
     expectTypeOf(collectDomEvidence).returns.resolves.toEqualTypeOf<DomEvidence>();
     expectTypeOf(discoverLinks).returns.resolves.toEqualTypeOf<LinkDiscoveryEvidence>();
     expectTypeOf(collectLayoutEvidence).returns.resolves.toEqualTypeOf<LayoutCollectionResult>();
     expectTypeOf(collectStressLayout).returns.resolves.toEqualTypeOf<readonly StressLayoutEvidence[]>();
-    expectTypeOf(collectColorEvidence).returns.resolves.toEqualTypeOf<ColorEvidence>();
+    // REC-1: color の Evidence は集めない（読む所がない）。前の記録の color の型は、読めるまま残す。
+    expectTypeOf<PageAuditCollectors>().not.toHaveProperty('collectColorEvidence');
     expectTypeOf<PerformanceCollector['collect']>().returns.resolves.toEqualTypeOf<PerformanceEvidence>();
     expectTypeOf(collectAccessibilityEvidence).returns.resolves.toEqualTypeOf<AccessibilityEvidence>();
     expectTypeOf(collectInteractionChangeEvidence).returns.toEqualTypeOf<InteractionChangeEvidence>();
@@ -658,6 +657,7 @@ describe('C8: evidence payload types', () => {
       'DISABLED',
       'NOT_VISIBLE',
       'MALFORMED_CANDIDATE',
+      'DESTRUCTIVE_ACTION_SKIPPED',
     ]);
     expect(Object.isFrozen(INTERACTION_REJECTION_REASONS)).toBe(true);
     expectTypeOf<InteractionRejectionReason>().toEqualTypeOf<ValueOf<typeof INTERACTION_REJECTION_REASONS>>();
@@ -718,6 +718,9 @@ describe('C8: evidence payload types', () => {
       'INNER_SCROLL_CONTAINER_NOT_TRAVERSED',
       'INNER_SCROLL_SCAN_LIMIT_REACHED',
       'SCROLL_TARGET_UNSTABLE',
+      // L9: 期限を受けないときは、進みの見張りが段を終えた理由になる。
+      'STAGE_UNRESPONSIVE',
+      'STAGE_NEVER_QUIET',
     ]);
     expect(Object.isFrozen(SCROLL_INCOMPLETE_REASONS)).toBe(true);
     for (const reason of SCROLL_INCOMPLETE_REASONS) {
@@ -847,6 +850,8 @@ describe('F07 M5: page identity, viewport, and URL rejection reason types', () =
       readonly startedAt: string;
       readonly finishedAt: string;
       readonly endReason: CoreContracts.RunExecutionEndReason;
+      // DEF-200（意図して足した期待）: ログインし直して自動で始めた実行の印と回数（任意）。
+      readonly automaticRelogin?: CoreContracts.RunExecutionAutomaticRelogin;
     }>();
   });
 });
@@ -952,7 +957,9 @@ describe('F12: types derived from the core value arrays', () => {
       .toEqualTypeOf<ValueOf<typeof CoreEvidence.BLOCKED_AUDIT_EXCLUSION_REASONS>>();
     // DEF-040（DEF-039・DEF-040 の設計書 2.2。NP3）: Worker の中の WebSocket を CSP で止めた理由は、Passive と凍結の後の両方の一覧にある。
     // AS-c: 監査の段の送信の扱いで通せる接続の上限を超えた理由（`AUDIT_SEND_OVER_LIMIT`）を加えた。
-    expectTypeOf<CoreEvidence.BlockedWebSocketEvent['reason']>().toEqualTypeOf<'PASSIVE_WEBSOCKET' | 'WORKER_CONNECT_POLICY' | 'AUDIT_SEND_OVER_LIMIT'>();
+    // DEF-276-relay（REV-DEF276 の M-2）: 文書の WebSocket の中継で、送りの列が上限を超えて閉じた理由（`WEBSOCKET_SEND_QUEUE_FULL`）を加えた。
+    expectTypeOf<CoreEvidence.BlockedWebSocketEvent['reason']>()
+      .toEqualTypeOf<'PASSIVE_WEBSOCKET' | 'WORKER_CONNECT_POLICY' | 'AUDIT_SEND_OVER_LIMIT' | 'WEBSOCKET_SEND_QUEUE_FULL'>();
     // DEF-039・DEF-040 の設計書 2.1.3: 操作中に遮断したリクエストの理由は、Guard の遮断と出口の中継の拒否を区別する閉じた一覧。
     expectTypeOf<CoreEvidence.BlockedInteractionRequestEvent['reason']>()
       .toEqualTypeOf<ValueOf<typeof CoreEvidence.BLOCKED_INTERACTION_REQUEST_REASONS>>();
@@ -961,8 +968,9 @@ describe('F12: types derived from the core value arrays', () => {
       .toEqualTypeOf<'INTERACTION_FROZEN' | 'INTERACTION_FROZEN_EGRESS' | 'EGRESS_UPSTREAM_DENIED' | 'GUARD_BYPASS_EGRESS'>();
     expectTypeOf<CoreEvidence.BlockedInteractionNavigationEvent['reason']>()
       .toEqualTypeOf<ValueOf<typeof CoreEvidence.INTERACTION_FROZEN_REASONS>>();
+    // fix round 3（通知の枠の設計書 3.2.2 の 4）: 通知の枠の閉じる押下の期間に開いたポップアップの理由を加えた。
     expectTypeOf<CoreEvidence.BlockedPopupEvent['reason']>()
-      .toEqualTypeOf<ValueOf<typeof CoreEvidence.INTERACTION_FROZEN_REASONS>>();
+      .toEqualTypeOf<ValueOf<typeof CoreEvidence.BLOCKED_POPUP_REASONS>>();
     expectTypeOf<CoreEvidence.BlockedInteractionWebSocketEvent['reason']>()
       .toEqualTypeOf<ValueOf<typeof CoreEvidence.BLOCKED_INTERACTION_WEBSOCKET_REASONS>>();
     expectTypeOf<CoreEvidence.BlockedInteractionWebSocketEvent['reason']>().toEqualTypeOf<'INTERACTION_FROZEN' | 'WORKER_CONNECT_POLICY'>();
@@ -989,12 +997,16 @@ describe('F12: types derived from the core value arrays', () => {
         'AUDIT_SEND_OVER_LIMIT',
         // T44R の I-1: ページを離れた後の要求の上限と、離れた後の文書の読み込み。
         'PAGE_LEAVE_REQUEST_LIMIT_REACHED',
+        // DEF-210: 通知の枠の閉じる押下の期間の決まりで止めた。
+        'NOTIFICATION_DISMISSAL_RESTRICTED',
+        // REV-EV4: 横にスクロールする領域のキーの押下の期間の決まりで止めた。
+        'SCROLL_KEY_PRESS_RESTRICTED',
       ],
       BLOCKED_NAVIGATION_REASONS: ['EXTERNAL_MAIN_FRAME_NAVIGATION'],
       // T25b round 1: 監査の段の除外で遮断した要求の理由（`blockedAuditExclusions` の中だけで使う）。
       BLOCKED_AUDIT_EXCLUSION_REASONS: ['AUDIT_EXCLUDED_URL'],
       // DEF-040（NP3）: `WORKER_CONNECT_POLICY` は、Worker の中の WebSocket を CSP で止めた理由。
-      BLOCKED_WEBSOCKET_REASONS: ['PASSIVE_WEBSOCKET', 'WORKER_CONNECT_POLICY', 'AUDIT_SEND_OVER_LIMIT'],
+      BLOCKED_WEBSOCKET_REASONS: ['PASSIVE_WEBSOCKET', 'WORKER_CONNECT_POLICY', 'AUDIT_SEND_OVER_LIMIT', 'WEBSOCKET_SEND_QUEUE_FULL'],
       INTERACTION_FROZEN_REASONS: ['INTERACTION_FROZEN'],
       // DEF-085: `GUARD_BYPASS_EGRESS` は、Guard を通らずに出ようとした要求を、すべての Guard の Context の中継が拒んだ理由。
       BLOCKED_INTERACTION_REQUEST_REASONS: ['INTERACTION_FROZEN', 'INTERACTION_FROZEN_EGRESS', 'EGRESS_UPSTREAM_DENIED', 'GUARD_BYPASS_EGRESS'],
@@ -1011,16 +1023,21 @@ describe('F12: types derived from the core value arrays', () => {
   });
 
   it('keeps the values of the reason types that are now derived from arrays', () => {
+    // L9: 見張りが段を終えたときは、戻すのを待たないので、その理由（`STAGE_UNRESPONSIVE`・`STAGE_NEVER_QUIET`）になる。
     expectTypeOf<CoreEvidence.ScrollRestorationFailureReason>()
-      .toEqualTypeOf<PartialFailureReason | Extract<IncompleteReasonCode, 'POSITION_NOT_AT_ORIGIN'>>();
+      .toEqualTypeOf<PartialFailureReason | Extract<IncompleteReasonCode, 'POSITION_NOT_AT_ORIGIN' | 'STAGE_UNRESPONSIVE' | 'STAGE_NEVER_QUIET'>>();
     expectTypeOf<CoreEvidence.LayoutIncompleteReason>()
       .toEqualTypeOf<Extract<PartialFailureReason, 'DEADLINE_EXCEEDED'> | Extract<IncompleteReasonCode, 'LAYOUT_COMPARISON_LIMIT_REACHED'>>();
     expectTypeOf<CoreEvidence.StressLayoutFailureReason>()
       .toEqualTypeOf<PartialFailureReason | Extract<IncompleteReasonCode, 'NAVIGATION_FAILED'>>();
+    // L2: 期限を受けないときは、進みの見張りが終えた理由（`STAGE_UNRESPONSIVE`・`STAGE_NEVER_QUIET`）も入る。
     expectTypeOf<CoreEvidence.PerformanceIncompleteReason>().toEqualTypeOf<
-      Exclude<PartialFailureReason, 'PAGE_CLOSED'> | Extract<IncompleteReasonCode, 'INVALID_BROWSER_DATA' | 'RESOURCE_LIMIT_REACHED'>
+      | Exclude<PartialFailureReason, 'PAGE_CLOSED'>
+      | Extract<IncompleteReasonCode, 'INVALID_BROWSER_DATA' | 'RESOURCE_LIMIT_REACHED' | 'STAGE_UNRESPONSIVE' | 'STAGE_NEVER_QUIET'>
     >();
-    expectTypeOf<CoreEvidence.AccessibilityIncompleteReason>().toEqualTypeOf<Exclude<PartialFailureReason, 'PAGE_CLOSED'>>();
+    expectTypeOf<CoreEvidence.AccessibilityIncompleteReason>().toEqualTypeOf<
+      Exclude<PartialFailureReason, 'PAGE_CLOSED'> | Extract<IncompleteReasonCode, 'STAGE_UNRESPONSIVE' | 'STAGE_NEVER_QUIET'>
+    >();
     expectTypeOf<CoreEvidence.UnobservedWebVitalStatus>().toEqualTypeOf<Exclude<ObservationStatus, 'OBSERVED'>>();
   });
 });
@@ -1044,9 +1061,15 @@ describe('P14a: page audit contracts', () => {
       'accessibility',
       'performance',
       'screenshot',
+      // AUD-2d: 落ち着いた後の確かめ直し。
+      'recheck',
+      // AUD-4d: フォーカスの確かめ（ほかの証拠を集め終えた後）。
+      'focus-check',
       'links',
       'interaction-discovery',
       'interaction',
+      // COV-4 の区切り 3: 操作で開いた状態の監査。
+      'opened-state',
       'safety',
       'rules',
     ]);
@@ -1069,70 +1092,8 @@ describe('P14a: page audit contracts', () => {
     expectTypeOf<PageAuditOutcome['siteUnavailableDetail']>().toEqualTypeOf<string | null>();
     expectTypeOf<keyof PageAuditOutcome>()
       // DEF-138: セッションの切れの証拠（`authSessionLoss`）も、Page の結果の外に持つ。
-      .toEqualTypeOf<'result' | 'safety' | 'siteUnavailableDetail' | 'authSessionLostDetail' | 'authSessionLoss' | 'navigationDiagnostics'>();
+      .toEqualTypeOf<'result' | 'safety' | 'siteUnavailableDetail' | 'authSessionLostDetail' | 'authSessionLoss'>();
     expectTypeOf<PageAuditResult>().not.toHaveProperty('siteUnavailableDetail');
-  });
-
-  // D1（サイトの不調で止めたときの診断の記録の設計書 2.1、2.2）: ページの結果は、各ビューポートの読み込みの観察（main frame の
-  // 文書の要求の事象）を、Page の結果（`PageAuditResult`）の外に持つ。始めなかったビューポートは `null`。記録は、要求ごとの時刻、status、
-  // 接続先の IP と port、終わりか失敗だけで、header の中身と本文の項目を持たない。
-  // D3（設計書 2.2 の 2026-10-07 の改訂）: ビューポートごとに、Passive の読み込みの観察（始めなければ `null`）に加えて、幅の走査の幅ごと
-  // （幅の値つき）と、Interaction の候補ごと（候補の順の番号つき）の観察を配列で持つ。
-  it('carries the navigation diagnostics of each viewport outside the page result (site unavailable diagnostics design 2.1, 2.2)', () => {
-    expectTypeOf<PageAuditOutcome['navigationDiagnostics']>()
-      .toEqualTypeOf<Readonly<Record<ViewportProfile, ViewportNavigationDiagnostics | null>>>();
-    expectTypeOf<ViewportNavigationDiagnostics>().toEqualTypeOf<{
-      readonly passive: NavigationDiagnostics | null;
-      readonly stressWidths: readonly StressWidthNavigationDiagnostics[];
-      readonly interactionCandidates: readonly InteractionCandidateNavigationDiagnostics[];
-    }>();
-    expectTypeOf<StressWidthNavigationDiagnostics>().toEqualTypeOf<{
-      readonly width: number;
-      readonly diagnostics: NavigationDiagnostics;
-    }>();
-    expectTypeOf<InteractionCandidateNavigationDiagnostics>().toEqualTypeOf<{
-      readonly index: number;
-      readonly diagnostics: NavigationDiagnostics;
-    }>();
-    expectTypeOf<PageAuditResult>().not.toHaveProperty('navigationDiagnostics');
-    expect(NAVIGATION_DIAGNOSTICS_STATUSES).toEqual(['OBSERVED', 'NOT_OBSERVED']);
-    expect(Object.isFrozen(NAVIGATION_DIAGNOSTICS_STATUSES)).toBe(true);
-    expectTypeOf<NavigationDiagnosticsStatus>().toEqualTypeOf<ValueOf<typeof NAVIGATION_DIAGNOSTICS_STATUSES>>();
-    expectTypeOf<NavigationDiagnostics>().toEqualTypeOf<ObservedNavigationDiagnostics | NotObservedNavigationDiagnostics>();
-    expectTypeOf<NavigationDiagnostics['status']>().toEqualTypeOf<NavigationDiagnosticsStatus>();
-    expectTypeOf<NotObservedNavigationDiagnostics>().toEqualTypeOf<{
-      readonly status: 'NOT_OBSERVED';
-      readonly reason: string;
-    }>();
-    expectTypeOf<ObservedNavigationDiagnostics>().toEqualTypeOf<{
-      readonly status: 'OBSERVED';
-      readonly observationStartedAtMs: number;
-      readonly observationEndedAtMs: number;
-      readonly documentRequests: readonly NavigationDocumentRequestDiagnostics[];
-      readonly omittedDocumentRequestCount: number;
-      readonly omittedEventCount: number;
-    }>();
-    expectTypeOf<NavigationDocumentRequestDiagnostics>().toEqualTypeOf<{
-      readonly hops: readonly NavigationDocumentRequestHop[];
-      readonly loadingFinishedAtMs: number | null;
-      readonly loadingFailure: NavigationDocumentLoadingFailure | null;
-    }>();
-    expectTypeOf<NavigationDocumentRequestHop>().toEqualTypeOf<{
-      readonly url: string;
-      readonly method: string;
-      readonly truncated: boolean;
-      readonly issuedAtMs: number;
-      readonly requestHeadersSentAtMs: number | null;
-      readonly responseHeadersReceivedAtMs: number | null;
-      readonly httpStatus: number | null;
-      readonly remoteIpAddress: string | null;
-      readonly remotePort: number | null;
-    }>();
-    expectTypeOf<NavigationDocumentLoadingFailure>().toEqualTypeOf<{
-      readonly failedAtMs: number;
-      readonly errorText: string;
-      readonly canceled: boolean;
-    }>();
   });
 
   // P18b（CC-015）: 不変条件の違反の型は、core のこの1つだけ。形は `code` と `message` の文字列で、JSON の形を変えない。
@@ -1187,15 +1148,9 @@ describe('R15a: run result, site metadata, and run summary contracts', () => {
     expectTypeOf<CoreEvidence.SitemapEvidence['truncated']>().toEqualTypeOf<boolean>();
   });
 
-  it('names the bounds of the site metadata text and the sitemap URLs in src/core/limits.ts (5.6.2)', () => {
-    for (const limit of [CoreLimits.MAX_SITE_METADATA_TEXT_LENGTH, CoreLimits.MAX_SITEMAP_URLS]) {
-      expect(Number.isSafeInteger(limit) && limit > 0, String(limit)).toBe(true);
-    }
-    // 目安（R15a の指示書）: 本文は数十万文字、sitemap の URL は数万件。
-    expect(CoreLimits.MAX_SITE_METADATA_TEXT_LENGTH).toBeGreaterThanOrEqual(100_000);
-    expect(CoreLimits.MAX_SITE_METADATA_TEXT_LENGTH).toBeLessThan(1_000_000);
-    expect(CoreLimits.MAX_SITEMAP_URLS).toBeGreaterThanOrEqual(10_000);
-    expect(CoreLimits.MAX_SITEMAP_URLS).toBeLessThan(100_000);
+  // LZ-3a: sitemap の URL の件数の上限（前は `MAX_SITEMAP_URLS` 50,000）は撤廃した（LZ-2 で本文の長さの上限も撤廃した）。
+  it('has no bound of the sitemap URLs (LZ-3a)', () => {
+    expect(Object.hasOwn(CoreLimits, 'MAX_SITEMAP_URLS')).toBe(false);
   });
 
   it('adds the partial page count, the unverified internal link count, and the retries to the run summary (5.6.5)', () => {

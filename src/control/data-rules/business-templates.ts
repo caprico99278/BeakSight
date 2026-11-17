@@ -71,6 +71,8 @@ export const SEMANTIC_KIND_FIELD_TYPES = Object.freeze({
   OUT_OF_TEMPLATE: VALUE_INPUT_FIELD_TYPES,
   // FM2c: 番号・コード（数字だけの固定の桁数の pattern を持つ文字の欄）。
   DIGIT_CODE: Object.freeze(['text', 'search'] as const),
+  // OP-2: 作り物の文字（テンプレートの外のふつうの文字の欄）。
+  GENERIC_TEXT: TEXT_TYPES,
 } as const satisfies Readonly<Record<SemanticKind, readonly CandidateFieldType[]>>);
 
 /** 意味の種類が欄の型に合うか。 */
@@ -238,6 +240,8 @@ const genericKindOf = (type: CandidateFieldType): SemanticKind | null =>
  */
 export interface InferenceOptions {
   readonly digitCode?: boolean;
+  /** OP-2: 語に当たらないふつうの文字の欄を、作り物の文字（`GENERIC_TEXT`）にする（推した規則を作るときだけ真）。 */
+  readonly genericText?: boolean;
 }
 
 export const inferSemanticKind = (field: InferenceField, options: InferenceOptions = {}): SemanticKind | null => {
@@ -259,6 +263,11 @@ export const inferSemanticKind = (field: InferenceField, options: InferenceOptio
   if (options.digitCode === true && (worded === null || DIGIT_CODE_REPLACED_KINDS.includes(worded)) && isSemanticKindCompatible('DIGIT_CODE', field.type)
     && fieldDigitCodeLengthOf(field.constraints) !== null) {
     return 'DIGIT_CODE';
+  }
+  // OP-2（設計書 `2026-10-27-beaksight-one-pass-flow-design.md` 4.1 の D10）: 語に当たらないふつうの文字の欄は、作り物の文字（推した規則を作るときだけ）。
+  // 入力の形の指定（pattern）のある欄は、形が分からないので推さない（今どおり人が決める）。
+  if (options.genericText === true && worded === null && isSemanticKindCompatible('GENERIC_TEXT', field.type) && (field.constraints.pattern ?? null) === null) {
+    return 'GENERIC_TEXT';
   }
   return worded;
 };

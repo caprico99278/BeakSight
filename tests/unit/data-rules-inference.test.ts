@@ -79,6 +79,8 @@ describe('FM2c: inferRuleSetContent makes the inferred rules storable', () => {
     expect(fieldRules.map((rule) => [rule.fieldName, rule.semanticKind, rule.method])).toEqual([
       ['arrival', 'GENERIC_DATETIME', 'FROM_TYPE'],
       ['email', 'EMAIL', 'FROM_TEMPLATE'],
+      // OP-2（D10）: 語に当たらないふつうの文字の欄は、作り物の文字（汎用の規則）。
+      ['free_x', 'GENERIC_TEXT', 'FROM_TYPE'],
       ['half_range', 'GENERIC_NUMBER', 'FROM_TYPE'],
       ['limited_x', 'GENERIC_DATETIME', 'FROM_TYPE'],
       ['member_x', 'DIGIT_CODE', 'FROM_TEMPLATE'],
@@ -129,7 +131,7 @@ describe('FM2c: inferRuleSetContent makes the inferred rules storable', () => {
   it('lists the fields it cannot infer with the reason codes', () => {
     const { inferred } = formCase();
     expect(inferred.unresolvedFields.map(({ fieldName, problem }) => [fieldName, problem.code, problem.detail])).toEqual([
-      ['free_x', 'NEEDS_RULE_INPUT', 'SEMANTIC_KIND_UNDECIDED'],
+      // OP-2（D10）: free_x は作り物の文字で決まる。入力の形の指定のある mixed_x は、今どおり推さない。
       ['half_range', 'NEEDS_RULE_INPUT', 'RANGE_MISSING'],
       ['mixed_x', 'NEEDS_RULE_INPUT', 'SEMANTIC_KIND_UNDECIDED'],
       ['stepped', 'NEEDS_RULE_INPUT', 'RANGE_MISSING'],
@@ -150,6 +152,7 @@ describe('FM2c: inferRuleSetContent makes the inferred rules storable', () => {
     expect(decided).toEqual([
       ['arrival', 'HUMAN'],
       ['email', 'HUMAN'],
+      ['free_x', 'HUMAN'],
       ['limited_x', 'HUMAN'],
       ['member_x', 'HUMAN'],
       ['name', 'HUMAN'],
@@ -432,10 +435,13 @@ describe('FM2c: the constraints of an API key come from the field of the same fo
     expect(inferred.content.fieldRules.map(({ fieldName, semanticKind, range, digitCount }) => [fieldName, semanticKind, range, digitCount])).toEqual([
       ['lv_x', 'GENERIC_NUMBER', { min: '1', max: '5', step: null }, null],
       ['plan_x', 'DIGIT_CODE', null, 3],
+      // OP-2（D10）: 語に当たらない文字の鍵は、作り物の文字。
+      ['ref_x', 'GENERIC_TEXT', null, null],
     ]);
     expect(inferred.defaultRangeFieldNames).toEqual([]);
-    expect(inferred.unresolvedFields.map(({ fieldName, problem }) => [fieldName, problem.detail])).toEqual([['ref_x', 'SEMANTIC_KIND_UNDECIDED']]);
-    const ruleSet = ruleSetFor(scenario, [...inferred.content.fieldRules,
+    // OP-2（D10）: ref_x は作り物の文字で決まる（前は推せずに人が決めた）。人の規則に置き換えた形でも、今どおり作れる。
+    expect(inferred.unresolvedFields).toEqual([]);
+    const ruleSet = ruleSetFor(scenario, [...inferred.content.fieldRules.filter(({ fieldName }) => fieldName !== 'ref_x'),
       { fieldName: 'ref_x', semanticKind: 'FIXED_LIST', method: 'FROM_FIXED_LIST', range: null, fixedValues: ['r1'] }]);
     for (const grant of ['grant-1', 'grant-2', 'grant-3', 'grant-4']) {
       const result = generateScenarioData({

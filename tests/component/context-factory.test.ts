@@ -23,6 +23,7 @@ import { overrideBrowser } from '../helpers/browser-proxies.js';
 import {
   BROWSER_DEFAULT_FAVICON_PATH,
   browserWithoutServiceWorkerRegistrationBlock,
+  chromiumRunsOf,
   launchCliChromium,
   launchHeadlessChromium,
   testContextsOf,
@@ -627,7 +628,11 @@ describe('BrowserContextFactory', () => {
     const factory = factoryFor(mutableConfig);
 
     mutableOrigins[0] = 'https://attacker.invalid';
-    const context = await factory.createPassiveContext(mutableViewport);
+    // SD-2: 許可 Origin の外への main frame の移動を止めるのはログインの段だけなので、その Context で写しを確かめる。
+    const context = await factory.createLoginStageContext(mutableViewport, {
+      loginPostEndpoints: [{ origin: 'https://example.test', path: '/login' }],
+      maxLoginPosts: 1,
+    });
     contexts.push(context);
     mutableViewport.width = 1;
 
@@ -863,6 +868,8 @@ describe('BrowserContextFactory', () => {
         recordRequestFailed: (request, url, errorText) => {
           failed.push({ request, url, errorText });
         },
+        // DEF-241: 応答の事象は、この確かめでは記録しない（終わりと失敗の事象を確かめる）。
+        recordResponseReceived: () => undefined,
         recordServedFromRunCache: () => undefined,
         recordWithheld: () => undefined,
         snapshot: () => {
@@ -1054,6 +1061,7 @@ describe('BrowserContextFactory', () => {
       const loadMeter: LoadMeter = {
         recordRequestFinished: () => undefined,
         recordRequestFailed: () => undefined,
+        recordResponseReceived: () => undefined,
         recordServedFromRunCache: (request) => {
           served.push(request);
         },
@@ -1683,38 +1691,7 @@ describe('BrowserContextFactory', () => {
 
     // BN-R0 fix round 1（I-1）: ページが出す、除外のパスへの GET（BN-0 で Guard が通す）は、Guard が中継に知らせるので、中継も通す。知らせのない同じ形の GET
     // （Guard を迂回した要求）は、中継が拒んで記録する。
-    it('passes at the proxy the page read to an excluded path that the Guard let through, and still rejects one the Guard never saw (BN-R0 I-1)', async () => {
-      const server = await startFixtureServer();
-      try {
-        const factory = factoryFor(configFor(server.origin), {
-          authentication: {
-            initialState: { cookies: [], origins: [] },
-            filterState: (state) => state,
-            auditExclusions: { excludedPathPrefixes: ['/excluded/'], auditPathPrefixes: [], dangerousTerms: [] },
-          },
-        });
-        const context = await factory.createPassiveContext(viewport);
-        contexts.push(context);
-        const { proxy } = lastEgressProxy();
-        const page = await factory.createPassivePage(context);
-        await page.goto(`${server.origin}/`);
-        const window = openServerWindow(server);
-        const pageStatus = await page.evaluate(async () => (await fetch('/excluded/page-read')).status);
-        const bypass = await requestThroughEgressProxy(proxy, 'GET', `${server.origin}/excluded/bypass`);
-
-        expect(pageStatus).toBe(404);
-        expect(bypass.status).toBe(403);
-        expect(window.requestLines()).toEqual(['GET /excluded/page-read']);
-        expect(factory.getSafetyLedger(context).snapshot().blockedInteractionRequests).toEqual([
-          { method: 'GET', url: `${server.origin}/excluded/bypass`, reason: 'GUARD_BYPASS_EGRESS' },
-        ]);
-        await factory.closePassiveContext(context);
-      } finally {
-        await server.close();
-      }
-    });
-
-    it('rejects at the proxy what the Guard of the Context would not allow (method, excluded path), as GUARD_BYPASS_EGRESS', async () => {
+    it('rejects at the proxy what the Guard of the Context would not allow (method), as GUARD_BYPASS_EGRESS, and passes a read to an excluded path (SD-2)', async () => {
       const server = await startFixtureServer();
       try {
         const factory = factoryFor(configFor(server.origin), {
@@ -1730,19 +1707,17 @@ describe('BrowserContextFactory', () => {
         const window = openServerWindow(server);
 
         const read = await requestThroughEgressProxy(proxy, 'GET', `${server.origin}/`);
-        // GET と HEAD は、Guard が許す読み取りなので、中継も通す。POST と除外のパスへの GET は、Guard が許さないので、中継も拒む。
-        // BN-0 の後の BN-R0 fix round 1（I-1）: Guard はページの文書でない読み取りなら除外のパスへの GET も通すが、中継は、この Context の Guard が通した
-        // （知らせた）要求でなければ、除外を当てて拒む（Guard を迂回した要求の 2 段目の守り）。ここの GET は、Guard を通らずに中継へ直に送ったもの。
+        // GET と HEAD は、Guard が許す読み取りなので、中継も通す。POST は、Guard が許さない（READ_ONLY）ので、中継も拒む。SD-2: 監査の段の除外は main frame の
+        // 文書の読み込みだけに当てるので、除外のパスへの GET も、Guard と同じく中継も通す（前の BN-R0 fix round 1 の 2 段目は外した）。
         const head = await requestThroughEgressProxy(proxy, 'HEAD', `${server.origin}/`);
         const post = await requestThroughEgressProxy(proxy, 'POST', `${server.origin}/__mutation`);
         const excluded = await requestThroughEgressProxy(proxy, 'GET', `${server.origin}/excluded/logout`);
 
-        expect([read.status, head.status, post.status, excluded.status]).toEqual([200, 200, 403, 403]);
+        expect([read.status, head.status, post.status, excluded.status]).toEqual([200, 200, 403, 404]);
         expect(factory.getSafetyLedger(context).snapshot().blockedInteractionRequests).toEqual([
           { method: 'POST', url: `${server.origin}/__mutation`, reason: 'GUARD_BYPASS_EGRESS' },
-          { method: 'GET', url: `${server.origin}/excluded/logout`, reason: 'GUARD_BYPASS_EGRESS' },
         ]);
-        expect(window.requestLines()).toEqual(['GET /', 'HEAD /']);
+        expect(window.requestLines()).toEqual(['GET /', 'HEAD /', 'GET /excluded/logout']);
         await factory.closePassiveContext(context);
       } finally {
         await server.close();
@@ -1778,7 +1753,9 @@ describe('BrowserContextFactory', () => {
 
     // T30b（Task 30 の設計書 4 章）: 書き込みの段の Context の中継は、承認の要求の形の POST（query なし）だけを、Guard が許しうるものとして通す
     // （回数と送る中身は Guard が数えて照合する。中継は本文を見ない）。ほかの POST、query つきの承認の POST、除外のパスへの GET は拒む。
-    it('lets only the approved POST of the write stage Context through the proxy, and rejects other POSTs, a query and an excluded path (T30b)', async () => {
+    // LU-SFIX2-B（LU-SREV2 の Minor-2 と同じ考え方）: 承認の形の POST も、Guard が通した要求の写しに当たるものだけを通す。Guard を通らずに中継へ直に送った
+    // 承認の形の POST は 403 で、サーバに届かない（Guard が通した POST が 1 件だけ届くことは `tests/integration/write-stage-context.test.ts` で確かめる）。
+    it('rejects the approved POST sent straight to the proxy of the write stage Context, other POSTs and a query (T30b, LU-SFIX2-B)', async () => {
       const server = await startFixtureServer();
       try {
         const factory = factoryFor(configFor(server.origin), {
@@ -1804,16 +1781,14 @@ describe('BrowserContextFactory', () => {
         const approved = await requestThroughEgressProxy(proxy, 'POST', `${server.origin}/__mutation`);
         const withQuery = await requestThroughEgressProxy(proxy, 'POST', `${server.origin}/__mutation?again=1`);
         const other = await requestThroughEgressProxy(proxy, 'POST', `${server.origin}/__other-mutation`);
-        const excluded = await requestThroughEgressProxy(proxy, 'GET', `${server.origin}/excluded/logout`);
 
         expect(options.upstreamFailureMode).toBe('PASS_THROUGH');
-        expect(approved.status).not.toBe(403);
-        expect([withQuery.status, other.status, excluded.status]).toEqual([403, 403, 403]);
-        expect(window.requestLines()).toEqual(['POST /__mutation']);
+        expect([approved.status, withQuery.status, other.status]).toEqual([403, 403, 403]);
+        expect(window.requestLines()).toEqual([]);
         expect(factory.getSafetyLedger(context).snapshot().blockedInteractionRequests).toEqual([
+          { method: 'POST', url: `${server.origin}/__mutation`, reason: 'GUARD_BYPASS_EGRESS' },
           { method: 'POST', url: `${server.origin}/__mutation?again=1`, reason: 'GUARD_BYPASS_EGRESS' },
           { method: 'POST', url: `${server.origin}/__other-mutation`, reason: 'GUARD_BYPASS_EGRESS' },
-          { method: 'GET', url: `${server.origin}/excluded/logout`, reason: 'GUARD_BYPASS_EGRESS' },
         ]);
         await factory.closePassiveContext(context);
       } finally {
@@ -1853,10 +1828,10 @@ const sharedWorkerViolationsOf = (ledger: SafetyLedger): readonly unknown[] => l
  * `SHARED_WORKER_OBSERVED` を記録して、その Context を閉じる。引数を外した Chromium（テストの明示の選択 `sharedWorkers: 'allow'`）で、
  * テストの既定の headless shell と CLI の Chromium の両方で確かめる。
  */
-describe.each([
+describe.each(chromiumRunsOf([
   { name: 'the headless shell', launch: (): Promise<Browser> => launchHeadlessChromium({ sharedWorkers: 'allow' }) },
   { name: 'the CLI Chromium', launch: (): Promise<Browser> => launchCliChromium({ sharedWorkers: 'allow' }) },
-])('DEF-044: the Shared Worker self-check of the factory, with $name launched without the Shared Worker disabling arguments', ({ launch }) => {
+]))('DEF-044: the Shared Worker self-check of the factory, with $name launched without the Shared Worker disabling arguments', ({ launch }) => {
   let allowingBrowser: Browser;
   let server: Awaited<ReturnType<typeof startFixtureServer>>;
 
@@ -2020,10 +1995,10 @@ const browserOpeningServiceWorkerRegistration = (real: Browser): Browser => brow
  * 自己検査の経路に届かない）。そこで、ブラウザが登録を許す条件（Playwright の置き換えも効かない場合。`browserOpeningServiceWorkerRegistration`）で
  * 確かめる。
  */
-describe.each([
+describe.each(chromiumRunsOf([
   { name: 'the headless shell', launch: (): Promise<Browser> => launchHeadlessChromium() },
   { name: 'the CLI Chromium', launch: (): Promise<Browser> => launchCliChromium() },
-])('DEF-049: the Service Worker self-check of the factory, with $name and without the registration block script', ({ name, launch }) => {
+]))('DEF-049: the Service Worker self-check of the factory, with $name and without the registration block script', ({ name, launch }) => {
   let realBrowser: Browser;
   let server: Awaited<ReturnType<typeof startFixtureServer>>;
 

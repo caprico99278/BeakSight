@@ -1,66 +1,90 @@
 /**
  * FM2e（手を減らす段 2 の設計書 3A.4）: 1 回の操作で自動ログインの設定を終える欄（資格情報の画面の、手動のログインのプロファイルの形）。
- * - 中身は 3 つ: 認証の方式の変更（今の方式 → 自動ログイン）、ログインの 3 つのセレクタ（最後の手動のログインの段の観察の案を入れて出し、推測の印を付ける。
- *   人が直せる。直した値は「人が決める」の印）、資格情報の入力（ユーザー名、パスワードを 2 回）。
- * - 「変更を確かめる」で確認のダイアログを開き、変えるもの（方式・セレクタ・回数の上限・資格情報）、改訂が進むこと、承認が外れるシナリオの数を出す。
+ * - 「自動ログインにする」で確認のダイアログを開き、変えるもの（方式・回数の上限・資格情報）、改訂が進むこと、承認が外れるシナリオの数を出す。
  *   確定で 1 回だけ保存の要求を送る（順はサーバの `setUpAutomatedLogin`）。送った後は、成否にかかわらず資格情報の入力をすぐに空にする。
  * - 値（ユーザー名とパスワード）は画面の状態の中だけに置き、表示しない（`CredentialValueField`）。文言はカタログだけ（`LOCAL_UI_AUTOMATED_LOGIN_SETUP_TEXT`）。
- * - 「ログインを確かめる」は自動で始めない（保存の後の画面がボタンを出す）。
+ * - PL-S（設計書 `doc/design/2026-10-26-beaksight-plain-ui-design.md` 7 章・9 章の 2）: 確認のダイアログに、CSS セレクタを出さない（変えるものの表は、方式・回数の
+ *   上限・資格情報）。代わりに、パスワードを入れる先（手でログインしたときと同じログインの画面の、ホストだけ。Origin の表記や path は出さない）、テスト用の
+ *   アカウントだけを入れること、保存の場所、回数の決まり（定義元の定数 `auto-login-limits.ts`）を出す。
+ * - PL-4（同 3 章の 1・2・3、4 章の 3、6 章の 4）: 資格情報の画面の要点のパネルの中身として描く。見える入力は ID・パスワード・パスワードをもう一度の 3 つと、
+ *   主のボタン「自動ログインにする」だけ。ログインの 3 つのセレクタは、最後の手動のログインの観察か最後の入口の確かめの案（`setup.proposals`）が 3 つそろうときだけ、
+ *   その案のまま送る（欄・推測の印・方式の表・詳しい設定は出さない。人が CSS を書く道は残さない。MI 4.7.1 の 6 の「送信先は観察からだけ」と同じ考え）。案が
+ *   そろわないときは「このサイトでは自動ログインを使えません」と出し、欄もボタンも出さない。認証の設定が古いときも、理由と直す画面へのリンクだけを出す
+ *   （押せないボタンは出さない）。保存の後は、画面の側（`onSaved`）が点検の開始の画面へ移す（`automatedLoginSetUpSearch` の印つき）。
  */
 import { useState } from 'react';
 import { Link } from '@tanstack/react-router';
 import { useServerFn } from '@tanstack/react-start';
 import { AUTOMATED_LOGIN_AUTH_STRATEGY } from '../../../../src/control/contracts.js';
-import type { EntryCheckField } from '../../../../src/control/entry-check.js';
+import { AUTO_LOGIN_DAILY_MAX_ATTEMPTS, AUTO_LOGIN_DAILY_WINDOW_MS, AUTO_LOGIN_MIN_INTERVAL_MS } from '../../../../src/control/job/auto-login-limits.js';
+import { DAY_MS, MINUTE_MS } from '../../../../src/core/time-units.js';
 import { formatCount, formatInteger, formatTimes } from '../../../../src/presentation/format.js';
 import {
-  AUTH_SETUP_VALIDATION_ERROR_DESCRIPTIONS,
   CREDENTIAL_REQUEST_REJECTION_DESCRIPTIONS,
-  LOCAL_UI_AUTH_TEXT,
   LOCAL_UI_AUTOMATED_LOGIN_SETUP_TEXT,
   LOCAL_UI_CREDENTIAL_TEXT,
   LOCAL_UI_TEXT,
 } from '../../../../src/presentation/messages.js';
 import { authStrategyDisplay } from '../display/labels';
-import type { AuthSetupFormField } from '../server/auth-setup-errors';
 import {
   setUpAutomatedLoginFn,
   type AutomatedLoginSetupResultView,
   type AutomatedLoginSetupView,
   type CredentialPageView,
 } from '../server/credential-functions';
+import { authSetupErrorSummaryText } from './AuthSetupForm';
 import { ConfirmDialog } from './ConfirmDialog';
 import { CredentialValueField } from './CredentialValueField';
-import { DraftValueMark } from './DraftValueMark';
-import { FieldFrame } from './FieldFrame';
 import { Notice } from './Notice';
+import { ARRIVAL_SEARCH } from './PageFrame';
 
 const text = LOCAL_UI_AUTOMATED_LOGIN_SETUP_TEXT;
 const credentialText = LOCAL_UI_CREDENTIAL_TEXT;
-const setupText = LOCAL_UI_AUTH_TEXT.setup;
 /** 保存の後の認証の方式（FM2R の Minor 4: 値は owner `contracts.ts` の定数）。 */
 const AUTOMATED_LOGIN = AUTOMATED_LOGIN_AUTH_STRATEGY;
 
-/** 3 つのセレクタの欄（順、認証の設定のフォームの項目、ラベルと説明）。 */
-const SELECTOR_FIELDS: readonly {
-  readonly field: EntryCheckField;
-  readonly formField: AuthSetupFormField;
-  readonly label: string;
-  readonly hint: string;
-}[] = Object.freeze([
-  { field: 'username', formField: 'usernameSelector', label: setupText.usernameSelector, hint: setupText.usernameSelectorHint },
-  { field: 'password', formField: 'passwordSelector', label: setupText.passwordSelector, hint: setupText.passwordSelectorHint },
-  { field: 'submit', formField: 'submitSelector', label: setupText.submitSelector, hint: setupText.submitSelectorHint },
-]);
+/** PL-4: 自動ログインにした後に、点検の開始の画面へ移すときの search の鍵と値（何が起きたかの印）。 */
+const AUTOMATED_LOGIN_SET_UP_SEARCH_KEY = 'automatedLogin';
+const AUTOMATED_LOGIN_SET_UP_SEARCH_VALUE = 'setUp';
 
-type Selectors = Readonly<Record<EntryCheckField, string>>;
+/**
+ * PL-4（設計書 6 章の 4、13 章の最後の段落）: 自動ログインにした後に、点検の開始の画面へ移すときの search（移った印 `ARRIVAL_SEARCH` と、自動ログインにした印）。
+ * 移った先は `arrivedFromAutomatedLoginSetUp` で読み、要点の 1 行目に `LOCAL_UI_AUTOMATED_LOGIN_SETUP_TEXT.arrived` を出す。
+ */
+export const automatedLoginSetUpSearch = Object.freeze({
+  ...ARRIVAL_SEARCH,
+  [AUTOMATED_LOGIN_SET_UP_SEARCH_KEY]: AUTOMATED_LOGIN_SET_UP_SEARCH_VALUE,
+} as { readonly arrived: 'auto'; readonly automatedLogin: 'setUp' });
 
-/** 欄の最初の値（案があれば案、なければ今の設定の値、どちらもなければ空）。 */
-const initialSelectorsOf = (setup: AutomatedLoginSetupView): Selectors => ({
-  username: setup.proposals.username?.value ?? setup.currentSelectors.username ?? '',
-  password: setup.proposals.password?.value ?? setup.currentSelectors.password ?? '',
-  submit: setup.proposals.submit?.value ?? setup.currentSelectors.submit ?? '',
-});
+/** PL-4: 移った先の route で、自動ログインにした直後に移ってきたかを読む（印がなければ偽）。 */
+export const arrivedFromAutomatedLoginSetUp = (search: Readonly<Record<string, unknown>>): boolean =>
+  search[AUTOMATED_LOGIN_SET_UP_SEARCH_KEY] === AUTOMATED_LOGIN_SET_UP_SEARCH_VALUE;
+
+/** PL-S: 確認のダイアログの回数の決まり（定義元の定数を、分・日・回で示す）。 */
+const LIMITS_TEXT = text.dialog.limits(
+  formatInteger(AUTO_LOGIN_MIN_INTERVAL_MS / MINUTE_MS),
+  formatInteger(AUTO_LOGIN_DAILY_WINDOW_MS / DAY_MS),
+  formatInteger(AUTO_LOGIN_DAILY_MAX_ATTEMPTS),
+);
+
+/** PL-S: パスワードを入れる先の文（ログインの画面のホストだけ。分からなければ、ホストを出さない文）。 */
+const destinationTextOf = (loginHost: string | null): string =>
+  (loginHost === null ? text.dialog.destinationUnknown : text.dialog.destination(loginHost));
+
+/** 3 つのセレクタ（観察の案。3 つそろうときだけ）。 */
+interface ProposedSelectors {
+  readonly usernameSelector: string;
+  readonly passwordSelector: string;
+  readonly submitSelector: string;
+}
+
+/** PL-4: 観察の案が 3 つそろうときの、送るセレクタ（そろわなければ `null`。人は直さない）。 */
+const proposedSelectorsOf = (setup: AutomatedLoginSetupView): ProposedSelectors | null => {
+  const { username, password, submit } = setup.proposals;
+  return username === null || password === null || submit === null
+    ? null
+    : { usernameSelector: username.value, passwordSelector: password.value, submitSelector: submit.value };
+};
 
 /** 資格情報の入力の値（画面の入力のまま。送った後に、すぐに空にする）。 */
 interface ValueState {
@@ -90,7 +114,10 @@ const resultOf = (value: unknown): AutomatedLoginSetupResultView | 'REQUEST_FAIL
   return 'REQUEST_FAILED';
 };
 
-/** 拒否の知らせ（説明と、することと、資格情報のファイルの戻し）。 */
+/**
+ * 拒否の知らせ（説明と、することと、資格情報のファイルの戻し）。PL-4: セレクタの欄を出さないので、認証の設定の誤り（`SETUP` の `errors`）は、項目の名前つきの
+ * 文で、ここに並べる（開始の画面と同じ文の部品 `authSetupErrorSummaryText`）。
+ */
 function FailureNotice({ failure }: Readonly<{ failure: Failure }>) {
   if (failure === 'REQUEST_FAILED') {
     return (
@@ -100,12 +127,14 @@ function FailureNotice({ failure }: Readonly<{ failure: Failure }>) {
     );
   }
   const description = failure.kind === 'CREDENTIAL' ? CREDENTIAL_REQUEST_REJECTION_DESCRIPTIONS[failure.reason] : text.rejections[failure.reason];
+  const setupErrors = failure.kind === 'SETUP' ? [...new Set(failure.errors.map(authSetupErrorSummaryText))] : [];
   return (
     <Notice kind="critical" heading={text.rejectedHeading}>
       <p data-testid="automated-login-setup-rejection" data-kind={failure.kind} data-reason={failure.reason}
         data-rollback={failure.kind === 'SETUP' ? failure.rollback : 'NOT_NEEDED'}>
         {description.description}
       </p>
+      {setupErrors.map((error) => <p key={error} data-testid="automated-login-setup-error">{error}</p>)}
       <p>{description.action}</p>
       <p data-testid="automated-login-setup-rollback">{text.rollbacks[failure.kind === 'SETUP' ? failure.rollback : 'NOT_NEEDED']}</p>
     </Notice>
@@ -115,34 +144,47 @@ function FailureNotice({ failure }: Readonly<{ failure: Failure }>) {
 export function AutomatedLoginSetupForm({ page, setup, onSaved }: Readonly<{
   page: CredentialPageView;
   setup: AutomatedLoginSetupView;
-  /** 保存の後（画面を読み直して、保存の後の状態と「ログインを確かめる」のボタンを出す）。 */
+  /** 保存の後（画面の側が、点検の開始の画面へ移す）。 */
   onSaved: () => void;
 }>) {
   const send = useServerFn(setUpAutomatedLoginFn);
   const { profile } = page;
-  const [selectors, setSelectors] = useState<Selectors>(() => initialSelectorsOf(setup));
   const [values, setValues] = useState<ValueState>(EMPTY_VALUES);
   const [dialogOpen, setDialogOpen] = useState(false);
   const [saving, setSaving] = useState(false);
   const [failure, setFailure] = useState<Failure | null>(null);
   const valueLengthHint = credentialText.valueLengthHint(formatInteger(page.minValueLength), formatInteger(page.maxValueLength));
+  const selectors = proposedSelectorsOf(setup);
 
-  const changeSelector = (field: EntryCheckField, value: string): void => {
-    setSelectors((current) => ({ ...current, [field]: value }));
-    setFailure(null);
-  };
   const setValue = (key: keyof ValueState, value: string): void => {
     setValues((current) => ({ ...current, [key]: value }));
     setFailure(null);
   };
-  const selectorErrors = (formField: AuthSetupFormField): readonly string[] =>
-    failure !== null && failure !== 'REQUEST_FAILED' && failure.kind === 'SETUP'
-      ? failure.errors.filter((error) => error.field === formField).map((error) => AUTH_SETUP_VALIDATION_ERROR_DESCRIPTIONS[error.code])
-      : [];
   const credentialErrors = (field: 'username' | 'password'): readonly string[] =>
     failure !== null && failure !== 'REQUEST_FAILED' && failure.kind === 'CREDENTIAL' && failure.field === field
       ? [CREDENTIAL_REQUEST_REJECTION_DESCRIPTIONS[failure.reason].description]
       : [];
+
+  // PL-4: 観察の案がそろわないときは、欄もボタンも出さない（人に CSS を書かせない）。
+  if (selectors === null) {
+    return (
+      <div data-testid="automated-login-setup">
+        <p data-testid="automated-login-setup-not-available">{text.notAvailable}</p>
+      </div>
+    );
+  }
+  // 認証の設定が古いか、ないとき: 理由と直す画面へのリンクだけ（押せないボタンは出さない）。
+  if (!setup.authSetupCurrent) {
+    return (
+      <div data-testid="automated-login-setup">
+        <Notice kind="caution" heading={text.authSetupNotCurrentHeading}>
+          <p data-testid="automated-login-setup-auth-setup-not-current">{text.authSetupNotCurrentBody}</p>
+          <p><Link to="/auth-setup/$profileId" params={{ profileId: profile.profileId }}>{text.openAuthSetup}</Link></p>
+        </Notice>
+      </div>
+    );
+  }
+
   const save = (): void => {
     setSaving(true);
     setFailure(null);
@@ -150,9 +192,7 @@ export function AutomatedLoginSetupForm({ page, setup, onSaved }: Readonly<{
       data: {
         profileId: profile.profileId,
         expectedRevision: profile.revision,
-        usernameSelector: selectors.username,
-        passwordSelector: selectors.password,
-        submitSelector: selectors.submit,
+        ...selectors,
         username: values.username,
         password: values.password,
         passwordConfirmation: values.passwordConfirmation,
@@ -172,20 +212,16 @@ export function AutomatedLoginSetupForm({ page, setup, onSaved }: Readonly<{
       })
       .finally(() => setSaving(false));
   };
-  const selectorText = (value: string | null): string => (value === null || value.trim().length === 0 ? text.dialog.emptySelector : value.trim());
   const attempts = setup.maxLoginAttempts;
 
   return (
-    <section className="panel" data-testid="automated-login-setup">
-      <h2 className="panel-heading">{text.heading}</h2>
+    <div data-testid="automated-login-setup">
       <p>{text.intro}</p>
+      <Notice kind="caution" heading={credentialText.testAccountOnlyHeading}>
+        <p data-testid="credential-test-account-only">{credentialText.testAccountOnlyBody}</p>
+        <p>{credentialText.browserSaveNote}</p>
+      </Notice>
       {failure === null ? null : <FailureNotice failure={failure} />}
-      {setup.authSetupCurrent ? null : (
-        <Notice kind="caution" heading={text.authSetupNotCurrentHeading}>
-          <p data-testid="automated-login-setup-auth-setup-not-current">{text.authSetupNotCurrentBody}</p>
-          <p><Link to="/auth-setup/$profileId" params={{ profileId: profile.profileId }}>{text.openAuthSetup}</Link></p>
-        </Notice>
-      )}
       <form
         className="form-grid"
         noValidate
@@ -196,46 +232,6 @@ export function AutomatedLoginSetupForm({ page, setup, onSaved }: Readonly<{
         }}
       >
         <fieldset className="field">
-          <legend className="field-label">{text.method.heading}</legend>
-          <dl className="facts" data-testid="automated-login-setup-method">
-            <dt>{text.method.before}</dt>
-            <dd data-item="before" data-auth={setup.currentAuth}>{authStrategyDisplay(setup.currentAuth).label}</dd>
-            <dt>{text.method.after}</dt>
-            <dd data-item="after" data-auth={AUTOMATED_LOGIN}>{authStrategyDisplay(AUTOMATED_LOGIN).label}</dd>
-          </dl>
-        </fieldset>
-        <fieldset className="field">
-          <legend className="field-label">{text.selectors.heading}</legend>
-          <p className="field-hint">{text.selectors.body}</p>
-          {SELECTOR_FIELDS.map(({ field, formField, label, hint }) => {
-            const proposal = setup.proposals[field];
-            const value = selectors[field];
-            return (
-              <div key={field} data-testid="automated-login-setup-selector" data-field={field}>
-                <FieldFrame label={label} hint={hint} errors={selectorErrors(formField)}>
-                  {({ id, describedBy, invalid }) => (
-                    <input
-                      id={id}
-                      className="input"
-                      name={formField}
-                      value={value}
-                      spellCheck={false}
-                      autoComplete="off"
-                      aria-describedby={describedBy}
-                      aria-invalid={invalid}
-                      onChange={(event) => changeSelector(field, event.target.value)}
-                    />
-                  )}
-                </FieldFrame>
-                {proposal === null
-                  ? <p className="field-hint" data-testid="automated-login-setup-no-proposal">{text.selectors.noProposal}</p>
-                  : <DraftValueMark testId="automated-login-setup-origin" origin={value === proposal.value ? proposal.origin : 'HUMAN'}
-                    ground={value === proposal.value ? proposal.ground : 'HUMAN_CHOICE'} />}
-              </div>
-            );
-          })}
-        </fieldset>
-        <fieldset className="field">
           <legend className="field-label">{text.credentials.heading}</legend>
           <CredentialValueField kind="username" label={credentialText.username} name="username" hint={valueLengthHint}
             value={values.username} errors={credentialErrors('username')} onChange={(value) => setValue('username', value)} />
@@ -245,7 +241,7 @@ export function AutomatedLoginSetupForm({ page, setup, onSaved }: Readonly<{
             value={values.passwordConfirmation} errors={[]} onChange={(value) => setValue('passwordConfirmation', value)} />
         </fieldset>
         <div className="button-row">
-          <button type="submit" className="button button--primary" disabled={saving || !setup.authSetupCurrent} data-testid="automated-login-setup-review">
+          <button type="submit" className="button button--primary" disabled={saving} data-testid="automated-login-setup-review">
             {saving ? text.saving : text.review}
           </button>
         </div>
@@ -256,6 +252,7 @@ export function AutomatedLoginSetupForm({ page, setup, onSaved }: Readonly<{
         body={text.dialog.body}
         confirmLabel={text.dialog.confirm}
         cancelLabel={text.dialog.cancel}
+        confirmTone="primary"
         busy={saving}
         onCancel={() => setDialogOpen(false)}
         onConfirm={save}
@@ -274,13 +271,6 @@ export function AutomatedLoginSetupForm({ page, setup, onSaved }: Readonly<{
               <td>{authStrategyDisplay(setup.currentAuth).label}</td>
               <td>{authStrategyDisplay(AUTOMATED_LOGIN).label}</td>
             </tr>
-            {SELECTOR_FIELDS.map(({ field, label }) => (
-              <tr key={field} data-testid="automated-login-setup-change" data-item={field}>
-                <th scope="row">{label}</th>
-                <td>{selectorText(setup.currentSelectors[field])}</td>
-                <td><code>{selectorText(selectors[field])}</code></td>
-              </tr>
-            ))}
             {attempts.before === attempts.after ? null : (
               <tr data-testid="automated-login-setup-change" data-item="maxLoginAttempts">
                 <th scope="row">{text.dialog.maxLoginAttempts}</th>
@@ -296,6 +286,12 @@ export function AutomatedLoginSetupForm({ page, setup, onSaved }: Readonly<{
           </tbody>
         </table>
         <Notice kind="caution">
+          <p data-testid="automated-login-setup-destination">{destinationTextOf(setup.loginHost)}</p>
+          <p data-testid="automated-login-setup-test-account">{text.dialog.testAccountOnly}</p>
+          <p data-testid="automated-login-setup-storage">{text.dialog.storage}</p>
+          <p data-testid="automated-login-setup-limits">{LIMITS_TEXT}</p>
+        </Notice>
+        <Notice kind="caution">
           <p data-testid="automated-login-setup-revision">
             {text.dialog.revisionNotice(LOCAL_UI_TEXT.profileForm.revisionText(profile.revision), LOCAL_UI_TEXT.profileForm.revisionText(profile.revision + 1))}
           </p>
@@ -306,6 +302,6 @@ export function AutomatedLoginSetupForm({ page, setup, onSaved }: Readonly<{
           </Notice>
         )}
       </ConfirmDialog>
-    </section>
+    </div>
   );
 }

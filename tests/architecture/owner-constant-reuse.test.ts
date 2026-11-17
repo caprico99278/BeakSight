@@ -8,10 +8,6 @@
  *     プロファイルの状態の形（`.status` との比べ、`ProfileStatus` の型の値）は誤りにする。
  * - (a′) プロファイルの状態の値 `RETIRED`（取り消したプロファイル）も、(a) と同じ形で `RETIRED_PROFILE_STATUS` だけに書く（PRE42-CC の組 1b。
  *   CC-109 の `'RETIRED'`）。文字列 `RETIRED` を別の意味（改訂の履歴の変更の種類 `ProfileChangeKind` など）で使うファイルは、閉じた一覧で除く。
- * - (a″) 実行のロックの判定の結果（`judgeRunLock` の `ACTIVE`・`STALE`）は、`src/core/process-lock.ts` の `RUN_LOCK_STATES` と、そこから読む
- *   `ACTIVE_RUN_LOCK_STATE` だけに書く（PRE42-CC の組 R。CC-110）。`judgeRunLock` を使う owner の外のファイルは、判定の結果と状態の文字列を
- *   比べない（`judgeRunLock(…) === 'ACTIVE'`、`state === 'ACTIVE'` の書き写しの戻りを止める）。画面のサーバのロック（`instance-lock.ts`）と
- *   出力先の開始のロック（`output-start-lock.ts`）は、(a) の除外にも入れない。
  * - (b) 画面のサーバ（`apps/local-ui/src/server/**`）の今の時刻（管理データの UTC の 14 桁）は、`timestamps.ts` の `nowCompactTimestamp` だけが
  *   `formatCompactUtcTimestamp(new Date(), …)` で作る（CC-109 の後半。保存の口ごとの `nowStamp` の書き写しの戻りを止める）。
  * - (c) 成果物の名前の定数（`*_ARTIFACT_FILE_NAME`・`*_ARTIFACT_FILE_NAMES`）と、1 つの名前の定数の値（`action-run.json` など）は、
@@ -66,7 +62,6 @@ const PROFILE_STATUS_OWNER = 'src/control/store/profile-records.ts';
 
 /** 文字列 `ACTIVE` を、プロファイルの状態でない意味で使うファイル（閉じた一覧。理由つき）。 */
 const OTHER_MEANING_FILES: Readonly<Record<string, string>> = Object.freeze({
-  'src/core/process-lock.ts': '実行のロックの状態（`RUN_LOCK_STATES`）の owner',
   'src/orchestration/run-checkpoint-session.ts': 'チェックポイントのセッションの段階（`SessionPhase`）',
 });
 
@@ -115,22 +110,6 @@ const retiredLiteralCountOf = (file: Pick<SourceFile, 'literals'>): number =>
 /** 文字列 `RETIRED` を書いたファイル（絞ってから走査する）。 */
 const filesWithRetiredText = (): readonly SourceFile[] =>
   PRODUCTION_FILES.filter(({ content }) => content.includes(RETIRED_PROFILE_STATUS)).map((file) => scanFile(file));
-
-// ---------------------------------------------------------------------------------------------------------------
-// (a″) 実行のロックの判定の結果（PRE42-CC の組 R。CC-110）
-// ---------------------------------------------------------------------------------------------------------------
-
-const RUN_LOCK_STATE_OWNER = 'src/core/process-lock.ts';
-/** ロックの判定の結果と、状態の文字列との比べ（`judgeRunLock(…) === 'ACTIVE'`、`state === 'ACTIVE'`、その逆。`STALE` も）。 */
-const RUN_LOCK_STATE_COMPARISON_SHAPES: readonly RegExp[] = [
-  /\)\s*[!=]==?\s*['"](?:ACTIVE|STALE)['"]/u,
-  /\bstate\s*[!=]==?\s*['"](?:ACTIVE|STALE)['"]/u,
-  /['"](?:ACTIVE|STALE)['"]\s*[!=]==?\s*[\w$.?]*\bstate\b/u,
-];
-
-/** ロックの判定（`judgeRunLock`）を使う、owner の外のファイル（絞ってから走査する）。 */
-const filesJudgingRunLocks = (): readonly SourceFile[] =>
-  PRODUCTION_FILES.filter(({ path, content }) => path !== RUN_LOCK_STATE_OWNER && content.includes('judgeRunLock')).map((file) => scanFile(file));
 
 // ---------------------------------------------------------------------------------------------------------------
 // (b) 画面のサーバの今の時刻
@@ -250,22 +229,6 @@ describe('Architecture Gate: the owner constants are read, not copied (PRE42-CC 
     expect(stopwatch.elapsedMs()).toBeLessThan(MAX_MS_PER_FILE * Math.max(files.length, 1));
   });
 
-  it('compares the run lock state only through ACTIVE_RUN_LOCK_STATE of process-lock.ts (PRE42-CC group R, CC-110)', () => {
-    const stopwatch = startCpuStopwatch();
-    const files = filesJudgingRunLocks();
-    // 空の走査で PASS しない（ロックの判定の利用者が見えている）。LG-4F: 保存のセッション（`run-checkpoint-session.ts`）は、前の方式の取り直しを
-    // 捨てて `judgeRunLock` を呼ばなくなった（判定は `takeOverStaleLock` の中）ので、利用者の一覧から外した。
-    expect(files.map(({ path }) => path)).toEqual(expect.arrayContaining([
-      'src/control/job/instance-lock.ts',
-      'src/orchestration/output-start-lock.ts',
-    ]));
-    expect(files.flatMap((file) => matchingCodeLines(file, RUN_LOCK_STATE_COMPARISON_SHAPES))).toEqual([]);
-    const owner = scanFile(PRODUCTION_FILES.find(({ path }) => path === RUN_LOCK_STATE_OWNER) ?? { path: RUN_LOCK_STATE_OWNER, content: '' });
-    expect(owner.code).toMatch(/export const RUN_LOCK_STATES = Object\.freeze\(\['ACTIVE', 'STALE'\] as const\);/u);
-    expect(owner.code).toMatch(/export const ACTIVE_RUN_LOCK_STATE = 'ACTIVE' satisfies RunLockState;/u);
-    expect(stopwatch.elapsedMs()).toBeLessThan(MAX_MS_PER_FILE * Math.max(files.length + 1, 1));
-  });
-
   it('makes the current compact timestamp of the local UI server only in timestamps.ts (nowCompactTimestamp)', () => {
     const stopwatch = startCpuStopwatch();
     const files = PRODUCTION_FILES
@@ -336,23 +299,6 @@ describe('Architecture Gate: the owner constants are read, not copied (PRE42-CC 
       expect(matchingCodeLines(fileOf('control.ts', source), RETIRED_PROFILE_STATUS_SHAPES), source).toEqual([]);
     }
     expect(retiredLiteralCountOf(fileOf('control.ts', "// 'RETIRED' のときだけ\nreturn rejected('PROFILE_RETIRED');"))).toBe(0);
-    // (a″) ロックの判定の結果の書き写し（寄せる前の形。PRE42-CC の組 R。CC-110）。
-    for (const source of [
-      "if (judgeRunLock(lock, { nowMs: host.nowMs, bootedAtMs: host.bootedAtMs, isProcessRunning }) === 'ACTIVE') {",
-      "if (state === 'ACTIVE') {",
-      "if (state !== 'STALE') {}",
-      "if ('ACTIVE' === judged.state) {}",
-    ]) {
-      expect(matchingCodeLines(fileOf('src/control/job/x.ts', source), RUN_LOCK_STATE_COMPARISON_SHAPES), source).toHaveLength(1);
-    }
-    for (const source of [
-      "// if (state === 'ACTIVE') {",
-      'if (state === ACTIVE_RUN_LOCK_STATE) {',
-      'if (judgeRunLock(lock, judgement) === ACTIVE_RUN_LOCK_STATE) {',
-      "if (this.#phase !== 'ACTIVE') {",
-    ]) {
-      expect(matchingCodeLines(fileOf('src/control/job/x.ts', source), RUN_LOCK_STATE_COMPARISON_SHAPES), source).toEqual([]);
-    }
     // (b) 今の時刻の書き写し。
     for (const source of [
       "const nowStamp = (): string => formatCompactUtcTimestamp(new Date(), 'save time');",

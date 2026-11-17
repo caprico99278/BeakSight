@@ -7,11 +7,10 @@
  *   ファイルの部品が確かめ直す。処理は `credential-service.ts`。
  * - 応答に値を返さない。誤りの応答には、誤りのコードと項目の名前だけを入れる。
  * - FM2e: 1 回の操作で自動ログインの設定を終える要求（`setUpAutomatedLoginFn`。スキーマ `ui-automated-login-setup`。順は `setUpAutomatedLogin`）。
+ * - MI-4: 切り替えの画面のセレクタの案は、最後の手動のログインの観察の案がなければ、最後の入口の確かめの案（`entryCheckLoginFields`）。
  */
 import { createServerFn, createServerOnlyFn } from '@tanstack/react-start';
 import { getProfile } from '../../../../src/control/store/profile-store.js';
-import { localUiAuditJobs } from './audit-jobs';
-import { localUiStore } from './control-store';
 import {
   changeCredential,
   clearCredentialHold,
@@ -31,7 +30,8 @@ import {
   type CredentialRequestView,
   type CredentialServiceDependencies,
 } from './credential-service';
-import { isCredentialPlatformSupported, localUiCredentialEnvironment, localUiCredentialStore } from './credential-runtime';
+import { localUiCredentialBaseDependencies } from './credential-dependencies';
+import { lastFinishedEntryCheckOf } from './entry-check-functions';
 import { requestOf } from './request-validation';
 import { approvedScenarioCountOf } from './scenario-facts';
 import { loadTargetContext } from './target-config';
@@ -49,14 +49,12 @@ interface ProfileKeyRequest {
  *   サーバの部品（管理データ、資格情報のファイルの部品）までブラウザに入り、読み込みで落ちる（T26g-2 round 1 の画面の検査で確かめた）。
  */
 export const localUiCredentialServiceDependencies = createServerOnlyFn((): CredentialServiceDependencies => ({
-  database: localUiStore(),
-  store: localUiCredentialStore(),
-  checkCredentialChange: (profileId) => localUiAuditJobs().checkCredentialChange(profileId),
-  platformSupported: isCredentialPlatformSupported,
-  environment: localUiCredentialEnvironment,
-  now: () => new Date(),
+  // MI-F3 項目 6: 基本の部品の組み立ては `credential-dependencies.ts`（起動のときの取り消しの片付けと共用）。
+  ...localUiCredentialBaseDependencies(),
   // FM2e: 1 回の操作で自動ログインに切り替える確認のダイアログの、承認が外れるシナリオの数（監査の負荷の変更と同じ部品）。
   approvedScenarioCount: approvedScenarioCountOf,
+  // MI-4: 最後の手動のログインの観察の案がないときの、最後の入口の確かめの欄の案（入口の確かめの結果の読み方は、ジョブの画面と同じ 1 か所）。
+  entryCheckLoginFields: async (profileId) => (await lastFinishedEntryCheckOf(profileId))?.proposal?.selectors ?? null,
 }));
 
 /** 資格情報の画面の値（値を含まない）。プロファイルがなければ `null`。 */

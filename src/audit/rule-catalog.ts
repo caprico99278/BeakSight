@@ -1,5 +1,6 @@
 import { isPositiveSafeInteger } from '../core/guards.js';
 import { ACCESSIBILITY_RULES } from './accessibility-rules.js';
+import { FOCUS_RULES } from './focus-rules.js';
 import { LAYOUT_RULES } from './layout-rules.js';
 import { PERFORMANCE_RULES } from './performance-rules.js';
 import type { AuditRule } from './rule.js';
@@ -11,6 +12,22 @@ import { TECHNICAL_RULES } from './technical-rules.js';
  * どちらも満たす。
  */
 export type CatalogRuleIdentity = Pick<AuditRule, 'ruleId' | 'ruleIdPrefix' | 'version'>;
+
+/**
+ * Finding（下書き）の ruleId が、その Rule のものか（`AuditRule` の ruleId の決まり）。`ruleIdPrefix` を持たない Rule は ruleId が一致するもの、持つ Rule は
+ * ruleId がその接頭辞で始まり、かつ接頭辞より長いもの。Rule Engine の下書きの検査と、Finding の ruleId から Rule の定義を引く処理（`ruleOfFindingRuleId`）が使う。
+ */
+export const isFindingRuleIdOf = (rule: Pick<CatalogRuleIdentity, 'ruleId' | 'ruleIdPrefix'>, ruleId: string): boolean => {
+  const prefix = rule.ruleIdPrefix;
+  return prefix === undefined ? ruleId === rule.ruleId : ruleId.startsWith(prefix) && ruleId.length > prefix.length;
+};
+
+/**
+ * OP-R2: Finding の ruleId を持つ Rule の定義（`freezeCatalog` で検査した一覧から。どの Rule のものでもなければ `undefined`）。検査した一覧では、ruleId と接頭辞が
+ * 重ならないので、当たる Rule は高々 1 つである。
+ */
+export const ruleOfFindingRuleId = <TRule extends CatalogRuleIdentity>(rules: readonly TRule[], ruleId: string): TRule | undefined =>
+  rules.find((rule) => isFindingRuleIdOf(rule, ruleId));
 
 /**
  * Rule の一覧を検査し、凍結した一覧を登録の順のまま返す。登録先ではなく、検査と凍結だけを行う。
@@ -78,6 +95,14 @@ export const RULE_CATALOG: readonly AuditRule[] = freezeCatalog([
   ...TECHNICAL_RULES,
   ...LAYOUT_RULES,
   ...ACCESSIBILITY_RULES,
+  // AUD-4d: フォーカスまで隠す要素。
+  ...FOCUS_RULES,
   ...PERFORMANCE_RULES,
   ...SAFETY_RULES,
 ]);
+
+/**
+ * OP-R2: Finding の ruleId を持つ page rule の、やさしい文（`AuditRule.plainMessage`）。どの page rule のものでもなければ `null`。Rule を評価しない。
+ * 報告は、Cross-page rule とあわせて引く `rulePlainMessageOf`（`./cross-page-rules.ts`）を使う。
+ */
+export const pageRulePlainMessageOf = (ruleId: string): string | null => ruleOfFindingRuleId(RULE_CATALOG, ruleId)?.plainMessage ?? null;

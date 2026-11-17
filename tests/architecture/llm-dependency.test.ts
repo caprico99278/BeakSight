@@ -173,8 +173,9 @@ const SOURCE_FILES = [...loadSourceFiles(), ...loadLocalUiSourceFiles(), ...LOCA
 const REQUIRED_FILES: readonly string[] = [
   'src/control/data-rules/scenario-data.ts',
   'src/control/data-rules-view.ts',
-  'apps/local-ui/src/server/data-rule-functions.ts',
-  'apps/local-ui/src/routes/scenarios/$profileId/$scenarioId/rules.tsx',
+  // SPEC-4: 規則の画面を外したので、規則を使う画面のサーバの部品（事実と自動の下書き）を走査の対象にする。
+  'apps/local-ui/src/server/data-rule-facts.ts',
+  'apps/local-ui/src/server/scenario-autodraft-functions.ts',
   // T29R-fix-1（M-6）: 画面の起動の部品と、ビルドの補助も走査する。
   'apps/local-ui/launcher/serve.ts',
   'apps/local-ui/build-tools/control-schemas-plugin.ts',

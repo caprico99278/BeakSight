@@ -8,7 +8,6 @@ import type { Browser, BrowserContext, Page } from 'playwright';
 import { afterEach, describe, expect, it } from 'vitest';
 import { BrowserContextFactory } from '../../src/browser/context-factory.js';
 import type { AuditConfig } from '../../src/config/types.js';
-import { MAX_ERROR_MESSAGE_LENGTH } from '../../src/core/limits.js';
 import { navigatePage } from '../../src/orchestration/page-navigation.js';
 import { closePassivePageAndContext } from '../../src/orchestration/passive-session-close.js';
 import { isPassiveRequestGuardClosed } from '../../src/safety/passive-request-guard.js';
@@ -119,6 +118,11 @@ async function openGuardedPage(config: AuditConfig): Promise<{ readonly page: Pa
 
 function options(ledger: SafetyLedger, allowedQueryParameters: ReadonlySet<string> = new Set<string>()) {
   return { timeoutMs: NAVIGATION_TIMEOUT_MS, ledger, allowedQueryParameters };
+}
+
+/** SD-2: 点検の範囲の判定（許可 Origin の外なら範囲の外）を渡す形。移った先が範囲の外なら `BLOCKED_EXTERNAL_REDIRECT`。 */
+function scopedOptions(ledger: SafetyLedger, ...allowedOrigins: readonly string[]) {
+  return { ...options(ledger), isOutsideAuditScope: (url: string) => !allowedOrigins.includes(new URL(url).origin) };
 }
 
 describe('navigatePage', () => {
@@ -232,27 +236,44 @@ describe('navigatePage', () => {
     expect(result).toMatchObject({ navigationOutcome: 'TIMEOUT', httpStatus: null });
     expect(result.failureDetail).toEqual(expect.any(String));
     expect(result.failureDetail?.length).toBeGreaterThan(0);
-    expect(result.failureDetail?.length).toBeLessThanOrEqual(MAX_ERROR_MESSAGE_LENGTH);
     // 応答（ヘッダ）のない時間切れ（`/__slow` は、遅らせる間、ヘッダを返さない）。設計書 2.1。
     expect(result.loadObservation).toEqual({ navigationOutcome: 'TIMEOUT', httpStatus: null, failureDetail: result.failureDetail });
   });
 
-  it('returns BLOCKED_EXTERNAL_REDIRECT when the Guard blocks an external main-frame redirect', async () => {
+  // L1（設計書 `2026-11-09-beaksight-remove-limits-design.md` 6 の L1）: 見放す印（進みの見張りの signal）で、読み込みの終わりを待たずに時間切れの観測で返す
+  // （応答の status は追跡の値。前の `timeoutMs` の時間切れと同じ形）。
+  it('L1: returns TIMEOUT with the tracked HTTP status when the abandon signal is aborted, without waiting for the load', async () => {
+    const server = await startObservationServer();
+    const { page: guardedPage, ledger } = await openGuardedPage(createTestConfig(server.origin));
+    const abandon = new AbortController();
+    setTimeout(() => abandon.abort(), STALL_AFTER_HEADERS_TIMEOUT_MS);
+    const startedAtMs = Date.now();
+
+    const result = await navigatePage(guardedPage, `${server.origin}${OBSERVATION_PATHS.stallAfterHeaders}`, {
+      timeoutMs: NAVIGATION_TIMEOUT_MS,
+      ledger,
+      allowedQueryParameters: new Set<string>(),
+      abandonSignal: abandon.signal,
+    });
+
+    expect(Date.now() - startedAtMs).toBeLessThan(NAVIGATION_TIMEOUT_MS);
+    expect(result).toMatchObject({ navigationOutcome: 'TIMEOUT', httpStatus: null, failureDetail: null });
+    expect(result.loadObservation).toEqual({ navigationOutcome: 'TIMEOUT', httpStatus: OK_STATUS, failureDetail: null });
+  });
+
+  // FIN-1（SD-2 の 2.4）: 外へのリダイレクトは Guard が止めずに届く。移った先が点検の範囲の外（`isOutsideAuditScope`）なら `BLOCKED_EXTERNAL_REDIRECT`
+  // （その画面は点検しない）。止めた記録はない。
+  it('returns BLOCKED_EXTERNAL_REDIRECT when an external main-frame redirect lands outside the audit scope (it is not stopped)', async () => {
     const external = await startServer();
     const primary = await startServer({ externalRedirectUrl: `${external.origin}/external-link.html` });
     const { page: guardedPage, ledger } = await openGuardedPage(createTestConfig(primary.origin));
 
-    const result = await navigatePage(guardedPage, `${primary.origin}/__external-redirect`, options(ledger));
+    const result = await navigatePage(guardedPage, `${primary.origin}/__external-redirect`, scopedOptions(ledger, primary.origin));
 
-    expect(result).toMatchObject({ navigationOutcome: 'BLOCKED_EXTERNAL_REDIRECT', httpStatus: null });
-    expect(result.failureDetail).toEqual(expect.any(String));
-    // 観測では `FAILED`（遮断の判断は、Ledger の増加で `navigatePage` が行う。設計書 2.1）。
-    expect(result.loadObservation).toMatchObject({ navigationOutcome: 'FAILED', failureDetail: result.failureDetail });
-    expect(external.getCounters().get).toBe(0);
-    expect(ledger.snapshot().blockedNavigations).toMatchObject([{
-      url: `${external.origin}/external-link.html`,
-      reason: 'EXTERNAL_MAIN_FRAME_NAVIGATION',
-    }]);
+    expect(result).toMatchObject({ navigationOutcome: 'BLOCKED_EXTERNAL_REDIRECT' });
+    expect(result.loadObservation).toMatchObject({ navigationOutcome: 'OK' });
+    expect(external.getCounters().get).toBe(1);
+    expect(ledger.snapshot().blockedNavigations).toEqual([]);
   });
 
   it('returns FAILED for a port that refuses connections', async () => {
@@ -268,12 +289,11 @@ describe('navigatePage', () => {
 
     expect(result).toMatchObject({ navigationOutcome: 'FAILED', httpStatus: null });
     expect(result.failureDetail).toEqual(expect.any(String));
-    expect(result.failureDetail?.length).toBeLessThanOrEqual(MAX_ERROR_MESSAGE_LENGTH);
     expect(result.loadObservation).toEqual({ navigationOutcome: 'FAILED', httpStatus: null, failureDetail: result.failureDetail });
     expect(ledger.snapshot().blockedNavigations).toHaveLength(0);
   });
 
-  it('judges BLOCKED_EXTERNAL_REDIRECT by the increase during this navigation, not by earlier blocked navigations', async () => {
+  it('judges BLOCKED_EXTERNAL_REDIRECT by this navigation, not by earlier navigations', async () => {
     const external = await startServer();
     const primary = await startServer({ externalRedirectUrl: `${external.origin}/external-link.html` });
     const unreachableOrigin = await closedLoopbackOrigin();
@@ -283,11 +303,11 @@ describe('navigatePage', () => {
       site: { ...config.site, allowedOrigins: [primary.origin, unreachableOrigin] },
     });
 
-    const blocked = await navigatePage(guardedPage, `${primary.origin}/__external-redirect`, options(ledger));
-    const failed = await navigatePage(guardedPage, `${unreachableOrigin}/index.html`, options(ledger));
+    const blocked = await navigatePage(guardedPage, `${primary.origin}/__external-redirect`, scopedOptions(ledger, primary.origin, unreachableOrigin));
+    const failed = await navigatePage(guardedPage, `${unreachableOrigin}/index.html`, scopedOptions(ledger, primary.origin, unreachableOrigin));
 
     expect([blocked.navigationOutcome, failed.navigationOutcome]).toEqual(['BLOCKED_EXTERNAL_REDIRECT', 'FAILED']);
-    expect(ledger.snapshot().blockedNavigations).toHaveLength(1);
+    expect(ledger.snapshot().blockedNavigations).toHaveLength(0);
   });
 
   it('returns FAILED instead of throwing when the page is already closed', async () => {
@@ -347,7 +367,7 @@ describe('closing the guarded page and Context right after a failed navigation',
     const url = expectedOutcome === 'BLOCKED_EXTERNAL_REDIRECT'
       ? `${primary.origin}/__external-redirect`
       : `${unreachableOrigin}/index.html`;
-    const navigation = await navigatePage(guardedPage, url, options(ledger));
+    const navigation = await navigatePage(guardedPage, url, scopedOptions(ledger, primary.origin, unreachableOrigin));
     expect(navigation.navigationOutcome).toBe(expectedOutcome);
     const guardedContext = context as BrowserContext;
     const activeFactory = factory as BrowserContextFactory;

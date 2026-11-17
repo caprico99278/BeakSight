@@ -28,7 +28,9 @@ import {
   type ScenarioApiMethod,
   type ScenarioKind,
   type ScenarioTransport,
+  updateLedgerScenarioIdOf,
 } from '../approval/scenario-contracts.js';
+import { revisionViewOf } from '../approval/scenario-facts.js';
 import type { UpdateTargetCandidate } from '../approval/execution-grant.js';
 import type { ControlDatabase } from '../store/control-database.js';
 import type { SqliteConnection } from '../store/sqlite-module.js';
@@ -352,6 +354,7 @@ const distinct = (values: readonly string[]): readonly string[] => Object.freeze
  *   同じ台帳の CREATE と UPDATE のシナリオ。呼び出し側が決める）の記録の使った値（CREATE の登録の値と、UPDATE で送った値）から、その欄の組で
  *   `uniqueKeyOf` を求め直した鍵（ほかのシナリオの鍵の文字列は、そのまま渡さない）。値なしの行（回復で足した行）は鍵を作らない。
  * - 電話番号: `scenarioId` のプロファイルの使った電話番号（今のまま）。
+ * - OP-F: 送らずに止めた回（`NOT_SENT`）の行は、鍵を作らない（電話番号は今のまま）。
  */
 export const writeGenerationHistoryIn = (
   connection: SqliteConnection,
@@ -359,10 +362,13 @@ export const writeGenerationHistoryIn = (
   scenarioIds: readonly string[],
   uniqueKeyFieldNames: readonly string[] | null,
 ): WriteGenerationHistory => {
-  const own = connection.prepare(SELECT_SCENARIO_SQL).all(scenarioId) as unknown as WriteResultRow[];
+  // OP-F（安全のレビューの M-1。設計書 `2026-10-27-beaksight-one-pass-flow-design.md` 4.1.2 の R4）: 送らずに止めた回（`NOT_SENT`）の値は、使った扱いにしない
+  // （送っていない。値の候補の少ない規則で、次の回の値が尽きないように）。送ったか分からない回（`UNKNOWN`）と、まだ締めていない回は、使った扱いのまま。
+  const sentOrUnknown = (row: WriteResultRow): boolean => row.submission !== NOT_SENT_SUBMISSION_STATE;
+  const own = (connection.prepare(SELECT_SCENARIO_SQL).all(scenarioId) as unknown as WriteResultRow[]).filter(sentOrUnknown);
   const family = uniqueKeyFieldNames === null || uniqueKeyFieldNames.length === 0
     ? []
-    : connection.prepare(SELECT_SCENARIOS_SQL).all(JSON.stringify([...new Set([scenarioId, ...scenarioIds])])) as unknown as WriteResultRow[];
+    : (connection.prepare(SELECT_SCENARIOS_SQL).all(JSON.stringify([...new Set([scenarioId, ...scenarioIds])])) as unknown as WriteResultRow[]).filter(sentOrUnknown);
   const phones = connection.prepare(SELECT_PROFILE_PHONES_SQL).all(scenarioId) as unknown as { readonly phone_numbers: string }[];
   const recomputed = family.flatMap((row) => {
     const values = submittedValuesOf(row.submitted_values);
@@ -487,11 +493,14 @@ const SELECT_LEDGER_REGISTRATIONS_SQL = `SELECT ${WRITE_RESULT_COLUMNS}, (SELECT
   FROM write_results WHERE profile_id = ? AND write_kind = ? AND (submission IS NULL OR submission <> ?) ORDER BY recorded_at DESC, job_id DESC`;
 /**
  * プロファイルの UPDATE の書き込みのうち、送ったかもしれないもの（CREATE の行と同じく、送らずに止めた回を除く。送ったか分からない回と締める前の回を
- * 含む）と、その版が参照する CREATE のシナリオ（記録の順）。
+ * 含む）と、その版の写しの行（記録の順）。OP-H: 参照する CREATE のシナリオは、SQL では取り出さない。版の文書を契約の形で読み（`revisionViewOf`）、唯一の
+ * 決まり `updateLedgerScenarioIdOf` で求める（form の UPDATE は `update`、API の UPDATE は `api.ledger`。前は `update` だけを見ていて、API の更新の後に
+ * 台帳が開けなかった）。
  */
 const SELECT_LEDGER_UPDATES_SQL = `SELECT write_results.job_id AS job_id, write_results.target_record_id AS target_record_id,
   write_results.result AS result, write_results.recorded_at AS recorded_at,
-  json_extract(scenario_revisions.document, '$.update.targetCreateScenarioId') AS create_scenario_id
+  scenario_revisions.revision AS revision, scenario_revisions.document AS document, scenario_revisions.evidence AS evidence,
+  scenario_revisions.discovery_job_id AS discovery_job_id, scenario_revisions.recorded_at AS revision_recorded_at
   FROM write_results JOIN scenario_revisions
     ON scenario_revisions.scenario_id = write_results.scenario_id AND scenario_revisions.revision = write_results.scenario_revision
   WHERE write_results.profile_id = ? AND write_results.write_kind = ?
@@ -503,8 +512,19 @@ interface LedgerUpdateRow {
   readonly target_record_id: string | null;
   readonly result: string | null;
   readonly recorded_at: string;
-  readonly create_scenario_id: unknown;
+  /** 版の写しの行（`RevisionRow` の列。版の記録の日時は `revision_recorded_at`）。 */
+  readonly revision: number;
+  readonly document: string;
+  readonly evidence: string;
+  readonly discovery_job_id: string;
+  readonly revision_recorded_at: string;
 }
+
+/** UPDATE の行の版が参照する CREATE のシナリオ（版の文書を契約の形で読み、唯一の決まりで求める。参照がなければ null）。 */
+const ledgerCreateScenarioIdOf = (row: LedgerUpdateRow): string | null =>
+  updateLedgerScenarioIdOf(revisionViewOf({
+    revision: row.revision, document: row.document, evidence: row.evidence, discovery_job_id: row.discovery_job_id, recorded_at: row.revision_recorded_at,
+  }).scenario);
 
 /** 登録の鍵（CREATE のシナリオと登録の ID。区切りは ID に入らない NUL）。 */
 const ledgerKeyOf = (scenarioId: string, recordId: string): string => `${scenarioId}\u0000${recordId}`;
@@ -526,10 +546,11 @@ export const readAuditedDataLedger = (database: ControlDatabase, profileId: stri
       LedgerUpdateRow[];
     const updates = new Map<string, AuditedRecordUpdates>();
     for (const row of updateRows) {
-      if (row.target_record_id === null || typeof row.create_scenario_id !== 'string') {
+      const createScenarioId = ledgerCreateScenarioIdOf(row);
+      if (row.target_record_id === null || createScenarioId === null) {
         throw storedRowIntegrityError(TABLE, 'an UPDATE write has no target record or no referenced CREATE scenario');
       }
-      const key = ledgerKeyOf(row.create_scenario_id, row.target_record_id);
+      const key = ledgerKeyOf(createScenarioId, row.target_record_id);
       updates.set(key, {
         count: (updates.get(key)?.count ?? 0) + 1,
         last: { jobId: row.job_id, result: oneOf(ACTION_RESULTS, row.result, 'result'), recordedAt: row.recorded_at },

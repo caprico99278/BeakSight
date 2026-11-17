@@ -18,9 +18,9 @@
  *   `readExecutionGrant`、`attachInputRuleReference`）を公開し直さない（この Task の画面は、書き込みの要求の動線を持たない。許可の発行は
  *   Task 30、入力の規則は Task 29）。公開し直すのは `src/control/approval/` のものだけで、判定を持たない（定義の文を持たない）。
  *   T30g（T30g の Blocker の判断（案 A）。注記の「許可の発行は Task 30」のとおり）: 実行の許可の発行（`issueExecutionGrant`）を、公開しない名前の
- *   一覧から外した。消費・確かめ直し・予約の締め・`readExecutionGrant`・入力の規則の参照を付ける口は、今どおり公開しない。
- * - (e)（T30g）: 画面のコード（`apps/local-ui/src/`）で実行の許可の発行（`issueExecutionGrant`）を参照するのは、書き込みの開始の Server Function の
- *   ファイル（`apps/local-ui/src/server/write-job-functions.ts`）1 つだけ。
+ *   一覧から外した。SPEC-4: 書き込みの開始の画面を外したので、発行を公開しない名前の一覧に戻した（テストは `scenario-store.ts` を直に読む）。
+ * - (e)（T30g。SPEC-4 で書き換えた）: 画面のコード（`apps/local-ui/src/`）は、実行の許可の発行（`issueExecutionGrant`）を参照しない（書き込みの開始の
+ *   画面を外したので、許可を出すのは点検の書き込みの段の前のジョブの管理だけ）。
  * - 判定は、`fs`、正規表現、文字列の走査だけ（`source-scan.ts` の共通の部品）。`src/**` の読み込みは、このファイルの読み込み時に 1 回だけ。
  *   1 秒以内に終える。
  */
@@ -124,7 +124,8 @@ const APPROVAL_VIEW_FILE = 'src/control/approval-view.ts';
 /** (d) 画面向けの公開し直しが公開しない名前（期限の 1 日の長さ、実行の許可と予約、入力の規則の参照を付ける口）。 */
 const APPROVAL_VIEW_WITHHELD_NAMES: readonly string[] = [
   TTL_DAY_MS_NAME,
-  // T30g: `issueExecutionGrant` は公開する（呼べる画面のコードは (e) で 1 ファイルに限る）。
+  // SPEC-4: 書き込みの開始の画面を外したので、発行も公開しない名前に戻した（T30g で公開していた）。
+  'issueExecutionGrant',
   'consumeExecutionGrant',
   'assertGrantStillValid',
   'settleWriteReservation',
@@ -144,8 +145,14 @@ const approvalViewViolationsOf = (path: string, source: ScannedSource): readonly
   ...(/(?<![\w$])(?:function|class|let|var)\s|(?<![\w$])const\s+[\w$]+\s*[=:]/u.test(source.bare) ? ['<definition>'] : []),
 ];
 
-/** (e) 実行の許可の発行を参照してよい、画面のコードのファイル（書き込みの開始の Server Function。T30g）。 */
-const WRITE_START_FUNCTIONS_FILE = 'apps/local-ui/src/server/write-job-functions.ts';
+/** (f) 承認の前の前提の名前と、定義・公開し直しのファイルと、使ってよい承認の前の画面のファイル（MI-F1）。 */
+const PRE_APPROVAL_PREMISE = 'PRE_APPROVAL_EVALUATION_PREMISE';
+const PRE_APPROVAL_PREMISE_HOMES: readonly string[] = Object.freeze(['src/control/data-rules/field-evaluation.ts', 'src/control/data-rules-view.ts']);
+const PRE_APPROVAL_PREMISE_USERS: readonly string[] = Object.freeze([
+  'apps/local-ui/src/server/data-rule-facts.ts',
+  'apps/local-ui/src/server/scenario-functions.ts',
+  'apps/local-ui/src/server/scenario-autodraft-functions.ts',
+]);
 /** (e) 実行の許可の発行の参照の数（コメントと文字列の中身を除いた本文の識別子）。 */
 const grantIssueReferencesOf = (source: ScannedSource): number => countIdentifier(source.bare, 'issueExecutionGrant');
 
@@ -244,11 +251,13 @@ describe('approval SSOT detectors (T28a)', () => {
       "export { APPROVAL_TTL_DAYS, APPROVAL_TTL_DAY_MS } from './approval/scenario-contracts.js';",
       "export { consumeExecutionGrant, readScenario } from './approval/scenario-store.js';",
       "export { attachInputRuleReference } from './approval/scenario-store.js';",
+      "export { issueExecutionGrant } from './approval/scenario-store.js';",
       "export { classifyCandidate } from '../discovery/classify.js';",
       'export const usesScenarios = (mode) => mode === 1;',
     ].join('\n'));
     expect(approvalViewViolationsOf(APPROVAL_VIEW_FILE, withheld)).toEqual([
       'APPROVAL_TTL_DAY_MS',
+      'issueExecutionGrant',
       'consumeExecutionGrant',
       'attachInputRuleReference',
       '<../discovery/classify.js>',
@@ -259,8 +268,6 @@ describe('approval SSOT detectors (T28a)', () => {
       "export { APPROVAL_TTL_DAYS, SCENARIO_KINDS } from './approval/scenario-contracts.js';",
       "export { approveScenario, readScenarioApprovalStatus } from './approval/scenario-store.js';",
       "export type { ScenarioView } from './approval/scenario-facts.js';",
-      // T30g: 発行は公開してよい。
-      "export { issueExecutionGrant } from './approval/scenario-store.js';",
     ].join('\n'));
     expect(approvalViewViolationsOf(APPROVAL_VIEW_FILE, clean)).toEqual([]);
   });
@@ -369,11 +376,22 @@ describe('approval SSOT and boundary (Task 28 design 5, 6)', () => {
     expect(findTransitiveForbidden(files, ACTIONS_FILES.map((file) => file.path))).toEqual([]);
   });
 
-  it('(e) only the write start Server Function file of the screen refers to the grant issue (T30g)', () => {
+  it('(e) no file of the screen code refers to the grant issue (SPEC-4)', () => {
     const uiFiles = loadLocalUiSourceFiles();
-    const owner = uiFiles.find((file) => file.path === WRITE_START_FUNCTIONS_FILE);
-    expect(owner === undefined ? 0 : grantIssueReferencesOf(owner)).toBeGreaterThan(0);
-    expect(uiFiles.filter((file) => file.path !== WRITE_START_FUNCTIONS_FILE && grantIssueReferencesOf(file) > 0).map((file) => file.path)).toEqual([]);
+    expect(uiFiles.length).toBeGreaterThan(0);
+    expect(uiFiles.filter((file) => grantIssueReferencesOf(file) > 0).map((file) => file.path)).toEqual([]);
+  });
+
+  // (f)（MI-F1。設計書 `2026-10-26-beaksight-minimal-input-ux-design.md` 4.7.1 の 5）: 承認の前の前提（副作用の確認を「承認のときに確認する」とみなす
+  // `PRE_APPROVAL_EVALUATION_PREMISE`）は、承認の前の画面の 3 つのファイルのほかで使わない（実行の許可の発行・書き込みの開始の判定に入らない）。定義の
+  // ファイルと、画面向けの公開し直しのファイルは数えない。
+  it('(f) only the three pre-approval screen files use the pre-approval evaluation premise (MI-F1)', () => {
+    const users = [...SOURCE_FILES, ...loadLocalUiSourceFiles()]
+      .filter((file) => !PRE_APPROVAL_PREMISE_HOMES.includes(file.path) && countIdentifier(file.bare, PRE_APPROVAL_PREMISE) > 0)
+      .map((file) => file.path)
+      .sort();
+    expect(users).toEqual([...PRE_APPROVAL_PREMISE_USERS].sort());
+    expect(countIdentifier(scanSource(`// ${PRE_APPROVAL_PREMISE}\nconst name = '${PRE_APPROVAL_PREMISE}';`).bare, PRE_APPROVAL_PREMISE)).toBe(0);
   });
 
   it('(d) the screen re-export publishes only names of src/control/approval/, without the TTL day length and the execution paths (T28e)', () => {

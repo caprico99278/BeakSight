@@ -16,7 +16,6 @@ import {
   CHECKPOINT_ARTIFACT_DIRECTORY,
   CHECKPOINT_ARTIFACT_FILE_NAMES,
   CHECKPOINT_PAGES_ARTIFACT_DIRECTORY,
-  DIAGNOSTICS_ARTIFACT_DIRECTORY,
   ENTRY_CHECK_ARTIFACT_FILE_NAME,
   MAX_BUNDLE_FILE_NAME_LABEL_LENGTH,
   PAGE_ARTIFACT_FILE_NAMES,
@@ -46,7 +45,6 @@ import {
   pageArtifactRelativePath,
   runArtifactDirectory,
   screenshotRelativePath,
-  siteUnavailableDiagnosticRelativePath,
 } from '../../src/core/artifact-layout.js';
 import { formatCompactUtcTimestamp } from '../../src/core/utc-timestamp.js';
 import { createRunIdFromTime } from '../../src/orchestration/run-id.js';
@@ -503,7 +501,7 @@ describe('artifact layout: creating the run directory exclusively (DEF-009)', ()
 describe('artifact layout: the checkpoint and the PREFLIGHT temporary file (resumable run design 4.1, 4.4, 4.5)', () => {
   it('names the checkpoint directory, its files and the page checkpoint directory', () => {
     expect(CHECKPOINT_ARTIFACT_DIRECTORY).toBe('checkpoint');
-    expect(CHECKPOINT_ARTIFACT_FILE_NAMES).toEqual({ state: 'state.json', previousState: 'state.prev.json', lock: 'run.lock' });
+    expect(CHECKPOINT_ARTIFACT_FILE_NAMES).toEqual({ state: 'state.json', previousState: 'state.prev.json' });
     expect(Object.isFrozen(CHECKPOINT_ARTIFACT_FILE_NAMES)).toBe(true);
     expect(CHECKPOINT_PAGES_ARTIFACT_DIRECTORY).toBe('checkpoint/pages');
   });
@@ -511,7 +509,6 @@ describe('artifact layout: the checkpoint and the PREFLIGHT temporary file (resu
   it('makes the checkpoint paths relative to the run directory, separated by /', () => {
     expect(checkpointArtifactRelativePath('state')).toBe('checkpoint/state.json');
     expect(checkpointArtifactRelativePath('previousState')).toBe('checkpoint/state.prev.json');
-    expect(checkpointArtifactRelativePath('lock')).toBe('checkpoint/run.lock');
     expect(checkpointPageArtifactRelativePath(PAGE_1)).toBe('checkpoint/pages/PAGE-000001.json');
     expect(checkpointPageArtifactRelativePath(PAGE_12)).toBe('checkpoint/pages/PAGE-000012.json');
     for (const path of [checkpointArtifactRelativePath('state'), checkpointPageArtifactRelativePath(PAGE_12)]) {
@@ -533,35 +530,6 @@ describe('artifact layout: the checkpoint and the PREFLIGHT temporary file (resu
     expect(isPreflightTemporaryFileName('.beaksight-preflight-0b7c9a43-4f8e-4a55-9d1e-3a5f2c6b7d80.tmp')).toBe(true);
     for (const name of ['.beaksight-preflight-.tmp', '.beaksight-preflight-x.txt', 'beaksight-preflight-x.tmp', 'run.json', '.run.json.x.tmp']) {
       expect(isPreflightTemporaryFileName(name), name).toBe(false);
-    }
-  });
-});
-
-// D2（サイトの不調で止めたときの診断の記録の設計書 2.3）: 診断の記録の置き場所。Run のディレクトリの直下の `diagnostics/` に、ページと
-// 実行の番号と試行の番号ごとに1つ置く。`checkpoint/` の外なので、Run の終わりの片付け（`checkpoint/` の中だけを消す）で消えない。
-// SU5（サイトが応答しないときに Run を止める設計書 3.5.2）: 同じ実行で同じページを 1 回確かめ直すので、名前に試行の番号（1 回目が 1）を加える。
-describe('artifact layout: the site-unavailable diagnostics (site-unavailable diagnostics design 2.3)', () => {
-  it('names the diagnostics directory directly under the run directory, outside checkpoint/', () => {
-    expect(DIAGNOSTICS_ARTIFACT_DIRECTORY).toBe('diagnostics');
-    expect(isPortableArtifactPathSegment(DIAGNOSTICS_ARTIFACT_DIRECTORY)).toBe(true);
-    expect(DIAGNOSTICS_ARTIFACT_DIRECTORY).not.toBe(CHECKPOINT_ARTIFACT_DIRECTORY);
-  });
-
-  it('makes the path of a diagnostic relative to the run directory, with the page ID, the execution number and the attempt number, separated by /', () => {
-    expect(siteUnavailableDiagnosticRelativePath(PAGE_12, 1, 1)).toBe('diagnostics/site-unavailable-PAGE-000012-1-1.json');
-    expect(siteUnavailableDiagnosticRelativePath(PAGE_12, 1, 2)).toBe('diagnostics/site-unavailable-PAGE-000012-1-2.json');
-    expect(siteUnavailableDiagnosticRelativePath(PAGE_1, 3, 1)).toBe('diagnostics/site-unavailable-PAGE-000001-3-1.json');
-    const path = siteUnavailableDiagnosticRelativePath(PAGE_12, 2, 1);
-    expect(isPortableRelativeArtifactPath(path)).toBe(true);
-    expect(path.startsWith(`${DIAGNOSTICS_ARTIFACT_DIRECTORY}/`)).toBe(true);
-    expect(path.split('/')).toHaveLength(2);
-    expect(artifactFilePath(join('out', RUN_ID), path)).toBe(join('out', RUN_ID, 'diagnostics', 'site-unavailable-PAGE-000012-2-1.json'));
-  });
-
-  it('rejects an execution number or an attempt number that is not a positive safe integer', () => {
-    for (const number of [0, -1, 1.5, Number.NaN, Number.POSITIVE_INFINITY, Number.MAX_SAFE_INTEGER + 1]) {
-      expect(() => siteUnavailableDiagnosticRelativePath(PAGE_1, number, 1), `execution ${String(number)}`).toThrow(RangeError);
-      expect(() => siteUnavailableDiagnosticRelativePath(PAGE_1, 1, number), `attempt ${String(number)}`).toThrow(RangeError);
     }
   });
 });
@@ -809,7 +777,6 @@ describe('artifact layout: names that mean something else on Windows (DEF-056)',
       ...VIEWPORT_PROFILES,
       PAGES_ARTIFACT_DIRECTORY,
       CHECKPOINT_ARTIFACT_DIRECTORY,
-      DIAGNOSTICS_ARTIFACT_DIRECTORY,
       ...numbers.map((attempt) => `${RETRY_ARTIFACT_DIRECTORY_PREFIX}${attempt}`),
       bundleFileName('1000-01-01T00:00:00.000Z'),
       bundleFileName('2026-10-08T03:09:30.000Z'),
@@ -828,8 +795,6 @@ describe('artifact layout: names that mean something else on Windows (DEF-056)',
         checkpointPageArtifactRelativePath(pageId),
         ...VIEWPORT_PROFILES.flatMap((viewport) => SCREENSHOT_CAPTURE_TYPES.flatMap((captureType) =>
           [null, ...numbers].map((retryAttempt) => screenshotRelativePath(pageId, viewport, captureType, retryAttempt)))),
-        ...numbers.flatMap((executionNumber) => numbers.map((attemptNumber) =>
-          siteUnavailableDiagnosticRelativePath(pageId, executionNumber, attemptNumber))),
       ]),
     ];
     for (const segment of segments) {

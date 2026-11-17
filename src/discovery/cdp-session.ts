@@ -7,9 +7,16 @@
 //   `DISCOVERY_SESSION_DETACH_TIMEOUT_MS` まで待つ（超えても切る処理は続く。失敗は投げない）。
 // - 命令は、呼ぶ側が閉じた一覧（`*_CDP_COMMANDS`）の名前を型で絞って渡す。ここは期限の中で送り、結果が record でなければ失敗にする
 //   （引数の形は CDP の定義に任せ、結果は呼ぶ側が形を見てから使う）。
+// - L6/L3-1: 操作さがしの 1 画面の見張り（`screen-watch.ts`）の中では、命令が返るたびに進みの印を付け（ブラウザからの応答）、見張りが画面を終えた後は
+//   session を開かない（見放した読み取りを続けない）。
 import type { CDPSession, Page } from 'playwright';
+import type { ProgressSignals } from '../core/progress-watch.js';
 import { awaitBeforeDeadline } from '../core/deadline.js';
 import { isRecord } from '../core/guards.js';
+import { screenWatchEnded, screenWatchForBrowserResponses } from './screen-watch.js';
+
+/** L6/L3-1: 1 画面の見張りの中で開いた session の、見張りの口（命令が返るたびに印を付ける）。 */
+const sessionWatches = new WeakMap<CDPSession, ProgressSignals>();
 
 /** 読み終わった後（失敗の後を含む）に、手放す処理と session を切る処理を待つ上限（ms）。超えても、切る処理は続く。 */
 export const DISCOVERY_SESSION_DETACH_TIMEOUT_MS = 1_000;
@@ -19,15 +26,16 @@ export class DiscoveryCdpReadFailure extends Error {}
 
 /**
  * 命令を、期限までに送る。期限切れ・失敗・結果が record でないときは `DiscoveryCdpReadFailure` を投げる。`method` は、呼ぶ側の閉じた一覧の
- * 名前（呼ぶ側が型で絞る）。
+ * 名前（呼ぶ側が型で絞る）。LZ-3b: 期限が `undefined` なら期限を置かない（`awaitBeforeDeadline` の決まり）。
  */
 export async function sendDiscoveryCdpCommand(
   session: CDPSession,
   method: string,
   params: Record<string, unknown>,
-  deadlineAtMs: number,
+  deadlineAtMs: number | undefined,
 ): Promise<Record<string, unknown>> {
   const outcome = await awaitBeforeDeadline(session.send(method as never, params as never), deadlineAtMs);
+  sessionWatches.get(session)?.mark('BROWSER_RESPONSE');
   if (outcome.status !== 'FULFILLED' || !isRecord(outcome.value)) {
     throw new DiscoveryCdpReadFailure();
   }
@@ -36,19 +44,21 @@ export async function sendDiscoveryCdpCommand(
 
 /**
  * page の CDP の session を期限までに開き、`read` で読む（例外を投げない）。開けない・`read` が投げたときは `failed` を返す。session は、
- * 読み終わったら（失敗しても）、`release`（あれば）の後に切る。
+ * 読み終わったら（失敗しても）、`release`（あれば）の後に切る。LZ-3b: 期限が `undefined` なら期限を置かない（固まった画面は呼ぶ側の進みの見張りが終える）。
  */
 export async function readWithDiscoveryCdpSession<T>(
   page: Page,
-  deadlineAtMs: number,
+  deadlineAtMs: number | undefined,
   failed: T,
   read: (session: CDPSession) => Promise<T>,
   release?: (session: CDPSession, releaseDeadlineAtMs: number) => Promise<unknown>,
 ): Promise<T> {
-  if (!Number.isFinite(deadlineAtMs) || deadlineAtMs <= Date.now()) {
-    // 期限を過ぎていれば、session を開かない。
+  if ((deadlineAtMs !== undefined && (!Number.isFinite(deadlineAtMs) || deadlineAtMs <= Date.now())) || screenWatchEnded(page)) {
+    // 期限を過ぎていれば（L6/L3-1: 1 画面の見張りが画面を終えた後も）、session を開かない。
     return failed;
   }
+  // 画面の変化の見回りの読み取りは、進みに数えない（`screenWatchForBrowserResponses`）。
+  const watch = screenWatchForBrowserResponses(page);
   let opening: Promise<CDPSession>;
   try {
     opening = page.context().newCDPSession(page);
@@ -62,6 +72,10 @@ export async function readWithDiscoveryCdpSession<T>(
     return failed;
   }
   const session = opened.value;
+  if (watch !== undefined) {
+    watch.mark('BROWSER_RESPONSE');
+    sessionWatches.set(session, watch);
+  }
   try {
     return await read(session);
   } catch {

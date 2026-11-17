@@ -27,6 +27,17 @@ export type DraftValueOrigin = (typeof DRAFT_VALUE_ORIGINS)[number];
  * - `READ_EXPECTATION_FROM_VARYING_FIELD`: 照合の READ の期待（本文が含む）の欄は、入力の規則で実行のたびに値が変わる欄から推す（FM2b）。
  * - `DEFAULT_RANGE_WITHOUT_HINT`: 範囲の手がかりがない日付・数の欄に、推した規則が既定の幅を入れた（FM2c の既定の幅。FM2R の Minor 11 で印に足した）。
  * - `HUMAN_CHOICE`: 人が選んだ・入れた値（更新の変える鍵など）。
+ * - `FORM_RECORD_ID_FROM_UPDATE_CANDIDATE`（PL-6b）: フォームの形の登録の ID の型（と書き換えの path の型）は、同じ表の書き換えの候補の画面と送信先の path の
+ *   ID の区切りから推す（推測）。
+ * - `FORM_RECORD_ID_FROM_CREATE_ACTION`（OP-G。設計書 `2026-10-27-beaksight-one-pass-flow-design.md` 4.1.4 の E1）: 同じ表の更新の候補がない（データのない
+ *   サイト）ときの、フォームの形の登録の ID の型は、登録の送信先の path の後ろに `{id}` を足した、よくある形から推す（推測）。
+ * - `API_RECORD_ID_KEY_COMMON_NAME`（OP-G。同 E2）: 同じ表の更新の候補がないときの、API の形の登録の ID の応答の鍵は、よくある番号の鍵の名前の短い一覧
+ *   （`COMMON_API_RECORD_ID_KEYS`）の先頭から推す（推測）。
+ * - `READ_PAGE_TEMPLATE_COMMON_SHAPE`（OP-G。同 E2）: データのないサイトの、API の形の照合の READ の `{id}` の画面の型は、登録の画面の 1 つ上の path の後ろに
+ *   `{id}` を足した、よくある詳細の画面の形から推す（推測）。
+ * - `READ_PAGE_LIST_OF_CREATE_PAGE`（OP-R。同 4.1.9 の R1）: API の形の照合の READ は、点検の段のリンクにある、登録の画面の 1 つ上の一覧の画面で、作った値を
+ *   含むかを見る（推測。一覧に作った値が出るかは確かめていない）。
+ * - `ANSWER_READ_FROM_SEARCH_CANDIDATE`（PL-6b）: フォームの形の答え合わせは、操作さがしの検索・一覧の候補の文字の欄から推す（推測）。
  * - `LOGIN_FIELD_SINGLE_CANDIDATE`: 自動ログインのセレクタは、手動のログインの段の始めに、ログインの画面でその欄の候補がちょうど 1 つだった要素の CSS
  *   （推測。FM2e。値は読まない）。
  */
@@ -45,6 +56,12 @@ export const DRAFT_VALUE_GROUND_ORIGINS = Object.freeze({
   DEFAULT_RANGE_WITHOUT_HINT: 'INFERRED',
   HUMAN_CHOICE: 'HUMAN',
   LOGIN_FIELD_SINGLE_CANDIDATE: 'INFERRED',
+  FORM_RECORD_ID_FROM_UPDATE_CANDIDATE: 'INFERRED',
+  ANSWER_READ_FROM_SEARCH_CANDIDATE: 'INFERRED',
+  FORM_RECORD_ID_FROM_CREATE_ACTION: 'INFERRED',
+  API_RECORD_ID_KEY_COMMON_NAME: 'INFERRED',
+  READ_PAGE_TEMPLATE_COMMON_SHAPE: 'INFERRED',
+  READ_PAGE_LIST_OF_CREATE_PAGE: 'INFERRED',
 } as const satisfies Readonly<Record<string, DraftValueOrigin>>);
 
 export type DraftValueGround = keyof typeof DRAFT_VALUE_GROUND_ORIGINS;

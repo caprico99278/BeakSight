@@ -12,6 +12,7 @@
 // - 読んだ行は、名前つきの一覧と契約の部品（`validateWorkerToParentMessage`、`isRunId`、`isPortableRelativeArtifactPath`）で確かめてから、
 //   凍結した写しにする。壊れた行は `ControlStoreError`（`DATABASE_INTEGRITY_FAILED`）で止める。
 import { isPortableRelativeArtifactPath } from '../../core/artifact-layout.js';
+import { FINISHED_AUDIT_JOB_STATE, WORKER_ENTRY_CHECK_JOB_KIND } from '../../core/audit-job-values.js';
 import { RUN_STATUSES, type RunId, type RunProgressReport, type RunStatus } from '../../core/contracts.js';
 import type { SessionLossEvidence } from '../../core/evidence-types.js';
 import { isRecord } from '../../core/guards.js';
@@ -24,7 +25,6 @@ import {
   type AutomatedLoginSubmission,
 } from '../auth/automated-login-results.js';
 import { canonicalHttpOriginOf } from '../../crawl/normalize-url.js';
-import { MAX_LOGIN_SIDE_REQUESTS } from '../auth/auth-setup-contracts.js';
 import { MIN_PROFILE_REVISION } from '../contracts.js';
 import { MANUAL_LOGIN_REGISTRATION_SKIP_REASONS } from '../manual-login-registration.js';
 import type { ControlDatabase } from '../store/control-database.js';
@@ -39,8 +39,10 @@ import {
   WORKER_PROTOCOL_VERSION,
   WORKER_SESSION_LOST_STATE,
   WORKER_WRITE_JOB_KINDS,
+  isWorkerCredentialSaveFailureCode,
   validateWorkerToParentMessage,
   type WorkerAuthState,
+  type WorkerCredentialSaveFailureCode,
   type WorkerLoginFormInvalidReason,
   type WorkerLoginObservation,
   type WorkerLoginStateNames,
@@ -55,8 +57,6 @@ import {
   AUDIT_JOB_FAILURE_REASONS,
   AUDIT_JOB_KINDS,
   AUDIT_JOB_STATES,
-  MAX_LOGIN_STAGE_SUMMARY_LENGTH,
-  MAX_SESSION_LOSS_RECORD_LENGTH,
   WRITE_REPORT_CHECKS,
   type AuditJobFailureReason,
   type AuditJobKind,
@@ -165,7 +165,8 @@ export interface AuditJobLoginStageSummary {
  * - `PROFILE_CHANGED`: ジョブを始めた後に、プロファイルか認証の設定が変わった（改訂が違う、設定がない・古い）。利用者の変更を上書きしない。
  * - `SAVE_REJECTED`: 保存の部品（プロファイルと認証の設定の検証）が拒んだ。
  */
-const [NO_PASSED_REQUESTS, NO_TOKEN_REQUEST, NO_STORAGE_KEY, NOTHING_NEW, MULTIPLE_TOKEN_TARGETS] = MANUAL_LOGIN_REGISTRATION_SKIP_REASONS;
+const [NO_PASSED_REQUESTS, NO_TOKEN_REQUEST, NO_STORAGE_KEY, NOTHING_NEW, MULTIPLE_TOKEN_TARGETS, TOKEN_TARGET_ON_TEST_ORIGIN] =
+  MANUAL_LOGIN_REGISTRATION_SKIP_REASONS;
 // ML-a-fix-3（ML-R2 の M-1）: 組み立ての部品の新しい理由（`MULTIPLE_TOKEN_TARGETS`）は、一覧の末尾に足す（前の理由の順を変えない）。
 export const AUDIT_JOB_LOGIN_AUTO_REGISTRATION_SKIP_REASONS = Object.freeze([
   NO_PASSED_REQUESTS,
@@ -175,6 +176,8 @@ export const AUDIT_JOB_LOGIN_AUTO_REGISTRATION_SKIP_REASONS = Object.freeze([
   'PROFILE_CHANGED',
   'SAVE_REJECTED',
   MULTIPLE_TOKEN_TARGETS,
+  // DEF-182（OP-DEF 修正の 1 回目）: token の送信先がテスト環境と同じ Origin（末尾に足す）。
+  TOKEN_TARGET_ON_TEST_ORIGIN,
 ] as const);
 export type AuditJobLoginAutoRegistrationSkipReason = (typeof AUDIT_JOB_LOGIN_AUTO_REGISTRATION_SKIP_REASONS)[number];
 
@@ -182,51 +185,83 @@ export type AuditJobLoginAutoRegistrationSkipReason = (typeof AUDIT_JOB_LOGIN_AU
  * ML-a: 自動の登録の結果（値を持たない）。`SAVED` は、保存したプロファイルの改訂と、プロファイルの承認したサービスの Origin に足した Origin（保存した設定の
  * 中身は、認証の設定の保存の部品 `getAuthSetup` で読む）。`SKIPPED` は理由だけ。
  */
-export type AuditJobLoginAutoRegistration =
+export type AuditJobLoginAutoRegistration = (
   | { readonly result: 'SAVED'; readonly profileRevision: number; readonly addedServiceOrigins: readonly string[] }
-  | { readonly result: 'SKIPPED'; readonly reason: AuditJobLoginAutoRegistrationSkipReason };
+  | { readonly result: 'SKIPPED'; readonly reason: AuditJobLoginAutoRegistrationSkipReason }
+) & {
+  /**
+   * OP-1（設計書 `2026-10-27-beaksight-one-pass-flow-design.md` 4.1.3 の 1）: 手でのログインの値を受け取ったときの、自動ログインへの切り替えの結果（受け取らなかったとき
+   * は持たない）。`SWITCHED` は切り替えた、`NOT_AVAILABLE` は切り替えられなかった（3 つのセレクタがそろわない、保存できないなど。値は捨てた）。
+   */
+  readonly automatedLogin?: AuditJobLoginAutoRegistrationSwitch;
+  /**
+   * OP-K（K3）: 切り替えられなかった（`NOT_AVAILABLE`）ときだけの、その理由（閉じた一覧 `AUDIT_JOB_AUTOMATED_LOGIN_UNAVAILABLE_REASONS`。値を持たない）。前の書き手の
+   * 記録にはない（任意の項目）。
+   */
+  readonly automatedLoginReason?: AuditJobAutomatedLoginUnavailableReason;
+  /**
+   * OP-L（L2）: 理由が `CREDENTIAL_NOT_SAVED` で、ワーカーが書けなかった理由のコードを知らせたときだけの、そのコード（閉じた一覧
+   * `WORKER_CREDENTIAL_SAVE_FAILURE_CODES`。値を持たない）。前の書き手の記録にはない（任意の項目）。
+   */
+  readonly automatedLoginSaveFailure?: WorkerCredentialSaveFailureCode;
+};
 
-/** 足した Origin の数の上限（token の送信先と、ログインに伴う送信の上限の和）。 */
-const MAX_AUTO_REGISTRATION_ADDED_ORIGINS = 1 + MAX_LOGIN_SIDE_REQUESTS;
+/** OP-1: 自動ログインへの切り替えの結果（閉じた一覧）。 */
+export const AUDIT_JOB_LOGIN_AUTO_REGISTRATION_SWITCHES = Object.freeze(['SWITCHED', 'NOT_AVAILABLE'] as const);
+export type AuditJobLoginAutoRegistrationSwitch = (typeof AUDIT_JOB_LOGIN_AUTO_REGISTRATION_SWITCHES)[number];
+
+/**
+ * OP-K（K3）: 受け取った値があるのに、自動ログインへ切り替えられなかった理由（閉じた一覧。判定の順は、ジョブの管理のログインの直後の登録）。
+ * - `TOKEN_TARGET_ON_TEST_ORIGIN`: ログインの送り先がテスト環境と同じ Origin（DEF-182）。
+ * - `LOGIN_FIELDS_MISSING`: ログインの 3 つの欄の場所が、手でのログインの観察にも、最後の下調べの案にもそろわない。
+ * - `SWITCH_INVALID`: 切り替えた後の設定が、確かめを通らない。
+ * - `DESTINATION_MISMATCH`: 受け取った値を運んだ送り先が、切り替えの後の資格情報の送り先に当たらない（OP-F の M-2）。
+ * - `CREDENTIAL_NOT_WRITABLE`: 資格情報を書く前の確かめが通らない（保存できないプラットフォームなど）。
+ * - `CREDENTIAL_NOT_SAVED`: ワーカーが資格情報を書けなかった（書いた知らせがない・合わない）。
+ * - `REGISTRATION_NOT_SAVED`: 設定の保存ができなかった（設定が変わった、対象の設定を読めない、保存の確かめが拒んだ）。
+ */
+export const AUDIT_JOB_AUTOMATED_LOGIN_UNAVAILABLE_REASONS = Object.freeze([
+  'TOKEN_TARGET_ON_TEST_ORIGIN',
+  'LOGIN_FIELDS_MISSING',
+  'SWITCH_INVALID',
+  'DESTINATION_MISMATCH',
+  'CREDENTIAL_NOT_WRITABLE',
+  'CREDENTIAL_NOT_SAVED',
+  'REGISTRATION_NOT_SAVED',
+] as const);
+export type AuditJobAutomatedLoginUnavailableReason = (typeof AUDIT_JOB_AUTOMATED_LOGIN_UNAVAILABLE_REASONS)[number];
 
 /** 自動の登録の結果として書ける・読める値か（閉じた形）。 */
 const isAutoRegistration = (value: unknown): value is AuditJobLoginAutoRegistration => {
   if (!isRecord(value)) {
     return false;
   }
+  // OP-1: 切り替えの結果（任意）は、閉じた一覧の値だけ。OP-K（K3）: 使えない理由（任意）は、`NOT_AVAILABLE` のときだけ、閉じた一覧の値だけ。
+  const reasonKey = 'automatedLoginReason' in value ? 1 : 0;
+  // OP-L（L2）: 書けなかった理由のコード（任意）は、理由が `CREDENTIAL_NOT_SAVED` のときだけ、閉じた一覧の値だけ。
+  const saveFailureKey = 'automatedLoginSaveFailure' in value ? 1 : 0;
+  if (saveFailureKey === 1 && (value['automatedLoginReason'] !== 'CREDENTIAL_NOT_SAVED' || !isWorkerCredentialSaveFailureCode(value['automatedLoginSaveFailure']))) {
+    return false;
+  }
+  const switchKey = ('automatedLogin' in value ? 1 : 0) + reasonKey + saveFailureKey;
+  if (switchKey > 0 && !(AUDIT_JOB_LOGIN_AUTO_REGISTRATION_SWITCHES as readonly unknown[]).includes(value['automatedLogin'])) {
+    return false;
+  }
+  if (reasonKey === 1 && (value['automatedLogin'] !== 'NOT_AVAILABLE'
+    || !(AUDIT_JOB_AUTOMATED_LOGIN_UNAVAILABLE_REASONS as readonly unknown[]).includes(value['automatedLoginReason']))) {
+    return false;
+  }
   const keys = Object.keys(value);
   if (value['result'] === 'SKIPPED') {
-    return keys.length === 2 && (AUDIT_JOB_LOGIN_AUTO_REGISTRATION_SKIP_REASONS as readonly unknown[]).includes(value['reason']);
+    return keys.length === 2 + switchKey && (AUDIT_JOB_LOGIN_AUTO_REGISTRATION_SKIP_REASONS as readonly unknown[]).includes(value['reason']);
   }
   const { profileRevision, addedServiceOrigins } = value;
-  return value['result'] === 'SAVED' && keys.length === 3
+  return value['result'] === 'SAVED' && keys.length === 3 + switchKey
     && typeof profileRevision === 'number' && Number.isSafeInteger(profileRevision) && profileRevision > MIN_PROFILE_REVISION
-    && Array.isArray(addedServiceOrigins) && addedServiceOrigins.length <= MAX_AUTO_REGISTRATION_ADDED_ORIGINS
+    // L11（設計書 `2026-11-09-beaksight-remove-limits-design.md` 4）: 足した Origin の数の上限は撤廃した（ログインに伴う送信の件数の上限をなくしたため）。
+    && Array.isArray(addedServiceOrigins)
     && new Set(addedServiceOrigins).size === addedServiceOrigins.length
     && addedServiceOrigins.every((origin) => typeof origin === 'string' && canonicalHttpOriginOf(origin) === origin);
-};
-
-/**
- * T43R-fix の M-5: まとめを、管理データの大きさの上限に収める。JSON（escape を含めた全体）の長さが上限を超えるときは、観察（鍵の名前の案、セレクタの案）と
- * 行の query の名前を落とし、省いた印を付ける（数のまとめと、行の Origin・path・種類・理由・回数は残す）。それでも超えるときは、そのまま返す（書く口が誤りにする）。
- */
-export const fittedLoginStageSummary = (summary: AuditJobLoginStageSummary): AuditJobLoginStageSummary => {
-  if (JSON.stringify(summary).length <= MAX_LOGIN_STAGE_SUMMARY_LENGTH) {
-    return summary;
-  }
-  // DEF-139: 状態の名前の記録も、観察と一緒に落とす（省いた印は同じ）。
-  const { observation: _observation, stateNames: _stateNames, ...rest } = summary;
-  return {
-    ...rest,
-    blockedRequests: summary.blockedRequests === null
-      ? null
-      : { ...summary.blockedRequests, requests: summary.blockedRequests.requests.map(({ query: _query, ...row }) => row) },
-    // ML-a: 通した送信の一覧も、行の query の名前を落とす。
-    ...(summary.passedRequests === undefined
-      ? {}
-      : { passedRequests: { ...summary.passedRequests, requests: summary.passedRequests.requests.map(({ query: _query, ...row }) => row) } }),
-    observationOmitted: true,
-  };
 };
 
 /** 作るジョブ（`STARTING`）。 */
@@ -691,26 +726,25 @@ export const recordNotice = (database: ControlDatabase, jobId: string, notice: W
  * 最後の認証の状態を記録する（T25d）。止まったページの URL は、`SESSION_LOST` のときだけ渡す（`null` なら、前の値を残す）。終わっていない
  * 行だけ。値と秘密は受けない（契約の `AUTH_STATE` を検証してから呼ぶ）。
  * T34e: ログインの段のまとめ（`loginStage`）があれば、同じトランザクションの中で、まだ記録のない行にだけ書く（1 回だけ。後の状態は書き換えない）。
- * 閉じた形でない値と、大きさの上限を超える値は、呼び出し側の誤り（`RangeError`）。
+ * 閉じた形でない値は、呼び出し側の誤り（`RangeError`）。URL-LEN（管理データの版 20）: 大きさの上限（前はまとめ 32,768・証拠 65,536。超えるまとめは観察と
+ * query の名前を落とした）はない。まとめと証拠は、そのまま書く。
  */
 export const recordAuthState = (
   database: ControlDatabase,
   jobId: string,
   state: WorkerAuthState,
   sessionLostUrl: string | null,
-  received: AuditJobLoginStageSummary | null = null,
+  loginStage: AuditJobLoginStageSummary | null = null,
   sessionLoss: SessionLossEvidence | null = null,
 ): boolean => {
-  // T43R-fix の M-5: 上限を超えるまとめは、観察と query の名前を落として収める（RangeError で落とさない）。
-  const loginStage = received === null ? null : fittedLoginStageSummary(received);
   const summary = loginStage === null ? null : JSON.stringify(loginStage);
-  if (loginStage !== null && (!isLoginStageSummary(loginStage) || (summary ?? '').length > MAX_LOGIN_STAGE_SUMMARY_LENGTH)) {
-    throw new RangeError('the login stage summary must be a closed login stage summary within the size limit');
+  if (loginStage !== null && !isLoginStageSummary(loginStage)) {
+    throw new RangeError('the login stage summary must be a closed login stage summary');
   }
-  // DEF-138: セッションの切れの証拠は、`SESSION_LOST` の閉じた形で、大きさの上限までのものだけ（呼び出し側が契約を確かめてから渡す）。
+  // DEF-138: セッションの切れの証拠は、`SESSION_LOST` の閉じた形のものだけ（呼び出し側が契約を確かめてから渡す）。
   const loss = sessionLoss === null ? null : JSON.stringify(sessionLoss);
-  if (sessionLoss !== null && (state !== WORKER_SESSION_LOST_STATE || !isSessionLossRecord(sessionLoss) || (loss ?? '').length > MAX_SESSION_LOSS_RECORD_LENGTH)) {
-    throw new RangeError('the session loss evidence must be a closed session loss evidence of SESSION_LOST within the size limit');
+  if (sessionLoss !== null && (state !== WORKER_SESSION_LOST_STATE || !isSessionLossRecord(sessionLoss))) {
+    throw new RangeError('the session loss evidence must be a closed session loss evidence of SESSION_LOST');
   }
   return withWriteTransaction(database, (connection) => {
     const changed = changedOne(connection.prepare(UPDATE_AUTH_STATE_SQL).run(state, sessionLostUrl, jobId, ACTIVE_STATES_JSON).changes);
@@ -743,11 +777,10 @@ export const recordLoginStageAutoRegistration = (
     return false;
   }
   const next: AuditJobLoginStageSummary = { ...current, autoRegistration: registration };
-  const text = JSON.stringify(next);
-  if (!isLoginStageSummary(next) || text.length > MAX_LOGIN_STAGE_SUMMARY_LENGTH) {
+  if (!isLoginStageSummary(next)) {
     return false;
   }
-  return changedOne(connection.prepare(UPDATE_LOGIN_STAGE_REGISTRATION_SQL).run(text, jobId, row.login_stage_summary).changes);
+  return changedOne(connection.prepare(UPDATE_LOGIN_STAGE_REGISTRATION_SQL).run(JSON.stringify(next), jobId, row.login_stage_summary).changes);
 });
 
 /** 生きている合図の時刻を記録する。終わっていない行だけ。 */
@@ -880,6 +913,14 @@ export const readJobIn = (connection: SqliteConnection, jobId: string): AuditJob
 };
 
 /** すべてのジョブ（新しい順）。 */
+/**
+ * OP-K（共通化。画面のサーバの `lastFinishedEntryCheckOf` と、ジョブの管理の自動ログインへの切り替えのセレクタの 2 か所が使う 1 か所）: プロファイルの最後の、終わった
+ * （`FINISHED`）入口の確かめ（下調べ）のジョブ（Run の状態を問わない）。`jobs` は新しい順（`readAllJobs` の順）。なければ `null`。
+ */
+export const lastFinishedEntryCheckJobOf = (jobs: readonly AuditJobView[], profileId: string): AuditJobView | null =>
+  jobs.find((candidate) =>
+    candidate.profileId === profileId && candidate.jobKind === WORKER_ENTRY_CHECK_JOB_KIND && candidate.state === FINISHED_AUDIT_JOB_STATE) ?? null;
+
 export const readAllJobs = (database: ControlDatabase): readonly AuditJobView[] =>
   withReadTransaction(database, (connection) =>
     Object.freeze((connection.prepare(SELECT_ALL_JOBS_SQL).all() as unknown as JobRow[]).map(viewOf)));

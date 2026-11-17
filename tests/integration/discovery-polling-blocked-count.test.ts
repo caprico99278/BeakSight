@@ -1,5 +1,5 @@
 // T27R2 の C1: ページの JS が一定の間隔で同じ Origin へ GET を送る（ポーリング）画面を、発見のジョブの流れ（`executeDiscoveryRun`）で読み、
-// Guard が許した普通の要求が、遮断として数えられないことを確かめる。本物の Chromium（headless だけ。テストの既定と、CLI の起動の設定の両方）と
+// Guard が許した普通の要求が、遮断として数えられないことを確かめる。本物の Chromium（テストの既定だけ。TEST-POLICY の 3）と
 // 127.0.0.1 の fixture のサーバ（`discovery-site-fixture.ts` の `pollingPages`。`DISCOVERY_SITE_POLLING_INTERVAL_MS` ごとの GET）。
 // - 成果物 `discovery.json` の安全の記録: 読んだどの画面も `blockedRequests` が 0（ポーリングのほかに、ページが止められる送信をしない画面だけ）。
 // - ジョブの記録（流れの結果）: Run は動き、安全の違反で止まらない（`ABORTED_BY_SAFETY`・`SAFETY_VIOLATION` でない）。
@@ -12,7 +12,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 import { validateArtifact } from '../../src/core/schema-validator.js';
-import { launchCliChromium, launchHeadlessChromium } from '../helpers/chromium.js';
+import { DEFAULT_CHROMIUM_LAUNCHERS } from '../helpers/chromium.js';
 import {
   DISCOVERY_SITE_EXTRA_PATHS,
   DISCOVERY_SITE_POLLING_PAGES,
@@ -22,10 +22,6 @@ import {
 import { runDiscoveryOnSite } from '../helpers/discovery-site-run.js';
 import { READ_METHODS } from '../helpers/leak-places.js';
 
-const LAUNCHERS = [
-  ['the default test Chromium', () => launchHeadlessChromium()],
-  ['the CLI launch settings', () => launchCliChromium()],
-] as const;
 const TEST_TIMEOUT_MS = 180_000;
 /** 読む画面の数より大きい上限。 */
 const ENOUGH_PAGES = 10;
@@ -33,7 +29,7 @@ const ENOUGH_PAGES = 10;
 const NAVIGATION_INTERVAL_MS = 400;
 const NO_BLOCKED_REQUESTS = 0;
 
-describe.each(LAUNCHERS)('T27R2 C1: a page polling its own origin does not count the allowed GETs as blocked (%s)', (_name, launch) => {
+describe.each(DEFAULT_CHROMIUM_LAUNCHERS)('T27R2 C1: a page polling its own origin does not count the allowed GETs as blocked (%s)', (_name, launch) => {
   let site: DiscoverySite;
   let outputDirectory: string;
 

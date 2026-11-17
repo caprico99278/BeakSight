@@ -16,7 +16,12 @@
  *     CONNECT の受け入れ（`tunnelAdmission`。DEF-125）があれば、Guard が通した要求の宛先（`admitTunnelDestinationOf`）への CONNECT だけを通し、
  *     ほかは知らせを `waitMs` まで待ってから `403` で拒み、`onRejected`（`phase: 'TUNNEL_NOT_ADMITTED'`）に知らせる（上流の方針より先に確かめる）。
  *   - `freeze()`: `FROZEN` にし、今つながっているすべてのソケット（クライアント側と上流側。CONNECT のトンネルと keep-alive を含む）を
- *     破棄する。以後は、すべての要求と CONNECT を `403` で拒み、`onRejected`（`phase: 'FROZEN'`）に知らせる。
+ *     破棄する。以後は、すべての要求と CONNECT を `403` で拒み、`onRejected`（`phase: 'FROZEN'`）に知らせる。DEF-208-1（設計書
+ *     `2026-11-05-beaksight-discovery-coverage-design.md` 3.1 の設計者の判断 (b)）: ただし、凍結の後の読み取りの受け入れ（`frozenReadAdmission`）があれば、
+ *     それが通す絶対形の HTTP の読み取り（GET・HEAD）だけは、`OPEN` と同じ確かめ（要求の方針・上流の方針・上限）の後に転送する。Upgrade は今のとおり拒む。
+ *     DEF-208-1 の (e): CONNECT の受け入れ（`tunnelAdmission`）があれば、凍結の後も、Guard が凍結の読み取りとして通した宛先（`admitTunnelDestinationOf` の
+ *     `frozenRead`）への CONNECT だけは、`OPEN` と同じ受け入れ（知らせを待つ時間も同じ）で通す。知らせのない宛先は、待った後に `403` で拒み、`FROZEN` で
+ *     知らせる。凍結の前に知らせた宛先は、凍結の後には使わない。トンネルの中身は見えないので、読み取りでない送信を止めるのは Guard だけ。
  *   - `close()`: `CLOSED` にし、すべてのソケットを破棄して、待ち受けを閉じる。重ねて呼んでもよい。
  * - 記録の口 `onRejected({ method, url, phase })`: `url` は、絶対形の要求ならその URL、CONNECT なら `host:port`（authority の形。
  *   https か wss かは分からない）。中継は Safety Ledger を知らない（Ledger に写すのは factory。設計書 2.1.2）。
@@ -42,7 +47,6 @@ import { createServer, request as httpRequest, type IncomingHttpHeaders, type In
 import type { LookupAddress, LookupOptions } from 'node:dns';
 import {
   connect as netConnect,
-  isIP,
   Socket as NetSocket,
   type AddressInfo,
   type LookupFunction,
@@ -96,6 +100,13 @@ export interface EgressRequestBudget {
 export interface EgressTunnelAdmission {
   /** 知らせのない CONNECT が、知らせを待つ時間（ms。0 以上の安全な整数）。 */
   readonly waitMs: number;
+  /**
+   * RB-4b（設計書 `2026-11-15-beaksight-test-rebuild-design.md` 3.2 の X10・X13）: 監査するサイトの Origin（許可 Origin と承認したサービスの Origin）。ある場合は、
+   * `OPEN` の間、宛先がこれらのどれでもない知らせのない CONNECT を、待たずに通す（ブラウザ自身の外への接続と、サイトの外の宛先を止めない。中身は見えないが、
+   * 監査するサイトのデータには届かない）。サイトの宛先への知らせのない CONNECT は、今どおり待ってから拒む（Guard を通らない送信の網）。凍結の後は、今どおり
+   * すべて拒む。省略は、すべての宛先を今どおり扱う。
+   */
+  readonly siteOrigins?: readonly string[] | undefined;
 }
 
 /** production の上流の方針: すべての host を許す。 */
@@ -122,6 +133,17 @@ export interface EgressProxyOptions {
   readonly upstreamFailureMode?: EgressUpstreamFailureMode | undefined;
   /** CONNECT の受け入れ（DEF-125。`EgressTunnelAdmission`）。省略すると、上流の方針に合う CONNECT をすべて通す（今のまま）。 */
   readonly tunnelAdmission?: EgressTunnelAdmission | undefined;
+  /**
+   * DEF-208-1: 凍結の後（`FROZEN`）に、絶対形の HTTP の読み取り（GET・HEAD）を通すか（Guard が凍結の段で通した読み取りの写しに当たるか。factory が渡す）。
+   * 読み取りでない要求には呼ばない。例外は拒否として扱う（fail-closed）。省略すると、今のまま凍結の後はすべて拒む。
+   */
+  readonly frozenReadAdmission?: EgressRequestPolicy | undefined;
+  /**
+   * DEF-233（設計書 `2026-11-09-beaksight-discovery-token-refresh-design.md` 2.1 の 2）: 凍結の後（`FROZEN`）に、絶対形の HTTP の `POST` を、サイトの token の
+   * 更新として通すか（Guard が凍結の段で通した更新の写しに当たるか。factory が渡す）。`POST` のほかには呼ばない。例外は拒否として扱う（fail-closed）。省略すると、
+   * 今のまま凍結の後の `POST` はすべて拒む。
+   */
+  readonly frozenTokenRefreshAdmission?: EgressRequestPolicy | undefined;
   /** 拒んだ要求の記録の口。 */
   readonly onRejected: (rejection: EgressRejection) => void;
   /** 待ち受けの後の中継の失敗の口。 */
@@ -134,16 +156,11 @@ export interface EgressProxy {
   readonly port: number;
   readonly state: EgressProxyState;
   /**
-   * 要求の host（URL の hostname の形）と port で、最後に接続できた上流の相手のアドレス（DEF-085 fix round 2）。`PASS_THROUGH` のときだけ覚える
-   * （`BAD_GATEWAY` ではいつも `null`）。覚えていなければ `null`。上限は `MAX_EGRESS_UPSTREAM_ADDRESS_ENTRIES`。
-   */
-  upstreamAddressOf(host: string, port: number): EgressUpstreamAddress | null;
-  /**
    * Guard が通した要求の URL の宛先（host と、ポート。ポートのない URL は scheme の既定。`http:`・`ws:` は 80、`https:`・`wss:` は 443）を、CONNECT を
    * 通す宛先に加える（DEF-125。`tunnelAdmission` のときだけ意味を持つ）。その宛先の知らせを待っている CONNECT は、すぐに進む。`http:`・`https:`・
    * `ws:`・`wss:` の URL でなければ、何もしない。
    */
-  admitTunnelDestinationOf(url: string): void;
+  admitTunnelDestinationOf(url: string, frozenRead?: boolean): void;
   freeze(): void;
   close(): Promise<void>;
 }
@@ -291,20 +308,7 @@ function passThroughConnectTarget(host: string): UpstreamConnectTarget {
   return isLocalhostName(host) ? { host: LOCALHOST_NAME, lookup: loopbackLookup } : { host: connectHost(host) };
 }
 
-/**
- * 上流の相手のアドレスを覚える表の件数の上限（DEF-085 fix round 2）。1 つの Context の中継が覚える、要求の host と port ごとの最後の相手の
- * アドレスの数。超えたら、最も古く更新したものから捨てる。値の根拠: 1 つの Context が読み込む 1 ページの、別の host と port の数は、ふつう
- * 数十までなので、余裕を持たせた（設計者の指示の「上限つきの小さな表」）。
- */
-export const MAX_EGRESS_UPSTREAM_ADDRESS_ENTRIES = 256;
-
-/** 上流の相手のアドレス（`socket.remoteAddress` と `remotePort`）。 */
-export interface EgressUpstreamAddress {
-  readonly address: string;
-  readonly port: number;
-}
-
-/** 表の鍵（要求の host を小文字にしたものと port）。host は URL の hostname の形（IPv6 は `[...]`）。 */
+/** 宛先の鍵（要求の host を小文字にしたものと port）。host は URL の hostname の形（IPv6 は `[...]`）。 */
 const upstreamAddressKey = (host: string, port: number): string => `${host.toLowerCase()} ${port}`;
 
 /**
@@ -424,6 +428,10 @@ class EgressProxyImpl implements EgressProxy {
   readonly #server: Server;
   readonly #upstreamPolicy: EgressUpstreamPolicy;
   readonly #requestPolicy: EgressRequestPolicy | undefined;
+  /** DEF-208-1: 凍結の後の読み取りの受け入れ。なければ `undefined`（今のまま）。 */
+  readonly #frozenReadAdmission: EgressRequestPolicy | undefined;
+  /** DEF-233: 凍結の後の token の更新（`POST`）の受け入れ。なければ `undefined`（今のまま）。 */
+  readonly #frozenTokenRefreshAdmission: EgressRequestPolicy | undefined;
   readonly #requestBudget: EgressRequestBudget | undefined;
   /** 回数の上限に当たった要求の数（DEF-099 fix）。 */
   #budgetUsed = 0;
@@ -432,17 +440,16 @@ class EgressProxyImpl implements EgressProxy {
   readonly #onError: (error: unknown) => void;
   /** 今つながっているソケット（クライアント側と上流側）。凍結と閉じる処理で、すべて破棄する。 */
   readonly #sockets = new Set<Duplex>();
-  /**
-   * 要求の host と port ごとの、最後に接続できた上流の相手のアドレス（DEF-085 fix round 2。`PASS_THROUGH` のときだけ書く）。挿入の順を
-   * 更新の順にし（書くたびに消してから入れ直す）、上限（`MAX_EGRESS_UPSTREAM_ADDRESS_ENTRIES`）を超えたら、最も古いものを捨てる。
-   */
-  readonly #upstreamAddresses = new Map<string, EgressUpstreamAddress>();
   /** クライアントの接続ごとの、今の要求の上流の接続（`PASS_THROUGH` の転送。fix round 3）。 */
   readonly #clientRelays = new WeakMap<Duplex, Socket>();
   /** CONNECT の受け入れ（DEF-125）。なければ `undefined`（今のまま）。 */
   readonly #tunnelAdmission: EgressTunnelAdmission | undefined;
+  /** RB-4b: 監査するサイトの宛先の鍵（`EgressTunnelAdmission.siteOrigins`。なければ `null`）。 */
+  readonly #siteTunnelKeys: ReadonlySet<string> | null;
   /** Guard が通した宛先の鍵（`tunnelDestinationKeyOf`。DEF-125）。 */
   readonly #admittedTunnels = new Set<string>();
+  /** DEF-208-1 の (e): Guard が凍結の読み取りとして通した宛先の鍵（凍結の後の CONNECT の受け入れが使う。凍結の前の宛先は入れない）。 */
+  readonly #frozenAdmittedTunnels = new Set<string>();
   /** 知らせを待っている CONNECT の終わらせ方（宛先の鍵ごと。引数は、知らせが来たか。DEF-125）。 */
   readonly #admissionWaiters = new Map<string, Set<(admitted: boolean) => void>>();
   #state: EgressProxyState = 'OPEN';
@@ -452,11 +459,18 @@ class EgressProxyImpl implements EgressProxy {
   constructor(options: EgressProxyOptions) {
     this.#upstreamPolicy = options.upstreamPolicy ?? ALLOW_ALL_EGRESS_UPSTREAMS;
     this.#requestPolicy = options.requestPolicy;
+    this.#frozenReadAdmission = options.frozenReadAdmission;
+    this.#frozenTokenRefreshAdmission = options.frozenTokenRefreshAdmission;
     this.#requestBudget = options.requestBudget === undefined
       ? undefined
       : Object.freeze({ matches: options.requestBudget.matches, limit: options.requestBudget.limit });
     this.#upstreamFailureMode = options.upstreamFailureMode ?? 'BAD_GATEWAY';
     this.#tunnelAdmission = options.tunnelAdmission === undefined ? undefined : Object.freeze({ waitMs: options.tunnelAdmission.waitMs });
+    // RB-4b: サイトの宛先の鍵（読めない Origin は鍵にしない。宛先の鍵の形は `tunnelDestinationKeyOf` と同じ）。
+    const siteOrigins = options.tunnelAdmission?.siteOrigins;
+    this.#siteTunnelKeys = siteOrigins === undefined
+      ? null
+      : new Set(siteOrigins.map((origin) => tunnelDestinationKeyOf(String(origin))).filter((key): key is string => key !== null));
     this.#onRejected = options.onRejected;
     this.#onError = options.onError;
     // DEF-085 fix round 3: `PASS_THROUGH` は、Chromium が送る要求を、Chromium と同じくらい寛容に読む（大きな Cookie の要求を含む）。
@@ -484,35 +498,6 @@ class EgressProxyImpl implements EgressProxy {
     return this.#state;
   }
 
-  upstreamAddressOf(host: string, port: number): EgressUpstreamAddress | null {
-    const entry = this.#upstreamAddresses.get(upstreamAddressKey(host, port));
-    return entry === undefined ? null : { ...entry };
-  }
-
-  /**
-   * 上流に接続できたソケットの相手のアドレスを、要求の host と port に結びつけて覚える（DEF-085 fix round 2。`PASS_THROUGH` のときだけ）。
-   * 相手のアドレスが IP アドレスでないか、port が分からなければ、覚えない。
-   */
-  #rememberUpstreamAddress(host: string, port: number, socket: Socket): void {
-    if (this.#upstreamFailureMode !== 'PASS_THROUGH') {
-      return;
-    }
-    const { remoteAddress, remotePort } = socket;
-    if (remoteAddress === undefined || isIP(remoteAddress) === 0 || remotePort === undefined) {
-      return;
-    }
-    const key = upstreamAddressKey(host, port);
-    this.#upstreamAddresses.delete(key);
-    this.#upstreamAddresses.set(key, Object.freeze({ address: remoteAddress, port: remotePort }));
-    while (this.#upstreamAddresses.size > MAX_EGRESS_UPSTREAM_ADDRESS_ENTRIES) {
-      const oldest = this.#upstreamAddresses.keys().next();
-      if (oldest.done === true) {
-        break;
-      }
-      this.#upstreamAddresses.delete(oldest.value);
-    }
-  }
-
   /** 待ち受けを始める。失敗したら reject する（待ち受けの後の `error` は `onError` に知らせる）。 */
   listen(): Promise<void> {
     return new Promise((resolve, reject) => {
@@ -533,12 +518,19 @@ class EgressProxyImpl implements EgressProxy {
     });
   }
 
-  admitTunnelDestinationOf(url: string): void {
+  admitTunnelDestinationOf(url: string, frozenRead = false): void {
     const key = typeof url === 'string' ? tunnelDestinationKeyOf(url) : null;
     if (key === null) {
       return;
     }
     this.#admittedTunnels.add(key);
+    // DEF-208-1 の (e): 凍結の読み取りとして通した宛先は、凍結の後の受け入れにも使う。凍結の後の待ちは、凍結の読み取りの知らせだけで進める。
+    if (frozenRead) {
+      this.#frozenAdmittedTunnels.add(key);
+    }
+    if (this.#state !== 'OPEN' && !(frozenRead && this.#state === 'FROZEN')) {
+      return;
+    }
     const waiters = this.#admissionWaiters.get(key);
     if (waiters !== undefined) {
       this.#admissionWaiters.delete(key);
@@ -677,6 +669,30 @@ class EgressProxyImpl implements EgressProxy {
     return this.#budgetUsed > this.#requestBudget.limit;
   }
 
+  /**
+   * DEF-208-1: 凍結の後の読み取りの受け入れが通すか（`FROZEN` の、読み取りの、絶対形の HTTP の要求だけ）。受け入れがない、読み取りでない、例外は偽。
+   */
+  #admitsFrozenRead(method: string, url: string): boolean {
+    const normalized = method.toUpperCase();
+    // DEF-233: `POST` は、token の更新の受け入れだけが通しうる（読み取りの受け入れには呼ばない）。
+    const admission = normalized === 'GET' || normalized === 'HEAD'
+      ? this.#frozenReadAdmission
+      : normalized === 'POST' ? this.#frozenTokenRefreshAdmission : undefined;
+    if (this.#state !== 'FROZEN' || admission === undefined) {
+      return false;
+    }
+    try {
+      return admission(method, url) === true;
+    } catch {
+      return false;
+    }
+  }
+
+  /** 転送を続けてよいか（`OPEN`、または DEF-208-1 の凍結の後に受け入れた読み取りで、まだ `FROZEN` のとき）。 */
+  #forwarding(frozenRead: boolean): boolean {
+    return this.#state === 'OPEN' || (frozenRead && this.#state === 'FROZEN');
+  }
+
   /** `OPEN` でなければ拒む（`403`。記録する）。`OPEN` なら `false` を返す。 */
   #rejectUnlessOpen(method: string, url: string, respond: () => void): boolean {
     if (this.#state === 'OPEN') {
@@ -702,7 +718,9 @@ class EgressProxyImpl implements EgressProxy {
       response.writeHead(status, { connection: 'close', 'content-length': '0' });
       response.end();
     };
-    if (this.#rejectUnlessOpen(method, requestUrl, () => respondEmpty(HTTP_STATUS_FORBIDDEN))) {
+    // DEF-208-1: 凍結の後でも、受け入れが通す読み取りは、OPEN と同じ確かめに進む。
+    const frozenRead = this.#admitsFrozenRead(method, requestUrl);
+    if (!frozenRead && this.#rejectUnlessOpen(method, requestUrl, () => respondEmpty(HTTP_STATUS_FORBIDDEN))) {
       return;
     }
     const target = forwardTargetOf(requestUrl);
@@ -726,7 +744,7 @@ class EgressProxyImpl implements EgressProxy {
       return;
     }
     if (this.#upstreamFailureMode === 'PASS_THROUGH') {
-      this.#relayPassThrough(request, method, target);
+      this.#relayPassThrough(request, method, target, frozenRead);
       return;
     }
     const upstream = httpRequest({
@@ -737,7 +755,7 @@ class EgressProxyImpl implements EgressProxy {
       headers: endToEndHeaders(request.headers),
       agent: false,
     }, (upstreamResponse) => {
-      if (this.#state !== 'OPEN') {
+      if (!this.#forwarding(frozenRead)) {
         upstreamResponse.destroy();
         response.destroy();
         return;
@@ -771,7 +789,7 @@ class EgressProxyImpl implements EgressProxy {
    *   （`ERR_CONNECTION_RESET`。中継なしと同じ網の層の失敗）。そのほかの失敗は、クライアントの接続を閉じる。
    * - 凍結と閉じる処理は、追っているソケット（クライアント側と上流側）をすべて壊す（今までと同じ）。
    */
-  #relayPassThrough(request: IncomingMessage, method: string, target: ForwardTarget): void {
+  #relayPassThrough(request: IncomingMessage, method: string, target: ForwardTarget, frozenRead: boolean): void {
     const client = request.socket;
     // Chromium は、前の応答を読み終えてから、同じ接続で次の要求を送る（keep-alive）。前の要求の上流は、ここで外して壊す（その上流が後で
     // 閉じても、クライアントの接続を閉じない）。
@@ -789,12 +807,11 @@ class EgressProxyImpl implements EgressProxy {
     let connected = false;
     upstream.once('connect', () => {
       connected = true;
-      if (this.#state !== 'OPEN' || client.destroyed) {
+      if (!this.#forwarding(frozenRead) || client.destroyed) {
         destroyQuietly(upstream);
         destroyQuietly(client);
         return;
       }
-      this.#rememberUpstreamAddress(target.host, target.port, upstream);
       const chunked = isChunkedMessage(request.headers);
       upstream.write(upstreamRequestHead(method, target.path, request.rawHeaders, chunked));
       request.on('data', (chunk: Buffer) => {
@@ -837,7 +854,9 @@ class EgressProxyImpl implements EgressProxy {
   #handleConnect(request: IncomingMessage, clientSocket: Duplex, head: Buffer): void {
     const authority = request.url ?? '';
     clientSocket.on('error', () => undefined);
-    if (this.#rejectUnlessOpen('CONNECT', authority, () => endWith(clientSocket, FORBIDDEN_RESPONSE))) {
+    // DEF-208-1 の (e): 凍結の後は、CONNECT の受け入れがあるときだけ、凍結の読み取りとして通した宛先の受け入れに進む（同じ仕組み。ほかは今のとおり拒む）。
+    const frozenTunnel = this.#state === 'FROZEN' && this.#tunnelAdmission !== undefined;
+    if (!frozenTunnel && this.#rejectUnlessOpen('CONNECT', authority, () => endWith(clientSocket, FORBIDDEN_RESPONSE))) {
       return;
     }
     const target = tunnelTargetOf(authority);
@@ -848,33 +867,37 @@ class EgressProxyImpl implements EgressProxy {
     // DEF-125: CONNECT の受け入れがあれば、Guard が通した宛先だけを通す（上流の方針より先に確かめる）。知らせがまだなければ、`waitMs` まで待つ。
     const admission = this.#tunnelAdmission;
     const key = upstreamAddressKey(target.host, target.port);
-    if (admission !== undefined && !this.#admittedTunnels.has(key)) {
+    const admittedTunnels = frozenTunnel ? this.#frozenAdmittedTunnels : this.#admittedTunnels;
+    // RB-4b: `OPEN` の間、監査するサイトの外の宛先は、待たずに通す（`siteOrigins`）。
+    const outsideSite = !frozenTunnel && this.#siteTunnelKeys !== null && !this.#siteTunnelKeys.has(key);
+    if (admission !== undefined && !admittedTunnels.has(key) && !outsideSite) {
       if (clientSocket.destroyed) {
         return;
       }
       this.#awaitTunnelAdmission(key, admission.waitMs, clientSocket, (admitted) => {
-        if (this.#state !== 'OPEN') {
+        if (!this.#forwarding(frozenTunnel)) {
           // 待つ間の凍結・閉じる処理: ソケットは壊れている（受け入れの拒否としては知らせない）。
           destroyQuietly(clientSocket);
           return;
         }
         if (!admitted) {
-          this.#reject('CONNECT', authority, 'TUNNEL_NOT_ADMITTED');
+          // DEF-208-1 の (e): 凍結の後の知らせのない宛先は、凍結の後の拒否として知らせる。
+          this.#reject('CONNECT', authority, frozenTunnel ? 'FROZEN' : 'TUNNEL_NOT_ADMITTED');
           endWith(clientSocket, FORBIDDEN_RESPONSE);
           return;
         }
         if (clientSocket.destroyed) {
           return;
         }
-        this.#openTunnel(authority, target, clientSocket, head);
+        this.#openTunnel(authority, target, clientSocket, head, frozenTunnel);
       });
       return;
     }
-    this.#openTunnel(authority, target, clientSocket, head);
+    this.#openTunnel(authority, target, clientSocket, head, frozenTunnel);
   }
 
   /** CONNECT のトンネルを開く（上流の方針を確かめてから、上流へ接続する。DEF-125 で `#handleConnect` から分けた。振る舞いは今までどおり）。 */
-  #openTunnel(authority: string, target: Omit<ForwardTarget, 'path'>, clientSocket: Duplex, head: Buffer): void {
+  #openTunnel(authority: string, target: Omit<ForwardTarget, 'path'>, clientSocket: Duplex, head: Buffer, frozenTunnel = false): void {
     if (!this.#upstreamPolicy(target.host, target.port)) {
       this.#reject('CONNECT', authority, 'OPEN');
       endWith(clientSocket, FORBIDDEN_RESPONSE);
@@ -882,12 +905,11 @@ class EgressProxyImpl implements EgressProxy {
     }
     let tunnelEstablished = false;
     const upstreamSocket = netConnect({ ...this.#upstreamTarget(target.host), port: target.port }, () => {
-      if (this.#state !== 'OPEN' || clientSocket.destroyed) {
+      if (!this.#forwarding(frozenTunnel) || clientSocket.destroyed) {
         destroyQuietly(upstreamSocket);
         destroyQuietly(clientSocket);
         return;
       }
-      this.#rememberUpstreamAddress(target.host, target.port, upstreamSocket);
       tunnelEstablished = true;
       clientSocket.write(CONNECTION_ESTABLISHED_RESPONSE);
       if (head.length > 0) {
@@ -940,6 +962,12 @@ export async function startEgressProxy(options: EgressProxyOptions): Promise<Egr
   }
   if (options.requestPolicy !== undefined && typeof options.requestPolicy !== 'function') {
     throw new TypeError('Egress proxy request policy must be a function');
+  }
+  if (options.frozenReadAdmission !== undefined && typeof options.frozenReadAdmission !== 'function') {
+    throw new TypeError('Egress proxy frozen read admission must be a function');
+  }
+  if (options.frozenTokenRefreshAdmission !== undefined && typeof options.frozenTokenRefreshAdmission !== 'function') {
+    throw new TypeError('Egress proxy frozen token refresh admission must be a function');
   }
   if (options.requestBudget !== undefined && (typeof options.requestBudget.matches !== 'function'
     || !Number.isSafeInteger(options.requestBudget.limit) || options.requestBudget.limit < 0)) {

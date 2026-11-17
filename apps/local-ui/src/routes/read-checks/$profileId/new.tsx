@@ -1,3 +1,4 @@
+import { useState } from 'react';
 import { Link, createFileRoute, notFound, useNavigate, useRouter } from '@tanstack/react-router';
 import { useServerFn } from '@tanstack/react-start';
 import {
@@ -7,7 +8,7 @@ import {
   READ_CHECK_TARGET_KIND_LABELS,
 } from '../../../../../../src/presentation/messages.js';
 import { Notice } from '../../../components/Notice';
-import { PageFrame } from '../../../components/PageFrame';
+import { PageFrame, readChecksTrail } from '../../../components/PageFrame';
 import { ReadCheckForm } from '../../../components/ReadCheckForm';
 import { createReadCheckFn, readCheckPageFn } from '../../../server/read-check-functions';
 
@@ -53,7 +54,11 @@ function NewReadCheckPage() {
   const navigate = useNavigate();
   const router = useRouter();
   const { profile } = page;
-  const kind: TargetKind = target ?? 'CANDIDATE';
+  // MI-7（設計書 `2026-10-26-beaksight-minimal-input-ux-design.md` 4.8）: 対象の種類は、来たリンクで決める（候補から来たら候補、「画面を読む定義を作る」から
+  // 来たら画面）。リンクなしで開いたときだけ、選ぶ radio を出す（選んでも URL は変えない。radio を出したまま）。
+  const linkedKind: TargetKind | null = target ?? (digest === undefined ? null : 'CANDIDATE');
+  const [chosenKind, setChosenKind] = useState<TargetKind>('CANDIDATE');
+  const kind: TargetKind = linkedKind ?? chosenKind;
   const candidate = page.candidates.find((view) => view.identityDigest === digest) ?? null;
   const onSaved = (): void => {
     void router.invalidate().then(() =>
@@ -64,40 +69,38 @@ function NewReadCheckPage() {
   };
 
   return (
-    <PageFrame title={text.pages.newReadCheck}>
+    <PageFrame title={text.pages.newReadCheck} trail={readChecksTrail(profile.profileId)}>
       {!page.editable ? (
         <Notice kind="caution">
           <p data-testid="read-check-retired">{page.eligible ? text.retired : text.notEligible}</p>
         </Notice>
       ) : (
-        <section className="panel">
+        // PL-5 の修正の 1 回目（設計書 3 章の 1）: 要点のパネル（対象と入力、主のボタン「保存」1 つ）。直す欄はこのフォームだけなので、詳しい内容は置かない。
+        <section className="panel" data-testid="read-check-new-summary">
           <h2 className="panel-heading">{text.formHeading}</h2>
-          <fieldset className="field-group" data-testid="read-check-target-kind">
-            <legend className="field-group-heading">{text.page.targetHeading}</legend>
-            {TARGET_KINDS.map((value) => (
-              <label key={value} className="choice">
-                <input
-                  type="radio"
-                  name="read-check-target-kind"
-                  value={value}
-                  checked={kind === value}
-                  data-target-kind={value}
-                  onChange={() => {
-                    void navigate({
-                      to: '/read-checks/$profileId/new',
-                      params: { profileId: profile.profileId },
-                      search: { ...(digest === undefined ? {} : { candidate: digest }), target: value },
-                    });
-                  }}
-                />
-                <span>{READ_CHECK_TARGET_KIND_LABELS[value]}</span>
-              </label>
-            ))}
-          </fieldset>
+          {linkedKind !== null ? null : (
+            <fieldset className="field-group" data-testid="read-check-target-kind">
+              <legend className="field-group-heading">{text.page.targetHeading}</legend>
+              {TARGET_KINDS.map((value) => (
+                <label key={value} className="choice">
+                  <input
+                    type="radio"
+                    name="read-check-target-kind"
+                    value={value}
+                    checked={kind === value}
+                    data-target-kind={value}
+                    onChange={() => setChosenKind(value)}
+                  />
+                  <span>{READ_CHECK_TARGET_KIND_LABELS[value]}</span>
+                </label>
+              ))}
+            </fieldset>
+          )}
           {kind === 'PAGE' ? (
             <ReadCheckForm
               key="page"
-              target={{ kind: 'PAGE', pagePaths: page.pagePaths, initialPath: '' }}
+              // MI-7（設計書 4.8）: 画面の path は、直近の発見の結果の先頭を既定にする（読めた画面がなければ空。期待の既定は変えない）。
+              target={{ kind: 'PAGE', pagePaths: page.pagePaths, initialPath: page.pagePaths[0] ?? '' }}
               form={page.form}
               initial={null}
               onSave={(definition) => create({ data: { profileId: profile.profileId, definition } })}
@@ -115,10 +118,9 @@ function NewReadCheckPage() {
           ) : (
             <>
               <dl className="facts" data-testid="read-check-target">
+                {/* PL-5 の修正の 1 回目（設計書 3 章の 2）: 画面のアドレスの後ろだけ（サイトのアドレスと送信先は出さない）。 */}
                 <dt>{text.columns.page}</dt>
-                <dd><code>{`${page.showOrigins ? candidate.pageOrigin : ''}${candidate.pagePath}`}</code></dd>
-                <dt>{text.columns.action}</dt>
-                <dd><code>{candidate.actionPath === null ? LOCAL_UI_DISCOVERY_TEXT.noAction : `${page.showOrigins ? candidate.actionOrigin ?? '' : ''}${candidate.actionPath}`}</code></dd>
+                <dd>{candidate.pagePath}</dd>
                 <dt>{text.columns.submitterWords}</dt>
                 <dd>{LOCAL_UI_DISCOVERY_TEXT.submitterWordsValue(candidate.submitterWords)}</dd>
               </dl>
@@ -135,9 +137,6 @@ function NewReadCheckPage() {
           )}
         </section>
       )}
-      <p>
-        <Link to="/read-checks/$profileId" params={{ profileId: profile.profileId }} className="button">{text.backToList}</Link>
-      </p>
     </PageFrame>
   );
 }

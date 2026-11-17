@@ -8,7 +8,6 @@ import { readFileSync } from 'node:fs';
 import { resolve } from 'node:path';
 import { describe, expect, it } from 'vitest';
 import { CONTROL_SCHEMA_NAMES, validateControlDocument } from '../../src/control/control-schema-validator.js';
-import { MAX_URL_LENGTH } from '../../src/core/limits.js';
 import {
   CANDIDATE_CLASSIFICATIONS,
   CANDIDATE_FIELD_TAGS,
@@ -20,15 +19,6 @@ import {
   FORM_METHODS,
   INCOMPLETE_REASONS,
   LISTENER_KINDS,
-  MAX_ACTION_QUERY_NAMES,
-  MAX_CANDIDATE_FIELDS,
-  MAX_CANDIDATE_URL_PART_LENGTH,
-  MAX_CONSTRAINT_VALUE_LENGTH,
-  MAX_FIELD_NAME_LENGTH,
-  MAX_FORM_TARGET_LENGTH,
-  MAX_OPTION_VALUE_LENGTH,
-  MAX_SELECT_OPTION_VALUES,
-  MAX_SUBMITTER_TEXT_LENGTH,
   METHOD_OVERRIDE_FIELD_NAME,
   METHOD_OVERRIDE_VALUES,
   UNSENDABLE_FIELD_TYPES,
@@ -76,7 +66,7 @@ const fullForm = complete(sampleForm({
     sampleField('csrf_token', 'hidden', { hasValue: true }),
     sampleField('q', 'search', { required: true, constraints: { ...NO_CONSTRAINTS, pattern: '[^<>]*', maxlength: '50' } }),
     sampleField('category', 'select-one', {
-      options: Array.from({ length: MAX_SELECT_OPTION_VALUES }, (_value, index) => `v${index}`),
+      options: Array.from({ length: 50 }, (_value, index) => `v${index}`),
       omittedOptionCount: 2,
       hasValue: true,
     }),
@@ -102,31 +92,25 @@ describe('T27a: the candidate schema and the contract constants', () => {
   });
 
   it('uses the named limits of the contract', () => {
-    expect(MAX_SELECT_OPTION_VALUES).toBe(50);
-    expect(MAX_CANDIDATE_URL_PART_LENGTH).toBe(MAX_URL_LENGTH);
-    const location = defs.location;
-    expect(prop(location, 'origin').maxLength).toBe(MAX_CANDIDATE_URL_PART_LENGTH);
-    expect(prop(location, 'path').maxLength).toBe(MAX_CANDIDATE_URL_PART_LENGTH);
+    // URL-LEN: 画面と送信先の Origin と path、form の target の長さの上限（前は 2,048・256）はない。
     const action = defs.action;
-    expect(prop(action, 'origin').maxLength).toBe(MAX_CANDIDATE_URL_PART_LENGTH);
-    expect(prop(action, 'path').maxLength).toBe(MAX_CANDIDATE_URL_PART_LENGTH);
-    expect(prop(action, 'queryNames').maxItems).toBe(MAX_ACTION_QUERY_NAMES);
-    expect(prop(action, 'queryNames').items?.maxLength).toBe(MAX_FIELD_NAME_LENGTH);
-    expect(prop(schema, 'fields').maxItems).toBe(MAX_CANDIDATE_FIELDS);
+    for (const node of [defs.location, action]) {
+      expect(prop(node, 'origin').maxLength).toBeUndefined();
+      expect(prop(node, 'path').maxLength).toBeUndefined();
+    }
+    expect(prop(schema, 'target').anyOf?.[0]?.maxLength).toBeUndefined();
     // T27R-fix-1（DEF-086）: 送信ボタンの文言は持たず、送信ボタンの語の閉じた一覧の語だけ（重なりなし。enum の一致は `schema-enum-consistency`）。
     expect(prop(schema, 'submitterWords').maxItems).toBe(DISCOVERY_SUBMITTER_WORDS.length);
     expect(prop(schema, 'submitterWords').uniqueItems).toBe(true);
     expect(prop(schema, 'submitterText')).toEqual({});
-    expect(prop(schema, 'target').anyOf?.[0]?.maxLength).toBe(MAX_FORM_TARGET_LENGTH);
     const field = defs.field;
-    expect(prop(field, 'name').maxLength).toBe(MAX_FIELD_NAME_LENGTH);
-    expect(prop(field, 'options').anyOf?.[0]?.maxItems).toBe(MAX_SELECT_OPTION_VALUES);
-    expect(prop(field, 'options').anyOf?.[0]?.items?.maxLength).toBe(MAX_OPTION_VALUE_LENGTH);
+    // LZ-2: 選択肢の値と制約の属性の値の長さの上限（前は 256・512）はない。
+    expect(prop(field, 'options').anyOf?.[0]?.items?.maxLength).toBeUndefined();
     const constraints = defs.constraints;
     expect(Object.keys(constraints?.properties ?? {})).toEqual([...FIELD_CONSTRAINT_NAMES]);
     expect(constraints?.required).toEqual([...FIELD_CONSTRAINT_NAMES]);
     for (const name of FIELD_CONSTRAINT_NAMES) {
-      expect(prop(constraints, name).anyOf?.[0]?.maxLength, name).toBe(MAX_CONSTRAINT_VALUE_LENGTH);
+      expect(prop(constraints, name).anyOf?.[0]?.maxLength, name).toBeUndefined();
     }
     const binding = defs.jsBinding;
     expect(binding?.required).toEqual(['form', 'submitter', 'ancestor', 'document', 'window', 'inlineHandler']);
@@ -148,7 +132,11 @@ describe('T27a: the candidate schema and the contract constants', () => {
     // DEF-130-fix: ページが出す文書でない要求を上限で止めた画面（`INCOMPLETE_PAGE_SUBRESOURCE_LIMIT`）を足した。
     expect(INCOMPLETE_REASONS).toEqual([
       'INCOMPLETE_SETTLE_TIMEOUT', 'INCOMPLETE_FRAME_OR_CLOSED_SHADOW', 'INCOMPLETE_FREEZE_UNAVAILABLE', 'INCOMPLETE_READ_FAILED',
-      'INCOMPLETE_LIMIT_REACHED', 'INCOMPLETE_PAGE_NAVIGATION_LIMIT', 'INCOMPLETE_PAGE_SUBRESOURCE_LIMIT', 'SERVICE_READ_REFUSED',
+      'INCOMPLETE_LIMIT_REACHED', 'INCOMPLETE_PAGE_NAVIGATION_LIMIT', 'INCOMPLETE_PAGE_SUBRESOURCE_LIMIT',
+      // fix round 4（通知の枠の設計書 3.2.3 の 3）: 閉じる押下の押す期間に移動を止めた画面。
+      'NOTIFICATION_DISMISSAL_NAVIGATION_BLOCKED', 'SERVICE_READ_REFUSED',
+      // L6/L3-1: 1 画面の進みの見張り（L0）が画面を終えた（L0 の理由と同じ名前）。
+      'STAGE_UNRESPONSIVE', 'STAGE_NEVER_QUIET',
     ]);
     expect(METHOD_OVERRIDE_FIELD_NAME).toBe('_method');
   });
@@ -176,6 +164,12 @@ describe('T27a: candidate schema validation', () => {
     expectValid(fullButton);
     expectValid(complete(sampleForm({ formMethod: 'POST', methodOverride: 'DELETE', submitterText: null })));
     expectValid(complete(sampleForm({ formMethod: 'DIALOG', enctype: 'text/plain', target: null })));
+    // URL-LEN: 前の上限（2,048・256）より長い画面と送信先の path、form の target も受ける。
+    expectValid(complete(sampleForm({
+      page: { origin: 'http://127.0.0.1:4173', path: `/${'p'.repeat(2_049)}` },
+      action: { origin: 'http://127.0.0.1:4173', path: `/${'a'.repeat(2_049)}`, queryNames: [] },
+      target: 't'.repeat(257),
+    })));
   });
 
   it('rejects values, tokens and labels as extra properties', () => {
@@ -185,9 +179,22 @@ describe('T27a: candidate schema validation', () => {
     expectInvalid({ ...fullForm, fields: [{ ...fullForm.fields[0], options: [{ value: 'a', label: 'A' }] }] });
   });
 
-  it('rejects more option values than the limit, and values outside the closed lists', () => {
-    const tooMany = Array.from({ length: MAX_SELECT_OPTION_VALUES + 1 }, (_value, index) => `v${index}`);
-    expectInvalid({ ...fullForm, fields: [{ ...fullForm.fields[0], options: tooMany }] });
+  // L13（N28・N29・N30）: 欄・選択肢・送信先の query の名前の数と、欄・query の名前の長さに上限を置かない（前は 200・50・50・256）。
+  it('accepts any number of fields, option values and query names, and long names', () => {
+    const longName = 'n'.repeat(300);
+    const [first, , select] = fullForm.fields;
+    if (first === undefined || select === undefined) throw new Error('no field');
+    expectValid({
+      ...fullForm,
+      action: { ...fullForm.action, queryNames: Array.from({ length: 51 }, (_value, index) => `q${index}`).concat(longName) },
+      fields: [
+        ...Array.from({ length: 201 }, (_value, index) => ({ ...first, name: `f${index}` })),
+        { ...select, name: longName, options: Array.from({ length: 51 }, (_value, index) => `v${index}`), omittedOptionCount: 0 },
+      ],
+    });
+  });
+
+  it('rejects values outside the closed lists', () => {
     expectInvalid({ ...fullForm, fields: [{ ...fullForm.fields[0], omittedOptionCount: -1 }] });
     expectInvalid({ ...fullForm, classification: 'DELETE' });
     expectInvalid({ ...fullForm, reasonCode: 'SOMETHING' });
@@ -205,7 +212,6 @@ describe('T27a: candidate schema validation', () => {
     expectInvalid({ ...fullForm, submitterWords: ['山田 太郎 を編集'] });
     expectInvalid({ ...fullForm, submitterWords: ['検索', '検索'] });
     expectInvalid({ ...fullForm, submitterWords: null });
-    expectInvalid({ ...fullForm, submitterWords: 'x'.repeat(MAX_SUBMITTER_TEXT_LENGTH + 1) });
     expectInvalid({ ...fullForm, page: { origin: 'http://127.0.0.1:4173', path: 'no-leading-slash' } });
   });
 

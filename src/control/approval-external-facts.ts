@@ -14,6 +14,7 @@ import { readFile } from 'node:fs/promises';
 import { join } from 'node:path';
 import type { ApprovalExternalFacts } from './approval/scenario-facts.js';
 import { authSetupDigestOf, type AuthSetupCredentialFacts } from './auth/auth-setup-digest.js';
+import { NO_LOGIN_AUTH_STRATEGY } from './contracts.js';
 import type { CredentialStore } from './credentials/credential-store.js';
 import { isProfileOperationAllowed, type ProfileOperation } from './execution-policy.js';
 import { readLatestCredentialChangeEventId } from './job/auto-login-store.js';
@@ -72,6 +73,11 @@ export const approvalExternalFactsOf = async (
   deps: ApprovalExternalFactsDependencies,
 ): Promise<ApprovalExternalFacts | null> => {
   const targetConfigDigest = await targetConfigDigestOfProfile(stored, deps.repositoryRoot);
+  // NL-1（設計書 `2026-11-06-beaksight-no-login-test-site-design.md` 3.1 の 5）: ログインしない方式のプロファイルは、残っている認証の設定（ログインを
+  // 使う方式から変えた後の残り）と資格情報を、承認に混ぜない（認証の設定の digest は null）。
+  if (stored.profile.auth === NO_LOGIN_AUTH_STRATEGY) {
+    return targetConfigDigest === null ? null : Object.freeze({ authSetupDigest: null, targetConfigDigest });
+  }
   const credential = await credentialFactsOf(stored, deps);
   if (targetConfigDigest === null || credential === undefined) {
     return null;

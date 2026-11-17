@@ -1,7 +1,7 @@
 /**
  * 監査済みデータの台帳の画面の Server Function（T32g。Task 32 の設計書 4.1 の「監査済みデータの台帳」。ロードマップ 13.4）。読むだけ。
  * - 台帳の行の読み出しは `src/control/actions/write-result-facts.ts` の `readAuditedDataLedger`（書き込みの結果の表の読み出しの owner。画面は管理
- *   データを直接読まない）。累計の件数は、発行の判定と同じ数え方（`readUsedCumulativeWrites`）。上限はシナリオの今の版の値。
+ *   データを直接読まない）。累計の件数は、発行の判定と同じ数え方（`readUsedCumulativeWrites`）。上限は返さない（LZ-3c）。
  * - 書き込みのモードのプロファイル（`usesScenarios`）だけ、台帳の行を返す。ほかのプロファイルは、行を返さず `eligible` を偽にする（画面が理由を
  *   出す）。プロファイルがなければ `null`。
  * - seed の記録は、許可の ID と入力の規則の集まりの digest だけ（seed の値・基準日・試行の番号は返さない）。送った値も返さない。日時は ISO 8601。
@@ -38,6 +38,8 @@ export interface LedgerEntryView {
   readonly readVerification: ReadCheckResult | null;
   readonly reservationState: SettledReservationState | null;
   readonly recordedAt: string;
+  /** PL-5（設計書 3 章の 1）: 行の「何を作ったか」の、書き込みの手順が操作を見つけた画面のアドレスの後ろ（書き込みの手順が読めなければ null）。 */
+  readonly pagePath: string | null;
   /** その ID への UPDATE の回数と、最後の 1 回の結果（締める前は null）とジョブ。 */
   readonly updates: {
     readonly count: number;
@@ -46,15 +48,13 @@ export interface LedgerEntryView {
   };
 }
 
-/** 台帳の、シナリオごとの累計の件数と上限。 */
+/** 台帳の、シナリオごとの累計の件数（LZ-3c: 累積の上限は判定に使わない名残なので返さない）。 */
 export interface LedgerScenarioView {
   readonly scenarioId: string;
   readonly kind: ScenarioKind;
   readonly revision: number;
   /** 累計の使った件数（発行の判定と同じ数え方）。 */
   readonly used: number;
-  /** 累計の上限（今の版の値）。 */
-  readonly limit: number;
 }
 
 /** 台帳の画面の値。 */
@@ -70,7 +70,7 @@ interface ProfileKeyRequest {
   readonly profileId: string;
 }
 
-const entryOf = (entry: AuditedDataLedgerEntry): LedgerEntryView => ({
+const entryOf = (entry: AuditedDataLedgerEntry, pagePaths: ReadonlyMap<string, string>): LedgerEntryView => ({
   jobId: entry.jobId,
   runId: entry.runId,
   scenarioId: entry.scenarioId,
@@ -82,6 +82,7 @@ const entryOf = (entry: AuditedDataLedgerEntry): LedgerEntryView => ({
   readVerification: entry.readVerification,
   reservationState: entry.reservationState,
   recordedAt: isoTimestampOf(entry.recordedAt),
+  pagePath: pagePaths.get(entry.scenarioId) ?? null,
   updates: {
     count: entry.updates.count,
     lastResult: entry.updates.last?.result ?? null,
@@ -102,16 +103,17 @@ export const auditedDataLedgerPageFn = createServerFn({ method: 'GET' })
       return { profile, eligible: false, entries: [], scenarios: [] };
     }
     const now = new Date();
+    const scenarios = listScenarios(localUiStore(), stored.profile.profileId);
+    const pagePaths = new Map(scenarios.map((scenario) => [scenario.scenarioId, scenario.evidence.page.path]));
     return {
       profile,
       eligible: true,
-      entries: readAuditedDataLedger(localUiStore(), stored.profile.profileId).map(entryOf),
-      scenarios: listScenarios(localUiStore(), stored.profile.profileId).map((scenario) => ({
+      entries: readAuditedDataLedger(localUiStore(), stored.profile.profileId).map((entry) => entryOf(entry, pagePaths)),
+      scenarios: scenarios.map((scenario) => ({
         scenarioId: scenario.scenarioId,
         kind: scenario.current.kind,
         revision: scenario.revision,
         used: readUsedCumulativeWrites(localUiStore(), scenario.scenarioId, now),
-        limit: scenario.current.limits.maxCumulativeCreates,
       })),
     };
   });

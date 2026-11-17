@@ -1,6 +1,6 @@
 // T27c（Task 27 の設計書 4.5、4.6、10 章の 4）: READ の確かめの定義と結果の記録と読み出し（`src/control/job/read-check-store.ts`）の結合テスト。
 // - 定義の作成（版 1）・変更（版を上げる。画面が読んだ版と違えば拒む）・取り消し（消さずに取り消した時刻を書く）。
-// - 1 つのプロファイルの、取り消していない定義の数の上限（`MAX_READ_CHECK_DEFINITIONS_PER_PROFILE`。1 回のジョブの READ の上限と同じ定数）。
+// - L4（COV-7）: 1 つのプロファイルの定義の数と、結果の読み出しの件数に上限を置かない。
 // - 保存の前の確かめ直し（形と秘密に見える名前。候補の確かめは呼び出し側が `validateReadCheckDefinition` で行う）。
 // - 結果の記録（ジョブ・定義・定義の版・閉じた一覧の結果・時刻）と、最近の結果の読み出し。
 // - T27e（T27c の申し送り 11）: 定義の版が今の版と違う結果（実行の間に定義が変わった）は書かない。1 回のジョブの結果をまとめて書く口
@@ -32,7 +32,6 @@ import { resolveControlDatabasePath } from '../../src/control/store/database-pat
 import { withReadTransaction } from '../../src/control/store/transaction.js';
 import { createProfile, updateProfile } from '../../src/control/store/profile-store.js';
 import {
-  MAX_READ_CHECK_DEFINITIONS_PER_PROFILE,
   READ_CHECK_RESULTS,
   type ReadCheckDefinition,
 } from '../../src/discovery/read-check-contracts.js';
@@ -121,16 +120,24 @@ describe('READ check definitions (T27c)', () => {
       .toEqual([['read-1', UPDATED_AT]]);
   });
 
-  it('limits the definitions of one profile that are not canceled (the same constant as the READ of one job)', () => {
-    for (let index = 0; index < MAX_READ_CHECK_DEFINITIONS_PER_PROFILE; index += 1) {
+  // L4（COV-7。設計書 `2026-11-09-beaksight-remove-limits-design.md`）: 1 つのプロファイルの定義の数に上限を置かない（前の上限 20 を超えても作れる）。
+  it('does not limit the definitions of one profile (more than the former limit)', () => {
+    const count = 25;
+    for (let index = 0; index < count; index += 1) {
       expect(create(`read-${index}`).ok).toBe(true);
     }
-    expect(create('read-over')).toEqual({ ok: false, reason: 'READ_CHECK_LIMIT_EXCEEDED' });
-    // ほかのプロファイルは数えない。取り消すと、また作れる。
-    expect(create('read-other', { profileId: OTHER_PROFILE_ID }).ok).toBe(true);
-    expect(cancelReadCheck(database, { readCheckId: 'read-0', expectedRevision: 1, at: UPDATED_AT }).ok).toBe(true);
-    expect(create('read-over').ok).toBe(true);
-    expect(readReadCheck(database, 'read-over')).not.toBeNull();
+    expect(listReadChecks(database, PROFILE_ID)).toHaveLength(count);
+  });
+
+  // L4（INV-LIMITS の N40）: 結果は、件数を渡さなければ全部を読む（前の既定 50 件を超えても）。
+  it('reads every result of a profile when no limit is given', () => {
+    expect(create('read-1').ok).toBe(true);
+    const count = 60;
+    expect(recordReadCheckResults(database, Array.from({ length: count }, (_value, index): ReadCheckResultInput => ({
+      jobId: `job-${index}`, readCheckId: 'read-1', readCheckRevision: 1, result: 'MATCHED', at: RESULT_AT,
+    }))).recorded).toHaveLength(count);
+    expect(readRecentReadCheckResults(database, PROFILE_ID)).toHaveLength(count);
+    expect(readRecentReadCheckResults(database, PROFILE_ID, 2)).toHaveLength(2);
   });
 
   it('rejects a missing profile, and the caller errors before writing', () => {

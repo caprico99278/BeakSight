@@ -20,7 +20,6 @@ import {
 import { readJob } from '../../src/control/job/job-store.js';
 import { closeControlDatabase, openControlDatabase } from '../../src/control/store/control-database.js';
 import {
-  MAX_WORKER_NOTICE_URL_LENGTH,
   WORKER_AUTH_STATES,
   WORKER_ENTRY_CHECK_JOB_KIND,
   WORKER_LOGIN_FAILURE_STATES,
@@ -137,10 +136,13 @@ describe('Control store: the jobs table', () => {
     insertJob(connection, jobRow({
       job_id: 'job-lost', state: 'FINISHED', finished_at: FINISHED_AT, last_auth_state: 'SESSION_LOST', session_lost_url: 'http://127.0.0.1/admin',
     }));
+    // URL-LEN（版 20）: 長さの上限（前は 2,048）はない。
+    insertJob(connection, jobRow({
+      job_id: 'job-long', state: 'FINISHED', finished_at: FINISHED_AT, last_auth_state: 'SESSION_LOST', session_lost_url: `http://127.0.0.1/${'u'.repeat(2_049)}`,
+    }));
     for (const row of [
       { job_id: 'bad-state', last_auth_state: 'LOGGED_IN' },
       { job_id: 'bad-empty-url', session_lost_url: '' },
-      { job_id: 'bad-long-url', session_lost_url: 'u'.repeat(MAX_WORKER_NOTICE_URL_LENGTH + 1) },
       { job_id: 'bad-strict', session_lost_url: new Uint8Array([1]) },
     ]) {
       expect(() => insertJob(connection, jobRow({ state: 'FAILED', finished_at: FINISHED_AT, failure_reason: 'CONFIG_ERROR', ...row })), row.job_id)

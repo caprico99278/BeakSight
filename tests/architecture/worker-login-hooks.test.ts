@@ -29,10 +29,17 @@
  *   `chromiumLaunchOptions`、`launchPersistentContext`、手動のログインの段のファイル）。ログイン用の Browser は、呼ぶ側が渡す。
  * - (z) 入力の部品の中で、値を受ける引数（`LOGIN_SECRET_PARAMETER`）が現れるのは、その宣言（`loginSecret:`）と `.fill(` の引数の中だけ
  *   （`evaluate` などに渡さない。別の名前に移さない）。
+ * - (aa) OP-1（設計書 `doc/design/2026-10-27-beaksight-one-pass-flow-design.md` 4.1 の D2）: 「欄の値は読まない」の、ログインの段だけの名前つきの例外。
+ *   人が入れた ID とパスワードを隔離した世界で読む部品（`LOGIN_CREDENTIAL_CAPTURE_PATH`）だけが、ページの中の関数を binding で Node の側へつなぐ CDP の
+ *   命令（`CAPTURE_ONLY_CDP_COMMANDS`）を書く。その部品を参照する（import・文字列）のは、手動のログインの段（`authenticated-login.ts`）だけ（自動ログインの段・
+ *   ほかのジョブの流れは参照しない。OP-1 の修正の 1 回目で、保存の口の process の組み立てを足した）。受け取った値を取り出す口（`CAPTURED_VALUE_ACCESSORS`）は、
+ *   部品の外では閉じた一覧（`CAPTURED_VALUE_USERS`。保存の口だけ）のファイルだけが書く。部品は (q) の入力の操作を行わない（(q) の例外の一覧に入れない）。
+ * - RB-2（TEST-TIME-B の条件 2。前の `testWaits` と SLIM-2 の `auditSendCloseSettleMs` を寄せた）: (p) に、観察の窓の一式の口（`observationWindows`）が、
+ *   process の組み立てと一式を通す部品の閉じた一覧にだけ現れ、本番の Run の依存にないことを足した。本番の入口は (n) で渡さない。
  * - ファイル全体を 1 秒以内に終える。
  */
 import { describe, expect, it } from 'vitest';
-import { countIdentifier, findCallSites, loadSourceFiles, scanSource, type ScannedSource } from './source-scan.js';
+import { countIdentifier, findCallSites, loadLocalUiSourceFiles, loadSourceFiles, scanSource, type ScannedSource } from './source-scan.js';
 
 const WORKER_DIRECTORY = 'src/worker/';
 const ENTRY_PATH = 'src/worker/audit-worker.ts';
@@ -43,7 +50,32 @@ const HOOK_OWNER_PATHS: ReadonlySet<string> = new Set([
   'src/worker/automated-login.ts',
 ]);
 // FM-2: ジョブのブラウザを表示しないテストだけの口（`hideJobBrowser`。process の組み立てだけが持つ）を足した。
-const TEST_ONLY_HOOK_NAMES: readonly string[] = ['onLoginPageReady', 'launchLoginBrowser', 'launchAutomatedLoginBrowser', 'openCredentialStore', 'hideJobBrowser'];
+const TEST_ONLY_HOOK_NAMES: readonly string[] = [
+  'onLoginPageReady', 'launchLoginBrowser', 'launchAutomatedLoginBrowser', 'openCredentialStore', 'hideJobBrowser',
+];
+const PROCESS_ASSEMBLY_PATH = 'src/worker/audit-worker-process.ts';
+/**
+ * RB-2: 観察の窓の一式の差し込みの口の名前（TEST-TIME-B の `testWaits` と SLIM-2 の `auditSendCloseSettleMs` を寄せた）と、それが現れてよいファイル（閉じた一覧。
+ * process の組み立てと、一式を受けて通す部品だけ）。CLI の引数・設定・IPC・画面のサーバには現れない（`src/cli/` は Run の中核の依存の型だけ）。
+ */
+const OBSERVATION_WINDOWS_HOOK_NAME = 'observationWindows';
+const OBSERVATION_WINDOWS_USERS: readonly string[] = [
+  PROCESS_ASSEMBLY_PATH,
+  'src/cli/audit-run.ts',
+  'src/orchestration/run-coordinator.ts',
+  'src/orchestration/page-auditor.ts',
+  'src/browser/context-factory.ts',
+  'src/worker/discovery-run.ts',
+  // RB-8 の残り（RB-12 で行った）: 1 画面の読み込みの受け口（`GuardedPageLoadOptions.observationWindows`。進行中の要求の数え方の本文の猶予）。
+  'src/worker/worker-run-session.ts',
+  'src/worker/write-create-run.ts',
+  // RB-11: 書き込みの入力の部品の受け口（API の入力の見張りの指定、form の押す操作の引数、押した後の静まりの待ちの指定）。
+  'src/browser/api-write-submitter.ts',
+  'src/browser/write-form-submitter.ts',
+  'src/browser/form-submission-common.ts',
+  // RB-9: 知らせの枠を閉じる輪の受け口（`NotificationDismissalOptions.observationWindows`）。
+  'src/interaction/notification-overlay.ts',
+];
 const ENTRY_CALL = /\brunAuditWorkerProcess\s*\(([^)]*)\)/gu;
 const ENVIRONMENT_READS = /\bprocess\s*\.\s*(?:env|argv)\b/gu;
 /**
@@ -74,7 +106,23 @@ const INPUT_OPERATION_OWNERS: ReadonlySet<string> = new Set([
  * Interaction の Guard が止める）。ここでも `click` のほかの入力の操作は許さない。
  */
 const CLICK_ONLY_EXCEPTION_PATH = 'src/interaction/isolated-auditor.ts';
+/**
+ * (q) `click` だけの例外（DEF-210。通知の枠の設計書 3.2）: 通知の枠の閉じるボタンを押す部品（値を入れない。押した後の送信は、その Context の Guard が監査の段の
+ * 判定で扱う）。ここでも `click` のほかの入力の操作は許さない。
+ */
+const NOTIFICATION_CLICK_EXCEPTION_PATH = 'src/interaction/notification-overlay.ts';
+const CLICK_ONLY_EXCEPTION_PATHS: ReadonlySet<string> = new Set([CLICK_ONLY_EXCEPTION_PATH, NOTIFICATION_CLICK_EXCEPTION_PATH]);
 const CLICK_OPERATION = /^\.\s*click\s*\($/u;
+/**
+ * (q) キーを押すことだけの例外（EV-4。設計書 `2026-11-16-beaksight-finding-evidence-design.md` 3.4）: 横にスクロールする領域の実操作（Tab で届くか・矢印の
+ * キーで動くか）。値を入れる要素は起点にせず、そこへフォーカスが来たら止める。押してよいキーは `KEY_PRESS_ALLOWED_KEYS` だけ（文字・Enter・Space は許さない）。
+ * 押す所は `.keyboard.press(key)` の 1 か所で、その引数は、ファイルの中のキーの一覧 `SCROLLABLE_REGION_KEYS` の型（一覧の外は押さずに投げる）。
+ */
+const KEY_PRESS_ONLY_EXCEPTION_PATH = 'src/evidence/reveal-and-capture.ts';
+const KEY_PRESS_OPERATION = /^(?:\.\s*press\s*\(|keyboard)$/u;
+const KEY_PRESS_ALLOWED_KEYS: readonly string[] = ['Tab', 'Shift+Tab', 'ArrowRight', 'ArrowLeft', 'ArrowDown', 'ArrowUp'];
+const KEY_PRESS_KEY_LIST = /\bSCROLLABLE_REGION_KEYS\s*=\s*Object\.freeze\(\[([^\]]*)\]/u;
+const KEY_PRESS_CALL = /\.\s*press\s*\(([^)]*)\)/gu;
 /** (x) 入力の部品を参照してよいファイル（自動ログインの段）。 */
 const AUTOMATED_LOGIN_PATH = 'src/worker/automated-login.ts';
 const MANUAL_LOGIN_PATH = 'src/worker/authenticated-login.ts';
@@ -87,6 +135,22 @@ const HEADED_LAUNCH_CODE = /authenticated-login|chromium-launch/gu;
 const LOGIN_SECRET_PARAMETER = 'loginSecret';
 /** (z) 引数の宣言（`loginSecret: <型>`）。 */
 const LOGIN_SECRET_DECLARATION = new RegExp(`(?<![\\w$.])${LOGIN_SECRET_PARAMETER}\\s*:`, 'gu');
+
+/** (aa) 値の受け取りの部品（ログインの段だけの例外）。 */
+const LOGIN_CREDENTIAL_CAPTURE_PATH = 'src/worker/login-credential-capture.ts';
+/** (aa) 値の受け取りの部品のモジュールの名前。 */
+const LOGIN_CREDENTIAL_CAPTURE_MODULE = /login-credential-capture/u;
+/** (aa) 受け取りの部品だけが書く CDP の命令（ページの中の関数を Node の側へつなぐ）。 */
+const CAPTURE_ONLY_CDP_COMMANDS: readonly string[] = ['Runtime.addBinding', 'Page.addScriptToEvaluateOnNewDocument', 'Runtime.bindingCalled'];
+/** (aa) 受け取った値を取り出す口の名前。 */
+const CAPTURED_VALUE_ACCESSORS = /\b(?:withCapturedLoginCredential|capturedLoginValuesOf)\b/gu;
+/**
+ * (aa) 部品の外で、受け取った値を取り出してよいファイル（閉じた一覧）。OP-1 の修正の 1 回目（設計書 4.1.3 の 1）: 保存の口（process の組み立て。親の許しの後に、
+ * 資格情報のファイルの部品の `register` に渡すだけ）。
+ */
+const CAPTURED_VALUE_USERS: ReadonlySet<string> = new Set<string>(['src/worker/audit-worker-process.ts']);
+/** (aa) 受け取りの部品を参照してよいファイル（閉じた一覧。手動のログインの段と、保存の口）。 */
+const CAPTURE_REFERRERS: readonly string[] = ['src/worker/audit-worker-process.ts', 'src/worker/authenticated-login.ts'];
 
 const SOURCE_FILES = loadSourceFiles();
 const WORKER_FILES = SOURCE_FILES.filter((file) => file.path.startsWith(WORKER_DIRECTORY));
@@ -115,6 +179,23 @@ const countLoginSecretLeaks = (source: ScannedSource): number => {
   return declarations === 0 ? 1 : total - declarations - insideFill;
 };
 
+type PathSource = ScannedSource & { readonly path: string };
+
+/** (aa) 受け取りの部品の外で、binding の CDP の命令を書くところ（`<path>: <命令>`）。 */
+const findCaptureCommandUses = (files: readonly PathSource[]): readonly string[] => files
+  .filter(({ path }) => path !== LOGIN_CREDENTIAL_CAPTURE_PATH)
+  .flatMap(({ path, code }) => CAPTURE_ONLY_CDP_COMMANDS.filter((command) => code.includes(command)).map((command) => `${path}: ${command}`));
+
+/** (aa) 受け取りの部品を参照するファイル（部品そのものを除く。コメントを除いた本文の指定子と文字列）。 */
+const findCaptureReferrers = (files: readonly PathSource[]): readonly string[] => files
+  .filter(({ path, code }) => path !== LOGIN_CREDENTIAL_CAPTURE_PATH && LOGIN_CREDENTIAL_CAPTURE_MODULE.test(code))
+  .map(({ path }) => path);
+
+/** (aa) 部品と閉じた一覧の外で、受け取った値を取り出す口を書くところ。 */
+const findCapturedValueAccess = (files: readonly PathSource[]): readonly string[] => files
+  .filter(({ path }) => path !== LOGIN_CREDENTIAL_CAPTURE_PATH && !CAPTURED_VALUE_USERS.has(path))
+  .flatMap(({ path, bare }) => [...bare.matchAll(CAPTURED_VALUE_ACCESSORS)].map((match) => `${path}: ${match[0]}`));
+
 describe('Worker login hooks (T25d) and the single form input owner (T26d-1)', () => {
   it('reads the worker files, the login stages, and the form input owner', () => {
     expect(WORKER_FILES.map(({ path }) => path)).toEqual(expect.arrayContaining([ENTRY_PATH, ...HOOK_OWNER_PATHS, AUTOMATED_LOGIN_PATH]));
@@ -139,6 +220,15 @@ describe('Worker login hooks (T25d) and the single form input owner (T26d-1)', (
       .filter(({ path }) => !HOOK_OWNER_PATHS.has(path))
       .flatMap(({ path, bare }) => TEST_ONLY_HOOK_NAMES.filter((name) => new RegExp(`\\b${name}\\b`, 'u').test(bare)).map((name) => `${path}: ${name}`));
     expect(leaks).toEqual([]);
+    // RB-2（TEST-TIME-B の条件 2）: 観察の窓の一式の口は、閉じた一覧のファイルにだけ現れる（画面のサーバも含めて）。本番の入口は (n) のとおり口を渡さず、本番の Run の
+    // 依存（`PRODUCTION_RUN_DEPENDENCIES`）にもないので、本番の値（省略時の既定）で動く。
+    const windowsUsers = [...SOURCE_FILES, ...loadLocalUiSourceFiles()]
+      .filter(({ bare }) => countIdentifier(bare, OBSERVATION_WINDOWS_HOOK_NAME) > 0).map(({ path }) => path).sort();
+    expect(windowsUsers).toEqual([...OBSERVATION_WINDOWS_USERS].sort());
+    const runCore = SOURCE_FILES.find(({ path }) => path === 'src/cli/audit-run.ts')?.bare ?? '';
+    const productionRunDependencies = /\bPRODUCTION_RUN_DEPENDENCIES\b[^=]*=[^;]*;/u.exec(runCore)?.[0] ?? '';
+    expect(productionRunDependencies).toContain('launchBrowser');
+    expect(countIdentifier(productionRunDependencies, OBSERVATION_WINDOWS_HOOK_NAME)).toBe(0);
   });
 
   it('(q) src/ never types into the page, except the four input owners (login, write, the submission probe and the API write)', () => {
@@ -149,12 +239,22 @@ describe('Worker login hooks (T25d) and the single form input owner (T26d-1)', (
     const operations = SOURCE_FILES
       .filter(({ path }) => !INPUT_OPERATION_OWNERS.has(path))
       .flatMap((file) => findInputOperations(file)
-        .filter((operation) => !(file.path === CLICK_ONLY_EXCEPTION_PATH && CLICK_OPERATION.test(operation)))
+        .filter((operation) => !(CLICK_ONLY_EXCEPTION_PATHS.has(file.path) && CLICK_OPERATION.test(operation)))
+        .filter((operation) => !(file.path === KEY_PRESS_ONLY_EXCEPTION_PATH && KEY_PRESS_OPERATION.test(operation)))
         .map((operation) => `${file.path}: ${operation}`));
     expect(operations).toEqual([]);
+    // EV-4: キーを押す例外のファイルは、一覧のキーだけを、`.keyboard.press(key)` の 1 か所で押す。
+    const keyOwner = SOURCE_FILES.find(({ path }) => path === KEY_PRESS_ONLY_EXCEPTION_PATH)?.code ?? '';
+    const listed = [...(KEY_PRESS_KEY_LIST.exec(keyOwner)?.[1] ?? '').matchAll(/'([^']*)'/gu)].map((match) => match[1]);
+    expect(listed).toEqual(KEY_PRESS_ALLOWED_KEYS);
+    expect([...keyOwner.matchAll(KEY_PRESS_CALL)].map((match) => (match[1] ?? '').trim())).toEqual(['key']);
+    expect(keyOwner).toMatch(/type ScrollableRegionKey = \(typeof SCROLLABLE_REGION_KEYS\)\[number\];/u);
+    expect(keyOwner).toMatch(/const pressRegionKey = \(page: KeyboardRevealPage, key: ScrollableRegionKey\)/u);
     // click の例外のファイルが、実際に click を使う（例外の一覧が古くなっていない）。
-    const clickOwner = SOURCE_FILES.find(({ path }) => path === CLICK_ONLY_EXCEPTION_PATH);
-    expect(findInputOperations(clickOwner ?? scanSource('')).some((operation) => CLICK_OPERATION.test(operation))).toBe(true);
+    for (const clickPath of CLICK_ONLY_EXCEPTION_PATHS) {
+      const clickOwner = SOURCE_FILES.find(({ path }) => path === clickPath);
+      expect(findInputOperations(clickOwner ?? scanSource('')).some((operation) => CLICK_OPERATION.test(operation)), clickPath).toBe(true);
+    }
     // 例外のファイルが、実際に値を入れる（例外の一覧が古くなっていない）。
     const owner = SOURCE_FILES.find(({ path }) => path === FORM_SUBMITTER_PATH);
     expect(findInputOperations(owner ?? scanSource(''))).toContain('.fill(');
@@ -193,7 +293,30 @@ describe('Worker login hooks (T25d) and the single form input owner (T26d-1)', (
     expect(countIdentifier(owner?.bare ?? '', LOGIN_SECRET_PARAMETER)).toBeGreaterThan(0);
   });
 
+  it('(aa) only the credential capture part writes the binding CDP commands, only the manual login stage refers to it, and only it reveals the values (OP-1)', () => {
+    expect(SOURCE_FILES.map(({ path }) => path)).toContain(LOGIN_CREDENTIAL_CAPTURE_PATH);
+    expect(findCaptureCommandUses(SOURCE_FILES)).toEqual([]);
+    const capture = SOURCE_FILES.find(({ path }) => path === LOGIN_CREDENTIAL_CAPTURE_PATH);
+    // 例外の一覧が古くなっていない（部品が実際にその命令を書く）。
+    expect(CAPTURE_ONLY_CDP_COMMANDS.filter((command) => !(capture?.code.includes(command) ?? false))).toEqual([]);
+    expect([...findCaptureReferrers(SOURCE_FILES)].sort()).toEqual(CAPTURE_REFERRERS);
+    expect(findCaptureReferrers(SOURCE_FILES)).not.toContain(AUTOMATED_LOGIN_PATH);
+    expect(findCapturedValueAccess(SOURCE_FILES)).toEqual([]);
+    // 部品は入力の操作をしない（(q) の例外の一覧の外）。
+    expect(findInputOperations(capture ?? scanSource(''))).toEqual([]);
+  });
+
   it('detects the patterns (detector self-check)', () => {
+    // (aa)
+    expect(findCaptureCommandUses([{ path: 'src/worker/other.ts', ...scanSource("await session.send('Runtime.addBinding', {});") }]))
+      .toEqual(['src/worker/other.ts: Runtime.addBinding']);
+    expect(findCaptureReferrers([
+      { path: AUTOMATED_LOGIN_PATH, ...scanSource("import { startLoginCredentialCapture } from './login-credential-capture.js';") },
+      { path: MANUAL_LOGIN_PATH, ...scanSource("import { startLoginCredentialCapture } from './login-credential-capture.js';") },
+      { path: 'src/worker/other.ts', ...scanSource('// login-credential-capture is the owner') },
+    ])).toEqual([AUTOMATED_LOGIN_PATH, MANUAL_LOGIN_PATH]);
+    expect(findCapturedValueAccess([{ path: 'src/worker/audit-worker-session.ts', ...scanSource('await withCapturedLoginCredential(c, save);') }]))
+      .toEqual(['src/worker/audit-worker-session.ts: withCapturedLoginCredential']);
     expect('process.env.X'.match(ENVIRONMENT_READS)).toHaveLength(1);
     expect([...'runAuditWorkerProcess(process, { loginStage })'.matchAll(ENTRY_CALL)].map((match) => match[1])).toEqual(['process, { loginStage }']);
     // (q) 違反の例（RED になる）と、違反でない例。

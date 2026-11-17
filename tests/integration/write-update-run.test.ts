@@ -1,12 +1,14 @@
 // T31g-2（Task 31 の設計書 3 章の「更新の前の読み取り」「送信」「結果の判定」「更新の後の照合」「証拠と記録」、4 章の「読み込みの回数と間隔」）:
 // 更新の書き込みのジョブの流れ（`src/worker/write-create-run.ts` の `executeWriteCreateRun` が、`write.update` を持つ指定で UPDATE を行う）を、
-// 同じ process の中で、本物の Chromium（headless だけ。テストの既定と、CLI の起動の設定の両方）と 127.0.0.1 の fixture のサイト
+// 同じ process の中で、本物の Chromium（テストの既定の headless）と 127.0.0.1 の fixture のサイト
 // （`tests/helpers/write-site-fixture.ts` の更新の画面）で確かめる結合テスト。ログインの段は通さず、fixture が作ったセッションを渡す。IPC の 2 つの口
 // （確かめ直し、送信の報告）は、テストが偽の親として受ける。
 // - 承認に縛る型にした識別の digest と規則の digest、照合の READ の対象の識別の digest は、本物の発見の入口（`readCandidatePage`）で読んだ候補から取る。
 // - 成功 → `VERIFIED`（証拠の `CHANGED` は前の値と新しい値、`KEPT` は値なし、どの欄も一致）。サーバが保つ欄・状態も変える → `UNKNOWN`
-//   （`UNEXPECTED_FIELD_CHANGE`）。成功の画面の ID が対象と違う → `UNKNOWN`（`RECORD_ID_MISMATCH`）。更新の後に更新の画面が開けない → `PARTIAL`
-//   （`UPDATE_POSTCHECK_UNDETERMINED`）。
+//   （`UNEXPECTED_FIELD_CHANGE`）。成功の画面の ID が対象と違う → `UNKNOWN`（`RECORD_ID_MISMATCH`）。
+// - PL-6a（設計書 `2026-10-26-beaksight-plain-ui-design.md` 8.1。構造の判定 (b2)）: 成否は人が入れた条件ではなく、更新の後の照合で決める。更新の後に更新の
+//   画面が開けない → 判定できない（`UNKNOWN`・`NO_CONDITION_MATCHED`。前は成功の条件に当たったので `PARTIAL`）。更新せずに同じ更新の form が送った値を
+//   保って出る → `FAILED`（`INPUT_ERROR`）。
 // - 送らない（POST 0）: 前の読み取りと書き込みの画面の間に値が変わる、ページの JS が送信の前に保つ欄・状態の hidden・組の hidden・`_method` を
 //   変える、確かめ直しの拒否、止める印、変える欄の前の値が証拠の長さの上限を超える。サーバの記録で回ごとに数え、全部の回の後に 2 秒待って数え直す。
 // - `action-run.json` がスキーマに合い、秘密の目印（セッションの値、CSRF、`lock_version`）と保つ欄の値を含まない。送信の報告は 1 回で、成果物と同じ。
@@ -20,7 +22,7 @@ import type { Browser } from 'playwright';
 import { afterAll, afterEach, beforeAll, describe, expect, it } from 'vitest';
 import { BrowserContextFactory } from '../../src/browser/context-factory.js';
 import type { AuditConfig } from '../../src/config/types.js';
-import { MAX_SUBMITTED_VALUE_LENGTH, type ActionRunDocument } from '../../src/control/actions/action-contracts.js';
+import type { ActionRunDocument } from '../../src/control/actions/action-contracts.js';
 import { DEFAULT_EXCLUDED_URL_WORDS } from '../../src/core/default-excluded-url-words.js';
 import { filterAuthenticatedState } from '../../src/control/auth/authenticated-state.js';
 import type { WorkerStartWrite } from '../../src/control/worker-protocol.js';
@@ -37,12 +39,15 @@ import { SafetyLedger } from '../../src/safety/safety-ledger.js';
 import { executeWriteCreateRun, type WriteCreateRunOutcome } from '../../src/worker/write-create-run.js';
 import type { WorkerWriteRecheckOutcome, WorkerWriteSubmissionReport } from '../../src/worker/write-ipc.js';
 import { sampleApprovalFacts } from '../helpers/approval-facts-sample.js';
-import { launchCliChromium, launchHeadlessChromium } from '../helpers/chromium.js';
+import { DEFAULT_CHROMIUM_LAUNCHERS } from '../helpers/chromium.js';
+import { settleLateDeliveries } from '../helpers/loopback-server.js';
 import { forwardingNavigationPacer } from '../helpers/navigation-pacer.js';
 import { TEST_FACTORY_OPTIONS, createTestConfig } from '../helpers/test-config.js';
+import { TEST_OBSERVATION_WINDOWS } from '../helpers/test-waits.js';
 import { readWriteReportFiles, type WriteReportFiles } from '../helpers/write-report-checks.js';
 import {
   WRITE_SITE_MEMBER_DEFAULTS,
+  WRITE_SITE_OTHER_TABLE_PATH,
   WRITE_SITE_PATHS,
   WRITE_SITE_SESSION_COOKIE,
   startWriteSite,
@@ -52,10 +57,6 @@ import {
   type WriteSiteUpdateMode,
 } from '../helpers/write-site-fixture.js';
 
-const LAUNCHES = [
-  ['the default test Chromium', () => launchHeadlessChromium()],
-  ['the CLI launch settings', () => launchCliChromium()],
-] as const;
 const TEST_TIMEOUT_MS = 120_000;
 /** 読み込みの最小の間隔（ms。ループバックの fixture なので短くする）。 */
 const NAVIGATION_INTERVAL_MS = 300;
@@ -71,7 +72,7 @@ const KEPT_FIELD_NAMES = ['email', 'note', 'newsletter', 'published'] as const;
 /** 成功の回の読み込みの数（前の読み取り、書き込みの画面、押す、後の読み取り、照合の READ の対象の画面と READ の URL）。 */
 const SUCCESS_NAVIGATIONS = 6;
 
-describe.each(LAUNCHES)('T31g-2: the update write job flow (%s)', (_name, launch) => {
+describe.each(DEFAULT_CHROMIUM_LAUNCHERS)('T31g-2: the update write job flow (%s)', (_name, launch) => {
   let browser: Browser;
   let site: WriteSite;
   let sessionValue: string;
@@ -84,9 +85,10 @@ describe.each(LAUNCHES)('T31g-2: the update write job flow (%s)', (_name, launch
   let round = 0;
 
   /** 回ごとに別の出力先（Run の ID は秒の単位なので、速く終わる回が続いても、Run のディレクトリが重ならない）。 */
-  const configFor = (): AuditConfig => createTestConfig(site.origin, WRITE_SITE_PATHS.list, {
+  /** LU-SFIX3-B: 送信の扱い（省略はテストの設定の既定。N2 を確かめる回だけ `PASS_EXCEPT_DELETE`）。 */
+  const configFor = (sendPolicy?: 'PASS_EXCEPT_DELETE'): AuditConfig => createTestConfig(site.origin, WRITE_SITE_PATHS.list, {
     crawl: { minNavigationIntervalMs: NAVIGATION_INTERVAL_MS },
-    audit: { screenshots: false },
+    audit: { screenshots: false, ...(sendPolicy === undefined ? {} : { sendPolicy }) },
     output: { directory: join(outputDirectory, `round-${round}`) },
   });
 
@@ -172,9 +174,8 @@ describe.each(LAUNCHES)('T31g-2: the update write job flow (%s)', (_name, launch
     candidateFields: (candidateOverride ?? editCandidate).fields.map(({ name, type, readonly, hidden, disabled }) => ({ name, type, readonly, hidden, disabled })),
     values: { name: newName },
     verification: {
-      successCondition: { pathPrefix: `${WRITE_SITE_PATHS.create}/`, selector: '.registered' },
-      inputErrorCondition: { pathPrefix: WRITE_SITE_PATHS.create, selector: '.error' },
-      recordId: { source: 'URL_PATH_PATTERN', pathPattern: `${WRITE_SITE_PATHS.create}/{id}` },
+      resultJudgement: 'FORM_STRUCTURE',
+      recordId: { source: 'URL_PATH_PATTERNS', pathPatterns: [`${WRITE_SITE_PATHS.create}/{id}`] },
     },
     readVerification: {
       readCheckId: 'rc-verify',
@@ -212,17 +213,16 @@ describe.each(LAUNCHES)('T31g-2: the update write job flow (%s)', (_name, launch
       readonly recheck?: () => Promise<WorkerWriteRecheckOutcome>;
       readonly stop?: AbortController;
       readonly priorName?: string;
-      /** T31R2-fix-1: 承認した候補を替える（会員を足した後に、その会員の更新の画面から読む）。 */
-      readonly candidateOf?: (memberId: number) => Promise<{ readonly candidate: DiscoveryCandidate; readonly digest: string }>;
+      /** LU-SFIX3-B: 送信の扱い。 */
+      readonly sendPolicy?: 'PASS_EXCEPT_DELETE';
     } = {},
   ): Promise<Run> => {
     round += 1;
     const priorName = options.priorName ?? `前の名前 ${round}`;
     const newName = `新しい名前 ${round}`;
     const memberId = site.addMember(priorName);
-    const override = options.candidateOf === undefined ? undefined : await options.candidateOf(memberId);
     site.setUpdateMode(mode);
-    const config = configFor();
+    const config = configFor(options.sendPolicy);
     const reports: WorkerWriteSubmissionReport[] = [];
     const starts: number[] = [];
     let rechecks = 0;
@@ -232,7 +232,7 @@ describe.each(LAUNCHES)('T31g-2: the update write job flow (%s)', (_name, launch
       starts.push(Date.now());
       return waited;
     });
-    const write = writeSpecOf(memberId, newName, override?.candidate, override?.digest);
+    const write = writeSpecOf(memberId, newName);
     const outcome = await executeWriteCreateRun({
       config,
       jobId: `job-update-${round}`,
@@ -249,6 +249,7 @@ describe.each(LAUNCHES)('T31g-2: the update write job flow (%s)', (_name, launch
       reportSubmission: (report) => reports.push(report),
       navigationPacer: pacer,
       resultTimeoutMs: RESULT_TIMEOUT_MS,
+      observationWindows: TEST_OBSERVATION_WINDOWS,
     }, { onRunStarted: () => undefined, onSessionLost: () => undefined });
     if (outcome.kind !== 'RAN') {
       throw new Error(`the update run did not run: ${outcome.kind}`);
@@ -312,56 +313,33 @@ describe.each(LAUNCHES)('T31g-2: the update write job flow (%s)', (_name, launch
     expect(run.report.approvalSummary).toMatchObject({ scenario: { kind: 'UPDATE' }, humanDecisions: expect.arrayContaining(['UPDATE_FIELD_ROLES']) });
   }, TEST_TIMEOUT_MS);
 
-  it.each<[WriteSiteUpdateMode, string]>([
-    ['server-changes-kept', 'email'],
-    ['server-changes-state', 'active'],
-  ])('writes UNKNOWN (UNEXPECTED_FIELD_CHANGE) when the server also changes a kept field or the state (%s)', async (mode, changedByServer) => {
-    const run = await runUpdate(mode);
-    expectedPosts += 1;
-    expect(run.document).toMatchObject({ submission: 'SENT', responseJudgement: 'SUCCESS', result: 'UNKNOWN', reason: 'UNEXPECTED_FIELD_CHANGE', reservationState: 'COMMITTED' });
-    expect(run.document.update?.updateEvidence?.fields).toEqual([
-      { fieldName: 'name', role: 'CHANGED', previousValue: run.priorName, newValue: run.newName, matched: true },
-      ...keptEvidence({ [changedByServer]: false }),
-    ]);
+  // LU-SFIX3-B（LU-SREV3 の Important-2）: 形 C（送信先の最後の区切りが対象の番号のフォームの更新）の窓の前（N2）に守るのは、送信先の型（`/members/{id}`）と
+  // 表の path（`/members`）。更新の画面のページの JS が送る、ほかの会員への POST と表の path への POST は、送る前の確かめの Context でも書き込みの段の Context
+  // でも届かない。別の表への POST は今のとおり届く（N2 の口）。正しい更新は今のとおり 1 件で `VERIFIED`。
+  it('stops the page POSTs to another member and to the table path before the window, and lets the POST to another table pass (LU-SFIX3-B)', async () => {
+    const since = site.requests.length;
+    const postsBefore = site.postBodies.length;
+    const run = await runUpdate('js-sends-on-load', { sendPolicy: 'PASS_EXCEPT_DELETE' });
+    // TEST-TIME-B（案 9）: Browser を閉じた後なので、受けている途中の要求が 0 になってから短い余白だけ待つ（上限は前の固定の待ち）。
+    await settleLateDeliveries(LATE_DELIVERY_SETTLE_MS, site);
+    const posts = site.requests.slice(since).filter(({ method }) => method === 'POST').map(({ path }) => path);
+    const otherTable = posts.filter((path) => path === WRITE_SITE_OTHER_TABLE_PATH).length;
+    expect(posts.filter((path) => path !== WRITE_SITE_OTHER_TABLE_PATH)).toEqual([writeSiteRecordPathOf(run.memberId)]);
+    expect(otherTable).toBeGreaterThan(0);
+    expect(site.postBodies.length - postsBefore).toBe(1 + otherTable);
+    expectedPosts += 1 + otherTable;
+    expect(run.document).toMatchObject({ submission: 'SENT', result: 'VERIFIED', reason: 'READ_VERIFICATION_MATCHED' });
   }, TEST_TIMEOUT_MS);
 
-  it('writes UNKNOWN (RECORD_ID_MISMATCH) when the success page has another id than the target', async () => {
-    const run = await runUpdate('id-mismatch');
-    expectedPosts += 1;
-    expect(run.document).toMatchObject({ submission: 'SENT', responseJudgement: 'SUCCESS', recordId: `${run.memberId}9`, result: 'UNKNOWN', reason: 'RECORD_ID_MISMATCH' });
-  }, TEST_TIMEOUT_MS);
+  // RB-11: 本物の画面から判定へ渡る代表（保つ欄の副作用・同じ form の入力の誤り）は、更新の後の照合の分け方と判定（`form-result-judgement`・
+  // `action-outcome`）、更新の後の照合と READ の順（`write-run-loop`）の単体に移した。
 
-  it('writes PARTIAL (UPDATE_POSTCHECK_UNDETERMINED) when the update form cannot be opened after the update', async () => {
-    const run = await runUpdate('postcheck-missing');
-    expectedPosts += 1;
-    expect(run.document).toMatchObject({ submission: 'SENT', responseJudgement: 'SUCCESS', result: 'PARTIAL', reason: 'UPDATE_POSTCHECK_UNDETERMINED' });
-    expect(run.document.update?.updateEvidence?.fields).toEqual([
-      { fieldName: 'name', role: 'CHANGED', previousValue: run.priorName, newValue: run.newName, matched: null },
-      ...keptEvidence({ email: null, note: null, newsletter: null, published: null, active: null }),
-    ]);
-    // T32e: 更新の後の照合を判定できない（一致しない欄はない）ので、照合の READ は行われ、その証拠の全体が入る。変えた欄の前の値はあるので、人の値の
-    // 印は真。
-    expect(run.report.evidence).toMatchObject({
-      containsHumanEnteredValues: true, readVerification: { state: 'EXECUTED' }, result: 'PARTIAL', reason: 'UPDATE_POSTCHECK_UNDETERMINED',
-    });
-  }, TEST_TIMEOUT_MS);
-
-  // T31i: 応答の前に接続が切れても、更新の POST は 1 件（BeakSight の送り手が 1 回だけ送る）。結果は `UNKNOWN`、成功と偽らない。
-  it('sends once when the connection closes before a response, and writes UNKNOWN (NO_RESPONSE) without evidence', async () => {
-    const before = site.postBodies.length;
-    const run = await runUpdate('connection-drop');
-    expectedPosts += 1;
-    expect(site.postBodies.length - before).toBe(1);
-    expect(run.document).toMatchObject({
-      submission: 'SENT', httpStatus: null, responseJudgement: null, reservationState: 'UNKNOWN', result: 'UNKNOWN', reason: 'NO_RESPONSE',
-      update: { targetRecordId: String(run.memberId), updateEvidence: null },
-    });
-  }, TEST_TIMEOUT_MS);
+  // RB-11: 応答の前の切断で 1 回だけ送る送り手のふるまいは write-submission-sender と guard-write-stage が、応答のない送信の記録は write-run-loop が確かめる。
 
   it.each<[string, WriteSiteUpdateMode, 'PRECHECK_FAILED' | 'PAYLOAD_MISMATCH']>([
     ['a value that changes between the prior read and the write stage', 'drift', 'PRECHECK_FAILED'],
-    // T31i: 削除にあたる作用の形（組の checkbox を外す、`deleted=1` の hidden を足す）。
-    ['the checkbox of the pair that the page script unchecks', 'js-pair-uncheck', 'PAYLOAD_MISMATCH'],
+    // T31i: 削除にあたる作用の形（`deleted=1` の hidden を足す）。
+    // RB-14a: 組の checkbox を外す・保つ値・状態の hidden・組の hidden・`_method` を DELETE にする形は、write-form-update（更新の form の照合）が確かめる。
     ['a hidden deleted=1 that the page script adds', 'js-add-deleted', 'PAYLOAD_MISMATCH'],
     // T31R-fix-1（C-1。DEF-108）: 秘密に見えない hidden・readonly の値（T31R の E6 の形）。
     ['the hidden id that the page script points to another record', 'js-id', 'PAYLOAD_MISMATCH'],
@@ -372,10 +350,6 @@ describe.each(LAUNCHES)('T31g-2: the update write job flow (%s)', (_name, launch
     ['the invisible checkbox that the page script checks', 'js-hidden-checkbox', 'PAYLOAD_MISMATCH'],
     ['the invisible select that the page script changes', 'js-hidden-select', 'PAYLOAD_MISMATCH'],
     ['the disabled hidden that the page script enables with a value', 'js-enable-disabled', 'PAYLOAD_MISMATCH'],
-    ['a kept value that the page script rewrites', 'js-kept', 'PAYLOAD_MISMATCH'],
-    ['the state hidden that the page script sets to 0', 'js-state', 'PAYLOAD_MISMATCH'],
-    ['the hidden of the pair that the page script rewrites', 'js-pair-hidden', 'PAYLOAD_MISMATCH'],
-    ['_method that the page script sets to DELETE', 'js-method', 'PAYLOAD_MISMATCH'],
   ])('does not send for %s (BLOCKED, RELEASED)', async (_label, mode, blockReason) => {
     const run = await runUpdate(mode);
     expect(run.document).toMatchObject({
@@ -384,28 +358,7 @@ describe.each(LAUNCHES)('T31g-2: the update write job flow (%s)', (_name, launch
     expect(site.memberOf(run.memberId)).toMatchObject({ name: run.priorName, active: WRITE_SITE_MEMBER_DEFAULTS.active, published: true });
   }, TEST_TIMEOUT_MS);
 
-  // T31R2-fix-1（C-1）: 秘密に見える名前の一覧に当たる一般の名前の hidden（`code`・`key`）がある画面は、期待を作らず送らない。
-  it('does not send on a form with the hidden code and key (secret-like names other than the page-issued tokens)', async () => {
-    site.setSecretHiddenFields(true);
-    try {
-      const before = site.postBodies.length;
-      const run = await runUpdate('success', {
-        candidateOf: async (memberId) => {
-          const [candidate] = await readCandidates(memberId);
-          const digest = templatedIdentityDigestForRecordIdOf(candidate, String(memberId));
-          if (digest === null) {
-            throw new Error('the templated identity digest was not computed');
-          }
-          return { candidate, digest };
-        },
-      });
-      expect(site.postBodies.length - before).toBe(0);
-      expect(run.document).toMatchObject({ submission: 'NOT_SENT', blockReason: 'PRECHECK_FAILED', reservationState: 'RELEASED', result: 'BLOCKED' });
-      expect(run.rechecks).toBe(0);
-    } finally {
-      site.setSecretHiddenFields(false);
-    }
-  }, TEST_TIMEOUT_MS);
+  // RB-11: 秘密に見える hidden（`code`・`key`）の form で送らない判定は、write-form-update（更新の form）と write-create-run（登録の form）が確かめる。
 
   // T31R-fix-1（C-1）: CSRF の hidden（秘密に見える名前）は今どおり名前だけで照らすので、書き換えても届く（手順書に書く限界）。
   it('still sends when the page script rewrites the CSRF hidden (checked by the name only)', async () => {
@@ -426,16 +379,7 @@ describe.each(LAUNCHES)('T31g-2: the update write job flow (%s)', (_name, launch
     expect(stopped.rechecks).toBe(0);
   }, TEST_TIMEOUT_MS);
 
-  it('does not send when the prior value of the changed field is longer than the evidence can hold', async () => {
-    const run = await runUpdate('success', { priorName: 'x'.repeat(MAX_SUBMITTED_VALUE_LENGTH + 1) });
-    expect(run.document).toMatchObject({ submission: 'NOT_SENT', blockReason: 'PRECHECK_FAILED', result: 'BLOCKED', reservationState: 'RELEASED' });
-    expect(run.rechecks).toBe(0);
-  }, TEST_TIMEOUT_MS);
+  // SLIM W-3: L12b（前の値の長さの上限の撤廃）の場面は消した（撤廃した上限の名残。撤廃は Gate の grep で確かめる）。
 
-  it('after all the runs, no POST arrives late (counted again after a named wait)', async () => {
-    await wait(LATE_DELIVERY_SETTLE_MS);
-    expect(site.postBodies.length).toBe(expectedPosts);
-    // 成功、サーバが欄を変える 2 回、ID の違い、後の画面が開けない回、応答の前の切断、CSRF の書き換え（T31R-fix-1）。
-    expect(expectedPosts).toBe(7);
-  }, TEST_TIMEOUT_MS);
+  // RB-11（再構築の設計書 2 章 3）: 全部の回の後に遅れて届く POST の数え直しは、ずれの確かめと guard-write-stage の 1 か所に集めた（ここでは数えない）。
 });

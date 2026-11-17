@@ -18,7 +18,7 @@
  * - T26g-2（T26R の M3）: (r)(s)(t)(w) を、画面のコード（`apps/local-ui/src` の `.ts`・`.tsx`）にも、例外なしで当てる。
  * - (x)（CCX-5。台帳の CC-065）: 資格情報を保存できるプラットフォームの値（`process.platform` の `'win32'`）を、文字列リテラルとして書くのは
  *   owner の `src/control/credentials/credential-platform.ts` だけ（`CREDENTIAL_PLATFORM` の定義がちょうど 1 つ）。`src/` と画面のコード
- *   （`apps/local-ui/src`）の両方に当てる。除外は、意味の違う 2 か所だけ（`PLATFORM_LITERAL_EXCEPTIONS` に理由を書く）。
+ *   （`apps/local-ui/src`）の両方に当てる。除外は、意味の違う 3 か所だけ（`PLATFORM_LITERAL_EXCEPTIONS` に理由を書く）。
  * - (y)（PRE42-CC 組 3。N4-8c）: 暗号化の往復の確かめの結果（`CredentialProtectionState`）の値の名前つきの定数は、`credential-platform.ts` の
  *   `CREDENTIAL_PROTECTION_AVAILABLE` だけ（定義がちょうど 1 つ）。owner の外（`src/` と画面）では、`'AVAILABLE' satisfies CredentialProtectionState`、
  *   `: CredentialProtectionState = 'AVAILABLE'` の形の定数を置かない（値の一覧そのものは `credential-store.ts` の `CREDENTIAL_PROTECTION_STATES`）。
@@ -120,8 +120,13 @@ const findWin32Literals = (source: ScannedSource): readonly string[] => source.l
  * (x) の除外（資格情報の保存とは意味の違う `'win32'`。理由つき）。
  * - `artifact-writer.ts`: Windows ではディレクトリの `fsync` ができない（ファイルシステムの性質。資格情報の保存の可否とは無関係）。
  * - `screenshot-collector.ts`: Windows のパスは大文字と小文字を区別しない（パスの比べ方。資格情報の保存の可否とは無関係）。
+ * - `run-exclusion.ts`: 監査中の印のパイプの名前の形を選ぶ（Windows は名前つきのパイプ。資格情報の保存とは意味が違う）。
  */
-const PLATFORM_LITERAL_EXCEPTIONS: ReadonlySet<string> = new Set(['src/report/artifact-writer.ts', 'src/evidence/screenshot-collector.ts']);
+const PLATFORM_LITERAL_EXCEPTIONS: ReadonlySet<string> = new Set([
+  'src/report/artifact-writer.ts',
+  'src/evidence/screenshot-collector.ts',
+  'src/core/run-exclusion.ts',
+]);
 
 /** (y) 暗号化の往復の確かめの結果の値の、名前つきの定数の定義（owner は `credential-platform.ts`）。 */
 const PROTECTION_AVAILABLE_DEFINITION = /\bexport\s+const\s+CREDENTIAL_PROTECTION_AVAILABLE\s*=\s*'AVAILABLE'\s+satisfies\s+CredentialProtectionState\b/gu;

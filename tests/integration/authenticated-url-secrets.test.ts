@@ -3,8 +3,8 @@
 // （`tests/helpers/authenticated-site-fixture.ts` の `queryTokens`）で確かめる。Chromium は headless だけ（テストの既定と、CLI の起動の設定の両方）。
 // - 認証つきの Run: query の秘密の目印（リンク、画像、移動の先の `code` と `state`）が、Run のディレクトリのどのファイル（保存、ZIP の中身を含む）
 //   にも現れず、伏せ字の印（`token=[REDACTED]` など）に替わって現れる。サーバには、目印つきの要求が届いている（巡回は伏せ字の前の URL で行う）。
-// - T25f round 1: 認証つきの Run では、`crawl.allowedQueryParameters` に伏せ字の一覧の名前（`token`）があれば、設定のエラーで始めない（Browser を
-//   起動せず、サイトへ何も送らない）。T44g: 公開監査も同じく始めない。
+// - T25f round 1: `crawl.allowedQueryParameters` に伏せ字の一覧の名前があれば始めない（認証つきの Run も公開監査も）ことは、Browser を使わない判定なので、
+//   単体 `tests/unit/authenticated-run-secret-queries.test.ts` で確かめる（SLIM-GROUP L-4 で、ここの場面を消した）。
 // - セッションの切れで止まった Run: 知らせ（`AUTH_SESSION_LOST`）と保存に目印が出ず、保存には伏せ字の印が現れる。もう一度ログインした状態で、
 //   同じ Run を再開できる（ページの URL は伏せ字の対象にならないので、伏せ字の後の保存から再開できる）。
 // - T44g（Task 44 の設計書 P4-1。案 2）: 公開監査（認証の指定なし）も、同じ書き手で伏せる（目印は、どのファイルにも残らない）。
@@ -12,7 +12,6 @@ import { mkdtemp, readdir, readFile, rm } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { unzipSync } from 'fflate';
-import type { Browser } from 'playwright';
 import { afterAll, afterEach, beforeAll, describe, expect, it } from 'vitest';
 import {
   executeAuditRun,
@@ -20,11 +19,10 @@ import {
   type AuditRunOutcome,
   type AuditRunStart,
 } from '../../src/cli/audit-run.js';
-import { ConfigError } from '../../src/config/config-error.js';
 import type { AuditConfig } from '../../src/config/types.js';
 import { DEFAULT_EXCLUDED_URL_WORDS } from '../../src/core/default-excluded-url-words.js';
 import { filterAuthenticatedState } from '../../src/control/auth/authenticated-state.js';
-import { RUN_ARTIFACT_FILE_NAMES, listRunDirectories } from '../../src/core/artifact-layout.js';
+import { PAGE_ARTIFACT_FILE_NAMES } from '../../src/core/artifact-layout.js';
 import { REDACTED } from '../../src/core/redaction.js';
 import type { RunAuthentication } from '../../src/orchestration/authenticated-run.js';
 import type { RunNotice } from '../../src/orchestration/run-coordinator.js';
@@ -36,21 +34,15 @@ import {
   type AuthenticatedSite,
   type AuthenticatedSiteOptions,
 } from '../helpers/authenticated-site-fixture.js';
-import { launchCliChromium, launchHeadlessChromium } from '../helpers/chromium.js';
+import { BOTH_CHROMIUM_LAUNCHERS, useSharedRunBrowser } from '../helpers/chromium.js';
 import { nonReadRequestsOf } from '../helpers/leak-places.js';
 import { createTestConfig } from '../helpers/test-config.js';
 
-const LAUNCHERS = [
-  ['the default test Chromium', () => launchHeadlessChromium()],
-  ['the CLI launch settings', () => launchCliChromium()],
-] as const;
 /** 巡回するページの数の上限（管理画面、report、item、jump、second、frames）。 */
 const MAX_PAGES = 6;
 /** セッションの切れの場面の上限（管理画面、report、item の 1 つ目で止まる）。 */
 const SESSION_LOST_MAX_PAGES = 4;
 const TEST_TIMEOUT_MS = 240_000;
-/** `crawl.allowedQueryParameters` に入れる、伏せ字の一覧の名前（認証つきの Run でも公開監査でも受けない。T44g）。 */
-const TOKEN_QUERY_NAME = 'token';
 
 /** ディレクトリの下のすべてのファイルの中身（ZIP は展開した中身も）。 */
 async function readAllFiles(directory: string): Promise<{ readonly path: string; readonly bytes: Uint8Array }[]> {
@@ -76,17 +68,17 @@ const containsBytes = (bytes: Uint8Array, needle: string): boolean => Buffer.fro
 const leakedFiles = (files: readonly { readonly path: string; readonly bytes: Uint8Array }[], markers: readonly string[]): readonly string[] =>
   files.flatMap(({ path, bytes }) => (markers.some((marker) => containsBytes(bytes, marker)) ? [path] : []));
 
-describe.each(LAUNCHERS)('T25f: the URL secrets of an authenticated Run (%s)', (_name, launch) => {
+describe.each(BOTH_CHROMIUM_LAUNCHERS)('T25f: the URL secrets of an authenticated Run (%s)', (_name, launch) => {
   let workDirectory: string;
   let site: AuthenticatedSite | undefined;
-  const browsers: Browser[] = [];
+  // SLIM-2（X7）: Run ごとに Chromium を起こし直さない（Run は、自分の Context だけを閉じて終わる）。
+  const runBrowser = useSharedRunBrowser(() => launch());
 
   beforeAll(async () => {
     workDirectory = await mkdtemp(join(tmpdir(), 'beaksight-authenticated-url-secrets-'));
   });
 
   afterEach(async () => {
-    await Promise.all(browsers.splice(0).map((browser) => browser.close().catch(() => undefined)));
     await site?.close();
     site = undefined;
   });
@@ -101,11 +93,7 @@ describe.each(LAUNCHERS)('T25f: the URL secrets of an authenticated Run (%s)', (
   }
 
   const dependenciesWith = (authentication?: RunAuthentication): AuditRunDependencies => ({
-    launchBrowser: async () => {
-      const browser = await launch();
-      browsers.push(browser);
-      return browser;
-    },
+    launchBrowser: runBrowser,
     clock: () => new Date(),
     now: () => Date.now(),
     ...(authentication === undefined ? {} : { authentication }),
@@ -134,12 +122,13 @@ describe.each(LAUNCHERS)('T25f: the URL secrets of an authenticated Run (%s)', (
     started: AuthenticatedSite,
     startPath: string,
     outputDirectory: string,
-    overrides: { readonly maxPages?: number; readonly allowedQueryParameters?: readonly string[] } = {},
+    overrides: { readonly maxPages?: number } = {},
   ): AuditConfig =>
     createTestConfig(started.originA, startPath, {
-      crawl: { maxPages: overrides.maxPages ?? MAX_PAGES, allowedQueryParameters: [...(overrides.allowedQueryParameters ?? [])] },
+      crawl: { maxPages: overrides.maxPages ?? MAX_PAGES, allowedQueryParameters: [] },
       viewports: { stressWidths: [] },
-      audit: { screenshots: true },
+      // SLIM-GROUP L-4: 伏せ字の確かめに要らない性能と accessibility の収集は外す（スクリーンショットは、目印を探すファイルに入れるので残す）。
+      audit: { screenshots: true, performance: false, accessibility: false },
       output: { directory: outputDirectory },
     });
 
@@ -159,7 +148,7 @@ describe.each(LAUNCHERS)('T25f: the URL secrets of an authenticated Run (%s)', (
   it('writes no query secret to any file of the Run directory and shows the redaction marker instead', async () => {
     const started = await startSite({ rotate: true });
     const { authentication, secrets } = authenticationFor(started);
-    const outputDirectory = join(workDirectory, `redacted-${browsers.length}-${Date.now()}`);
+    const outputDirectory = join(workDirectory, `redacted-${Date.now()}`);
     const ran = ranOf(await executeAuditRun(configFor(started, AUTH_SITE_PATHS.admin, outputDirectory), dependenciesWith(authentication), {
       startNew: true,
     }));
@@ -180,40 +169,17 @@ describe.each(LAUNCHERS)('T25f: the URL secrets of an authenticated Run (%s)', (
     const markers = [...new Set([...started.queryTokenValues(), ...secrets, ...started.secretValues()])];
     expect(leakedFiles(files, markers)).toEqual([]);
     // 伏せ字の印に替わって現れる（Evidence のリンクの生の値、画像の要求、移動の先の最後の URL）。
-    const audit = files.find(({ path }) => path.endsWith(RUN_ARTIFACT_FILE_NAMES.audit));
+    // REC-2: audit.json は目録なので、ページの記録（Run のディレクトリの page.json）で確かめる。
+    const pageFiles = files.filter(({ path }) => !path.includes('!') && path.endsWith(PAGE_ARTIFACT_FILE_NAMES.page));
+    expect(pageFiles.length).toBeGreaterThan(0);
     for (const expected of [`token=${REDACTED}&page=2`, `access_token=${REDACTED}`, `code=${REDACTED}&state=${REDACTED}`]) {
-      expect(containsBytes(audit?.bytes ?? new Uint8Array(), expected), expected).toBe(true);
+      expect(pageFiles.some(({ bytes }) => containsBytes(bytes, expected)), expected).toBe(true);
     }
-  }, TEST_TIMEOUT_MS);
-
-  it('does not start an authenticated Run nor a public audit that keeps a secret name in crawl.allowedQueryParameters', async () => {
-    const started = await startSite({});
-    const outputDirectory = join(workDirectory, `rejected-${browsers.length}-${Date.now()}`);
-    const config = configFor(started, AUTH_SITE_PATHS.admin, outputDirectory, { allowedQueryParameters: [TOKEN_QUERY_NAME] });
-
-    // 認証つきの Run: 設定のエラーで、Browser を起動せず、サイトへ何も送らず、Run のディレクトリも作らない。
-    const launchedBefore = browsers.length;
-    await expect(executeAuditRun(config, dependenciesWith(authenticationFor(started).authentication), { startNew: true }))
-      .rejects.toBeInstanceOf(ConfigError);
-    expect(browsers.length).toBe(launchedBefore);
-    expect(started.requests).toEqual([]);
-    expect(await listRunDirectories(outputDirectory)).toEqual([]);
-
-    // T44g（Task 44 の P4-1 の発見事項 4）: 公開監査（認証の指定なし）も、同じ設定のエラーで、Browser を起動せず、サイトへ何も送らない。
-    const publicOutput = join(workDirectory, `public-allowed-${Date.now()}`);
-    const publicConfig = configFor(started, AUTH_SITE_TOKEN_PATHS.publicTokens, publicOutput, {
-      maxPages: 2,
-      allowedQueryParameters: [TOKEN_QUERY_NAME],
-    });
-    await expect(executeAuditRun(publicConfig, dependenciesWith(), { startNew: true })).rejects.toBeInstanceOf(ConfigError);
-    expect(browsers.length).toBe(launchedBefore);
-    expect(started.requests).toEqual([]);
-    expect(await listRunDirectories(publicOutput)).toEqual([]);
   }, TEST_TIMEOUT_MS);
 
   it('stops with AUTH_SESSION_LOST without any secret in the notice or the checkpoint, and resumes with a new login', async () => {
     const started = await startSite({ rotate: true, expireFirstSessionAtPath: AUTH_SITE_TOKEN_PATHS.item });
-    const outputDirectory = join(workDirectory, `lost-${browsers.length}-${Date.now()}`);
+    const outputDirectory = join(workDirectory, `lost-${Date.now()}`);
     const config = configFor(started, AUTH_SITE_PATHS.admin, outputDirectory, { maxPages: SESSION_LOST_MAX_PAGES });
     const notices: RunNotice[] = [];
     const firstAuthentication = authenticationFor(started);
@@ -248,7 +214,7 @@ describe.each(LAUNCHERS)('T25f: the URL secrets of an authenticated Run (%s)', (
   // T44g（Task 44 の設計書 P4-1。案 2）: 公開監査（認証の指定なし）も、同じ書き手で伏せる（今までは目印がそのまま残っていた）。
   it('redacts the public audit too: the secret query values are replaced without the authentication', async () => {
     const started = await startSite({});
-    const outputDirectory = join(workDirectory, `public-${browsers.length}-${Date.now()}`);
+    const outputDirectory = join(workDirectory, `public-${Date.now()}`);
     const ran = ranOf(await executeAuditRun(
       configFor(started, AUTH_SITE_TOKEN_PATHS.publicTokens, outputDirectory, { maxPages: 1 }),
       dependenciesWith(),

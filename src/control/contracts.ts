@@ -31,6 +31,12 @@ export type AuthStrategy = (typeof AUTH_STRATEGIES)[number];
  */
 export const AUTOMATED_LOGIN_AUTH_STRATEGY = 'AUTOMATED_LOGIN' satisfies AuthStrategy;
 
+/**
+ * ログインしない認証の方式（NL-1。設計書 `2026-11-06-beaksight-no-login-test-site-design.md` 3.1）。公開の監査と、ログインのないテスト用のサイト
+ * （テストの 2 つのモード。`approvedTestOrigins` がすべて loopback のときだけ）が使う。この方式のプロファイルは、認証の設定を求めない。
+ */
+export const NO_LOGIN_AUTH_STRATEGY = 'NONE' satisfies AuthStrategy;
+
 /** プロファイルの版。スキーマの `schemaVersion` の const と一致する。 */
 export const SITE_PROFILE_SCHEMA_VERSION = 'beaksight-profile/1';
 
@@ -40,14 +46,10 @@ export const PROFILE_ID_PATTERN = /^[a-z0-9][a-z0-9-]{0,62}$/u;
 /** プロファイルの改訂の番号の最小値。スキーマの `revision` の minimum と一致する。 */
 export const MIN_PROFILE_REVISION = 1;
 
-/** 環境の隔離の確認の非秘密の参照（`environmentEvidenceRef`）の最大長（UTF-16 のコード単位）。スキーマの maxLength と一致する。 */
-export const MAX_ENVIRONMENT_EVIDENCE_REF_LENGTH = 200;
+// LZ-2: 環境の隔離の確認の非秘密の参照（`environmentEvidenceRef`）の長さの上限（前は `MAX_ENVIRONMENT_EVIDENCE_REF_LENGTH` 200）は撤廃した。
 
-/**
- * 承認したサービスの Origin（`approvedServiceOrigins`。認証のサービスと API の Origin。Task 34 の設計書 3.1）の最大の件数。スキーマの maxItems と
- * 一致する。
- */
-export const MAX_APPROVED_SERVICE_ORIGINS = 4;
+// L11（設計書 `2026-11-09-beaksight-remove-limits-design.md` 4。設計者の判断）: 承認したサービスの Origin（`approvedServiceOrigins`）の件数の上限（前は 4）は
+// 撤廃した（スキーマの maxItems を外した。定数は LZ-1 で消した）。
 
 /** サイト・環境のプロファイル（ロードマップ第 5 章の形のまま。フィールドの追加・改名はしない）。 */
 export interface SiteProfile {
@@ -67,12 +69,30 @@ export interface SiteProfile {
   readonly environmentEvidenceRef: string | null;
   /**
    * 承認したサービスの Origin（T34a。Task 34 の設計書 3.1。任意の項目で、ないときは空と同じ）。認証のサービスと API の Origin（テスト環境の 2 つの
-   * モードだけ。HTTPS の Origin の正規の直列化（loopback の host だけ http も受ける）。上限 `MAX_APPROVED_SERVICE_ORIGINS`、重なりなし）。ターゲット
+   * モードだけ。HTTPS の Origin の正規の直列化（loopback の host だけ http も受ける）。件数の上限なし（L11）、重なりなし）。ターゲット
    * 設定の `site.allowedOrigins` と重ならない（クロールの対象・読み込みの数え方・サイトの情報の取得の対象は広げない）。版を上げずに足した項目なので、
    * 項目のないプロファイルの文書は今のまま。
    */
   readonly approvedServiceOrigins?: readonly string[];
+  /**
+   * OP-1 の修正の 1 回目（設計書 `2026-10-27-beaksight-one-pass-flow-design.md` 4.1.3 の 2）: ログインのしかたの希望（任意の項目。省けば `AUTOMATIC`。
+   * `loginPreferenceOf` で読む）。`MANUAL_EVERY_TIME` なら、自動ログインのプロファイルでも毎回手でログインし、手でのログインの値を受け取らない（今ある資格情報の
+   * ファイルは消さない）。版を上げずに足した項目なので、項目のないプロファイルの文書は今のまま。
+   */
+  readonly loginPreference?: LoginPreference;
 }
+
+/** OP-1: ログインのしかたの希望（閉じた一覧。先頭が既定）。 */
+export const LOGIN_PREFERENCES = Object.freeze(['AUTOMATIC', 'MANUAL_EVERY_TIME'] as const);
+export type LoginPreference = (typeof LOGIN_PREFERENCES)[number];
+/** OP-1: 既定（自動ログイン）。 */
+export const AUTOMATIC_LOGIN_PREFERENCE = 'AUTOMATIC' satisfies LoginPreference;
+/** OP-1: 毎回手でログインする。 */
+export const MANUAL_EVERY_TIME_LOGIN_PREFERENCE = 'MANUAL_EVERY_TIME' satisfies LoginPreference;
+
+/** OP-1: プロファイルのログインのしかたの希望（項目がなければ既定 `AUTOMATIC`）。 */
+export const loginPreferenceOf = (profile: Pick<SiteProfile, 'loginPreference'>): LoginPreference =>
+  profile.loginPreference ?? AUTOMATIC_LOGIN_PREFERENCE;
 
 /** プロファイルの検証で拒否するときのコード（閉じた一覧。設計書 4.4）。表示の文言は Task 23 の表示カタログに置く。 */
 export const PROFILE_VALIDATION_ERROR_CODES = Object.freeze([
@@ -90,6 +110,12 @@ export const PROFILE_VALIDATION_ERROR_CODES = Object.freeze([
   'PROFILE_SERVICE_ORIGIN_INVALID',
   // T34a: 承認したサービスの Origin が、ターゲット設定の `site.allowedOrigins` に入っている（テスト環境の Origin と重ねない）。
   'PROFILE_SERVICE_ORIGIN_INSIDE_TARGET',
+  // PL-F 修正の 1 回目（PL-REV の Minor 2）: 環境の証跡の参照が秘密に見える（判定は `src/core/secret-like-text.ts` の `isSecretLikeText`）。
+  // 「書き込みも試す」の切り替えの拒否の理由と同じコード。
+  'ISOLATION_REFERENCE_SECRET_LIKE',
+  // NL-1（設計書 `2026-11-06-beaksight-no-login-test-site-design.md` 3.1 の 2）: テスト環境の認証・書き込みのモードでログインしない（`auth: NONE`）のに、
+  // `approvedTestOrigins` に loopback でない Origin がある。
+  'PROFILE_NO_LOGIN_REQUIRES_LOOPBACK',
 ] as const);
 export type ProfileValidationErrorCode = (typeof PROFILE_VALIDATION_ERROR_CODES)[number];
 

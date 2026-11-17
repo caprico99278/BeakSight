@@ -1,8 +1,8 @@
 /**
  * 画面のサーバの監査のジョブの管理（Task 24 の設計書 3 章、4.4。T24f）。サーバだけで使う。
  * - 画面のサーバの process の中に、`createAuditJobManager` を 1 つだけ作って使い回す（管理データの接続 `control-store` と同じ形）。
- *   リポジトリの root は、このモジュールの場所から決める（`localUiRepositoryRoot`）。ワーカーは `<root>/dist/worker/audit-worker.js`
- *   （`npm run build` の出力。`npm run ui` は、ビルドしてから起動する）。ワーカーの cwd はリポジトリの root。
+ *   データの根とワーカーの入口は `local-ui-runtime` が決める（本番は、リポジトリの root と `<root>/dist/worker/audit-worker.js`。`npm run build`
+ *   の出力。`npm run ui` は、ビルドしてから起動する）。ワーカーの cwd はデータの根。
  * - ターゲット設定の読み直し（開始の直前の検証し直し）は、プロファイルの画面と同じ `loadConfig` の形（`loadTargetContext`）。
  * - 作るとき（最初に使うとき）に、前の画面のサーバで終わっていなかったジョブの行を中断に直す（`recoverInterruptedJobs`）。本番の起動の部品と
  *   開発のサーバは、待ち受けの前（開発のサーバは待ち受けを始めたとき）に `prepareLocalUiAuditJobs` を呼ぶ。
@@ -25,11 +25,9 @@ import { errorMessageOrString } from '../../../../src/core/errors.js';
 import { LOCAL_UI_JOB_CONSOLE_TEXT, describeLocalUiStartFailure } from '../../../../src/presentation/messages.js';
 import { localUiRepositoryRoot, localUiStore } from './control-store';
 import { localUiCredentialRoot, localUiCredentialStore } from './credential-runtime';
+import { localUiRuntimeOptions } from './local-ui-runtime';
 import { loadTargetContext } from './target-config';
 import { recordLocalUiWorkerExit } from './ui-server-log-file';
-
-/** リポジトリの root からの、監査のワーカーの入口（`npm run build` の出力）。 */
-const WORKER_ENTRY_SEGMENTS = Object.freeze(['dist', 'worker', 'audit-worker.js'] as const);
 
 /** 終わったときの結果（ジョブの管理を作っていなかった場合）。 */
 const NOTHING_TO_SHUT_DOWN: AuditJobShutdownResult = Object.freeze({ stopRequested: 0, killed: 0 });
@@ -40,8 +38,8 @@ let state: { readonly manager: AuditJobManager; readonly recovered: number } | n
 /** 終わりの後始末を始めた（その後は、ジョブの管理を作り直さない）。 */
 let shutDown = false;
 
-/** 監査のワーカーの入口（絶対パス）。 */
-export const localUiWorkerPath = (): string => join(localUiRepositoryRoot(), ...WORKER_ENTRY_SEGMENTS);
+/** 監査のワーカーの入口（絶対パス。本番は `<root>/dist/worker/audit-worker.js`。RB-7: `local-ui-runtime` の 1 か所から読む）。 */
+export const localUiWorkerPath = (): string => localUiRuntimeOptions().workerPath;
 
 /** 起動のときの準備の結果。作れなければ（ほかの画面のサーバが動いている）、コンソールに出す行。 */
 export type LocalUiAuditJobsPreparation =

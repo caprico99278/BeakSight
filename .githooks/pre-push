@@ -1,0 +1,16 @@
+#!/bin/sh
+# push で送るコミットに、Git に載せない語（local/secret-terms.txt の一覧）が含まれていないかを調べる。
+# 有効にする: git config core.hooksPath .githooks（doc/spec/development.md の「Git に載せない語の検査」）
+# 標準入力の各行: <ローカルの ref> <ローカルの sha> <リモートの ref> <リモートの sha>
+repo_root=$(git rev-parse --show-toplevel) || exit 1
+status=0
+while read -r local_ref local_sha remote_ref remote_sha; do
+  [ -n "$local_sha" ] || continue
+  # ブランチを消す push（ローカルの sha が全部 0）は、送る中身がないので飛ばす。
+  case "$local_sha" in
+    *[!0]*) ;;
+    *) continue ;;
+  esac
+  node "$repo_root/tools/secret-terms/scan.mjs" --push "$local_sha" "$remote_sha" </dev/null || status=1
+done
+exit $status

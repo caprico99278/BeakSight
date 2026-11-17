@@ -1,18 +1,12 @@
 {
   "$id": "urn:beaksight:schema:control:ui-auth-setup-profile-save:1",
-  "description": "Local UI Server Function input (T43d; Task 43 design 4.4): save the auth setup together with the approved service origins added to the profile, in one transaction. expectedRevision is the profile revision the screen read; addServiceOrigins are added to the profile; the auth setup is bound to the next revision. The documents are validated by saveProfileAndAuthSetup (validateSiteProfile and validateAuthSetup).",
+  "description": "Local UI Server Function input (T43d; Task 43 design 4.4; MI-F1, minimal input design 4.7.1 item 1): save the auth setup together with the approved service origins added to the profile, in one transaction. expectedRevision is the profile revision the screen read; row is the job row the draft came from (as in ui-login-stage-row-key): the server rebuilds the origins it may add from the job record and that row, and does not take origins from the screen. The auth setup is bound to the next revision. The documents are validated by saveProfileAndAuthSetup (validateSiteProfile and validateAuthSetup).",
   "type": "object",
   "additionalProperties": false,
-  "required": ["setup", "expectedRevision", "addServiceOrigins"],
+  "required": ["setup", "expectedRevision", "row"],
   "properties": {
     "setup": { "type": "object" },
     "expectedRevision": { "type": "integer", "minimum": 1, "maximum": 9007199254740991 },
-    "addServiceOrigins": {
-      "type": "array",
-      "minItems": 1,
-      "maxItems": 4,
-      "uniqueItems": true,
-      "items": { "type": "string", "minLength": 1, "maxLength": 2048 }
-    }
+    "row": { "$ref": "urn:beaksight:schema:control:ui-login-stage-row-key:1" }
   }
 }

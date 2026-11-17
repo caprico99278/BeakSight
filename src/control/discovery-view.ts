@@ -41,6 +41,8 @@ export {
   DISCOVERY_END_REASONS,
   DISCOVERY_UNREAD_REASONS,
   discoveryCandidatesOf,
+  // OP-2 の修正の 1 回目（判断 2）: 一覧の行の名前（読んだ画面の見出し → 題）。
+  discoveryPageScreenNameOf,
   discoverySummaryOf,
   mergeDiscoveryCandidates,
 } from '../discovery/discovery-result.js';
@@ -56,17 +58,10 @@ export type {
 } from '../discovery/discovery-result.js';
 
 export {
-  MAX_READ_CHECK_DEFINITIONS_PER_PROFILE,
-  MAX_READ_CHECK_DETAIL_FIELD_LENGTH,
-  MAX_READ_CHECK_EXPECTATIONS,
-  MAX_READ_CHECK_EXPECTED_TEXT_LENGTH,
-  MAX_READ_CHECK_PARAMETER_VALUE_LENGTH,
-  MAX_READ_CHECK_ROW_COUNT,
   READ_CHECK_EXPECTATION_KINDS,
   READ_CHECK_RESULTS,
   isSendableReadCheckParameter,
-  // T37d（Task 37 の設計書 3.5）: 定義の対象の種類と、画面の path の上限。
-  MAX_READ_CHECK_PAGE_PATH_LENGTH,
+  // T37d（Task 37 の設計書 3.5）: 定義の対象の種類（URL-LEN: 画面の path の上限は撤廃した）。
   READ_CHECK_TARGET_KINDS,
   readCheckTargetKindOf,
 } from '../discovery/read-check-contracts.js';

@@ -1,6 +1,6 @@
 import type { LinkNormalizationEvidence, NormalizedHttpUrlEvidence, UrlRejectionReason } from '../core/evidence-types.js';
-import { MAX_URL_LENGTH } from '../core/limits.js';
 import { REDACTED } from '../core/redaction.js';
+import { isSecretUrlQueryParameterName } from '../core/secret-query-names.js';
 import { compareCodeUnits } from '../core/text.js';
 
 /** 正規化済みの http(s) URL。定義は `src/core/evidence-types.ts` に1か所だけ置く。 */
@@ -31,6 +31,21 @@ const canonicalizePathPercentEncoding = (pathname: string): string => pathname.r
   },
 );
 
+/**
+ * 正規化で残す query の名前か（L14。設計書 `2026-11-09-beaksight-remove-limits-design.md` 6 の L14、表 A の N7）。
+ * - 追跡用の名前（`utm_*`・`gclid`・`fbclid`）は、いつも捨てる。
+ * - 残す名前を選んでいない（空の集合。設定の `crawl.allowedQueryParameters` の既定 `[]`）なら、ほかの名前を全部残す（操作さがしの場所の鍵 COV-2 と同じく、
+ *   query の違うページを別のページとして読む）。ただし、URL の伏せ字の一覧に当たる名前（`isSecretUrlQueryParameterName`。token・session など）は捨てる
+ *   （正規化した URL は、記録・報告に書くため。認証つきの Run が、この名前を選ばせない決まり `secretAllowedQueryParameters` と同じ扱い）。
+ * - 選んだ名前があれば、その名前だけを残す（今までどおり）。
+ */
+const isKeptQueryParameter = (name: string, allowedQueryParameters: ReadonlySet<string>): boolean => {
+  if (isTrackingParameter(name)) {
+    return false;
+  }
+  return allowedQueryParameters.size === 0 ? !isSecretUrlQueryParameterName(name) : allowedQueryParameters.has(name);
+};
+
 /** 認証情報を含むURLを受け入れないときの理由（`URL_REJECTION_REASONS` の1つ）。 */
 export const CREDENTIALS_NOT_ALLOWED = 'CREDENTIALS_NOT_ALLOWED' satisfies UrlRejectionReason;
 
@@ -39,7 +54,7 @@ export const CREDENTIALS_NOT_ALLOWED = 'CREDENTIALS_NOT_ALLOWED' satisfies UrlRe
  * 受け入れない理由は、閉じた一覧 `URL_REJECTION_REASONS` のコード。
  * - 解析できないURLは `INVALID_URL`、http(s) 以外は `UNSUPPORTED_SCHEME`。
  * - 認証情報を含むURL（基準URLから引き継いだものを含む）は `CREDENTIALS_NOT_ALLOWED`。
- * - 正規化したURLが `MAX_URL_LENGTH` より長いものは `URL_TOO_LONG`（Evidence とクロールのキューに、上限を超えるURLを入れない）。
+ * - L14（表 A の N23）: 長さの上限（前の `MAX_URL_LENGTH` による `URL_TOO_LONG`）では拒まない。`URL_TOO_LONG` の値は、前の記録の読み方のために一覧に残す。
  */
 export const normalizeUrl = (
   rawUrl: string,
@@ -68,7 +83,7 @@ export const normalizeUrl = (
   }
 
   const allowedParameters = [...url.searchParams.entries()]
-    .filter(([name]) => allowedQueryParameters.has(name) && !isTrackingParameter(name))
+    .filter(([name]) => isKeptQueryParameter(name, allowedQueryParameters))
     .sort(([leftName], [rightName]) => compareCodeUnits(leftName, rightName));
   const normalizedQuery = new URLSearchParams();
   for (const [name, value] of allowedParameters) {
@@ -78,11 +93,8 @@ export const normalizeUrl = (
   url.pathname = canonicalizePathPercentEncoding(url.pathname);
   url.search = normalizedQuery.toString();
   url.hash = '';
-  const normalizedUrl = url.toString();
-  if (normalizedUrl.length > MAX_URL_LENGTH) {
-    return reject('URL_TOO_LONG');
-  }
-  return { ok: true, url: normalizedUrl as NormalizedHttpUrl };
+  // L14（INV-LIMITS の表 A の N23）: 長さでは受け入れを拒まない（長い URL のページも読む）。記録の値の長さは、記録する側が決める。
+  return { ok: true, url: url.toString() as NormalizedHttpUrl };
 };
 
 /** `URL.protocol` の値が `http:` または `https:` か。 */

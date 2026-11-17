@@ -9,15 +9,13 @@
 import { describe, expect, it } from 'vitest';
 import {
   ACTION_EVIDENCE_SCHEMA_VERSION,
-  MAX_SUBMITTED_VALUE_LENGTH,
   type ActionEvidenceDocument,
   type ActionGuardSummary,
+  type ActionGuardUnexpectedRequest,
 } from '../../src/control/actions/action-contracts.js';
-import { MAX_RECORD_ID_LENGTH, MAX_SCENARIO_FIELD_NAMES, SCENARIO_ID_PATTERN } from '../../src/control/approval/scenario-contracts.js';
+import { SCENARIO_ID_PATTERN } from '../../src/control/approval/scenario-contracts.js';
 import { PROFILE_ID_PATTERN } from '../../src/control/contracts.js';
 import { validateArtifact } from '../../src/core/schema-validator.js';
-import { MAX_CANDIDATE_URL_PART_LENGTH, MAX_FIELD_NAME_LENGTH } from '../../src/discovery/candidate-contracts.js';
-import { MAX_READ_EVIDENCE_OBSERVED_TEXT_LENGTH } from '../../src/discovery/read-check-evaluation.js';
 import type { WriteStageMonitorSnapshot } from '../../src/safety/passive-request-guard.js';
 import { SUBMISSION_STAGE_BLOCK_REASONS } from '../../src/safety/request-policy.js';
 import { WRITE_PAYLOAD_BLOCK_REASONS } from '../../src/safety/write-payload-policy.js';
@@ -78,6 +76,12 @@ const verifiedUpdate = (overrides: Partial<ActionEvidenceDocument> = {}): Action
   ...overrides,
 });
 
+/** OP-M: 止めた、承認した送信のほかの要求の一覧の 1 行の見本（値・Origin を持たない）。 */
+const UNEXPECTED_REQUEST_ROW: ActionGuardUnexpectedRequest = Object.freeze({
+  method: 'POST', destination: 'APPROVED_SERVICE_ORIGIN', pathShape: '/rest/v1/rpc/check_email', resourceType: 'fetch', timing: 'AFTER_FILL',
+  reason: 'NON_READ_METHOD', markerInBody: true, bodyKind: 'OBJECT', count: 1,
+});
+
 /** 秘密を持つ項目に見える名前の語（共通の語に、ロックの版を足した）。 */
 const EVIDENCE_SECRET_PROPERTY_WORDS: readonly string[] = [...SECRET_PROPERTY_WORDS, 'lock_version', 'lockversion'];
 
@@ -118,23 +122,51 @@ describe('action-evidence.json schema (T32c)', () => {
     expect(resolveRef(prop(schema, 'jobId').$ref ?? '')?.pattern).toBe(SCENARIO_ID_PATTERN.source);
     expect(resolveRef('urn:beaksight:schema:action-run:1.0#/properties/profileId')?.pattern).toBe(PROFILE_ID_PATTERN.source);
     const values = resolveRef(prop(defs.submission, 'submittedValues').$ref ?? '') ?? {};
-    expect(values.maxProperties).toBe(MAX_SCENARIO_FIELD_NAMES);
-    expect((values.propertyNames as JsonSchema).maxLength).toBe(MAX_FIELD_NAME_LENGTH);
-    expect((values.additionalProperties as JsonSchema).maxLength).toBe(MAX_SUBMITTED_VALUE_LENGTH);
-    expect(resolveRef(firstOf(prop(defs.submission, 'actionPath')).$ref ?? '')?.maxLength).toBe(MAX_CANDIDATE_URL_PART_LENGTH);
-    expect(firstOf(resolveRef(prop(schema, 'recordId').$ref ?? '') ?? {}).maxLength).toBe(MAX_RECORD_ID_LENGTH);
+    // L13（N28・N30）: 送った値の数と名前の長さの上限（前は 200・256）はない。
+    expect(values.maxProperties).toBeUndefined();
+    expect((values.propertyNames as JsonSchema).maxLength).toBeUndefined();
+    // L12b（設計書 `2026-11-09-beaksight-remove-limits-design.md` 6.2。S18）: 送った値の長さの上限（前は `MAX_SUBMITTED_VALUE_LENGTH`）を撤廃した。
+    expect((values.additionalProperties as JsonSchema).maxLength).toBeUndefined();
+    // URL-LEN: 送信先の path の長さの上限（前は 2,048）はない。
+    expect(resolveRef(firstOf(prop(defs.submission, 'actionPath')).$ref ?? '')?.maxLength).toBeUndefined();
+    // L12b（設計者の判断 2）: 登録の ID の長さの上限（前は `MAX_RECORD_ID_LENGTH` の 256）は撤廃した。
+    expect(firstOf(resolveRef(prop(schema, 'recordId').$ref ?? '') ?? {}).maxLength).toBeUndefined();
     const detail = resolveRef('urn:beaksight:schema:read-evidence:1.0#/$defs/detailEvidence/properties/observedValue') ?? {};
-    expect(firstOf(detail).maxLength).toBe(MAX_READ_EVIDENCE_OBSERVED_TEXT_LENGTH);
+    // LZ-2: 取れた値の長さの上限（前は 256）はない。
+    expect(firstOf(detail).maxLength).toBeUndefined();
   });
 
   it('keeps the guard summary to counts and marks (the snapshot of the write stage fits without a copied type)', () => {
     const guard = defs.guardSummary ?? {};
     expect(guard.additionalProperties).toBe(false);
     expect(Object.keys(guard.properties ?? {}).sort()).toEqual([
-      'blockedByOtherRulesInWindow', 'blockedByPayloadReason', 'blockedByReason', 'documentCharsetRead', 'responseDeliveryCanceled', 'submissionWindowOpen',
+      'blockedByOtherRulesInWindow', 'blockedByPayloadReason', 'blockedByReason', 'documentCharsetRead', 'passedRequests', 'passedRequestsUnlisted',
+      'responseDeliveryCanceled', 'submissionWindowOpen', 'unexpectedRequests', 'unexpectedRequestsUnlisted',
     ]);
-    expect([...(guard.required ?? [])].sort()).toEqual(Object.keys(guard.properties ?? {}).sort());
+    // OP-M: 止めた、承認した送信のほかの要求の一覧（1 つの配列）と一覧に入れなかった数だけが任意の項目（あったときだけ。版は上げない）。ほかはすべて必須。
+    // OP-N（設計書 4.1.7 の N2）: 送信の扱いで通した要求の一覧（同じ形）と一覧に入れなかった数も、任意の項目（あったときだけ。版は上げない）。
+    const optional = new Set(['unexpectedRequests', 'unexpectedRequestsUnlisted', 'passedRequests', 'passedRequestsUnlisted']);
+    expect([...(guard.required ?? [])].sort()).toEqual(Object.keys(guard.properties ?? {}).filter((name) => !optional.has(name)).sort());
     expect(typeof guardSummaryOf).toBe('function');
+  });
+
+  // L12a（設計書 `2026-11-09-beaksight-remove-limits-design.md` 4 の S12）: 行の数の上限（前は Guard の名前つきの上限 20）を撤廃した。
+  it('does not cap the list of the requests other than the approved send (OP-M, L12a)', () => {
+    const requests = (defs.unexpectedRequests ?? {}) as JsonSchema & { readonly type?: unknown; readonly maxItems?: number };
+    expect(requests.type).toBe('array');
+    expect(requests.maxItems).toBeUndefined();
+  });
+
+  // LZ-3c: 画面の候補の数・同じ識別の数（前は 100,000）と欄の位置（前は 1,000）の最大を撤廃した（サイトの構造のまま記録する）。
+  it('does not cap the counts and the field position of a mismatch or an input failure (LZ-3c)', () => {
+    const counts = [
+      ['candidateMismatch', 'pageCandidateCount'], ['candidateMismatch', 'sameIdentityCount'], ['candidateMismatch', 'fieldPosition'],
+      ['inputFailure', 'fieldPosition'],
+    ] as const;
+    for (const [def, name] of counts) {
+      const property = (defs[def]?.properties?.[name] ?? {}) as { readonly anyOf?: readonly { readonly maximum?: number }[] };
+      expect(property.anyOf?.map(({ maximum }) => maximum), `${def}.${name}`).toEqual([undefined, undefined]);
+    }
   });
 
   it('has no property for a credential, a cookie, a CSRF token, a hidden value, a lock version or an authenticated state', () => {
@@ -188,7 +220,14 @@ describe('action-evidence.json schema (T32c)', () => {
       precheck: { candidateDigestMatched: null, blockReason: 'PRECHECK_FAILED' }, guard: null, reason: 'PRECHECK_FAILED',
     })],
     ['a blocked UPDATE', blockedCreate({ kind: 'UPDATE', update: { targetRecordId: 'rec_42-a', updateEvidence: null } })],
+    // L12b（設計者の判断 2）: 登録の ID の長さの上限（前は 256 文字）は撤廃した。
+    ['a record id of 300 characters', verifiedCreate({ recordId: 'x'.repeat(300) })],
     ['a guard summary without every reason key', verifiedCreate({ guard: { ...quietGuard(), blockedByReason: {}, blockedByPayloadReason: {} } })],
+    // OP-M: 止めた、承認した送信のほかの要求の一覧（任意。値・Origin を持たない）。
+    ['a blocked run with the requests other than the approved send', blockedCreate({
+      reason: 'PRECHECK_FAILED', precheck: { candidateDigestMatched: true, blockReason: 'PRECHECK_FAILED' },
+      guard: { ...quietGuard(), unexpectedRequests: [UNEXPECTED_REQUEST_ROW], unexpectedRequestsUnlisted: 2 },
+    })],
   ])('accepts %s', async (_label, document) => {
     expect(await validateArtifact('action-evidence', document)).toEqual({ ok: true });
   });
@@ -206,31 +245,25 @@ describe('action-evidence.json schema (T32c)', () => {
     ['a guard summary with an unknown stage reason', verifiedCreate({ guard: { ...quietGuard(), blockedByReason: { SOMETHING_ELSE: 1 } } })],
     ['a guard summary with a negative count', verifiedCreate({ guard: { ...quietGuard(), blockedByOtherRulesInWindow: -1 } })],
     ['a guard summary with a fractional count', verifiedCreate({ guard: { ...quietGuard(), blockedByReason: { SUBMISSION_WINDOW: 0.5 } } })],
+    // OP-M: 一覧の行は、閉じた一覧の区分と時点だけで、Origin や本文を持たない。0 回の行も受けない（L12a: 行の数の上限は撤廃した）。
+    ['an unexpected request with an origin', verifiedCreate({ guard: { ...quietGuard(), unexpectedRequests: [{ ...UNEXPECTED_REQUEST_ROW, origin: 'https://outside.example.invalid' } as never] } })],
+    ['an unexpected request with a body', verifiedCreate({ guard: { ...quietGuard(), unexpectedRequests: [{ ...UNEXPECTED_REQUEST_ROW, body: '{}' } as never] } })],
+    ['an unexpected request with an unknown destination', verifiedCreate({ guard: { ...quietGuard(), unexpectedRequests: [{ ...UNEXPECTED_REQUEST_ROW, destination: 'https://outside.example.invalid' }] } })],
+    ['an unexpected request with an unknown timing', verifiedCreate({ guard: { ...quietGuard(), unexpectedRequests: [{ ...UNEXPECTED_REQUEST_ROW, timing: 'LATER' }] } })],
+    ['an unexpected request with a reason that is not a code', verifiedCreate({ guard: { ...quietGuard(), unexpectedRequests: [{ ...UNEXPECTED_REQUEST_ROW, reason: 'blocked because of x' }] } })],
+    ['an unexpected request counted zero times', verifiedCreate({ guard: { ...quietGuard(), unexpectedRequests: [{ ...UNEXPECTED_REQUEST_ROW, count: 0 }] } })],
+    ['an unlisted count of zero (written only when some were not listed)', verifiedCreate({ guard: { ...quietGuard(), unexpectedRequestsUnlisted: 0 } })],
+    ['the list as an object instead of one array', verifiedCreate({ guard: { ...quietGuard(), unexpectedRequests: { requests: [UNEXPECTED_REQUEST_ROW] } as never } })],
     ['a missing result', (({ result: _omitted, ...rest }) => rest)(verifiedCreate())],
     ['a missing human value mark', (({ containsHumanEnteredValues: _omitted, ...rest }) => rest)(verifiedCreate())],
     ['an unknown result', verifiedCreate({ result: 'COMPLETE' as never })],
     ['an unknown kind', verifiedCreate({ kind: 'DELETE' as never })],
     ['an unknown submission state', verifiedCreate({ submission: { ...verifiedCreate().submission, state: 'MAYBE' as never } })],
-    ['a too long submitted value', verifiedCreate({
-      submission: { ...verifiedCreate().submission, submittedValues: { name: 'x'.repeat(MAX_SUBMITTED_VALUE_LENGTH + 1) } },
-    })],
+    // L12b（S18）: 送った値の長さの上限を撤廃したので、長い値は拒まない。
     ['an action path without "/"', verifiedCreate({ submission: { ...verifiedCreate().submission, actionPath: 'members' } })],
-    ['a too long action path', verifiedCreate({
-      submission: { ...verifiedCreate().submission, actionPath: `/${'x'.repeat(MAX_CANDIDATE_URL_PART_LENGTH)}` },
-    })],
-    ['a too long record id', verifiedCreate({ recordId: 'x'.repeat(MAX_RECORD_ID_LENGTH + 1) })],
     ['a bad HTTP status', verifiedCreate({ response: { httpStatus: 99, judgement: 'SUCCESS', judgedAt: '20261015000012' } })],
     ['a bad timestamp', verifiedCreate({ finishedAt: '2026-10-15T00:00:00Z' })],
     ['a bad run id', verifiedCreate({ runId: 'run-1' })],
-    ['a too long READ value', verifiedCreate({
-      containsHumanEnteredValues: true,
-      readVerification: executedRead({
-        expectations: [{
-          expectation: { kind: 'DETAIL_FIELD_EQUALS', field: '氏名', value: 'x' }, result: 'NOT_MATCHED', undeterminedReason: null,
-          observedValue: 'x'.repeat(MAX_READ_EVIDENCE_OBSERVED_TEXT_LENGTH + 1),
-        }],
-      }),
-    })],
     ['a not executed READ with a result', verifiedCreate({
       readVerification: { readCheckId: 'rc-1', readCheckRevision: 2, state: 'NOT_EXECUTED', result: 'MATCHED' } as never,
     })],

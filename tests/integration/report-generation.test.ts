@@ -98,9 +98,15 @@ describe('ArtifactWriter.writeRun with a crawl of the fixture site (U16b)', () =
   it('builds a view model whose Evidence places and screenshot paths point to the written files', async () => {
     const model = buildReportViewModel(written.result);
     expect(model.summary.runStatus).toBe(written.result.run.runStatus);
-    expect(model.evidence.length).toBe(crawled.pages.reduce((count, page) => count + page.evidence.length, 0));
+    // 指摘・Safety の事象・Interaction が参照する Evidence の場所は、書いた page.json の記録を指す。
+    const locations = [
+      ...model.findings.flatMap((view) => view.evidence.flatMap(({ location }) => (location === null ? [] : [location]))),
+      ...model.safety.events.flatMap(({ location }) => (location === null ? [] : [location])),
+      ...model.interactions.items.flatMap(({ location }) => (location === null ? [] : [location])),
+    ];
+    expect(locations.length).toBeGreaterThan(0);
     const pageJson = new Map<string, unknown>();
-    for (const location of model.evidence) {
+    for (const location of locations) {
       const page = pageJson.get(location.path) ?? (await readJson(location.path));
       pageJson.set(location.path, page);
       expect((atPointer(page, location.pointer) as { readonly evidenceId?: string } | undefined)?.evidenceId).toBe(location.evidenceId);

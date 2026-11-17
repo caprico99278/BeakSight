@@ -10,8 +10,6 @@ import {
   AUDIT_MODES,
   AUTH_STRATEGIES,
   ENVIRONMENT_KINDS,
-  MAX_APPROVED_SERVICE_ORIGINS,
-  MAX_ENVIRONMENT_EVIDENCE_REF_LENGTH,
   MIN_PROFILE_REVISION,
   PROFILE_ID_PATTERN,
   PROFILE_VALIDATION_ERROR_CODES,
@@ -93,6 +91,10 @@ describe('T22a: the closed lists of src/control/contracts.ts', () => {
         // T34a（Task 34 の設計書 3.1）: 承認したサービスの Origin の形とモード、設定の許可 Origin との重なり。
         'PROFILE_SERVICE_ORIGIN_INVALID',
         'PROFILE_SERVICE_ORIGIN_INSIDE_TARGET',
+        // PL-F 修正の 1 回目（PL-REV の Minor 2）: 環境の証跡の参照が秘密に見える。
+        'ISOLATION_REFERENCE_SECRET_LIKE',
+        // NL-1（設計書 `2026-11-06-beaksight-no-login-test-site-design.md` 3.1 の 2）: ログインのないテスト用のサイトは、loopback の Origin だけ。
+        'PROFILE_NO_LOGIN_REQUIRES_LOOPBACK',
       ],
     ],
   ] as const)('defines %s as a frozen list of the designed values without duplicates', (_name, values, expected) => {
@@ -111,7 +113,6 @@ describe('T22a: the closed lists of src/control/contracts.ts', () => {
   it('fixes the profile schema version and the named limits', () => {
     expect(SITE_PROFILE_SCHEMA_VERSION).toBe('beaksight-profile/1');
     expect(MIN_PROFILE_REVISION).toBe(1);
-    expect(MAX_ENVIRONMENT_EVIDENCE_REF_LENGTH).toBe(200);
     expect(PROFILE_ID_PATTERN.source).toBe('^[a-z0-9][a-z0-9-]{0,62}$');
   });
 
@@ -139,8 +140,10 @@ describe('T22a: schemas/control/profile.schema.json and the contracts', () => {
     expect(schema.additionalProperties).toBe(false);
     expect(schema.required).toEqual(PROFILE_KEYS);
     // T34a（Task 34 の設計書 3.1）: 任意の項目 `approvedServiceOrigins` を、版を上げずに足した（必須の項目は変えない）。
-    expect(Object.keys(schema.properties as object)).toEqual([...PROFILE_KEYS, 'approvedServiceOrigins']);
-    expect(propertyOf(schema, 'approvedServiceOrigins').maxItems).toBe(MAX_APPROVED_SERVICE_ORIGINS);
+    // OP-1（設計書 `2026-10-27-beaksight-one-pass-flow-design.md` 4.1.3 の 2）: 任意の項目 `loginPreference` を、版を上げずに足した（必須の項目は変えない）。
+    expect(Object.keys(schema.properties as object)).toEqual([...PROFILE_KEYS, 'approvedServiceOrigins', 'loginPreference']);
+    // L11（設計書 `2026-11-09-beaksight-remove-limits-design.md` 4）で直した: 承認したサービスの Origin の件数の上限は撤廃した（前は 4）。
+    expect(propertyOf(schema, 'approvedServiceOrigins').maxItems).toBeUndefined();
     expect(propertyOf(schema, 'approvedServiceOrigins').uniqueItems).toBe(true);
   });
 
@@ -151,7 +154,8 @@ describe('T22a: schemas/control/profile.schema.json and the contracts', () => {
     expect(propertyOf(schema, 'auth').enum).toEqual([...AUTH_STRATEGIES]);
     expect(propertyOf(schema, 'profileId').pattern).toBe(PROFILE_ID_PATTERN.source);
     expect(propertyOf(schema, 'revision').minimum).toBe(MIN_PROFILE_REVISION);
-    expect(propertyOf(schema, 'environmentEvidenceRef').maxLength).toBe(MAX_ENVIRONMENT_EVIDENCE_REF_LENGTH);
+    // LZ-2: 環境の証跡の参照の長さの上限（前は 200）はない。
+    expect(propertyOf(schema, 'environmentEvidenceRef').maxLength).toBeUndefined();
   });
 
   it('does not put the combination rules of the design 4.3 into the schema (only the shape)', () => {
@@ -185,6 +189,8 @@ describe('T22a: validateControlDocument with the profile schema', () => {
       'ui-auth-setup-save',
       // T43d: 画面の認証の設定とプロファイルのまとめて保存の Server Function の入力（Task 43 の設計書 4.4）。
       'ui-auth-setup-profile-save',
+      // MI-F3: 画面の監査の開始の画面から、認証の設定の読まないパスだけを替えて保存する Server Function の入力（入力を極限まで減らす設計書 4.3）。
+      'ui-auth-setup-excluded-paths-save',
       // T26a: 資格情報のファイル（Task 26 の設計書 4.1）。
       'credential-file',
       // T26e: 画面の資格情報の登録・変更・入れ直しと、ログインの検証の開始の Server Function の入力（Task 26 の設計書 4.2、4.6）。
@@ -207,24 +213,10 @@ describe('T22a: validateControlDocument with the profile schema', () => {
       'approval-receipt',
       // T28e: 画面のシナリオの Server Function の入力（Task 28 の設計書 4.6）。
       'ui-scenario-key',
-      'ui-scenario-form',
-      'ui-scenario-create',
-      'ui-scenario-update',
-      'ui-scenario-approve',
-      'ui-scenario-revoke',
       // FM2b: 画面のシナリオの下書きをボタン 1 回で作る Server Function の入力（手を減らす段 2 の設計書 3A.2）。
       'ui-scenario-auto-draft',
-      'ui-scenario-auto-rules',
       // T29a・FM2c: 入力の規則の集まりの版 2（手動の操作を減らす設計書 3A.3。LG-3: 版 1 の `data-rule` は捨てた）。
       'data-rule-v2',
-      // T29e: 画面の入力の規則の保存の Server Function の入力（Task 29 の設計書 4.4）。
-      'ui-data-rule-save',
-      // T30g fix round 1: 画面の書き込みの開始の Server Function の入力（Task 30 の設計書 3 章、10 章）。
-      'ui-write-start',
-      // T31h-2: 画面の更新の書き込みの開始の Server Function の入力（Task 31 の設計書 3 章、10 章）。
-      'ui-write-update-start',
-      // T41g-3: 画面の「登録してから更新する」の Server Function の入力（Task 41 の設計書 3.5.1）。
-      'ui-write-chain-start',
       // T43c: 画面の入口の確かめの開始の Server Function の入力（Task 43 の設計書 4.3）。
       'ui-entry-check-start',
       // FM-1: 画面のログインの段の表の 1 行の「登録する」の Server Function の入力（手動の操作を減らす設計書 2.1）。
@@ -232,10 +224,14 @@ describe('T22a: validateControlDocument with the profile schema', () => {
       'ui-login-stage-row-register',
       // FM-1: 画面のプロファイルの表示の設定の保存の Server Function の入力（手動の操作を減らす設計書 2.2）。
       'ui-profile-display-settings',
+      // DN-1: 画面のサイトの画面に出す名前の保存の Server Function の入力（プロファイルの表示名の設計書 2 章）。
+      'ui-profile-display-name',
       // T44d: 画面のプロファイルの負荷の値の確かめと保存の Server Function の入力（Task 44 の設計書 P2-1）。
       'ui-target-crawl-limits',
       // FM2e: 画面の 1 回の操作で自動ログインの設定を終える Server Function の入力（手を減らす段 2 の設計書 3A.4）。
       'ui-automated-login-setup',
+      // OP-2: 画面の「登録・更新を試せる画面」の一覧のチェックの保存の Server Function の入力。
+      'ui-write-screen-check',
     ]);
     expect(Object.isFrozen(CONTROL_SCHEMA_NAMES)).toBe(true);
   });
@@ -246,10 +242,17 @@ describe('T22a: validateControlDocument with the profile schema', () => {
     ['a TEST approved-write profile', { ...testProfile, mode: 'TEST_APPROVED_WRITE', auth: 'AUTOMATED_LOGIN' }],
     ['a TEST public-passive profile with an evidence reference', { ...testProfile, mode: 'PUBLIC_PASSIVE', auth: 'NONE', approvedTestOrigins: [] }],
     ['the longest profile id', { ...publicProfile, profileId: `a${'-'.repeat(62)}` }],
-    ['the longest evidence reference', { ...testProfile, environmentEvidenceRef: 'e'.repeat(MAX_ENVIRONMENT_EVIDENCE_REF_LENGTH) }],
+    ['an evidence reference longer than the former limit', { ...testProfile, environmentEvidenceRef: 'e'.repeat(201) }],
     ['a large revision', { ...publicProfile, revision: 1_000_000 }],
   ] as const)('accepts %s', (_name, profile) => {
     expect(validateControlDocument('profile', profile)).toEqual({ ok: true });
+  });
+
+  // LZ-3c: ログインの段の表の行の番号に最大はない（前は 7。表の行の数の上限 8 は LZ-3a で撤廃したので、9 行目からを登録できなかった）。
+  it('accepts a login stage row index beyond the former limit of the table', () => {
+    expect(validateControlDocument('ui-login-stage-row-key', { jobId: 'job-1', passed: false, index: 8 })).toEqual({ ok: true });
+    expect(validateControlDocument('ui-login-stage-row-register', { jobId: 'job-1', passed: true, index: 100, expectedProfileRevision: 1 }))
+      .toEqual({ ok: true });
   });
 
   // 組み合わせの規則はスキーマにない。表にない組み合わせ（RF1 の PUBLIC と書き込み）も、形が正しければスキーマは受ける。
@@ -296,7 +299,6 @@ describe('T22a: validateControlDocument with the profile schema', () => {
     ['a profile id of 64 characters', { profileId: `a${'-'.repeat(63)}` }],
     ['a non-string target config path', { targetConfigPath: 1 }],
     ['an empty evidence reference', { environmentEvidenceRef: '' }],
-    ['a too long evidence reference', { environmentEvidenceRef: 'e'.repeat(MAX_ENVIRONMENT_EVIDENCE_REF_LENGTH + 1) }],
     ['duplicate test origins', { approvedTestOrigins: ['https://app.example.invalid', 'https://app.example.invalid'] }],
     ['a non-string test origin', { approvedTestOrigins: [1] }],
     ['test origins that are not an array', { approvedTestOrigins: 'https://app.example.invalid' }],

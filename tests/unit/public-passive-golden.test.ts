@@ -33,21 +33,17 @@ type RequestShape = keyof typeof REQUEST_SHAPES;
 const ALLOW_INSPECT_REDIRECTS: PassiveRequestDecision = { action: 'ALLOW', delivery: 'INSPECT_REDIRECTS' };
 const ALLOW_DIRECT: PassiveRequestDecision = { action: 'ALLOW', delivery: 'DIRECT' };
 const BLOCK_NON_READ_METHOD: PassiveRequestDecision = { action: 'BLOCK', category: 'REQUEST', reason: 'NON_READ_METHOD' };
-const BLOCK_EXTERNAL_NAVIGATION: PassiveRequestDecision = {
-  action: 'BLOCK',
-  category: 'NAVIGATION',
-  reason: 'EXTERNAL_MAIN_FRAME_NAVIGATION',
-};
 
 /** golden の表（7 method × 2 × 2 = 28 行）。作成の時点の値。 */
 const GUARD_GOLDEN: readonly (readonly [method: string, origin: OriginPlacement, shape: RequestShape, expected: PassiveRequestDecision])[] = [
   ['GET', 'inside', 'mainFrameNavigation', ALLOW_INSPECT_REDIRECTS],
   ['GET', 'inside', 'subresource', ALLOW_DIRECT],
-  ['GET', 'outside', 'mainFrameNavigation', BLOCK_EXTERNAL_NAVIGATION],
+  // SD-2（設計書 `2026-11-16-beaksight-action-based-delete-guard-design.md` 2.4）: 許可 Origin の外への main frame の移動も止めない（範囲の外の画面は点検しない）。
+  ['GET', 'outside', 'mainFrameNavigation', ALLOW_INSPECT_REDIRECTS],
   ['GET', 'outside', 'subresource', ALLOW_DIRECT],
   ['HEAD', 'inside', 'mainFrameNavigation', ALLOW_INSPECT_REDIRECTS],
   ['HEAD', 'inside', 'subresource', ALLOW_DIRECT],
-  ['HEAD', 'outside', 'mainFrameNavigation', BLOCK_EXTERNAL_NAVIGATION],
+  ['HEAD', 'outside', 'mainFrameNavigation', ALLOW_INSPECT_REDIRECTS],
   ['HEAD', 'outside', 'subresource', ALLOW_DIRECT],
   ['POST', 'inside', 'mainFrameNavigation', BLOCK_NON_READ_METHOD],
   ['POST', 'inside', 'subresource', BLOCK_NON_READ_METHOD],
@@ -98,12 +94,14 @@ describe('T22c golden: classifyPassiveRequest for PUBLIC_PASSIVE (design 4.5 I02
  */
 const SCHEMA_VERSION_GOLDEN: readonly (readonly [name: string, id: string, schemaVersion: string | readonly string[]])[] = [
   ['run', 'urn:beaksight:schema:run:1.0', 'run-schema/1.0'],
-  ['audit', 'urn:beaksight:schema:audit:1.0', 'audit-schema/1.0'],
-  ['page', 'urn:beaksight:schema:page:1.0', ['page-schema/1.1']],
+  // REC-2: audit.json は目録（`$id` も 2.0）。前の版を読む所はない。
+  ['audit', 'urn:beaksight:schema:audit:2.0', 'audit-schema/2.0'],
+  // REC-3: ディスクの形は 2.0（メモリの形は 1.1）。保存のページは 1.1（中身がディスクの形）。`$id` は変えない。
+  ['page', 'urn:beaksight:schema:page:1.0', ['page-schema/1.1', 'page-schema/2.0']],
   ['checkpoint', 'urn:beaksight:schema:checkpoint:1.0', 'checkpoint-schema/1.0'],
-  ['checkpoint-page', 'urn:beaksight:schema:checkpoint-page:1.0', 'checkpoint-page-schema/1.0'],
-  ['finding', 'urn:beaksight:schema:finding:1.0', 'finding-schema/1.0'],
-  ['site-unavailable-diagnostic', 'urn:beaksight:schema:site-unavailable-diagnostic:1.0', 'site-unavailable-diagnostic-schema/1.1'],
+  ['checkpoint-page', 'urn:beaksight:schema:checkpoint-page:1.0', 'checkpoint-page-schema/1.1'],
+  // AUD-9a: Finding に groupingKeys を足し、新しい Finding は 1.1 を書く（`$id` は変えない）。欄のない古い Run の 1.0 も読む。
+  ['finding', 'urn:beaksight:schema:finding:1.0', ['finding-schema/1.0', 'finding-schema/1.1']],
 ];
 
 interface SchemaVersionFacts {

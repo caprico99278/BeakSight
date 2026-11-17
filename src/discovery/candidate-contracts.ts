@@ -9,9 +9,8 @@
 // - CCX-12（CC-076）: `_method` の欄の名前の判定（`isMethodOverrideFieldName`）と、実際の method の式（`effectiveFormMethodOf`）は、この
 //   ファイルだけに書く（発見の分類とシナリオの下書きの確かめが共用する。`tests/architecture/core-small-parts-ownership.test.ts` の (f)）。
 import { CANDIDATE_FIELD_TYPES, CONTACT_CANDIDATE_FIELD_TYPES, type CandidateFieldType } from '../core/candidate-field-types.js';
-import { MAX_URL_LENGTH } from '../core/limits.js';
 import { foldNfkcCase } from '../core/text.js';
-import type { SubmissionProbeRecord } from './submission-probe-contracts.js';
+import type { SubmissionProbeOpener, SubmissionProbeRecord } from './submission-probe-contracts.js';
 
 /**
  * 候補の種類（設計書 4.1）。`FORM` は form の送信ボタン 1 つ（ボタンがなければ form）ごと、`BUTTON` はボタンの役割の要素のうち送信ボタンで
@@ -232,13 +231,13 @@ export type ListenerKind = (typeof LISTENER_KINDS)[number];
  * - `INCOMPLETE_READ_FAILED`: 凍結の後の読み取り（probe か JS の結び付き）が失敗したか、時間の上限を超えたか、読んだ要素と CDP の要素が
  *   対応しなかった（読み取りの間に DOM が変わった）。結び付きの分からない候補を出さないので、候補は 0 件。
  * - `INCOMPLETE_LIMIT_REACHED`: 走査した要素の数、画面の候補の数、候補の欄の数、query の名前の数、URL の長さのどれかの上限に達し、
- *   読み切れなかった（読めた分の候補は出す）。
+ *   読み切れなかった（読めた分の候補は出す）。COV-6b-1・URL-LEN・L13 でどの上限も撤廃したので、今は付けない（前の記録を読むために値は残す。管理データの候補の schema の enum にあるので、LZ-1 でも消さない）。
  * - `INCOMPLETE_PAGE_NAVIGATION_LIMIT`（DEF-129）: その画面の Context で、ページが始めた文書の読み込み（main frame か、T37R2-fix で子の frame の、
  *   JS の読み込み直しや移動、meta の転送）を、Guard が frame ごとの上限（`PAGE_INITIATED_NAVIGATION_LIMIT_PER_FRAME`）で止めた（画面が落ち着かず、
  *   読んだ内容が途中のものかもしれない。読めた分の候補は出す）。
  *   ジョブの流れが、画面を閉じた後に付ける。
  * - `INCOMPLETE_PAGE_SUBRESOURCE_LIMIT`（DEF-130-fix）: その画面の Context で、1 画面の読み込みあたりの、ページが出す文書でない要求（画像・`fetch`・
- *   `xhr` など）を、Guard が上限（`PAGE_SUBRESOURCE_REQUEST_LIMIT`）で止めた（画面がデータを描き切れなかったかもしれない。読めた分の候補は出す）。
+ *   `xhr` など）を、Guard が上限（前は 1,000。L10 で撤廃した）で止めた（画面がデータを描き切れなかったかもしれない。読めた分の候補は出す）。
  *   ジョブの流れが、画面を閉じた後に付ける。
  * - `SERVICE_READ_REFUSED`（T37a。Task 37 の設計書 3.1。T37R-fix-B2 で数える項目を更新）: その画面の Context で、承認したサービスの Origin への要求を
  *   上限で断った、サービスの Origin から 401 を受けた、登録した読み取りの手続きの呼び出しを回数の上限か送り方で止めた、承認したサービスの Origin への
@@ -254,39 +253,25 @@ export const INCOMPLETE_REASONS = Object.freeze([
   'INCOMPLETE_LIMIT_REACHED',
   'INCOMPLETE_PAGE_NAVIGATION_LIMIT',
   'INCOMPLETE_PAGE_SUBRESOURCE_LIMIT',
+  // fix round 4（通知の枠の設計書 3.2.3 の 3）: 閉じる押下か隠しの押す期間に、Guard が移動かポップアップを止めた画面（誤りの画面を読んだおそれがある。候補は 0 件）。
+  'NOTIFICATION_DISMISSAL_NAVIGATION_BLOCKED',
   'SERVICE_READ_REFUSED',
+  // L6/L3-1（設計書 `2026-11-09-beaksight-remove-limits-design.md` 5 の 1）: 1 画面の進みの見張り（L0）が、全く反応がない・静まらない画面を、それまでの記録で終えた
+  // （理由の名前は L0 の理由 `PROGRESS_WATCH_END_REASON_CODES` と同じ）。
+  'STAGE_UNRESPONSIVE',
+  'STAGE_NEVER_QUIET',
 ] as const);
 export type IncompleteReason = (typeof INCOMPLETE_REASONS)[number];
 
-/** select の選択肢の値の最大の件数（設計書 4.1。超えた分は件数だけ `omittedOptionCount` に持つ）。 */
-export const MAX_SELECT_OPTION_VALUES = 50;
+// L13（N28〜N30）: 選択肢の数・欄の数・欄と query の名前の長さ・query の名前の数の上限は撤廃した（定数は LZ-1 で消した）。
 
-/** 選択肢の値 1 つの最大長（UTF-16 のコード単位。probe が切り詰める）。 */
-export const MAX_OPTION_VALUE_LENGTH = 256;
+// LZ-2: 選択肢の値・欄の名前・制約の属性の値の長さの上限（前は `MAX_OPTION_VALUE_LENGTH` 256・`MAX_FIELD_NAME_LENGTH` 256・
+// `MAX_CONSTRAINT_VALUE_LENGTH` 512）は撤廃した（切り詰めない）。
 
-/** 1 つの候補の入力の欄の最大の件数。 */
-export const MAX_CANDIDATE_FIELDS = 200;
+// LZ-3c: 送信ボタンの文言を読む最大長（前は `MAX_SUBMITTER_TEXT_LENGTH` 256）は撤廃した。probe と押す時点の確かめは、文言の全部から送信ボタンの語を
+// 求め、文言は捨てる（候補には持たない。T27R-fix-1。DEF-086）。照合は厳しくなる向きだけ（前の長さの後ろの語も比べる）。
 
-/** 入力の欄の名前と、送信先の query の名前の最大長（UTF-16 のコード単位）。 */
-export const MAX_FIELD_NAME_LENGTH = 256;
-
-/** 入力の欄の制約の属性の値の最大長（UTF-16 のコード単位。`pattern` を含む）。 */
-export const MAX_CONSTRAINT_VALUE_LENGTH = 512;
-
-/**
- * 送信ボタンの文言を読む最大長（UTF-16 のコード単位。空白をまとめた後）。probe は、この長さまでの文言から送信ボタンの語を求め、文言は捨てる
- * （候補には持たない。T27R-fix-1。DEF-086）。
- */
-export const MAX_SUBMITTER_TEXT_LENGTH = 256;
-
-/** form の `target` の最大長（UTF-16 のコード単位）。 */
-export const MAX_FORM_TARGET_LENGTH = 256;
-
-/** 送信先の query の名前の最大の件数。 */
-export const MAX_ACTION_QUERY_NAMES = 50;
-
-/** 画面と送信先の Origin と path の最大長（UTF-16 のコード単位）。監査の URL の上限（`MAX_URL_LENGTH`）と同じ。 */
-export const MAX_CANDIDATE_URL_PART_LENGTH = MAX_URL_LENGTH;
+// URL-LEN: form の `target` の長さの上限（前は 256）と、画面と送信先の Origin と path の長さの上限（前は 2,048）は撤廃した（切り詰めない）。
 
 /** 画面（候補を見つけたページ）。 */
 export interface CandidateLocation {
@@ -319,11 +304,14 @@ export interface CandidateField {
   readonly hidden: boolean;
   readonly constraints: CandidateFieldConstraints;
   /**
-   * 選択肢の値（`MAX_SELECT_OPTION_VALUES` 件まで。label の文言は持たない）。select は option の値、checkbox と radio は `value` の属性
+   * 選択肢の値（L13: 件数で切らない。label の文言は持たない）。select は option の値、checkbox と radio は `value` の属性
    * （ないときは `on`）。ほかの欄は null。
    */
   readonly options: readonly string[] | null;
-  /** `MAX_SELECT_OPTION_VALUES` を超えて省いた選択肢の件数（0 以上）。 */
+  /**
+   * 省いた選択肢の件数（0 以上。L13: 件数で切らないので、今の probe は常に 0）。候補の識別（`fingerprint.ts`）に入り、管理データの候補の schema も
+   * 求めるので残す（LZ-1: digest の版の決まりがないため、消さない）。
+   */
   readonly omittedOptionCount: number;
   /** 値があるか（値そのものは持たない）。 */
   readonly hasValue: boolean;
@@ -388,9 +376,13 @@ export interface CandidateDigests {
 /**
  * 成果物（`discovery.json`）の候補 1 件。`schemas/control/candidate.schema.json` の形。T37c（Task 37 の設計書 3.4）: 送らずに観察する probe の結果
  * （任意の項目 `submissionProbe`。probe の対象にした候補だけ。契約は `submission-probe-contracts.ts`）。識別の digest と規則の digest には入れない。
+ * LU-11（設計書 `2026-11-02-beaksight-list-row-update-design.md` 5.4 の 4、D5）: フォームの候補の、同じ行の開き手（任意の項目 `rowOpener`。形は probe の
+ * `opener` と同じ。開き手のボタンの候補の識別の digest・名前があるか・開き手の語。値は持たない）。結び付く開き手がちょうど 1 つのときだけ。識別の digest と
+ * 規則の digest には入れない。
  */
 export interface DiscoveryCandidate extends DiscoveredCandidate, CandidateClassificationResult, CandidateDigests {
   readonly submissionProbe?: SubmissionProbeRecord;
+  readonly rowOpener?: SubmissionProbeOpener;
 }
 
 // ---------------------------------------------------------------------------------------------------------------

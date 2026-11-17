@@ -7,7 +7,7 @@
 import { describe, expect, it } from 'vitest';
 import type { LinkAdmissionEvidence, LinkEvidence, LinkNormalizationEvidence, NormalizedHttpUrlEvidence } from '../../src/core/evidence-types.js';
 import { createPageId } from '../../src/core/ids.js';
-import { internalNavigableUrlsOf } from '../../src/crawl/internal-navigable-links.js';
+import { crawlableLinkUrlsOf, internalNavigableUrlsOf } from '../../src/crawl/internal-navigable-links.js';
 
 const ORIGIN = 'https://example.com';
 const normalized = (url: string): NormalizedHttpUrlEvidence => url as NormalizedHttpUrlEvidence;
@@ -79,5 +79,15 @@ const cases: readonly { readonly name: string; readonly links: readonly LinkEvid
 describe('internalNavigableUrlsOf: the crawl candidates from the link Evidence (CCX-6)', () => {
   it.each(cases)('$name', ({ links, expected }) => {
     expect(internalNavigableUrlsOf(links)).toEqual(expected);
+  });
+});
+
+// SD-1（設計書 `2026-11-16-beaksight-action-based-delete-guard-design.md` 2.3）: 巡回の移動は、リンクの文字と URL の削除の語を見る（公開監査にも当てる）。
+describe('crawlableLinkUrlsOf: the crawl does not follow destructive links (SD-1)', () => {
+  it('drops a link whose text or URL has a destructive word, and every link to the same URL', () => {
+    const named = (path: string, anchorText: string): LinkEvidence => ({ ...internal(path), anchorText });
+    expect(crawlableLinkUrlsOf([
+      named('/a', '詳細'), named('/items/1', '削除'), named('/items/1', '詳細'), internal('/items/2/destroy'), named('/b', 'ログアウト'), internal('/c'),
+    ])).toEqual([`${ORIGIN}/a`, `${ORIGIN}/c`]);
   });
 });

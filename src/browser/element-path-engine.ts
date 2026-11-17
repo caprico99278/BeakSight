@@ -6,6 +6,9 @@
 // - 位置の要素に、合図の名前の、取り消せて泡立たない事象を送り、取り消されたときだけ要素を返す。取り消すのは、isolated world に付けた受け手
 //   （`src/discovery/isolated-read.ts` の `withSignaledElements`。的が、確かめの時の backendNodeId の要素のときだけ取り消す）。位置の要素と、
 //   確かめの時の要素を、1 つの同期の呼び出しの中で照らすので、照らした後に入れ替わる窓がない（独立レビュー T32R の I-1）。
+// - DEF-237（設計書 `doc/design/2026-11-09-beaksight-element-identity-design.md`）: 同じ要素かは backendNodeId（合図の受け手）で決め、位置の道は探す
+//   ための手がかりにとどめる（この決まりは、この engine の 1 か所に置く）。道の要素が受け手でないとき（前の位置に要素が足された・要素が動いた）は、文書の
+//   全部の要素に合図を送り、受け手の要素を返す。受け手がなければ要素を返さない（押さない）。shadow root の中は、今のとおり対象外。
 // - 既知の限界（設計書と `doc/spec/safety.md` の扱いのとおり）:
 //   1. Playwright の操作（click など）が送る pointer の事象は、ページの JS が window の capture 段で見うる（Playwright の操作と同じ性質。
 //      照らした後の座標の事象の的は、Playwright の当たりの確かめに任せる）。
@@ -50,8 +53,8 @@ const ELEMENT_PATH_ENGINE_RULES: ElementPathEngineRules = Object.freeze({
 });
 
 /**
- * 位置の要素に合図の事象を送り、取り消されたときだけ要素を返す（Playwright の utility world で動く。標準の getter でたどる）。形が違う・
- * 位置に要素がない・取り消されないときは null。
+ * 位置の要素に合図の事象を送り、取り消されたときだけ要素を返す（Playwright の utility world で動く。標準の getter でたどる）。DEF-237: 位置の要素が
+ * 取り消さないときは、文書の全部の要素に送り、取り消した要素を返す。形が違う・どの要素も取り消さないときは null。
  */
 const elementAtSignaledPathInPage = composeInPage((R: StandardReaders, selector: string, rules: ElementPathEngineRules): Element | null => {
   const text = String(selector);
@@ -68,12 +71,23 @@ const elementAtSignaledPathInPage = composeInPage((R: StandardReaders, selector:
   if (steps.length === 0 || !steps.every((step) => Number.isSafeInteger(step) && step >= 0)) {
     return null;
   }
+  // 合図の受け手（確かめの時の要素）が取り消したか（取り消したら、その要素が確かめの時の要素）。
+  const armed = (candidate: Element): boolean =>
+    !EventTarget.prototype.dispatchEvent.call(candidate, new Event(signal, { cancelable: true, bubbles: false, composed: false }));
   const element = R.elementAtPath(steps);
-  if (element === null) {
-    return null;
+  if (element !== null && armed(element)) {
+    return element;
   }
-  const event = new Event(signal, { cancelable: true, bubbles: false, composed: false });
-  return EventTarget.prototype.dispatchEvent.call(element, event) ? null : element;
+  // DEF-237: 位置の道は探す手がかり。道の要素が受け手でなければ（前の位置に要素が足された・要素が動いた）、文書の全部の要素に合図を送り、受け手の要素を
+  // 返す。受け手がなければ（外された・作り直された）null（押さない）。shadow root の中は探さない。
+  const all = R.queryAllInRoots([document], '*');
+  for (let index = 0; index < all.length; index += 1) {
+    const candidate = all[index];
+    if (candidate instanceof Element && candidate !== element && armed(candidate)) {
+      return candidate;
+    }
+  }
+  return null;
 });
 
 /** 自前の selector engine の本文（`query`・`queryAll`。`root` は使わず、文書の根からたどる。shadow root を突き抜けない）。 */

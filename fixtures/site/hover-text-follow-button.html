@@ -7,9 +7,10 @@
   <body>
     <button type="button" aria-pressed="true">Following</button>
     <script>
-      // マウスが乗っている間は「Unfollow」、離れると「Following」を表示する。押すと aria-pressed が切り替わる。
+      // マウスが乗っている間は「Following (hover)」、離れると「Following」を表示する。押すと aria-pressed が切り替わる。
+      // FIN-1: 前は「Unfollow」だった。REV-SD の I-3 で unfollow が削除に関する語になり、押さない操作になったので、語を替えた（見る観点は文字の変わり）。
       const button = document.querySelector('button');
-      button.addEventListener('mouseenter', () => { button.textContent = 'Unfollow'; });
+      button.addEventListener('mouseenter', () => { button.textContent = 'Following (hover)'; });
       button.addEventListener('mouseleave', () => { button.textContent = 'Following'; });
       button.addEventListener('click', () => {
         button.setAttribute('aria-pressed', String(button.getAttribute('aria-pressed') !== 'true'));

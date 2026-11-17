@@ -5,17 +5,14 @@
 // 例の値は匿名の値だけ（実在の token ではない）。
 import { describe, expect, it } from 'vitest';
 import { REDACTED } from '../../src/core/redaction.js';
+import { PATH_TEMPLATE_ID_SEGMENT } from '../../src/core/record-id-path-pattern.js';
 import {
   API_PREFER_SHAPES,
-  MAX_API_REQUEST_BODY_BYTES,
-  MAX_API_SHAPE_BODY_KEYS,
-  MAX_API_SHAPE_HEADER_NAMES,
-  MAX_API_SHAPE_MARKERS,
-  MAX_API_SHAPE_NAME_LENGTH,
-  MAX_API_SHAPE_QUERY_NAMES,
+  apiArrayElementsOf,
   apiContentTypePartsOf,
   apiPreferItemsOf,
   apiRequestShapeOf,
+  apiShapeApprovedOriginOf,
   hasApiProcedureCallSegment,
   isRecordIdLikePathSegment,
   type ApiRequestShapeContext,
@@ -73,7 +70,7 @@ describe('apiRequestShapeOf (T37b: the shape of a blocked request, without value
       pathShape: '/rest/v1/members',
       queryNames: ['id', 'select'],
       omittedQueryNameCount: 0,
-      filters: [{ name: 'id', operator: 'eq', valueMatchesPagePath: true }],
+      filters: [{ name: 'id', operator: 'eq', valueMatchesPagePath: true, valueIsRecordIdLike: true }],
       headerNames: ['apikey', 'authorization', 'content-type', 'prefer'],
       omittedHeaderNameCount: 0,
       contentType: 'application/json',
@@ -88,7 +85,8 @@ describe('apiRequestShapeOf (T37b: the shape of a blocked request, without value
           { name: 'meta', type: 'object' },
           { name: 'name', type: 'string' },
           { name: 'note', type: 'string' },
-          { name: 'tags', type: 'array' },
+          // ARR-1: 一覧の鍵は要素の情報（型の集合・数・入れ子・文字の上限の超過）を持つ。値は持たない。
+          { name: 'tags', type: 'array', elements: { types: [], count: 0, nested: false, textOverLimit: false } },
         ],
         omittedKeyCount: 0,
         markerKeys: [
@@ -105,7 +103,7 @@ describe('apiRequestShapeOf (T37b: the shape of a blocked request, without value
 
   it('keeps only whether a key is a state key, judged by the given predicate with the name before hiding (T37R-fix-A I-3)', () => {
     const seen: string[] = [];
-    const longStateName = `deleted_${'x'.repeat(MAX_API_SHAPE_NAME_LENGTH)}`;
+    const longStateName = `deleted_${MARKER_NAME}`;
     const shape = apiRequestShapeOf(inputOf({ body: jsonBody({ name: MARKER_NAME, [longStateName]: true }) }), {
       ...CONTEXT,
       isStateKeyName: (name) => {
@@ -129,10 +127,10 @@ describe('apiRequestShapeOf (T37b: the shape of a blocked request, without value
   it('compares the filter value with the last ID-like segment of the page path only (T37R-fix-A M-1)', () => {
     const filtersOf = (query: string) =>
       apiRequestShapeOf(inputOf({ url: `${API}/rest/v1/members?${query}` }), { ...CONTEXT, pagePath: '/orgs/7/members/1/edit' }).filters;
-    expect(filtersOf('org_id=eq.7')).toEqual([{ name: 'org_id', operator: 'eq', valueMatchesPagePath: false }]);
-    expect(filtersOf('id=eq.1')).toEqual([{ name: 'id', operator: 'eq', valueMatchesPagePath: true }]);
+    expect(filtersOf('org_id=eq.7')).toEqual([{ name: 'org_id', operator: 'eq', valueMatchesPagePath: false, valueIsRecordIdLike: true }]);
+    expect(filtersOf('id=eq.1')).toEqual([{ name: 'id', operator: 'eq', valueMatchesPagePath: true, valueIsRecordIdLike: true }]);
     expect(apiRequestShapeOf(inputOf({ url: `${API}/rest/v1/members?id=eq.1` }), { ...CONTEXT, pagePath: '/admin/members/new' }).filters)
-      .toEqual([{ name: 'id', operator: 'eq', valueMatchesPagePath: false }]);
+      .toEqual([{ name: 'id', operator: 'eq', valueMatchesPagePath: false, valueIsRecordIdLike: true }]);
   });
 
   it('keeps the Origin class decided by the caller (the Origin owner), and makes a malformed one or an unreadable URL another', () => {
@@ -142,6 +140,22 @@ describe('apiRequestShapeOf (T37b: the shape of a blocked request, without value
     expect(apiRequestShapeOf(inputOf({ url: `${ELSEWHERE}/rest/v1/members`, origin: { kind: 'OTHER' } }), CONTEXT).origin).toEqual({ kind: 'OTHER' });
     expect(apiRequestShapeOf(inputOf({ origin: { kind: 'APPROVED_API', index: -1 } }), CONTEXT).origin).toEqual({ kind: 'OTHER' });
     expect(apiRequestShapeOf(inputOf({ url: 'not a url' }), CONTEXT)).toMatchObject({ origin: { kind: 'OTHER' }, pathShape: REDACTED, queryNames: [] });
+    // DEF-220: 承認したテストの Origin の区分も、番号ごと写す（形が違えば「そのほか」）。
+    expect(apiRequestShapeOf(inputOf({ url: `${APP}/api/members`, origin: { kind: 'APPROVED_TEST', index: 2 } }), CONTEXT).origin)
+      .toEqual({ kind: 'APPROVED_TEST', index: 2 });
+    expect(apiRequestShapeOf(inputOf({ origin: { kind: 'APPROVED_TEST', index: 1.5 } }), CONTEXT).origin).toEqual({ kind: 'OTHER' });
+  });
+
+  it('DEF-220: resolves the index of the Origin class to the Origin with the list of its own kind only (apiShapeApprovedOriginOf)', () => {
+    const lists = { approvedServiceOrigins: [API, OTHER_API], approvedTestOrigins: [APP] };
+    expect(apiShapeApprovedOriginOf({ kind: 'APPROVED_API', index: 1 }, lists)).toBe(OTHER_API);
+    expect(apiShapeApprovedOriginOf({ kind: 'APPROVED_TEST', index: 0 }, lists)).toBe(APP);
+    // 番号の意味を混ぜない: テストの番号はサービスの一覧で解かず、その逆もしない。
+    expect(apiShapeApprovedOriginOf({ kind: 'APPROVED_TEST', index: 1 }, lists)).toBeUndefined();
+    expect(apiShapeApprovedOriginOf({ kind: 'APPROVED_API', index: 0 }, { approvedTestOrigins: [APP] })).toBeUndefined();
+    expect(apiShapeApprovedOriginOf({ kind: 'APPROVED_TEST', index: 0 }, { approvedServiceOrigins: [API] })).toBeUndefined();
+    expect(apiShapeApprovedOriginOf({ kind: 'ALLOWED' }, lists)).toBeUndefined();
+    expect(apiShapeApprovedOriginOf({ kind: 'OTHER' }, lists)).toBeUndefined();
   });
 
   it('hides the value-like path segments and the segments that carry a marker', () => {
@@ -156,18 +170,49 @@ describe('apiRequestShapeOf (T37b: the shape of a blocked request, without value
   it('reads the filter shape: the name, the operator (only eq is read) and whether the value is the value of the page path', () => {
     const filtersOf = (query: string, pagePath = CONTEXT.pagePath) =>
       apiRequestShapeOf(inputOf({ url: `${API}/rest/v1/members?${query}` }), { ...CONTEXT, pagePath }).filters;
-    expect(filtersOf('id=eq.42')).toEqual([{ name: 'id', operator: 'eq', valueMatchesPagePath: true }]);
-    expect(filtersOf('id=eq.43')).toEqual([{ name: 'id', operator: 'eq', valueMatchesPagePath: false }]);
-    expect(filtersOf('id=eq.members')).toEqual([{ name: 'id', operator: 'eq', valueMatchesPagePath: false }]);
-    expect(filtersOf('id=eq.edit')).toEqual([{ name: 'id', operator: 'eq', valueMatchesPagePath: false }]);
-    expect(filtersOf('id=neq.42')).toEqual([{ name: 'id', operator: 'OTHER', valueMatchesPagePath: false }]);
-    expect(filtersOf('id=42')).toEqual([{ name: 'id', operator: 'OTHER', valueMatchesPagePath: false }]);
-    expect(filtersOf(`id=eq.${UUID}`, `/admin/members/${UUID}/edit`)).toEqual([{ name: 'id', operator: 'eq', valueMatchesPagePath: true }]);
+    expect(filtersOf('id=eq.42')).toEqual([{ name: 'id', operator: 'eq', valueMatchesPagePath: true, valueIsRecordIdLike: true }]);
+    expect(filtersOf('id=eq.43')).toEqual([{ name: 'id', operator: 'eq', valueMatchesPagePath: false, valueIsRecordIdLike: true }]);
+    expect(filtersOf('id=eq.members')).toEqual([{ name: 'id', operator: 'eq', valueMatchesPagePath: false, valueIsRecordIdLike: false }]);
+    expect(filtersOf('id=eq.edit')).toEqual([{ name: 'id', operator: 'eq', valueMatchesPagePath: false, valueIsRecordIdLike: false }]);
+    expect(filtersOf('id=neq.42')).toEqual([{ name: 'id', operator: 'OTHER', valueMatchesPagePath: false, valueIsRecordIdLike: false }]);
+    expect(filtersOf('id=42')).toEqual([{ name: 'id', operator: 'OTHER', valueMatchesPagePath: false, valueIsRecordIdLike: false }]);
+    expect(filtersOf(`id=eq.${UUID}`, `/admin/members/${UUID}/edit`)).toEqual([{ name: 'id', operator: 'eq', valueMatchesPagePath: true, valueIsRecordIdLike: true }]);
     expect(filtersOf('select=*&on_conflict=id')).toEqual([]);
     expect(filtersOf('id=eq.42&email=eq.x')).toEqual([
-      { name: 'email', operator: 'eq', valueMatchesPagePath: false },
-      { name: 'id', operator: 'eq', valueMatchesPagePath: true },
+      { name: 'email', operator: 'eq', valueMatchesPagePath: false, valueIsRecordIdLike: false },
+      { name: 'id', operator: 'eq', valueMatchesPagePath: true, valueIsRecordIdLike: true },
     ]);
+  });
+
+  // LU-2（設計書 `2026-11-02-beaksight-list-row-update-design.md` 5.2 の 1・2）: path の最後の番号の区切りだけを `{id}` にし、filter の値が番号の形かを残す。
+  it('makes only the last record number segment of the path the {id} segment (LU-2)', () => {
+    const pathOf = (path: string) => apiRequestShapeOf(inputOf({ url: `${API}${path}` }), CONTEXT).pathShape;
+    expect(pathOf('/api/items/4')).toBe(`/api/items/${PATH_TEMPLATE_ID_SEGMENT}`);
+    expect(pathOf(`/api/items/${UUID}`)).toBe(`/api/items/${PATH_TEMPLATE_ID_SEGMENT}`);
+    expect(pathOf(`/api/items/${UUID.toUpperCase()}`)).toBe(`/api/items/${PATH_TEMPLATE_ID_SEGMENT}`);
+    // 途中の区切りの番号は変えない。番号のない path も変えない。
+    expect(pathOf('/projects/7/items')).toBe('/projects/7/items');
+    expect(pathOf('/api/items')).toBe('/api/items');
+    expect(pathOf('/api/items/v2')).toBe('/api/items/v2');
+    expect(pathOf('/api/items/4/')).toBe('/api/items/4/');
+    expect(pathOf('/projects/7/items/4')).toBe(`/projects/7/items/${PATH_TEMPLATE_ID_SEGMENT}`);
+    // 伏せ字の区切り（値に見える区切り・目印を含む区切り）は `{id}` にしない。
+    expect(pathOf(`/api/items/${'a'.repeat(32)}${'0'.repeat(32)}`)).toBe(`/api/items/${REDACTED}`);
+    expect(pathOf(`/api/items/${MARKER_NUMBER}`)).toBe(`/api/items/${REDACTED}`);
+  });
+
+  it('keeps whether the filter value is a record number (digits or UUID), without the value (LU-2)', () => {
+    const filtersOf = (query: string) =>
+      apiRequestShapeOf(inputOf({ url: `${API}/api/items?${query}` }), { ...CONTEXT, pagePath: '/items' }).filters;
+    const filterOf = (valueIsRecordIdLike: boolean, operator = 'eq') => [{ name: 'id', operator, valueMatchesPagePath: false, valueIsRecordIdLike }];
+    expect(filtersOf('id=eq.3')).toEqual(filterOf(true));
+    expect(filtersOf(`id=eq.${UUID}`)).toEqual(filterOf(true));
+    expect(filtersOf('id=eq.abc')).toEqual(filterOf(false));
+    expect(filtersOf('id=eq.')).toEqual(filterOf(false));
+    // 値に見える長い文字は番号の形にしない（path の型で伏せる区切りと同じく、番号の形は数字と UUID だけ）。
+    expect(filtersOf(`id=eq.${'a'.repeat(32)}${'0'.repeat(32)}`)).toEqual(filterOf(false));
+    expect(filtersOf('id=gt.3')).toEqual(filterOf(false, 'OTHER'));
+    expect(JSON.stringify(filtersOf('id=eq.3'))).not.toContain('eq.3');
   });
 
   it.each([
@@ -197,6 +242,9 @@ describe('apiRequestShapeOf (T37b: the shape of a blocked request, without value
     expect(apiRequestShapeOf(inputOf({ headers: { 'content-type': 'Text/Plain;charset=UTF-8' } }), CONTEXT).contentType).toBe('text/plain');
     expect(apiRequestShapeOf(inputOf({ headers: { 'content-type': `x ${SECRET_API_KEY}` } }), CONTEXT).contentType).toBe(REDACTED);
     expect(apiRequestShapeOf(inputOf({ headers: {} }), CONTEXT).contentType).toBeNull();
+    // L13（N25）: 媒体の型は長さでは伏せない（前は 100 文字を超えたら伏せた）。
+    const longMediaType = `application/${'x'.repeat(120)}`;
+    expect(apiRequestShapeOf(inputOf({ headers: { 'content-type': longMediaType } }), CONTEXT).contentType).toBe(longMediaType);
   });
 
   it('records the top-level body form: object, array, scalar JSON, not JSON, none, unreadable', () => {
@@ -207,19 +255,13 @@ describe('apiRequestShapeOf (T37b: the shape of a blocked request, without value
     expect(bodyOf({ kind: 'TEXT', text: `name=${MARKER_NAME}` })).toEqual(empty('NOT_JSON'));
     expect(bodyOf({ kind: 'NONE' })).toEqual(empty('NONE'));
     expect(bodyOf({ kind: 'UNREADABLE' })).toEqual(empty('UNREADABLE'));
-    expect(bodyOf({ kind: 'TEXT', text: `{"a":"${'x'.repeat(MAX_API_REQUEST_BODY_BYTES)}"}` }).kind).toBe('UNREADABLE');
   });
 
-  it('reads the body only within the byte limit shared with the write stage check (T39R-fix M-5)', () => {
-    const bodyOf = (text: string) => apiRequestShapeOf(inputOf({ body: { kind: 'TEXT', text } }), CONTEXT).body.kind;
-    expect(MAX_API_REQUEST_BODY_BYTES).toBe(65_536);
-    // UTF-8 で 2 bytes の文字: 文字の数は上限の中でも、bytes が上限を超えれば読まない。
-    const wrap = (inner: string): string => `{"a":"${inner}"}`;
-    const overhead = new TextEncoder().encode(wrap('')).byteLength;
-    expect(bodyOf(wrap('é'.repeat(Math.floor((MAX_API_REQUEST_BODY_BYTES - overhead) / 2))))).toBe('OBJECT');
-    expect(bodyOf(wrap('é'.repeat(Math.floor((MAX_API_REQUEST_BODY_BYTES - overhead) / 2) + 1)))).toBe('UNREADABLE');
-    expect(bodyOf(wrap('x'.repeat(MAX_API_REQUEST_BODY_BYTES - overhead)))).toBe('OBJECT');
-    expect(bodyOf(wrap('x'.repeat(MAX_API_REQUEST_BODY_BYTES - overhead + 1)))).toBe('UNREADABLE');
+  // L13（N25）: 本文の大きさで読まないことはない（前は 64KiB を超えたら「読めない」）。
+  it('reads a body of any size', () => {
+    const shape = apiRequestShapeOf(inputOf({ body: jsonBody({ a: 'é'.repeat(70_000), name: MARKER_NAME }) }), CONTEXT);
+    expect(shape.body.kind).toBe('OBJECT');
+    expect(shape.body.markerKeys).toEqual([{ key: 'name', markers: [0] }]);
   });
 
   it('splits Prefer into items and Content-Type into the media type and the parameters in the one way of the contract (T39R-fix M-5)', () => {
@@ -248,48 +290,49 @@ describe('apiRequestShapeOf (T37b: the shape of a blocked request, without value
     expect(hasApiProcedureCallSegment(path)).toBe(expected);
   });
 
-  it('hides the names that look like values, are too long, or carry a marker (keys, query names, header names)', () => {
-    const longName = 'n'.repeat(MAX_API_SHAPE_NAME_LENGTH + 1);
+  it('hides the names that look like values or carry a marker, and keeps a long name (keys, query names, header names)', () => {
+    // L13（N25）: 長さでは伏せない（前は 64 文字を超えたら伏せた）。
+    const longName = 'n'.repeat(100);
     const shape = apiRequestShapeOf(inputOf({
       url: `${API}/rest/v1/members?${encodeURIComponent(MARKER_NAME)}=1&${longName}=2&${SECRET_API_KEY}=3`,
       headers: { [`x-${MARKER_NAME}`]: 'v', [longName]: 'v' },
       body: jsonBody({ [MARKER_EMAIL]: 'a', [longName]: 'b', [SECRET_API_KEY]: 'c', ok: MARKER_NAME }),
     }), CONTEXT);
-    expect(shape.queryNames).toEqual([REDACTED, REDACTED, REDACTED]);
-    expect(shape.headerNames).toEqual([REDACTED, REDACTED]);
-    expect(shape.body.keys.map(({ name }) => name)).toEqual([REDACTED, REDACTED, REDACTED, 'ok']);
+    expect(shape.queryNames).toEqual([REDACTED, REDACTED, longName]);
+    expect(shape.headerNames).toEqual([REDACTED, longName]);
+    expect(shape.body.keys.map(({ name }) => name)).toEqual([REDACTED, REDACTED, longName, 'ok']);
     expectNoValues(shape);
-    expect(JSON.stringify(shape)).not.toContain(longName);
   });
 
-  it('keeps the limits of the body keys, the query names and the header names, and counts the omitted ones', () => {
+  // L13（N25）: 本文の鍵・query の名前・ヘッダの名前・目印は、数で切らない（前は 64・32・64・32）。
+  it('keeps all the body keys, query names, header names and markers', () => {
     const many = (count: number, prefix: string) => Array.from({ length: count }, (_, index) => `${prefix}${String(index).padStart(3, '0')}`);
-    const keys = many(MAX_API_SHAPE_BODY_KEYS + 3, 'k');
-    const queries = many(MAX_API_SHAPE_QUERY_NAMES + 2, 'q');
-    const headers = many(MAX_API_SHAPE_HEADER_NAMES + 4, 'h');
+    const keys = many(65, 'k');
+    const queries = many(33, 'q');
+    const headers = many(65, 'h');
+    const markers = Array.from({ length: 33 }, (_, index) => `${MARKER_NAME}m${String(index).padStart(3, '0')}`);
     const shape = apiRequestShapeOf(inputOf({
       url: `${API}/rest/v1/members?${queries.map((name) => `${name}=1`).join('&')}`,
       headers: Object.fromEntries(headers.map((name) => [name, 'v'])),
-      body: jsonBody(Object.fromEntries(keys.map((name) => [name, 1]))),
-    }), CONTEXT);
-    expect(shape.body.keys).toHaveLength(MAX_API_SHAPE_BODY_KEYS);
-    expect(shape.body.omittedKeyCount).toBe(3);
-    expect(shape.queryNames).toHaveLength(MAX_API_SHAPE_QUERY_NAMES);
-    expect(shape.omittedQueryNameCount).toBe(2);
-    expect(shape.filters.length).toBeLessThanOrEqual(MAX_API_SHAPE_QUERY_NAMES);
-    expect(shape.headerNames).toHaveLength(MAX_API_SHAPE_HEADER_NAMES);
-    expect(shape.omittedHeaderNameCount).toBe(4);
+      body: jsonBody({ ...Object.fromEntries(keys.map((name) => [name, 1])), last: markers.at(-1) }),
+    }), { ...CONTEXT, markers });
+    expect(shape.body.keys).toHaveLength(66);
+    expect(shape.body.omittedKeyCount).toBe(0);
+    expect(shape.queryNames).toHaveLength(33);
+    expect(shape.filters).toHaveLength(33);
+    expect(shape.omittedQueryNameCount).toBe(0);
+    expect(shape.headerNames).toHaveLength(65);
+    expect(shape.omittedHeaderNameCount).toBe(0);
+    expect(shape.body.markerKeys).toEqual([{ key: 'last', markers: [32] }]);
   });
 
-  it('rejects too many markers or a marker that is not a string, without the values in the message', () => {
-    const tooMany = Array.from({ length: MAX_API_SHAPE_MARKERS + 1 }, (_, index) => `${MARKER_NAME}${String(index)}`);
-    expect(() => apiRequestShapeOf(inputOf(), { ...CONTEXT, markers: tooMany })).toThrow(TypeError);
+  it('rejects a marker that is not a string, without the values in the message', () => {
+    expect(() => apiRequestShapeOf(inputOf(), { ...CONTEXT, markers: [MARKER_NAME, 1 as unknown as string] })).toThrow(TypeError);
     try {
-      apiRequestShapeOf(inputOf(), { ...CONTEXT, markers: tooMany });
+      apiRequestShapeOf(inputOf(), { ...CONTEXT, markers: [MARKER_NAME, 1 as unknown as string] });
     } catch (error) {
       expect(String(error)).not.toContain(MARKER_NAME);
     }
-    expect(() => apiRequestShapeOf(inputOf(), { ...CONTEXT, markers: [1 as unknown as string] })).toThrow(TypeError);
   });
 
   it('does not keep a marker match from a nested value, and matches a number value by its text', () => {
@@ -298,9 +341,80 @@ describe('apiRequestShapeOf (T37b: the shape of a blocked request, without value
     expectNoValues(shape);
   });
 
+  it('does not mark a key with a value that is not an array as in an array', () => {
+    const shape = apiRequestShapeOf(inputOf({ body: jsonBody({ name: MARKER_NAME, age: 3 }) }), CONTEXT);
+    expect(shape.body.keys).toEqual([{ name: 'age', type: 'number' }, { name: 'name', type: 'string' }]);
+    expect(shape.body.markerKeys).toEqual([{ key: 'name', markers: [0] }]);
+  });
+
   it('normalizes the method and the resource type, and hides an unexpected method', () => {
     expect(apiRequestShapeOf(inputOf({ method: 'post', resourceType: 'xhr' }), CONTEXT)).toMatchObject({ method: 'POST', resourceType: 'xhr' });
     expect(apiRequestShapeOf(inputOf({ method: `X ${SECRET_API_KEY}` }), CONTEXT).method).toBe(REDACTED);
     expect(apiRequestShapeOf(inputOf({ resourceType: 'Fetch Secret' }), CONTEXT).resourceType).toBe('other');
+  });
+});
+
+// ARR-1（設計書 `2026-11-08-beaksight-api-array-keys-design.md` 3.2）: 一覧の形の値（array）の鍵は、要素の型の集合・数・入れ子の有無・文字の上限の
+// 超過を持つ（値は持たない）。要素の文字（か数）に目印が入れば、その鍵を目印の鍵の一覧に入れ、一覧の中で見つかった印（`inArray`）を付ける。
+describe('apiRequestShapeOf (ARR-1: the elements of an array key)', () => {
+  const keyOf = (body: unknown, name: string) =>
+    apiRequestShapeOf(inputOf({ body: jsonBody(body) }), CONTEXT).body.keys.find((key) => key.name === name);
+
+  it('records an empty array', () => {
+    expect(keyOf({ tags: [] }, 'tags')).toEqual({ name: 'tags', type: 'array', elements: { types: [], count: 0, nested: false, textOverLimit: false } });
+  });
+
+  it('records an array of texts, an array of numbers and an array of mixed scalars (the set of types is sorted)', () => {
+    expect(keyOf({ tags: ['a', 'b', 'c'] }, 'tags')?.elements).toEqual({ types: ['string'], count: 3, nested: false, textOverLimit: false });
+    expect(keyOf({ ids: [1, 2] }, 'ids')?.elements).toEqual({ types: ['number'], count: 2, nested: false, textOverLimit: false });
+    expect(keyOf({ mixed: [true, null, 'x', 2] }, 'mixed')?.elements)
+      .toEqual({ types: ['boolean', 'null', 'number', 'string'], count: 4, nested: false, textOverLimit: false });
+  });
+
+  it('records a nested array (an element that is an object or an array) without looking into it', () => {
+    // ARR-5（`arr-5-array-object-rows.test.ts`）: object の行は、中の鍵と印を見るようにした（目印のない object の行と、一覧の中の一覧は今のまま中を見ない）。
+    expect(keyOf({ rows: [{ name: 'x' }] }, 'rows')?.elements).toEqual({ types: ['object'], count: 1, nested: true, textOverLimit: false });
+    expect(keyOf({ rows: [['a'], 'b'] }, 'rows')?.elements).toEqual({ types: ['array', 'string'], count: 2, nested: true, textOverLimit: false });
+    const shape = apiRequestShapeOf(inputOf({ body: jsonBody({ rows: [{ name: MARKER_NAME }], deep: [[MARKER_EMAIL]] }) }), CONTEXT);
+    expect(shape.body.markerKeys).toEqual([{ key: 'rows', markers: [0], inArray: true }]);
+    expect(shape.body.keys.find(({ name }) => name === 'rows')?.elements?.positions)
+      .toEqual([{ markers: [], empty: false, type: 'object', keys: [{ name: 'name', markers: [0], empty: false, type: 'string' }] }]);
+    expectNoValues(shape);
+  });
+
+  // L13 fix round 1: 一覧の要素の数・文字の長さ・行の中の鍵の数に上限を置かない（前は 20・200・16。超えた一覧は位置の情報を持たず、文字は上限の超過の印）。
+  it('records the positions of a long list, a long text and a row of many inner keys without a limit', () => {
+    const many = [MARKER_NAME, ...Array.from({ length: 20 }, () => '')];
+    const elements = keyOf({ tags: many }, 'tags')?.elements;
+    expect(elements).toMatchObject({ types: ['string'], count: 21, nested: false, textOverLimit: false });
+    expect(elements?.positions).toHaveLength(21);
+    expect(keyOf({ tags: ['x'.repeat(201)] }, 'tags')?.elements?.textOverLimit).toBe(false);
+    const row = { name: MARKER_NAME, ...Object.fromEntries(Array.from({ length: 16 }, (_, index) => [`k${String(index).padStart(2, '0')}`, 'y'.repeat(201)])) };
+    const inner = keyOf({ rows: [row] }, 'rows')?.elements?.positions?.[0]?.keys;
+    expect(inner).toHaveLength(17);
+    expect(inner?.some((key) => key.textOverLimit === true)).toBe(false);
+  });
+
+  it('puts a key whose text or number element carries a marker into the marker keys, marked as in an array, without the values', () => {
+    const shape = apiRequestShapeOf(inputOf({
+      body: jsonBody({ name: MARKER_NAME, labels: [MARKER_EMAIL], codes: [Number(MARKER_NUMBER), 5], both: [`a ${MARKER_NAME}`, MARKER_EMAIL], plain: ['a'] }),
+    }), CONTEXT);
+    expect(shape.body.markerKeys).toEqual([
+      { key: 'both', markers: [0, 1], inArray: true },
+      { key: 'codes', markers: [2], inArray: true },
+      { key: 'labels', markers: [1], inArray: true },
+      { key: 'name', markers: [0] },
+    ]);
+    expectNoValues(shape);
+  });
+
+  it('collects the same marker once even when two elements carry it', () => {
+    const shape = apiRequestShapeOf(inputOf({ body: jsonBody({ labels: [MARKER_NAME, `x${MARKER_NAME}`] }) }), CONTEXT);
+    expect(shape.body.markerKeys).toEqual([{ key: 'labels', markers: [0], inArray: true }]);
+  });
+
+  it('shares the element summary for the later check of the write stage (the same summary as the shape)', () => {
+    expect(apiArrayElementsOf(['a', 1])).toEqual({ types: ['number', 'string'], count: 2, nested: false, textOverLimit: false });
+    expect(apiArrayElementsOf([{}])).toMatchObject({ nested: true });
   });
 });

@@ -30,6 +30,7 @@ import {
   API_WRITE_SECRET_LIKE_KEY_WORDS,
   isSecretUrlQueryParameterName,
 } from '../core/secret-query-names.js';
+import { REDACTED } from '../core/redaction.js';
 import { compareCodeUnits, foldNfkcCase, stripCombiningMarks } from '../core/text.js';
 import { classifyUrl } from '../crawl/admission-policy.js';
 import {
@@ -45,7 +46,9 @@ import {
   type ListenerKind,
 } from './candidate-contracts.js';
 import {
+  DISCOVERY_CREATE_PAGE_LINK_WORDS,
   DISCOVERY_CREATE_WORDS,
+  DESTRUCTIVE_WORD_SKIPPED_OKURIGANA,
   DISCOVERY_DESTRUCTIVE_WORDS,
   DISCOVERY_GRAPHQL_PATH_WORDS,
   DISCOVERY_PROCEDURE_WRITE_WORDS,
@@ -115,6 +118,11 @@ export const isAsciiWord = (word: string): boolean => /^[\x20-\x7e]+$/u.test(wor
 const UPPERCASE_RUN_BOUNDARY = /(\p{Lu})(\p{Lu}\p{Ll})/gu;
 /** 文字と数字の境（`delete2` の `delete` と `2`、`2nd` の `2` と `nd`）。 */
 const LETTER_DIGIT_BOUNDARY = /(?<=\p{L})(?=\p{N})|(?<=\p{N})(?=\p{L})/gu;
+/**
+ * DEF-240: 英字（全角の英字も）と、仮名・漢字の境（`deleted済み` の `deleted` と `済み`、`会員deleted` の `会員` と `deleted`）。仮名と漢字の間では分けない
+ * （日本語だけの名前の判定は変えない）。
+ */
+const LATIN_KANA_KANJI_BOUNDARY = /(?<=\p{Script=Latin})(?=[\p{Script=Han}\p{Script=Hiragana}\p{Script=Katakana}])|(?<=[\p{Script=Han}\p{Script=Hiragana}\p{Script=Katakana}])(?=\p{Script=Latin})/gu;
 
 /**
  * 欄の名前を語に分ける（T27R-fix-2。設計書 11 章の 2026-10-12 の行の (4)）。`_`・`-`・`.`・`[`・`]`・空白など文字と数字以外の区切り、文字と数字の
@@ -124,7 +132,7 @@ const LETTER_DIGIT_BOUNDARY = /(?<=\p{L})(?=\p{N})|(?<=\p{N})(?=\p{L})/gu;
  * READ の送る値の危険な語は部分一致）には使わない。
  */
 export const fieldNameWordsOf = (name: string): readonly string[] =>
-  separatedWordsOf(splitCamelCase(name.replace(UPPERCASE_RUN_BOUNDARY, '$1 $2')).replace(LETTER_DIGIT_BOUNDARY, ' '));
+  separatedWordsOf(splitCamelCase(name.replace(UPPERCASE_RUN_BOUNDARY, '$1 $2')).replace(LETTER_DIGIT_BOUNDARY, ' ').replace(LATIN_KANA_KANJI_BOUNDARY, ' '));
 
 /** percent-encode を外した形を、元の形と合わせて返す（外せない形は含めない）。 */
 const percentDecodedForms = (text: string): readonly string[] => {
@@ -195,6 +203,29 @@ export const submitterWordsOf = (text: string): readonly string[] => {
  */
 export const submitterTextHasSubmitWord = (text: string): boolean => containsWord(DISCOVERY_SUBMIT_PRESS_WORDS, [text]);
 
+/** OP-I（I2）: 登録の画面らしいリンクの判定が読む、リンクの Evidence の項目（`LinkEvidence` の一部と同じ形）。 */
+export interface CreatePageLinkFacts {
+  readonly anchorText: string;
+  readonly ariaLabel: string | null;
+  readonly title: string | null;
+  readonly normalized: { readonly ok: true; readonly url: string } | { readonly ok: false };
+}
+
+/**
+ * OP-I（I2。設計書 `2026-10-27-beaksight-one-pass-flow-design.md` 4.1.5）: 操作さがしの段で先に読む、登録の画面らしいリンクか。手がかりは、リンクの文字・
+ * `aria-label`・`title`・アドレスの path（percent-encode を外した形も）の語。語の一覧は `DISCOVERY_CREATE_PAGE_LINK_WORDS`（比べ方は登録の語と同じ語の
+ * 境界。日本語は部分一致）。危険な語（`DISCOVERY_DESTRUCTIVE_WORDS`）にも当たるリンクと、正規化できないリンクは、先に読まない（読むかどうかは、呼ぶ側の
+ * 今の除外の判定のまま。ここは読む順だけを決める）。
+ */
+export const isCreatePageLink = (link: CreatePageLinkFacts): boolean => {
+  if (!link.normalized.ok) {
+    return false;
+  }
+  const texts = [link.anchorText, link.ariaLabel ?? '', link.title ?? '', ...percentDecodedForms(new URL(link.normalized.url).pathname)]
+    .filter((text) => text.length > 0);
+  return !containsDestructiveWord(texts) && containsWord(DISCOVERY_CREATE_PAGE_LINK_WORDS, texts);
+};
+
 /**
  * READ の確かめで送る値（名前 → 値）の名前か値が、発見の分類の危険な語に当たるか（T27R-fix-1。DEF-088 の (b)）。比べ方は分類の危険な語と同じ
  * （部分一致、畳み込み、区切りを除いた形。日本語を含む）。サーバが percent-encode を外しうるので、外した形でも比べる（fail-closed）。定義の保存の
@@ -202,6 +233,53 @@ export const submitterTextHasSubmitWord = (text: string): boolean => containsWor
  */
 export const readParametersHaveDestructiveWord = (parameters: Readonly<Record<string, string>>): boolean =>
   containsDestructiveWord(Object.entries(parameters).flatMap(([name, value]) => [...percentDecodedForms(name), ...percentDecodedForms(value)]));
+
+/** REV-SD の M-2: 日本語の語の直後で飛ばす送り仮名（語の一覧のファイルの `DESTRUCTIVE_WORD_SKIPPED_OKURIGANA`）。 */
+const OKURIGANA_SKIPPED_BEFORE_SUFFIX = DESTRUCTIVE_WORD_SKIPPED_OKURIGANA;
+
+/** 日本語の語 `word` が `text` にあり、その直後（送り仮名「し」を飛ばして）が `suffixes` のどれでもない所が 1 つでもあるか。 */
+const hasJapaneseWordWithoutSuffix = (text: string, word: string, suffixes: readonly string[]): boolean => {
+  for (let at = text.indexOf(word); at >= 0; at = text.indexOf(word, at + 1)) {
+    let after = at + word.length;
+    if (text.startsWith(OKURIGANA_SKIPPED_BEFORE_SUFFIX, after)) after += OKURIGANA_SKIPPED_BEFORE_SUFFIX.length;
+    if (!suffixes.some((suffix) => text.startsWith(suffix, after))) return true;
+  }
+  return false;
+};
+
+/**
+ * SD-1・REV-SD の I-5（設計書 `2026-11-16-beaksight-action-based-delete-guard-design.md` 2.2。設計者の判断 2026-11-16）: 文字（操作の名前・リンクの文字・URL の path と
+ * query など）のどれかが、`words` の語に当たるか。percent-encode を外した形でも比べる。操作の前の判定（`src/discovery/destructive-action.ts`）が一覧を渡して使う。
+ * - 英語の語（ASCII）は語の境界: 文字の語の並び（`fieldNameWordsOf`。区切り・camelCase・文字と数字の境で分け、畳み込む）に、語を同じ関数で分けた並びがそのまま
+ *   現れる（最後の語は複数形の `s` も）。`Presets`・`Nuclear` に `reset`・`clear` は当たらない。
+ * - 日本語の語は部分一致（畳み込んだ形と、区切りを除いた形）。`nounSuffixes` を渡すと、語の直後がその語のときは当てない（「削除済み」）。
+ * 分類の危険な語の比べ（`destructiveWordsIn`。部分一致。候補の `submitterWords` と識別の digest）は変えない。
+ */
+export const textsHaveBoundedWord = (
+  texts: readonly string[],
+  words: readonly string[],
+  nounSuffixes: readonly string[] = [],
+  /** REV-EV12 の M-3: 英語の語の直後の語がこの一覧の語なら当てない（巡回の URL の名詞と案内の語）。 */
+  asciiFollowerExclusions: readonly string[] = [],
+): boolean => {
+  const forms = texts.flatMap(percentDecodedForms);
+  const sequences = forms.map(fieldNameWordsOf);
+  const searched = forms.flatMap((text) => {
+    const folded = foldNfkcCase(text);
+    return [folded, compactText(folded)];
+  });
+  return words.some((word) => {
+    if (!isAsciiWord(word)) {
+      return [word, compactText(word)].some((form) => form.length > 0 && searched.some((text) => hasJapaneseWordWithoutSuffix(text, form, nounSuffixes)));
+    }
+    const parts = fieldNameWordsOf(word);
+    const last = parts.length - 1;
+    return parts.length > 0 && sequences.some((sequence) => sequence.some((_token, start) => parts.every((part, offset) => {
+      const token = sequence[start + offset];
+      return token === part || (offset === last && token === `${part}${PLURAL_SUFFIX}`);
+    }) && !asciiFollowerExclusions.includes(sequence[start + parts.length] ?? '')));
+  });
+};
 
 /**
  * 欄の名前が、語の一覧（比べる形で書いた語）のどれかに当たるか（T29c。CC-082 の 1 つ目。欄の名前の語の単位の比べの唯一の owner）。英語の語
@@ -463,6 +541,20 @@ export const isPublicationStateKeyName = (name: string): boolean => fieldNameHas
  */
 export const isApiSoftDeleteKeyName = (name: string): boolean =>
   fieldNameHasSoftDeleteWord(name) || (fieldNameHasStateWord(name) && !isPublicationStateKeyName(name));
+
+/**
+ * ARR-5 fix round 1（SREV-ARR2 の C1・I1）: API の本文の object の行の中の鍵の名前として使えるか（承認・送る前の照合・ワーカーの契約が共用する唯一の判定）。
+ * 最上位の鍵を分類・承認が拒む判定の部品を、すべて重ねて使う（行の中の鍵は、拒む理由を分けずに一覧の鍵ごと拒む）。次のどれかなら使えない。
+ * - 伏せた名前（`REDACTED`）、秘密に見える名前（`isApiWriteKeyNameSecretLike`）、method の上書き（`isMethodOverrideFieldName`）。
+ * - 論理削除にあたる名前（`isApiSoftDeleteKeyName`。最上位の鍵の型の分類と同じ）、危険な語・削除の語（`fieldNameHasRemovalWord`。`fieldNameHasDestructiveWord` を含む）。
+ * - 状態の語（`fieldNameHasStateWord`。行の中では公開の状態の語も、値を照らせないので使わない。最上位の鍵より厳しい側）。
+ */
+export const isApiRowKeyNameUsable = (name: string): boolean => name !== REDACTED
+  && !isApiWriteKeyNameSecretLike(name)
+  && !isMethodOverrideFieldName(name)
+  && !isApiSoftDeleteKeyName(name)
+  && !fieldNameHasRemovalWord(name)
+  && !fieldNameHasStateWord(name);
 
 /** 状態の欄の名前（語の境界で比べる）を持つか。 */
 const hasStateField = (candidate: DiscoveredCandidate): boolean => candidate.fields.some((field) => fieldNameHasStateWord(field.name));

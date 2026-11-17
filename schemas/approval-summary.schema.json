@@ -118,7 +118,7 @@
           "additionalProperties": false,
           "required": ["used", "limit"],
           "properties": {
-            "used": { "type": "integer", "minimum": 0, "maximum": 20 },
+            "used": { "type": "integer", "minimum": 0 },
             "limit": { "$ref": "urn:beaksight:schema:control:scenario:1#/properties/limits/properties/maxCumulativeCreates" }
           }
         },

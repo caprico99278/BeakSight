@@ -1,9 +1,10 @@
-// T41b（Task 41 の設計書 3.2、8 章の「T41a・T41c の報告と設計者の判断」）: API の更新（UPDATE）のシナリオの、下書き → 承認 → 許可（台帳の照合済みの
-// 登録の最新の 1 件）→ 書き込みのジョブの開始 → `START` が届く、までを、本物の管理データとジョブの管理（`createAuditJobManager`）と偽のワーカー
-// （`tests/helpers/fake-audit-worker.ts` の `write`。本物の `fork`）で確かめる。ワーカーの更新の流れは T41d なので、ここでは `START` の中身だけを見る。
-// - 台帳は API の登録のシナリオ（ID を応答の本文の鍵 `id` から取る。filter の名前と同じ）。照合まで済んだ登録を 2 件作り、新しい方が対象になる。
-// - `START`: ジョブの種類 `WRITE_UPDATE`、`api` はシナリオの API の指定のまま、`values` は変える鍵だけ、`update: { targetRecordId }`、書き込みの画面は
-//   台帳の画面の path の型に対象の ID を入れた具体的な path。保つ鍵とページが決める鍵の値、probe の目印を持たない。
+// T41b（Task 41 の設計書 3.2、8 章の「T41a・T41c の報告と設計者の判断」）: API の更新（UPDATE）のシナリオの、下書き → 承認 → 点検の登録の段 → 許可（同じ
+// 点検で照合まで済んだ登録）→ 更新の段の書き込みの指定が届く、までを、本物の管理データとジョブの管理（`createAuditJobManager`）と偽のワーカー
+// （`tests/helpers/fake-audit-worker.ts` の `chain`。本物の `fork`）で確かめる。ワーカーの更新の流れは T41d なので、ここでは書き込みの指定の中身だけを見る。
+// SLIM W-1: 単独で書き込みを始める口を外したので、点検（`tests/helpers/chain-write-support.ts`）を通す。
+// - 台帳は API の登録のシナリオ（ID を応答の本文の鍵 `id` から取る。filter の名前と同じ）。
+// - 書き込みの指定: ジョブの種類 `WRITE_UPDATE`、`api` はシナリオの API の指定のまま、`values` は変える鍵だけ、`update: { targetRecordId }`、書き込みの画面は
+//   台帳の画面の path の型に対象の ID を入れた具体的な path。保つ鍵の値は台帳の登録で送った値（BeakSight が作ったテストの値）、probe の目印を持たない。
 // - 発行の確かめ直し: 台帳の ID の鍵を filter の名前と違う鍵に替えると、`SCENARIO_API_FILTER_NOT_BOUND_TO_LEDGER_ID` で許可を出さない。
 // 管理データと出力先は一時のフォルダだけを使う。起動したワーカーは、すべて止まったことを確かめる。値は匿名の合成のテストデータだけ。
 import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
@@ -15,7 +16,6 @@ import {
   approveScenario,
   createScenario,
   issueExecutionGrant,
-  readPlannedUpdateTarget,
   readScenario,
   readScenarioApprovalStatus,
   updateScenario,
@@ -24,6 +24,7 @@ import {
 import { FORM_NAVIGATION_SETUP_ITEMS } from '../helpers/auth-setup-samples.js';
 import {type AuthSetup } from '../../src/control/auth/auth-setup-contracts.js';
 import { MIN_PROFILE_REVISION } from '../../src/control/contracts.js';
+import { readAuditedDataLedger, readWriteResult } from '../../src/control/actions/write-result-facts.js';
 import { saveRuleSetAndAttach } from '../../src/control/data-rules/rule-store.js';
 import type { AuditJobManager } from '../../src/control/job/audit-job-manager.js';
 import { discoveryIndexEntryOf, recordDiscoveryCandidates } from '../../src/control/job/discovery-index-store.js';
@@ -43,25 +44,21 @@ import {
   type DiscoveryDocument,
 } from '../../src/discovery/discovery-result.js';
 import { observedSubmissionProbeOf, type SubmissionProbeInputField } from '../../src/discovery/submission-probe-contracts.js';
+import { chainWriteWorkerValues, runWriteChain, verifiedApiCreateRunText, writeStagesOf } from '../helpers/chain-write-support.js';
 import { writeFakeWorker, type FakeWorker } from '../helpers/fake-audit-worker.js';
 import { seedWriteResultForTest } from '../helpers/write-result-fixtures.js';
 import { createCountingFork } from '../helpers/worker-fork.js';
-import {
-  awaitWorkersExit,
-  createFakeWorkerJobManager,
-  fakeWorkerValuesOf,
-  isJobEnded,
-  waitForJob,
-  withOutputDirectory,
-  type JobViewSource,
-} from '../helpers/job-test-support.js';
+import { awaitWorkersExit, createFakeWorkerJobManager, withOutputDirectory } from '../helpers/job-test-support.js';
 import { ALL_CONFIRMED, candidateOf } from '../unit/approval-samples.js';
 import { NO_JS_BINDING, sampleButton } from '../unit/discovery-candidate-samples.js';
 import { TEST_ORIGIN, TEST_TARGET_PATH, resolveTestContext, testWriteProfile } from './control-profile-fixtures.js';
 
 const TEST_TIMEOUT_MS = 60_000;
+/** 点検の登録の段と更新の段の Run の ID。 */
 const FAKE_RUN_ID = 'RUN-20261018000000';
-const OTHER_RUN_ID = 'RUN-20261018000999';
+const UPDATE_RUN_ID = 'RUN-20261018000100';
+/** 点検の登録の段で取れる ID（台帳の登録 6・7 の後）。 */
+const CHAIN_CREATED_ID = '8';
 const OUTPUT_DIRECTORY = 'api-update-output';
 const TARGET_CONFIG_TEXT = JSON.stringify({ target: { id: 'example-api-update' } });
 const PROFILE_ID = 'example-api-update';
@@ -146,20 +143,32 @@ let manager: AuditJobManager | undefined;
 let facts: ApprovalExternalFacts;
 const forks = createCountingFork();
 
+const revisionOf = (scenarioId: string): number => readScenario(database, scenarioId)?.revision ?? 0;
+
+/**
+ * 点検の偽のワーカー: 登録の段は照合まで済んだ記録を書き（取れた ID は `CHAIN_CREATED_ID`）、更新の段は書き込みの指定の中身だけを見るため、送信の報告も記録も
+ * 書かずに終わる（ワーカーの更新の流れは T41d）。
+ */
 const fakeWorker = (name: string): FakeWorker => {
   const directory = join(workDirectory, 'workers', name);
   mkdirSync(directory, { recursive: true });
-  return writeFakeWorker(directory, 'write', fakeWorkerValuesOf({ runId: FAKE_RUN_ID, otherRunId: OTHER_RUN_ID }, {
-    // `START` の中身だけを見る（ワーカーの更新の流れは T41d）。送信の報告も記録も書かずに終わる。
+  const api = readScenario(database, CREATE_ID)?.current.api;
+  if (api === undefined) {
+    throw new Error('the ledger has no API spec');
+  }
+  return writeFakeWorker(directory, 'chain', chainWriteWorkerValues({
+    outputDirectory: resolve(workDirectory, OUTPUT_DIRECTORY), discovery: DISCOVERY, writeRunId: FAKE_RUN_ID,
     write: {
-      outputDirectory: resolve(workDirectory, OUTPUT_DIRECTORY), recheck: 0, onReject: 'report', submission: null, actionRunText: null, end: 'crash', report: null,
+      outputDirectory: resolve(workDirectory, OUTPUT_DIRECTORY), runIds: [FAKE_RUN_ID, UPDATE_RUN_ID], recheck: 1, onReject: 'report',
+      submission: { submission: 'SENT', blockReason: null }, end: 'finish', report: null,
+      actionRunText: verifiedApiCreateRunText({
+        profileId: PROFILE_ID, scenarioId: CREATE_ID, scenarioRevision: revisionOf(CREATE_ID), api, runId: FAKE_RUN_ID, recordId: CHAIN_CREATED_ID, at: MANAGER_NOW,
+      }),
+      updateStage: { submission: null, actionRunText: null, end: 'crash' },
     },
   }));
 };
 
-const currentManager: JobViewSource = { getAuditJob: (jobId) => manager?.getAuditJob(jobId) ?? null };
-
-const revisionOf = (scenarioId: string): number => readScenario(database, scenarioId)?.revision ?? 0;
 
 const draftOf = (candidate: DiscoveryCandidate, fieldNames: readonly string[], api: Record<string, unknown>, expectedField: string) => ({
   profileId: PROFILE_ID,
@@ -171,7 +180,7 @@ const draftOf = (candidate: DiscoveryCandidate, fieldNames: readonly string[], a
   limits: { maxCreatesPerRun: 1, maxCumulativeCreates: 20 },
   approvalTtlDays: 30,
   verification: {
-    successCondition: null, inputErrorCondition: null, recordId: null,
+    resultJudgement: null, recordId: null,
     readVerification: { readCheckId: READ_CHECK_ID, revision: 1, bindings: [], expectations: [{ kind: 'TEXT_CONTAINS', fieldName: expectedField }] },
   },
   api: { shapeDigest: candidate.submissionProbe?.shapeDigest ?? '', pageKeys: [], filterName: null, recordId: null, ledger: null, ...api },
@@ -270,15 +279,8 @@ afterEach(async () => {
   rmSync(workDirectory, { recursive: true, force: true });
 });
 
-describe('T41b: an API UPDATE from the grant to the START', () => {
-  it('issues a grant on the latest verified registration of the ledger and sends the agreed START of the API UPDATE', async () => {
-    expect(readPlannedUpdateTarget(database, UPDATE_ID)).toBe(REGISTERED_IDS[1]);
-    const issued = issueExecutionGrant(database, {
-      scenarioId: UPDATE_ID, expectedRevision: revisionOf(UPDATE_ID), grantId: 'grant-u1', jobId: 'job-u1', count: 1, external: facts, at: ISSUE_AT,
-      expectedTargetRecordId: REGISTERED_IDS[1],
-    });
-    expect(issued).toMatchObject({ ok: true, grant: { targetRecordId: REGISTERED_IDS[1], reservation: { state: 'RESERVED' } } });
-
+describe('T41b: an API UPDATE from the grant to the write specification', () => {
+  it('issues a grant on the registration verified in the same inspection and sends the agreed write specification of the API UPDATE', async () => {
     const worker = fakeWorker('api-update');
     manager = createFakeWorkerJobManager({
       database,
@@ -288,26 +290,25 @@ describe('T41b: an API UPDATE from the grant to the START', () => {
       forkWorker: forks.fork,
       now: () => dateOfCompactUtcTimestamp(MANAGER_NOW),
     });
-    const started = await manager.startWriteUpdate({ profileId: PROFILE_ID, expectedRevision: MIN_PROFILE_REVISION, scenarioId: UPDATE_ID, grantId: 'grant-u1' });
-    if (!started.ok) {
-      throw new Error(`the API update job did not start: ${started.reason}`);
-    }
-    await waitForJob(currentManager, started.job.jobId, (job) => isJobEnded(job) && (manager?.runningWorkerCount() ?? 0) === 0);
-    const start = worker.received().find((message) => message['type'] === 'START');
+    const { writeJobs } = await runWriteChain(manager, PROFILE_ID, MIN_PROFILE_REVISION);
+    const created = readWriteResult(database, writeJobs[0]?.jobId ?? '');
+    expect(created).toMatchObject({ writeKind: 'CREATE', result: 'VERIFIED', recordId: CHAIN_CREATED_ID });
+    const [, start] = writeStagesOf(worker.received());
+    const grantId = readWriteResult(database, writeJobs[1]?.jobId ?? '')?.grantId;
     const api = readScenario(database, UPDATE_ID)?.current.api;
     expect(start).toMatchObject({
       jobKind: 'WRITE_UPDATE',
       write: {
         transport: 'API',
         scenarioId: UPDATE_ID,
-        grantId: 'grant-u1',
-        formPage: { origin: TEST_ORIGIN, path: `/admin/members/${REGISTERED_IDS[1]}/edit` },
+        grantId,
+        formPage: { origin: TEST_ORIGIN, path: `/admin/members/${CHAIN_CREATED_ID}/edit` },
         // T41R2-fix-B・T41R3-fix-B: 台帳の登録で送った保つ鍵（メールと点数）の最後に分かっている値（BeakSight が作ったテストの値）。
         update: {
-          targetRecordId: REGISTERED_IDS[1],
-          knownKeptValues: [{ key: 'email', value: 'sample0001@example.invalid' }, { key: 'score', value: '1' }],
+          targetRecordId: CHAIN_CREATED_ID,
+          knownKeptValues: [{ key: 'email', value: created?.submittedValues['email'] }, { key: 'score', value: '1' }],
         },
-        verification: { successCondition: null, inputErrorCondition: null, recordId: null },
+        verification: { resultJudgement: null, recordId: null },
         readVerification: { definition: { targetPagePath: TEMPLATE_PATH } },
       },
     });
@@ -347,5 +348,23 @@ describe('T41b: an API UPDATE from the grant to the START', () => {
       scenarioId: UPDATE_ID, expectedRevision: revisionOf(UPDATE_ID), grantId: 'grant-u2', jobId: 'job-u2', count: 1, external: facts, at: ISSUE_AT,
       expectedTargetRecordId: REGISTERED_IDS[1],
     })).toMatchObject({ ok: false, reason: 'SCENARIO_API_FILTER_NOT_BOUND_TO_LEDGER_ID' });
+  });
+  // OP-H（撮影 UI-W4 の不具合 1）: API の UPDATE の書き込みの後も、作ったデータの一覧（台帳）が読める。API の UPDATE の台帳の参照は `api.ledger`
+  // （唯一の決まり `updateLedgerScenarioIdOf`）。更新は、台帳の登録の同じ ID の行にだけ数える。
+  it('reads the audited data ledger after an API UPDATE write, counting it on the registration of its ledger', () => {
+    seedWriteResultForTest(database, {
+      profileId: PROFILE_ID, scenarioId: UPDATE_ID, scenarioRevision: revisionOf(UPDATE_ID), grantId: 'grant-u3', jobId: 'job-u3',
+      external: facts, at: ISSUE_AT, submittedValues: { name: '更新一郎' }, expectedTargetRecordId: REGISTERED_IDS[1],
+      report: {
+        submission: 'SENT', blockReason: null, httpStatus: 200, responseJudgement: 'SUCCESS', recordId: REGISTERED_IDS[1], readVerification: 'MATCHED',
+        submittedAt: ISSUE_AT,
+        updateEvidence: { fields: [{ fieldName: 'name', role: 'CHANGED', previousValue: '登録 1', newValue: '更新一郎', matched: true }] },
+      },
+    });
+    const ledger = readAuditedDataLedger(database, PROFILE_ID);
+    expect(ledger.map(({ jobId, recordId, updates }) => [jobId, recordId, updates.count, updates.last?.jobId ?? null])).toEqual([
+      ['job-c1', REGISTERED_IDS[1], 1, 'job-u3'],
+      ['job-c0', REGISTERED_IDS[0], 0, null],
+    ]);
   });
 });

@@ -1,6 +1,6 @@
 // T27d（Task 27 の設計書 4.4、4.6 と、変更履歴の「T27b・T27c の報告と T27d の前の判断」「Blocker: T27d」の行）: 発見のジョブ（`DISCOVERY`）の、
 // ジョブの管理（`createAuditJobManager` の `startDiscovery` と、ジョブの終わりの索引の更新）を、偽のワーカー（`tests/helpers/fake-audit-worker.ts`
-// の `discovery` の動き）を本物の `fork` で起動して確かめる（本物のワーカーと Chromium での端から端は `discovery-job-fork.test.ts`）。
+// の `discovery` の動き）を本物の `fork` で起動して確かめる（本物の Chromium での発見の流れは `discovery-run.test.ts`、画面からの端から端は `full-flow.test.ts`）。
 // - 開始の確かめは監査と同じ（プロファイルが `TEST_AUTH_PASSIVE`、認証の設定が `CURRENT`）。公開の監査のプロファイルは拒む。`START` は
 //   `DISCOVERY` の種類と、認証の指定（種類を含む SHA-256）を持つ。
 // - ジョブの終わり: 親が `discovery.json` を読み、スキーマ・ジョブの ID・Run の ID・件数の要約で確かめ、同じ識別の digest の候補をまとめて
@@ -238,9 +238,11 @@ describe('discovery jobs (T27d): the start', () => {
   });
 
   // T28b（Task 28 の設計書 2 章のユーザーの判断 1、4.5）: 書き込みのモード（`TEST_APPROVED_WRITE`）のプロファイルでも、認証の設定を保存して、発見の
-  // ジョブを始められる（確かめは認証つきの読み取りの監査と同じ）。認証つきの監査（`AUDIT`）は、今までどおり `MODE_NOT_EXECUTABLE` で、ワーカーを
-  // 起動しない。
-  it('saves the auth setup of a write mode profile, starts its DISCOVERY job, and still rejects its AUDIT (T28b)', async () => {
+  // ジョブを始められる（確かめは認証つきの読み取りの監査と同じ）。手動のログインなので、ログインの確かめは方式の理由で拒み、ワーカーを起動しない。
+  // MI-5（設計書 `2026-10-26-beaksight-minimal-input-ux-design.md` 4.5）: 認証つきの監査（`AUDIT`）は、書き込みのモードでも始められるようになったので、
+  // ここで拒むことは確かめない（書き込みのモードの監査の開始の確かめは `control-audit-jobs.test.ts`、送信の扱いがモードを見ないことは
+  // `tests/unit/audit-send-settings.test.ts`）。
+  it('saves the auth setup of a write mode profile, starts its DISCOVERY job, and rejects its LOGIN_CHECK (T28b)', async () => {
     expect(createProfile(database, testWriteProfile(WRITE_PROFILE_ID, MIN_PROFILE_REVISION), { resolveContext: resolveTestContext }).ok).toBe(true);
     expect(saveAuthSetup(database, { ...SETUP, profileId: WRITE_PROFILE_ID }, { resolveContext: resolveTestContext })).toMatchObject({ ok: true });
     const ended = await runDiscoveryJob('write-mode', okDocument([readEntry('/admin', [BUTTON])]), 'discovery', countingFork, WRITE_PROFILE_ID);
@@ -249,8 +251,6 @@ describe('discovery jobs (T27d): the start', () => {
       .toMatchObject({ jobKind: 'DISCOVERY', authentication: { approvedTestOrigins: [TEST_ORIGIN] } });
     expect(readDiscoveryIndex(database, WRITE_PROFILE_ID).candidates.map(({ identityDigest }) => identityDigest)).toEqual([BUTTON.identityDigest]);
     expect(forks.count()).toBe(1);
-    expect(await manager?.startAuditJob({ profileId: WRITE_PROFILE_ID, expectedRevision: MIN_PROFILE_REVISION, startNew: true }))
-      .toEqual({ ok: false, reason: 'MODE_NOT_EXECUTABLE', errors: [] });
     expect(await manager?.startLoginCheck({ profileId: WRITE_PROFILE_ID, expectedRevision: MIN_PROFILE_REVISION }))
       .toEqual({ ok: false, reason: 'AUTH_STRATEGY_NOT_EXECUTABLE', errors: [] });
     expect(forks.count()).toBe(1);
@@ -272,13 +272,14 @@ describe('discovery jobs (T27d): recording discovery.json into the index at the 
     expect(index.latestReadPagePaths).toEqual(['/admin', '/admin/items', '/admin/items/new']);
     expect(Object.fromEntries(index.candidates.map(({ identityDigest, classification, reasonCode, drift }) => [identityDigest, [classification, reasonCode, drift]])))
       .toEqual({
-        [BUTTON.identityDigest]: ['DISPLAY_ONLY', 'NO_KNOWN_ACTION', 'NEW'],
-        [SEARCH.identityDigest]: ['DISPLAY_ONLY', 'DUPLICATE_IDENTITY_CONFLICT', 'NEW'],
-        [CREATE.identityDigest]: ['CREATE', 'CREATE_WORD', 'NEW'],
+        [BUTTON.identityDigest]: ['DISPLAY_ONLY', 'NO_KNOWN_ACTION', 'SEEN'],
+        [SEARCH.identityDigest]: ['DISPLAY_ONLY', 'DUPLICATE_IDENTITY_CONFLICT', 'SEEN'],
+        [CREATE.identityDigest]: ['CREATE', 'CREATE_WORD', 'SEEN'],
       });
   });
 
-  it('tells UNCHANGED, CHANGED, MISSING (pages read again) and NOT_REVISITED (pages not read) in the next job', async () => {
+  // SPEC-1: drift は SEEN・MISSING・NOT_REVISITED の 3 通り（前の UNCHANGED・CHANGED は SEEN にまとめた）。
+  it('tells SEEN, MISSING (pages read again) and NOT_REVISITED (pages not read) in the next job', async () => {
     await runDiscoveryJob('base', okDocument([
       readEntry('/admin', [BUTTON]),
       readEntry('/admin/items', [SEARCH]),
@@ -293,8 +294,8 @@ describe('discovery jobs (T27d): recording discovery.json into the index at the 
     expect(second).toMatchObject({ state: 'FINISHED', resultRunStatus: 'PARTIAL' });
     expect(driftsOf()).toEqual({
       [BUTTON.identityDigest]: 'MISSING',
-      [SEARCH.identityDigest]: 'CHANGED',
-      [CREATE.identityDigest]: 'UNCHANGED',
+      [SEARCH.identityDigest]: 'SEEN',
+      [CREATE.identityDigest]: 'SEEN',
       [OTHER_BUTTON.identityDigest]: 'NOT_REVISITED',
     });
   });

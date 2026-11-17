@@ -33,7 +33,6 @@ export const CANDIDATE_FIELD_TYPES = Object.freeze([
 export type CandidateFieldType = (typeof CANDIDATE_FIELD_TYPES)[number];
 
 /**
- * 連絡先の欄の型（メールアドレスと電話番号。Task 31 の判断 3）。画面の UPDATE の入力（form と API）が、既定で保つことを近くで知らせる欄の型
- * （T41e。`ScenarioUpdateFields.tsx`・`ScenarioApiFields.tsx`）。
+ * 連絡先の欄の型（メールアドレスと電話番号。Task 31 の判断 3）。SPEC-4 で、これを使った更新の入力の画面は外した（今は契約の一覧として公開するだけ）。
  */
 export const CONTACT_CANDIDATE_FIELD_TYPES = Object.freeze(['email', 'tel'] as const satisfies readonly CandidateFieldType[]);

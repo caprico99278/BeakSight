@@ -6,16 +6,6 @@ import {
   type ConsoleMessageEvidence,
   type PageErrorEvidence,
 } from '../core/evidence-types.js';
-import {
-  MAX_CONSOLE_MESSAGES,
-  MAX_CONSOLE_TEXT_LENGTH,
-  MAX_ERROR_MESSAGE_LENGTH,
-  MAX_ERROR_NAME_LENGTH,
-  MAX_PAGE_ERRORS,
-  MAX_STACK_LENGTH,
-  MAX_URL_LENGTH,
-} from '../core/limits.js';
-import { truncateText } from '../core/text.js';
 import { createCollectorHandle, type CollectorHandle } from './collector-handle.js';
 
 function copyConsoleMessage(message: ConsoleMessageEvidence): ConsoleMessageEvidence {
@@ -37,24 +27,17 @@ function readStringProperty(target: object, key: string): string | null {
 }
 
 /**
- * pageerror の値を、例外を投げずに上限付きの Evidence にする。
+ * pageerror の値を、例外を投げずに Evidence にする。
  * 名前を読めない場合は空文字列、stack を読めない場合は `null` にする。メッセージは `safeErrorMessage` で読む。
+ * LZ-2: 名前・メッセージ・stack の長さの上限（前は 256・2,048・8,192）は置かない。切り詰めない（`truncated` は前の記録の形のために残し、いつも偽）。
  */
 function pageErrorEvidence(error: unknown): PageErrorEvidence {
   const source = typeof error === 'object' && error !== null ? error : null;
-  const name = truncateText(
-    (source === null ? null : readStringProperty(source, 'name')) ?? '',
-    MAX_ERROR_NAME_LENGTH,
-  );
-  // 切り詰めたかどうかを知るため、全文を読んでから上限で切り詰める。
-  const message = truncateText(safeErrorMessage(error, Number.MAX_SAFE_INTEGER), MAX_ERROR_MESSAGE_LENGTH);
-  const rawStack = source === null ? null : readStringProperty(source, 'stack');
-  const stack = rawStack === null ? null : truncateText(rawStack, MAX_STACK_LENGTH);
   return Object.freeze({
-    name: name.text,
-    message: message.text,
-    stack: stack?.text ?? null,
-    truncated: name.truncated || message.truncated || (stack?.truncated ?? false),
+    name: (source === null ? null : readStringProperty(source, 'name')) ?? '',
+    message: safeErrorMessage(error),
+    stack: source === null ? null : readStringProperty(source, 'stack'),
+    truncated: false,
   });
 }
 
@@ -62,8 +45,10 @@ export class ConsoleCollector {
   static attach(page: Page): CollectorHandle<ConsoleEvidence> {
     const consoleMessages: ConsoleMessageEvidence[] = [];
     const pageErrors: PageErrorEvidence[] = [];
-    let omittedConsoleMessageCount = 0;
-    let omittedPageErrorCount = 0;
+    // L2（設計書 `2026-11-09-beaksight-remove-limits-design.md` 4、INV-LIMITS の表 A の N8）: 件数の上限（`MAX_CONSOLE_MESSAGES`・`MAX_PAGE_ERRORS`）を
+    // 置かず、全部を記録する。省いた数の欄は、形を保つために残し、常に 0。
+    const omittedConsoleMessageCount = 0;
+    const omittedPageErrorCount = 0;
 
     const onConsole = (message: ConsoleMessage): void => {
       const messageType = message.type();
@@ -71,29 +56,21 @@ export class ConsoleCollector {
       if (type === undefined) {
         return;
       }
-      if (consoleMessages.length >= MAX_CONSOLE_MESSAGES) {
-        omittedConsoleMessageCount += 1;
-        return;
-      }
       const location = message.location();
-      const text = truncateText(message.text(), MAX_CONSOLE_TEXT_LENGTH);
-      const url = truncateText(location.url, MAX_URL_LENGTH);
       consoleMessages.push(Object.freeze({
         type,
-        text: text.text,
+        // LZ-2: 文は切り詰めない（前は 2,048 まで。`truncated` は前の記録の形のために残し、いつも偽）。
+        text: message.text(),
         location: Object.freeze({
-          url: url.text,
+          // URL-LEN: 場所の URL は切り詰めない（前は 2,048 までに切り詰めた）。
+          url: location.url,
           lineNumber: location.lineNumber,
           columnNumber: location.columnNumber,
         }),
-        truncated: text.truncated || url.truncated,
+        truncated: false,
       }));
     };
     const onPageError = (error: Error): void => {
-      if (pageErrors.length >= MAX_PAGE_ERRORS) {
-        omittedPageErrorCount += 1;
-        return;
-      }
       pageErrors.push(pageErrorEvidence(error));
     };
 

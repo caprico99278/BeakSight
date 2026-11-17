@@ -23,10 +23,9 @@
 import type { AuditSendPolicyName } from '../core/audit-send-policy.js';
 import type { JobSafetyViolation, RunAuthenticationSummary, RunStatus } from '../core/contracts.js';
 import type { SessionLossEvidence } from '../core/evidence-types.js';
-import { MAX_URL_LENGTH } from '../core/limits.js';
 import { isSecretUrlQueryParameterName } from '../core/secret-query-names.js';
 import { deriveRunStatus } from '../core/status.js';
-import { normalizeWhitespace, truncateWellFormed } from '../core/text.js';
+import { normalizeWhitespace, replaceLoneSurrogates } from '../core/text.js';
 import { READ_CANDIDATE_CLASSIFICATION, type CandidateLocation, type DiscoveryCandidate } from './candidate-contracts.js';
 import { readParametersHaveDestructiveWord } from './classify.js';
 import { authenticationSummaryPartOf, mergeDiscoveryCandidates, safetyViolationSummaryPartOf, type JobEndReasonDetail } from './discovery-result.js';
@@ -110,6 +109,10 @@ export type ReadCheckEvidenceState = (typeof READ_CHECK_EVIDENCE_STATES)[number]
  * - `RESULT_PAGE_UNREADABLE`: READ の URL は読み込めたが、構造を読めなかった（読み取りの失敗、時間切れ）→ `UNDETERMINED`。
  * - `SESSION_LOST`: READ の URL の読み込みで、セッションの切れを見つけた → `UNDETERMINED`（ジョブは止まる）。T37d: ログインの状態の鍵の消失も
  *   これ（ジョブの終わり方の詳しい理由が `session-key`）。
+ * - `RECORD_ID_NOT_AVAILABLE`（DEF-235）: 番号の入る画面の path の型の定義で、番号の元（読めた画面、点検の段のリンク、作った登録）にも、一覧の画面のリンクにも、
+ *   型に当たる番号がなかった（見る登録がまだない）→ `UNDETERMINED`（断らない。利用者に番号を求めない）。
+ * - `STAGE_UNRESPONSIVE`・`STAGE_NEVER_QUIET`（L4。L0 の進みの見張り `src/core/progress-watch.ts`）: READ の URL の構造の読み取りで、ブラウザからもページからも全く
+ *   反応がなかった（応答しなかった）、またはページの自発の変化だけが続いた（静まらない）ので、読み取りを終えた → `UNDETERMINED`（ほかの定義へ進む）。
  * - `SERVICE_READ_REFUSED`（T37d。Task 37 の設計書 3.5）: 読んで照らしたが、その読み込みの間に、上限で断った承認したサービスの Origin への要求か、
  *   サービスの Origin の 401 があった（データが描けなかったかもしれない）→ 照らした結果に関係なく `UNDETERMINED`。
  * - `AUDIT_STAGE_REQUEST_BLOCKED`（T37d）: 読んで照らしたが、その読み込みの間に、登録した読み取りの手続きの呼び出しを回数の上限か送り方で止めたか、
@@ -131,6 +134,9 @@ export const READ_CHECK_DETAILS = Object.freeze([
   'HTTP_ERROR_STATUS',
   'RESULT_PAGE_UNREADABLE',
   'SESSION_LOST',
+  'RECORD_ID_NOT_AVAILABLE',
+  'STAGE_UNRESPONSIVE',
+  'STAGE_NEVER_QUIET',
   'SERVICE_READ_REFUSED',
   'AUDIT_STAGE_REQUEST_BLOCKED',
 ] as const);
@@ -158,6 +164,9 @@ export const READ_CHECK_DETAIL_RESULTS: Readonly<Record<ReadCheckDetail, ReadChe
   HTTP_ERROR_STATUS: 'UNDETERMINED',
   RESULT_PAGE_UNREADABLE: 'UNDETERMINED',
   SESSION_LOST: 'UNDETERMINED',
+  RECORD_ID_NOT_AVAILABLE: 'UNDETERMINED',
+  STAGE_UNRESPONSIVE: 'UNDETERMINED',
+  STAGE_NEVER_QUIET: 'UNDETERMINED',
   SERVICE_READ_REFUSED: 'UNDETERMINED',
   AUDIT_STAGE_REQUEST_BLOCKED: 'UNDETERMINED',
 });
@@ -193,11 +202,9 @@ export type ReadRowSource = (typeof READ_ROW_SOURCES)[number];
 // 上限
 // ---------------------------------------------------------------------------------------------------------------
 
-/** 成果物に書く、構造ごとの行の数の一覧の最大の件数（表と一覧のそれぞれ。超えた分は書かない。構造の数は `tables`・`lists` が持つ）。 */
-export const MAX_READ_EVIDENCE_STRUCTURE_COUNTS = 50;
+// L4（INV-LIMITS の N33）: 成果物に書く、構造ごとの行の数の一覧の件数の上限（前は 50）は撤廃した（定数は LZ-1 で消した）。
 
-/** 成果物に書く、照らした詳細の項目の取れた値の最大長（UTF-16 のコード単位）。期待の値の上限と同じ。 */
-export const MAX_READ_EVIDENCE_OBSERVED_TEXT_LENGTH = 256;
+// LZ-2: 成果物に書く、照らした詳細の項目の取れた値の長さの上限（前は `MAX_READ_EVIDENCE_OBSERVED_TEXT_LENGTH` 256）は撤廃した（切り詰めない）。
 
 // ---------------------------------------------------------------------------------------------------------------
 // ページの構造（`read-executor.ts` が読む）
@@ -274,7 +281,7 @@ export type ReadExpectationEvidence =
     readonly expectation: Extract<ReadCheckExpectation, { readonly kind: 'DETAIL_FIELD_EQUALS' }>;
     readonly result: ReadExpectationResult;
     readonly undeterminedReason: ReadExpectationUndeterminedReason | null;
-    /** その項目の取れた値（`MAX_READ_EVIDENCE_OBSERVED_TEXT_LENGTH` で切る。項目がない・判定できなければ null）。 */
+    /** その項目の取れた値（LZ-2: 切らない。項目がない・判定できなければ null）。 */
     readonly observedValue: string | null;
   };
 
@@ -315,18 +322,25 @@ export type ReadCheckExecutedEvidence = ReadCheckEvidenceTarget & {
   /** 期待ごとの結果（読んで照らしたときだけ。定義の順）。 */
   readonly expectations: readonly ReadExpectationEvidence[];
   /**
-   * DEF-129: READ の URL を読み込んだときの、Guard が通した main frame の文書の要求の数（BeakSight 自身の読み込み、リダイレクトの続き、ページが始めた
-   * 読み込みを含む）。読み込まなかった定義と、前の書き手の成果物にはない。ページが始めた読み込みを上限で止めた画面は、落ち着いていない画面として照らす。
+   * DEF-129・T37R2-fix・DEF-130-fix: READ の URL を読み込んだときの、Guard が通した main frame の文書・子の frame の文書・文書でない要求の数。SPEC-1 で
+   * 書くのをやめた（どの表示も読まなかった）。前の書き手の成果物を読むために型だけ残す。
    */
   readonly documentRequests?: number;
-  /** T37R2-fix: 同じ読み込みの、Guard が通した子の frame の文書の要求の数（別の数）。`documentRequests` と同じく、読み込まなかった定義と前の書き手の成果物にはない。 */
   readonly childFrameDocumentRequests?: number;
-  /**
-   * DEF-130-fix: 同じ読み込みの、Guard が通した文書でない要求の数（別の数）。`documentRequests` と同じく、読み込まなかった定義と前の書き手の成果物には
-   * ない。文書でない要求を上限で止めた画面は、落ち着いていない画面として照らす。
-   */
   readonly subresourceRequests?: number;
+  /**
+   * DEF-235: 番号の入る画面の path の型の定義を、番号を埋めて読んだときの、番号ごとの結果（読んだ順）。定義の結果（上の項目）は、この中の代表
+   * （`readCheckRecordsEvidenceOf`）。番号を埋めて読まなかった定義にはない。
+   */
+  readonly records?: readonly ReadCheckRecordEvidence[];
 };
+
+/** DEF-235: 番号を埋めて読んだ 1 回の結果（番号は URL に入る。ArtifactWriter が書くときに URL の伏せ字を通す）。 */
+export type ReadCheckRecordEvidence = Pick<
+  ReadCheckExecutedEvidence,
+  'result' | 'detail' | 'url' | 'httpStatus' | 'blockedRequests' | 'structure' | 'expectations'
+  | 'documentRequests' | 'childFrameDocumentRequests' | 'subresourceRequests'
+>;
 
 /** 確かめなかった定義 1 件（止まった後の残り）。 */
 export type ReadCheckNotExecutedEvidence = ReadCheckEvidenceTarget & {
@@ -428,7 +442,8 @@ export type ReadCheckUrlBuild =
  * 名前は使わない（GET の form は、送るときに送信先の query を置き換える）。
  * - 秘密に見える名前があれば、組み立てない（`SECRET_LIKE_PARAMETER`）。
  * - 名前か値が、発見の分類の危険な語に当たれば、組み立てない（`PARAMETER_DANGEROUS_WORD`。T27R-fix-1。DEF-088 の (b)）。
- * - 組み立てた URL の Origin と path が送信先と違う（path が `//` で始まるなど）、http(s) でない、長さが `MAX_URL_LENGTH` を超える → `URL_NOT_BUILT`。
+ * - 組み立てた URL の Origin と path が送信先と違う（path が `//` で始まるなど）、http(s) でない → `URL_NOT_BUILT`。URL-LEN: 長さでは拒まない（前は 2,048
+ *   を超えたら `URL_NOT_BUILT`）。
  */
 export const buildReadCheckUrl = (action: CandidateLocation, parameters: ReadCheckParameters): ReadCheckUrlBuild => {
   const names = Object.keys(parameters);
@@ -453,8 +468,7 @@ export const buildReadCheckUrl = (action: CandidateLocation, parameters: ReadChe
     search.append(name, parameters[name] ?? '');
   }
   const query = search.toString();
-  const built = `${url.origin}${url.pathname}${query.length > 0 ? `?${query}` : ''}`;
-  return built.length > MAX_URL_LENGTH ? Object.freeze({ ok: false, detail: 'URL_NOT_BUILT' }) : Object.freeze({ ok: true, url: built });
+  return Object.freeze({ ok: true, url: `${url.origin}${url.pathname}${query.length > 0 ? `?${query}` : ''}` });
 };
 
 // ---------------------------------------------------------------------------------------------------------------
@@ -553,7 +567,7 @@ const evaluateSettledReadExpectation = (structure: ReadPageStructure, expectatio
         expectation,
         result: matchedOf(observed === readTextForComparison(expectation.value)),
         undeterminedReason: null,
-        observedValue: truncateWellFormed(observed, MAX_READ_EVIDENCE_OBSERVED_TEXT_LENGTH),
+        observedValue: replaceLoneSurrogates(observed),
       });
     }
   }
@@ -619,13 +633,42 @@ export const withReadCheckAuditStageDetail = (
   ? evidence
   : Object.freeze({ ...evidence, result: 'UNDETERMINED', detail }));
 
+/**
+ * DEF-235（設計書 3.4）: 自動の下書きが作った型の定義（`read-check-record-ids.ts` の `isPageOpenedReadCheckDefinition`）を READ の確かめの段で読んだ結果を、「画面が
+ * 開けた」で照らし直す（純粋）。読んで照らした結果（`EXPECTATIONS_EVALUATED`。2xx で、ログインの切れでなく、構造を読めた画面）は `MATCHED`（仮の期待の結果は
+ * 写さない）。読めなかった・エラーの状態・監査の段の詳しい理由のある結果は、そのまま返す。
+ */
+export const pageOpenedEvidenceOf = (evidence: ReadCheckExecutedEvidence): ReadCheckExecutedEvidence =>
+  (evidence.detail === 'EXPECTATIONS_EVALUATED' ? Object.freeze({ ...evidence, result: 'MATCHED', expectations: Object.freeze([]) }) : evidence);
+
+/** 1 回の結果を、番号ごとの結果の形にする（定義の ID・版・対象・状態・番号ごとの結果は写さない）。 */
+const readCheckRecordEvidenceOf = (evidence: ReadCheckExecutedEvidence): ReadCheckRecordEvidence => {
+  const { readCheckId: _id, readCheckRevision: _revision, targetKind: _kind, targetIdentityDigest: _digest, targetPagePath: _path, state: _state,
+    records: _records, ...record } = evidence;
+  return Object.freeze(record);
+};
+
+/**
+ * DEF-235: 番号ごとに読んだ結果（1 件以上。読んだ順）を、1 つの定義の結果にする（純粋）。定義の結果は代表の 1 回（`NOT_MATCHED` の最初、なければ `MATCHED` でない
+ * 最初、なければ最初）の項目で、番号ごとの結果をすべて `records` に持つ。管理データの `read_check_results` は、代表の結果を 1 行だけ記録する（表の形は変えない）。
+ */
+export const readCheckRecordsEvidenceOf = (evidences: readonly ReadCheckExecutedEvidence[]): ReadCheckExecutedEvidence => {
+  const [first] = evidences;
+  if (first === undefined) {
+    throw new RangeError('the record results of a READ check need at least one result');
+  }
+  const representative = evidences.find(({ result }) => result === 'NOT_MATCHED') ?? evidences.find(({ result }) => result !== 'MATCHED') ?? first;
+  return Object.freeze({ ...representative, records: Object.freeze(evidences.map(readCheckRecordEvidenceOf)) });
+};
+
 /** 構造の要約（件数だけ）。 */
 export const readStructureSummaryOf =(structure: ReadPageStructure): ReadStructureSummary => Object.freeze({
   region: structure.region,
   tables: structure.tableRowCounts.length,
-  tableRowCounts: Object.freeze(structure.tableRowCounts.slice(0, MAX_READ_EVIDENCE_STRUCTURE_COUNTS)),
+  // L4（INV-LIMITS の N33）: 構造ごとの数を、件数で切らずに全部書く（前は 50 件まで）。
+  tableRowCounts: Object.freeze([...structure.tableRowCounts]),
   lists: structure.listItemCounts.length,
-  listItemCounts: Object.freeze(structure.listItemCounts.slice(0, MAX_READ_EVIDENCE_STRUCTURE_COUNTS)),
+  listItemCounts: Object.freeze([...structure.listItemCounts]),
   detailFields: structure.detailEntries.length,
   textLength: readTextForComparison(structure.text).length,
   limitReached: structure.limitReached,

@@ -7,6 +7,7 @@ import type {
   PageId,
   RunCheckpointState,
   RunEnvironment,
+  RunExecutionAutomaticRelogin,
   RunExecutionEndReason,
   RunId,
   RunLoadOriginRequests,
@@ -14,12 +15,11 @@ import type {
   RunRetryRecord,
   RunStatus,
 } from '../core/contracts.js';
+import type { AuditPageScopeKind, RunPageScopeRecord } from '../core/audit-page-scope.js';
 import { safeErrorMessage } from '../core/errors.js';
 import type { EffectiveAuditConfig, NormalizedHttpUrlEvidence } from '../core/evidence-types.js';
 import { isRecord } from '../core/guards.js';
 import { deepFreeze } from '../core/immutable.js';
-import { MAX_ERROR_MESSAGE_LENGTH } from '../core/limits.js';
-import type { LockFileAcquisition, RunLock, RunLockTakeover } from '../core/process-lock.js';
 import { REDACTED } from '../core/redaction.js';
 import type { ArtifactValidationResult } from '../core/schema-validator.js';
 import { compareCodeUnits } from '../core/text.js';
@@ -31,9 +31,8 @@ import { IdAllocator, type IdAllocatorSnapshot } from './id-allocator.js';
 
 // 中断した Run の再開のための保存（チェックポイント）の内容の作成、整合の確かめ、再開できるかの判定、設定と版の比べ、再開する Run の選び方、
 // 実行の終わり方と保存の終わり方の判定（中断した Run の再開の設計書 3.2、4.1、4.2、4.3.2、4.7、4.7.1、4.8、5章。この意味の owner）。
-// - ロックの中身と判定、古いロックの取り直し（設計書 4.4）の owner は `src/core/process-lock.ts`（T24h-3 で移した）。ここは、今の名前で
-//   export し直すだけである。
-// - ファイルは読み書きしない。保存のファイルの読み書き、ロックのファイルの作成・更新・削除は `ArtifactWriter` が行う（ARCH08）。
+// - 監査中の印（出力先のロック。SPEC-2）の中身と判定の owner は `src/core/process-lock.ts`。保存はロックを持たない。
+// - ファイルは読み書きしない。保存のファイルの読み書きは `ArtifactWriter` が行う（ARCH08）。
 // - スキーマの検証（`validateArtifact('checkpoint' | 'checkpoint-page', …)`）も、保存のファイルを読み書きする `ArtifactWriter` が行う
 //   （ARCH08 の Gate で、`validateArtifact` を呼べる場所は限られているため。R2 の Blocker B1）。ここでは、スキーマの検証の済んだ値の、
 //   スキーマでは確かめられない整合だけを確かめる。
@@ -41,7 +40,8 @@ import { IdAllocator, type IdAllocatorSnapshot } from './id-allocator.js';
 /** `checkpoint/state.json` の `schemaVersion`（`schemas/checkpoint.schema.json`）。 */
 export const RUN_CHECKPOINT_SCHEMA_VERSION = 'checkpoint-schema/1.0';
 /** `checkpoint/pages/<pageId>.json` の `schemaVersion`（`schemas/checkpoint-page.schema.json`）。 */
-export const RUN_CHECKPOINT_PAGE_SCHEMA_VERSION = 'checkpoint-page-schema/1.0';
+/** REC-3: 1.1 は、`result` と `retryEvidence` をディスクの形（`page-schema/2.0`）で書く。1.0 の保存は読まない（新しく始める）。 */
+export const RUN_CHECKPOINT_PAGE_SCHEMA_VERSION = 'checkpoint-page-schema/1.1';
 
 /** 1回の実行（起動）の記録（設計書 4.8）。 */
 export interface RunCheckpointExecution {
@@ -53,6 +53,8 @@ export interface RunCheckpointExecution {
   readonly endReason: RunExecutionEndReason | null;
   /** その実行の環境（`run.json` の `environment` と同じ形）。 */
   readonly environment: RunEnvironment;
+  /** DEF-200: ログインし直して自動で始めた実行の印と回数（`run.json` の実行の記録と同じ。ほかは持たない）。 */
+  readonly automaticRelogin?: RunExecutionAutomaticRelogin;
 }
 
 /**
@@ -146,11 +148,21 @@ export interface RunCheckpoint {
   /** 監査を終えたページの ID（`checkpoint/pages/<pageId>.json` と対応する）。 */
   readonly completedPageIds: readonly PageId[];
   /**
+   * EV-5（設計書 `2026-11-16-beaksight-finding-evidence-design.md` 3.5）: 時間切れの後の再開で、確かめを待つ指摘が減らなくなるまで読み直したページの ID（読み直しを終えた順。
+   * 後の再開では読み直さない。`completedPageIds` にあるもの）。任意の項目で、ない保存（前の保存）は空とみなす（版は上げない）。
+   */
+  readonly revisitedPageIds?: readonly PageId[];
+  /**
    * Run の種類（T25g-2。独立レビュー T25R の Important I1）。認証つきの Run だけが持つ（認証の設定を区別する値。秘密を含まない）。
    * ない保存（公開監査の Run と、この項目より前の古い保存）は、公開監査の Run とみなす。再開する Run を選ぶ比べ（`selectRunToResume`）で比べ、
    * 今回の Run の種類と違えば再開しない。
    */
   readonly authentication?: RunCheckpointAuthentication;
+  /**
+   * WSO: 点検の範囲（「チェックした画面だけ」の Run だけが持つ。読む画面の数だけで、URL は持たない）。ない保存は、サイトの全部の画面の Run とみなす（版は上げない）。
+   * 再開する Run を選ぶとき、範囲が同じ Run だけを候補にする（`selectRunToResume`）。
+   */
+  readonly pageScope?: RunPageScopeRecord;
 }
 
 /**
@@ -213,8 +225,12 @@ export function createRunCheckpoint(input: RunCheckpointInput): RunCheckpoint {
     siteMetadata: input.siteMetadata,
     load: input.load,
     completedPageIds: input.completedPageIds,
+    // EV-5: 読み直しを終えたページがあるときだけ書く（ない保存の形は変えない）。
+    ...(input.revisitedPageIds === undefined || input.revisitedPageIds.length === 0 ? {} : { revisitedPageIds: input.revisitedPageIds }),
     // T25g-2: 認証つきの Run だけ、Run の種類を記録する（公開監査の保存の形は変えない）。
     ...(input.authentication === undefined ? {} : { authentication: { settingsDigest: input.authentication.settingsDigest } }),
+    // WSO: 範囲つきの Run だけ、範囲を記録する（サイトの全部の画面の保存の形は変えない）。
+    ...(input.pageScope === undefined ? {} : { pageScope: { kind: input.pageScope.kind, pageCount: input.pageScope.pageCount } }),
   }));
 }
 
@@ -283,15 +299,13 @@ const collectExecutionInconsistencies = (checkpoint: RunCheckpoint, errors: stri
 };
 
 /**
- * 作り直しの例外のメッセージ（`collectRestorationInconsistencies`）。巡回の記録の URL を伏せ字（`REDACTED`）にしてから、上限
- * （`MAX_ERROR_MESSAGE_LENGTH`）付きの文字列にする。`CrawlFrontier.restore` と `CrawlQueue.restore` は、同じ URL が2回ある場合のメッセージに
- * URL を入れるが、保存の整合の食い違いの文には、URL を入れないためである。長い URL から伏せる（ほかの URL を前の部分に含む URL を、残さない）。
- * 伏せる前に切り詰めると、URL の前の部分が残りうるので、切り詰めは伏せた後に行う。
+ * 作り直しの例外のメッセージ（`collectRestorationInconsistencies`）。巡回の記録の URL を伏せ字（`REDACTED`）にする（LZ-2: 切り詰めない）。
+ * `CrawlFrontier.restore` と `CrawlQueue.restore` は、同じ URL が2回ある場合のメッセージに URL を入れるが、保存の整合の食い違いの文には、
+ * URL を入れないためである。長い URL から伏せる（ほかの URL を前の部分に含む URL を、残さない）。
  */
 const restorationFailureMessage = (error: unknown, checkpoint: RunCheckpoint): string => {
   const urls = checkpoint.frontier.entries.map(({ url }) => url).sort((left, right) => right.length - left.length);
-  const message = urls.reduce((text, url) => text.replaceAll(url, REDACTED), safeErrorMessage(error, Number.MAX_SAFE_INTEGER));
-  return safeErrorMessage(message, MAX_ERROR_MESSAGE_LENGTH);
+  return urls.reduce((text, url) => text.replaceAll(url, REDACTED), safeErrorMessage(error));
 };
 
 /** 保存から作り直した採番器と巡回の記録（`restoreRunCheckpointCrawl` の結果）。 */
@@ -311,7 +325,10 @@ export interface RestoredRunCheckpointCrawl {
  * 監査の途中だった URL と、待ち行列に戻す理由の SKIPPED の URL は、`QUEUED` に戻る（設計書 3.2、4.2）。
  */
 export function restoreRunCheckpointCrawl(
-  checkpoint: Pick<RunCheckpoint, 'allocator' | 'frontier' | 'effectiveConfig'>,
+  // DEF-200: 操作さがしの状態の保存も、同じ作り直しを使う（読むのは巡回の深さの上限と残してよい query の名前だけ）。
+  checkpoint: Pick<RunCheckpoint, 'allocator' | 'frontier'> & {
+    readonly effectiveConfig: { readonly crawl: Pick<RunCheckpoint['effectiveConfig']['crawl'], 'maxDepth' | 'allowedQueryParameters'> };
+  },
   allocator: IdAllocator = IdAllocator.restore(checkpoint.allocator),
 ): RestoredRunCheckpointCrawl {
   const { maxDepth, allowedQueryParameters } = checkpoint.effectiveConfig.crawl;
@@ -370,6 +387,12 @@ export function checkRunCheckpointConsistency(checkpoint: RunCheckpoint): Artifa
       errors.push(`/completedPageIds/${index} (${pageId}) is not a page of the crawl frontier`);
     } else if (!AUDIT_FINISHED_CRAWL_URL_STATES.has(entry.state)) {
       errors.push(`/completedPageIds/${index} (${pageId}) has the crawl URL state ${entry.state}, not AUDITED or FAILED`);
+    }
+  });
+  // EV-5: 読み直しを終えたページは、終わったページの ID にある。
+  (checkpoint.revisitedPageIds ?? []).forEach((pageId, index) => {
+    if (!completed.has(pageId)) {
+      errors.push(`/revisitedPageIds/${index} (${pageId}) is not listed in /completedPageIds`);
     }
   });
   checkpoint.frontier.entries.forEach((entry, index) => {
@@ -813,8 +836,9 @@ const isNewerRun = (left: RunResumeCandidate, right: RunResumeCandidate): boolea
 /**
  * 再開する Run を選ぶ（設計書 4.7.1 の「選び方」。この意味の owner）。`runs` は、出力先の `state.json`（使えなければ `state.prev.json`）を
  * 読めた Run（終わった Run も含む）、`current` は今回の実効の設定（対象の ID は `current.target.id`）。
- * 1. 同じ対象（`checkpoint.effectiveConfig.target.id`）の Run のうち、最初の実行の開始（`checkpoint.startedAt`）が最も新しいもの1つだけを
- *    候補にする（同じ時刻なら、Run の ID がコード単位の順で後のもの）。ほかの対象の Run は無視する。候補がなければ `START_NEW`。
+ * 1. 同じ対象（`checkpoint.effectiveConfig.target.id`）で、同じ範囲（WSO。保存の `pageScope` と今回の `currentPageScope`。どちらもないのはサイトの全部の画面）の
+ *    Run のうち、最初の実行の開始（`checkpoint.startedAt`）が最も新しいもの1つだけを
+ *    候補にする（同じ時刻なら、Run の ID がコード単位の順で後のもの）。ほかの対象・ほかの範囲の Run は無視する。候補がなければ `START_NEW`。
  * 2. 候補の `decideRunResumption` が `NOT_RESUMABLE` なら `START_NEW`（古い途中の Run を、後で思いがけず再開しないため）。
  * 3. 候補の実効の設定が違えば（`effectiveConfigDifferences` の結果から、比べない項目 `RESUME_CONFIG_IGNORED_PATHS` を除いたものが空で
  *    ない）、`CONFIG_DIFFERS`（違う項目のパスを持つ。比べない項目は含めない）。Run の種類（保存の `authentication` と、今回の
@@ -828,9 +852,14 @@ export function selectRunToResume(
   runs: readonly RunResumeCandidate[],
   current: EffectiveAuditConfig,
   currentAuthentication: RunCheckpointAuthentication | null = null,
+  currentPageScope: AuditPageScopeKind | null = null,
 ): RunResumeSelection {
   let latest: RunResumeCandidate | null = null;
   for (const run of runs) {
+    // WSO: 範囲が違う Run（サイトの全部の画面と、チェックした画面だけ）は、互いの続きの候補にしない（新しい範囲の Run が、前の範囲の Run の続きを奪わない）。
+    if ((run.checkpoint.pageScope?.kind ?? null) !== currentPageScope) {
+      continue;
+    }
     if (run.checkpoint.effectiveConfig.target.id === current.target.id && (latest === null || isNewerRun(run, latest))) {
       latest = run;
     }
@@ -853,29 +882,13 @@ export function selectRunToResume(
     : Object.freeze({ kind: 'RESUME', candidate: latest, decision });
 }
 
-// ロックの中身と判定、古いロックの原子的な取り直しの手順の置き場所は `src/core/process-lock.ts`（T24h-3。画面のサーバのロックと共用する）。
-// 呼び出し側はそこを直接 import する（LG-4: ここからの export し直しは捨てた）。
-
 /**
- * `RunCheckpointStore.acquireRunLock` の結果（設計書 4.4）。形と意味は `src/core/process-lock.ts` の `LockFileAcquisition`（T24h-3 で移した）。
- * `ArtifactWriter` の `RunLockAcquisition` と同じ形である。
- */
-export type RunCheckpointLockAcquisition = LockFileAcquisition;
-
-/**
- * 保存とロックのファイルの書き手（設計書 4.3.1）。`ArtifactWriter` が形の上で満たす（満たすことは、テストの型の確かめで確かめる）。
+ * 保存のファイルの書き手（設計書 4.3.1）。`ArtifactWriter` が形の上で満たす（満たすことは、テストの型の確かめで確かめる）。
  * orchestration は report を import しないので、`ArtifactWriter` を型として参照しない。ファイルの読み書きは、書き手だけが行う（ARCH08）。
  * - `writeCheckpointPage`: ページの保存を `checkpoint/pages/<pageId>.json` に書き、Run のディレクトリからの相対パスを返す。
  * - `writeCheckpointState`: 状態の保存を `checkpoint/state.json` に書く（今の `state.json` は `state.prev.json` に移す）。
- * - `acquireRunLock`: `checkpoint/run.lock` を排他的に作る。すでにあれば、作らずにその中身を返す。
- * - `rewriteRunLock`: `checkpoint/run.lock` を、渡した中身でまるごと書き換える（ハートビート）。
- * - `readRunLock`: `checkpoint/run.lock` の中身を JSON として読んだ値を返す（ファイルがない、または JSON として読めなければ `null`。
- *   判定は `judgeRunLock`）。読むだけで、書かない（ほかの起動が同時に取り直したときに、今の中身を示すため。設計書 4.4）。
- * - `releaseRunLock`: `checkpoint/run.lock` を消す（なければ何もしない）。
  * - `cleanUpForResume`: 再開する前に、Run のディレクトリの中の、前の回の途中のもの（終わったページの一覧にないページのディレクトリ、
  *   書き出しの途中の一時ファイルなど）を消し、消したものの、Run のディレクトリからの相対パスを返す（設計書 4.5）。
- * - `takeOverRunLock`: 判定した古い `checkpoint/run.lock` を、原子的に取り直す（DEF-060。`RunLockTakeover`）。保存のセッションは、古いロックの
- *   取り直しにこれを使う（`takeOverStaleLock`）。LG-4: 必須（書き換えて読み直す前の方式は捨てた）。本番の `ArtifactWriter` は持つ。
  * 書けなかった場合は、どれも reject する。
  */
 /**
@@ -887,20 +900,7 @@ export interface RunCheckpointPageWriteOptions {
 }
 
 export interface RunCheckpointStore {
-  takeOverRunLock(runDirectory: string, judged: unknown, lock: RunLock): Promise<RunLockTakeover>;
   writeCheckpointPage(runDirectory: string, page: RunCheckpointPage, options?: RunCheckpointPageWriteOptions): Promise<string>;
   writeCheckpointState(runDirectory: string, state: RunCheckpoint): Promise<void>;
-  acquireRunLock(runDirectory: string, lock: RunLock): Promise<RunCheckpointLockAcquisition>;
-  rewriteRunLock(runDirectory: string, lock: RunLock): Promise<void>;
-  readRunLock(runDirectory: string): Promise<unknown>;
-  releaseRunLock(runDirectory: string): Promise<void>;
   cleanUpForResume(runDirectory: string, completedPageIds: readonly PageId[]): Promise<readonly string[]>;
-  /**
-   * SR-1-F5（SR-1R3 の M3）: 状態の保存（`state.json`、使えなければ `state.prev.json`）を、`checkState` の確かめを通して読む（省略できる。本番の
-   * `ArtifactWriter` は持つ）。保存のセッションは、再開の Run のロックを取った後に、再開を選んだときの保存と同じかを確かめるのに使う。
-   */
-  readCheckpointState?(
-    runDirectory: string,
-    checkState: (state: RunCheckpoint) => ArtifactValidationResult,
-  ): Promise<{ readonly ok: true; readonly state: RunCheckpoint } | { readonly ok: false }>;
 }

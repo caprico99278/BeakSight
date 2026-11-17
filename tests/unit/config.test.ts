@@ -4,17 +4,8 @@ import { join, resolve } from 'node:path';
 import { afterEach, describe, expect, it } from 'vitest';
 import { DEFAULT_CONFIG } from '../../src/config/defaults.js';
 import { ConfigError } from '../../src/config/config-error.js';
-import { loadConfig } from '../../src/config/load-config.js';
+import { OLD_HIDDEN_CRAWL_DEFAULTS, loadConfig } from '../../src/config/load-config.js';
 import { validateConfig } from '../../src/config/validate-config.js';
-import {
-  INTERACTION_PERSISTENCE_WINDOW_MS,
-  INTERACTION_STABILITY_WINDOW_MS,
-  INTERACTION_TIMEOUT_COUNT_PER_CANDIDATE,
-  MAX_CRAWL_MAX_PAGES,
-  MAX_URL_LENGTH,
-  MIN_INTERACTION_TIMEOUT_EXCLUSIVE_MS,
-} from '../../src/core/limits.js';
-import { INTERACTION_CANDIDATE_LIMITS } from '../../src/safety/interaction-policy.js';
 import { createTestConfig } from '../helpers/test-config.js';
 
 const temporaryDirectories: string[] = [];
@@ -24,6 +15,7 @@ const initialWorkingDirectory = process.cwd();
 const validConfig = () => createTestConfig('https://example.test', '/', {
   crawl: { minNavigationIntervalMs: DEFAULT_CONFIG.crawl.minNavigationIntervalMs },
 });
+const validBaseConfig = validConfig;
 
 const writeTargetConfig = async (path: string, id: string, extra: Record<string, unknown> = {}): Promise<void> => {
   await writeFile(path, JSON.stringify({
@@ -50,8 +42,6 @@ describe('configuration', () => {
     expect(DEFAULT_CONFIG.browser.timezone).toBe('Asia/Tokyo');
     expect(DEFAULT_CONFIG.viewports.primaryDesktop).toEqual({ width: 1440, height: 900 });
     expect(DEFAULT_CONFIG.viewports.primaryMobile).toEqual({ width: 390, height: 844 });
-    expect(DEFAULT_CONFIG.crawl.maxPages).toBe(500);
-    expect(DEFAULT_CONFIG.crawl.maxRuntimeMs).toBe(3_600_000);
     expect(DEFAULT_CONFIG.site).toEqual({ startUrl: '', allowedOrigins: [] });
   });
 
@@ -116,16 +106,12 @@ describe('configuration', () => {
     expect(result).toMatchObject({ ok: false, errors: [`crawl.${key} must be a positive integer`] });
   });
 
-  // T44R（Task 44 のレビューの M-3）: ページの上限には上限（名前つきの定数）を置く。サービスの Origin への要求の 1 回の Run の上限（ページの上限から作る）が、
-  // 安全な整数を超えないようにするため。
-  it('rejects crawl.maxPages above MAX_CRAWL_MAX_PAGES, and accepts the bound itself (T44R M-3)', () => {
+  // LZ-3a: ページの上限の上限（前は 100,000）は撤廃した。利用者が指定した正の整数をそのまま受ける。
+  it('accepts any positive integer for crawl.maxPages (LZ-3a)', () => {
     const config = validConfig();
-    expect(MAX_CRAWL_MAX_PAGES).toBe(100_000);
-    expect(validateConfig({ ...config, crawl: { ...config.crawl, maxPages: MAX_CRAWL_MAX_PAGES + 1 } }))
-      .toMatchObject({ ok: false, errors: [`crawl.maxPages must be at most ${MAX_CRAWL_MAX_PAGES}`] });
-    expect(validateConfig({ ...config, crawl: { ...config.crawl, maxPages: Number.MAX_SAFE_INTEGER } }))
-      .toMatchObject({ ok: false, errors: [`crawl.maxPages must be at most ${MAX_CRAWL_MAX_PAGES}`] });
-    expect(validateConfig({ ...config, crawl: { ...config.crawl, maxPages: MAX_CRAWL_MAX_PAGES } }).ok).toBe(true);
+    for (const maxPages of [100_001, Number.MAX_SAFE_INTEGER]) {
+      expect(validateConfig({ ...config, crawl: { ...config.crawl, maxPages } }).ok).toBe(true);
+    }
   });
 
   // P14a（Task 14〜17 の設計書 4.5.7）: 時間の設定は、正の整数に限る。`auditInteraction` などが正の整数を要求するため。
@@ -160,55 +146,6 @@ describe('configuration', () => {
     },
   );
 
-  // P14e（R14 の m2、Task 14〜17 の設計書 4.5.7）: Interaction が有効なら、ページの期限は、候補1つの見積もり
-  // （読み込みの期限 + 倍数 × Interaction の期限）以上でなければならない。満たさない設定では、候補を1つも監査できない。
-  describe('overallPageTimeoutMs and the Interaction candidate budget (R14 m2)', () => {
-    const overallPageTimeoutError = (requiredMs: number): string =>
-      `crawl.overallPageTimeoutMs must be at least crawl.navigationTimeoutMs + ${INTERACTION_TIMEOUT_COUNT_PER_CANDIDATE} `
-        + `x crawl.interactionTimeoutMs (${requiredMs} ms) when audit.interactions is enabled`;
-    const candidateBudgetMs = (crawl: { navigationTimeoutMs: number; interactionTimeoutMs: number }): number =>
-      crawl.navigationTimeoutMs + INTERACTION_TIMEOUT_COUNT_PER_CANDIDATE * crawl.interactionTimeoutMs;
-
-    it('accepts the default configuration, whose page deadline covers one Interaction candidate', () => {
-      expect(DEFAULT_CONFIG.audit.interactions).toBe(true);
-      expect(candidateBudgetMs(DEFAULT_CONFIG.crawl)).toBeLessThanOrEqual(DEFAULT_CONFIG.crawl.overallPageTimeoutMs);
-      expect(validateConfig(validConfig())).toMatchObject({ ok: true });
-    });
-
-    it('accepts a page deadline equal to the budget of one Interaction candidate', () => {
-      const config = validConfig();
-      const overallPageTimeoutMs = candidateBudgetMs(config.crawl);
-
-      expect(validateConfig({ ...config, crawl: { ...config.crawl, overallPageTimeoutMs } })).toMatchObject({ ok: true });
-    });
-
-    it('rejects a page deadline shorter than the budget of one Interaction candidate', () => {
-      const config = validConfig();
-      const requiredMs = candidateBudgetMs(config.crawl);
-      const result = validateConfig({ ...config, crawl: { ...config.crawl, overallPageTimeoutMs: requiredMs - 1 } });
-
-      expect(result).toMatchObject({ ok: false, errors: [overallPageTimeoutError(requiredMs)] });
-    });
-
-    it('rejects a long Interaction timeout that makes the budget exceed the default page deadline', () => {
-      const config = validConfig();
-      const crawl = { ...config.crawl, navigationTimeoutMs: 30_000, interactionTimeoutMs: 20_000 };
-      const result = validateConfig({ ...config, crawl });
-
-      expect(result).toMatchObject({ ok: false, errors: [overallPageTimeoutError(candidateBudgetMs(crawl))] });
-    });
-
-    it('accepts a short page deadline when audit.interactions is disabled', () => {
-      const config = validConfig();
-
-      expect(validateConfig({
-        ...config,
-        crawl: { ...config.crawl, overallPageTimeoutMs: candidateBudgetMs(config.crawl) - 1 },
-        audit: { ...config.audit, interactions: false },
-      })).toMatchObject({ ok: true });
-    });
-  });
-
   it.each([
     ['primaryDesktop', { width: 1440.5, height: 900 }],
     ['primaryDesktop', { width: 1440, height: 900.25 }],
@@ -242,41 +179,15 @@ describe('configuration', () => {
     },
   );
 
-  // F17（F16 の発見事項5）: 安定性の確認と持続の確認の時間を行えない、短すぎる Interaction の期限は、設定のエラーにする。
-  it('derives the lower bound of crawl.interactionTimeoutMs from the stability and persistence windows', () => {
-    expect(MIN_INTERACTION_TIMEOUT_EXCLUSIVE_MS).toBe(INTERACTION_STABILITY_WINDOW_MS + INTERACTION_PERSISTENCE_WINDOW_MS);
-    expect(INTERACTION_STABILITY_WINDOW_MS).toBe(500);
-    expect(INTERACTION_PERSISTENCE_WINDOW_MS).toBe(500);
-  });
-
-  it.each([1, 500, MIN_INTERACTION_TIMEOUT_EXCLUSIVE_MS - 1, MIN_INTERACTION_TIMEOUT_EXCLUSIVE_MS])(
-    'rejects crawl.interactionTimeoutMs = %s because it cannot cover the stability and persistence checks (F17)',
-    (interactionTimeoutMs) => {
-      const config = validConfig();
-      const result = validateConfig({ ...config, crawl: { ...config.crawl, interactionTimeoutMs } });
-
-      expect(result).toMatchObject({
-        ok: false,
-        errors: [
-          `crawl.interactionTimeoutMs must be greater than ${MIN_INTERACTION_TIMEOUT_EXCLUSIVE_MS} ms `
-            + '(the pre-freeze stability check and the post-condition persistence check)',
-        ],
-      });
-    },
-  );
-
-  it.each([DEFAULT_CONFIG.crawl.interactionTimeoutMs, MIN_INTERACTION_TIMEOUT_EXCLUSIVE_MS + 1])(
-    'accepts crawl.interactionTimeoutMs = %s (F17)',
+  // SPEC-5（設計書 2026-11-14 5.1）: 安定と持続の窓をやめたので、窓の和から導いた下限（前は 1,000ms を超えること。F17）もやめた。正の整数なら受ける。
+  it.each([1, 500, 1_000, OLD_HIDDEN_CRAWL_DEFAULTS.interactionTimeoutMs])(
+    'accepts crawl.interactionTimeoutMs = %s',
     (interactionTimeoutMs) => {
       const config = validConfig();
 
       expect(validateConfig({ ...config, crawl: { ...config.crawl, interactionTimeoutMs } })).toMatchObject({ ok: true });
     },
   );
-
-  it('keeps the default crawl.interactionTimeoutMs at 3,000 ms (F17)', () => {
-    expect(DEFAULT_CONFIG.crawl.interactionTimeoutMs).toBe(3_000);
-  });
 
   // L1（サイトへの負荷の制御の設計書 3.2、4.2）: ページの読み込みの最小の間隔と、1ページの Interaction の候補の上限。
   // 間隔は、許可 Origin にループバックでないものが1つでもあれば 1000 ms 以上、ループバックのアドレスだけなら 0 以上。
@@ -287,8 +198,6 @@ describe('configuration', () => {
       + 'includes an origin that is not a loopback address (127.0.0.1, [::1], localhost)';
     const INTERVAL_INTEGER_ERROR = 'crawl.minNavigationIntervalMs must be a non-negative integer';
     const INTERACTION_LIMIT_INTEGER_ERROR = 'crawl.maxInteractionsPerPage must be a positive integer';
-    const INTERACTION_LIMIT_MAXIMUM_ERROR = `crawl.maxInteractionsPerPage must be at most ${INTERACTION_CANDIDATE_LIMITS.maxCandidates} `
-      + '(the number of Interaction candidates discovered on a page)';
 
     /** `allowedOrigins` だけを許可し、その1つ目から始める設定に、`crawl` の項目を重ねる。 */
     const configWith = (allowedOrigins: readonly string[], crawl: Record<string, unknown>): Record<string, unknown> => {
@@ -300,15 +209,18 @@ describe('configuration', () => {
       };
     };
 
-    it('uses 5,000 ms and 20 candidates as the defaults', () => {
+    // サイトへの負荷の決まり: 既定の読み込みの間隔（候補の上限の既定がないことは hidden-defaults-removed が確かめる）。
+    it('uses 5,000 ms as the default interval', () => {
       expect(DEFAULT_CONFIG.crawl.minNavigationIntervalMs).toBe(5_000);
-      expect(DEFAULT_CONFIG.crawl.maxInteractionsPerPage).toBe(20);
     });
 
-    it('accepts the defaults for a non-loopback origin', () => {
+    it('accepts the defaults and a chosen candidate limit for a non-loopback origin', () => {
       expect(validateConfig(configWith([NON_LOOPBACK_ORIGIN], {
         minNavigationIntervalMs: DEFAULT_CONFIG.crawl.minNavigationIntervalMs,
-        maxInteractionsPerPage: DEFAULT_CONFIG.crawl.maxInteractionsPerPage,
+      }))).toMatchObject({ ok: true });
+      expect(validateConfig(configWith([NON_LOOPBACK_ORIGIN], {
+        minNavigationIntervalMs: DEFAULT_CONFIG.crawl.minNavigationIntervalMs,
+        maxInteractionsPerPage: 7,
       }))).toMatchObject({ ok: true });
     });
 
@@ -319,9 +231,10 @@ describe('configuration', () => {
 
       const config = await loadConfig(path);
 
-      expect(Object.keys(config.crawl)).toEqual(expect.arrayContaining(['minNavigationIntervalMs', 'maxInteractionsPerPage']));
+      expect(Object.keys(config.crawl)).toEqual(expect.arrayContaining(['minNavigationIntervalMs']));
       expect(config.crawl.minNavigationIntervalMs).toBe(DEFAULT_CONFIG.crawl.minNavigationIntervalMs);
-      expect(config.crawl.maxInteractionsPerPage).toBe(DEFAULT_CONFIG.crawl.maxInteractionsPerPage);
+      // L14: 指定していない上限は持たない。
+      expect(config.crawl.maxInteractionsPerPage).toBeUndefined();
     });
 
     it.each(LOOPBACK_ORIGINS)('accepts crawl.minNavigationIntervalMs = 0 when the only allowed origin is the loopback origin %s', (origin) => {
@@ -373,16 +286,8 @@ describe('configuration', () => {
       });
     });
 
-    it('rejects crawl.maxInteractionsPerPage above INTERACTION_CANDIDATE_LIMITS.maxCandidates', () => {
-      const maxInteractionsPerPage = INTERACTION_CANDIDATE_LIMITS.maxCandidates + 1;
-
-      expect(validateConfig(configWith([NON_LOOPBACK_ORIGIN], { minNavigationIntervalMs: 1_000, maxInteractionsPerPage }))).toMatchObject({
-        ok: false,
-        errors: [INTERACTION_LIMIT_MAXIMUM_ERROR],
-      });
-    });
-
-    it.each([1, INTERACTION_CANDIDATE_LIMITS.maxCandidates])('accepts crawl.maxInteractionsPerPage = %s', (maxInteractionsPerPage) => {
+    // L10（設計書 `2026-11-09-beaksight-remove-limits-design.md` 4）: 前の候補の数の上限（100）を超える指定（101）も受ける。
+    it.each([1, 101])('accepts crawl.maxInteractionsPerPage = %s', (maxInteractionsPerPage) => {
       expect(validateConfig(configWith([NON_LOOPBACK_ORIGIN], { minNavigationIntervalMs: 1_000, maxInteractionsPerPage })))
         .toMatchObject({ ok: true });
     });
@@ -400,7 +305,8 @@ describe('configuration', () => {
         errors: [unsupportedSettingsError],
       });
       expect(validateConfig({ ...config, crawl: withoutInterval })).toMatchObject({ ok: false, errors: [unsupportedSettingsError] });
-      expect(validateConfig({ ...config, crawl: withoutLimit })).toMatchObject({ ok: false, errors: [unsupportedSettingsError] });
+      // L14: 1 ページの候補の上限は、指定したときだけ持つ（ない設定も受け入れる）。
+      expect(validateConfig({ ...config, crawl: withoutLimit })).toEqual({ ok: true, value: { ...config, crawl: withoutLimit } });
     });
   });
 
@@ -410,28 +316,18 @@ describe('configuration', () => {
     expect(validateConfig({ ...validConfig(), site: { startUrl: 'https://example.test/', allowedOrigins: ['https://other.test'] } }).ok).toBe(false);
   });
 
-  it('rejects a startUrl that URL normalization rejects, such as a normalized URL longer than MAX_URL_LENGTH (R\'2 m5)', () => {
-    const origin = 'https://example.test';
-    const tooLong = `${origin}/${'a'.repeat(MAX_URL_LENGTH)}`;
-    const result = validateConfig({ ...validConfig(), site: { startUrl: tooLong, allowedOrigins: [origin] } });
-
-    expect(result).toMatchObject({ ok: false, errors: [expect.stringContaining('URL_TOO_LONG')] });
-    expect(result.ok ? [] : result.errors).toEqual([expect.stringContaining('site.startUrl')]);
-  });
-
-  it('judges the length of the startUrl after normalization, with the configured query parameters (R\'2 m5)', () => {
+  // L14（INV-LIMITS の表 A の N23）: 正規化は長さで拒まないので、長い開始 URL も受け入れる（前は `URL_TOO_LONG` で拒んだ。R'2 m5）。
+  it('accepts a startUrl longer than the former limit (2,048), with or without the kept query parameters (L14 N23)', () => {
     const origin = 'https://example.test';
     const config = validConfig();
-    // 追跡用の引数は正規化で除かれるので、生の値が長くても受け入れる。
-    const trackingOnly = `${origin}/?utm_source=${'x'.repeat(MAX_URL_LENGTH)}`;
-    expect(validateConfig({ ...config, site: { startUrl: trackingOnly, allowedOrigins: [origin] } }).ok).toBe(true);
-    // 許可した引数は正規化の後も残るので、長すぎれば拒否する。
-    const keptParameter = `${origin}/?page=${'1'.repeat(MAX_URL_LENGTH)}`;
+    const tooLong = `${origin}/${'a'.repeat(2_048)}`;
+    expect(validateConfig({ ...config, site: { startUrl: tooLong, allowedOrigins: [origin] } }).ok).toBe(true);
+    const keptParameter = `${origin}/?page=${'1'.repeat(2_048)}`;
     expect(validateConfig({
       ...config,
       site: { startUrl: keptParameter, allowedOrigins: [origin] },
       crawl: { ...config.crawl, allowedQueryParameters: ['page'] },
-    })).toMatchObject({ ok: false, errors: [expect.stringContaining('URL_TOO_LONG')] });
+    }).ok).toBe(true);
   });
 
   it.each(['', 'not a locale!', 'ja_JP_', 'x'])('rejects the browser locale %j that Intl.DateTimeFormat does not accept (R\'2 m5)', (locale) => {
@@ -527,7 +423,8 @@ describe('configuration', () => {
     const config = await loadConfig();
 
     expect(config.site.startUrl).toBe('https://example.com/');
-    expect(config.crawl.maxPages).toBe(500);
+    // L14: ページの上限は既定を持たない。
+    expect(config.crawl.maxPages).toBeUndefined();
   });
 
   it('loads an explicitly selected target with no overrides', async () => {
@@ -567,7 +464,9 @@ describe('configuration', () => {
     const config = await loadConfig(path, { crawl: { maxPages: 17 } });
 
     expect(config.crawl.maxPages).toBe(17);
-    expect(config.crawl.maxDepth).toBe(20);
+    // L14: 深さと時間の上限は既定を持たない（指定したときだけ）。
+    expect(config.crawl.maxDepth).toBeUndefined();
+    expect(config.crawl.maxRuntimeMs).toBeUndefined();
   });
 
   it('rejects a selected target with a missing or invalid target.id', async () => {

@@ -3,7 +3,8 @@
 //   判定（`checkGenericRule`）と生成（`generateGenericValue`）は、同じ値の空間の組み立てを使う（判定で作れると言えば、生成も作れる）。
 // - number・range: min 以上 max 以下の、min を起点とする step の倍数（境界を含む）。小数は 10 進の整数に直して数える（浮動小数点の誤差を
 //   作らない）。step の既定は 1。range は HTML の既定（min 0、max 100）を使う（値の空間がブラウザで決まっているため）。number は min・max
-//   の両方が要る。step の `any`、指数の表記、0 以下の step、安全な整数を超える数の値は扱わない。
+//   の両方が要る。step の `any`、指数の表記、0 以下の step、安全な整数を超える数の値は扱わない。OP-O（O2 の (b)）: 画面が数の形を整えても変わらない値
+//   （`String(Number(value))` と同じ形）だけを作る（小数の桁は 6 まで、小数の有効な桁は 15 まで。超える空間は `CONSTRAINT_UNSUPPORTED`）。
 // - date・month・week・time・datetime-local: min・max の両方が要る。step は、各型の単位（日・月・週・秒）の正の整数（既定は date・month・
 //   week が 1、time・datetime-local が 60 秒。HTML の既定）。min を起点とする step の倍数。time の min > max（日をまたぐ範囲）は扱わない。
 //   範囲は欄の min・max だけで決める（設計書 10 章の 3）。基準日（実行の許可の発行日。Asia/Tokyo の日付）は、形を確かめて受けるだけで、
@@ -95,6 +96,24 @@ const MINUS_SIGN = '-';
 const ZERO_DIGIT = '0';
 /** 値の空間の数の上限（番号が安全な整数に収まる）。 */
 const MAX_SPACE_COUNT = BigInt(Number.MAX_SAFE_INTEGER) + BIGINT_ONE;
+/**
+ * OP-O（O2 の (b)）: 画面が数として形を整えても（`String(Number(value))`。先頭の 0 を落とす、小数を整える、指数の表記にする）形の変わらない値だけを作る上限。
+ * - 整数（小数の桁 0）: 絶対値が安全な整数まで（超えると丸まる）。
+ * - 小数: 小数の桁が `MAX_FIXED_NOTATION_FRACTION_DIGITS` まで（1e-6 より小さい値は指数の表記になる）で、有効な桁が `MAX_EXACT_DECIMAL_DIGITS` まで
+ *   （超えると丸まりうる）。値の空間のすべての値は「10 進の整数 ÷ 10^小数の桁」で、10 進の整数の絶対値は min と max の大きいほうを超えないので、端で決まる。
+ */
+const MAX_SAFE_INTEGER_BIGINT = BigInt(Number.MAX_SAFE_INTEGER);
+const MAX_FIXED_NOTATION_FRACTION_DIGITS = 6;
+const MAX_EXACT_DECIMAL_DIGITS = 15;
+const EXACT_DECIMAL_LIMIT = DECIMAL_BASE ** BigInt(MAX_EXACT_DECIMAL_DIGITS);
+
+const absoluteOf = (value: bigint): bigint => (value < BIGINT_ZERO ? -value : value);
+
+/** OP-O（O2 の (b)）: 小数の桁 `scale` の、端が `scaledMin`・`scaledMax` の値が、どれも数の形を整えても変わらないか。 */
+const keepsNumberForm = (scaledMin: bigint, scaledMax: bigint, scale: number): boolean => {
+  const largest = absoluteOf(scaledMin) > absoluteOf(scaledMax) ? absoluteOf(scaledMin) : absoluteOf(scaledMax);
+  return scale === 0 ? largest <= MAX_SAFE_INTEGER_BIGINT : scale <= MAX_FIXED_NOTATION_FRACTION_DIGITS && largest < EXACT_DECIMAL_LIMIT;
+};
 
 interface ParsedDecimal {
   readonly negative: boolean;
@@ -150,7 +169,8 @@ const numberSpace = (minText: string | null, maxText: string | null, stepText: s
     return 'RANGE_EMPTY';
   }
   const count = (scaledMax - scaledMin) / scaledStep + BIGINT_ONE;
-  if (count > MAX_SPACE_COUNT) {
+  // OP-O（O2 の (b)）: 画面が数の形を整えると変わる値を含む空間は作らない（入れた値と、画面の値と、送る値がずれる）。
+  if (count > MAX_SPACE_COUNT || !keepsNumberForm(scaledMin, scaledMax, scale)) {
     return 'CONSTRAINT_UNSUPPORTED';
   }
   return { count: Number(count), valueAt: (index) => formatScaled(scaledMin + BigInt(index) * scaledStep, scale) };

@@ -7,28 +7,23 @@ import {
   AUTO_LOGIN_MIN_INTERVAL_MS,
 } from '../../../../../src/control/job/auto-login-limits.js';
 import { ACTIVE_PROFILE_STATUS } from '../../../../../src/control/store/profile-records.js';
-import { formatDateTime, formatDuration, formatInteger, formatTimes } from '../../../../../src/presentation/format.js';
+import { formatElapsedTime, formatInteger, formatTimes } from '../../../../../src/presentation/format.js';
 import {
   AUDIT_JOB_FAILURE_REASON_DESCRIPTIONS,
   CREDENTIAL_REQUEST_REJECTION_DESCRIPTIONS,
-  LOCAL_UI_AUTOMATED_LOGIN_SETUP_TEXT,
   LOCAL_UI_CREDENTIAL_TEXT,
   LOCAL_UI_LOGIN_CHECK_TEXT,
-  LOCAL_UI_TEXT,
+  LOCAL_UI_NEXT_STEP_TEXT,
 } from '../../../../../src/presentation/messages.js';
-import { AutomatedLoginSetupForm } from '../../components/AutomatedLoginSetupForm';
+import { AdvancedSettings } from '../../components/AdvancedSettings';
+import { AutomatedLoginSetupForm, automatedLoginSetUpSearch } from '../../components/AutomatedLoginSetupForm';
 import { ConfirmDialog } from '../../components/ConfirmDialog';
 import { CredentialValueField } from '../../components/CredentialValueField';
-import { NextStepLinks } from '../../components/NextSteps';
+import { ProfileActionLink } from '../../components/NextSteps';
 import { Notice } from '../../components/Notice';
-import { PageFrame } from '../../components/PageFrame';
-import {
-  automatedLoginResultDisplay,
-  credentialChangeKindDisplay,
-  credentialEnvironmentDisplay,
-  profileStatusDisplay,
-  toneClass,
-} from '../../display/labels';
+import { PageFrame, siteTrail } from '../../components/PageFrame';
+import { automatedLoginResultDisplay, credentialEnvironmentDisplay, usesAuthSetup } from '../../display/labels';
+import { closedSearchValueOf, isClosedSearchValue } from '../../display/search-values';
 import type { CredentialRequestRejection } from '../../server/credential-errors';
 import {
   changeCredentialFn,
@@ -40,12 +35,15 @@ import {
   type CredentialRequestView,
 } from '../../server/credential-functions';
 
-/** 保存の後に出す知らせ（URL の search で渡す。値は閉じた一覧）。FM2e: 1 回の操作で自動ログインに切り替えた後（`automatedLoginSetUp`）。 */
+/**
+ * 保存の後に出す知らせ（URL の search で渡す。値は閉じた一覧）。PL-4: 自動ログインにした後は、点検の開始の画面へ移すので、この画面の知らせはない
+ * （前の `automatedLoginSetUp` は消した）。
+ */
 const DONE_NOTICES = Object.freeze([
-  'registered', 'changed', 'replaced', 'removed', 'changedAndHoldCleared', 'replacedAndHoldCleared', 'automatedLoginSetUp',
+  'registered', 'changed', 'replaced', 'removed', 'changedAndHoldCleared', 'replacedAndHoldCleared',
 ] as const);
 type DoneNotice = (typeof DONE_NOTICES)[number];
-const isDoneNotice = (value: unknown): value is DoneNotice => DONE_NOTICES.some((notice) => notice === value);
+const isDoneNotice = (value: unknown): value is DoneNotice => isClosedSearchValue(DONE_NOTICES, value);
 
 export const Route = createFileRoute('/credentials/$profileId')({
   validateSearch: (search: Record<string, unknown>): { done?: DoneNotice } => (isDoneNotice(search['done']) ? { done: search['done'] } : {}),
@@ -69,29 +67,17 @@ const DONE_TEXT: Readonly<Record<DoneNotice, readonly string[]>> = Object.freeze
   removed: [text.remove.done],
   changedAndHoldCleared: [text.change.done, text.clearHold.done],
   replacedAndHoldCleared: [text.replace.done, text.clearHold.done],
-  automatedLoginSetUp: [LOCAL_UI_AUTOMATED_LOGIN_SETUP_TEXT.done],
 });
 
 /**
- * FM2e: 1 回の操作で自動ログインに切り替えた後の、「ログインを確かめる」の知らせ（自動では始めない。自動ログインの間隔と上限に数えるため、利用者が押す）。
- * ボタンは、保存の後に出す「次の手順」（`NextStepLinks` の資格情報の後の段。ログインを確かめる）を使う（同じボタンを 2 つ出さない）。
+ * 自動ログインの上限の説明（ログインの確かめの画面と同じ文言と、上限の名前つきの定数）。PL-4: 止めているときに、要点に出す（なぜすぐに再開しないか）。
+ * 時間は `formatElapsedTime`（分・日。秒の表示はしない）。
  */
-function AutomatedLoginSetUpNext() {
-  return (
-    <Notice kind="caution">
-      <p data-testid="automated-login-setup-login-check-note">{LOCAL_UI_AUTOMATED_LOGIN_SETUP_TEXT.loginCheckNote}</p>
-      <p>{LOGIN_CHECK_LIMIT_NOTE}</p>
-    </Notice>
-  );
-}
-
-/** 自動ログインの上限の説明（ログインの確かめの画面と同じ文言と、上限の名前つきの定数）。 */
 const LOGIN_CHECK_LIMIT_NOTE = LOCAL_UI_LOGIN_CHECK_TEXT.limitNote(
-  formatDuration(AUTO_LOGIN_MIN_INTERVAL_MS),
-  formatDuration(AUTO_LOGIN_DAILY_WINDOW_MS),
+  formatElapsedTime(AUTO_LOGIN_MIN_INTERVAL_MS),
+  formatElapsedTime(AUTO_LOGIN_DAILY_WINDOW_MS),
   formatTimes(AUTO_LOGIN_DAILY_MAX_ATTEMPTS),
 );
-
 
 /** 拒否の表示（説明と手順。項目の誤りは、その欄にも出す）。 */
 function RejectionNotice({ rejection, heading }: Readonly<{ rejection: CredentialRequestRejection; heading: string }>) {
@@ -104,57 +90,40 @@ function RejectionNotice({ rejection, heading }: Readonly<{ rejection: Credentia
   );
 }
 
-/** 保存の状態（値は出さない）。 */
-function CredentialStatus({ page }: Readonly<{ page: CredentialPageView }>) {
-  const status = text.status;
-  const { credential, hold } = page;
-  const protection = credentialEnvironmentDisplay(page.environment);
-  const originText = page.originMatches === null
-    ? status.originUnknown
-    : page.originMatches ? status.originMatches : status.originStale;
+/** テスト用のアカウントだけを入れることと、ブラウザに保存させないこと（入力の欄があるときだけ。設計書 7 章）。 */
+function TestAccountOnlyNotice() {
   return (
-    <section className="panel">
-      <h2 className="panel-heading">{status.heading}</h2>
-      <dl className="facts" data-testid="credential-status">
-        <dt>{status.saved}</dt>
-        <dd data-testid="credential-saved" data-saved={credential === null ? 'no' : 'yes'}>
-          {credential === null ? status.savedNo : status.savedYes}
-        </dd>
-        {credential === null ? null : (
-          <>
-            <dt>{status.createdAt}</dt>
-            <dd>{formatDateTime(credential.createdAt)}</dd>
-            <dt>{status.updatedAt}</dt>
-            <dd>{formatDateTime(credential.updatedAt)}</dd>
-            <dt>{status.lastChangeKind}</dt>
-            <dd data-testid="credential-last-change" data-kind={credential.lastChangeKind}>
-              {credentialChangeKindDisplay(credential.lastChangeKind).label}
-            </dd>
-            <dt>{status.revision}</dt>
-            <dd>{LOCAL_UI_TEXT.profileForm.revisionText(credential.credentialRevision)}</dd>
-            <dt>{status.loginOrigin}</dt>
-            <dd className="cell-break"><code>{credential.loginOrigin}</code></dd>
-          </>
-        )}
-        <dt>{status.currentLoginOrigin}</dt>
-        <dd className="cell-break">{page.currentLoginOrigin === null ? status.originUnknown : <code>{page.currentLoginOrigin}</code>}</dd>
-        {credential === null ? null : (
-          <>
-            <dt>{status.originState}</dt>
-            <dd data-testid="credential-origin-state" data-state={page.originMatches === false ? 'stale' : 'ok'}>{originText}</dd>
-          </>
-        )}
-        <dt>{status.protection}</dt>
-        <dd>
-          <span className={toneClass(protection.tone)} data-testid="credential-protection" data-state={page.environment}>{protection.label}</span>
-        </dd>
-        <dt>{status.hold}</dt>
-        <dd data-testid="credential-hold" data-held={hold === null ? 'no' : 'yes'}>
-          {hold === null ? status.notHeld : status.heldText(automatedLoginResultDisplay(hold.reason).label, formatDateTime(hold.heldAt))}
-        </dd>
-      </dl>
-      {hold === null ? null : <p className="section-gap">{AUDIT_JOB_FAILURE_REASON_DESCRIPTIONS[hold.reason].action}</p>}
-    </section>
+    <Notice kind="caution" heading={text.testAccountOnlyHeading}>
+      <p data-testid="credential-test-account-only">{text.testAccountOnlyBody}</p>
+      <p>{text.browserSaveNote}</p>
+    </Notice>
+  );
+}
+
+/**
+ * PL-4: 要点の、保存の状態の行（値は出さない）。保存してあれば、保存の場所とログインする先（ホストだけ）。止めていれば、理由と、人がすることと、回数の決まり。
+ * 日時・改訂・Origin・暗号化の行は出さない（設計書 3 章の 2。記録は管理データにある）。
+ */
+function CredentialSummaryLines({ page }: Readonly<{ page: CredentialPageView }>) {
+  const { credential, hold } = page;
+  return (
+    <>
+      {credential === null ? (
+        page.readError === null ? <p data-testid="credential-saved" data-saved="no">{text.summary.notSaved}</p> : null
+      ) : (
+        <>
+          <p data-testid="credential-saved" data-saved="yes">{text.summary.saved}</p>
+          {page.loginHost === null ? null : <p data-testid="credential-destination">{text.summary.destination(page.loginHost)}</p>}
+        </>
+      )}
+      {hold === null ? null : (
+        <Notice kind="caution">
+          <p data-testid="credential-hold" data-held="yes" data-reason={hold.reason}>{text.summary.held(automatedLoginResultDisplay(hold.reason).label)}</p>
+          <p>{AUDIT_JOB_FAILURE_REASON_DESCRIPTIONS[hold.reason].action}</p>
+          <p>{LOGIN_CHECK_LIMIT_NOTE}</p>
+        </Notice>
+      )}
+    </>
   );
 }
 
@@ -166,10 +135,21 @@ interface ValueState {
 }
 const EMPTY_VALUES: ValueState = Object.freeze({ username: '', password: '', passwordConfirmation: '' });
 
-/** 資格情報の画面（Task 26 の設計書 4.2）。プロファイルの詳細から開く。値（ユーザー名を含む）は、一度も出さない。 */
+/**
+ * 資格情報の画面（Task 26 の設計書 4.2）。プロファイルの詳細から開く。値（ユーザー名を含む）は、一度も出さない。
+ * PL-4（設計書 `doc/design/2026-10-26-beaksight-plain-ui-design.md` 3 章の 1〜3、4 章の 3、6 章の 4）: 上から、要点のパネル（今の様子の行、入れる欄があるときは
+ * その欄、主のボタン 1 つ）→ 詳しい内容 1 つ（`AdvancedSettings`。変える・削除）。
+ * - 手でログインするサイト: 自動ログインにする欄（`AutomatedLoginSetupForm`）。確定で点検の開始の画面へ移る。ログインの設定がないときは「先に 1 回、手でログインして
+ *   点検してください」と主のボタン「点検を始める」。公開の画面だけのサイトは、要らない旨だけ。残ったファイルがあれば、削除だけ。
+ * - 自動ログインのサイト: 保存してあれば、保存の場所とログインする先、主のボタン「点検を始める」（止めているときは主のボタンを出さず、理由と停止を解く入口）。
+ *   まだなければ、登録の 3 欄と主のボタン「登録する」。ログインする先が変わったときは、入れ直しの 3 欄。変える・削除は詳しい内容の中。ログインの確かめの画面への
+ *   入口は、停止を解くときだけ（判断 1）。
+ */
 function CredentialPage() {
   const page = Route.useLoaderData();
-  const { done } = Route.useSearch();
+  const { done: rawDone } = Route.useSearch();
+  // MI-C2 項目 19: ルータは根の生の search も子へ渡すので、知らせの値は描く前に閉じた一覧でもう一度確かめる（`display/search-values.ts`）。
+  const done = closedSearchValueOf(DONE_NOTICES, rawDone);
   const register = useServerFn(registerCredentialFn);
   const change = useServerFn(changeCredentialFn);
   const replace = useServerFn(replaceCredentialFn);
@@ -186,7 +166,6 @@ function CredentialPage() {
   const [removing, setRemoving] = useState(false);
   const [removeRejection, setRemoveRejection] = useState<CredentialRequestRejection | null>(null);
   const { profile, credential } = page;
-  const status = profileStatusDisplay(profile.status);
   const active = profile.status === ACTIVE_PROFILE_STATUS;
   const savable = page.eligible && active && page.environment === 'AVAILABLE' && page.currentLoginOrigin !== null;
   const replaceNeeded = credential !== null && page.originMatches === false;
@@ -203,6 +182,14 @@ function CredentialPage() {
     // 先に今の内容を読み直し（loader）、それから知らせを出す（知らせと内容が食い違わないように）。
     void router.invalidate().then(() =>
       navigate({ to: '/credentials/$profileId', params: { profileId: profile.profileId }, search: { done: notice }, replace: true }));
+  };
+  /**
+   * PL-4（設計書 6 章の 4）: 自動ログインにした後は、点検の開始の画面へ移す（移った印と、自動ログインにした印。開始の画面の route は search を受けないので、
+   * 印は location の search のまま残り、`PageFrame` と移った先が直接読む。search の型の確かめだけを外して渡す）。
+   */
+  const showAudit = (): void => {
+    const search = (): never => automatedLoginSetUpSearch as never;
+    void navigate({ to: '/start/$profileId', params: { profileId: profile.profileId }, search });
   };
   /** 送る（送った後は、成否にかかわらず、入力の値をすぐに空にする）。 */
   const submit = (send: () => Promise<CredentialRequestView>, notice: DoneNotice, noticeWithHold: DoneNotice): void => {
@@ -237,17 +224,20 @@ function CredentialPage() {
   );
   // 削除の操作（ファイルがあるか、読めないときだけ）。自動ログインのプロファイルと、自動ログインでなくなったプロファイルの両方で使う。
   const removeSection = credential === null && page.readError === null ? null : (
-    <section className="panel">
+    <div data-testid="credential-remove-section">
       {removeRejection === null ? null : <RejectionNotice rejection={removeRejection} heading={text.removeRejectedHeading} />}
-      <button type="button" className="button button--danger" data-testid="credential-remove" onClick={() => setDialogOpen(true)}>
-        {text.remove.open}
-      </button>
+      <div className="button-row">
+        <button type="button" className="button button--danger" data-testid="credential-remove" onClick={() => setDialogOpen(true)}>
+          {text.remove.open}
+        </button>
+      </div>
       <ConfirmDialog
         open={dialogOpen}
         title={text.remove.title}
         body={text.remove.body}
         confirmLabel={text.remove.confirm}
         cancelLabel={text.remove.cancel}
+        confirmTone="danger"
         busy={removing}
         onCancel={() => setDialogOpen(false)}
         onConfirm={() => {
@@ -265,240 +255,232 @@ function CredentialPage() {
             .finally(() => setRemoving(false));
         }}
       />
-    </section>
+    </div>
   );
-  const submitButton = (label: string, busyLabel: string, testId: string) => (
+  /** 送るボタン（要点の中の登録・入れ直しは主のボタン。詳しい内容の中の変更は二次のボタン。主のボタンは main に 1 つまで）。 */
+  const submitButton = (label: string, busyLabel: string, testId: string, primary: boolean) => (
     <div className="button-row">
-      <button type="submit" className="button button--primary" disabled={submitting} data-testid={testId}>
+      <button type="submit" className={primary ? 'button button--primary' : 'button'} disabled={submitting} data-testid={testId}>
         {submitting ? busyLabel : label}
       </button>
     </div>
   );
+  const doneNotice = done === undefined ? null : (
+    <Notice kind="positive">
+      {DONE_TEXT[done].map((line) => <p key={line} data-testid="credential-done" data-notice={done}>{line}</p>)}
+    </Notice>
+  );
+  const inUseNotice = page.inUse ? (
+    <Notice kind="caution" heading={text.inUseHeading}>
+      <p data-testid="credential-in-use">{text.inUseBody}</p>
+    </Notice>
+  ) : null;
+  const unavailableNotice = (
+    <Notice kind="caution" heading={text.unavailableHeading}>
+      <p data-testid="credential-unavailable" data-state={page.environment}>{environment.description}</p>
+    </Notice>
+  );
 
-  return (
-    <PageFrame title={text.pages.credentials}>
-      {done === undefined ? null : (
-        <Notice kind="positive">
-          {DONE_TEXT[done].map((line) => <p key={line} data-testid="credential-done" data-notice={done}>{line}</p>)}
-        </Notice>
-      )}
-      {done === 'automatedLoginSetUp' && page.eligible && active ? <AutomatedLoginSetUpNext /> : null}
-      {/* T43a（Task 43 の設計書 4.1）: 資格情報を保存した後（削除の後は除く）に、次の手順（ログインの確かめ）と「次にすること」へのリンク。 */}
-      {done === undefined || done === 'removed' || !page.eligible || !active ? null : (
-        <NextStepLinks profileId={profile.profileId} after="CREDENTIAL" mode={profile.mode} auth={profile.auth} />
-      )}
-      <section className="panel">
-        <h2 className="panel-heading">{profile.profileId}</h2>
-        <dl className="facts">
-          <dt>{LOCAL_UI_TEXT.profileList.columns.status}</dt>
-          <dd><span className={toneClass(status.tone)}>{status.label}</span></dd>
-          <dt>{LOCAL_UI_TEXT.profileList.columns.revision}</dt>
-          <dd>{LOCAL_UI_TEXT.profileForm.revisionText(profile.revision)}</dd>
-        </dl>
-      </section>
-
-      {!page.eligible ? (
-        <>
-          {/* FM2e（手を減らす段 2 の設計書 3A.4）: 手動のログインのプロファイルは、1 回の操作で自動ログインに切り替える欄を出す（残った資格情報の
-              ファイルがあれば、先に消す。暗号化を使えない、ジョブが動いている間は出さない）。 */}
-          {page.automatedLoginSetup !== null && removeSection === null ? null : (
-            <Notice kind="caution">
-              <p data-testid="credential-not-eligible">{text.notEligible}</p>
-            </Notice>
-          )}
-          {page.automatedLoginSetup !== null && removeSection === null && page.environment !== 'AVAILABLE' ? (
-            <Notice kind="caution" heading={text.unavailableHeading}>
-              <p data-testid="credential-unavailable" data-state={page.environment}>{environment.description}</p>
-            </Notice>
-          ) : null}
-          {page.automatedLoginSetup !== null && removeSection === null && page.environment === 'AVAILABLE' && page.inUse ? (
-            <Notice kind="caution" heading={text.inUseHeading}>
-              <p data-testid="credential-in-use">{text.inUseBody}</p>
-            </Notice>
-          ) : null}
-          {page.automatedLoginSetup !== null && removeSection === null && page.environment === 'AVAILABLE' && !page.inUse ? (
-            <>
-              <Notice kind="caution" heading={text.testAccountOnlyHeading}>
-                <p data-testid="credential-test-account-only">{text.testAccountOnlyBody}</p>
-                <p>{text.browserSaveNote}</p>
-              </Notice>
-              <AutomatedLoginSetupForm page={page} setup={page.automatedLoginSetup} onSaved={() => showDone('automatedLoginSetUp')} />
-            </>
-          ) : null}
-          {/* T26g-2 round 1: 自動ログインでないプロファイルに残ったファイルは、削除の操作だけを出す。 */}
-          {removeSection === null ? null : (
+  if (!page.eligible) {
+    // 手でログインするサイトと、公開の画面だけのサイト（要点のパネルだけ）。
+    const setup = page.automatedLoginSetup;
+    const manual = usesAuthSetup(profile.mode, profile.auth);
+    return (
+      <PageFrame title={text.pages.credentials} trail={siteTrail(profile.profileId)}>
+        <section className="panel" data-testid="credential-summary">
+          <h2 className="panel-heading">{LOCAL_UI_NEXT_STEP_TEXT.summaryHeading}</h2>
+          {doneNotice}
+          {removeSection !== null ? (
+            // T26g-2 round 1: 自動ログインでないプロファイルに残ったファイルは、削除の操作だけを出す。
             <>
               <Notice kind="caution">
                 <p data-testid="credential-leftover">{text.leftoverNotEligible}</p>
               </Notice>
-              {page.inUse ? (
-                <Notice kind="caution" heading={text.inUseHeading}>
-                  <p data-testid="credential-in-use">{text.inUseBody}</p>
-                </Notice>
-              ) : null}
+              {inUseNotice}
               {removeSection}
             </>
+          ) : !active ? (
+            <p data-testid="credential-retired">{text.retired}</p>
+          ) : setup !== null ? (
+            // FM2e・PL-4: 1 回の操作で自動ログインにする欄（暗号化を使えない、ジョブが動いている間は出さない）。
+            page.environment !== 'AVAILABLE' ? unavailableNotice
+              : page.inUse ? inUseNotice
+                : <AutomatedLoginSetupForm page={page} setup={setup} onSaved={showAudit} />
+          ) : (
+            // PL-4（作業記録 UX-1 の画面 C の S4）: 手でログインするサイトでログインの設定がまだないときは、先に手でログインする点検へ。公開の画面だけのサイトは文だけ。
+            <>
+              <p data-testid="credential-not-eligible" data-kind={manual ? 'MANUAL' : 'PUBLIC'}>{manual ? text.notEligibleManual : text.notEligiblePublic}</p>
+              {manual ? (
+                <div className="button-row">
+                  <ProfileActionLink action="AUDIT_START" profileId={profile.profileId} primary />
+                </div>
+              ) : null}
+            </>
           )}
-        </>
-      ) : (
-        <>
-          <Notice kind="caution" heading={text.testAccountOnlyHeading}>
-            <p data-testid="credential-test-account-only">{text.testAccountOnlyBody}</p>
-            <p>{text.browserSaveNote}</p>
-          </Notice>
-          <CredentialStatus page={page} />
-          {page.readError === null ? null : (
-            <Notice kind="critical" heading={text.status.readFailedHeading}>
-              <p data-testid="credential-read-error" data-reason={page.readError}>
-                {CREDENTIAL_REQUEST_REJECTION_DESCRIPTIONS[page.readError].description}
-              </p>
-              <p>{CREDENTIAL_REQUEST_REJECTION_DESCRIPTIONS[page.readError].action}</p>
-            </Notice>
-          )}
-          {active ? null : (
-            <Notice kind="caution">
-              <p data-testid="credential-retired">{text.retired}</p>
-            </Notice>
-          )}
-          {active && page.environment !== 'AVAILABLE' ? (
-            <Notice kind="caution" heading={text.unavailableHeading}>
-              <p data-testid="credential-unavailable" data-state={page.environment}>{environment.description}</p>
-            </Notice>
-          ) : null}
-          {active && page.environment === 'AVAILABLE' && page.currentLoginOrigin === null ? (
-            <Notice kind="caution" heading={text.authSetupMissingHeading}>
-              <p data-testid="credential-auth-setup-missing">{text.authSetupMissingBody}</p>
-              <p>
-                <Link to="/auth-setup/$profileId" params={{ profileId: profile.profileId }}>{text.openAuthSetup}</Link>
-              </p>
-            </Notice>
-          ) : null}
-          {page.inUse ? (
-            <Notice kind="caution" heading={text.inUseHeading}>
-              <p data-testid="credential-in-use">{text.inUseBody}</p>
-            </Notice>
-          ) : null}
+        </section>
+      </PageFrame>
+    );
+  }
 
-          {savable && credential === null && page.readError === null ? (
-            <section className="panel">
-              <h2 className="panel-heading">{text.register.heading}</h2>
-              <p>{text.register.body}</p>
-              {rejection === null ? null : <RejectionNotice rejection={rejection} heading={text.rejectedHeading} />}
-              <form
-                className="form-grid"
-                noValidate
-                data-testid="credential-register-form"
-                onSubmit={(event) => {
-                  event.preventDefault();
-                  const { username, password, passwordConfirmation } = values;
-                  submit(() => register({ data: { profileId: profile.profileId, username, password, passwordConfirmation } }), 'registered', 'registered');
-                }}
-              >
-                <CredentialValueField kind="username" label={text.username} name="username" hint={valueLengthHint}
-                  value={values.username} errors={fieldErrors('username')} onChange={(value) => setValue('username', value)} />
-                <CredentialValueField kind="password" label={text.password} name="password" hint={valueLengthHint}
-                  value={values.password} errors={fieldErrors('password')} onChange={(value) => setValue('password', value)} />
-                <CredentialValueField kind="password" label={text.passwordConfirmation} name="passwordConfirmation"
-                  value={values.passwordConfirmation} errors={[]} onChange={(value) => setValue('passwordConfirmation', value)} />
-                {submitButton(text.register.submit, text.register.submitting, 'credential-register-submit')}
-              </form>
-            </section>
-          ) : null}
-
-          {savable && credential !== null && !replaceNeeded ? (
-            <section className="panel">
-              <h2 className="panel-heading">{text.change.heading}</h2>
-              {rejection === null ? null : <RejectionNotice rejection={rejection} heading={text.rejectedHeading} />}
-              <form
-                className="form-grid"
-                noValidate
-                data-testid="credential-change-form"
-                onSubmit={(event) => {
-                  event.preventDefault();
-                  const { username, password, passwordConfirmation } = values;
-                  submit(() => change({
-                    data: {
-                      profileId: profile.profileId,
-                      username: changeUsername ? username : null,
-                      password: changePassword ? password : null,
-                      passwordConfirmation: changePassword ? passwordConfirmation : null,
-                      clearHold: page.hold !== null && clearHold,
-                    },
-                  }), 'changed', 'changedAndHoldCleared');
-                }}
-              >
-                <fieldset className="field">
-                  <legend className="field-label">{text.change.legend}</legend>
-                  <label className="choice">
-                    <input type="checkbox" name="changeUsername" checked={changeUsername}
-                      onChange={(event) => setChangeUsername(event.target.checked)} />
-                    <span>{text.change.changeUsername}</span>
-                  </label>
-                  <label className="choice">
-                    <input type="checkbox" name="changePassword" checked={changePassword}
-                      onChange={(event) => setChangePassword(event.target.checked)} />
-                    <span>{text.change.changePassword}</span>
-                  </label>
-                  <p className="field-hint">{text.change.unchangedNote}</p>
-                </fieldset>
-                {changeUsername ? (
-                  <CredentialValueField kind="username" label={text.change.newUsername} name="username" hint={valueLengthHint}
-                    value={values.username} errors={fieldErrors('username')} onChange={(value) => setValue('username', value)} />
-                ) : null}
-                {changePassword ? (
-                  <>
-                    <CredentialValueField kind="password" label={text.change.newPassword} name="password" hint={valueLengthHint}
-                      value={values.password} errors={fieldErrors('password')} onChange={(value) => setValue('password', value)} />
-                    <CredentialValueField kind="password" label={text.change.newPasswordConfirmation} name="passwordConfirmation"
-                      value={values.passwordConfirmation} errors={[]} onChange={(value) => setValue('passwordConfirmation', value)} />
-                  </>
-                ) : null}
-                {clearHoldChoice}
-                {submitButton(text.change.submit, text.change.submitting, 'credential-change-submit')}
-              </form>
-            </section>
-          ) : null}
-
-          {savable && replaceNeeded ? (
-            <section className="panel">
-              <h2 className="panel-heading">{text.replace.heading}</h2>
-              <p data-testid="credential-replace-needed">{text.replace.body}</p>
-              {rejection === null ? null : <RejectionNotice rejection={rejection} heading={text.rejectedHeading} />}
-              <form
-                className="form-grid"
-                noValidate
-                data-testid="credential-replace-form"
-                onSubmit={(event) => {
-                  event.preventDefault();
-                  const { username, password, passwordConfirmation } = values;
-                  submit(() => replace({
-                    data: { profileId: profile.profileId, username, password, passwordConfirmation, clearHold: page.hold !== null && clearHold },
-                  }), 'replaced', 'replacedAndHoldCleared');
-                }}
-              >
-                <CredentialValueField kind="username" label={text.username} name="username" hint={valueLengthHint}
-                  value={values.username} errors={fieldErrors('username')} onChange={(value) => setValue('username', value)} />
-                <CredentialValueField kind="password" label={text.password} name="password" hint={valueLengthHint}
-                  value={values.password} errors={fieldErrors('password')} onChange={(value) => setValue('password', value)} />
-                <CredentialValueField kind="password" label={text.passwordConfirmation} name="passwordConfirmation"
-                  value={values.passwordConfirmation} errors={[]} onChange={(value) => setValue('passwordConfirmation', value)} />
-                {clearHoldChoice}
-                {submitButton(text.replace.submit, text.replace.submitting, 'credential-replace-submit')}
-              </form>
-            </section>
-          ) : null}
-
-          {removeSection}
-        </>
-      )}
-      <div className="button-row">
-        {page.eligible && active ? (
-          <Link to="/login-check/$profileId" params={{ profileId: profile.profileId }} className="button">
-            {LOCAL_UI_LOGIN_CHECK_TEXT.pages.loginCheck}
-          </Link>
+  /** 要点に出す入力の欄（登録か入れ直し）。 */
+  const registerForm = savable && credential === null && page.readError === null ? (
+    <>
+      <TestAccountOnlyNotice />
+      <p>{text.register.body}</p>
+      {rejection === null ? null : <RejectionNotice rejection={rejection} heading={text.rejectedHeading} />}
+      <form
+        className="form-grid"
+        noValidate
+        data-testid="credential-register-form"
+        onSubmit={(event) => {
+          event.preventDefault();
+          const { username, password, passwordConfirmation } = values;
+          submit(() => register({ data: { profileId: profile.profileId, username, password, passwordConfirmation } }), 'registered', 'registered');
+        }}
+      >
+        <CredentialValueField kind="username" label={text.username} name="username" hint={valueLengthHint}
+          value={values.username} errors={fieldErrors('username')} onChange={(value) => setValue('username', value)} />
+        <CredentialValueField kind="password" label={text.password} name="password" hint={valueLengthHint}
+          value={values.password} errors={fieldErrors('password')} onChange={(value) => setValue('password', value)} />
+        <CredentialValueField kind="password" label={text.passwordConfirmation} name="passwordConfirmation"
+          value={values.passwordConfirmation} errors={[]} onChange={(value) => setValue('passwordConfirmation', value)} />
+        {submitButton(text.register.submit, text.register.submitting, 'credential-register-submit', true)}
+      </form>
+    </>
+  ) : null;
+  const replaceForm = savable && replaceNeeded ? (
+    <>
+      <p data-testid="credential-replace-needed">{text.replace.body}</p>
+      <TestAccountOnlyNotice />
+      {rejection === null ? null : <RejectionNotice rejection={rejection} heading={text.rejectedHeading} />}
+      <form
+        className="form-grid"
+        noValidate
+        data-testid="credential-replace-form"
+        onSubmit={(event) => {
+          event.preventDefault();
+          const { username, password, passwordConfirmation } = values;
+          submit(() => replace({
+            data: { profileId: profile.profileId, username, password, passwordConfirmation, clearHold: page.hold !== null && clearHold },
+          }), 'replaced', 'replacedAndHoldCleared');
+        }}
+      >
+        <CredentialValueField kind="username" label={text.username} name="username" hint={valueLengthHint}
+          value={values.username} errors={fieldErrors('username')} onChange={(value) => setValue('username', value)} />
+        <CredentialValueField kind="password" label={text.password} name="password" hint={valueLengthHint}
+          value={values.password} errors={fieldErrors('password')} onChange={(value) => setValue('password', value)} />
+        <CredentialValueField kind="password" label={text.passwordConfirmation} name="passwordConfirmation"
+          value={values.passwordConfirmation} errors={[]} onChange={(value) => setValue('passwordConfirmation', value)} />
+        {clearHoldChoice}
+        {submitButton(text.replace.submit, text.replace.submitting, 'credential-replace-submit', true)}
+      </form>
+    </>
+  ) : null;
+  /** 詳しい内容の、変える欄（保存してあって、入れ直しが要らないとき）。 */
+  const changeForm = savable && credential !== null && !replaceNeeded ? (
+    <section className="panel">
+      <h2 className="panel-heading">{text.change.heading}</h2>
+      <TestAccountOnlyNotice />
+      {rejection === null ? null : <RejectionNotice rejection={rejection} heading={text.rejectedHeading} />}
+      <form
+        className="form-grid"
+        noValidate
+        data-testid="credential-change-form"
+        onSubmit={(event) => {
+          event.preventDefault();
+          const { username, password, passwordConfirmation } = values;
+          submit(() => change({
+            data: {
+              profileId: profile.profileId,
+              username: changeUsername ? username : null,
+              password: changePassword ? password : null,
+              passwordConfirmation: changePassword ? passwordConfirmation : null,
+              clearHold: page.hold !== null && clearHold,
+            },
+          }), 'changed', 'changedAndHoldCleared');
+        }}
+      >
+        <fieldset className="field">
+          <legend className="field-label">{text.change.legend}</legend>
+          <label className="choice">
+            <input type="checkbox" name="changeUsername" checked={changeUsername}
+              onChange={(event) => setChangeUsername(event.target.checked)} />
+            <span>{text.change.changeUsername}</span>
+          </label>
+          <label className="choice">
+            <input type="checkbox" name="changePassword" checked={changePassword}
+              onChange={(event) => setChangePassword(event.target.checked)} />
+            <span>{text.change.changePassword}</span>
+          </label>
+          <p className="field-hint">{text.change.unchangedNote}</p>
+        </fieldset>
+        {changeUsername ? (
+          <CredentialValueField kind="username" label={text.change.newUsername} name="username" hint={valueLengthHint}
+            value={values.username} errors={fieldErrors('username')} onChange={(value) => setValue('username', value)} />
         ) : null}
-        <Link to="/profiles/$profileId" params={{ profileId: profile.profileId }} className="button">{text.backToProfile}</Link>
-      </div>
+        {changePassword ? (
+          <>
+            <CredentialValueField kind="password" label={text.change.newPassword} name="password" hint={valueLengthHint}
+              value={values.password} errors={fieldErrors('password')} onChange={(value) => setValue('password', value)} />
+            <CredentialValueField kind="password" label={text.change.newPasswordConfirmation} name="passwordConfirmation"
+              value={values.passwordConfirmation} errors={[]} onChange={(value) => setValue('passwordConfirmation', value)} />
+          </>
+        ) : null}
+        {clearHoldChoice}
+        {submitButton(text.change.submit, text.change.submitting, 'credential-change-submit', false)}
+      </form>
+    </section>
+  ) : null;
+  // 削除は、ほかにすることがないとき（読めない・取り消した）は要点に、ふだんは詳しい内容に出す。
+  const removeInSummary = page.readError !== null || !active;
+  // 要点のボタン: 保存してあって使えるときは「点検を始める」（主）。止めているときは主のボタンを出さず、停止を解く入口（ログインの確かめの画面）を二次で。
+  const ready = credential !== null && !replaceNeeded && active && page.readError === null && page.environment === 'AVAILABLE'
+    && page.currentLoginOrigin !== null && !page.inUse;
+
+  return (
+    <PageFrame title={text.pages.credentials} trail={siteTrail(profile.profileId)}>
+      <section className="panel" data-testid="credential-summary">
+        <h2 className="panel-heading">{LOCAL_UI_NEXT_STEP_TEXT.summaryHeading}</h2>
+        {doneNotice}
+        {page.readError === null ? null : (
+          <Notice kind="critical" heading={text.status.readFailedHeading}>
+            <p data-testid="credential-read-error" data-reason={page.readError}>
+              {CREDENTIAL_REQUEST_REJECTION_DESCRIPTIONS[page.readError].description}
+            </p>
+            <p>{CREDENTIAL_REQUEST_REJECTION_DESCRIPTIONS[page.readError].action}</p>
+          </Notice>
+        )}
+        {active ? null : <p data-testid="credential-retired">{text.retired}</p>}
+        {active && page.environment !== 'AVAILABLE' ? unavailableNotice : null}
+        {active && page.environment === 'AVAILABLE' && page.currentLoginOrigin === null ? (
+          <Notice kind="caution" heading={text.authSetupMissingHeading}>
+            <p data-testid="credential-auth-setup-missing">{text.authSetupMissingBody}</p>
+            <p>
+              <Link to="/auth-setup/$profileId" params={{ profileId: profile.profileId }}>{text.openAuthSetup}</Link>
+            </p>
+          </Notice>
+        ) : null}
+        {inUseNotice}
+        <CredentialSummaryLines page={page} />
+        {registerForm}
+        {replaceForm}
+        {removeInSummary ? removeSection : null}
+        {ready ? (
+          <div className="button-row" data-testid="credential-summary-actions">
+            {page.hold === null
+              ? <ProfileActionLink action="AUDIT_START" profileId={profile.profileId} primary />
+              : <ProfileActionLink action="CLEAR_HOLD" profileId={profile.profileId} primary={false} />}
+          </div>
+        ) : null}
+      </section>
+      {changeForm === null && (removeInSummary || removeSection === null) ? null : (
+        <section className="panel">
+          <AdvancedSettings testId="credential-advanced-settings" openRequested={rejection !== null || removeRejection !== null}>
+            {changeForm}
+            {removeInSummary ? null : removeSection}
+          </AdvancedSettings>
+        </section>
+      )}
     </PageFrame>
   );
 }

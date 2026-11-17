@@ -1,9 +1,7 @@
 import { EventEmitter } from 'node:events';
 import type { Page } from 'playwright';
-import { describe, expect, it } from 'vitest';
+import { afterEach, describe, expect, it, vi } from 'vitest';
 import type { MainFrameLoadObservation } from '../../src/browser/main-frame-load.js';
-import { NAVIGATION_DIAGNOSTICS_START_DEADLINE_MESSAGE } from '../../src/browser/navigation-diagnostics.js';
-import type { NavigationDiagnostics } from '../../src/core/contracts.js';
 import { wait } from '../../src/core/deadline.js';
 import {
   VISUALLY_HIDDEN_MAX_DIMENSION_PX,
@@ -11,6 +9,7 @@ import {
   type LayoutEvidence,
 } from '../../src/core/evidence-types.js';
 import {
+  LAYOUT_COLLECTION_PART_SIZE,
   LAYOUT_THRESHOLDS,
   STRESS_VIEWPORT_HEIGHT,
   collectLayoutEvidence,
@@ -22,6 +21,9 @@ import {
 import { fakePlaywrightRequest } from '../helpers/fake-playwright-request.js';
 import { NO_PACING_WAIT, NO_SETTLING_WAIT } from '../helpers/navigation-pacer.js';
 import { TIMER_CLOCK_GRANULARITY_MS } from '../helpers/timer-clock.js';
+
+/** テストの幅の走査に渡す、1 幅あたりの期限（ms。幅の走査の期限は、呼び出し側の Page Auditor が決める）。 */
+const STRESS_TEST_WIDTH_TIMEOUT_MS = 10_000;
 
 function rawLayout(width: number, height: number) {
   return {
@@ -46,13 +48,16 @@ function rawLayout(width: number, height: number) {
     fixedHeadingOverlaps: [],
     elementOverlaps: [],
     fixedElements: [],
+    // COV-6: 一覧ごとの次に読む位置（どれも null なら、1 回で読み終える）。
+    next: {
+      boxesOutsideViewport: null as number | null,
+      zeroSizeInteractive: null as number | null,
+      clippedText: null as number | null,
+      fixedHeadingOverlaps: null as number | null,
+      elementOverlaps: null as number | null,
+      fixedElements: null as number | null,
+    },
     truncation: {
-      omittedOutsideViewportCount: 0,
-      omittedZeroSizeInteractiveCount: 0,
-      omittedClippedTextCount: 0,
-      omittedFixedHeadingOverlapCount: 0,
-      omittedElementOverlapCount: 0,
-      omittedFixedElementCount: 0,
       overlapComparisonLimitReached: false,
       clippedTextNodeScanLimitReachedCount: 0,
       renderedDescendantScanLimitReachedCount: 0,
@@ -111,6 +116,19 @@ function clippedCandidate(selector: string, overrides: Record<string, unknown> =
     heightClipped: false,
     partiallyClippedText: true,
     truncated: false,
+    // AUD-4a: 意図した省略を見分けるための事実（ブラウザが返す形）。
+    clippingStyle: {
+      textOverflow: 'clip',
+      whiteSpace: 'nowrap',
+      webkitLineClamp: 'none',
+      lineClamp: '',
+      display: 'block',
+      webkitBoxOrient: 'horizontal',
+      maxHeight: 'none',
+    },
+    lineHeightPx: 20,
+    visibleLineCount: 1,
+    collapsedByControl: false,
     ...overrides,
   };
 }
@@ -130,7 +148,7 @@ function neverSettles(): Promise<never> {
 /** 間隔を確かめないテストの、幅の走査の引数。期限は、呼び出し時点から、幅の数 × `defaultTimeoutMs` 後。 */
 function unpacedStressOptions(widths: readonly number[]): StressLayoutOptions {
   return {
-    deadlineAtMs: Date.now() + LAYOUT_THRESHOLDS.defaultTimeoutMs * widths.length,
+    deadlineAtMs: Date.now() + STRESS_TEST_WIDTH_TIMEOUT_MS * widths.length,
     beforeNavigation: NO_PACING_WAIT,
     settleBeforeLayout: NO_SETTLING_WAIT,
   };
@@ -461,12 +479,13 @@ describe('responsive layout stress lifecycle', () => {
 // L2（サイトへの負荷の制御の設計書 4.1、4.4）: 幅の走査は、各幅の読み込み（`page.goto`）の直前に、ページの読み込みの間隔の待ち
 // （`beforeNavigation`）を呼び、待った時間の分だけ、自分の期限を延ばす。
 describe('responsive layout stress navigation pacing (load control design 4.1, 4.4)', () => {
-  it('waits right before the navigation of each width, after its session is created', async () => {
+  // DEF-209: 待ってから、その幅のセッション（Context と空の page）を作る（待つ間に、空の page の窓を出さない）。
+  it('waits before the session of each width is created, and navigates right after it', async () => {
     const events: string[] = [];
     let paced = 0;
 
     const result = await collectStressLayout(sessionFactory(events), 'https://fixture.test/page', [390, 320], {
-      deadlineAtMs: Date.now() + LAYOUT_THRESHOLDS.defaultTimeoutMs,
+      deadlineAtMs: Date.now() + STRESS_TEST_WIDTH_TIMEOUT_MS,
       settleBeforeLayout: NO_SETTLING_WAIT,
       beforeNavigation: async () => {
         paced += 1;
@@ -477,12 +496,12 @@ describe('responsive layout stress navigation pacing (load control design 4.1, 4
 
     expect(result.map((entry) => entry.status)).toEqual(['COMPLETE', 'COMPLETE']);
     expect(events).toEqual([
-      `create:1:390x${STRESS_VIEWPORT_HEIGHT}`,
       'pace:1',
+      `create:1:390x${STRESS_VIEWPORT_HEIGHT}`,
       'goto:1:https://fixture.test/page',
       'close:1',
-      `create:2:320x${STRESS_VIEWPORT_HEIGHT}`,
       'pace:2',
+      `create:2:320x${STRESS_VIEWPORT_HEIGHT}`,
       'goto:2:https://fixture.test/page',
       'close:2',
     ]);
@@ -515,7 +534,7 @@ describe('responsive layout stress navigation pacing (load control design 4.1, 4
     // page に渡す走査の期限（`scanDeadlineAtMs` = 走査の期限 − `partialResultReserveMs`）は、待ちが返した時間の合計だけ後ろに延びる。
     // 延ばし過ぎ（例: 待った時間の2倍）と延ばし忘れは、この値の違いで分かる（上のテストは、延ばし過ぎを見分けられない）。
     const returnedWaitsMs = [700, 300] as const;
-    const deadlineAtMs = Date.now() + LAYOUT_THRESHOLDS.defaultTimeoutMs;
+    const deadlineAtMs = Date.now() + STRESS_TEST_WIDTH_TIMEOUT_MS;
     const scanDeadlines: number[] = [];
     const factory: PassiveStressSessionFactory = async (viewport) => ({
       page: {
@@ -559,7 +578,7 @@ describe('responsive layout stress navigation pacing (load control design 4.1, 4
 
     // @ts-expect-error: ページの読み込みの間隔の待ち（`beforeNavigation`）を渡さないと、型のエラーになる。
     await expect(collectStressLayout(factory, 'https://fixture.test/page', [320], {
-      deadlineAtMs: Date.now() + LAYOUT_THRESHOLDS.defaultTimeoutMs,
+      deadlineAtMs: Date.now() + STRESS_TEST_WIDTH_TIMEOUT_MS,
     })).rejects.toThrow('beforeNavigation');
     // @ts-expect-error: 期限と間隔の待ちの引数そのものを省略すると、型のエラーになる。
     await expect(collectStressLayout(factory, 'https://fixture.test/page', [320])).rejects.toThrow('beforeNavigation');
@@ -574,7 +593,7 @@ describe('responsive layout stress navigation pacing (load control design 4.1, 4
     };
 
     await expect(collectStressLayout(factory, 'https://fixture.test/page', [320], {
-      deadlineAtMs: Date.now() + LAYOUT_THRESHOLDS.defaultTimeoutMs,
+      deadlineAtMs: Date.now() + STRESS_TEST_WIDTH_TIMEOUT_MS,
       beforeNavigation: 'wait' as unknown as () => Promise<number>,
       settleBeforeLayout: NO_SETTLING_WAIT,
     })).rejects.toThrow('beforeNavigation');
@@ -597,27 +616,13 @@ type FakeLoad =
 
 const FAKE_STATUS_OK = 200;
 const FAKE_STATUS_SERVICE_UNAVAILABLE = 503;
-/**
- * 偽の page の Context が、CDP の session を開く求めを断るときのメッセージ（D3。診断の記録の設計書 2.2）。偽の page には CDP の session が
- * ないので、ページ本体の要求の観察は始められず、受け口には `NOT_OBSERVED`（理由はこのメッセージ）が渡る。
- */
-const FAKE_NO_CDP_SESSION_MESSAGE = 'the fake page has no CDP session';
-
-/**
- * 偽の page の Context が、CDP の session を開く求め（ページ本体の要求の観察の開始）にどう振る舞うか。
- * `REFUSED` は `FAKE_NO_CDP_SESSION_MESSAGE` で断る。`NEVER_OPENS` は、いつまでも開かない（観察の開始の期限の確かめに使う）。
- */
-type FakeCdpSession = 'REFUSED' | 'NEVER_OPENS';
 
 /**
  * 事象の受け口の数を記録する、偽の page を持つセッションの factory。n 番目の幅の読み込みは `loads[n - 1]` のとおりに振る舞う。
- * 偽の page の Context は、CDP の session を開く求め（ページ本体の要求の観察の開始。D3）に `cdp:<n>` を記録し、`cdpSession` の
- * とおりに振る舞う（既定は断る）。
  */
 function eventEmittingSessionFactory(
   loads: readonly FakeLoad[],
   events: string[],
-  cdpSession: FakeCdpSession = 'REFUSED',
 ): PassiveStressSessionFactory {
   let serial = 0;
   return async (viewport): Promise<PassiveStressSession> => {
@@ -630,19 +635,9 @@ function eventEmittingSessionFactory(
     const mainFrame = Object.freeze({});
     const emitter = new EventEmitter();
     const listeners = (): string => `request=${emitter.listenerCount('request')},response=${emitter.listenerCount('response')}`;
-    const context = {
-      newCDPSession: async (): Promise<never> => {
-        events.push(`cdp:${id}`);
-        if (cdpSession === 'NEVER_OPENS') {
-          return neverSettles();
-        }
-        throw new Error(FAKE_NO_CDP_SESSION_MESSAGE);
-      },
-    };
     const page = Object.assign(emitter, {
       mainFrame: () => mainFrame,
       isClosed: () => false,
-      context: () => context,
       evaluate: async () => rawLayout(viewport.width, viewport.height),
       goto: async (url: string) => {
         events.push(`goto:${id}:${url}:${listeners()}`);
@@ -668,16 +663,10 @@ function eventEmittingSessionFactory(
   };
 }
 
-/** 偽の page（CDP の session がない）での、ページ本体の要求の観察の結果（D3）。 */
-const NOT_OBSERVED_IN_FAKE_PAGE: NavigationDiagnostics = Object.freeze({ status: 'NOT_OBSERVED', reason: FAKE_NO_CDP_SESSION_MESSAGE });
-
 describe('responsive layout stress main frame load observation (site unavailability design 2.1)', () => {
-  // D3（診断の記録の設計書 2.2 の 2026-10-07 の改訂）: 受け口には、観測に加えて、各幅の読み込みの間のページ本体の要求の観察の結果を渡す。
-  // 観察は、各幅の `goto` の直前に始め（偽の page では CDP の session を開けないので `NOT_OBSERVED`）、`goto` の直後に、結果によらず止める。
   it('passes the observation of the load of each width to afterNavigation (200, 503 and a failure), tracking only during the load', async () => {
     const events: string[] = [];
     const observations: MainFrameLoadObservation[] = [];
-    const diagnostics: NavigationDiagnostics[] = [];
     const failureMessage = 'page.goto: net::ERR_CONNECTION_REFUSED at https://fixture.test/page';
 
     const result = await collectStressLayout(
@@ -690,9 +679,8 @@ describe('responsive layout stress main frame load observation (site unavailabil
       [390, 320, 768],
       {
         ...unpacedStressOptions([390, 320, 768]),
-        afterNavigation: (observation, navigationDiagnostics) => {
+        afterNavigation: (observation) => {
           observations.push(observation);
-          diagnostics.push(navigationDiagnostics);
         },
       },
     );
@@ -703,21 +691,15 @@ describe('responsive layout stress main frame load observation (site unavailabil
       { navigationOutcome: 'FAILED', httpStatus: null, failureDetail: failureMessage },
     ]);
     expect(observations.every((observation) => Object.isFrozen(observation))).toBe(true);
-    // D3: 各幅の読み込み（応答した幅も、失敗した幅も）の観察の結果が渡る。偽の page では観察を始められない。
-    expect(diagnostics).toEqual([NOT_OBSERVED_IN_FAKE_PAGE, NOT_OBSERVED_IN_FAKE_PAGE, NOT_OBSERVED_IN_FAKE_PAGE]);
-    expect(diagnostics.every((entry) => Object.isFrozen(entry))).toBe(true);
     // 観測を渡しても、幅の結果は今までどおりである（collector は判定をしない）。
     expect(result.map((entry) => [entry.width, entry.status])).toEqual([[390, 'COMPLETE'], [320, 'COMPLETE'], [768, 'FAILED']]);
     expect(result[2]).toMatchObject({ stage: 'NAVIGATION', reason: 'NAVIGATION_FAILED', message: failureMessage });
-    // 事象の受け口は、読み込みの前に付け、セッションを閉じる前に外す。観察（CDP の session を開く求め）は、各幅の読み込みの前に始める。
+    // 事象の受け口は、読み込みの前に付け、セッションを閉じる前に外す。
     expect(events).toEqual([
-      'cdp:1',
       'goto:1:https://fixture.test/page:request=1,response=1',
       'close:1:request=0,response=0',
-      'cdp:2',
       'goto:2:https://fixture.test/page:request=1,response=1',
       'close:2:request=0,response=0',
-      'cdp:3',
       'goto:3:https://fixture.test/page:request=1,response=1',
       'close:3:request=0,response=0',
     ]);
@@ -726,7 +708,6 @@ describe('responsive layout stress main frame load observation (site unavailabil
   it('passes a TIMEOUT without an HTTP status when the load of a width gets no response before the stress deadline', async () => {
     const events: string[] = [];
     const observations: MainFrameLoadObservation[] = [];
-    const diagnostics: NavigationDiagnostics[] = [];
 
     const result = await collectStressLayout(
       eventEmittingSessionFactory([{ kind: 'NO_RESPONSE' }], events),
@@ -736,86 +717,18 @@ describe('responsive layout stress main frame load observation (site unavailabil
         deadlineAtMs: Date.now() + 50,
         beforeNavigation: NO_PACING_WAIT,
         settleBeforeLayout: NO_SETTLING_WAIT,
-        afterNavigation: (observation, navigationDiagnostics) => {
+        afterNavigation: (observation) => {
           observations.push(observation);
-          diagnostics.push(navigationDiagnostics);
         },
       },
     );
 
     expect(observations).toEqual([{ navigationOutcome: 'TIMEOUT', httpStatus: null, failureDetail: null }]);
-    // D3: 期限切れの幅でも、観察の結果（偽の page では `NOT_OBSERVED`）が渡る。
-    expect(diagnostics).toEqual([NOT_OBSERVED_IN_FAKE_PAGE]);
     expect(result[0]).toMatchObject({ width: 320, status: 'FAILED', stage: 'NAVIGATION', reason: 'DEADLINE_EXCEEDED' });
     expect(events).toEqual([
-      'cdp:1',
       'goto:1:https://fixture.test/page:request=1,response=1',
       'close:1:request=0,response=0',
     ]);
-  });
-
-  // D3R の Minor-1（診断の記録の設計書 2.2「長く待たない」）: 観察の開始は、幅の読み込みの期限と、今から `sessionOpenTimeoutMs` 後の早い方
-  // までしか待たない（Passive の観察と同じ）。読み込みの期限は変えない（観察を始められなくても、読み込みは期限まで行う）。
-  describe('the deadline of the start of the navigation diagnostics (D3R Minor-1)', () => {
-    /** 注入する、観察の開始を待つ上限（ms）。 */
-    const SHORT_SESSION_OPEN_TIMEOUT_MS = 50;
-    /** 幅の読み込みの期限（ms）。観察の開始がこの期限まで待ってしまう場合に、それと分かるよう、戻るまでの上限より十分に長くする。 */
-    const LONG_STRESS_DEADLINE_MS = 3_000;
-    /** 観察の開始の期限を過ぎてから戻るまでの余裕を含めた、戻るまでの上限（ms）。 */
-    const RETURN_LIMIT_MS = 1_000;
-
-    it('gives up starting the observation sessionOpenTimeoutMs after now, and loads the width as without it', async () => {
-      const events: string[] = [];
-      const observations: MainFrameLoadObservation[] = [];
-      const diagnostics: NavigationDiagnostics[] = [];
-      const startedAtMs = Date.now();
-
-      const result = await collectStressLayout(
-        eventEmittingSessionFactory([{ kind: 'ANSWER', status: FAKE_STATUS_OK }], events, 'NEVER_OPENS'),
-        'https://fixture.test/page',
-        [320],
-        {
-          deadlineAtMs: startedAtMs + LONG_STRESS_DEADLINE_MS,
-          beforeNavigation: NO_PACING_WAIT,
-          settleBeforeLayout: NO_SETTLING_WAIT,
-          sessionOpenTimeoutMs: SHORT_SESSION_OPEN_TIMEOUT_MS,
-          afterNavigation: (observation, navigationDiagnostics) => {
-            observations.push(observation);
-            diagnostics.push(navigationDiagnostics);
-          },
-        },
-      );
-      const elapsedMs = Date.now() - startedAtMs;
-
-      // 観察の開始の期限は `setTimeout` で待つ（`awaitBeforeDeadline`）。偽の session のほかの処理はほぼ時間を使わないため、下限は待つ時間から
-      // 時刻の単位の違い（`TIMER_CLOCK_GRANULARITY_MS`）だけを引いたものにする（DEF-065）。
-      expect(elapsedMs).toBeGreaterThanOrEqual(SHORT_SESSION_OPEN_TIMEOUT_MS - TIMER_CLOCK_GRANULARITY_MS);
-      expect(elapsedMs).toBeLessThan(RETURN_LIMIT_MS);
-      expect(diagnostics).toEqual([{ status: 'NOT_OBSERVED', reason: NAVIGATION_DIAGNOSTICS_START_DEADLINE_MESSAGE }]);
-      // 読み込みと、幅の結果は、観察を始められなくても今までどおりである。
-      expect(observations).toEqual([{ navigationOutcome: 'OK', httpStatus: FAKE_STATUS_OK, failureDetail: null }]);
-      expect(result.map((entry) => [entry.width, entry.status])).toEqual([[320, 'COMPLETE']]);
-      expect(events).toEqual([
-        'cdp:1',
-        'goto:1:https://fixture.test/page:request=1,response=1',
-        'close:1:request=0,response=0',
-      ]);
-    });
-
-    it('rejects a sessionOpenTimeoutMs that is not a positive integer before creating a session', async () => {
-      let creations = 0;
-      const factory: PassiveStressSessionFactory = async () => {
-        creations += 1;
-        throw new Error('must not create');
-      };
-
-      await expect(collectStressLayout(factory, 'https://fixture.test/page', [320], {
-        ...unpacedStressOptions([320]),
-        sessionOpenTimeoutMs: 0,
-        afterNavigation: () => undefined,
-      })).rejects.toThrow(RangeError);
-      expect(creations).toBe(0);
-    });
   });
 
   it('does not call afterNavigation for widths that could not start before the stress deadline', async () => {
@@ -895,72 +808,6 @@ describe('layout collection deadline (V8)', () => {
     expect(Object.isFrozen(result)).toBe(true);
   });
 
-  it('does not start the browser evaluation after the deadline', async () => {
-    let evaluations = 0;
-    const page = {
-      evaluate: async () => {
-        evaluations += 1;
-        return rawLayout(320, STRESS_VIEWPORT_HEIGHT);
-      },
-    } as unknown as Page;
-
-    const result = await collectLayoutEvidence(page, { width: 320, height: STRESS_VIEWPORT_HEIGHT }, {
-      deadlineAtMs: Date.now() - 1,
-    });
-
-    expect(result).toEqual({ status: 'PARTIAL', reason: 'DEADLINE_EXCEEDED', layout: null });
-    expect(evaluations).toBe(0);
-  });
-
-  it('keeps the facts that the browser gathered before stopping at the deadline', async () => {
-    const page = {
-      evaluate: async () => ({
-        ...rawLayout(320, STRESS_VIEWPORT_HEIGHT),
-        boxesOutsideViewport: [outsideCandidate('#late', rect(0, 1_000, 100, 20), {
-          outside: { left: false, right: false, top: false, bottom: true },
-        })],
-        incompleteReason: 'DEADLINE_EXCEEDED',
-      }),
-    } as unknown as Page;
-
-    const result = await collectLayoutEvidence(page, { width: 320, height: STRESS_VIEWPORT_HEIGHT });
-
-    expect(result.status).toBe('PARTIAL');
-    expect(result.status === 'PARTIAL' ? result.reason : undefined).toBe('DEADLINE_EXCEEDED');
-    expect(result.layout?.boxesOutsideViewport.map((candidate) => candidate.selector)).toEqual(['#late']);
-  });
-
-  it('returns PARTIAL with the facts when the overlap scan reached the comparison limit (R4 M2)', async () => {
-    const page = {
-      evaluate: async () => ({
-        ...rawLayout(320, STRESS_VIEWPORT_HEIGHT),
-        truncation: { ...rawLayout(320, STRESS_VIEWPORT_HEIGHT).truncation, overlapComparisonLimitReached: true },
-      }),
-    } as unknown as Page;
-
-    const result = await collectLayoutEvidence(page, { width: 320, height: STRESS_VIEWPORT_HEIGHT });
-
-    expect(result.status).toBe('PARTIAL');
-    expect(result.status === 'PARTIAL' ? result.reason : undefined).toBe('LAYOUT_COMPARISON_LIMIT_REACHED');
-    expect(result.layout?.truncation.overlapComparisonLimitReached).toBe(true);
-    expect(Object.isFrozen(result)).toBe(true);
-  });
-
-  it('keeps the deadline as the reason when the scan also reached the comparison limit (R4 M2)', async () => {
-    const page = {
-      evaluate: async () => ({
-        ...rawLayout(320, STRESS_VIEWPORT_HEIGHT),
-        truncation: { ...rawLayout(320, STRESS_VIEWPORT_HEIGHT).truncation, overlapComparisonLimitReached: true },
-        incompleteReason: 'DEADLINE_EXCEEDED',
-      }),
-    } as unknown as Page;
-
-    const result = await collectLayoutEvidence(page, { width: 320, height: STRESS_VIEWPORT_HEIGHT });
-
-    expect(result).toMatchObject({ status: 'PARTIAL', reason: 'DEADLINE_EXCEEDED' });
-    expect(result.layout?.truncation.overlapComparisonLimitReached).toBe(true);
-  });
-
   it('rejects an unknown incomplete reason from the browser', async () => {
     const page = {
       evaluate: async () => ({ ...rawLayout(320, STRESS_VIEWPORT_HEIGHT), incompleteReason: 'SOMETHING_ELSE' }),
@@ -988,6 +835,23 @@ describe('layout overlap and truncation evidence (V5, V9)', () => {
           overflowY: 'visible',
           fixedOrStickyAncestor: false,
           truncated: false,
+          // DEF-204: 描く面の事実（何も描かない入れ物）と pointer-events。
+          surface: {
+            backgroundColor: 'rgba(0, 0, 0, 0)',
+            backgroundImage: 'none',
+            borderWidths: ['0px', '0px', '0px', '0px'],
+            borderStyles: ['none', 'none', 'none', 'none'],
+            borderColors: ['rgb(0, 0, 0)', 'rgb(0, 0, 0)', 'rgb(0, 0, 0)', 'rgb(0, 0, 0)'],
+            outlineWidth: '0px',
+            outlineStyle: 'none',
+            outlineColor: 'rgb(0, 0, 0)',
+            boxShadow: 'none',
+            backdropFilter: 'none',
+            hasOwnText: false,
+            hasPseudoContent: false,
+            replacedContent: false,
+          },
+          pointerEvents: 'none',
         }],
       }),
     } as unknown as Page;
@@ -999,14 +863,16 @@ describe('layout overlap and truncation evidence (V5, V9)', () => {
       viewportIntersectionArea: 200 * 150,
       viewportArea: 400 * 300,
       viewportAreaRatio: 0.25,
+      paintsOwnSurface: false,
+      pointerEvents: 'none',
     });
     expect(Object.isFrozen(layout.fixedElements[0])).toBe(true);
   });
 
-  it('adds candidates beyond the limit to the omitted count instead of dropping them silently', async () => {
-    const extra = 3;
-    const candidate = {
-      selector: '#zero',
+  it('collects every candidate in parts of LAYOUT_COLLECTION_PART_SIZE from the cursor, without an omitted count (COV-6)', async () => {
+    const total = LAYOUT_COLLECTION_PART_SIZE * 2 + 3;
+    const candidates = Array.from({ length: total }, (_, index) => ({
+      selector: `#zero-${index}`,
       tagName: 'button',
       role: null,
       rect: rect(0, 0, 0, 0),
@@ -1017,30 +883,165 @@ describe('layout overlap and truncation evidence (V5, V9)', () => {
       overflowY: 'visible',
       hasRenderedDescendant: false,
       truncated: false,
-    };
+    }));
+    const cursors: Record<string, number | null>[] = [];
     const page = {
-      evaluate: async () => ({
-        ...rawLayout(320, STRESS_VIEWPORT_HEIGHT),
-        zeroSizeInteractive: Array.from(
-          { length: LAYOUT_THRESHOLDS.maxZeroSizeInteractiveCandidates + extra },
-          () => candidate,
-        ),
-        truncation: {
-          ...rawLayout(320, STRESS_VIEWPORT_HEIGHT).truncation,
-          omittedZeroSizeInteractiveCount: 4,
-        },
-      }),
+      evaluate: async (_collect: unknown, argument: { readonly cursor: Record<string, number | null>; readonly partSize: number }) => {
+        cursors.push(argument.cursor);
+        const start = argument.cursor.zeroSizeInteractive;
+        const base = rawLayout(320, STRESS_VIEWPORT_HEIGHT);
+        const after = start === null || start === undefined ? null : start + argument.partSize;
+        return {
+          ...base,
+          zeroSizeInteractive: start === null || start === undefined ? [] : candidates.slice(start, start + argument.partSize),
+          next: { ...base.next, zeroSizeInteractive: after !== null && after < total ? after : null },
+          truncation: { ...base.truncation, renderedDescendantScanLimitReachedCount: 1 },
+        };
+      },
     } as unknown as Page;
 
     const layout = completeLayout(await collectLayoutEvidence(page, { width: 320, height: STRESS_VIEWPORT_HEIGHT }));
 
-    expect(layout.zeroSizeInteractive).toHaveLength(LAYOUT_THRESHOLDS.maxZeroSizeInteractiveCandidates);
-    expect(layout.truncation.omittedZeroSizeInteractiveCount).toBe(4 + extra);
+    expect(layout.zeroSizeInteractive.map((candidate) => candidate.selector)).toEqual(candidates.map((candidate) => candidate.selector));
+    expect(layout.collectedInParts).toBe(3);
+    expect(cursors.map((cursor) => cursor.zeroSizeInteractive)).toEqual([
+      0,
+      LAYOUT_COLLECTION_PART_SIZE,
+      LAYOUT_COLLECTION_PART_SIZE * 2,
+    ]);
+    // 1 回目で読み終えた一覧は、次の回から null（ブラウザは作業を省く）。
+    expect(cursors[1]?.clippedText).toBeNull();
+    expect(layout.truncation).toMatchObject({
+      omittedZeroSizeInteractiveCount: 0,
+      omittedOutsideViewportCount: 0,
+      omittedClippedTextCount: 0,
+      omittedFixedHeadingOverlapCount: 0,
+      omittedElementOverlapCount: 0,
+      omittedFixedElementCount: 0,
+      renderedDescendantScanLimitReachedCount: 3,
+    });
     expect(Object.isFrozen(layout.truncation)).toBe(true);
   });
 
+  it('keeps the facts of the earlier parts as PARTIAL when a later part outlives the deadline (COV-6)', async () => {
+    const candidate = clippedCandidate('#clipped');
+    let calls = 0;
+    const page = {
+      evaluate: async (_collect: unknown, argument: { readonly partSize: number }) => {
+        calls += 1;
+        if (calls > 1) {
+          return neverSettles();
+        }
+        const base = rawLayout(320, STRESS_VIEWPORT_HEIGHT);
+        return {
+          ...base,
+          clippedText: Array.from({ length: argument.partSize }, () => candidate),
+          next: { ...base.next, clippedText: argument.partSize },
+        };
+      },
+    } as unknown as Page;
+
+    const result = await collectLayoutEvidence(page, { width: 320, height: STRESS_VIEWPORT_HEIGHT }, { deadlineAtMs: Date.now() + 300 });
+
+    expect(result).toMatchObject({ status: 'PARTIAL', reason: 'DEADLINE_EXCEEDED' });
+    expect(result.layout?.clippedText).toHaveLength(LAYOUT_COLLECTION_PART_SIZE);
+    expect(result.layout?.collectedInParts).toBe(1);
+  });
+
+  describe('no deadline of its own (COV-6, the decision of the user on 2026-11-09)', () => {
+    /** 前の collector の期限の既定（10 秒）。いまは期限を持たないことを、これより長い時間で確かめる。 */
+    const FORMER_DEFAULT_TIMEOUT_MS = 10_000;
+
+    afterEach(() => {
+      vi.useRealTimers();
+    });
+
+    it('keeps reading to the end without a deadline from the caller, however long the parts take', async () => {
+      vi.useFakeTimers();
+      const candidate = clippedCandidate('#clipped');
+      const partCount = 3;
+      let calls = 0;
+      const page = {
+        evaluate: async (_collect: unknown, argument: { readonly partSize: number; readonly scanDeadlineAtMs: number | null }) => {
+          calls += 1;
+          // ブラウザ内の走査にも、止める時刻を渡さない。
+          expect(argument.scanDeadlineAtMs).toBeNull();
+          // 1 回ごとに、前の期限の既定より長い時間がかかる。
+          vi.setSystemTime(Date.now() + FORMER_DEFAULT_TIMEOUT_MS * 2);
+          const base = rawLayout(320, STRESS_VIEWPORT_HEIGHT);
+          return {
+            ...base,
+            clippedText: Array.from({ length: argument.partSize }, () => candidate),
+            next: { ...base.next, clippedText: calls < partCount ? argument.partSize * calls : null },
+          };
+        },
+      } as unknown as Page;
+
+      const layout = completeLayout(await collectLayoutEvidence(page, { width: 320, height: STRESS_VIEWPORT_HEIGHT }));
+
+      expect(layout.collectedInParts).toBe(partCount);
+      expect(layout.clippedText).toHaveLength(LAYOUT_COLLECTION_PART_SIZE * partCount);
+    });
+
+    it('does not stop on its own while a part has not returned, without a deadline from the caller', async () => {
+      vi.useFakeTimers();
+      const candidate = clippedCandidate('#clipped');
+      let calls = 0;
+      const page = {
+        evaluate: async (_collect: unknown, argument: { readonly partSize: number }) => {
+          calls += 1;
+          if (calls > 1) {
+            return neverSettles();
+          }
+          const base = rawLayout(320, STRESS_VIEWPORT_HEIGHT);
+          return {
+            ...base,
+            clippedText: Array.from({ length: argument.partSize }, () => candidate),
+            next: { ...base.next, clippedText: argument.partSize },
+          };
+        },
+      } as unknown as Page;
+
+      let settled = false;
+      void collectLayoutEvidence(page, { width: 320, height: STRESS_VIEWPORT_HEIGHT }).then(() => {
+        settled = true;
+      });
+      await vi.advanceTimersByTimeAsync(FORMER_DEFAULT_TIMEOUT_MS * 6 + TIMER_CLOCK_GRANULARITY_MS);
+
+      // 時間で打ち切らない（ページが応答しないときに戻る守りは、呼び出し側の期限が持つ）。
+      expect(calls).toBe(2);
+      expect(settled).toBe(false);
+    });
+  });
+
+  it('rejects a part with more candidates than LAYOUT_COLLECTION_PART_SIZE, and candidates of a list already read (COV-6)', async () => {
+    const candidate = clippedCandidate('#clipped');
+    const tooMany = {
+      evaluate: async () => ({
+        ...rawLayout(320, STRESS_VIEWPORT_HEIGHT),
+        clippedText: Array.from({ length: LAYOUT_COLLECTION_PART_SIZE + 1 }, () => candidate),
+      }),
+    } as unknown as Page;
+    await expect(collectLayoutEvidence(tooMany, { width: 320, height: STRESS_VIEWPORT_HEIGHT })).rejects.toThrow(
+      'Unbounded browser layout list: clippedText',
+    );
+
+    let calls = 0;
+    const afterRead = {
+      evaluate: async () => {
+        calls += 1;
+        const base = rawLayout(320, STRESS_VIEWPORT_HEIGHT);
+        return calls === 1
+          ? { ...base, clippedText: [candidate], next: { ...base.next, clippedText: 1 } }
+          : { ...base, clippedText: [candidate], boxesOutsideViewport: [outsideCandidate('#late', rect(0, 0, 10, 10))] };
+      },
+    } as unknown as Page;
+    await expect(collectLayoutEvidence(afterRead, { width: 320, height: STRESS_VIEWPORT_HEIGHT })).rejects.toThrow(
+      'Unexpected browser layout list after it was read: boxesOutsideViewport',
+    );
+  });
+
   it.each([
-    'omittedElementOverlapCount',
     'clippedTextNodeScanLimitReachedCount',
     'renderedDescendantScanLimitReachedCount',
   ] as const)('rejects an invalid count in truncation.%s from the browser', async (name) => {
@@ -1058,16 +1059,16 @@ describe('layout overlap and truncation evidence (V5, V9)', () => {
     }
   });
 
-  it.each([-1, 1.5, Number.NaN])('rejects an invalid omitted count %s from the browser', async (count) => {
+  it.each([-1, 0, 1.5, Number.NaN])('rejects a next position %s that does not move forward from the browser (COV-6)', async (position) => {
     const page = {
       evaluate: async () => ({
         ...rawLayout(320, STRESS_VIEWPORT_HEIGHT),
-        truncation: { ...rawLayout(320, STRESS_VIEWPORT_HEIGHT).truncation, omittedElementOverlapCount: count },
+        next: { ...rawLayout(320, STRESS_VIEWPORT_HEIGHT).next, elementOverlaps: position },
       }),
     } as unknown as Page;
 
     await expect(collectLayoutEvidence(page, { width: 320, height: STRESS_VIEWPORT_HEIGHT })).rejects.toThrow(
-      'truncation.omittedElementOverlapCount',
+      'next.elementOverlaps',
     );
   });
 });
@@ -1165,5 +1166,17 @@ describe('layout evidence that avoids false positives (RT12 I1, I2, I3)', () => 
     await expect(collect(layoutWith({
       zeroSizeInteractive: [{ ...layout.zeroSizeInteractive[0], hasRenderedDescendant: undefined }],
     }))).rejects.toThrow('hasRenderedDescendant');
+  });
+
+  it('keeps clippedToZeroArea of the visibility facts, and rejects a value that is not a boolean (DEF-205)', async () => {
+    const hidden = { ...visibleFacts, clippedToZeroArea: true };
+    const layout = completeLayout(await collect(layoutWith({
+      clippedText: [clippedCandidate('#skip-link', { visibility: hidden })],
+    })));
+
+    expect(layout.clippedText[0]?.visibility.clippedToZeroArea).toBe(true);
+    await expect(collect(layoutWith({
+      clippedText: [clippedCandidate('#skip-link', { visibility: { ...visibleFacts, clippedToZeroArea: 'yes' } })],
+    }))).rejects.toThrow('clippedToZeroArea');
   });
 });

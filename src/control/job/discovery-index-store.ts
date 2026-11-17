@@ -1,8 +1,8 @@
 // 発見の候補の索引の読み書きの唯一の owner（管理データの版 5 の `discovery_candidates` と `discovery_jobs`。Task 27 の設計書 4.4 の「ドリフト」、
 // 4.6、4.8。T27c、T27d）。
 // - 記録（`recordDiscoveryCandidates`）: 発見のジョブ（`DISCOVERY`）の結果を、1 つのトランザクションで書く。プロファイルと識別の digest で突き合わせ、
-//   新しい（`NEW`）・変わった（`CHANGED`。規則の digest・分類・理由のコード・状態の欄の印のどれかが前と違う）・まだある（`UNCHANGED`）・消えた
-//   （`MISSING`。今回読み切れた画面の path にあって、今回の結果にない）・読み直していない（`NOT_REVISITED`。今回読まなかった画面の候補。T27d）を
+//   見えた（`SEEN`。SPEC-1 で前の新しい・変わった・まだあるをまとめた。変わった候補は、規則の digest・分類・理由のコード・状態の欄の印と最後に変わった
+//   ジョブを書く）・消えた（`MISSING`。今回読み切れた画面の path にあって、今回の結果にない）・読み直していない（`NOT_REVISITED`。今回読まなかった画面の候補。T27d）を
 //   返す。消えた候補も読み直していない候補も消さない（最後に見たジョブと時刻が前のまま残る）。変わった候補は、最後に変わったジョブを書く。
 //   T27d（設計書の変更履歴「Blocker: T27d」の行の (2)）: ジョブ 1 回を `discovery_jobs` の 1 行（主キーはジョブの ID。読み切れた画面の path の一覧を
 //   持つ）として、同じトランザクションで書く。同じジョブの 2 回目の記録は、この行（主キー）で拒む（候補が 0 件のジョブも同じ）。
@@ -20,13 +20,16 @@
 // - T38d（Task 38 の設計書 3.1、3.5。管理データの版 13）: 候補ごとの「型の digest の一覧」（`shapeDigests`。押して見た要求の型の digest
 //   `submissionProbe.shapeDigest`。digest だけ）を書く。`inputFields` のない probe（T38a の前の成果物）と型のない probe は、型を持たないものとして扱う。
 //   同じジョブの同じ識別の digest の候補（型ごとに 1 行。`mergeDiscoveryCandidates`）は、型の一覧を合わせて 1 件にする（ほかの項目が違えば
-//   `RangeError`）。上限は `MAX_INDEX_SHAPE_DIGESTS`。どの場合も今回の一覧で書き直す（型の違いはドリフトに数えない）。版 13 の前に書いた行は
+//   `RangeError`）。COV-1: 件数の上限は外した（管理データの版 18）。どの場合も今回の一覧で書き直す（型の違いはドリフトに数えない）。版 13 の前に書いた行は
 //   一覧なし（読み出しの `shapeDigests` は null。API の承認の有効性は止める側。判定は T38c）。
 // - T38R-fix（Task 38 の設計書 7 章の最後の行）: C-1: 型の digest は、書き込みの probe（結果が `API_CREATE`・`API_UPDATE`）の型だけ。I-1: 鍵と欄の対応の
 //   digest の一覧（`keyFieldDigests`。`apiKeyFieldsDigestOf`）も、型の一覧と同じく書き、合わせ、読む（列を足す前の行は null）。
 // - T41a（Task 41 の設計書 3.1）: form のない候補の、画面の path の最後の ID を `{id}` にした識別の digest（`pagePathTemplatedIdentityDigestOf`）も、型に
 //   した識別の digest の一覧（同じ列 `templated_identity_digests`）に入れる。印が form の digest と違うので、印で分けて共用する（管理データの版は 14 のまま。
 //   列の形と上限は変わらない）。API の UPDATE の承認の有効性が、この一覧で候補を確かめる。
+// - LU-11（設計書 `2026-11-02-beaksight-list-row-update-design.md` 5.4 の 4、D5）: 行の下に広がるフォーム（画面の path に番号がなく、送信先の最後が番号）の、
+//   送信先を型にした識別の digest（`listRowFormTemplatedIdentityDigestOf`）も、同じ列に入れる（印が違うので互いに当たらない。管理データの版は変えない）。上限を
+//   超えるときは、この digest を残し、form の digest を並びの順に上限まで残す（form の digest は画面の path の番号の区切りの組で、この形の画面には番号がない）。
 // - 書き込みは、すべて `withWriteTransaction` の中。読むだけの関数は `withReadTransaction` を通す。生の接続を直接参照しない（Architecture Gate
 //   `control-store-boundary.test.ts` の (f)(g)）。呼び出し側の誤り（形の違う入力、同じジョブを 2 回、前の時刻）は、書く前に `RangeError`。
 import { isSha256Fingerprint } from '../../core/ids.js';
@@ -37,7 +40,6 @@ import {
   CANDIDATE_REASON_CLASSIFICATIONS,
   CANDIDATE_REASON_CODES,
   FORM_METHODS,
-  MAX_CANDIDATE_URL_PART_LENGTH,
   METHOD_OVERRIDE_VALUES,
   type CandidateClassification,
   type CandidateReasonCode,
@@ -45,13 +47,13 @@ import {
   type FormMethod,
   type MethodOverride,
 } from '../../discovery/candidate-contracts.js';
-import { MAX_DISCOVERY_READ_PAGE_PATHS } from '../../discovery/discovery-result.js';
-import { MAX_RECORD_ID_SEGMENT_PAIRS, pagePathTemplatedIdentityDigestOf, templatedIdentityDigestsOf } from '../../discovery/fingerprint.js';
 import {
-  MAX_SUBMISSION_PROBE_PRESSES_PER_PAGE,
-  submissionProbeWriteOf,
-  type SubmissionProbeRecord,
-} from '../../discovery/submission-probe-contracts.js';
+  MAX_RECORD_ID_SEGMENT_PAIRS,
+  listRowFormTemplatedIdentityDigestOf,
+  pagePathTemplatedIdentityDigestOf,
+  templatedIdentityDigestsOf,
+} from '../../discovery/fingerprint.js';
+import { submissionProbeWriteOf, type SubmissionProbeRecord } from '../../discovery/submission-probe-contracts.js';
 import { apiKeyFieldsDigestOf, scenarioApiKeyFieldsOfProbe } from '../approval/scenario-contracts.js';
 import { usableRecordIdOf } from '../actions/action-outcome.js';
 import type { ControlDatabase } from '../store/control-database.js';
@@ -87,22 +89,16 @@ export interface DiscoveryIndexEntry {
    */
   readonly templatedIdentityDigests: readonly string[];
   /**
-   * 型の digest の一覧（T38d。UTF-16 のコード単位の順、重なりなし、上限 `MAX_INDEX_SHAPE_DIGESTS` 件。digest だけ）。作るのは `discoveryIndexEntryOf`
+   * 型の digest の一覧（T38d。UTF-16 のコード単位の順、重なりなし。digest だけ。COV-1: 件数の上限はない）。作るのは `discoveryIndexEntryOf`
    * （`inputFields` を持つ probe の型の digest。ほかは空）。
    */
   readonly shapeDigests: readonly string[];
   /**
-   * 鍵と欄の対応の digest の一覧（T38R-fix の I-1。`apiKeyFieldsDigestOf`。型の digest の一覧と同じ行の probe ごと。並べて重なりなし、上限
-   * `MAX_INDEX_SHAPE_DIGESTS` 件）。作るのは `discoveryIndexEntryOf`。
+   * 鍵と欄の対応の digest の一覧（T38R-fix の I-1。`apiKeyFieldsDigestOf`。型の digest の一覧と同じ行の probe ごと。並べて重なりなし。COV-1: 件数の
+   * 上限はない）。作るのは `discoveryIndexEntryOf`。
    */
   readonly keyFieldDigests: readonly string[];
 }
-
-/**
- * 索引の 1 件が持てる型の digest の数の上限（T38d。1 画面で押す回数の上限と同じ。1 回の発見で、1 つの識別の digest の型はそれより多くならない。
- * 管理データの版 13 の CHECK も同じ数）。
- */
-export const MAX_INDEX_SHAPE_DIGESTS = MAX_SUBMISSION_PROBE_PRESSES_PER_PAGE;
 
 /** 発見のジョブ 1 回の記録の入力。 */
 export interface DiscoveryIndexUpdate {
@@ -113,14 +109,20 @@ export interface DiscoveryIndexUpdate {
   readonly at: string;
   readonly entries: readonly DiscoveryIndexEntry[];
   /**
-   * 今回のジョブで読み切れた画面の path（`/` で始まる。重複なし。上限 `MAX_DISCOVERY_READ_PAGE_PATHS`。T27d）。ここにある path の候補で今回ない
+   * 今回のジョブで読み切れた画面の path（`/` で始まる。重複なし。T27d。LZ-3a: 数の上限はない）。ここにある path の候補で今回ない
    * ものを `MISSING`、ほかの今回ない候補を `NOT_REVISITED` にする。作るのは `src/discovery/discovery-result.ts` の `discoveryReadPagePaths`。
    */
   readonly readPagePaths: readonly string[];
 }
 
-/** 前の記録に対するドリフト（閉じた一覧。設計書 4.4。T27d で `NOT_REVISITED` を足した）。 */
-export const DISCOVERY_INDEX_DRIFTS = Object.freeze(['NEW', 'CHANGED', 'UNCHANGED', 'MISSING', 'NOT_REVISITED'] as const);
+/**
+ * 前の記録に対するドリフト（閉じた一覧。設計書 4.4。T27d で `NOT_REVISITED` を足した）。SPEC-1: 3 通りにした（前の `NEW`・`CHANGED`・`UNCHANGED` は
+ * `SEEN` にまとめた）。承認が使うのは `MISSING`・`NOT_REVISITED` だけで、変わったかは行の値（規則の digest と最後に変わったジョブ）で分かる。
+ * - `SEEN`: 最後の発見のジョブで見えた。
+ * - `MISSING`: 最後の発見のジョブで読み切れた画面にあって、その結果になかった。
+ * - `NOT_REVISITED`: 最後の発見のジョブで、その画面を読まなかった。
+ */
+export const DISCOVERY_INDEX_DRIFTS = Object.freeze(['SEEN', 'MISSING', 'NOT_REVISITED'] as const);
 export type DiscoveryIndexDrift = (typeof DISCOVERY_INDEX_DRIFTS)[number];
 
 /** 記録の結果（ドリフトごとの識別の digest。UTF-16 のコード単位の順。凍結）。 */
@@ -224,21 +226,21 @@ const sortedFrozen = (values: readonly string[]): readonly string[] => Object.fr
 // 入力の確かめ（呼び出し側の誤りは `RangeError`。書く前に確かめる）
 // ---------------------------------------------------------------------------------------------------------------
 
-const isCandidatePath = (value: unknown): value is string =>
-  typeof value === 'string' && value.startsWith(PATH_START) && value.length <= MAX_CANDIDATE_URL_PART_LENGTH;
+/** 候補の path か（`/` で始まる。URL-LEN: 長さの上限（前は 2,048）はない。管理データの版 20 で列の上限も外した）。 */
+const isCandidatePath = (value: unknown): value is string => typeof value === 'string' && value.startsWith(PATH_START);
 
-/** digest の一覧の形か（digest の形、UTF-16 のコード単位の順で重なりなし、上限まで）。 */
-const isSortedDigestList = (value: unknown, limit: number): value is readonly string[] =>
+/** digest の一覧の形か（digest の形、UTF-16 のコード単位の順で重なりなし、上限まで。上限を省くと件数を問わない）。 */
+const isSortedDigestList = (value: unknown, limit?: number): value is readonly string[] =>
   Array.isArray(value)
-  && value.length <= limit
+  && (limit === undefined || value.length <= limit)
   && value.every(isSha256Fingerprint)
   && value.every((digest, index) => index === 0 || (value[index - 1] as string) < digest);
 
 /** 型にした識別の digest の一覧の形か（T31e）。 */
 const isTemplatedIdentityDigests = (value: unknown): value is readonly string[] => isSortedDigestList(value, MAX_RECORD_ID_SEGMENT_PAIRS);
 
-/** 型の digest の一覧の形か（T38d）。 */
-const isShapeDigests = (value: unknown): value is readonly string[] => isSortedDigestList(value, MAX_INDEX_SHAPE_DIGESTS);
+/** 型の digest の一覧の形か（T38d。COV-1: 件数の上限はない。管理データの版 18 で CHECK も外した）。 */
+const isShapeDigests = (value: unknown): value is readonly string[] => isSortedDigestList(value);
 
 /** 索引の 1 件の形を確かめ、項目を選んだ凍結した写しを返す（余分な項目は写さない）。 */
 const requireEntry = (entry: DiscoveryIndexEntry): DiscoveryIndexEntry => {
@@ -297,7 +299,7 @@ const sameEntryButShapes = (left: DiscoveryIndexEntry, right: DiscoveryIndexEntr
 const joinedDigestsOf = (left: readonly string[], right: readonly string[], label: string): readonly string[] => {
   const joined = sortedFrozen([...new Set([...left, ...right])]);
   if (!isShapeDigests(joined)) {
-    throw new RangeError(`one identity digest of a discovery job must have at most ${MAX_INDEX_SHAPE_DIGESTS} ${label}`);
+    throw new RangeError(`one identity digest of a discovery job must have sorted distinct ${label}`);
   }
   return joined;
 };
@@ -309,10 +311,10 @@ const withJoinedShapes = (known: DiscoveryIndexEntry, entry: DiscoveryIndexEntry
   keyFieldDigests: joinedDigestsOf(known.keyFieldDigests, entry.keyFieldDigests, 'key field digests'),
 });
 
-/** 読み切れた画面の path の一覧を確かめ、並べた凍結した写しを返す（T27d）。形の違う値、重複、上限を超える件数は `RangeError`。 */
+/** 読み切れた画面の path の一覧を確かめ、並べた凍結した写しを返す（T27d）。形の違う値と重複は `RangeError`（LZ-3a: 件数の上限はない）。 */
 const requireReadPagePaths = (paths: readonly string[]): readonly string[] => {
-  if (!Array.isArray(paths) || paths.length > MAX_DISCOVERY_READ_PAGE_PATHS) {
-    throw new RangeError(`the read page paths must be an array of at most ${MAX_DISCOVERY_READ_PAGE_PATHS} paths`);
+  if (!Array.isArray(paths)) {
+    throw new RangeError('the read page paths must be an array');
   }
   if (!paths.every(isCandidatePath)) {
     throw new RangeError('every read page path must start with a slash and be within the limit');
@@ -449,7 +451,7 @@ const recordIn = (
   const readPaths: ReadonlySet<string> = new Set(checked.readPagePaths);
   const rows = new Map((connection.prepare(SELECT_PROFILE_CANDIDATES_SQL).all(profileId) as unknown as CandidateRow[])
     .map((row) => [row.identity_digest, row]));
-  const outcome: Record<DiscoveryIndexDrift, string[]> = { NEW: [], CHANGED: [], UNCHANGED: [], MISSING: [], NOT_REVISITED: [] };
+  const outcome: Record<DiscoveryIndexDrift, string[]> = { SEEN: [], MISSING: [], NOT_REVISITED: [] };
   for (const entry of checked.entries) {
     const row = rows.get(entry.identityDigest);
     rows.delete(entry.identityDigest);
@@ -464,26 +466,22 @@ const recordIn = (
         profileId, entry.identityDigest, entry.ruleDigest, entry.classification, entry.reasonCode, entry.pagePath, entry.actionPath,
         entry.formMethod, entry.methodOverride, entry.hasStateField ? SQL_TRUE : SQL_FALSE, jobId, at, jobId, at, templated, shapes, keyFields,
       );
-      outcome.NEW.push(entry.identityDigest);
     } else if (changedFrom(row, entry)) {
       connection.prepare(UPDATE_CHANGED_SQL).run(
         entry.ruleDigest, entry.classification, entry.reasonCode, entry.hasStateField ? SQL_TRUE : SQL_FALSE, jobId, at, jobId, templated, shapes,
         keyFields, profileId, entry.identityDigest,
       );
-      outcome.CHANGED.push(entry.identityDigest);
     } else {
       connection.prepare(UPDATE_SEEN_SQL).run(jobId, at, templated, shapes, keyFields, profileId, entry.identityDigest);
-      outcome.UNCHANGED.push(entry.identityDigest);
     }
+    outcome.SEEN.push(entry.identityDigest);
   }
   // 今回の結果にない候補は、消さずに残す（最後に見たジョブが前のまま）。読み切れた画面の候補は `MISSING`、ほかは `NOT_REVISITED`。
   for (const row of rows.values()) {
     (readPaths.has(row.page_path) ? outcome.MISSING : outcome.NOT_REVISITED).push(row.identity_digest);
   }
   return Object.freeze({
-    NEW: sortedFrozen(outcome.NEW),
-    CHANGED: sortedFrozen(outcome.CHANGED),
-    UNCHANGED: sortedFrozen(outcome.UNCHANGED),
+    SEEN: sortedFrozen(outcome.SEEN),
     MISSING: sortedFrozen(outcome.MISSING),
     NOT_REVISITED: sortedFrozen(outcome.NOT_REVISITED),
   });
@@ -523,6 +521,11 @@ const keyFieldDigestsOfCandidate = (candidate: DiscoveryCandidate): readonly str
 const templatedDigestsOfCandidate = (candidate: DiscoveryCandidate): readonly string[] => {
   const page = pagePathTemplatedIdentityDigestOf(candidate);
   const form = templatedIdentityDigestsOf(candidate, (value) => usableRecordIdOf(value) !== null);
+  // LU-11: 行の下に広がるフォームの digest（ほかの digest と重ならない）。上限の中に必ず残す。
+  const listRow = listRowFormTemplatedIdentityDigestOf(candidate);
+  if (listRow !== null) {
+    return sortedFrozen([...new Set([listRow, ...form.slice(0, MAX_RECORD_ID_SEGMENT_PAIRS - 1)])]);
+  }
   return page === null ? form : sortedFrozen([...new Set([...form, page])]);
 };
 
@@ -565,14 +568,9 @@ const viewOf = (row: CandidateRow, latestJobId: string, latestReadPaths: Readonl
     || (row.method_override !== null && !isOneOf(METHOD_OVERRIDE_VALUES, row.method_override))) {
     throw integrityError('the method is not in the closed lists');
   }
-  let drift: DiscoveryIndexDrift = 'UNCHANGED';
-  if (row.last_seen_job_id !== latestJobId) {
-    drift = latestReadPaths.has(row.page_path) ? 'MISSING' : 'NOT_REVISITED';
-  } else if (row.first_seen_job_id === latestJobId) {
-    drift = 'NEW';
-  } else if (row.last_changed_job_id === latestJobId) {
-    drift = 'CHANGED';
-  }
+  const drift: DiscoveryIndexDrift = row.last_seen_job_id === latestJobId
+    ? 'SEEN'
+    : latestReadPaths.has(row.page_path) ? 'MISSING' : 'NOT_REVISITED';
   return deepFreeze({
     profileId: row.profile_id,
     identityDigest: row.identity_digest,
@@ -599,8 +597,7 @@ const viewOf = (row: CandidateRow, latestJobId: string, latestReadPaths: Readonl
 /**
  * プロファイルの索引を読む。最後の発見のジョブは、`discovery_jobs` の記録した時刻が最も新しい行のジョブ（同じ時刻なら、後に記録した行。
  * 記録した時刻は前のジョブより前にできないので、記録の順と同じ。ジョブの ID はランダムなので比べない。候補が 0 件のジョブも含む）。各候補のドリフトは、そのジョブに対するもの（最後に見たジョブが違えば、その画面をそのジョブで読み切れていれば
- * `MISSING`、読んでいなければ `NOT_REVISITED`。最初に見たのがそのジョブなら `NEW`、最後に変わったのがそのジョブなら `CHANGED`、ほかは
- * `UNCHANGED`）。
+ * `MISSING`、読んでいなければ `NOT_REVISITED`。最後に見たのがそのジョブなら `SEEN`）。
  */
 export const readDiscoveryIndex = (database: ControlDatabase, profileId: string): DiscoveryIndexView =>
   withReadTransaction(database, (connection) => readDiscoveryIndexIn(connection, profileId));

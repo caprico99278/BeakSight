@@ -6,11 +6,9 @@ import {
   type MainFrameLoadObservation,
   type MainFrameLoadSettlement,
 } from '../browser/main-frame-load.js';
-import { startNavigationDiagnostics } from '../browser/navigation-diagnostics.js';
 import { pageFailureReason } from '../browser/page-failure.js';
 import type { Viewport } from '../config/types.js';
-import type { NavigationDiagnostics } from '../core/contracts.js';
-import { awaitBeforeDeadline, deadlineWithinTimeoutAtMs, resolveTimeoutMs } from '../core/deadline.js';
+import { awaitBeforeDeadline } from '../core/deadline.js';
 import { safeErrorMessage } from '../core/errors.js';
 import {
   FIXED_ELEMENT_POSITIONS,
@@ -18,10 +16,12 @@ import {
   LAYOUT_ELEMENT_KINDS,
   VISUALLY_HIDDEN_MAX_DIMENSION_PX,
   type ClippedTextEvidence,
+  type ClippedTextStyleEvidence,
   type FixedElementEvidence,
   type FixedElementPosition,
   type FixedHeadingOverlapEvidence,
   type HorizontalClipAncestorKind,
+  type IntendedClippingKind,
   type LayoutCollectionResult,
   type LayoutDocumentEvidence,
   type LayoutElementEvidence,
@@ -29,8 +29,15 @@ import {
   type LayoutEvidence,
   type LayoutIncompleteReason,
   type LayoutTruncationEvidence,
+  type LineOverlapEvidence,
+  OVERLAP_HIT_RELATIONS,
+  OVERLAP_HIT_TARGETS,
   type OutsideViewportEvidence,
+  type OverlapHitLayerEvidence,
+  type OverlapHitPointEvidence,
+  type OverlapHitTestEvidence,
   type RectangleEvidence,
+  type ScrollContainerEvidence,
   type ScrollPosition,
   type StressLayoutEvidence,
   type StressLayoutFailureReason,
@@ -41,35 +48,20 @@ import {
 import { isNonNegativeFiniteNumber, isNonNegativeSafeInteger, isPositiveFiniteNumber } from '../core/guards.js';
 import {
   GEOMETRY_EPSILON_PX,
-  MAX_ERROR_MESSAGE_LENGTH,
   MAX_SELECTOR_DEPTH,
-  MAX_SELECTOR_LENGTH,
-  SESSION_OPEN_TIMEOUT_MS,
 } from '../core/limits.js';
 import { VISIBILITY_CHECK_OPTIONS } from '../core/visibility.js';
 import { composeInPage, type StandardReaders } from '../browser/in-page-readers.js';
+import { paintsOwnSurfaceOf, type OwnSurfaceFacts } from '../core/own-surface.js';
+import { readInParts } from '../core/read-in-parts.js';
 
 export const LAYOUT_THRESHOLDS = Object.freeze({
   stressViewportHeight: 900,
   minOcclusionAreaPx2: 1,
   maxZeroSizeDimensionPx: 0,
   geometryEpsilonPx: GEOMETRY_EPSILON_PX,
-  maxOutsideViewportCandidates: 100,
-  maxZeroSizeInteractiveCandidates: 100,
-  maxClippedTextCandidates: 100,
-  maxFixedHeadingOverlapCandidates: 100,
-  /** 記録する主要要素どうしの重なりの候補の最大件数。超えた分は件数だけを記録する。 */
-  maxElementOverlapCandidates: 100,
-  /** 記録する固定要素（`position: fixed | sticky`）の最大件数。超えた分は件数だけを記録する。 */
-  maxFixedElementCandidates: 100,
-  /** 重なりの走査の1回（固定要素と見出し、主要要素どうし）で比べる組の最大数。超えたら走査を止め、その事実を記録する。 */
-  maxOverlapComparisons: 200_000,
-  maxClippedTextLength: 256,
-  /**
-   * 見切れの候補1つあたり、`partiallyClippedText` を判定するために走査する、子孫のテキストのノードの最大数（空白だけのノードも数える）。
-   * 超えた場合は判定できないものとして false にし、その件数を記録する。候補の上限（`maxClippedTextCandidates`）と掛けた値が、1ページの走査の上限になる。
-   */
-  maxClippedTextNodeScan: 256,
+  // LZ-3b: 記録する見切れのテキストの長さの上限（前の `maxClippedTextLength` 256）は撤廃した。テキストを切り詰めずに記録する（見切れの候補の
+  // `truncated` は前の記録の形のために残し、いつも偽。selector も切り詰めない）。
   /**
    * `partiallyClippedText` の判定で、箱と交わるテキストの行を、縦方向に「切り取られている」とみなす、箱の外に出た量の割合の下限（この値を含まない）。
    * 割合は、行の矩形の高さに対して計る。行の矩形はフォントの内容領域の高さを持ち、行の高さより大きいことがあるので、
@@ -84,23 +76,75 @@ export const LAYOUT_THRESHOLDS = Object.freeze({
    */
   clippedTextLineMaxIgnoredHorizontalOverflowPx: 2,
   /**
-   * 大きさ0の操作要素の候補1つあたり、`hasRenderedDescendant` を判定するために走査する子孫の要素の最大数。
-   * 超えた場合は判定できないものとして false にし、その件数を記録する。
+   * DEF-204（設計書 `2026-11-06-beaksight-notification-overlay-design.md` 3.5）: 固定要素が自分の文字を持つか（描く面の事実）を調べる、子のノードの最大数。
+   * 超えた場合は、文字があるもの（描く面があるもの）として扱う。
    */
-  maxRenderedDescendantScan: 256,
+  maxOwnTextNodeScan: 256,
   /** 描画された子孫とみなさない、子孫の幅か高さの上限（px。この値を含む）。visually hidden の要素を数えないため（RT12r の N5）。 */
   maxUnrenderedDescendantDimensionPx: VISUALLY_HIDDEN_MAX_DIMENSION_PX,
-  maxSelectorLength: MAX_SELECTOR_LENGTH,
   maxSelectorDepth: MAX_SELECTOR_DEPTH,
   viewportMatchTolerancePx: 0,
   minViewportIntersectionDimensionPx: 0,
-  /** 期限を指定されなかったときの、1回の layout の収集の期限（ミリ秒）。 */
-  defaultTimeoutMs: 10_000,
   /** ブラウザ内の走査を、期限のこの時間前に止める（部分結果を期限までに Node 側へ返すための時間。ミリ秒）。 */
   partialResultReserveMs: 250,
+  /**
+   * AUD-3b: hit-test の四隅の点を、交わりの矩形の内側へ寄せる量の上限（px）。寄せる量は、この値と各辺の 4 分の 1 の小さい方（境界の上の点は、どちらの要素に
+   * 当たるかが描画の丸めで揺れるため）。点は、中心と四隅の 5 点（数の上限ではない。交わりの形から決まる）。
+   */
+  hitTestPointInsetPx: 4,
+  /** AUD-3b: 要素そのものが中身を描く種類（hit-test の点の要素の、描く面の事実に使う）。 */
+  replacedContentSelector: 'img, picture, video, canvas, svg, iframe, embed, object, input, textarea, select',
 });
 
+
 export const STRESS_VIEWPORT_HEIGHT = LAYOUT_THRESHOLDS.stressViewportHeight;
+
+/**
+ * COV-6: ページの中の 1 回の読み取りで返す、候補の一覧（はみ出し・大きさ0の操作要素・見切れ・固定要素と見出しの重なり・主要要素どうしの重なり・固定要素）
+ * ごとの件数（自分の処理の上限 C。1 回の受け渡しの大きさを抑えるための分け方の単位で、記録の件数の上限ではない）。
+ * 読み取りは毎回ページ全体を走査し直し、続きの位置からこの件数だけを返す（`readInParts`）。読み終えた一覧は、次の回から走査の作業を省く。
+ */
+export const LAYOUT_COLLECTION_PART_SIZE = 2_000;
+
+/** COV-6: 候補の一覧の名前（続きの位置の項目と同じ）。 */
+const LAYOUT_PART_LIST_NAMES = Object.freeze([
+  'boxesOutsideViewport',
+  'zeroSizeInteractive',
+  'clippedText',
+  'fixedHeadingOverlaps',
+  'elementOverlaps',
+  'fixedElements',
+] as const);
+type LayoutPartListName = (typeof LAYOUT_PART_LIST_NAMES)[number];
+
+/**
+ * COV-6: 一覧ごとの、この回に読み始める位置。`null` は読み終えた一覧（ブラウザは、その一覧の作業を省き、空の部分を返す）。
+ * 位置は、はみ出し・大きさ0の操作要素・見切れ・固定要素では一覧の中の番号、重なりの 2 つの一覧では比べる組の番号（何番目の組から比べるか）。
+ */
+export type LayoutPartCursor = Readonly<Record<LayoutPartListName, number | null>>;
+
+const FIRST_LAYOUT_PART_CURSOR: LayoutPartCursor = Object.freeze({
+  boxesOutsideViewport: 0,
+  zeroSizeInteractive: 0,
+  clippedText: 0,
+  fixedHeadingOverlaps: 0,
+  elementOverlaps: 0,
+  fixedElements: 0,
+});
+
+/**
+ * AUD-4a: `-webkit-line-clamp` が効く `display` の計算値。いまの Chromium は、行数の省略が効く `-webkit-box`・`-webkit-inline-box` の計算値を
+ * `flow-root`・`inline-flow-root` で返す（2026-11-09 にテストの Chromium で確かめた）ので、両方を入れる。
+ */
+const WEBKIT_LINE_CLAMP_DISPLAYS: readonly string[] = Object.freeze([
+  '-webkit-box',
+  '-webkit-inline-box',
+  'flow-root',
+  'inline-flow-root',
+]);
+
+/** AUD-4a: 折り返さない `white-space` の計算値（ellipsis で 1 行を省略する書き方）。 */
+const NO_WRAP_WHITE_SPACES: readonly string[] = Object.freeze(['nowrap', 'pre']);
 
 /**
  * 祖先の `overflow-x` の計算値ごとの、横方向の切り取りの種類（Task 12・13 の設計書 5.1.2）。ここにない値（`visible`）は切り取らない。
@@ -129,33 +173,79 @@ const LAYOUT_ELEMENT_KIND_SELECTORS: readonly (readonly [Exclude<LayoutElementKi
 ] as const);
 
 export interface LayoutCollectionOptions {
-  /** 収集の期限（`Date.now()` の絶対時刻）。省略時は呼び出し時点から `defaultTimeoutMs` 後。 */
-  readonly deadlineAtMs: number;
+  /**
+   * 呼び出し側の期限（`Date.now()` の絶対時刻）。省略できる。COV-6（2026-11-09 のユーザーの判断）: layout の collector は自分の期限を持たず、
+   * 省略すると時間で打ち切らない。渡したときだけ、この期限を守る（それまでの回の事実で `PARTIAL`）。
+   * 呼び出し側が渡すのは、Page Auditor のページの期限（`crawl.overallPageTimeoutMs` から導く）と、幅の走査の期限。幅の走査は Page Auditor が
+   * 見放さない段階なので、ページが応答しないときに戻る守りは、この期限だけである（外すかは、呼び出し側の設計で決める）。
+   */
+  readonly deadlineAtMs?: number;
 }
 
 type RawLayoutElementEvidence = Omit<LayoutElementEvidence, 'area'>;
+
+/** AUD-3b: ブラウザが返す hit-test の点の要素の事実（描く面があるかは、Node の側で `paintsOwnSurfaceOf` が決める）。 */
+interface RawOverlapHitLayer extends Omit<OverlapHitLayerEvidence, 'paintsOwnSurface'> {
+  readonly surface: Omit<OwnSurfaceFacts, 'replacedContent'>;
+  /** 要素そのものが中身を描く種類（画像・埋め込み・入力の欄など）か。 */
+  readonly replaced: boolean;
+}
+
+interface RawOverlapHitPoint extends Omit<OverlapHitPointEvidence, 'layers'> {
+  readonly layers: readonly RawOverlapHitLayer[];
+}
+
+/** AUD-3b: ブラウザが返す hit-test の事実。 */
+interface RawOverlapHitTest extends Omit<OverlapHitTestEvidence, 'points' | 'overlay'> {
+  readonly points: readonly RawOverlapHitPoint[];
+  readonly overlay: RawOverlapHitLayer;
+}
 
 interface RawElementOverlapEvidence {
   readonly first: RawLayoutElementEvidence;
   readonly second: RawLayoutElementEvidence;
   readonly intersection: RectangleEvidence & { readonly area: number };
   readonly truncated: boolean;
+  readonly hitTest?: RawOverlapHitTest;
+  readonly coveredScrollContainer?: ScrollContainerEvidence;
+  readonly lineOverlap?: LineOverlapEvidence;
 }
+
+type RawFixedHeadingOverlapEvidence = Omit<FixedHeadingOverlapEvidence, 'hitTest'> & { readonly hitTest?: RawOverlapHitTest };
 
 interface RawFixedElementEvidence extends RawLayoutElementEvidence {
   readonly truncated: boolean;
+  /** DEF-204: 描く面の判定に読む事実（判定は `src/core/own-surface.ts` の `paintsOwnSurfaceOf`）。 */
+  readonly surface: OwnSurfaceFacts;
+  readonly pointerEvents: string;
+  readonly hitTest?: RawOverlapHitTest;
 }
 
-interface RawLayoutEvidence {
+/** AUD-4a: ブラウザが返す見切れの候補（区分と行数の省略の数は Node の側で導く）。 */
+type RawClippedTextEvidence = Omit<ClippedTextEvidence, 'lineClampCount' | 'intendedClipping'>;
+
+/** COV-6: ページの中の 1 回の読み取りで返す走査の印（`omitted*Count` は返さない。数は、この回に返した候補の分だけ）。 */
+type RawLayoutTruncation = Pick<
+  LayoutTruncationEvidence,
+  'overlapComparisonLimitReached' | 'clippedTextNodeScanLimitReachedCount' | 'renderedDescendantScanLimitReachedCount'
+>;
+
+/**
+ * COV-6: ページの中の 1 回の読み取りの結果。一覧は続きの位置からの部分で、`next` は一覧ごとの次に読む位置（読み終えたら `null`）。
+ * 走査の印は、COV-6 の後は打ち切らないので、ブラウザは常に偽と 0 を返す（呼び出し側の形を変えないために残す）。
+ */
+interface RawLayoutPart {
   readonly scrollPosition: ScrollPosition;
   readonly document: LayoutDocumentEvidence;
+  /** 一覧の中の祖先の番号（`nearestListedAncestorIndex`）は、ページの中のすべての候補の中の番号。 */
   readonly boxesOutsideViewport: readonly OutsideViewportEvidence[];
   readonly zeroSizeInteractive: readonly ZeroSizeInteractiveEvidence[];
-  readonly clippedText: readonly ClippedTextEvidence[];
-  readonly fixedHeadingOverlaps: readonly FixedHeadingOverlapEvidence[];
+  readonly clippedText: readonly RawClippedTextEvidence[];
+  readonly fixedHeadingOverlaps: readonly RawFixedHeadingOverlapEvidence[];
   readonly elementOverlaps: readonly RawElementOverlapEvidence[];
   readonly fixedElements: readonly RawFixedElementEvidence[];
-  readonly truncation: LayoutTruncationEvidence;
+  readonly next: LayoutPartCursor;
+  readonly truncation: RawLayoutTruncation;
   /** ブラウザ内の走査が止まった理由（期限だけ）。比べる組の上限は `truncation.overlapComparisonLimitReached` で返す。 */
   readonly incompleteReason: BrowserLayoutIncompleteReason | null;
 }
@@ -173,7 +263,7 @@ export interface StressLayoutOptions {
   /** すべての幅の収集の期限（`Date.now()` の絶対時刻）。 */
   readonly deadlineAtMs: number;
   /**
-   * 各幅の読み込み（`page.goto`）の直前に呼ぶ、ページの読み込みの間隔の待ち（サイトへの負荷の制御の設計書 4.1。Page Auditor は
+   * 各幅の読み込み（`page.goto`）の前、その幅のセッションを作る直前に呼ぶ（DEF-209: 待つ間に、空の page の窓を出さない）、ページの読み込みの間隔の待ち（サイトへの負荷の制御の設計書 4.1。Page Auditor は
    * `NavigationPacer` の `beforeNavigation` を渡す）。待った時間（ms）を返す。返った時間の分だけ、`deadlineAtMs` を延ばし、
    * 延ばした期限で、その幅と次の幅を判定する（設計書 4.4。待ち時間は期限を消費しない）。
    * 必須の引数である（渡し忘れると間隔を空けずに読み込む、という形を残さない。Page Auditor の pacer と同じ。RL の Minor-5）。
@@ -184,30 +274,25 @@ export interface StressLayoutOptions {
    * T44 P1-5（Task 44 の設計書の履歴の「T44h の測りとユーザーの判断」。「待ってから測る」）: 各幅の読み込みが終わった後、形を測る前に呼ぶ、落ち着きの待ち
    * （Page Auditor は、最初の読み込み（Desktop・Mobile）と同じ部品 `waitForPageSettled` と待ち方 `PAGE_SETTLING_PACING`、上限
    * `crawl.resourceSettlingTimeoutMs` を渡す。部品は複製しない）。引数は、その幅の page と、その幅の読み込みの期限。待つだけで、読み込みの間隔と回数は
-   * 変えない。落ち着かないまま上限が来ても、今までどおり測る（幅の結果の理由は足さない）。T44R2 の I-6: 呼ぶ側は、その幅の期限の前に形を測る時間を残して
-   * 待ちを止める（Page Auditor は `STRESS_LAYOUT_MEASURE_RESERVE_MS` を引いた時刻を上限にする）。
+   * 変えない。落ち着かないまま上限が来ても、今までどおり測る（幅の結果の理由は足さない）。L1: 幅の期限と、形を測る時間の予備（前は 1,500ms）は撤廃した。
    * 必須の引数である（渡し忘れると、後から描く画面を見ずに測る、という形を残さない。`beforeNavigation` と同じ）。待たない呼び出し側（テストなど）は、
    * それを明示する関数（`async () => undefined`）を渡す。関数でない値は、セッションを作らずに例外を投げる。
    */
   readonly settleBeforeLayout: (page: Page, deadlineAtMs: number) => Promise<void>;
   /**
-   * 各幅の読み込み（`page.goto`）の観測と、その読み込みの間のページ本体の要求の観察の結果を受け取る口（サイトが応答しないときに Run を
-   * 止める設計書 2.1。サイトの不調で止めたときの診断の記録の設計書 2.2 の 2026-10-07 の改訂）。読み込みを始めた幅ごとに1回、読み込みが
-   * 終わった（期限の競争の結果が出た）直後に呼ぶ。読み込みを始めなかった幅（`NOT_STARTED`）では呼ばない。
-   * 観測は `src/browser/main-frame-load.ts` の部品で作る。観察は `src/browser/navigation-diagnostics.ts` の部品で、`goto` の直前に
-   * 始め（期限は、その幅の読み込みの期限と、今から `sessionOpenTimeoutMs` 後の早い方）、`goto` の直後に、結果によらず止める。
-   * 始められなくても読み込みは行い、`NOT_OBSERVED` の結果を渡す。この collector は判定をしない（判定は、受け取った Page Auditor が行う）。
-   * 省略できる。省略すると、観測を作らず、page の事象の受け口も付けず、観察も始めない（今までの振る舞いのまま）。関数でない値は、
+   * 各幅の読み込み（`page.goto`）の観測を受け取る口（サイトが応答しないときに Run を止める設計書 2.1）。読み込みを始めた幅ごとに1回、
+   * 読み込みが終わった（期限の競争の結果が出た）直後に呼ぶ。読み込みを始めなかった幅（`NOT_STARTED`）では呼ばない。
+   * 観測は `src/browser/main-frame-load.ts` の部品で作る。この collector は判定をしない（判定は、受け取った Page Auditor が行う）。
+   * 省略できる。省略すると、観測を作らず、page の事象の受け口も付けない（今までの振る舞いのまま）。関数でない値は、
    * セッションを作らずに例外を投げる。
    */
-  readonly afterNavigation?: ((observation: MainFrameLoadObservation, diagnostics: NavigationDiagnostics) => void) | undefined;
+  readonly afterNavigation?: ((observation: MainFrameLoadObservation) => void) | undefined;
   /**
-   * 各幅の読み込みの間のページ本体の要求の観察を始める処理（CDP の session を開く）を待つ上限（ms。診断の記録の設計書 2.2「長く待たない」。
-   * D3R の Minor-1）。既定は `SESSION_OPEN_TIMEOUT_MS`。観察の開始の期限は、今からこの時間の後と、その幅の読み込みの期限の早い方である
-   * （Passive の観察の開始と同じ）。読み込みの期限そのものは変えない。`afterNavigation` を省略した場合は使わない。正の安全な整数で
-   * なければ、セッションを作らずに例外（`RangeError`）を投げる。
+   * AUD-3d: 各幅の layout を読んだ直後（その幅の page を閉じる前）に呼ぶ口（Page Auditor は、その幅の viewport の画像を撮る）。layout を読めた幅
+   * （`COMPLETE`・`PARTIAL`）だけで呼ぶ。口の失敗は、その幅の layout の結果を変えない（口の中で受け止めること）。省略できる。EV-2: 読んだ layout も渡す
+   * （その幅の指摘の対象まで動かして撮るため）。
    */
-  readonly sessionOpenTimeoutMs?: number | undefined;
+  readonly afterLayout?: ((page: Page, width: number, layout: LayoutEvidence) => Promise<void>) | undefined;
 }
 
 function positiveFiniteDimension(value: number, name: string): void {
@@ -267,12 +352,15 @@ function freezeIntersection(
 function freezeVisibility(visibility: VisibilityEvidence, name: string): VisibilityEvidence {
   finite(visibility.opacity, `${name}.opacity`);
   nonnegative(visibility.clientRectCount, `${name}.clientRectCount`);
+  if (visibility.clippedToZeroArea !== undefined) {
+    flag(visibility.clippedToZeroArea, `${name}.clippedToZeroArea`);
+  }
   return Object.freeze({ ...visibility });
 }
 
 function validateSelector(selector: string, name: string): string {
-  if (selector.length === 0 || selector.length > LAYOUT_THRESHOLDS.maxSelectorLength) {
-    throw new Error(`Invalid or unbounded browser selector: ${name}`);
+  if (selector.length === 0) {
+    throw new Error(`Invalid browser selector: ${name}`);
   }
   return selector;
 }
@@ -299,12 +387,6 @@ function validateListedAncestorIndex(index: number | null, ownIndex: number, lis
   return index;
 }
 
-/** 上限を超えて返された分を切り捨て、その件数を返す（ブラウザ内の上限の確認と二重に守る）。 */
-function retain<T>(items: readonly T[], limit: number): { readonly retained: readonly T[]; readonly excess: number } {
-  const retained = items.slice(0, limit);
-  return { retained, excess: items.length - retained.length };
-}
-
 function freezeElement(element: RawLayoutElementEvidence, name: string): LayoutElementEvidence {
   const rect = freezeRect(element.rect, `${name}.rect`);
   return Object.freeze({
@@ -320,6 +402,145 @@ function freezeElement(element: RawLayoutElementEvidence, name: string): LayoutE
     fixedOrStickyAncestor: flag(element.fixedOrStickyAncestor, `${name}.fixedOrStickyAncestor`),
   });
 }
+
+/** ブラウザが返した文字列の値を確かめる。 */
+function text(value: string, name: string): string {
+  if (typeof value !== 'string') {
+    throw new Error(`Invalid browser layout text: ${name}`);
+  }
+  return value;
+}
+
+/** DEF-204: 要素そのものが中身を描く種類（画像・埋め込み・入力の欄）。描く面があるものとして扱う。 */
+const SURFACE_REPLACED_KINDS = Object.freeze(['image', 'media', 'input'] as const satisfies readonly LayoutElementKind[]);
+
+/** ブラウザが返した描く面の事実を確かめる（形が違えば例外）。 */
+function surfaceFacts(surface: OwnSurfaceFacts, name: string): OwnSurfaceFacts {
+  if (typeof surface !== 'object' || surface === null) {
+    throw new Error(`Invalid browser layout surface: ${name}`);
+  }
+  const sides = (values: readonly string[], side: string): readonly string[] => {
+    if (!Array.isArray(values) || values.length !== 4) {
+      throw new Error(`Invalid browser layout surface sides: ${name}.${side}`);
+    }
+    return values.map((value, index) => text(value, `${name}.${side}[${String(index)}]`));
+  };
+  return {
+    backgroundColor: text(surface.backgroundColor, `${name}.backgroundColor`),
+    backgroundImage: text(surface.backgroundImage, `${name}.backgroundImage`),
+    borderWidths: sides(surface.borderWidths, 'borderWidths'),
+    borderStyles: sides(surface.borderStyles, 'borderStyles'),
+    borderColors: sides(surface.borderColors, 'borderColors'),
+    outlineWidth: text(surface.outlineWidth, `${name}.outlineWidth`),
+    outlineStyle: text(surface.outlineStyle, `${name}.outlineStyle`),
+    outlineColor: text(surface.outlineColor, `${name}.outlineColor`),
+    boxShadow: text(surface.boxShadow, `${name}.boxShadow`),
+    backdropFilter: text(surface.backdropFilter, `${name}.backdropFilter`),
+    hasOwnText: flag(surface.hasOwnText, `${name}.hasOwnText`),
+    hasPseudoContent: flag(surface.hasPseudoContent, `${name}.hasPseudoContent`),
+    replacedContent: false,
+  };
+}
+
+/** AUD-3b: ブラウザが返した hit-test の要素の関係を確かめる。 */
+function hitRelation<T extends string | null>(relation: T, name: string): T {
+  if (relation !== null && !(OVERLAP_HIT_RELATIONS as readonly string[]).includes(relation)) {
+    throw new Error(`Invalid browser layout hit-test relation: ${name}`);
+  }
+  return relation;
+}
+
+/** AUD-3b: ブラウザが返した hit-test の点の要素の事実を確かめ、描く面があるか（`paintsOwnSurfaceOf`）を足して凍結する。 */
+function freezeHitLayer(layer: RawOverlapHitLayer, name: string): OverlapHitLayerEvidence {
+  finite(layer.effectiveOpacity, `${name}.effectiveOpacity`);
+  return Object.freeze({
+    selector: validateSelector(layer.selector, `${name}.selector`),
+    relation: hitRelation(layer.relation, `${name}.relation`),
+    position: text(layer.position, `${name}.position`),
+    zIndex: text(layer.zIndex, `${name}.zIndex`),
+    pointerEvents: text(layer.pointerEvents, `${name}.pointerEvents`),
+    effectiveOpacity: layer.effectiveOpacity,
+    visibility: text(layer.visibility, `${name}.visibility`),
+    backgroundColor: text(layer.backgroundColor, `${name}.backgroundColor`),
+    hasBackgroundImage: flag(layer.hasBackgroundImage, `${name}.hasBackgroundImage`),
+    paintsOwnSurface: paintsOwnSurfaceOf({
+      ...surfaceFacts({ ...layer.surface, replacedContent: false }, `${name}.surface`),
+      replacedContent: flag(layer.replaced, `${name}.replaced`),
+    }),
+  });
+}
+
+/** AUD-3b: ブラウザが返した hit-test の事実を確かめて凍結する（ないときは `undefined`。前の形のまま）。 */
+function freezeHitTest(hitTest: RawOverlapHitTest | undefined, name: string): OverlapHitTestEvidence | undefined {
+  if (hitTest === undefined) {
+    return undefined;
+  }
+  if (!(OVERLAP_HIT_TARGETS as readonly string[]).includes(hitTest.target)) {
+    throw new Error(`Invalid browser layout hit-test target: ${name}`);
+  }
+  return Object.freeze({
+    target: hitTest.target,
+    points: Object.freeze(hitTest.points.map((point, index): OverlapHitPointEvidence => {
+      const pointName = `${name}.points[${String(index)}]`;
+      finite(point.x, `${pointName}.x`);
+      finite(point.y, `${pointName}.y`);
+      return Object.freeze({
+        x: point.x,
+        y: point.y,
+        topRelation: hitRelation(point.topRelation, `${pointName}.topRelation`),
+        layers: Object.freeze(point.layers.map((layer, layerIndex) => freezeHitLayer(layer, `${pointName}.layers[${String(layerIndex)}]`))),
+        targetFound: flag(point.targetFound, `${pointName}.targetFound`),
+        targetSelector: point.targetSelector === null ? null : validateSelector(point.targetSelector, `${pointName}.targetSelector`),
+      });
+    })),
+    overlay: freezeHitLayer(hitTest.overlay, `${name}.overlay`),
+    modal: Object.freeze({
+      dialogModal: flag(hitTest.modal.dialogModal, `${name}.modal.dialogModal`),
+      ariaModal: flag(hitTest.modal.ariaModal, `${name}.modal.ariaModal`),
+    }),
+  });
+}
+
+/** AUD-3b: hit-test の事実があれば `{ hitTest }`、なければ空（前の Evidence の形のまま）。 */
+const hitTestField = (hitTest: RawOverlapHitTest | undefined, name: string): { readonly hitTest?: OverlapHitTestEvidence } => {
+  const frozen = freezeHitTest(hitTest, name);
+  return frozen === undefined ? {} : { hitTest: frozen };
+};
+
+/** EV-1: 覆われる側のスクロールの祖先があれば `{ coveredScrollContainer }`、なければ空（前の Evidence の形のまま）。 */
+const scrollContainerField = (
+  container: ScrollContainerEvidence | undefined,
+  name: string,
+): { readonly coveredScrollContainer?: ScrollContainerEvidence } => {
+  if (container === undefined) {
+    return {};
+  }
+  finite(container.scrollTop, `${name}.scrollTop`);
+  nonnegative(container.scrollRangeY, `${name}.scrollRangeY`);
+  return {
+    coveredScrollContainer: Object.freeze({
+      selector: validateSelector(container.selector, `${name}.selector`),
+      rect: freezeRect(container.rect, `${name}.rect`),
+      scrollTop: container.scrollTop,
+      scrollRangeY: container.scrollRangeY,
+    }),
+  };
+};
+
+/** EV-1: 行ごとの矩形の重なりがあれば `{ lineOverlap }`、なければ空。 */
+const lineOverlapField = (lineOverlap: LineOverlapEvidence | undefined, name: string): { readonly lineOverlap?: LineOverlapEvidence } => {
+  if (lineOverlap === undefined) {
+    return {};
+  }
+  nonnegative(lineOverlap.area, `${name}.area`);
+  return {
+    lineOverlap: Object.freeze({
+      area: lineOverlap.area,
+      pointCount: count(lineOverlap.pointCount, `${name}.pointCount`),
+      bothHitPointCount: count(lineOverlap.bothHitPointCount, `${name}.bothHitPointCount`),
+    }),
+  };
+};
 
 function freezeFixedElement(
   element: RawFixedElementEvidence,
@@ -346,6 +567,12 @@ function freezeFixedElement(
     viewportArea,
     viewportAreaRatio: viewportArea > 0 ? viewportIntersectionArea / viewportArea : 0,
     truncated: flag(element.truncated, `${name}.truncated`),
+    paintsOwnSurface: paintsOwnSurfaceOf({
+      ...surfaceFacts(element.surface, `${name}.surface`),
+      replacedContent: (SURFACE_REPLACED_KINDS as readonly LayoutElementKind[]).includes(facts.kind),
+    }),
+    pointerEvents: text(element.pointerEvents, `${name}.pointerEvents`),
+    ...hitTestField(element.hitTest, `${name}.hitTest`),
   });
 }
 
@@ -358,7 +585,135 @@ function validateIncompleteReason(
   return reason;
 }
 
-function freezeLayout(raw: RawLayoutEvidence): LayoutEvidence {
+/** COV-6: ブラウザが返した部分の件数が、分け方の単位（`LAYOUT_COLLECTION_PART_SIZE`）を超えないことを確かめる（ブラウザ内の分け方と二重に守る）。 */
+function assertBoundedPart(list: readonly unknown[], name: string): void {
+  if (!Array.isArray(list) || list.length > LAYOUT_COLLECTION_PART_SIZE) {
+    throw new Error(`Unbounded browser layout list: ${name}`);
+  }
+}
+
+/** ブラウザが返した 0 以上の有限の値か null を確かめる（AUD-4a の行の高さと見える行の数）。 */
+function optionalMeasure(value: number | null | undefined, name: string): number | null {
+  if (value === null) {
+    return null;
+  }
+  if (typeof value !== 'number') {
+    throw new Error(`Invalid browser layout measure: ${name}`);
+  }
+  nonnegative(value, name);
+  return value;
+}
+
+/** AUD-4a: 1 以上の整数を表す計算値の数（それ以外は null）。 */
+function positiveIntegerOf(value: string): number | null {
+  const trimmed = value.trim();
+  if (!/^\d+$/u.test(trimmed)) {
+    return null;
+  }
+  const parsed = Number(trimmed);
+  return Number.isSafeInteger(parsed) && parsed >= 1 ? parsed : null;
+}
+
+/** AUD-4a: 効いている行数の省略の行の数（`ClippedTextEvidence.lineClampCount` の定義）。 */
+function lineClampCountOf(style: ClippedTextStyleEvidence): number | null {
+  const webkit = WEBKIT_LINE_CLAMP_DISPLAYS.includes(style.display) && style.webkitBoxOrient === 'vertical'
+    ? positiveIntegerOf(style.webkitLineClamp)
+    : null;
+  return webkit ?? positiveIntegerOf(style.lineClamp);
+}
+
+/** AUD-4a: 意図した省略の形の区分（`INTENDED_CLIPPING_KINDS` の当てはめる順。書き方の事実だけで決め、外すかは Rule が決める）。 */
+function intendedClippingOf(
+  style: ClippedTextStyleEvidence,
+  lineClampCount: number | null,
+  collapsedByControl: boolean,
+): IntendedClippingKind | null {
+  if (collapsedByControl) {
+    return 'COLLAPSED';
+  }
+  if (lineClampCount !== null) {
+    return 'LINE_CLAMP';
+  }
+  return style.textOverflow === 'ellipsis' && NO_WRAP_WHITE_SPACES.includes(style.whiteSpace) ? 'INTENDED_ELLIPSIS' : null;
+}
+
+/** AUD-4a: ブラウザが返した省略の書き方の計算値を確かめる。 */
+function clippingStyleOf(style: ClippedTextStyleEvidence, name: string): ClippedTextStyleEvidence {
+  if (typeof style !== 'object' || style === null) {
+    throw new Error(`Invalid browser layout clipping style: ${name}`);
+  }
+  return Object.freeze({
+    textOverflow: text(style.textOverflow, `${name}.textOverflow`),
+    whiteSpace: text(style.whiteSpace, `${name}.whiteSpace`),
+    webkitLineClamp: text(style.webkitLineClamp, `${name}.webkitLineClamp`),
+    lineClamp: text(style.lineClamp, `${name}.lineClamp`),
+    display: text(style.display, `${name}.display`),
+    webkitBoxOrient: text(style.webkitBoxOrient, `${name}.webkitBoxOrient`),
+    maxHeight: text(style.maxHeight, `${name}.maxHeight`),
+  });
+}
+
+function freezeClippedText(candidate: RawClippedTextEvidence, name: string): ClippedTextEvidence {
+  nonnegative(candidate.clientWidth, `${name}.clientWidth`);
+  nonnegative(candidate.clientHeight, `${name}.clientHeight`);
+  nonnegative(candidate.scrollWidth, `${name}.scrollWidth`);
+  nonnegative(candidate.scrollHeight, `${name}.scrollHeight`);
+  if (candidate.clippingStyle === undefined) {
+    throw new Error(`Invalid browser layout clipping style: ${name}`);
+  }
+  const clippingStyle = clippingStyleOf(candidate.clippingStyle, `${name}.clippingStyle`);
+  const collapsedByControl = flag(candidate.collapsedByControl as boolean, `${name}.collapsedByControl`);
+  const lineClampCount = lineClampCountOf(clippingStyle);
+  return Object.freeze({
+    ...candidate,
+    selector: validateSelector(candidate.selector, name),
+    rect: freezeRect(candidate.rect, `${name}.rect`),
+    visibility: freezeVisibility(candidate.visibility, `${name}.visibility`),
+    partiallyClippedText: flag(candidate.partiallyClippedText, `${name}.partiallyClippedText`),
+    truncated: flag(candidate.truncated, `${name}.truncated`),
+    clippingStyle,
+    lineHeightPx: optionalMeasure(candidate.lineHeightPx, `${name}.lineHeightPx`),
+    visibleLineCount: optionalMeasure(candidate.visibleLineCount, `${name}.visibleLineCount`),
+    lineClampCount,
+    collapsedByControl,
+    intendedClipping: intendedClippingOf(clippingStyle, lineClampCount, collapsedByControl),
+  });
+}
+
+/**
+ * COV-6: ブラウザが返した 1 回の部分の形を確かめる（一覧の件数、次の位置、読み終えた一覧が空であること）。
+ * 次の位置は、今の位置より後でなければならない（同じ所を読み続けない。ページが組み込みの関数を書き換えた場合も止まる）。
+ */
+function validateRawLayoutPart(raw: RawLayoutPart, cursor: LayoutPartCursor): void {
+  if (typeof raw !== 'object' || raw === null || typeof raw.next !== 'object' || raw.next === null) {
+    throw new Error('Invalid browser layout part');
+  }
+  for (const name of LAYOUT_PART_LIST_NAMES) {
+    assertBoundedPart(raw[name], name);
+    const start = cursor[name];
+    const next = raw.next[name];
+    if (start === null && raw[name].length > 0) {
+      throw new Error(`Unexpected browser layout list after it was read: ${name}`);
+    }
+    if (next !== null && (start === null || count(next, `next.${name}`) <= start)) {
+      throw new Error(`Invalid browser layout part position: next.${name}`);
+    }
+  }
+}
+
+/** COV-6: 今の部分の次に読む位置（どの一覧も読み終えていれば `null`）。 */
+function nextLayoutPartCursor(raw: RawLayoutPart): LayoutPartCursor | null {
+  return LAYOUT_PART_LIST_NAMES.some((name) => raw.next[name] !== null)
+    ? Object.freeze(Object.fromEntries(LAYOUT_PART_LIST_NAMES.map((name) => [name, raw.next[name]])) as LayoutPartCursor)
+    : null;
+}
+
+/** COV-6: 部分ごとの読み取りを、1 つの layout の Evidence にまとめる（文書の項目とスクロール位置は最初の部分のもの）。 */
+function assembleLayout(parts: readonly RawLayoutPart[]): LayoutEvidence {
+  const [raw] = parts;
+  if (raw === undefined) {
+    throw new Error('Layout collection produced no part');
+  }
   finite(raw.scrollPosition.scrollX, 'scrollPosition.scrollX');
   finite(raw.scrollPosition.scrollY, 'scrollPosition.scrollY');
   const scrollPosition = Object.freeze({
@@ -383,8 +738,9 @@ function freezeLayout(raw: RawLayoutEvidence): LayoutEvidence {
     horizontalOverflowPx: Math.max(0, horizontalOverflowPx),
     viewportHorizontalClip: validateHorizontalClipAncestor(viewportHorizontalClip, 'document.viewportHorizontalClip'),
   });
-  const outsideRetention = retain(raw.boxesOutsideViewport, LAYOUT_THRESHOLDS.maxOutsideViewportCandidates);
-  const boxesOutsideViewport = Object.freeze(outsideRetention.retained
+  const allOf = <T>(read: (part: RawLayoutPart) => readonly T[]): readonly T[] => parts.flatMap(read);
+  const outsideCandidates = allOf((part) => part.boxesOutsideViewport);
+  const boxesOutsideViewport = Object.freeze(outsideCandidates
     .map((candidate, index) => Object.freeze({
       ...candidate,
       selector: validateSelector(candidate.selector, `boxesOutsideViewport[${index}]`),
@@ -398,14 +754,13 @@ function freezeLayout(raw: RawLayoutEvidence): LayoutEvidence {
       nearestListedAncestorIndex: validateListedAncestorIndex(
         candidate.nearestListedAncestorIndex,
         index,
-        outsideRetention.retained.length,
+        outsideCandidates.length,
         `boxesOutsideViewport[${index}]`,
       ),
       outside: Object.freeze({ ...candidate.outside }),
       truncated: flag(candidate.truncated, `boxesOutsideViewport[${index}].truncated`),
     })));
-  const zeroSizeRetention = retain(raw.zeroSizeInteractive, LAYOUT_THRESHOLDS.maxZeroSizeInteractiveCandidates);
-  const zeroSizeInteractive = Object.freeze(zeroSizeRetention.retained
+  const zeroSizeInteractive = Object.freeze(allOf((part) => part.zeroSizeInteractive)
     .map((candidate, index) => Object.freeze({
       ...candidate,
       selector: validateSelector(candidate.selector, `zeroSizeInteractive[${index}]`),
@@ -414,27 +769,10 @@ function freezeLayout(raw: RawLayoutEvidence): LayoutEvidence {
       hasRenderedDescendant: flag(candidate.hasRenderedDescendant, `zeroSizeInteractive[${index}].hasRenderedDescendant`),
       truncated: flag(candidate.truncated, `zeroSizeInteractive[${index}].truncated`),
     })));
-  const clippedRetention = retain(raw.clippedText, LAYOUT_THRESHOLDS.maxClippedTextCandidates);
-  const clippedText = Object.freeze(clippedRetention.retained
-    .map((candidate, index) => {
-      nonnegative(candidate.clientWidth, `clippedText[${index}].clientWidth`);
-      nonnegative(candidate.clientHeight, `clippedText[${index}].clientHeight`);
-      nonnegative(candidate.scrollWidth, `clippedText[${index}].scrollWidth`);
-      nonnegative(candidate.scrollHeight, `clippedText[${index}].scrollHeight`);
-      const text = candidate.text.slice(0, LAYOUT_THRESHOLDS.maxClippedTextLength);
-      return Object.freeze({
-        ...candidate,
-        selector: validateSelector(candidate.selector, `clippedText[${index}]`),
-        text,
-        rect: freezeRect(candidate.rect, `clippedText[${index}].rect`),
-        visibility: freezeVisibility(candidate.visibility, `clippedText[${index}].visibility`),
-        partiallyClippedText: flag(candidate.partiallyClippedText, `clippedText[${index}].partiallyClippedText`),
-        truncated: flag(candidate.truncated, `clippedText[${index}].truncated`) || text.length < candidate.text.length,
-      });
-    }));
-  const fixedHeadingRetention = retain(raw.fixedHeadingOverlaps, LAYOUT_THRESHOLDS.maxFixedHeadingOverlapCandidates);
-  const fixedHeadingOverlaps = Object.freeze(fixedHeadingRetention.retained
-    .map((candidate, index) => Object.freeze({
+  const clippedText = Object.freeze(allOf((part) => part.clippedText)
+    .map((candidate, index) => freezeClippedText(candidate, `clippedText[${index}]`)));
+  const fixedHeadingOverlaps = Object.freeze(allOf((part) => part.fixedHeadingOverlaps)
+    .map(({ hitTest, coveredScrollContainer, ...candidate }, index) => Object.freeze({
       ...candidate,
       overlaySelector: validateSelector(candidate.overlaySelector, `fixedHeadingOverlaps[${index}].overlay`),
       headingSelector: validateSelector(candidate.headingSelector, `fixedHeadingOverlaps[${index}].heading`),
@@ -450,22 +788,23 @@ function freezeLayout(raw: RawLayoutEvidence): LayoutEvidence {
       ),
       intersection: freezeIntersection(candidate.intersection, `fixedHeadingOverlaps[${index}].intersection`),
       truncated: flag(candidate.truncated, `fixedHeadingOverlaps[${index}].truncated`),
+      ...hitTestField(hitTest, `fixedHeadingOverlaps[${index}].hitTest`),
+      ...scrollContainerField(coveredScrollContainer, `fixedHeadingOverlaps[${index}].coveredScrollContainer`),
     })));
-  const overlapRetention = retain(raw.elementOverlaps, LAYOUT_THRESHOLDS.maxElementOverlapCandidates);
-  const elementOverlaps = Object.freeze(overlapRetention.retained
+  const elementOverlaps = Object.freeze(allOf((part) => part.elementOverlaps)
     .map((candidate, index) => Object.freeze({
       first: freezeElement(candidate.first, `elementOverlaps[${index}].first`),
       second: freezeElement(candidate.second, `elementOverlaps[${index}].second`),
       intersection: freezeIntersection(candidate.intersection, `elementOverlaps[${index}].intersection`),
       truncated: flag(candidate.truncated, `elementOverlaps[${index}].truncated`),
+      ...hitTestField(candidate.hitTest, `elementOverlaps[${index}].hitTest`),
+      ...scrollContainerField(candidate.coveredScrollContainer, `elementOverlaps[${index}].coveredScrollContainer`),
+      ...lineOverlapField(candidate.lineOverlap, `elementOverlaps[${index}].lineOverlap`),
     })));
-  const fixedRetention = retain(raw.fixedElements, LAYOUT_THRESHOLDS.maxFixedElementCandidates);
-  const fixedElements = Object.freeze(fixedRetention.retained
+  const fixedElements = Object.freeze(allOf((part) => part.fixedElements)
     .map((candidate, index) => freezeFixedElement(candidate, documentEvidence, `fixedElements[${index}]`)));
-  const truncation = raw.truncation;
-  const omitted = (value: number, name: keyof LayoutTruncationEvidence, excess: number): number => (
-    count(value, `truncation.${name}`) + excess
-  );
+  const sumOf = (name: 'clippedTextNodeScanLimitReachedCount' | 'renderedDescendantScanLimitReachedCount'): number => parts
+    .reduce((sum, part, index) => sum + count(part.truncation[name], `parts[${index}].truncation.${name}`), 0);
 
   return Object.freeze({
     scrollPosition,
@@ -476,50 +815,22 @@ function freezeLayout(raw: RawLayoutEvidence): LayoutEvidence {
     fixedHeadingOverlaps,
     elementOverlaps,
     fixedElements,
+    // COV-6: 候補を件数の上限で打ち切らないので、`omitted*Count` は 0（古い記録を読むためだけに残す）。
     truncation: Object.freeze({
-      omittedOutsideViewportCount: omitted(
-        truncation.omittedOutsideViewportCount,
-        'omittedOutsideViewportCount',
-        outsideRetention.excess,
-      ),
-      omittedZeroSizeInteractiveCount: omitted(
-        truncation.omittedZeroSizeInteractiveCount,
-        'omittedZeroSizeInteractiveCount',
-        zeroSizeRetention.excess,
-      ),
-      omittedClippedTextCount: omitted(
-        truncation.omittedClippedTextCount,
-        'omittedClippedTextCount',
-        clippedRetention.excess,
-      ),
-      omittedFixedHeadingOverlapCount: omitted(
-        truncation.omittedFixedHeadingOverlapCount,
-        'omittedFixedHeadingOverlapCount',
-        fixedHeadingRetention.excess,
-      ),
-      omittedElementOverlapCount: omitted(
-        truncation.omittedElementOverlapCount,
-        'omittedElementOverlapCount',
-        overlapRetention.excess,
-      ),
-      omittedFixedElementCount: omitted(
-        truncation.omittedFixedElementCount,
-        'omittedFixedElementCount',
-        fixedRetention.excess,
-      ),
-      overlapComparisonLimitReached: flag(
-        truncation.overlapComparisonLimitReached,
-        'truncation.overlapComparisonLimitReached',
-      ),
-      clippedTextNodeScanLimitReachedCount: count(
-        truncation.clippedTextNodeScanLimitReachedCount,
-        'truncation.clippedTextNodeScanLimitReachedCount',
-      ),
-      renderedDescendantScanLimitReachedCount: count(
-        truncation.renderedDescendantScanLimitReachedCount,
-        'truncation.renderedDescendantScanLimitReachedCount',
-      ),
+      omittedOutsideViewportCount: 0,
+      omittedZeroSizeInteractiveCount: 0,
+      omittedClippedTextCount: 0,
+      omittedFixedHeadingOverlapCount: 0,
+      omittedElementOverlapCount: 0,
+      omittedFixedElementCount: 0,
+      overlapComparisonLimitReached: parts.some((part, index) => flag(
+        part.truncation.overlapComparisonLimitReached,
+        `parts[${index}].truncation.overlapComparisonLimitReached`,
+      )),
+      clippedTextNodeScanLimitReachedCount: sumOf('clippedTextNodeScanLimitReachedCount'),
+      renderedDescendantScanLimitReachedCount: sumOf('renderedDescendantScanLimitReachedCount'),
     }),
+    collectedInParts: parts.length,
   });
 }
 
@@ -531,14 +842,20 @@ interface LayoutEvaluationArgument {
   readonly fixedPositions: typeof FIXED_ELEMENT_POSITIONS;
   /** 祖先の `overflow-x` ごとの、横方向の切り取りの種類（`HORIZONTAL_CLIP_BY_OVERFLOW`）。 */
   readonly horizontalClipByOverflow: typeof HORIZONTAL_CLIP_BY_OVERFLOW;
-  /** ブラウザ内の走査を止める時刻（`Date.now()` の絶対時刻）。 */
-  readonly scanDeadlineAtMs: number;
+  /** ブラウザ内の走査を止める時刻（`Date.now()` の絶対時刻）。呼び出し側の期限がなければ null（止めない）。 */
+  readonly scanDeadlineAtMs: number | null;
+  /** COV-6: 一覧ごとの、この回に読み始める位置（`null` は読み終えた一覧）。 */
+  readonly cursor: LayoutPartCursor;
+  /** COV-6: この回に一覧ごとに返す最大の件数（`LAYOUT_COLLECTION_PART_SIZE`）。 */
+  readonly partSize: number;
 }
 
 /**
- * ブラウザ内で、上限付きのジオメトリの事実を1回の走査で集める。
- * 候補の件数は上限を確かめてから selector を作り、兄弟の順番は親ごとに1回だけ数える（要素数に比例する作業量）。
- * 期限を過ぎたら走査を止め、それまでに集めた事実と理由を返す。
+ * ブラウザ内で、ジオメトリの事実を1回の走査で集める。
+ * COV-6: 候補は件数の上限で打ち切らない。一覧ごとに、続きの位置（`cursor`）から `partSize` 件だけの selector などを作って返し、次に読む位置を
+ * `next` で返す（兄弟の順番は親ごとに1回だけ数える。要素数に比例する作業量）。重なりは、すべての組を比べる（比べる組の数で打ち切らない）。
+ * 読み終えた一覧（`cursor` が `null`）は、その作業を省く。候補の中のテキストと子孫の走査も、数で打ち切らない。
+ * 呼び出し側の期限があり、それを過ぎたら走査を止め、それまでに集めた事実と理由を返す（期限がなければ止めない）。
  * 部品（`R`）を `composeInPage` で組み込んで `page.evaluate` に渡すため、この関数の外にあるものを参照しない。
  */
 function collectLayoutReader(R: StandardReaders, {
@@ -548,7 +865,21 @@ function collectLayoutReader(R: StandardReaders, {
   fixedPositions,
   horizontalClipByOverflow,
   scanDeadlineAtMs,
-}: LayoutEvaluationArgument): RawLayoutEvidence {
+  cursor,
+  partSize,
+}: LayoutEvaluationArgument): RawLayoutPart {
+  // COV-6: 一覧を読むか（読み終えていないか）と、一覧の中の番号がこの回に返す範囲にあるか。
+  const wants = (name: keyof LayoutPartCursor): boolean => cursor[name] !== null;
+  const inPart = (name: keyof LayoutPartCursor, index: number): boolean => {
+    const start = cursor[name];
+    return start !== null && index >= start && index < start + partSize;
+  };
+  /** COV-6: 番号で数える一覧の、次に読む位置（この回に返した分の後に、まだ候補が残っていればその番号。なければ null）。 */
+  const nextOf = (name: keyof LayoutPartCursor, total: number, returned: number): number | null => {
+    const start = cursor[name];
+    return start !== null && returned > 0 && start + returned < total ? start + returned : null;
+  };
+  const wantsObservedElements = wants('fixedHeadingOverlaps') || wants('elementOverlaps') || wants('fixedElements');
   // DOM clobbering（DEF-072・DEF-073）: form の中の名前つきの入力の欄は form の、名前つきの img・form などは `document` の、同じ名前の
   // プロパティとメソッドを隠す（`<input name="matches">`、`<img name="body">` など）。form になりうる要素（文書のすべての要素と、その祖先・子孫・
   // 兄弟）と `document` の標準のプロパティとメソッドは、標準の prototype の getter とメソッドで読む（`src/evidence/dom-collector.ts` の
@@ -567,6 +898,18 @@ function collectLayoutReader(R: StandardReaders, {
   const scrollHeightOf = standardGetter<number>(Element.prototype, 'scrollHeight');
   const hiddenOf = standardGetter<boolean | string>(HTMLElement.prototype, 'hidden');
   const innerTextOf = standardGetter<string>(HTMLElement.prototype, 'innerText');
+  /**
+   * EV-4: 見切れの候補の表示の値。閉じた選択の部品（`multiple` でなく `size` が 1 以下の `select`）は、選んだ選択肢の文字（innerText は全部の選択肢を
+   * つなげた文字になるため）。ほかは innerText。
+   */
+  const displayedTextOf = (element: HTMLElement): string => {
+    if (element instanceof HTMLSelectElement && !standardGetter<boolean>(HTMLSelectElement.prototype, 'multiple')(element)
+      && standardGetter<number>(HTMLSelectElement.prototype, 'size')(element) <= 1) {
+      const [selected] = Array.from(standardGetter<HTMLCollectionOf<HTMLOptionElement>>(HTMLSelectElement.prototype, 'selectedOptions')(element));
+      return selected === undefined ? '' : standardGetter<string>(HTMLOptionElement.prototype, 'label')(selected);
+    }
+    return innerTextOf(element);
+  };
   const getAttributeOf = (element: Element, name: string): string | null => Element.prototype.getAttribute.call(element, name);
   const matchesOf = (element: Element, selectors: string): boolean => Element.prototype.matches.call(element, selectors);
   const containsOf = (node: Node, other: Node): boolean => Node.prototype.contains.call(node, other);
@@ -593,7 +936,7 @@ function collectLayoutReader(R: StandardReaders, {
   };
   let incompleteReason: 'DEADLINE_EXCEEDED' | null = null;
   const deadlinePassed = (): boolean => {
-    if (incompleteReason === null && Date.now() >= scanDeadlineAtMs) {
+    if (incompleteReason === null && scanDeadlineAtMs !== null && Date.now() >= scanDeadlineAtMs) {
       incompleteReason = 'DEADLINE_EXCEEDED';
     }
     return incompleteReason !== null;
@@ -637,9 +980,8 @@ function collectLayoutReader(R: StandardReaders, {
       }
       selector = segments.join(' > ');
     }
-    return selector.length > thresholds.maxSelectorLength
-      ? { selector: selector.slice(0, thresholds.maxSelectorLength), truncated: true }
-      : { selector, truncated: false };
+    // LZ-2: セレクタの長さの上限（前は `MAX_SELECTOR_LENGTH`）は置かない。切り詰めない。
+    return { selector, truncated: false };
   };
   const rectFor = (element: Element): RectangleEvidence => {
     const rect = boundingClientRectOf(element);
@@ -656,7 +998,12 @@ function collectLayoutReader(R: StandardReaders, {
   };
   // 可視判定は checkVisibility だけで行う（設計書 foundation-corrections 5.5）。
   // 大きさが0であること（rect）と aria-hidden は、可視判定に含めず、別の項目として記録する。
-  const visibilityFor = (element: Element, style: CSSStyleDeclaration, visible: boolean): VisibilityEvidence => ({
+  const visibilityFor = (
+    element: Element,
+    style: CSSStyleDeclaration,
+    visible: boolean,
+    clippedToZeroArea: boolean,
+  ): VisibilityEvidence => ({
     visible,
     display: style.display,
     visibility: style.visibility,
@@ -664,7 +1011,76 @@ function collectLayoutReader(R: StandardReaders, {
     hiddenAttribute: element instanceof HTMLElement ? hiddenOf(element) !== false : false,
     ariaHidden: getAttributeOf(element, 'aria-hidden') === 'true',
     clientRectCount: clientRectsOf(element).length,
+    clippedToZeroArea,
   });
+  // DEF-205: 要素自身の `clip`・`clip-path` で、描く面が 0 になるか（`VisibilityEvidence.clippedToZeroArea`）。読めない書き方は偽（今までどおり数える）。
+  // 長さは px と %（% は箱の幅・高さに対する割合）だけを読む。
+  const lengthPx = (token: string, reference: number): number | null => {
+    const match = /^(-?\d*\.?\d+(?:e[+-]?\d+)?)(px|%)$/u.exec(token);
+    if (match === null) {
+      return token === '0' ? 0 : null;
+    }
+    const value = Number.parseFloat(match[1] ?? '');
+    return match[2] === '%' ? (value * reference) / 100 : value;
+  };
+  const functionArguments = (value: string, name: string): string | null => {
+    const trimmed = value.trim().toLowerCase();
+    if (!trimmed.startsWith(`${name}(`)) {
+      return null;
+    }
+    const close = trimmed.indexOf(')');
+    return close < 0 ? null : trimmed.slice(name.length + 1, close);
+  };
+  const ownClipLeavesNoArea = (element: Element, style: CSSStyleDeclaration): boolean => {
+    const clip = style.clip.trim().toLowerCase();
+    const clipPath = style.clipPath.trim().toLowerCase();
+    const clipApplies = clip !== '' && clip !== 'auto' && (style.position === 'absolute' || style.position === 'fixed');
+    if (!clipApplies && (clipPath === '' || clipPath === 'none')) {
+      return false;
+    }
+    const box = boundingClientRectOf(element);
+    if (clipApplies) {
+      // `rect(上, 右, 下, 左)`。`auto` は、上と左は 0、右は幅、下は高さ。
+      const parts = (functionArguments(clip, 'rect') ?? '').split(/[\s,]+/u).filter((part) => part.length > 0);
+      if (parts.length === 4) {
+        const edge = (index: number, auto: number): number | null => {
+          const part = parts[index] ?? '';
+          return part === 'auto' ? auto : lengthPx(part, 0);
+        };
+        const [top, right, bottom, left] = [edge(0, 0), edge(1, box.width), edge(2, box.height), edge(3, 0)];
+        if (top !== null && right !== null && bottom !== null && left !== null && (right - left <= 0 || bottom - top <= 0)) {
+          return true;
+        }
+      }
+    }
+    const inset = functionArguments(clipPath, 'inset');
+    if (inset !== null) {
+      const parts = (inset.split(' round ')[0] ?? '').split(/\s+/u).filter((part) => part.length > 0);
+      if (parts.length < 1 || parts.length > 4) {
+        return false;
+      }
+      // 1〜4 個の値を、上・右・下・左に広げる（CSS の margin と同じ）。
+      const [a, b = a, c = a, d = b] = parts as [string, string?, string?, string?];
+      const top = lengthPx(a, box.height);
+      const right = lengthPx(b ?? '', box.width);
+      const bottom = lengthPx(c ?? '', box.height);
+      const left = lengthPx(d ?? '', box.width);
+      return top !== null && right !== null && bottom !== null && left !== null
+        && (top + bottom >= box.height || left + right >= box.width);
+    }
+    // 半径は、値が 0 のときだけ面が 0（% の基準を 1 にして、0 でない % を 0 にしない）。
+    const circle = functionArguments(clipPath, 'circle');
+    if (circle !== null) {
+      const radius = (circle.split(' at ')[0] ?? '').trim();
+      return radius !== '' && lengthPx(radius, 1) === 0;
+    }
+    const ellipse = functionArguments(clipPath, 'ellipse');
+    if (ellipse !== null) {
+      const radii = (ellipse.split(' at ')[0] ?? '').trim().split(/\s+/u).filter((part) => part.length > 0);
+      return radii.length === 2 && radii.some((radius) => lengthPx(radius, 1) === 0);
+    }
+    return false;
+  };
   const kindOf = (element: Element): LayoutElementKind => {
     for (const [kind, selector] of kindSelectors) {
       if (matchesOf(element, selector)) {
@@ -812,7 +1228,7 @@ function collectLayoutReader(R: StandardReaders, {
     rect: RectangleEvidence,
     widthClipped: boolean,
     heightClipped: boolean,
-  ): { readonly clipped: boolean; readonly limitReached: boolean } => {
+  ): { readonly clipped: boolean } => {
     const left = rect.left + clientLeftOf(element);
     const top = rect.top + clientTopOf(element);
     const right = left + clientWidthOf(element);
@@ -826,15 +1242,11 @@ function collectLayoutReader(R: StandardReaders, {
     );
     const walker = createTreeWalker(element, NodeFilter.SHOW_TEXT);
     const range = createRange();
-    let scanned = 0;
     // 箱の中に見える行があったか。箱の上か下に丸ごと出た行があったか（見える行が見つかるまで、判定を保留する）。
     let visibleLineFound = false;
     let lineWhollyAboveOrBelow = false;
-    for (let node = walker.nextNode(); node !== null; node = walker.nextNode()) {
-      if (scanned >= thresholds.maxClippedTextNodeScan) {
-        return { clipped: false, limitReached: true };
-      }
-      scanned += 1;
+    // COV-6: テキストのノードの数で打ち切らない（打ち切ると、見切れを見落とす）。期限を過ぎたら、この回の走査ごと止める（`PARTIAL`）。
+    for (let node = walker.nextNode(); node !== null && !deadlinePassed(); node = walker.nextNode()) {
       const textParent = parentElementOf(node);
       if (!hasText(node.nodeValue) || (textParent !== null && !checkVisibilityOf(textParent, visibilityOptions))) {
         continue;
@@ -849,18 +1261,18 @@ function collectLayoutReader(R: StandardReaders, {
             || (heightClipped
               && sticksOutBeyond(line.top, line.bottom, top, bottom, (line.bottom - line.top) * minOutsideRatio))
           ) {
-            return { clipped: true, limitReached: false };
+            return { clipped: true };
           }
           visibleLineFound = true;
         } else if (heightClipped && overlapsHorizontally && !overlapsVertically) {
           lineWhollyAboveOrBelow = true;
         }
         if (visibleLineFound && lineWhollyAboveOrBelow) {
-          return { clipped: true, limitReached: false };
+          return { clipped: true };
         }
       }
     }
-    return { clipped: false, limitReached: false };
+    return { clipped: false };
   };
   // 子孫に、可視で大きさのある要素があるか（設計書 5.1.2、RT12 の I3）。幅か高さが 1 px 以下の子孫（visually hidden）は数えない（RT12r の N5）。
   // 文書の左か上の外に丸ごと置かれた子孫（文書の座標で、右端か下端が 0 以下のもの。`left:-9999px` など）も数えない（RT12r2 の M2）。
@@ -872,13 +1284,13 @@ function collectLayoutReader(R: StandardReaders, {
     element: Element,
     style: CSSStyleDeclaration,
     rect: RectangleEvidence,
-  ): { readonly rendered: boolean; readonly limitReached: boolean } => {
+  ): { readonly rendered: boolean } => {
     // 大きさが0の方向を、要素自身が overflow で切り取るなら、子孫は見えない。
     if (
       (clippingOverflows.has(style.overflowX) && rect.width <= thresholds.maxZeroSizeDimensionPx)
       || (clippingOverflows.has(style.overflowY) && rect.height <= thresholds.maxZeroSizeDimensionPx)
     ) {
-      return { rendered: false, limitReached: false };
+      return { rendered: false };
     }
     const candidateOutsideDocument = (
       rect.left + scrollPosition.scrollX < 0 && rect.right + scrollPosition.scrollX <= 0
@@ -886,12 +1298,8 @@ function collectLayoutReader(R: StandardReaders, {
       rect.top + scrollPosition.scrollY < 0 && rect.bottom + scrollPosition.scrollY <= 0
     );
     const walker = createTreeWalker(element, NodeFilter.SHOW_ELEMENT);
-    let scanned = 0;
-    for (let node = walker.nextNode(); node !== null; node = walker.nextNode()) {
-      if (scanned >= thresholds.maxRenderedDescendantScan) {
-        return { rendered: false, limitReached: true };
-      }
-      scanned += 1;
+    // COV-6: 子孫の数で打ち切らない（打ち切ると、描画された子孫のある操作要素を、大きさ0として誤って報告する）。期限を過ぎたら、この回の走査ごと止める。
+    for (let node = walker.nextNode(); node !== null && !deadlinePassed(); node = walker.nextNode()) {
       const descendant = node as Element;
       if (!checkVisibilityOf(descendant, visibilityOptions)) {
         continue;
@@ -905,10 +1313,68 @@ function collectLayoutReader(R: StandardReaders, {
           || (box.right + scrollPosition.scrollX > 0 && box.bottom + scrollPosition.scrollY > 0)
         )
       ) {
-        return { rendered: true, limitReached: false };
+        return { rendered: true };
       }
     }
-    return { rendered: false, limitReached: false };
+    return { rendered: false };
+  };
+
+  // AUD-4a: 閉じた折りたたみ。`aria-expanded="false"` の操作要素の `aria-controls` が指す id（空白で区切る）を、1回だけ集める。
+  const collapsedControlledIds = new Set<string>();
+  if (wants('clippedText')) {
+    for (const control of Element.prototype.querySelectorAll.call(documentElement, '[aria-expanded="false"][aria-controls]')) {
+      for (const id of (getAttributeOf(control, 'aria-controls') ?? '').split(/\s+/u)) {
+        if (id.length > 0) {
+          collapsedControlledIds.add(id);
+        }
+      }
+    }
+  }
+  /** AUD-4a: 要素か祖先の id を、閉じた折りたたみの操作要素が指すか。 */
+  const collapsedByControlOf = (element: Element): boolean => {
+    if (collapsedControlledIds.size === 0) {
+      return false;
+    }
+    for (let current: Element | null = element; current !== null && current !== documentElement; current = parentElementOf(current)) {
+      const id = idOf(current);
+      if (id.length > 0 && collapsedControlledIds.has(id)) {
+        return true;
+      }
+    }
+    return false;
+  };
+  /**
+   * AUD-4a: 行の高さ（px）。`line-height` の計算値が px ならその値。`normal` などは、箱の中の最初のテキストの行の矩形の高さ
+   * （`normal` の行の箱はフォントの内容領域の高さになる）。テキストのノードは、最初の文字のあるノードまで見る。求められなければ null。
+   */
+  const lineHeightOf = (element: HTMLElement, style: CSSStyleDeclaration): number | null => {
+    const declared = /^(\d*\.?\d+)px$/u.exec(style.lineHeight);
+    if (declared !== null) {
+      return Number.parseFloat(declared[1] ?? '');
+    }
+    const walker = createTreeWalker(element, NodeFilter.SHOW_TEXT);
+    const range = createRange();
+    for (let node = walker.nextNode(); node !== null && !deadlinePassed(); node = walker.nextNode()) {
+      if (!hasText(node.nodeValue)) {
+        continue;
+      }
+      range.selectNodeContents(node);
+      const [firstLine] = range.getClientRects();
+      if (firstLine !== undefined && firstLine.height > 0) {
+        return firstLine.height;
+      }
+    }
+    return null;
+  };
+  /** AUD-4a: 箱の中に見える行の数（内容の高さ ÷ 行の高さ。端数を残す）。 */
+  const visibleLineCountOf = (element: HTMLElement, style: CSSStyleDeclaration, lineHeightPx: number | null): number | null => {
+    if (lineHeightPx === null || lineHeightPx <= 0) {
+      return null;
+    }
+    const contentHeight = clientHeightOf(element)
+      - (Number.parseFloat(style.paddingTop) || 0)
+      - (Number.parseFloat(style.paddingBottom) || 0);
+    return Math.max(0, contentHeight) / lineHeightPx;
   };
 
   interface ObservedElement {
@@ -922,35 +1388,33 @@ function collectLayoutReader(R: StandardReaders, {
     readonly fixedOrStickyAncestor: boolean;
   }
 
-  /** はみ出しの候補と、その要素（一覧の中の祖先の番号を、最後に求めるため）と、文書の順の番号。 */
+  /** この回に返すはみ出しの候補と、その要素（一覧の中の祖先の番号を、最後に求めるため）。 */
   interface OutsideCandidate {
     readonly element: Element;
-    readonly order: number;
     readonly evidence: Omit<OutsideViewportEvidence, 'nearestListedAncestorIndex'>;
   }
 
   const allElements = documentBody === null ? [] : [...documentBody.querySelectorAll('*')];
-  // はみ出しの候補は、次の順に優先して、件数の上限まで残す（どの組も文書の順に集める）。
-  // 1. 横にはみ出すか固定の要素で、横方向に切り取る祖先もスクロールできる祖先もない（`horizontalClipAncestor` が `NONE`）もの（RT12r の N4）
-  // 2. 横にはみ出すか固定の要素で、それ以外のもの（カルーセルの中のスライドなど）
-  // 3. 縦にだけはみ出すもの
-  const unclippedPriorityOutsideViewport: OutsideCandidate[] = [];
-  const clippedPriorityOutsideViewport: OutsideCandidate[] = [];
-  const ordinaryOutsideViewport: OutsideCandidate[] = [];
+  // COV-6: はみ出しの候補は、件数の上限で打ち切らず、文書の順にすべてを一覧にする（この回には続きの位置からの分だけを返す）。
+  // 一覧の中の祖先の番号を求めるため、すべての候補の要素と、一覧の中の番号を覚える。
+  const outsideIndexes = new Map<Element, number>();
+  const outsideInPart: OutsideCandidate[] = [];
   const zeroSizeInteractive: ZeroSizeInteractiveEvidence[] = [];
-  const clippedText: ClippedTextEvidence[] = [];
+  const clippedText: RawClippedTextEvidence[] = [];
   const headings: ObservedElement[] = [];
   const fixedCandidates: ObservedElement[] = [];
   const primaryElements: ObservedElement[] = [];
-  let outsideViewportCount = 0;
   let zeroSizeInteractiveCount = 0;
   let clippedTextCount = 0;
-  let clippedTextNodeScanLimitReachedCount = 0;
-  let renderedDescendantScanLimitReachedCount = 0;
   // 要素（とその祖先）に `position: fixed | sticky` があるか。親は子より先に走査されるので、親の値を引き継ぐ。
   const withinFixedOrSticky = new Map<Element, boolean>();
+  // DEF-205: 要素（とその祖先）の `clip`・`clip-path` で、描く面が 0 になるか。親は子より先に走査されるので、親の値を引き継ぐ
+  // （`position: fixed` の要素は、祖先の切り取りの外に出ることがあるので、引き継がない）。
+  const clippedToZeroAreaOf = new Map<Element, boolean>();
   if (documentBody !== null) {
-    withinFixedOrSticky.set(documentBody, isFixedOrSticky(window.getComputedStyle(documentBody).position));
+    const bodyStyleForScan = window.getComputedStyle(documentBody);
+    withinFixedOrSticky.set(documentBody, isFixedOrSticky(bodyStyleForScan.position));
+    clippedToZeroAreaOf.set(documentBody, ownClipLeavesNoArea(documentBody, bodyStyleForScan));
   }
 
   for (const [order, element] of allElements.entries()) {
@@ -962,12 +1426,15 @@ function collectLayoutReader(R: StandardReaders, {
     const parent = parentElementOf(element);
     const fixedOrStickyAncestor = parent !== null && (withinFixedOrSticky.get(parent) ?? false);
     withinFixedOrSticky.set(element, fixed || fixedOrStickyAncestor);
+    const clippedToZeroArea = (style.position !== 'fixed' && parent !== null && (clippedToZeroAreaOf.get(parent) ?? false))
+      || ownClipLeavesNoArea(element, style);
+    clippedToZeroAreaOf.set(element, clippedToZeroArea);
     const visible = checkVisibilityOf(element, visibilityOptions);
     if (!visible) {
       continue;
     }
     const rect = rectFor(element);
-    const visibility = visibilityFor(element, style, visible);
+    const visibility = visibilityFor(element, style, visible, clippedToZeroArea);
     const kind = kindOf(element);
 
     const outside = {
@@ -976,25 +1443,16 @@ function collectLayoutReader(R: StandardReaders, {
       top: rect.top < -thresholds.geometryEpsilonPx,
       bottom: rect.bottom > actualViewport.height + thresholds.geometryEpsilonPx,
     };
-    if (outside.left || outside.right || outside.top || outside.bottom) {
-      outsideViewportCount += 1;
-      const prioritized = outside.left || outside.right || fixed;
-      const limit = thresholds.maxOutsideViewportCandidates;
-      // 祖先をたどる処理は、残せる組がある場合だけ行う。
-      let retained: OutsideCandidate[] | null = null;
-      let horizontalClipAncestor: HorizontalClipAncestorKind | null = null;
-      if (!prioritized) {
-        retained = ordinaryOutsideViewport.length < limit ? ordinaryOutsideViewport : null;
-      } else if (unclippedPriorityOutsideViewport.length < limit || clippedPriorityOutsideViewport.length < limit) {
-        horizontalClipAncestor = horizontalClipAncestorOf(element, style);
-        const group = horizontalClipAncestor === 'NONE' ? unclippedPriorityOutsideViewport : clippedPriorityOutsideViewport;
-        retained = group.length < limit ? group : null;
-      }
-      if (retained !== null) {
+    // REC-1: 一覧に入れるのは、横にはみ出す要素だけ（読む Rule は横のはみ出しだけを見る）。縦だけにはみ出す要素（画面の下に続く要素）は入れない。
+    // 一覧の中の祖先の番号は、横にはみ出す祖先を指すので、Rule の「横にはみ出す祖先があるか」の結果は変わらない。
+    if (wants('boxesOutsideViewport') && (outside.left || outside.right)) {
+      const index = outsideIndexes.size;
+      outsideIndexes.set(element, index);
+      // selector と祖先をたどる処理は、この回に返す候補だけで行う。
+      if (inPart('boxesOutsideViewport', index)) {
         const { selector, truncated } = selectorFor(element);
-        retained.push({
+        outsideInPart.push({
           element,
-          order,
           evidence: {
             selector,
             kind,
@@ -1004,7 +1462,7 @@ function collectLayoutReader(R: StandardReaders, {
             zIndex: style.zIndex,
             overflowX: style.overflowX,
             overflowY: style.overflowY,
-            horizontalClipAncestor: horizontalClipAncestor ?? horizontalClipAncestorOf(element, style),
+            horizontalClipAncestor: horizontalClipAncestorOf(element, style),
             outside,
             truncated,
           },
@@ -1013,16 +1471,15 @@ function collectLayoutReader(R: StandardReaders, {
     }
 
     if (
-      (rect.width <= thresholds.maxZeroSizeDimensionPx || rect.height <= thresholds.maxZeroSizeDimensionPx)
+      wants('zeroSizeInteractive')
+      && (rect.width <= thresholds.maxZeroSizeDimensionPx || rect.height <= thresholds.maxZeroSizeDimensionPx)
       && matchesOf(element, 'a[href], button, input, select, textarea, [role="button"], [role="link"]')
     ) {
+      const index = zeroSizeInteractiveCount;
       zeroSizeInteractiveCount += 1;
-      if (zeroSizeInteractive.length < thresholds.maxZeroSizeInteractiveCandidates) {
+      if (inPart('zeroSizeInteractive', index)) {
         const { selector, truncated } = selectorFor(element);
         const descendantScan = renderedDescendantOf(element, style, rect);
-        if (descendantScan.limitReached) {
-          renderedDescendantScanLimitReachedCount += 1;
-        }
         zeroSizeInteractive.push({
           selector,
           tagName: tagNameOf(element).toLowerCase(),
@@ -1039,24 +1496,25 @@ function collectLayoutReader(R: StandardReaders, {
       }
     }
 
-    if (element instanceof HTMLElement) {
+    if (wants('clippedText') && element instanceof HTMLElement) {
       const widthClipped = clippingOverflows.has(style.overflowX)
         && scrollWidthOf(element) > clientWidthOf(element) + thresholds.geometryEpsilonPx;
       const heightClipped = clippingOverflows.has(style.overflowY)
         && scrollHeightOf(element) > clientHeightOf(element) + thresholds.geometryEpsilonPx;
       if (widthClipped || heightClipped) {
-        const text = normalize(innerTextOf(element));
+        const text = normalize(displayedTextOf(element));
         if (text.length > 0) {
+          const index = clippedTextCount;
           clippedTextCount += 1;
-          if (clippedText.length < thresholds.maxClippedTextCandidates) {
+          if (inPart('clippedText', index)) {
             const { selector, truncated } = selectorFor(element);
             const lineCheck = textLineClipOf(element, rect, widthClipped, heightClipped);
-            if (lineCheck.limitReached) {
-              clippedTextNodeScanLimitReachedCount += 1;
-            }
+            const lineHeightPx = lineHeightOf(element, style);
             clippedText.push({
               selector,
-              text: text.slice(0, thresholds.maxClippedTextLength),
+              text,
+              tagName: tagNameOf(element).toLowerCase(),
+              role: getAttributeOf(element, 'role'),
               rect,
               visibility,
               overflowX: style.overflowX,
@@ -1070,13 +1528,29 @@ function collectLayoutReader(R: StandardReaders, {
               widthClipped,
               heightClipped,
               partiallyClippedText: lineCheck.clipped,
-              truncated: truncated || text.length > thresholds.maxClippedTextLength,
+              truncated,
+              // AUD-4a: 意図した省略を見分けるための事実（区分は Node の側で導く）。
+              clippingStyle: {
+                textOverflow: style.textOverflow,
+                whiteSpace: style.whiteSpace,
+                webkitLineClamp: style.getPropertyValue('-webkit-line-clamp'),
+                lineClamp: style.getPropertyValue('line-clamp'),
+                display: style.display,
+                webkitBoxOrient: style.getPropertyValue('-webkit-box-orient'),
+                maxHeight: style.maxHeight,
+              },
+              lineHeightPx,
+              visibleLineCount: visibleLineCountOf(element, style, lineHeightPx),
+              collapsedByControl: collapsedByControlOf(element),
             });
           }
         }
       }
     }
 
+    if (!wantsObservedElements) {
+      continue;
+    }
     const observed: ObservedElement = {
       element,
       order,
@@ -1106,67 +1580,210 @@ function collectLayoutReader(R: StandardReaders, {
     }
   }
 
-  let overlapComparisonLimitReached = false;
-  // 重なりの走査1回ぶんの、比べる組の上限を管理する。上限に達したら false を返す。
-  const comparisonBudget = (): (() => boolean) => {
-    let comparisons = 0;
-    return () => {
-      if (comparisons >= thresholds.maxOverlapComparisons) {
-        overlapComparisonLimitReached = true;
-        return false;
-      }
-      comparisons += 1;
-      return true;
-    };
-  };
+  // COV-6: 重なりの走査は、比べる組の数で打ち切らない（ユーザーの判断で上限を撤廃した）。すべての組を比べ、見つけた重なりに番号を振り、
+  // この回は続きの位置（`cursor`）の番号から `partSize` 件だけを返す（受け渡しの大きさを抑える分け方だけ）。
   const related = (first: Element, second: Element): boolean => (
     first === second || containsOf(first, second) || containsOf(second, first)
   );
 
-  const fixedHeadingOverlaps: FixedHeadingOverlapEvidence[] = [];
+  // AUD-3b（整理の文書 `2026-11-09-beaksight-audit-precision-triage.md` の AUD-3b・3c）: 固定要素の重なりの hit-test の事実。ページの中を読むだけ（要求も
+  // 読み込みも足さない）。区分は Node の側（`src/audit/fixed-overlap-classes.ts`）が決める。
+  const elementsFromPointOf = (x: number, y: number): Element[] => Document.prototype.elementsFromPoint.call(document, x, y);
+  /** 要素と祖先の `opacity` の積。 */
+  const effectiveOpacityOf = (element: Element): number => {
+    let opacity = 1;
+    for (let current: Element | null = element; current !== null; current = parentElementOf(current)) {
+      const value = Number.parseFloat(window.getComputedStyle(current).opacity);
+      if (Number.isFinite(value)) {
+        opacity *= value;
+      }
+    }
+    return opacity;
+  };
+  /** 点の要素と、覆う要素・覆われる要素との関係（覆われる要素の側を先に見る）。 */
+  const hitRelationOf = (element: Element, overlay: Element, covered: Element | null): RawOverlapHitLayer['relation'] => {
+    if (covered !== null && element === covered) {
+      return 'COVERED';
+    }
+    if (covered !== null && containsOf(covered, element)) {
+      return 'COVERED_DESCENDANT';
+    }
+    if (element === overlay) {
+      return 'OVERLAY';
+    }
+    return containsOf(overlay, element) ? 'OVERLAY_DESCENDANT' : 'OTHER';
+  };
+  const hitLayerOf = (element: Element, relation: RawOverlapHitLayer['relation']): RawOverlapHitLayer => {
+    const style = window.getComputedStyle(element);
+    return {
+      selector: selectorFor(element).selector,
+      relation,
+      position: style.position,
+      zIndex: style.zIndex,
+      pointerEvents: style.pointerEvents,
+      effectiveOpacity: effectiveOpacityOf(element),
+      visibility: style.visibility,
+      backgroundColor: style.backgroundColor,
+      hasBackgroundImage: style.backgroundImage.trim().toLowerCase() !== 'none',
+      surface: R.ownSurfaceFactsOf(element, style, thresholds.maxOwnTextNodeScan),
+      replaced: matchesOf(element, thresholds.replacedContentSelector),
+    };
+  };
+  /** 交わり（ビューポートの中の部分）の中心と、内側に寄せた四隅（EV-2: 点の作り方は部品 `R.hitPointsOf` の 1 か所）。 */
+  const hitPointsOf = (area: RectangleEvidence): (readonly [number, number])[] =>
+    R.hitPointsOf(area, actualViewport.width, actualViewport.height, thresholds.hitTestPointInsetPx);
+  /** 覆う要素か祖先が、開いたモーダル（`dialog` の showModal・`aria-modal="true"`）か。 */
+  const modalOf = (overlay: Element): RawOverlapHitTest['modal'] => {
+    let dialogModal = false;
+    let ariaModal = false;
+    for (let current: Element | null = overlay; current !== null; current = parentElementOf(current)) {
+      if (tagNameOf(current) === 'DIALOG') {
+        try {
+          dialogModal ||= matchesOf(current, ':modal');
+        } catch {
+          // `:modal` を読めないブラウザでは、モーダルでないものとして扱う（覆いとして数える側）。
+        }
+      }
+      ariaModal ||= getAttributeOf(current, 'aria-modal') === 'true';
+    }
+    return { dialogModal, ariaModal };
+  };
+  /**
+   * 覆う要素（`overlay`）の hit-test。覆われる要素（`covered`）があれば、点ごとに、最前面から覆われる要素（かその子孫）の手前までの要素を読む。
+   * なければ（固定要素だけ）、最前面から、覆う要素の層でも祖先でもない最初の要素（下にある内容）の手前までを読む。覆う要素の祖先は読まない。
+   */
+  const hitTestOf = (overlay: Element, covered: Element | null, area: RectangleEvidence): RawOverlapHitTest => ({
+    target: covered === null ? 'BENEATH' : 'COVERED',
+    points: hitPointsOf(area).map(([x, y]) => {
+      const stack = elementsFromPointOf(x, y);
+      const layers: RawOverlapHitLayer[] = [];
+      let targetSelector: string | null = null;
+      for (const element of stack) {
+        const relation = hitRelationOf(element, overlay, covered);
+        if (relation === 'COVERED' || relation === 'COVERED_DESCENDANT') {
+          targetSelector = selectorFor(covered ?? element).selector;
+          break;
+        }
+        if (relation === 'OTHER' && containsOf(element, overlay)) {
+          continue;
+        }
+        if (covered === null && relation === 'OTHER') {
+          targetSelector = selectorFor(element).selector;
+          break;
+        }
+        layers.push(hitLayerOf(element, relation));
+      }
+      const top = stack[0];
+      return {
+        x,
+        y,
+        topRelation: top === undefined ? null : hitRelationOf(top, overlay, covered),
+        layers,
+        targetFound: targetSelector !== null,
+        targetSelector,
+      };
+    }),
+    overlay: hitLayerOf(overlay, 'OVERLAY'),
+    modal: modalOf(overlay),
+  });
+
+  // EV-1（設計書 `2026-11-16-beaksight-finding-evidence-design.md` 3.1）: 覆われる側のいちばん近い、縦にスクロールできる祖先（祖先の見つけ方は部品
+  // `R.scrollAncestorsOf`）。なければ `undefined`（Evidence に項目を足さない）。
+  const scrollContainerFieldOf = (element: Element): { coveredScrollContainer?: ScrollContainerEvidence } => {
+    // REV-SD2 の M-1: 縦に動かせる祖先は、`overflow-y` が auto・scroll・overlay のものだけ（横だけ auto で縦が hidden の祖先は、利用者が縦に動かせない）。
+    const container = R.scrollAncestorsOf(element).find((node) => ['auto', 'scroll', 'overlay'].includes(window.getComputedStyle(node).overflowY)
+      && scrollHeightOf(node) > clientHeightOf(node));
+    if (container === undefined) {
+      return {};
+    }
+    return {
+      coveredScrollContainer: {
+        selector: selectorFor(container).selector,
+        rect: rectFor(container),
+        scrollTop: standardGetter<number>(Element.prototype, 'scrollTop')(container),
+        scrollRangeY: Math.max(0, scrollHeightOf(container) - clientHeightOf(container)),
+      },
+    };
+  };
+  // EV-1: どちらも固定要素でない組の、行ごとの矩形（`getClientRects`）の重なりと、ビューポートの中の交わりの中心の点で、両方が hit-test に出るか。
+  const lineOverlapOf = (first: Element, second: Element): LineOverlapEvidence => {
+    let area = 0;
+    let pointCount = 0;
+    let bothHitPointCount = 0;
+    const isOrInside = (owner: Element, element: Element): boolean => element === owner || containsOf(owner, element);
+    for (const firstLine of clientRectsOf(first)) {
+      for (const secondLine of clientRectsOf(second)) {
+        const left = Math.max(firstLine.left, secondLine.left);
+        const right = Math.min(firstLine.right, secondLine.right);
+        const top = Math.max(firstLine.top, secondLine.top);
+        const bottom = Math.min(firstLine.bottom, secondLine.bottom);
+        if (right <= left || bottom <= top) {
+          continue;
+        }
+        area += (right - left) * (bottom - top);
+        const x = (left + right) / 2;
+        const y = (top + bottom) / 2;
+        if (x < 0 || y < 0 || x >= actualViewport.width || y >= actualViewport.height) {
+          continue;
+        }
+        pointCount += 1;
+        const stack = elementsFromPointOf(x, y);
+        if (stack.some((element) => isOrInside(first, element)) && stack.some((element) => isOrInside(second, element))) {
+          bothHitPointCount += 1;
+        }
+      }
+    }
+    return { area, pointCount, bothHitPointCount };
+  };
+
+  const fixedHeadingOverlaps: RawFixedHeadingOverlapEvidence[] = [];
   let fixedHeadingOverlapCount = 0;
-  const compareFixedHeading = comparisonBudget();
-  fixedHeadingScan:
-  for (const overlay of fixedCandidates) {
-    for (const heading of headings) {
-      if (deadlinePassed() || !compareFixedHeading()) {
-        break fixedHeadingScan;
+  if (wants('fixedHeadingOverlaps')) {
+    fixedHeadingScan:
+    for (const overlay of fixedCandidates) {
+      for (const heading of headings) {
+        if (deadlinePassed()) {
+          break fixedHeadingScan;
+        }
+        if (
+          related(overlay.element, heading.element)
+          || !intersectsViewport(overlay.rect)
+          || !intersectsViewport(heading.rect)
+        ) {
+          continue;
+        }
+        const intersection = intersectionOf(overlay.rect, heading.rect);
+        if (intersection === null) {
+          continue;
+        }
+        const index = fixedHeadingOverlapCount;
+        fixedHeadingOverlapCount += 1;
+        if (!inPart('fixedHeadingOverlaps', index)) {
+          continue;
+        }
+        const overlaySelector = selectorFor(overlay.element);
+        const headingSelector = selectorFor(heading.element);
+        fixedHeadingOverlaps.push({
+          overlaySelector: overlaySelector.selector,
+          headingSelector: headingSelector.selector,
+          overlayRect: overlay.rect,
+          headingRect: heading.rect,
+          overlayVisibility: overlay.visibility,
+          headingVisibility: heading.visibility,
+          overlayPosition: overlay.style.position as FixedElementPosition,
+          overlayZIndex: overlay.style.zIndex,
+          overlayOverflowX: overlay.style.overflowX,
+          overlayOverflowY: overlay.style.overflowY,
+          headingPosition: heading.style.position,
+          headingZIndex: heading.style.zIndex,
+          headingOverflowX: heading.style.overflowX,
+          headingOverflowY: heading.style.overflowY,
+          intersection,
+          truncated: overlaySelector.truncated || headingSelector.truncated,
+          hitTest: hitTestOf(overlay.element, heading.element, intersection),
+          ...scrollContainerFieldOf(heading.element),
+        });
       }
-      if (
-        related(overlay.element, heading.element)
-        || !intersectsViewport(overlay.rect)
-        || !intersectsViewport(heading.rect)
-      ) {
-        continue;
-      }
-      const intersection = intersectionOf(overlay.rect, heading.rect);
-      if (intersection === null) {
-        continue;
-      }
-      fixedHeadingOverlapCount += 1;
-      if (fixedHeadingOverlaps.length >= thresholds.maxFixedHeadingOverlapCandidates) {
-        continue;
-      }
-      const overlaySelector = selectorFor(overlay.element);
-      const headingSelector = selectorFor(heading.element);
-      fixedHeadingOverlaps.push({
-        overlaySelector: overlaySelector.selector,
-        headingSelector: headingSelector.selector,
-        overlayRect: overlay.rect,
-        headingRect: heading.rect,
-        overlayVisibility: overlay.visibility,
-        headingVisibility: heading.visibility,
-        overlayPosition: overlay.style.position as FixedElementPosition,
-        overlayZIndex: overlay.style.zIndex,
-        overlayOverflowX: overlay.style.overflowX,
-        overlayOverflowY: overlay.style.overflowY,
-        headingPosition: heading.style.position,
-        headingZIndex: heading.style.zIndex,
-        headingOverflowX: heading.style.overflowX,
-        headingOverflowY: heading.style.overflowY,
-        intersection,
-        truncated: overlaySelector.truncated || headingSelector.truncated,
-      });
     }
   }
 
@@ -1194,83 +1811,98 @@ function collectLayoutReader(R: StandardReaders, {
     if (intersection === null) {
       return;
     }
+    const index = elementOverlapCount;
     elementOverlapCount += 1;
-    if (elementOverlaps.length >= thresholds.maxElementOverlapCandidates) {
+    if (!inPart('elementOverlaps', index)) {
       return;
     }
     const [earlier, later] = first.order < second.order ? [first, second] : [second, first];
     const earlierSelector = selectorFor(earlier.element);
     const laterSelector = selectorFor(later.element);
+    // AUD-3b: 片方だけが固定要素の組は、固定要素を覆う側として hit-test を読む。
+    const fixedSide = first.fixed === second.fixed ? null : first.fixed ? first : second;
+    const otherSide = fixedSide === first ? second : first;
     elementOverlaps.push({
       first: elementFacts(earlier, earlierSelector.selector),
       second: elementFacts(later, laterSelector.selector),
       intersection,
       truncated: earlierSelector.truncated || laterSelector.truncated,
+      ...(fixedSide === null
+        ? { lineOverlap: lineOverlapOf(first.element, second.element) }
+        : { hitTest: hitTestOf(fixedSide.element, otherSide.element, intersection), ...scrollContainerFieldOf(otherSide.element) }),
     });
   };
 
-  // 固定要素を含む組を先に調べる（上限で切り捨てるときに優先する）。どちらもビューポートと交わる組に限る。
-  const primaryInViewport = primaryElements.filter((observed) => intersectsViewport(observed.rect));
-  const fixedPrimaryInViewport = primaryInViewport.filter((observed) => observed.fixed);
-  const compareFixedPairs = comparisonBudget();
-  fixedPairScan:
-  for (const overlay of fixedPrimaryInViewport) {
-    for (const other of primaryInViewport) {
-      if (other.fixed && other.order <= overlay.order) {
-        continue;
+  if (wants('elementOverlaps')) {
+    // 固定要素を含む組を先に調べる。どちらもビューポートと交わる組に限る。
+    const primaryInViewport = primaryElements.filter((observed) => intersectsViewport(observed.rect));
+    const fixedPrimaryInViewport = primaryInViewport.filter((observed) => observed.fixed);
+    let pairsStopped = false;
+    fixedPairScan:
+    for (const overlay of fixedPrimaryInViewport) {
+      for (const other of primaryInViewport) {
+        if (other.fixed && other.order <= overlay.order) {
+          continue;
+        }
+        if (deadlinePassed()) {
+          pairsStopped = true;
+          break fixedPairScan;
+        }
+        recordOverlap(overlay, other);
       }
-      if (deadlinePassed() || !compareFixedPairs()) {
-        break fixedPairScan;
+    }
+
+    // 固定要素でない主要要素どうしは、上端の順に並べ、縦に重なる組だけを比べる。
+    const staticPrimary = primaryElements
+      .filter((observed) => !observed.fixed)
+      .sort((first, second) => first.rect.top - second.rect.top || first.order - second.order);
+    if (!pairsStopped) {
+      staticPairScan:
+      for (const [index, current] of staticPrimary.entries()) {
+        for (let next = index + 1; next < staticPrimary.length; next += 1) {
+          const candidate = staticPrimary[next];
+          if (candidate === undefined || candidate.rect.top >= current.rect.bottom) {
+            break;
+          }
+          if (deadlinePassed()) {
+            break staticPairScan;
+          }
+          recordOverlap(current, candidate);
+        }
       }
-      recordOverlap(overlay, other);
     }
   }
 
-  // 固定要素でない主要要素どうしは、上端の順に並べ、縦に重なる組だけを比べる。
-  const staticPrimary = primaryElements
-    .filter((observed) => !observed.fixed)
-    .sort((first, second) => first.rect.top - second.rect.top || first.order - second.order);
-  const compareStaticPairs = comparisonBudget();
-  staticPairScan:
-  for (const [index, current] of staticPrimary.entries()) {
-    for (let next = index + 1; next < staticPrimary.length; next += 1) {
-      const candidate = staticPrimary[next];
-      if (candidate === undefined || candidate.rect.top >= current.rect.bottom) {
-        break;
-      }
-      if (deadlinePassed() || !compareStaticPairs()) {
-        break staticPairScan;
-      }
-      recordOverlap(current, candidate);
-    }
-  }
-
-  const fixedPrimary = primaryElements.filter((observed) => observed.fixed);
+  // DEF-204（設計書 `2026-11-06-beaksight-notification-overlay-design.md` 3.5）: 固定要素そのものが描く面の事実（判定は Node の側の
+  // `paintsOwnSurfaceOf`）。読む項目は `OwnSurfaceFacts`（`src/core/own-surface.ts`）。種類（画像など）は Node の側で足す。
+  // CC-129: 読み方は部品（`R.ownSurfaceFactsOf`）。計算値は、走査で取った要素の `style` から読む。
+  const surfaceOf = (element: Element, style: CSSStyleDeclaration): Omit<OwnSurfaceFacts, 'replacedContent'> =>
+    R.ownSurfaceFactsOf(element, style, thresholds.maxOwnTextNodeScan);
+  const fixedPrimary = wants('fixedElements') ? primaryElements.filter((observed) => observed.fixed) : [];
+  const fixedStart = cursor.fixedElements ?? 0;
   const fixedElements: RawFixedElementEvidence[] = fixedPrimary
-    .slice(0, thresholds.maxFixedElementCandidates)
+    .slice(fixedStart, fixedStart + partSize)
     .map((observed) => {
       const { selector, truncated } = selectorFor(observed.element);
-      return { ...elementFacts(observed, selector), truncated };
+      return {
+        ...elementFacts(observed, selector),
+        truncated,
+        surface: { ...surfaceOf(observed.element, observed.style), replacedContent: false },
+        pointerEvents: observed.style.pointerEvents,
+        // AUD-3b: 要素の面（ビューポートの中の部分）の上の点で、下にある内容を描画と押下で妨げるかの事実。
+        hitTest: hitTestOf(observed.element, null, observed.rect),
+      };
     });
 
-  // 優先の順に上限まで選び、文書の順に並べ直す。
-  const retainedOutsideViewport = [
-    ...unclippedPriorityOutsideViewport,
-    ...clippedPriorityOutsideViewport,
-    ...ordinaryOutsideViewport,
-  ]
-    .slice(0, thresholds.maxOutsideViewportCandidates)
-    .sort((first, second) => first.order - second.order);
-  // 一覧の中の、最も近い祖先の番号（設計書 5.1.2）。一覧の要素ごとに、親の方向へたどって探す。
-  const listedIndexes = new Map(retainedOutsideViewport.map(({ element }, index) => [element, index] as const));
-  const boxesOutsideViewport: OutsideViewportEvidence[] = retainedOutsideViewport.map(({ element, evidence }) => {
+  // 一覧の中の、最も近い祖先の番号（設計書 5.1.2。番号は、ページの中のすべての候補の中の番号）。この回に返す要素ごとに、親の方向へたどって探す。
+  const boxesOutsideViewport: OutsideViewportEvidence[] = outsideInPart.map(({ element, evidence }) => {
     let nearestListedAncestorIndex: number | null = null;
     for (
       let ancestor = parentElementOf(element);
       ancestor !== null && nearestListedAncestorIndex === null;
       ancestor = parentElementOf(ancestor)
     ) {
-      nearestListedAncestorIndex = listedIndexes.get(ancestor) ?? null;
+      nearestListedAncestorIndex = outsideIndexes.get(ancestor) ?? null;
     }
     return { ...evidence, nearestListedAncestorIndex };
   });
@@ -1303,16 +1935,19 @@ function collectLayoutReader(R: StandardReaders, {
     fixedHeadingOverlaps,
     elementOverlaps,
     fixedElements,
+    next: {
+      boxesOutsideViewport: nextOf('boxesOutsideViewport', outsideIndexes.size, outsideInPart.length),
+      zeroSizeInteractive: nextOf('zeroSizeInteractive', zeroSizeInteractiveCount, zeroSizeInteractive.length),
+      clippedText: nextOf('clippedText', clippedTextCount, clippedText.length),
+      fixedHeadingOverlaps: nextOf('fixedHeadingOverlaps', fixedHeadingOverlapCount, fixedHeadingOverlaps.length),
+      elementOverlaps: nextOf('elementOverlaps', elementOverlapCount, elementOverlaps.length),
+      fixedElements: nextOf('fixedElements', fixedPrimary.length, fixedElements.length),
+    },
+    // COV-6: 比べる組・テキストのノード・子孫の要素の数で打ち切らないので、印は常に偽と 0（古い記録と同じ形を保つ）。
     truncation: {
-      omittedOutsideViewportCount: outsideViewportCount - retainedOutsideViewport.length,
-      omittedZeroSizeInteractiveCount: zeroSizeInteractiveCount - zeroSizeInteractive.length,
-      omittedClippedTextCount: clippedTextCount - clippedText.length,
-      omittedFixedHeadingOverlapCount: fixedHeadingOverlapCount - fixedHeadingOverlaps.length,
-      omittedElementOverlapCount: elementOverlapCount - elementOverlaps.length,
-      omittedFixedElementCount: fixedPrimary.length - fixedElements.length,
-      overlapComparisonLimitReached,
-      clippedTextNodeScanLimitReachedCount,
-      renderedDescendantScanLimitReachedCount,
+      overlapComparisonLimitReached: false,
+      clippedTextNodeScanLimitReachedCount: 0,
+      renderedDescendantScanLimitReachedCount: 0,
     },
     incompleteReason,
   };
@@ -1326,43 +1961,67 @@ const DEADLINE_EXCEEDED_WITHOUT_LAYOUT: LayoutCollectionResult = Object.freeze({
 });
 
 /**
- * 上限付き・読み取り専用のジオメトリ観測結果を、期限付きの単一のブラウザevaluationで収集する。
- * 期限を過ぎた場合は、例外を投げずに `PARTIAL` と理由を返す。
+ * 読み取り専用のジオメトリ観測結果を、分けたブラウザ evaluation で収集する（COV-6）。
+ * collector は自分の期限を持たない（時間で打ち切らない。2026-11-09 のユーザーの判断）。呼び出し側が期限を渡したときだけ、それを過ぎたら
+ * 例外を投げずに、それまでの回の事実と `PARTIAL` を返す。
  * ブラウザ内の評価の失敗、不正なジオメトリ、実際のビューポートとの食い違いは、例外として呼び出し側に返す。
  */
 export async function collectLayoutEvidence(
   page: Page,
   viewport: Viewport,
-  options: LayoutCollectionOptions = { deadlineAtMs: Date.now() + LAYOUT_THRESHOLDS.defaultTimeoutMs },
+  options: LayoutCollectionOptions = {},
 ): Promise<LayoutCollectionResult> {
   positiveFiniteDimension(viewport.width, 'Layout viewport width');
   positiveFiniteDimension(viewport.height, 'Layout viewport height');
   const { deadlineAtMs } = options;
-  if (!Number.isFinite(deadlineAtMs)) {
+  if (deadlineAtMs !== undefined && !Number.isFinite(deadlineAtMs)) {
     throw new Error('Layout collection deadline must be finite');
   }
   const viewportSnapshot = Object.freeze({ width: viewport.width, height: viewport.height });
-  if (Date.now() >= deadlineAtMs) {
+  if (deadlineAtMs !== undefined && Date.now() >= deadlineAtMs) {
     return DEADLINE_EXCEEDED_WITHOUT_LAYOUT;
   }
-  const evaluated = await awaitBeforeDeadline(page.evaluate(collectLayoutInPage, {
-    thresholds: LAYOUT_THRESHOLDS,
-    visibilityOptions: VISIBILITY_CHECK_OPTIONS,
-    kindSelectors: LAYOUT_ELEMENT_KIND_SELECTORS,
-    fixedPositions: FIXED_ELEMENT_POSITIONS,
-    horizontalClipByOverflow: HORIZONTAL_CLIP_BY_OVERFLOW,
-    scanDeadlineAtMs: deadlineAtMs - LAYOUT_THRESHOLDS.partialResultReserveMs,
-  } satisfies LayoutEvaluationArgument), deadlineAtMs);
-  if (evaluated.status === 'DEADLINE_EXCEEDED') {
+  // COV-6: 候補は件数の上限で打ち切らず、`LAYOUT_COLLECTION_PART_SIZE` 件ずつ、続きの位置から読み直す（`readInParts`）。進み続けている間は
+  // 最後まで読む。呼び出し側の期限があり、ある回がそれを過ぎたら、それまでの回の事実で `PARTIAL` にする（最初の回なら、事実なし）。
+  let incompleteReason: BrowserLayoutIncompleteReason | null = null;
+  const parts = await readInParts<LayoutPartCursor, RawLayoutPart | null>(FIRST_LAYOUT_PART_CURSOR, async (cursor) => {
+    if (deadlineAtMs !== undefined && Date.now() >= deadlineAtMs) {
+      incompleteReason = 'DEADLINE_EXCEEDED';
+      return { part: null, next: null };
+    }
+    const reading = page.evaluate(collectLayoutInPage, {
+      thresholds: LAYOUT_THRESHOLDS,
+      visibilityOptions: VISIBILITY_CHECK_OPTIONS,
+      kindSelectors: LAYOUT_ELEMENT_KIND_SELECTORS,
+      fixedPositions: FIXED_ELEMENT_POSITIONS,
+      horizontalClipByOverflow: HORIZONTAL_CLIP_BY_OVERFLOW,
+      scanDeadlineAtMs: deadlineAtMs === undefined ? null : deadlineAtMs - LAYOUT_THRESHOLDS.partialResultReserveMs,
+      cursor,
+      partSize: LAYOUT_COLLECTION_PART_SIZE,
+    } satisfies LayoutEvaluationArgument);
+    const evaluated = deadlineAtMs === undefined
+      ? await reading.then(
+        (value) => ({ status: 'FULFILLED', value }) as const,
+        (reason: unknown) => ({ status: 'REJECTED', reason }) as const,
+      )
+      : await awaitBeforeDeadline(reading, deadlineAtMs);
+    if (evaluated.status === 'DEADLINE_EXCEEDED') {
+      incompleteReason = 'DEADLINE_EXCEEDED';
+      return { part: null, next: null };
+    }
+    if (evaluated.status === 'REJECTED') {
+      throw evaluated.reason;
+    }
+    const raw = evaluated.value;
+    validateRawLayoutPart(raw, cursor);
+    incompleteReason = validateIncompleteReason(raw.incompleteReason);
+    return { part: raw, next: incompleteReason === null ? nextLayoutPartCursor(raw) : null };
+  });
+  const readParts = parts.filter((part): part is RawLayoutPart => part !== null);
+  if (readParts.length === 0) {
     return DEADLINE_EXCEEDED_WITHOUT_LAYOUT;
   }
-  if (evaluated.status === 'REJECTED') {
-    throw evaluated.reason;
-  }
-
-  const raw = evaluated.value;
-  const incompleteReason = validateIncompleteReason(raw.incompleteReason);
-  const evidence = freezeLayout(raw);
+  const evidence = assembleLayout(readParts);
   if (
     Math.abs(evidence.document.viewportWidth - viewportSnapshot.width) > LAYOUT_THRESHOLDS.viewportMatchTolerancePx
     || Math.abs(evidence.document.viewportHeight - viewportSnapshot.height) > LAYOUT_THRESHOLDS.viewportMatchTolerancePx
@@ -1392,7 +2051,7 @@ function failedWidth(
     status: 'FAILED',
     stage,
     reason,
-    message: error === undefined ? null : safeErrorMessage(error, MAX_ERROR_MESSAGE_LENGTH),
+    message: error === undefined ? null : safeErrorMessage(error),
     layout: null,
   });
 }
@@ -1401,10 +2060,10 @@ function failedWidth(
  * レスポンシブの各幅を、その都度新規に保護されたowner管理下のセッションでサンプリングする。
  * ある幅の遷移や収集が失敗しても、それまでの幅の結果を保持し、失敗した幅を理由付きで記録して次の幅へ進む。
  * 期限を過ぎた後の幅は、セッションを作らずに `NOT_STARTED` として記録する。
- * 各幅の遷移の直前に `options.beforeNavigation` を呼び、待った時間の分だけ期限を延ばす（サイトへの負荷の制御の設計書 4.1、4.4）。
- * `options.afterNavigation` を渡した場合は、各幅の遷移の前に main frame の文書の追跡を付け、ページ本体の要求の観察を始め、遷移の結果から
- * 観測を作って、遷移の直後に止めた観察の結果とともに渡し、追跡を外す（サイトが応答しないときに Run を止める設計書 2.1。サイトの不調で
- * 止めたときの診断の記録の設計書 2.2）。
+ * 各幅のセッションを作る直前（遷移の前）に `options.beforeNavigation` を呼び、待った時間の分だけ期限を延ばす（サイトへの負荷の制御の設計書 4.1、4.4。
+ * DEF-209: 待ってからセッションを作る）。
+ * `options.afterNavigation` を渡した場合は、各幅の遷移の前に main frame の文書の追跡を付け、遷移の結果から観測を作って渡し、追跡を外す
+ * （サイトが応答しないときに Run を止める設計書 2.1）。
  * `options`（期限と間隔の待ち）は省略できない。省略した場合と、`beforeNavigation` が関数でない場合、`afterNavigation` が関数でも
  * `undefined` でもない場合は、セッションを作らずに例外を投げる。
  * セッションの作成と close の失敗は、owner のライフサイクルの失敗として例外で返す。
@@ -1438,8 +2097,6 @@ export async function collectStressLayout(
   if (afterNavigation !== undefined && typeof afterNavigation !== 'function') {
     throw new Error('Responsive stress afterNavigation must be a function when given');
   }
-  const sessionOpenTimeoutMs = resolveTimeoutMs(options.sessionOpenTimeoutMs, SESSION_OPEN_TIMEOUT_MS);
-
   const results: StressLayoutEvidence[] = [];
   for (const width of widths) {
     if (Date.now() >= deadlineAtMs) {
@@ -1447,34 +2104,25 @@ export async function collectStressLayout(
       continue;
     }
     const viewport = Object.freeze({ width, height: STRESS_VIEWPORT_HEIGHT });
+    // DEF-209: 読み込みの間隔を待ってから、その幅のセッション（Context と空の page）を作る（ビューポートの監査と同じ順。待つ間に、空の page の窓を
+    // 出さない）。待った時間は、期限を消費しない（サイトへの負荷の制御の設計書 4.4）。待ちの失敗は、セッションを作る前の失敗なので、セッションの作成の
+    // 失敗と同じく例外で返す。
+    deadlineAtMs += await beforeNavigation();
     const session = await pageFactory(viewport);
     let workError: unknown;
     let closeError: unknown;
     let result: StressLayoutEvidence | undefined;
     try {
-      // ページの読み込みの間隔のために待った時間は、期限を消費しない（サイトへの負荷の制御の設計書 4.4）。
-      deadlineAtMs += await beforeNavigation();
-      // 受け口があれば、読み込みの観測と、ページ本体の要求の観察の結果を渡す（サイトが応答しないときに Run を止める設計書 2.1。診断の
-      // 記録の設計書 2.2）。追跡は読み込みの前に付け、観測を渡した後に外す。観察は読み込みの直前に始め、読み込みの直後に、結果によらず
-      // 止める（止める処理は `detach` の終わりを待たない）。観察を始める処理は、この幅の読み込みの期限と、今から `sessionOpenTimeoutMs`
-      // 後の早い方までしか待たず（設計書 2.2「長く待たない」。Passive の観察と同じ）、始められなくても読み込みは、読み込みの期限まで
-      // 今までどおり行う。判定はしない。
+      // 受け口があれば、読み込みの観測を渡す（サイトが応答しないときに Run を止める設計書 2.1）。追跡は読み込みの前に付け、観測を渡した後に
+      // 外す。判定はしない。
       const tracker = afterNavigation === undefined ? null : trackMainFrameDocument(session.page);
-      const recorder = afterNavigation === undefined
-        ? null
-        : await startNavigationDiagnostics(session.page, { deadlineAtMs: deadlineWithinTimeoutAtMs(deadlineAtMs, sessionOpenTimeoutMs) });
       let navigated: MainFrameLoadSettlement;
       try {
-        let diagnostics: NavigationDiagnostics | null = null;
-        try {
-          // DEF-129: BeakSight 自身の読み込みであることを Guard に知らせる（ページが始めた読み込みの数を数え直す）。
-          announceOwnMainFrameNavigation(session.page);
-          navigated = await awaitBeforeDeadline(session.page.goto(url, { waitUntil: 'load' }), deadlineAtMs);
-        } finally {
-          diagnostics = recorder === null ? null : await recorder.finish();
-        }
-        if (tracker !== null && afterNavigation !== undefined && diagnostics !== null) {
-          afterNavigation(observeMainFrameLoad(tracker, navigated), diagnostics);
+        // DEF-129: BeakSight 自身の読み込みであることを Guard に知らせる（ページが始めた読み込みの数を数え直す）。
+        announceOwnMainFrameNavigation(session.page);
+        navigated = await awaitBeforeDeadline(session.page.goto(url, { waitUntil: 'load' }), deadlineAtMs);
+        if (tracker !== null && afterNavigation !== undefined) {
+          afterNavigation(observeMainFrameLoad(tracker, navigated));
         }
       } finally {
         tracker?.dispose();
@@ -1488,6 +2136,10 @@ export async function collectStressLayout(
         // T44 P1-5: 最初の読み込みと同じ落ち着きの待ちの後に測る（後から描く画面のデータを見る）。
         await settleBeforeLayout(session.page, deadlineAtMs);
         const collected = await collectLayoutEvidence(session.page, viewport, { deadlineAtMs });
+        // AUD-3d: layout を読んだ直後に、その幅の画像を撮る口を呼ぶ（読めなかった幅では呼ばない）。
+        if (collected.layout !== null && options.afterLayout !== undefined) {
+          await options.afterLayout(session.page, width, collected.layout);
+        }
         result = collected.status === 'COMPLETE'
           ? Object.freeze({ width, height: STRESS_VIEWPORT_HEIGHT, status: 'COMPLETE', layout: collected.layout })
           : Object.freeze({

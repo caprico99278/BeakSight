@@ -16,10 +16,8 @@ import {
 } from '../../src/core/evidence-types.js';
 import { SafetyLedger, safetyEventsEvidenceFromSnapshot } from '../../src/safety/safety-ledger.js';
 
-/** Ledger の 1 つの記録の種類の、事象の数の上限（`safety-ledger.ts` の `MAX_LEDGER_EVENTS` と同じ値。超えた分の扱いを確かめる）。 */
-const LEDGER_EVENT_LIMIT = 256;
-/** Ledger の文字列の長さの上限（`safety-ledger.ts` の `MAX_LEDGER_TEXT_LENGTH` と同じ値）。 */
-const LEDGER_TEXT_LIMIT = 2_048;
+/** LZ-2 の前の Ledger の文字列の長さの上限（定数は LZ-2 で消した。前の上限を超える長さの場面に使う）。 */
+const FORMER_LEDGER_TEXT_LIMIT = 2_048;
 
 const EVENT: BlockedAuditExclusionEvent = Object.freeze({
   method: 'get',
@@ -34,7 +32,7 @@ const readSchema = (name: string): object =>
   JSON.parse(readFileSync(new URL(`../../schemas/${name}.schema.json`, import.meta.url), 'utf8')) as object;
 
 /** 成果物のスキーマをすべて登録した Ajv（スキーマどうしの参照を解決するため）。 */
-const ARTIFACT_SCHEMA_NAMES = ['run', 'audit', 'page', 'finding', 'checkpoint', 'checkpoint-page', 'site-unavailable-diagnostic'] as const;
+const ARTIFACT_SCHEMA_NAMES = ['run', 'audit', 'page', 'finding', 'checkpoint', 'checkpoint-page'] as const;
 const createAjv = (): Ajv => {
   const ajv = new Ajv({ allErrors: true, strict: true });
   for (const name of ARTIFACT_SCHEMA_NAMES) ajv.addSchema(readSchema(name));
@@ -54,6 +52,10 @@ describe('T25b round 1: the blockedAuditExclusions record of the Safety Ledger',
       'AUDIT_SEND_OVER_LIMIT',
       // T44R の I-1。
       'PAGE_LEAVE_REQUEST_LIMIT_REACHED',
+      // DEF-210: 通知の枠の閉じる押下の期間の決まりで止めた。
+      'NOTIFICATION_DISMISSAL_RESTRICTED',
+      // REV-EV4: 横にスクロールする領域のキーの押下の期間の決まりで止めた。
+      'SCROLL_KEY_PRESS_RESTRICTED',
     ]);
     expect(BLOCKED_NAVIGATION_REASONS).toEqual(['EXTERNAL_MAIN_FRAME_NAVIGATION']);
     expect(SAFETY_EVENT_KINDS).not.toContain('blockedAuditExclusions');
@@ -102,31 +104,16 @@ describe('T25b round 1: the blockedAuditExclusions record of the Safety Ledger',
     expect(safetyEventsEvidenceFromSnapshot(snapshot, 'PASSIVE', { kind: 'PAGE_AUDIT' }).blockedAuditExclusions).toEqual(snapshot.blockedAuditExclusions);
   });
 
-  it('truncates the URL like the other request records', () => {
+  it('keeps the whole URL like the other request records (LZ-2)', () => {
     const ledger = new SafetyLedger();
-    ledger.recordBlockedAuditExclusion({ ...EVENT, url: `https://example.com/${'a'.repeat(LEDGER_TEXT_LIMIT)}` });
+    const url = `https://example.com/${'a'.repeat(FORMER_LEDGER_TEXT_LIMIT)}`;
+    ledger.recordBlockedAuditExclusion({ ...EVENT, url });
     const snapshot = ledger.snapshot();
-    expect(snapshot.blockedAuditExclusions?.events[0]?.url.length).toBeLessThanOrEqual(LEDGER_TEXT_LIMIT);
-    expect(snapshot.recordLimits.truncatedTextCount).toBe(1);
+    expect(snapshot.blockedAuditExclusions?.events[0]?.url).toBe(url);
+    expect(snapshot.recordLimits.truncatedTextCount).toBe(0);
   });
 
-  it('keeps counting beyond the event limit, and records the dropped events in the record limits', () => {
-    const ledger = new SafetyLedger();
-    const total = LEDGER_EVENT_LIMIT + 3;
-    for (let index = 0; index < total; index += 1) {
-      ledger.recordBlockedAuditExclusion({ ...EVENT, url: `https://example.com/admin/logout?n=${index}` });
-    }
-    const snapshot = ledger.snapshot();
-    expect(snapshot.blockedAuditExclusions?.count).toBe(total);
-    expect(snapshot.blockedAuditExclusions?.events).toHaveLength(LEDGER_EVENT_LIMIT);
-    // T25c（指示書の作るもの 6）: 除外の記録は、設定どおりに止めた記録で、件数（`count`）が正しく残るので、この記録だけが上限を超えても
-    // 不完全（`truncated`）にしない（Run を PARTIAL にしない）。記録しなかった件数と、上限に達した分類は、事実として残す。
-    expect(snapshot.recordLimits).toMatchObject({
-      truncated: false,
-      droppedEventCount: total - LEDGER_EVENT_LIMIT,
-      reachedCategories: ['blockedAuditExclusions'],
-    });
-  });
+  // LZ-3a: 前の事象の数の上限（256）を超える除外も残らず記録する（`safety-ledger-audit-exclusion-limit.test.ts`）。
 
   it('is accepted by the page schema (Safety Evidence) and the checkpoint schema (Ledger snapshot) as an optional property', () => {
     const ajv = createAjv();

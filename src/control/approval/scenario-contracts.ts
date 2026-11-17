@@ -18,12 +18,12 @@
 //   （`ScenarioUpdateSpec`。台帳の参照、更新の画面と送信先の path の型、保つ欄、候補から求めた型にした識別の digest）を足した。kind が `UPDATE` の
 //   下書きでは必須、`CREATE` は持てない（null）。LG-3: UPDATE の指定の前に保存した UPDATE の版（null）は、スキーマが拒むので読まない。変える欄は今の送る欄（`fieldNames`）、保つ欄は `keepFieldNames`。path の型の `{id}` の印は、候補の識別の
 //   owner（`src/discovery/fingerprint.ts` の `PATH_TEMPLATE_ID_SEGMENT`）と同じ値（登録の ID の取り方の path の型と共用）。
+// - PL-6a（設計書 `2026-10-26-beaksight-plain-ui-design.md` 8.1。設計者の判断 (a)〜(f)）: 検証の指定の成功の条件と入力の誤りの条件（人が入れる path の
+//   前方一致と CSS セレクタ）を、結果の判定のしかたの印（`resultJudgement`。form は `FORM_STRUCTURE`、API は null）に置き換えた。form の登録の ID の取り方は
+//   ID の型の一覧（`FormRecordIdSpec`。`URL_PATH_PATTERNS`、2 つまで）だけ。照合の READ に照合の専用の印（`verificationOnly`）を足した。前の文書の成否の
+//   条件の項目（`RETIRED_SCENARIO_VERIFICATION_ITEMS`）は、スキーマが受け、読むときに捨てる。
 import { WRITE_AUDIT_MODE } from '../contracts.js';
-import {
-  MAX_AUTH_SETUP_URL_LENGTH,
-  MAX_SUCCESS_SELECTOR_LENGTH,
-  type LoginResultCondition,
-} from '../auth/auth-setup-contracts.js';
+import type { LoginResultCondition } from '../auth/auth-setup-contracts.js';
 import type { ReadCheckView } from '../job/read-check-store.js';
 import { WORKER_JOB_ID_PATTERN } from '../worker-protocol.js';
 import { API_SCENARIO_TRANSPORT, FORM_SCENARIO_TRANSPORT, type ScenarioTransport } from '../../core/scenario-transport.js';
@@ -32,17 +32,15 @@ import { isPublicationStateKeyName } from '../../discovery/classify.js';
 import { PATH_TEMPLATE_ID_SEGMENT } from '../../discovery/fingerprint.js';
 import {
   API_WRITE_METHODS,
-  MAX_API_SHAPE_BODY_KEYS,
-  MAX_API_SHAPE_HEADER_NAMES,
-  MAX_API_SHAPE_MEDIA_TYPE_LENGTH,
-  MAX_API_SHAPE_NAME_LENGTH,
-  MAX_API_SHAPE_PATH_LENGTH,
+  apiArrayFieldPositionsOf,
+  apiArrayObjectRowsOf,
+  type ApiArrayFieldPosition,
+  type ApiArrayRowRole,
   type API_SELECTION_QUERY_NAMES,
   type ApiJsonValueType,
   type ApiPreferShape,
 } from '../../core/api-request-shape.js';
 import {
-  MAX_SUBMISSION_PROBE_FIELD_SELECTOR_LENGTH,
   submissionProbeKeyFieldsOf,
   type SubmissionProbeInputField,
   type SubmissionProbeRecord,
@@ -54,21 +52,13 @@ import { compareCodeUnits } from '../../core/text.js';
 import { DAY_MS, MINUTE_MS } from '../../core/time-units.js';
 import { API_FIELD_IDENTITY_KINDS, apiFieldIdentityValueOf, type ApiFieldIdentity, type ApiFieldIdentityKind } from '../../core/api-field-identity.js';
 import {
-  MAX_CANDIDATE_FIELDS,
-  MAX_CANDIDATE_URL_PART_LENGTH,
   type CandidateClassification,
   type CandidateFieldType,
   type FormEnctype,
   type FormMethod,
   type MethodOverride,
 } from '../../discovery/candidate-contracts.js';
-import {
-  MAX_READ_CHECK_DEFINITIONS_PER_PROFILE,
-  MAX_READ_CHECK_EXPECTATIONS,
-  MAX_READ_CHECK_PARAMETERS,
-  MAX_READ_CHECK_ROW_COUNT,
-  type ReadCheckTargetKind,
-} from '../../discovery/read-check-contracts.js';
+import type { ReadCheckTargetKind } from '../../discovery/read-check-contracts.js';
 
 // ---------------------------------------------------------------------------------------------------------------
 // 版の印と閉じた一覧
@@ -149,7 +139,10 @@ export { WRITE_AUDIT_MODE };
 // 既定値（ユーザー承認済み。設計書 3 章の判断 3、10 章）
 // ---------------------------------------------------------------------------------------------------------------
 
-/** 承認の期限の日数の既定（シナリオは、これ以下だけを持てる）。 */
+/**
+ * 新しく作るシナリオに入れる承認の期限の日数（前の既定と同じ値）。LZ-3c: 承認の digest の版を変えないための名残。判定には使わない（承認は期限で切れない。
+ * L12b）。利用者には見せず、上限もない（前に保存した値はそのまま読む）。
+ */
 export const APPROVAL_TTL_DAYS = 30;
 
 /** 承認の期限の 1 日の長さ（ms。UTC の暦の 1 日）。期限の時刻の計算は `approval-validity.ts` の `approvalExpiresAtOf` だけが使う。 */
@@ -158,7 +151,10 @@ export const APPROVAL_TTL_DAY_MS = DAY_MS;
 /** 1 回の Run の書き込みの件数の上限の既定（UPDATE も同じ値。Task 31 で見直す）。 */
 export const DEFAULT_MAX_CREATES_PER_RUN = 1;
 
-/** 累積の書き込みの件数の上限の既定（UPDATE も同じ値）。 */
+/**
+ * 新しく作るシナリオに入れる累積の件数（前の既定と同じ値。UPDATE も同じ）。LZ-3c: 承認の digest の版を変えないための名残。判定には使わない（累積の上限は
+ * L12b で撤廃した）。利用者には見せず、上限もない（前に保存した値はそのまま読む）。
+ */
 export const DEFAULT_MAX_CUMULATIVE_CREATES = 20;
 
 /** 書き込みのジョブの同時実行の数。 */
@@ -167,17 +163,8 @@ export const WRITE_JOB_CONCURRENCY = 1;
 /** 実行の許可（ExecutionGrant）の期限（ms。許可を発行してから書き込みのジョブを始めるまで。1 回だけ使える）。 */
 export const EXECUTION_GRANT_TTL_MS = 5 * MINUTE_MS;
 
-/**
- * 同じシナリオの連続の書き込みの最小の間隔（ms。Task 30 の設計書 2 章のユーザーの判断 3。T30d）。最後の書き込み（予約を `COMMITTED`・`UNKNOWN` で
- * 締めた時刻）からこの時間が経つまで、実行の許可を出さない。既定値を変えるのはユーザーの判断。
- */
-export const MIN_WRITE_INTERVAL_MS = 5 * MINUTE_MS;
-
-/** 同じシナリオの、窓（`WRITE_RATE_WINDOW_MS`）の中の書き込みの最大の件数（ユーザーの判断 3。T30d。この件数に達したら許可を出さない）。 */
-export const MAX_WRITES_PER_DAY = 5;
-
-/** 書き込みの件数を数える窓の長さ（ms。24 時間。T30d）。窓は「判定の時刻の 24 時間前より後、判定の時刻まで」。 */
-export const WRITE_RATE_WINDOW_MS = DAY_MS;
+// LZ-3c: 連続の書き込みの間隔（前は `MIN_WRITE_INTERVAL_MS` 5 分）と 24 時間の件数（前は `MAX_WRITES_PER_DAY` 5 件・`WRITE_RATE_WINDOW_MS`）は、L12b で
+// 撤廃した後の名残として捨てた。
 
 /** シナリオの上限の最小。 */
 export const MIN_SCENARIO_LIMIT = 1;
@@ -188,11 +175,7 @@ export const MIN_APPROVAL_TTL_DAYS = 1;
 /** シナリオの版（と、照らす READ の定義の版、入力の規則の版）の最小。 */
 export const MIN_SCENARIO_REVISION = 1;
 
-/** 送る欄の名前の最大の件数（1 つの候補の欄の数の上限と同じ）。 */
-export const MAX_SCENARIO_FIELD_NAMES = MAX_CANDIDATE_FIELDS;
-
-/** 照らす READ の定義の参照の最大の件数（1 つのプロファイルの定義の数の上限と同じ）。 */
-export const MAX_SCENARIO_READ_CHECKS = MAX_READ_CHECK_DEFINITIONS_PER_PROFILE;
+// L13（N28）・L4（COV-7）: 送る欄の名前の数と、照らす READ の定義の参照の数の上限は撤廃した（定数は LZ-1 で消した）。
 
 /**
  * シナリオ・承認の記録・照らす READ の定義・入力の規則の集まりの ID の形（ジョブの ID と同じ形。READ の確かめの定義の ID と同じ決め）。
@@ -206,13 +189,31 @@ export const SCENARIO_ID_PATTERN = WORKER_JOB_ID_PATTERN;
 
 /**
  * 検証の指定の項目（閉じた一覧）。どれかが未指定（null）なら、実行の許可を出さない（`VERIFICATION_SPEC_MISSING`）。
- * - `successCondition`: 送信の後の画面が登録の成功に当たる条件。
- * - `inputErrorCondition`: 送信の後の画面が入力の誤りに当たる条件。
+ * - `resultJudgement`（PL-6a。設計書 `2026-10-26-beaksight-plain-ui-design.md` 8.1。人が入れた成功の条件と入力の誤りの条件を置き換えた）: 結果の判定の
+ *   しかたの印。form のシナリオは構造の判定（`FORM_STRUCTURE_RESULT_JUDGEMENT`。下書きの確かめが付ける。人は入れない）、API のシナリオは null（応答の
+ *   状態で決めるので使わない）。
  * - `recordId`: 登録の ID の取り方。
  * - `readVerification`: 生成した値で読み直す照合の READ。
  */
-export const SCENARIO_VERIFICATION_ITEMS = Object.freeze(['successCondition', 'inputErrorCondition', 'recordId', 'readVerification'] as const);
+export const SCENARIO_VERIFICATION_ITEMS = Object.freeze(['resultJudgement', 'recordId', 'readVerification'] as const);
 export type ScenarioVerificationItem = (typeof SCENARIO_VERIFICATION_ITEMS)[number];
+
+/**
+ * PL-6a: 結果の判定のしかたの印（閉じた一覧）。`FORM_STRUCTURE`: form の書き込みの構造の判定（`src/control/actions/action-outcome.ts` の
+ * `formResultJudgementOf`。照合と、送った値を保った同じフォームの形と、URL の ID の型で決める）。承認の digest の項目なので、判定のしかたを変えたら印を変える。
+ */
+export const FORM_STRUCTURE_RESULT_JUDGEMENT = 'FORM_STRUCTURE';
+export const SCENARIO_RESULT_JUDGEMENTS = Object.freeze([FORM_STRUCTURE_RESULT_JUDGEMENT] as const);
+export type ScenarioResultJudgement = (typeof SCENARIO_RESULT_JUDGEMENTS)[number];
+
+/** PL-6a: form のシナリオで求める項目（`SCENARIO_VERIFICATION_ITEMS` のすべて。同じ順）。 */
+export const FORM_SCENARIO_VERIFICATION_ITEMS = SCENARIO_VERIFICATION_ITEMS;
+
+/**
+ * PL-6a（設計書 8.1 の「契約の変更」。LG の決まり（設計者の判断 (c)）: 前の文書の成否の条件の項目）: 前に保存したシナリオの文書が持つ、人が入れた成否の
+ * 条件の項目の名前。スキーマは受け、読むとき（`scenario-store.ts`）に捨てる。新しく書く文書は持たない。
+ */
+export const RETIRED_SCENARIO_VERIFICATION_ITEMS = Object.freeze(['successCondition', 'inputErrorCondition'] as const);
 
 /**
  * T40a-fix（Task 40 の設計書 7 章の「T40a の報告（API の検証の指定）」）: API のシナリオの検証の指定で求める項目（`SCENARIO_VERIFICATION_ITEMS` の
@@ -228,26 +229,30 @@ export const API_UPDATE_SCENARIO_VERIFICATION_ITEMS = Object.freeze(['readVerifi
 
 /**
  * 登録の ID の取り方（閉じた一覧）。
- * - `URL_PATH_PATTERN`: 成功の後の URL の path を、型（例 `/items/{id}`）に当てて取る。
- * - `ELEMENT`: 成功の画面の要素（CSS セレクタ）の文字から取る。
+ * - `URL_PATH_PATTERN`: 成功の後の URL の path を、型（例 `/items/{id}`）に当てて取る（API のシナリオの画面の取り方）。
+ * - `ELEMENT`: 成功の画面の要素（CSS セレクタ）の文字から取る（API のシナリオの画面の取り方）。
+ * - `URL_PATH_PATTERNS`（PL-6a。設計書 8.1）: form のシナリオの取り方。送った後の URL を、ID の型（1 つ以上）に順に当てて取る。
+ *   form は、この取り方だけを持てる（人が入れる CSS セレクタの `ELEMENT` は使わない）。API は前の 2 つだけ。
  */
-export const RECORD_ID_SOURCES = Object.freeze(['URL_PATH_PATTERN', 'ELEMENT'] as const);
+export const RECORD_ID_SOURCES = Object.freeze(['URL_PATH_PATTERN', 'ELEMENT', 'URL_PATH_PATTERNS'] as const);
 export type RecordIdSource = (typeof RECORD_ID_SOURCES)[number];
+/** PL-6a: form のシナリオの ID の取り方の値（`RECORD_ID_SOURCES` の名前つきの定数）。 */
+export const FORM_RECORD_ID_SOURCE = 'URL_PATH_PATTERNS' satisfies RecordIdSource;
 
 /** path の型の中の、登録の ID の場所の印（型にちょうど 1 つ。path の 1 つの区切りの全体。T31b: 候補の識別の owner の印と同じ値）。 */
 export const RECORD_ID_PLACEHOLDER = PATH_TEMPLATE_ID_SEGMENT;
 
-/** path の型の最大長（UTF-16 のコード単位。シナリオの要求の path の上限と同じ）。 */
-export const MAX_RECORD_ID_PATH_PATTERN_LENGTH = MAX_CANDIDATE_URL_PART_LENGTH;
+// URL-LEN: path の型の長さの上限（前は 2,048）は撤廃した。
 
-/** 取り出した登録の ID の最大長（UTF-16 のコード単位。`action-run.json` の `recordId`）。 */
-export const MAX_RECORD_ID_LENGTH = 256;
+// LZ-3c: form の登録の ID の型の件数の上限（前は `MAX_FORM_RECORD_ID_PATTERNS` 2。PL-6a）は撤廃した（スキーマにも maxItems を置かない）。型は 1 つ以上で、
+// 送った後の URL に順に当てる（判定は `action-outcome.ts` の `recordIdOfResultUrl`）。
 
-/** 結果の条件の path の前方一致の最大長（Task 26 の結果の条件と同じ上限）。 */
-export const MAX_RESULT_CONDITION_PATH_LENGTH = MAX_AUTH_SETUP_URL_LENGTH;
+// L12b（設計書 `2026-11-09-beaksight-remove-limits-design.md` 6.2。設計者の判断 2）: 取り出した登録の ID の最大長（前は `MAX_RECORD_ID_LENGTH` の
+// 256）は撤廃した（`action-run.json` の `recordId` と管理データの `write_results.record_id`。版 19 で列の上限も外した）。
 
-/** 検証の指定のセレクタ（結果の条件、ID の要素）の最大長（Task 26 の結果の条件のセレクタと同じ上限）。 */
-export const MAX_VERIFICATION_SELECTOR_LENGTH = MAX_SUCCESS_SELECTOR_LENGTH;
+// URL-LEN: 結果の条件の path の前方一致の長さの上限（前は 2,048）は撤廃した。
+
+// LZ-2: 検証の指定のセレクタ（結果の条件、ID の要素）の長さの上限（前は `MAX_VERIFICATION_SELECTOR_LENGTH` 256）は撤廃した。
 
 /**
  * 照合の READ で使える期待の種類（Task 27 の期待の種類のうち、1 件の登録を確かめられるもの）。`ROW_COUNT_AT_LEAST` は、二重の登録を見分け
@@ -256,25 +261,19 @@ export const MAX_VERIFICATION_SELECTOR_LENGTH = MAX_SUCCESS_SELECTOR_LENGTH;
  */
 export { VERIFICATION_EXPECTATION_KINDS, type VerificationExpectationKind };
 
-/** 照合の READ の行の数の期待の最小（登録した 1 件が見えること）と最大（Task 27 の期待の上限）。 */
+/** 照合の READ の行の数の期待の最小（登録した 1 件が見えること）。 */
 export const MIN_VERIFICATION_ROW_COUNT = 1;
-export const MAX_VERIFICATION_ROW_COUNT = MAX_READ_CHECK_ROW_COUNT;
 
-/** 照合の READ の、生成した値に結び付ける送る値の最大の件数（1 つの READ の定義の送る値の上限と同じ。最小は 1 件）。 */
-export const MAX_VERIFICATION_BINDINGS = MAX_READ_CHECK_PARAMETERS;
-
-/** 照合の READ の期待の最大の件数（1 つの READ の定義の期待の上限と同じ。最小は 1 件）。 */
-export const MAX_VERIFICATION_EXPECTATIONS = MAX_READ_CHECK_EXPECTATIONS;
+// LZ-3a: 照合の READ の行の数（前は `MAX_VERIFICATION_ROW_COUNT` 100,000）・結び付ける送る値の件数（前は `MAX_VERIFICATION_BINDINGS` 50）・期待の件数（前は
+// `MAX_VERIFICATION_EXPECTATIONS` 10）の上限は撤廃した（スキーマにも置かない）。
 
 // ---------------------------------------------------------------------------------------------------------------
 // UPDATE の指定（T31b。Task 31 の設計書 3 章、4 章）
 // ---------------------------------------------------------------------------------------------------------------
 
-/** 更新の画面の path と送信先の path の型の最大長（UTF-16 のコード単位。シナリオの要求の path の上限と同じ）。 */
-export const MAX_UPDATE_PATH_TEMPLATE_LENGTH = MAX_CANDIDATE_URL_PART_LENGTH;
+// URL-LEN: 更新の画面の path と送信先の path の型の長さの上限（前は 2,048）は撤廃した。
 
-/** 保つ欄の名前の最大の件数（1 つの候補の欄の数の上限と同じ）。 */
-export const MAX_SCENARIO_KEEP_FIELD_NAMES = MAX_CANDIDATE_FIELDS;
+// L13（N28）: 保つ欄の名前の数の上限は撤廃した（定数は LZ-1 で消した）。
 
 /** 人が決める UPDATE の指定（下書きの入力）。 */
 export interface ScenarioUpdateDraft {
@@ -286,6 +285,24 @@ export interface ScenarioUpdateDraft {
   readonly actionPathTemplate: string;
   /** 保つ欄（見えていて編集できる欄のうち、変える欄（`fieldNames`）でないもの。保存の形では UTF-16 のコード単位の順）。 */
   readonly keepFieldNames: readonly string[];
+  /**
+   * LU-6（設計書 `2026-11-02-beaksight-list-row-update-design.md` 5.4 の 1）: 一覧の行から開く入力の更新（形 B）の、行の選び方（任意。値は持たない）。
+   * 型の上だけ（確かめは LU-12。今の下書きの確かめは、この項目を受けない）。
+   */
+  readonly listRow?: ScenarioListRow;
+}
+
+/**
+ * LU-6（設計書 5.4 の 1）: 一覧の行の更新の、行の選び方（API の台帳 `ScenarioApiLedger` と form の UPDATE の指定 `ScenarioUpdateDraft` の任意の項目）。
+ * 値（行の中身）は持たない。
+ * - `listPagePath`: 一覧の画面の path（`{id}` なし。候補の画面の path と同じ）。
+ * - `openerIdentityDigest`: 行の中の開き手の識別の digest（probe の記録の `opener.identityDigest`。名前のある開き手だけ。D3）。
+ * - `rowKeyField`: 行を選ぶ欄の名前（台帳の登録の、実行のたびに違う値になる欄の 1 つ。`uniqueEachRunFieldNamesOf`）。
+ */
+export interface ScenarioListRow {
+  readonly listPagePath: string;
+  readonly openerIdentityDigest: string;
+  readonly rowKeyField: string;
 }
 
 /** UPDATE の指定（シナリオの中身。人の入力に、候補から求めた型にした識別の digest を足したもの。承認の digest の項目）。 */
@@ -330,34 +347,25 @@ export type ScenarioApiRecordIdSource = (typeof SCENARIO_API_RECORD_ID_SOURCES)[
  */
 export { BROWSER_SUPPLIED_HEADER_NAMES, BROWSER_SUPPLIED_HEADER_NAME_PREFIXES, isPageSuppliedHeaderName } from '../../core/api-request-shape.js';
 
-/** API のシナリオの鍵（本文の鍵、ページが決める鍵）の最大の件数（probe の型の鍵の上限と同じ）。 */
-export const MAX_SCENARIO_API_KEYS = MAX_API_SHAPE_BODY_KEYS;
-/** 許すヘッダの名前の最大の件数（probe の型のヘッダの名前の上限と同じ）。 */
-export const MAX_SCENARIO_API_HEADER_NAMES = MAX_API_SHAPE_HEADER_NAMES;
-/** 鍵・ヘッダ・filter・query の名前の最大長（probe の型の名前の上限と同じ）。 */
-export const MAX_SCENARIO_API_KEY_LENGTH = MAX_API_SHAPE_NAME_LENGTH;
-/** path の型の最大長（probe の型の path の上限と同じ）。 */
-export const MAX_SCENARIO_API_PATH_LENGTH = MAX_API_SHAPE_PATH_LENGTH;
-/** `Content-Type` の媒体の型の最大長（probe の型の上限と同じ）。 */
-export const MAX_SCENARIO_API_MEDIA_TYPE_LENGTH = MAX_API_SHAPE_MEDIA_TYPE_LENGTH;
-/** 欄の CSS の最大長（probe の欄の識別の上限と同じ）。 */
-export const MAX_SCENARIO_API_FIELD_SELECTOR_LENGTH = MAX_SUBMISSION_PROBE_FIELD_SELECTOR_LENGTH;
+// L13（N25）・URL-LEN: 鍵の数・ヘッダの名前の数・名前の長さ・媒体の型の長さ・path の型の長さの上限は撤廃した（定数は LZ-1 で消した）。
+// LZ-2: 欄の CSS の長さの上限（前は `MAX_SCENARIO_API_FIELD_SELECTOR_LENGTH` 512）も撤廃した。
 
 /** 欄の識別（値は持たない。CC-102: 契約の owner `src/core/api-field-identity.ts` の公開し直し）。 */
 export type ScenarioApiFieldIdentity = ApiFieldIdentity;
 
 /**
  * 欄の型ごとの、受ける値の JSON の型（目印を入れる欄だけ。ほかの欄は鍵に対応しない）。T38b の下書きの確かめと、T38e の入力の規則の判定
- * （`field-evaluation.ts`）が使う唯一の表。
+ * （`field-evaluation.ts`）が使う唯一の表。ARR-2（設計書 `2026-11-08-beaksight-api-array-keys-design.md` 3.3 の 1）: 文字の欄は、文字の一覧（array。
+ * 要素は欄の文字 1 つ。要素の型と数は下書きの確かめが probe の型で確かめる）にも入る。
  */
 export const SCENARIO_API_FIELD_JSON_TYPES: Readonly<Partial<Record<CandidateFieldType, readonly ApiJsonValueType[]>>> = Object.freeze({
-  text: ['string'],
-  search: ['string'],
-  email: ['string'],
-  url: ['string'],
-  tel: ['string'],
-  date: ['string'],
-  textarea: ['string'],
+  text: ['string', 'array'],
+  search: ['string', 'array'],
+  email: ['string', 'array'],
+  url: ['string', 'array'],
+  tel: ['string', 'array'],
+  date: ['string', 'array'],
+  textarea: ['string', 'array'],
   number: ['number'],
 });
 
@@ -385,11 +393,93 @@ export const scenarioApiFieldIdentityOf = (field: SubmissionProbeInputField): Sc
  */
 export const scenarioApiKeyFieldsOfProbe = (probe: SubmissionProbeRecord): readonly ScenarioApiKeyField[] =>
   Object.freeze(submissionProbeKeyFieldsOf(probe)
-    .flatMap(({ key, type, field }) => {
-      const identity = field === null ? null : scenarioApiFieldIdentityOf(field);
-      return field === null || identity === null ? [] : [Object.freeze({ key, type, field: identity, fieldType: field.type })];
+    .flatMap(({ key, type, field, element }) => {
+      const keyField = field === null ? null : scenarioApiKeyFieldOfProbe(probe, key, type, field, element);
+      return keyField === null ? [] : [keyField];
     })
     .sort((left, right) => compareCodeUnits(left.key, right.key)));
+
+/**
+ * ARR-3（設計書 `2026-11-09-beaksight-api-array-rows-design.md` 2.2 の 2）: 欄に対応づけた一覧の鍵の、位置ごとの役（probe の型の位置の情報から。要素が
+ * 2 つ以上で、欄 1 つと空の位置の形のときだけ。ほかの鍵・要素 1 つの一覧（DEF-226 の形）・受けない形は undefined）。ARR-4（設計書 2.3）: 要素の位置の欄
+ * （`element`）は、欄の位置が 1 つ以上で、その位置が欄の形のとき（一覧の全体の役）。
+ */
+export const scenarioApiArrayPositionsOfProbe = (
+  probe: SubmissionProbeRecord,
+  key: string,
+  element?: ScenarioApiArrayElementRef,
+): readonly ApiArrayFieldPosition[] | undefined => {
+  const listKey = element?.key ?? key;
+  const elements = probe.shape?.body.keys.find(({ name, type }) => name === listKey && type === 'array')?.elements;
+  // ARR-5: 行の中の鍵の欄は、位置の役でなく行の役（`scenarioApiArrayRowsOfProbe`）を持つ。
+  const positions = elements === undefined || element?.name !== undefined ? null : apiArrayFieldPositionsOf(elements);
+  if (positions === null || positions.length < 2) {
+    return undefined;
+  }
+  const fieldCount = positions.filter((position) => position === 'FIELD').length;
+  if (element === undefined) {
+    return fieldCount === 1 ? positions : undefined;
+  }
+  return positions[element.index] === 'FIELD' ? positions : undefined;
+};
+
+/**
+ * ARR-5（設計書 2.4）: object の一覧の行の中の鍵の欄の、行ごとの中の鍵の役（probe の型の位置の情報から。行の中の鍵の欄で、その鍵が欄の形のときだけ。
+ * ほかは undefined）。
+ */
+export const scenarioApiArrayRowsOfProbe = (
+  probe: SubmissionProbeRecord,
+  element: ScenarioApiArrayElementRef | undefined,
+): readonly (readonly ApiArrayRowRole[])[] | undefined => {
+  if (element?.name === undefined) {
+    return undefined;
+  }
+  const elements = probe.shape?.body.keys.find(({ name, type }) => name === element.key && type === 'array')?.elements;
+  const rows = elements === undefined ? null : apiArrayObjectRowsOf(elements);
+  if (rows === null || !rows.ok) {
+    return undefined;
+  }
+  return rows.rows[element.index]?.some(({ name, role }) => name === element.name && role === 'FIELD') === true ? rows.rows : undefined;
+};
+
+/**
+ * ARR-4（設計書 2.3）: 一覧の要素の位置の欄の、本文の一覧の鍵と位置（鍵と欄の対応の `key` は道 `key[i]`）。ARR-5（設計書 2.4）: object の行の中の鍵の
+ * 欄は、中の鍵の名前も持つ（`key` は道 `key[i].name`）。
+ */
+export interface ScenarioApiArrayElementRef {
+  readonly key: string;
+  readonly index: number;
+  readonly name?: string;
+}
+
+/**
+ * 鍵と欄の対応 1 件（欄の識別を作れなければ null）。索引の鍵と欄の digest と、承認の内容が使う唯一の作り方（ARR-3: 欄の一覧の位置の役を持つ）。
+ */
+export const scenarioApiKeyFieldOfProbe = (
+  probe: SubmissionProbeRecord,
+  key: string,
+  type: ApiJsonValueType,
+  field: SubmissionProbeInputField,
+  element?: ScenarioApiArrayElementRef,
+): ScenarioApiKeyField | null => {
+  const identity = scenarioApiFieldIdentityOf(field);
+  if (identity === null) {
+    return null;
+  }
+  const positions = type === 'array' ? scenarioApiArrayPositionsOfProbe(probe, key, element) : undefined;
+  const rows = type === 'array' ? scenarioApiArrayRowsOfProbe(probe, element) : undefined;
+  const elementCopy = element === undefined ? undefined
+    : element.name === undefined ? { key: element.key, index: element.index } : { key: element.key, index: element.index, name: element.name };
+  return Object.freeze({
+    key,
+    type,
+    field: identity,
+    fieldType: field.type,
+    ...(elementCopy === undefined ? {} : { element: elementCopy }),
+    ...(positions === undefined ? {} : { positions: [...positions] }),
+    ...(rows === undefined ? {} : { rows: rows.map((row) => row.map(({ name, role }) => ({ name, role }))) }),
+  });
+};
 
 /** 鍵と欄の対応の digest の形の印（版つき。T38R-fix の I-1。T38R2-fix の M-2 で欄の型を足して 2 にした。版 13 とともに未公開）。 */
 export const API_KEY_FIELDS_DIGEST_FORMAT = 'beaksight:api-key-fields/2';
@@ -405,8 +495,30 @@ export const apiKeyFieldsDigestOf = (shapeDigest: string, keyFields: readonly Sc
     shapeDigest,
     [...keyFields]
       .sort((left, right) => compareCodeUnits(left.key, right.key))
-      .map(({ key, type, field, fieldType }) => [key, type, field.kind, apiFieldIdentityValueOf(field), fieldType]),
+      .map(apiKeyFieldDigestEntryOf),
   ]));
+
+/** ARR-3: 鍵と欄の対応の digest と承認の digest の、位置の役の値の印（印で、ほかの値と取り違えない）。 */
+export const API_ARRAY_POSITIONS_ENTRY_MARK = 'ARRAY_POSITIONS';
+
+/**
+ * 鍵と欄の対応 1 件の digest の値（`[鍵, JSON の型, 欄の識別の種類, 名前か CSS, 欄の型]`）。ARR-3（設計書 2.2 の 5）: 位置の役を持つ鍵だけ、末尾に
+ * `[印, 役…]` を足す（持たない鍵の値は変えない）。承認の digest（`approval-digest.ts`）も同じ値を使う。
+ */
+export const apiKeyFieldDigestEntryOf = ({ key, type, field, fieldType, positions, element, rows }: ScenarioApiKeyField): readonly unknown[] => [
+  key, type, field.kind, apiFieldIdentityValueOf(field), fieldType,
+  ...(positions === undefined ? [] : [[API_ARRAY_POSITIONS_ENTRY_MARK, ...positions]]),
+  // ARR-4（設計書 2.3）: 要素の位置の欄だけ、末尾に `[印, 一覧の鍵, 位置]` を足す（持たない鍵の値は変えない）。ARR-5: 行の中の鍵の欄は、中の鍵の名前も足す。
+  ...(element === undefined ? [] : [[API_ARRAY_ELEMENT_ENTRY_MARK, element.key, element.index, ...(element.name === undefined ? [] : [element.name])]]),
+  // ARR-5（設計書 2.4）: 行の役を持つ欄だけ、`[印, [[中の鍵, 役]…]…]` を足す。
+  ...(rows === undefined ? [] : [[API_ARRAY_ROWS_ENTRY_MARK, ...rows.map((row) => row.map(({ name, role }) => [name, role]))]]),
+];
+
+/** ARR-5: 鍵と欄の対応の digest と承認の digest の、行の役の値の印。 */
+export const API_ARRAY_ROWS_ENTRY_MARK = 'ARRAY_ROWS';
+
+/** ARR-4: 鍵と欄の対応の digest と承認の digest の、要素の位置の値の印。 */
+export const API_ARRAY_ELEMENT_ENTRY_MARK = 'ARRAY_ELEMENT';
 
 /** 2 つの欄の識別が同じか。 */
 export const isSameScenarioApiFieldIdentity =(left: ScenarioApiFieldIdentity, right: ScenarioApiFieldIdentity): boolean =>
@@ -419,12 +531,41 @@ export interface ScenarioApiKeyField {
   readonly field: ScenarioApiFieldIdentity;
   /** 目印を入れた欄の型（T38R2-fix の M-2。probe の欄の型。`SCENARIO_API_FIELD_TYPES` のどれか）。 */
   readonly fieldType: CandidateFieldType;
+  /**
+   * ARR-3（設計書 `2026-11-09-beaksight-api-array-rows-design.md` 2.2 の 2・4）: 型が array で要素が 2 つ以上のときだけ持つ、位置ごとの役（要素の順。
+   * 欄 `FIELD` はちょうど 1 つ、ほかは空の位置）。書き込みの段の照合は、位置ごとに一致することを求める。要素 1 つの一覧（DEF-226 の形）は持たない。
+   * ARR-4: 要素の位置の欄（`element`）は、一覧の全体の役（欄の位置は 1 つ以上。同じ一覧の鍵の欄はみな同じ役を持つ）。
+   */
+  readonly positions?: readonly ApiArrayFieldPosition[];
+  /**
+   * ARR-4（設計書 `2026-11-09-beaksight-api-array-rows-design.md` 2.3）: 欄の印が 2 つ以上入る一覧の、1 つの位置の欄のときだけ持つ、本文の一覧の鍵と
+   * 位置（`key` は道 `key[i]`。`apiArrayElementPathOf`）。値は欄ごと（道ごと）に作る。
+   */
+  readonly element?: ScenarioApiArrayElementRef;
+  /**
+   * ARR-5（設計書 `2026-11-09-beaksight-api-array-rows-design.md` 2.4）: object の一覧の行の中の鍵の欄（`element.name` あり）だけが持つ、行ごとの中の鍵の役
+   * （行の順、中の鍵の名前の順。同じ一覧の鍵の欄はみな同じ役）。書き込みの段の照合は、行の数・行ごとの中の鍵の集合・値を、この役と完全一致で照らす。
+   */
+  readonly rows?: readonly (readonly ApiArrayRowRole[])[];
+}
+
+/**
+ * ARR-2（設計書 `2026-11-08-beaksight-api-array-keys-design.md` 3.3 の 2）: ページが決める一覧の鍵（array）の、承認した要素の形（probe の型の
+ * `ApiRequestArrayElements` の要素の型の集合と数。値は持たない）。書き込みの段の照合は、送る本文の一覧がこの形と同じことを求める。
+ */
+export interface ScenarioApiArrayElements {
+  /** 要素の JSON の型の集合（scalar だけ。重なりなし、コード単位の順）。 */
+  readonly types: readonly ApiJsonValueType[];
+  /** 要素の数（L13 fix round 1: 上限なし）。 */
+  readonly count: number;
 }
 
 /** ページが決める鍵 1 つ（欄に対応しない鍵のうち、承認で名前を示したもの。登録では値は照らさない）。 */
 export interface ScenarioApiPageKey {
   readonly key: string;
   readonly type: ApiJsonValueType;
+  /** ARR-2: 型が array のときだけ持つ、承認した要素の形（登録だけ。一覧のない鍵は持たない）。 */
+  readonly elements?: ScenarioApiArrayElements;
   /**
    * T41a（Task 41 の設計書 3.3、ユーザーの判断 2）: 更新の画面の欄としての識別（UPDATE だけ。probe が選んだ欄（目印なし）のうち、名前が鍵と同じ欄が
    * ちょうど 1 つ）。Guard は前の読み取りで読んだ値と照らす（T41c）。登録は持たない。
@@ -454,7 +595,10 @@ export interface ScenarioApiRecordId {
 /** API の UPDATE の台帳の参照（同じプロファイルの CREATE のシナリオと、更新の画面の path の型。`{id}` が台帳の ID）。 */
 export interface ScenarioApiLedger {
   readonly targetCreateScenarioId: string;
+  /** 更新の画面の path の型（`{id}` をちょうど 1 つ）。LU-6: 一覧の行の更新（`listRow` あり）では、一覧の画面の path（`listRow.listPagePath` と同じ。`{id}` なし）。 */
   readonly formPathTemplate: string;
+  /** LU-6（設計書 5.4 の 1）: 一覧の行の更新の行の選び方（任意。なければ今の更新の画面の更新）。 */
+  readonly listRow?: ScenarioListRow;
 }
 
 /** 人が決める API の指定（下書きの入力。ほかの項目は、候補の probe から作る）。 */
@@ -491,6 +635,18 @@ export interface ScenarioApiSpec {
   /** 許すヘッダの名前（ページが付ける名前だけ。小文字の順）。 */
   readonly headerNames: readonly string[];
   readonly filterName: string | null;
+  /**
+   * DEF-198（設計書 `2026-11-02-beaksight-list-row-update-design.md` 5.9 の 2）: UPDATE の、番号の filter（`filterName`）のほかの filter の名前（所属の
+   * 絞り込みなど。名前の順。1 つ以上）。人は入れず、下書きの確かめが probe の型から作る（`apiUpdateFiltersOf`）。ほかの filter のない版は持たない（空の一覧も
+   * 持たない。今の承認の digest は変わらない）。照らす値は、同じ点検で登録した行のページが決めた同じ名前の鍵の値（書き込みの段の開始の指定。シナリオは持たない）。
+   */
+  readonly otherFilterNames?: readonly string[];
+  /**
+   * DEF-203（設計書 `2026-11-02-beaksight-list-row-update-design.md` 5.10 の 2）: UPDATE の本文の、更新の画面の欄と結びつかない鍵（番号・所属の鍵のほか）のうち、
+   * 台帳の登録のページが決める鍵にもある鍵の名前（名前の順。1 つ以上）。人は入れず、下書きの確かめが probe の型と台帳の事実から作る。照らす値は、同じ点検で
+   * 登録した行のページが決めた同じ名前の鍵の値（書き込みの段の開始の指定 `update.ledgerKeyValues`。シナリオは持たない）。ない版は持たない（空の一覧も持たない）。
+   */
+  readonly ledgerPageKeys?: readonly string[];
   readonly recordId: ScenarioApiRecordId | null;
   readonly ledger: ScenarioApiLedger | null;
   /**
@@ -546,7 +702,7 @@ export interface ScenarioKindFact {
    * T31R-fix-1 の I-2: 今の版の検証の指定の登録の ID の取り方（未指定なら null。事実を持たない文脈は省く）。UPDATE の path の型の `{id}` の位置を
    * 台帳の取り方に結ぶ確かめ（`scenario-policy.ts` の `isUpdatePathBoundToLedger`）が使う。
    */
-  readonly recordId?: ScenarioRecordIdSpec | null;
+  readonly recordId?: ScenarioVerificationRecordId | null;
   /**
    * T41a（Task 41 の設計書 3.1 の「台帳の ID と filter の結び付け」）: 今の版の API の指定の登録の ID の取り方（応答の本文の鍵。API の登録でないか未指定
    * なら null。事実を持たない文脈は省く）。API の UPDATE の filter の名前を台帳の ID に結ぶ確かめ（`scenario-policy.ts` の
@@ -558,15 +714,48 @@ export interface ScenarioKindFact {
    * 事実を持たない文脈は省く）。API の更新の台帳が、同じ表（同じ Origin と path の型）の API の登録であることの確かめ（`apiUpdateLedgerBindingRejectionOf`）が使う。
    */
   readonly apiRequest?: Pick<ScenarioApiRequestShape, 'origin' | 'pathShape'> | null;
+  /**
+   * LU-6（設計書 5.4 の 2）: 今の版の、実行のたびに違う値になる欄の名前（値の生成の持ち主の判定 `uniqueEachRunFieldNamesOf`。入力の規則から親が求める。
+   * 事実を持たない文脈は省く）。一覧の行の更新の行を選ぶ欄（`listRow.rowKeyField`）が、この中にあることの確かめが使う（省けば拒む。fail-closed）。
+   */
+  readonly uniqueEachRunFieldNames?: readonly string[] | null;
+  /**
+   * DEF-203（設計書 5.10 の 2）: 今の版の API の指定のページが決める鍵の名前（API のシナリオでなければ null。事実を持たない文脈は省く）。API の更新の本文の、
+   * 欄と結びつかない鍵を、台帳の登録の値と照らす鍵として受けてよいかの確かめ（`scenario-policy.ts` の `ledgerBoundPageKeyNamesOf`）が使う（省けば受けない）。
+   */
+  readonly apiPageKeyNames?: readonly string[] | null;
 }
 
-/** 結果の条件（Task 26 の結果の条件と同じ型。`{ pathPrefix, selector }`）。 */
+/** 結果の条件（Task 26 の結果の条件と同じ型。`{ pathPrefix, selector }`）。PL-6a: 前の文書と版 1.1 の記録の、読むだけの形。 */
 export type ScenarioResultCondition = LoginResultCondition;
 
-/** 登録の ID の取り方。 */
+/** 登録の ID の取り方（API のシナリオの、保存の後の画面の取り方）。 */
 export type ScenarioRecordIdSpec =
   | { readonly source: 'URL_PATH_PATTERN'; readonly pathPattern: string }
   | { readonly source: 'ELEMENT'; readonly selector: string };
+
+/** PL-6a: form のシナリオの登録の ID の取り方（ID の型 1 件以上。送った後の URL に順に当てる）。 */
+export interface FormRecordIdSpec {
+  readonly source: typeof FORM_RECORD_ID_SOURCE;
+  readonly pathPatterns: readonly string[];
+}
+
+/** PL-6a: 検証の指定の登録の ID の取り方（form は `FormRecordIdSpec`、API は `ScenarioRecordIdSpec`。下書きの確かめが送り方で分ける）。 */
+export type ScenarioVerificationRecordId = FormRecordIdSpec | ScenarioRecordIdSpec;
+
+/** PL-6a: 登録の ID の取り方が form の取り方か。 */
+export const isFormRecordIdSpec = (spec: ScenarioVerificationRecordId | null): spec is FormRecordIdSpec => spec?.source === FORM_RECORD_ID_SOURCE;
+
+/**
+ * PL-6a: 登録の ID の取り方の、URL の path の型の一覧（form は型のすべて、API の `URL_PATH_PATTERN` はその型、`ELEMENT` と null は空）。台帳の ID の
+ * 結び付けの確かめと、画面の注意が使う。
+ */
+export const recordIdPathPatternsOf = (spec: ScenarioVerificationRecordId | null): readonly string[] => {
+  if (spec === null || spec.source === 'ELEMENT') {
+    return [];
+  }
+  return spec.source === 'URL_PATH_PATTERN' ? [spec.pathPattern] : spec.pathPatterns;
+};
 
 /** 照合の READ の送る値 1 つを、生成した値（送る欄）に結び付ける（READ の送る値の名前 → シナリオの送る欄の名前）。 */
 export interface VerificationBinding {
@@ -588,20 +777,26 @@ export interface ScenarioReadVerification {
   readonly bindings: readonly VerificationBinding[];
   /** 期待（1 件以上。入力の順）。 */
   readonly expectations: readonly VerificationExpectation[];
+  /**
+   * PL-6a（設計書 8.1 の「契約の変更」、設計者の判断 (f)）: 照合の専用の印（真なら、参照する READ の定義は、このシナリオの照合だけに使い、単独の READ の
+   * 確かめのジョブでは読まない。管理データの版を上げずに、シナリオの文書に持つ）。省けば偽（人が作った READ の定義を照合にも使う今の形）。
+   */
+  readonly verificationOnly?: boolean;
 }
 
-/** 検証の指定（項目ごとに、未指定なら null）。 */
+/** 検証の指定（項目ごとに、未指定なら null）。PL-6a: 成否の条件の 2 項目を、結果の判定のしかたの印（`resultJudgement`）に置き換えた。 */
 export interface ScenarioVerification {
-  readonly successCondition: ScenarioResultCondition | null;
-  readonly inputErrorCondition: ScenarioResultCondition | null;
-  readonly recordId: ScenarioRecordIdSpec | null;
+  readonly resultJudgement: ScenarioResultJudgement | null;
+  readonly recordId: ScenarioVerificationRecordId | null;
   readonly readVerification: ScenarioReadVerification | null;
 }
 
+/** PL-6a: 下書きの検証の指定（結果の判定のしかたの印は、下書きの確かめが送り方から付ける。省いてよい。入れるなら付ける値と同じ）。 */
+export type ScenarioVerificationDraft = Omit<ScenarioVerification, 'resultJudgement'> & { readonly resultJudgement?: ScenarioResultJudgement | null };
+
 /** すべて未指定の検証の指定（下書きに検証の指定がないとき）。 */
 export const UNSPECIFIED_VERIFICATION: ScenarioVerification = Object.freeze({
-  successCondition: null,
-  inputErrorCondition: null,
+  resultJudgement: null,
   recordId: null,
   readVerification: null,
 });
@@ -751,4 +946,9 @@ export interface ScenarioReadCheckDefinitionFact extends ScenarioReadCheckFact {
    * ない）。API のシナリオだけ、型の定義を照合の READ に使える（結び付けは 0 件。`{id}` には台帳の ID だけを入れる。実際の照合は Task 40）。
    */
   readonly pageTemplate?: boolean;
+  /**
+   * OP-R（設計書 `2026-10-27-beaksight-one-pass-flow-design.md` 4.1.9 の R1）: 画面の path の定義の path（画面の path の定義だけが持つ。省略は分からない）。API の
+   * 登録のシナリオだけ、登録の画面の 1 つ上の一覧の画面（`read-list-page.ts` の `readListPagePathOf`）の定義を照合の READ に使える（結び付けは 0 件）。
+   */
+  readonly pagePath?: string;
 }

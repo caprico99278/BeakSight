@@ -152,11 +152,12 @@ describe('T38R-fix I-2: secret-like names of the page keys and the record id key
 
   it('rejects a page key of a JSON object or an array (only scalar page keys)', () => {
     expect(validate(withPageKey('meta', { note: 'x' }), { pageKeys: ['meta'] })).toEqual(['SCENARIO_API_PAGE_KEY_NOT_SCALAR']);
-    expect(validate(withPageKey('items', [{ id: 1 }]), { pageKeys: ['items'] })).toEqual(['SCENARIO_API_PAGE_KEY_NOT_SCALAR']);
+    // ARR-2（DEF-226）: 登録の入れ子の一覧は、一覧の入れ子の理由に分けた（入れ子のない上限の中の一覧は受ける。`def-226-array-key-approval.test.ts`）。
+    expect(validate(withPageKey('items', [{ id: 1 }]), { pageKeys: ['items'] })).toEqual(['SCENARIO_API_ARRAY_NESTED']);
     expect(validate(withPageKey('source', 1), { pageKeys: ['source'] })).toEqual([]);
     // T40R-fix-B: 一覧の最後に、照合の READ の理由を足した（この 3 つの後ろ）。T40R2-fix: ID の型の理由は注意に下げて外した。T41a: その後ろに 2 つを
-    // 足した（`scenario-api-update-contract.test.ts`）。
-    expect(SCENARIO_DRAFT_REJECTION_REASONS.slice(-6, -2)).toEqual([
+    // 足した（`scenario-api-update-contract.test.ts`）。ARR-2: さらに後ろに 4 つを足した。ARR-3: さらに 1 つ。ARR-5: さらに 2 つ。ARR-5 fix round 1: さらに 2 つ。
+    expect(SCENARIO_DRAFT_REJECTION_REASONS.slice(-15, -11)).toEqual([
       'SCENARIO_API_DISCOVERY_PROFILE_STALE', 'SCENARIO_API_PAGE_KEY_NOT_SCALAR', 'SCENARIO_API_RECORD_ID_KEY_SECRET_LIKE',
       'SCENARIO_API_READ_VERIFICATION_NOT_BOUND',
     ]);
@@ -223,10 +224,10 @@ describe('T38R-fix C-2 and I-1: the approval validity of an API scenario', () =>
       profile: { profileId: PROFILE_ID, revision: 4, status: 'ACTIVE', mode: 'TEST_APPROVED_WRITE', approvedServiceOrigins: [API] },
       authSetupDigest: AUTH_SETUP_DIGEST,
       targetConfigDigest: TARGET_CONFIG_DIGEST,
-      candidate: { identityDigest: entry.identityDigest, ruleDigest: entry.ruleDigest, classification: entry.classification, drift: 'UNCHANGED' },
+      candidate: { identityDigest: entry.identityDigest, ruleDigest: entry.ruleDigest, classification: entry.classification, drift: 'SEEN' },
       candidateShapeDigests: joined(entries.map(({ shapeDigests }) => shapeDigests)),
       candidateKeyFieldDigests: joined(entries.map(({ keyFieldDigests }) => keyFieldDigests)),
-      apiShapeOriginIndex: 0,
+      apiShapeOrigin: { kind: 'APPROVED_API', index: 0 },
       latestDiscoveryProfileRevision: 4,
       templatedCandidates: null,
       inputRuleReference: INPUT_RULES,
@@ -280,7 +281,19 @@ describe('T38R-fix C-2 and I-1: the approval validity of an API scenario', () =>
     const profile = factsOf(approvedCandidate).profile;
     expect(reasonsWith(approvedCandidate, { profile: { ...profile, approvedServiceOrigins: [OTHER_API] } })).toEqual(['API_ORIGIN_NOT_APPROVED']);
     expect(reasonsWith(approvedCandidate, { profile: { ...profile, approvedServiceOrigins: [OTHER_API, API] } })).toEqual(['API_ORIGIN_NOT_APPROVED']);
-    expect(reasonsWith(approvedCandidate, { apiShapeOriginIndex: null })).toEqual(['API_ORIGIN_NOT_APPROVED']);
+    expect(reasonsWith(approvedCandidate, { apiShapeOrigin: null })).toEqual(['API_ORIGIN_NOT_APPROVED']);
+  });
+
+  it('DEF-220: resolves the number of an approved test Origin with the approved test Origins of the profile only', () => {
+    const profile = factsOf(approvedCandidate).profile;
+    const testOrigin = { kind: 'APPROVED_TEST', index: 0 } as const;
+    // テストの Origin の番号は、プロファイルの承認したテストの Origin の一覧で解く。
+    expect(reasonsWith(approvedCandidate, { apiShapeOrigin: testOrigin, profile: { ...profile, approvedServiceOrigins: [], approvedTestOrigins: [API] } }))
+      .toEqual([]);
+    // サービスの Origin の一覧では解かない（番号の意味を混ぜない）。一覧から外れた・位置が変わったテストの Origin は再承認。
+    expect(reasonsWith(approvedCandidate, { apiShapeOrigin: testOrigin })).toEqual(['API_ORIGIN_NOT_APPROVED']);
+    expect(reasonsWith(approvedCandidate, { apiShapeOrigin: testOrigin, profile: { ...profile, approvedTestOrigins: [OTHER_API, API] } }))
+      .toEqual(['API_ORIGIN_NOT_APPROVED']);
   });
 
   it('needs a new discovery when the latest discovery job ran with another revision of the profile (C-2)', () => {

@@ -32,7 +32,40 @@
       "type": "object",
       "additionalProperties": false,
       "required": ["entries"],
-      "properties": { "entries": { "type": "array", "items": { "$ref": "#/$defs/frontierEntry" } } }
+      "properties": {
+        "entries": { "type": "array", "items": { "$ref": "#/$defs/frontierEntry" } },
+        "coverage": {
+          "description": "COV-4 (doc/design/2026-11-09-beaksight-coverage-by-state-design.md 3.2): the coverage queue snapshot of the audit crawl (CoverageQueue.snapshot, format beaksight-coverage-queue/2; the same shape as the coverage of the discovery checkpoint). CoverageQueue.restore checks the states, the location keys, the pending list and the trails. An earlier checkpoint has no coverage; it is read from the entries (QUEUED entries are the entrances, the finished ones are read).",
+          "type": "object",
+          "required": ["format", "states", "pending", "pressed", "closedChains"],
+          "properties": {
+            "format": { "const": "beaksight-coverage-queue/2" },
+            "states": { "type": "array" },
+            "pending": { "type": "array", "items": { "type": "string" } },
+            "pressed": { "type": "array" },
+            "closedChains": { "type": "array" }
+          }
+        },
+        "openedStructureKeys": {
+          "description": "COV-4 part 3: the structure keys of the opened states audited in the Run (each opened structure is audited once, also after a resume). An earlier checkpoint has none (read as empty).",
+          "type": "array",
+          "items": { "type": "string", "pattern": "^sha256:[0-9a-f]{64}$" }
+        },
+        "openedPresses": {
+          "description": "COV-4 part 3 (nested opened states): the pressed pairs inside the opened states (structure key, candidate ID, ordinal). Each pair is pressed once, also after a resume. An earlier checkpoint has none (read as empty).",
+          "type": "array",
+          "items": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["structureKey", "candidateId", "ordinal"],
+            "properties": {
+              "structureKey": { "type": "string", "pattern": "^sha256:[0-9a-f]{64}$" },
+              "candidateId": { "type": "string", "minLength": 1 },
+              "ordinal": { "type": "integer", "minimum": 0 }
+            }
+          }
+        }
+      }
     },
     "allocator": {
       "type": "object",
@@ -161,7 +194,17 @@
         "settingsDigest": { "type": "string", "pattern": "^sha256:[a-f0-9]{64}$" }
       }
     },
+    "pageScope": {
+      "description": "WSO: the scope of a run that reads only the checked screens (the number of the screens to read; no URL). Optional; a checkpoint without it is a run of the whole site. A run is resumed only by a run of the same scope.",
+      "$ref": "urn:beaksight:schema:run:1.0#/properties/pageScope"
+    },
     "completedPageIds": {
+      "type": "array",
+      "uniqueItems": true,
+      "items": { "$ref": "urn:beaksight:schema:page:1.0#/properties/pageId" }
+    },
+    "revisitedPageIds": {
+      "description": "EV-5 (doc/design/2026-11-16-beaksight-finding-evidence-design.md 3.5): the finished pages read again after a run stopped by the time limit until their findings on hold no longer decreased (not read again on a later resume). Optional; an earlier checkpoint has none (no page read again).",
       "type": "array",
       "uniqueItems": true,
       "items": { "$ref": "urn:beaksight:schema:page:1.0#/properties/pageId" }
@@ -188,7 +231,8 @@
             null
           ]
         },
-        "environment": { "$ref": "urn:beaksight:schema:run:1.0#/properties/environment" }
+        "environment": { "$ref": "urn:beaksight:schema:run:1.0#/properties/environment" },
+        "automaticRelogin": { "$ref": "urn:beaksight:schema:run:1.0#/properties/executions/items/properties/automaticRelogin" }
       }
     },
     "frontierEntry": {
@@ -264,6 +308,8 @@
         "passedAuditSendRequests": { "$ref": "urn:beaksight:schema:page:1.0#/$defs/passedAuditSendRequests" },
         "passedAuditSendWebSockets": { "$ref": "urn:beaksight:schema:page:1.0#/$defs/passedAuditSendWebSockets" },
         "blockedClosingRequests": { "$ref": "urn:beaksight:schema:page:1.0#/$defs/blockedClosingRequests" },
+        "frameClassificationFailures": { "$ref": "urn:beaksight:schema:page:1.0#/$defs/frameClassificationFailures" },
+        "readNavigationFailures": { "$ref": "urn:beaksight:schema:page:1.0#/$defs/readNavigationFailures" },
         "invariantViolations": { "$ref": "urn:beaksight:schema:run:1.0#/properties/safety/properties/invariantViolations" },
         "invariantViolationCount": {
           "$ref": "urn:beaksight:schema:run:1.0#/properties/safety/properties/invariantViolationCount"

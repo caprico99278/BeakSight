@@ -1,9 +1,9 @@
 // DEF-138（設計書 `2026-10-19-beaksight-session-loss-evidence-design.md` 2.2、3 章の受け入れ条件 4）: IPC の `AUTH_STATE` の任意の `sessionLoss`。
 // - `SESSION_LOST` だけが持てる。形は `run.json` の `authentication.sessionLoss` と同じ（スキーマを参照する）。
-// - path の表記は query の名前だけ（値を持たない）。値に見える区切り、fragment、絶対の URL、上限を超える数、受けない鍵の名前の案を拒む。
+// - path の表記は query の名前だけ（値を持たない）。値に見える区切り、fragment、絶対の URL、受けない鍵の名前の案を拒む（LZ-3a: 数の上限はない）。
 // 例の値は、匿名の値だけを使う。
 import { describe, expect, it } from 'vitest';
-import { MAX_SESSION_LOSS_BLOCKED_REQUESTS, MAX_SESSION_LOSS_REDIRECT_PATHS, type SessionLossEvidence } from '../../src/core/evidence-types.js';
+import type { SessionLossEvidence } from '../../src/core/evidence-types.js';
 import { WORKER_PROTOCOL_VERSION, WORKER_SESSION_LOST_STATE, validateWorkerToParentMessage } from '../../src/control/worker-protocol.js';
 
 const URL_OF_PAGE = 'http://127.0.0.1:4173/admin/expired';
@@ -34,6 +34,17 @@ describe('DEF-138: the session loss evidence of AUTH_STATE', () => {
     expect(validateWorkerToParentMessage(message(WORKER_SESSION_LOST_STATE, { ...EVIDENCE, storageKeyChange: null, stage: null })).ok).toBe(true);
   });
 
+  // LZ-3a: 経路の段（前は 10）・止めた要求の行（前は 8）・鍵の名前の案（前は 4）の数の上限はない。
+  it('accepts more route steps, blocked request rows and key shapes than the former limits', () => {
+    const shapes = ['-token', '-auth', '-session', '-jwt', '-access'].map((suffix) => ({ prefix: '', suffix }));
+    expect(validateWorkerToParentMessage(message(WORKER_SESSION_LOST_STATE, {
+      ...EVIDENCE,
+      redirectPaths: Array.from({ length: 11 }, () => EVIDENCE.redirectPaths[0]),
+      blockedRequests: Array.from({ length: 9 }, () => EVIDENCE.blockedRequests[0]),
+      storageKeyChange: [{ ...EVIDENCE.storageKeyChange?.[0], shapes }],
+    })).ok).toBe(true);
+  });
+
   it.each([
     ['another state', message('AUTHENTICATED', EVIDENCE)],
     ['a query value in the landed path', message(WORKER_SESSION_LOST_STATE, { ...EVIDENCE, landedPath: '/auth?ticket=abc' })],
@@ -44,12 +55,6 @@ describe('DEF-138: the session loss evidence of AUTH_STATE', () => {
     ['a fragment in a path', message(WORKER_SESSION_LOST_STATE, { ...EVIDENCE, landedPath: '/auth#token' })],
     ['a query in a blocked request path', message(WORKER_SESSION_LOST_STATE, {
       ...EVIDENCE, blockedRequests: [{ ...EVIDENCE.blockedRequests[0], path: '/auth/v1/token?grant_type' }],
-    })],
-    ['too many route steps', message(WORKER_SESSION_LOST_STATE, {
-      ...EVIDENCE, redirectPaths: Array.from({ length: MAX_SESSION_LOSS_REDIRECT_PATHS + 1 }, () => EVIDENCE.redirectPaths[0]),
-    })],
-    ['too many blocked request rows', message(WORKER_SESSION_LOST_STATE, {
-      ...EVIDENCE, blockedRequests: Array.from({ length: MAX_SESSION_LOSS_BLOCKED_REQUESTS + 1 }, () => EVIDENCE.blockedRequests[0]),
     })],
     ['a whole key name as a shape', message(WORKER_SESSION_LOST_STATE, {
       ...EVIDENCE, storageKeyChange: [{ ...EVIDENCE.storageKeyChange?.[0], shapes: [{ prefix: 'alice-session-', suffix: '' }] }],

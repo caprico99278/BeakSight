@@ -13,11 +13,16 @@ export const ENVIRONMENTS_BY_MODE: Readonly<Record<AuditMode, readonly [Environm
   TEST_APPROVED_WRITE: ['TEST'],
 });
 
-/** モードごとに受ける認証の方式（設計書 4.3 の表。先頭が初めの値）。表にない組み合わせは `PROFILE_AUTH_MISMATCH`。 */
+/**
+ * モードごとに受ける認証の方式（設計書 4.3 の表。先頭が初めの値）。表にない組み合わせは `PROFILE_AUTH_MISMATCH`。
+ * NL-1（設計書 `2026-11-06-beaksight-no-login-test-site-design.md` 3.1 の 1）: テストの 2 つのモードに、ログインしない方式（`NONE`）を末尾に足した
+ * （作成の欄の初めの値は変えない）。`TEST` の環境で `NONE` を受けるのは、`approvedTestOrigins` がすべて loopback のときだけ（`profile-policy.ts` の
+ * `PROFILE_NO_LOGIN_REQUIRES_LOOPBACK`）。
+ */
 export const AUTH_STRATEGIES_BY_MODE: Readonly<Record<AuditMode, readonly [AuthStrategy, ...AuthStrategy[]]>> = deepFreeze({
   PUBLIC_PASSIVE: ['NONE'],
-  TEST_AUTH_PASSIVE: ['MANUAL_SESSION', 'AUTOMATED_LOGIN'],
-  TEST_APPROVED_WRITE: ['MANUAL_SESSION', 'AUTOMATED_LOGIN'],
+  TEST_AUTH_PASSIVE: ['MANUAL_SESSION', 'AUTOMATED_LOGIN', 'NONE'],
+  TEST_APPROVED_WRITE: ['MANUAL_SESSION', 'AUTOMATED_LOGIN', 'NONE'],
 });
 
 /** テスト環境の Origin と環境の証拠を必須にするモード（認証・書き込みのモード）。承認したサービスの Origin を持てるのも、このモードだけ。 */
@@ -25,6 +30,9 @@ export const TEST_ORIGIN_MODES: readonly AuditMode[] = deepFreeze(['TEST_AUTH_PA
 
 /** 環境の証拠（確かめた記録の参照）を持たない環境（公開の環境）。 */
 export const ENVIRONMENT_WITHOUT_EVIDENCE: EnvironmentKind = 'PUBLIC';
+
+/** テスト環境（NL-1: ログインしない方式を、テストの 2 つのモードで loopback の Origin に限って受ける環境）。 */
+export const TEST_ENVIRONMENT: EnvironmentKind = 'TEST';
 
 /** その環境で、環境の証拠（確かめた記録の参照）を持てるか（公開の環境でなければ持てる）。 */
 export const environmentAcceptsEvidence = (environment: EnvironmentKind): boolean => environment !== ENVIRONMENT_WITHOUT_EVIDENCE;

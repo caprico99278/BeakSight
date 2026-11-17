@@ -12,7 +12,6 @@ import { RUN_ARTIFACT_FILE_NAMES, artifactFilePath, bundleFileName } from '../co
 import { BEAKSIGHT_BLOCK_RELATIONS } from '../core/beaksight-block-relation.js';
 import { RUN_STATUSES, type RunProgressReport, type RunStatus } from '../core/contracts.js';
 import { safeErrorMessage } from '../core/errors.js';
-import { MAX_ERROR_MESSAGE_LENGTH } from '../core/limits.js';
 import { normalizeWhitespace, replaceControlCharacters } from '../core/text.js';
 import {
   BEAKSIGHT_BLOCK_RELATION_CATALOG,
@@ -35,7 +34,6 @@ import {
   CLI_TEXT,
   PAGE_COVERAGE_ITEMS,
   RUN_SUMMARY_TEXT,
-  activeRunInOutputDirectoryText,
   authSessionLostNoticeText,
   checkpointStoreFailedText,
   cliCountText,
@@ -44,6 +42,7 @@ import {
   describeConfigError,
   differentConfigRunText,
   differentVersionRunText,
+  evidenceSufficiencyEntries,
   finalizingRunText,
   findingGroupCountsLabelText,
   finishedCheckpointCleanupFailedText,
@@ -51,12 +50,11 @@ import {
   listText,
   progressItemsText,
   resumingRunText,
-  runLockHeldText,
-  runLockTakenOverText,
   serviceRequestPacingWaitText,
   siteUnavailableRecheckText,
   siteUnavailableSlowdownText,
   siteUnavailableStopText,
+  specifiedLimitText,
   truncatedListText,
   unreadableCheckpointText,
   versionDifferenceText,
@@ -97,7 +95,7 @@ const CONTROL_CHARACTER_REPLACEMENT = ' ';
 
 /** 不明な値（例外、文字列）を、1行の技術的な詳細にする（上限付き。制御文字と改行は空白にする）。 */
 export const technicalDetailText = (value: unknown): string =>
-  normalizeWhitespace(replaceControlCharacters(safeErrorMessage(value, MAX_ERROR_MESSAGE_LENGTH), CONTROL_CHARACTER_REPLACEMENT));
+  normalizeWhitespace(replaceControlCharacters(safeErrorMessage(value), CONTROL_CHARACTER_REPLACEMENT));
 
 /** 行の一覧を、LF で終わる1つの文字列にする。 */
 export const joinLines = (lines: readonly string[]): string => `${lines.join('\n')}\n`;
@@ -230,7 +228,7 @@ export function runProgressLines(report: RunProgressReport): readonly string[] {
           text.pagesFinished,
           countWithDetailsText(formatCount(report.pagesFinished), [
             cliCountText(RUN_SUMMARY_TEXT.coverage.discovered, formatCount(report.pagesDiscovered)),
-            cliCountText(text.maxPages, formatCount(report.maxPages)),
+            cliCountText(text.maxPages, specifiedLimitText(report.maxPages, formatCount)),
           ]),
         ),
         cliCountText(CLI_TEXT.run.navigationCount, formatTimes(report.navigationCount)),
@@ -248,10 +246,11 @@ export function runProgressLines(report: RunProgressReport): readonly string[] {
 /**
  * `run` の結果の行（設計書 第7章）。値は、表示用モデルの `summary` から取る。
  * - Run Status の日本語のラベル（値そのものを添える）
- * - 出力先（Run のディレクトリ）と、HTML レポートとバンドルのパス。バンドルの名前は、最後の実行の終わりの時刻
+ * - 出力先（Run のディレクトリ）と、HTML レポートとバンドルのパス（AUD-1d: 部に分けたときは、全部の部のパス。部の数は `bundlePartCount`）。バンドルの名前は、最後の実行の終わりの時刻
  *   （表示用モデルの `executions.lastFinishedAt`。どの実行かは表示用モデルが決める。CCX-19）から `bundleFileName` で作る（ChatGPT 用
  *   バンドルのファイル名の設計書 2.3。日時の書式を作り直さない）
  * - ページの網羅（発見、監査、一部未完了、失敗、スキップ）
+ * - EV-5: 確かめを待つ問題と、まだ見ていない画面の 2 行（`evidenceSufficiencyEntries`。HTML と同じ言葉）
  * - severity の区分（サイト品質、Safety）ごとの、severity ごとの件数
  * - サイトへの負荷（ページの読み込みの回数と、許可 Origin への要求の件数と1分あたりの最大。サイトへの負荷の制御の設計書 4.5）。
  *   指摘の件数の行の後に置く（HTML レポートの要約の小節の順と同じ）。回数は `formatTimes`、要求の件数と最大は
@@ -266,7 +265,7 @@ export function runProgressLines(report: RunProgressReport): readonly string[] {
  *   行の次、未完了の理由の行の前に置く。出すかどうかと詳細は、表示用モデルの `siteUnavailableStop` のまま（ここで判断し直さない）
  * - 未完了の理由がある場合は、その件数
  */
-export function runSummaryLines(summary: RunSummaryView, runDirectory: string): readonly string[] {
+export function runSummaryLines(summary: RunSummaryView, runDirectory: string, bundlePartCount = 1): readonly string[] {
   const coverage = RUN_SUMMARY_TEXT.coverage;
   const counts = summary.findingCounts;
   const { load, executions, beaksightBlockRelation: blockRelation } = summary;
@@ -283,12 +282,19 @@ export function runSummaryLines(summary: RunSummaryView, runDirectory: string): 
     cliFieldText(RUN_SUMMARY_TEXT.runStatus, labelWithCodeText(RUN_STATUS_CATALOG[summary.runStatus].label, summary.runStatus)),
     cliFieldText(CLI_TEXT.run.outputDirectory, runDirectory),
     cliFieldText(CLI_TEXT.run.report, artifactFilePath(runDirectory, RUN_ARTIFACT_FILE_NAMES.report)),
-    cliFieldText(CLI_TEXT.run.bundle, artifactFilePath(runDirectory, bundleFileName(executions.lastFinishedAt))),
+    // AUD-1d: 部に分けたバンドルは、全部の部のパス（部の順）。
+    cliFieldText(
+      CLI_TEXT.run.bundle,
+      listText(Array.from({ length: bundlePartCount }, (_, index) =>
+        artifactFilePath(runDirectory, bundleFileName(executions.lastFinishedAt, undefined, { partNumber: index + 1, partCount: bundlePartCount })))),
+    ),
     cliFieldText(
       RUN_SUMMARY_TEXT.coverageHeading,
       // T44R2 の M-8: 項目の並びは `PAGE_COVERAGE_ITEMS`（1 か所）。
       listText(PAGE_COVERAGE_ITEMS.map((item) => cliCountText(coverage[item], formatCount(summary.coverage[item])))),
     ),
+    // EV-5: 証拠の足り方（表示用モデルの数のまま。2 行）。網羅の行の次、指摘の件数の行の前に置く。
+    ...evidenceSufficiencyEntries(summary.evidenceSufficiency, formatCount).map(({ label, value }) => cliFieldText(label, value)),
     ...groupLines,
     // BN-d: BeakSight の遮断と結び付く指摘（バンドルの本体から外したサイト品質の指摘）の件数。出すかと件数は、表示用モデルの値のまま。
     ...(blockRelation.linkedFindingCount > 0
@@ -351,15 +357,8 @@ const RUN_VERSION_FIELD_LABELS = Object.freeze({
 
 /** 再開を始められなかった理由（`RunResumeUnavailableError.reason`）ごとの文言。書き漏れは、型のエラーになる。 */
 const RUN_RESUME_UNAVAILABLE_TEXTS = Object.freeze({
-  LOCK_HELD_BY_ACTIVE_RUN: runLockHeldText,
-  LOCK_TAKEN_OVER_CONCURRENTLY: runLockTakenOverText,
   CHECKPOINT_STORE_FAILED: checkpointStoreFailedText,
 } as const satisfies Record<RunResumeUnavailableReason, (runId: string) => string>);
-
-/** 同じ出力先で、別の Run が実行中なので、Run を始めずに終える行。 */
-export function activeRunLines(runId: string): readonly string[] {
-  return [activeRunInOutputDirectoryText(runId)];
-}
 
 /** 途中の Run の再開のための保存を読めないので、再開の対象にしない行（壊れた保存）。 */
 export function unreadableCheckpointLines(runId: string): readonly string[] {

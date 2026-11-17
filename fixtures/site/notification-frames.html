@@ -1,0 +1,55 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8">
+    <title>Notification frames fixture</title>
+    <style>
+      * { box-sizing: border-box; }
+      body { margin: 0; font-family: sans-serif; font-size: 16px; line-height: 1.25; }
+      main { width: 800px; padding: 80px 8px 8px; }
+      button { font: inherit; }
+      /* ヘッダ（固定）。中の × ボタンは、通知の枠の閉じるボタンにしない。 */
+      #site-header { position: fixed; top: 0; left: 0; right: 0; height: 48px; background: #eee; }
+      /* 全面の透明な入れ物の中の、隅の通知の枠。 */
+      #corner-layer { position: fixed; inset: 0; z-index: 40; pointer-events: none; }
+      #corner-notice {
+        position: absolute; right: 16px; bottom: 16px; width: 240px; height: 140px;
+        background: #fff; border: 1px solid #333; pointer-events: auto;
+      }
+      /* ダイアログの役割の枠（固定でない）。 */
+      #info-dialog { width: 280px; height: 120px; margin: 16px 0; background: #fff; border: 1px solid #333; }
+      /* 閉じるボタンのない、固定の小さな枠。 */
+      #help-tab { position: fixed; left: 16px; bottom: 16px; width: 120px; height: 40px; background: #def; }
+      /* 全面のモーダル（背景を描く）。 */
+      #full-modal { position: fixed; inset: 0; z-index: 50; background: rgba(0, 0, 0, 0.4); }
+      #full-modal-body { margin: 40px; height: 480px; background: #fff; }
+    </style>
+  </head>
+  <body>
+    <header id="site-header">
+      <span>Site title</span>
+      <button type="button" id="header-close">×</button>
+    </header>
+    <main>
+      <h1>Sample page</h1>
+      <p>This paragraph explains the page in plain words for the test.</p>
+      <div id="info-dialog" role="dialog" aria-label="Information">
+        <p>Plain information for the test.</p>
+        <button type="button" id="dialog-close">閉じる</button>
+      </div>
+    </main>
+    <div id="help-tab"><a href="#help" id="help-link">Help</a></div>
+    <div id="corner-layer">
+      <div id="corner-notice">
+        <p>Plain notice for the test.</p>
+        <button type="button" id="corner-close">×</button>
+      </div>
+    </div>
+    <div id="full-modal">
+      <div id="full-modal-body">
+        <p>Plain modal text for the test.</p>
+        <button type="button" id="modal-close" aria-label="Close"></button>
+      </div>
+    </div>
+  </body>
+</html>

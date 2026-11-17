@@ -2,9 +2,11 @@
  * UI-close（設計書 `doc/design/2026-10-19-beaksight-ui-close-stops-server-design.md` の 4 章の受け入れ条件 1〜5）: 管理画面のブラウザを閉じたら、
  * 画面のサーバ（ビルドした画面を、一時の root の起動の部品 `launcher/serve.ts` で起動する）も止まることを、headless の Chromium で確かめる。
  * 猶予と途絶えの上限と、確かめの間隔は、起動の引数で注入して短くする（ページの知らせの間隔は製品のまま）。
- * 監査のジョブは、一時の root の入口を偽のワーカー（`tests/helpers/fake-audit-worker.ts` の `hold`。サイトに接続しない）に替えて動かす。
+ * SLIM-GROUP UI-7: 受け入れ条件 1・2・5 を本物のサーバで確かめる。3（開かなければ止めない）・4（ジョブの間は止めない）・途絶え（OP-P）は、止める判定の
+ * 1 か所（`launcher/presence.ts` の `createPresenceMonitor`）を偽の時計で確かめる `ui-presence-monitor.test.ts` と、終わりの記録の形の
+ * `tests/unit/ui-server-log.test.ts`（速い組）で確かめる。
  */
-import { mkdirSync, readFileSync, writeFileSync } from 'node:fs';
+import { readFileSync } from 'node:fs';
 import { createServer } from 'node:net';
 import type { Browser, BrowserContext, Page } from 'playwright';
 import { afterAll, afterEach, beforeAll, describe, expect, it } from 'vitest';
@@ -12,10 +14,7 @@ import { wait as sleep } from '../../../src/core/deadline.js';
 import { resolveUiServerLogPath } from '../../../src/control/store/database-path.js';
 import { LOCAL_UI_CONSOLE_TEXT } from '../../../src/presentation/messages.js';
 import { launchHeadlessChromium } from '../../../tests/helpers/chromium.js';
-import { writeFakeWorker } from '../../../tests/helpers/fake-audit-worker.js';
-import { fakeWorkerValuesOf } from '../../../tests/helpers/job-test-support.js';
 import { UI_PRESENCE_ALIVE_PATH, UI_PRESENCE_CLOSED_PATH, UI_PRESENCE_INTERVAL_MS } from '../src/security/ui-presence.ts';
-import { publicProfileDocument, writeAuditTargetConfig } from './helpers/audit-site.ts';
 import {
   createTemporaryUiRoot,
   findFreePort,
@@ -26,7 +25,6 @@ import {
   type StartedServer,
   type TemporaryUiRoot,
 } from './helpers/local-server.ts';
-import { callServerFunction, readServerFunctionIds } from './helpers/server-functions.ts';
 
 /** 注入する猶予（閉じた知らせの後）。読み込み直しが戻るのに足りる長さ。 */
 const CLOSED_GRACE_MS = 3_000;
@@ -38,11 +36,7 @@ const CHECK_INTERVAL_MS = 100;
 const STOP_LIMIT_MS = CLOSED_GRACE_MS + 4_000;
 const SCENARIO_TIMEOUT_MS = 120_000;
 const WAIT_STEP_MS = 100;
-const JOB_WAIT_LIMIT_MS = 30_000;
-const STATUS = Object.freeze({ OK: 200, NO_CONTENT: 204, UNAUTHORIZED: 401, FORBIDDEN: 403 });
-const PROFILE_ID = 'ui-close-public';
-const WORKER_ENTRY = 'dist/worker/audit-worker.js';
-const FAKE_HEARTBEAT_INTERVAL_MS = 200;
+const STATUS = Object.freeze({ UNAUTHORIZED: 401, FORBIDDEN: 403 });
 
 let root: TemporaryUiRoot | undefined;
 let browser: Browser | undefined;
@@ -129,10 +123,21 @@ afterAll(async () => {
 });
 
 describe('UI-close: closing the local UI stops the server', () => {
-  it('keeps running on a reload and while another tab is open, and stops after the grace when the last page is closed (1, 2)', async () => {
+  it('keeps running on a reload and while another tab is open, and stops after the grace when the last page is closed (1, 2, 5)', async () => {
     const server = await startServer();
     // DEF-146: cookie の値（終わりの記録のファイルに書かない値）。
-    const cookieValue = (await cookieOf(server)).split('=').slice(1).join('=');
+    const cookie = await cookieOf(server);
+    const cookieValue = cookie.split('=').slice(1).join('=');
+    // 5: token のない知らせ、別の Origin・cross-site の知らせ、GET の知らせは受けない。
+    for (const path of [UI_PRESENCE_ALIVE_PATH, UI_PRESENCE_CLOSED_PATH]) {
+      const target = `${path}?page=probe`;
+      expect((await rawRequest(server.port, target, { method: 'POST' })).status, path).toBe(STATUS.UNAUTHORIZED);
+      expect((await rawRequest(server.port, target, { method: 'POST', headers: { cookie, origin: 'http://127.0.0.1:1' } })).status, path)
+        .toBe(STATUS.FORBIDDEN);
+      expect((await rawRequest(server.port, target, { method: 'POST', headers: { cookie, origin: server.origin, 'sec-fetch-site': 'cross-site' } })).status, path)
+        .toBe(STATUS.FORBIDDEN);
+      expect((await rawRequest(server.port, target, { method: 'GET', headers: { cookie, origin: server.origin } })).status, path).toBe(STATUS.FORBIDDEN);
+    }
     const context = await newContext();
     const first = await openUi(context, server);
     // 読み込み直し: 閉じた知らせの後、猶予の中に新しいページの知らせが来るので、止まらない。
@@ -153,6 +158,9 @@ describe('UI-close: closing the local UI stops the server', () => {
     const logText = readFileSync(resolveUiServerLogPath(rootOf().root), 'utf8');
     const lines = logText.split('\n').filter((line) => line.length > 0).map((line) => JSON.parse(line) as Record<string, unknown>);
     expect(lines.at(-1)).toMatchObject({ kind: 'SHUTDOWN', reason: 'UI_CLOSED', immediate: false, runningJobs: 0 });
+    // OP-P（P3）: 起動の行と、止める決まりを受けた行（終わりの処理の前）も書く。
+    expect(lines.map((line) => line['kind'])).toEqual(['START', 'STOP_REQUESTED', 'SHUTDOWN']);
+    expect(lines.at(-2)).toMatchObject({ kind: 'STOP_REQUESTED', reason: 'UI_CLOSED', runningJobs: 0 });
     expect(typeof lines.at(-1)?.['at']).toBe('string');
     expect(lines.filter((line) => line['kind'] === 'EXIT')).toEqual([]);
     const token = server.tokenUrl.searchParams.get('token') ?? '';
@@ -162,54 +170,4 @@ describe('UI-close: closing the local UI stops the server', () => {
     expect(logText).not.toContain(cookieValue);
   }, SCENARIO_TIMEOUT_MS);
 
-  it('keeps running when the UI was never opened, and does not take notices without the token or from another origin (3, 5)', async () => {
-    const server = await startServer();
-    const cookie = await cookieOf(server);
-    for (const path of [UI_PRESENCE_ALIVE_PATH, UI_PRESENCE_CLOSED_PATH]) {
-      const target = `${path}?page=probe`;
-      expect((await rawRequest(server.port, target, { method: 'POST' })).status, path).toBe(STATUS.UNAUTHORIZED);
-      expect((await rawRequest(server.port, target, { method: 'POST', headers: { cookie, origin: 'http://127.0.0.1:1' } })).status, path)
-        .toBe(STATUS.FORBIDDEN);
-      expect((await rawRequest(server.port, target, { method: 'POST', headers: { cookie, origin: server.origin, 'sec-fetch-site': 'cross-site' } })).status, path)
-        .toBe(STATUS.FORBIDDEN);
-      expect((await rawRequest(server.port, target, { method: 'GET', headers: { cookie, origin: server.origin } })).status, path).toBe(STATUS.FORBIDDEN);
-    }
-    // 受けなかった知らせは数えない（受けていれば、途絶えの上限の後に止まる）。画面を開いていないので、止まらない。
-    await sleep(SILENCE_LIMIT_MS + CLOSED_GRACE_MS);
-    expect(isRunning(server)).toBe(true);
-    expect((await rawRequest(server.port, '/', { headers: { cookie } })).status).toBe(STATUS.OK);
-  }, SCENARIO_TIMEOUT_MS);
-
-  it('does not stop while a job runs, and stops after the job ends (4)', async () => {
-    const directory = `${rootOf().root}/fake-workers/ui-close`;
-    mkdirSync(directory, { recursive: true });
-    const worker = writeFakeWorker(directory, 'hold', fakeWorkerValuesOf({ runId: 'RUN-20261019000000', otherRunId: 'RUN-20261019000999' }, {
-      heartbeatIntervalMs: FAKE_HEARTBEAT_INTERVAL_MS,
-    }));
-    writeFileSync(`${rootOf().root}/${WORKER_ENTRY}`, readFileSync(worker.path, 'utf8'), 'utf8');
-    const targetConfigPath = writeAuditTargetConfig(rootOf().root, PROFILE_ID, 'http://127.0.0.1:9', { minNavigationIntervalMs: 0, screenshots: false });
-    const server = await startServer();
-    const cookie = await cookieOf(server);
-    const ids = readServerFunctionIds(`${rootOf().root}/apps/local-ui/dist/server/server.js`);
-    const call = async <T>(name: string, method: 'GET' | 'POST', data: unknown): Promise<T> => {
-      const result = await callServerFunction({ port: server.port, origin: server.origin, cookie, ids }, name, method, data);
-      expect(result.response.status, name).toBe(STATUS.OK);
-      return result.value as T;
-    };
-    expect(await call('createProfileFn', 'POST', { profile: publicProfileDocument(PROFILE_ID, targetConfigPath) })).toMatchObject({ ok: true });
-    const start = await call<{ ok: boolean; jobId: string }>('startAuditJobFn', 'POST', { profileId: PROFILE_ID, expectedRevision: 1, startNew: true });
-    expect(start.ok, JSON.stringify(start)).toBe(true);
-    const context = await newContext();
-    const page = await openUi(context, server);
-    await page.close({ runBeforeUnload: true });
-    // ジョブが動いている間は、猶予の後も止まらない。
-    await sleep(CLOSED_GRACE_MS * 2);
-    expect(isRunning(server)).toBe(true);
-    expect(await call<{ active: boolean }>('getAuditJobFn', 'GET', { jobId: start.jobId })).toMatchObject({ active: true });
-    // ジョブが終わったら、確かめ直して止まる。
-    expect(await call('stopAuditJobFn', 'POST', { jobId: start.jobId, force: false })).toMatchObject({ ok: true });
-    await waitForExit(server, JOB_WAIT_LIMIT_MS);
-    expect(await isPortFree(server.port)).toBe(true);
-    expect(server.output()).toContain(LOCAL_UI_CONSOLE_TEXT.closedByUi);
-  }, SCENARIO_TIMEOUT_MS);
 });

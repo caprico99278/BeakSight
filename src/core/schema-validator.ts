@@ -9,13 +9,14 @@ export type ArtifactSchemaName =
   | 'finding'
   | 'checkpoint'
   | 'checkpoint-page'
-  | 'site-unavailable-diagnostic'
   | 'discovery'
+  | 'discovery-checkpoint'
   | 'read-evidence'
   | 'action-run'
   | 'action-evidence'
   | 'approval-summary'
-  | 'entry-check';
+  | 'entry-check'
+  | 'report-summary';
 
 /** スキーマの検証の結果（成果物と Control の契約で共通）。 */
 export type SchemaValidationResult =
@@ -55,15 +56,16 @@ export interface SchemaValidatorRegistry {
 
 const schemaIdByName: Readonly<Record<ArtifactSchemaName, string>> = {
   run: 'urn:beaksight:schema:run:1.0',
-  audit: 'urn:beaksight:schema:audit:1.0',
+  // REC-2: audit.json は目録（`audit-schema/2.0`）。前の版（1.x）の audit.json を読む所はないので、前の版の口は置かない。
+  audit: 'urn:beaksight:schema:audit:2.0',
   page: 'urn:beaksight:schema:page:1.0',
   finding: 'urn:beaksight:schema:finding:1.0',
   checkpoint: 'urn:beaksight:schema:checkpoint:1.0',
   'checkpoint-page': 'urn:beaksight:schema:checkpoint-page:1.0',
-  // サイトの不調で止めたときの診断の記録（サイトの不調で止めたときの診断の記録の設計書 2.3）。
-  'site-unavailable-diagnostic': 'urn:beaksight:schema:site-unavailable-diagnostic:1.0',
   // 発見のジョブの成果物 `discovery.json`（Task 27 の設計書の変更履歴「Blocker: T27d」の行の (1)。T27d）。
   discovery: 'urn:beaksight:schema:discovery:1.0',
+  // DEF-200: 操作さがしの続きのための状態の保存（`checkpoint/discovery-state.json`）。
+  'discovery-checkpoint': 'urn:beaksight:schema:discovery-checkpoint:1.0',
   // READ の確かめのジョブの成果物 `read-evidence.json`（Task 27 の設計書 4.5。T27e）。
   'read-evidence': 'urn:beaksight:schema:read-evidence:1.0',
   // 書き込みのジョブの記録 `action-run.json`（Task 30 の設計書 3 章の「記録」。T30a）。公開監査の `run.json` のスキーマは変えない。
@@ -73,6 +75,8 @@ const schemaIdByName: Readonly<Record<ArtifactSchemaName, string>> = {
   'approval-summary': 'urn:beaksight:schema:approval-summary:1.0',
   // 入口の確かめのジョブの成果物 `entry-check.json`（Task 43 の設計書 4.3。T43c）。
   'entry-check': 'urn:beaksight:schema:entry-check:1.0',
+  // 監査の報告の小さなまとめ `report-summary.json`（plain UI の設計書 14 章。PL-R）。画面の作業の画面が、問題の数を読む。
+  'report-summary': 'urn:beaksight:schema:report-summary:1.0',
 };
 
 /**
@@ -101,14 +105,37 @@ const schemaDirectory = isDistributionBuild ? '../schemas/' : '../../schemas/';
 
 const schemaUrlFor = (schemaName: ArtifactSchemaName): URL => new URL(`${schemaDirectory}${schemaName}.schema.json`, import.meta.url);
 
+/** 誤りの文の先頭の、位置の部分（Ajv の instancePath。文書の全体は `/`）。 */
+const schemaErrorLocationOf = (instancePath: string): string => instancePath || '/';
+
 /** スキーマの検証の誤りを、1 行の文字列にする（成果物と Control の契約で共通の形）。 */
 export const describeSchemaError = (error: ErrorObject): string => {
   if (error.keyword === 'required') {
     const missingProperty = error.params.missingProperty;
-    return `${error.instancePath || '/'} must include ${missingProperty}`;
+    return `${schemaErrorLocationOf(error.instancePath)} must include ${missingProperty}`;
   }
 
-  return `${error.instancePath || '/'} ${error.message ?? error.keyword}`;
+  return `${schemaErrorLocationOf(error.instancePath)} ${error.message ?? error.keyword}`;
+};
+
+/**
+ * MEM-1（DEF-266）: 部分の値（audit.json の `run`・ページ・Finding など）を確かめた結果を、全体の文書の中の位置（`pointer`。JSON Pointer。例 `/pages/3`）の
+ * 結果にする（全体をまるごと確かめた誤りと同じ文と位置）。文は、位置の部分（`schemaErrorLocationOf`）と、その後の部分からなる（`describeSchemaError`）ので、
+ * 位置の部分だけを置き換える。
+ */
+export const schemaValidationResultAt = (result: LocatedSchemaValidationResult, pointer: string): LocatedSchemaValidationResult => {
+  if (result.ok) {
+    return result;
+  }
+  const issues = Object.freeze(result.issues.map((issue) => {
+    const instancePath = `${pointer}${issue.instancePath}`;
+    return Object.freeze({
+      ...issue,
+      instancePath,
+      message: `${schemaErrorLocationOf(instancePath)}${issue.message.slice(schemaErrorLocationOf(issue.instancePath).length)}`,
+    });
+  }));
+  return { ok: false, errors: issues.map(({ message }) => message), issues };
 };
 
 /** なくなった項目の誤り（Ajv の `required`）の keyword。 */
@@ -204,7 +231,7 @@ const loadValidators = (): Promise<Readonly<Record<ArtifactSchemaName, SchemaDoc
 export const validateArtifact = async (
   schemaName: ArtifactSchemaName,
   value: unknown,
-): Promise<ArtifactValidationResult> => {
+): Promise<LocatedSchemaValidationResult> => {
   // 検証関数の表は普通のオブジェクトなので、`constructor` などの継承したプロパティ名で引くと、`Object` などの無関係な関数が
   // 検証関数として呼ばれ、検証を素通りする。スキーマ名は、自身のプロパティかどうかで確かめる（DEF-002）。
   if (!Object.hasOwn(schemaIdByName, schemaName)) {

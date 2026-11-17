@@ -10,6 +10,7 @@ import {
   RULE_ORIGINS,
   RULE_SET_SCHEMA_VERSION,
   SEMANTIC_KINDS,
+  ruleSetHasHumanItems,
   type FieldRelation,
   type FieldRule,
   type RuleSetRevision,
@@ -109,6 +110,20 @@ describe('LG-3: reading the stored documents (one place for the reading rule)', 
     expect(() => ruleSetRevisionOfStoredDocument({ ...sampleRuleSet(), schemaVersion: 'beaksight-data-rule/9' })).toThrow(RangeError);
     expect(() => ruleSetRevisionOfStoredDocument({ ...sampleRuleSet(), fieldRules: [{ ...INFERRED_WINDOW_RULE, origin: 'MACHINE' }] })).toThrow(RangeError);
     expect(() => ruleSetRevisionOfStoredDocument(null)).toThrow(RangeError);
+  });
+});
+
+describe('SPEC-4: a rule set that a person saved on the removed rules screen (the human marks)', () => {
+  const inferred = (fieldName: string): FieldRule => ({ ...sampleFieldRule(fieldName), origin: 'INFERRED' });
+  it.each<readonly [string, Partial<RuleSetRevision>, boolean]>([
+    ['only inferred items', { fieldRules: [inferred('a')], relations: [], uniqueKeyFieldNames: [] }, false],
+    ['no items', { fieldRules: [], relations: [], uniqueKeyFieldNames: [] }, false],
+    ['a field rule without a mark', { fieldRules: [sampleFieldRule('a')], relations: [], uniqueKeyFieldNames: [] }, true],
+    ['a relation without a mark', { fieldRules: RELATION_RULES.map((rule) => ({ ...rule, origin: 'INFERRED' as const })), relations: [START_END], uniqueKeyFieldNames: [] }, true],
+    ['unique key fields without a mark', { fieldRules: [inferred('a')], relations: [], uniqueKeyFieldNames: ['a'] }, true],
+    ['inferred unique key fields', { fieldRules: [inferred('a')], relations: [], uniqueKeyFieldNames: ['a'], uniqueKeyOrigin: 'INFERRED' }, false],
+  ])('tells whether the rule set has %s from a person', (_label, content, expected) => {
+    expect(ruleSetHasHumanItems(sampleRuleSet(content))).toBe(expected);
   });
 });
 

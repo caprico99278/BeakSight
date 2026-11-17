@@ -15,7 +15,7 @@ import type { IncompleteReason } from '../core/contracts.js';
 import { awaitBeforeDeadline, resolveTimeoutMs } from '../core/deadline.js';
 import { safeErrorMessage } from '../core/errors.js';
 import { isRecord } from '../core/guards.js';
-import { BROWSER_CLOSE_TIMEOUT_MS, MAX_ERROR_MESSAGE_LENGTH } from '../core/limits.js';
+import { BROWSER_CLOSE_TIMEOUT_MS } from '../core/limits.js';
 import { validateArtifact } from '../core/schema-validator.js';
 import { classifyUrl } from '../crawl/admission-policy.js';
 import { assertPassiveRequestGuardActive } from '../safety/passive-request-guard.js';
@@ -87,10 +87,158 @@ export async function closeBrowserBeforeDeadline(
 /** Chromium を起動する関数（注入する）。本番では `chromium.launch` を渡す。 */
 export type BrowserLauncher = (options: { readonly headless: boolean }) => Promise<Browser>;
 
+// ---------------------------------------------------------------------------------------------------------------
+// RB-5（設計書 `2026-11-15-beaksight-test-rebuild-design.md` 3.5、案 6 章 D）: Browser の lease。ワーカーは Browser を headless の値ごとに 1 つだけ起こし、
+// 段（発見・READ・監査・書き込み・入口の確かめ）ごとには factory と Context だけを作る。段の境の分離は、次の 3 つで保つ。
+// - lease は、自分の起動の関数（`createBrowserLease` に渡したもの。本番は自己検査つきの起動の部品）で起こした Browser だけを貸す（外で作った Browser を受け取る口はない）。
+// - 貸すのは同時に 1 つの段だけ（借りている間は貸さない。factory は同時に 1 つ）。
+// - 段の終わり（`endPreflightBrowser`）に、段の factory の Worker の自己検査の session を外し、起動のときになかった Context が残っていないかを確かめる。
+//   残っていれば（切れていても）、その Browser を捨てて閉じ、次の段は起こし直した Browser を借りる（失敗にはしない）。
+// ---------------------------------------------------------------------------------------------------------------
+
+declare const BROWSER_LEASE_BRAND: unique symbol;
+
+/** Browser の lease（`createBrowserLease` だけが作る。中身は外から見えない）。 */
+export interface BrowserLease {
+  readonly [BROWSER_LEASE_BRAND]: true;
+}
+
+/** lease が起こした Browser 1 つと、起動のときにあった Context（起動の部品の persistent の既定の Context）。 */
+interface LeasedBrowser {
+  readonly browser: Browser;
+  readonly launchContexts: ReadonlySet<BrowserContext>;
+}
+
+interface BrowserLeaseState {
+  readonly launchBrowser: BrowserLauncher;
+  /** headless の値 → 起こした Browser。 */
+  readonly browsers: Map<boolean, LeasedBrowser>;
+  /** 貸している段の headless の値（貸していなければ `null`）。 */
+  lentTo: boolean | null;
+  closed: boolean;
+}
+
+/** 借りた段の記録（返したら `returned`）。 */
+interface BrowserLoan {
+  readonly state: BrowserLeaseState;
+  readonly headless: boolean;
+  readonly leased: LeasedBrowser;
+  returned: boolean;
+}
+
+const BROWSER_LEASES = new WeakMap<BrowserLease, BrowserLeaseState>();
+/** PREFLIGHT の成功の結果 → 借りた段の記録（lease から借りた段だけ）。 */
+const PREFLIGHT_LOANS = new WeakMap<PreflightSuccess, BrowserLoan>();
+
+/** `launchBrowser` で Browser を起こす lease を作る（起こすのは、最初に借りる段の PREFLIGHT）。 */
+export function createBrowserLease(launchBrowser: BrowserLauncher): BrowserLease {
+  if (typeof launchBrowser !== 'function') {
+    throw new TypeError('a browser lease requires a browser launcher function');
+  }
+  const lease = Object.freeze({}) as BrowserLease;
+  BROWSER_LEASES.set(lease, { launchBrowser, browsers: new Map(), lentTo: null, closed: false });
+  return lease;
+}
+
+/**
+ * lease が起こした Browser を閉じる（ワーカーの終わり）。閉じた後の lease は貸さない。何度呼んでもよく、失敗は投げない。
+ * 段に貸している Browser は、ここでは閉じない（強制の止め方で段の途中に終わるときの待ちを、今と同じにする。段が返せば、その時に閉じる。返さずに
+ * process が終われば、今と同じく Playwright が Chromium を終える）。
+ */
+export async function closeBrowserLease(lease: BrowserLease, options: { readonly timeoutMs?: number | undefined } = {}): Promise<void> {
+  const state = BROWSER_LEASES.get(lease);
+  if (state === undefined) {
+    return;
+  }
+  state.closed = true;
+  const idle = [...state.browsers].filter(([headless]) => headless !== state.lentTo);
+  for (const [headless] of idle) {
+    state.browsers.delete(headless);
+  }
+  await Promise.all(idle.map(([, { browser }]) => closeBrowserBeforeDeadline(browser, options).catch(() => null)));
+}
+
+/** lease から Browser を借りる（切れていれば起こし直す）。起動の誤りは、そのまま投げる。 */
+async function borrowLeasedBrowser(state: BrowserLeaseState, headless: boolean): Promise<BrowserLoan> {
+  if (state.closed) {
+    throw new Error('the browser lease is closed');
+  }
+  if (state.lentTo !== null) {
+    throw new Error('the browser lease is already lent to another stage');
+  }
+  state.lentTo = headless;
+  try {
+    let leased = state.browsers.get(headless);
+    if (leased !== undefined && !leased.browser.isConnected()) {
+      state.browsers.delete(headless);
+      leased = undefined;
+    }
+    if (leased === undefined) {
+      const browser = await state.launchBrowser({ headless });
+      leased = Object.freeze({ browser, launchContexts: new Set(browser.contexts()) });
+      state.browsers.set(headless, leased);
+    }
+    return { state, headless, leased, returned: false };
+  } catch (error) {
+    state.lentTo = null;
+    throw error;
+  }
+}
+
+/**
+ * 借りた Browser を返す。起動のときになかった Context が残っている・切れている・`discard`・lease が閉じた、のどれかなら、Browser を捨てて閉じ、
+ * 閉じる処理の失敗を返す（`closeBrowserBeforeDeadline` と同じ形）。ほかは、閉じずに lease に残す（`null`）。
+ */
+async function giveBackLeasedBrowser(
+  loan: BrowserLoan,
+  discard: boolean,
+  timeoutMs: number | undefined,
+): Promise<{ readonly error: unknown } | null> {
+  if (loan.returned) {
+    return null;
+  }
+  loan.returned = true;
+  const { state, headless, leased } = loan;
+  state.lentTo = null;
+  const contextLeft = leased.browser.contexts().some((context) => !leased.launchContexts.has(context));
+  if (!discard && !state.closed && !contextLeft && leased.browser.isConnected()) {
+    return null;
+  }
+  if (state.browsers.get(headless) === leased) {
+    state.browsers.delete(headless);
+  }
+  return closeBrowserBeforeDeadline(leased.browser, { timeoutMs });
+}
+
+/**
+ * 段の終わりに、PREFLIGHT が渡した Browser を片付ける（段の関数と Run Coordinator の唯一の口）。返す値は `closeBrowserBeforeDeadline` と同じ形。
+ * - 自分で起こした Browser（lease なし）は、閉じる。
+ * - lease から借りた Browser は、段の factory の Worker の自己検査の session を外してから、lease に返す（`giveBackLeasedBrowser`。残りがあれば捨てて閉じる）。
+ *   2 回目からは何もしない（借りた Browser を閉じない）。
+ */
+export async function endPreflightBrowser(
+  preflight: PreflightSuccess,
+  options: { readonly timeoutMs?: number | undefined } = {},
+): Promise<{ readonly error: unknown } | null> {
+  const loan = PREFLIGHT_LOANS.get(preflight);
+  if (loan === undefined) {
+    return closeBrowserBeforeDeadline(preflight.browser, options);
+  }
+  if (!loan.returned) {
+    await preflight.factory.close();
+  }
+  return giveBackLeasedBrowser(loan, false, options.timeoutMs);
+}
+
 export interface PreflightOptions {
   /** `loadConfig` で検証済みの設定。 */
   readonly config: AuditConfig;
   readonly launchBrowser: BrowserLauncher;
+  /**
+   * RB-5: Browser の lease（ワーカーとテスト）。渡すと、`launchBrowser` を呼ばずに lease から借りる（初めての段と、前の Browser を捨てた後は、lease が
+   * 自分の起動の関数で起こす。起動の誤りの項目は、自分で起こすときと同じ）。段の終わりは `endPreflightBrowser` で返す。`createBrowserLease` で作った値でなければ `TypeError`。
+   */
+  readonly browserLease?: BrowserLease | undefined;
   /** Context ごとに新しい `SafetyLedger` を作る関数。返す `BrowserContextFactory` も、この関数を使う。 */
   readonly createSafetyLedger: SafetyLedgerFactory;
   /** Run の artifact の出力先のディレクトリ。なければ作る。 */
@@ -116,7 +264,7 @@ export interface PreflightDeadlines extends PassiveSessionDeadlineOptions {
 
 export interface PreflightSuccess {
   readonly ok: true;
-  /** 起動した Chromium。閉じるのは、呼び出し側（Run Coordinator）である。 */
+  /** 起動した（RB-5: lease から借りた）Chromium。段の終わりに、呼び出し側が `endPreflightBrowser` で片付ける。 */
   readonly browser: Browser;
   /** `browser` と `config` と `createSafetyLedger` で作った factory。Run の Context は、これで作る。 */
   readonly factory: BrowserContextFactory;
@@ -132,7 +280,7 @@ export interface PreflightFailure {
   readonly ok: false;
   /** 最初に失敗した項目。 */
   readonly failedCheck: PreflightCheck;
-  /** 失敗の内容（`MAX_ERROR_MESSAGE_LENGTH` 以内）。 */
+  /** 失敗の内容（切り詰めない）。 */
   readonly message: string;
   /** Run の未完了の理由。コードは `PREFLIGHT_FAILED`、`detail` は `failedCheck`。 */
   readonly reason: IncompleteReason;
@@ -181,9 +329,16 @@ export async function runPreflight(options: PreflightOptions): Promise<Preflight
     }
   }
 
+  const leaseState = options.browserLease === undefined ? undefined : BROWSER_LEASES.get(options.browserLease);
   let browser: Browser;
+  let loan: BrowserLoan | null = null;
   try {
-    browser = await launchBrowser({ headless: !config.browser.headed });
+    if (leaseState === undefined) {
+      browser = await launchBrowser({ headless: !config.browser.headed });
+    } else {
+      loan = await borrowLeasedBrowser(leaseState, !config.browser.headed);
+      browser = loan.leased.browser;
+    }
   } catch (error) {
     // EL-12: 起動の部品の自己検査の不合格（外部のアプリの起動を止める設定が効かない）は、起動の失敗と分けた項目にする。
     return preflightFailure(isChromiumLaunchRefused(error, 'EXTERNAL_LAUNCH_BLOCK_UNAVAILABLE') ? 'EXTERNAL_LAUNCH_BLOCK' : 'BROWSER_LAUNCH', error, []);
@@ -196,7 +351,11 @@ export async function runPreflight(options: PreflightOptions): Promise<Preflight
     const guard = await checkPassiveGuard(factory, config, safetyLedgers, sessionDeadlines);
     if (guard.passed) {
       // Browser、factory、Ledger は、呼び出し側が使い続けるので、凍結しない（結果の外側と一覧だけを凍結する）。
-      return Object.freeze({ ok: true, browser, factory, safetyLedgers: Object.freeze([...safetyLedgers]) });
+      const success: PreflightSuccess = Object.freeze({ ok: true, browser, factory, safetyLedgers: Object.freeze([...safetyLedgers]) });
+      if (loan !== null) {
+        PREFLIGHT_LOANS.set(success, loan);
+      }
+      return success;
     }
     guardFailure = guard.failure;
   } catch (error) {
@@ -204,9 +363,11 @@ export async function runPreflight(options: PreflightOptions): Promise<Preflight
   }
 
   // 失敗した場合は、起動した Chromium を閉じる（Context も一緒に閉じる）。閉じるのに失敗した場合と、期限
-  // （`BROWSER_CLOSE_TIMEOUT_MS`）を過ぎた場合は、メッセージに加える。
+  // （`BROWSER_CLOSE_TIMEOUT_MS`）を過ぎた場合は、メッセージに加える。RB-5: lease から借りた Browser も、捨てて閉じる（今と同じく、次の段は起こし直す）。
   let message = describe(guardFailure);
-  const closeFailure = await closeBrowserBeforeDeadline(browser, { timeoutMs: browserCloseTimeoutMs });
+  const closeFailure = loan === null
+    ? await closeBrowserBeforeDeadline(browser, { timeoutMs: browserCloseTimeoutMs })
+    : await giveBackLeasedBrowser(loan, true, browserCloseTimeoutMs);
   if (closeFailure !== null) {
     message = `${message}; browser close failed: ${describe(closeFailure.error)}`;
   }
@@ -222,6 +383,9 @@ function assertPreflightOptions(options: PreflightOptions): void {
   }
   if (typeof options.launchBrowser !== 'function') {
     throw new TypeError('preflight requires a browser launcher function');
+  }
+  if (options.browserLease !== undefined && !BROWSER_LEASES.has(options.browserLease)) {
+    throw new TypeError('preflight browser lease must be made by createBrowserLease');
   }
   if (typeof options.createSafetyLedger !== 'function') {
     throw new TypeError('preflight requires a Safety Ledger factory function');
@@ -347,7 +511,7 @@ async function checkPassiveGuard(
 }
 
 function describe(error: unknown): string {
-  return safeErrorMessage(error, MAX_ERROR_MESSAGE_LENGTH);
+  return safeErrorMessage(error);
 }
 
 /** Guard を確かめる Context と page の、閉じる処理の失敗1つの文言（`guarded <手順> close failed: <内容>`）。 */

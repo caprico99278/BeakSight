@@ -11,10 +11,6 @@ export {
   FIELD_RULE_STATUSES,
   FIXED_LIST_GENERATION_METHOD,
   GENERATION_METHODS,
-  MAX_FIELD_RELATIONS,
-  MAX_FIXED_VALUE_LENGTH,
-  MAX_FIXED_VALUES,
-  MAX_RULE_RANGE_VALUE_LENGTH,
   NEEDS_RULE_INPUT_DETAILS,
   RULE_CONFLICT_DETAILS,
   RULE_ORIGINS,
@@ -54,8 +50,9 @@ export type { ExternalDeliveryKind } from './data-rules/external-delivery-words.
 
 export { isSemanticKindCompatible } from './data-rules/business-templates.js';
 
-export { evaluateRuleSet } from './data-rules/field-evaluation.js';
-export type { FieldEvaluation, RuleSetEvaluation } from './data-rules/field-evaluation.js';
+// MI-6: 承認の前の画面が、副作用の確認を「承認のときに確認する」前提で判定するための前提の値（判定の owner は field-evaluation.ts）。
+export { EXTERNAL_NOTIFICATION_AT_APPROVAL, PRE_APPROVAL_EVALUATION_PREMISE, evaluateRuleSet } from './data-rules/field-evaluation.js';
+export type { EvaluationPremise, FieldEvaluation, RuleSetEvaluation } from './data-rules/field-evaluation.js';
 
 export { generateScenarioData } from './data-rules/scenario-data.js';
 
@@ -63,7 +60,7 @@ export { generateScenarioData } from './data-rules/scenario-data.js';
 export { readVerificationVaryingRejectionOf } from './data-rules/varying-values.js';
 // FM2b（手を減らす段 2 の設計書 3A.2）: 照合の READ の期待の欄を、実行のたびに値が変わる欄から推す（許可の発行と同じ値の作り方と判定）。
 export { planRuleSet } from './data-rules/field-evaluation.js';
-export { varyingFieldNamesOf } from './data-rules/varying-values.js';
+export { uniqueEachRunFieldNamesOf, varyingFieldNamesOf } from './data-rules/varying-values.js';
 export type { ScenarioDataResult } from './data-rules/scenario-data.js';
 
 // FM2c（手動の操作を減らす設計書 3A.3）: 推した規則を保存できる規則の集まりの中身にする部品（下書きの自動の作成（FM2b）と画面が使う）。
@@ -77,6 +74,7 @@ export {
   RULE_SET_STORE_REJECTION_REASONS,
   readLatestRuleSet,
   readRuleSetRevisions,
+  defaultRuleSetIdOf,
   saveRuleSetAndAttach,
 } from './data-rules/rule-store.js';
 export type { RuleSetSaveAndAttachResult, RuleSetStoreRejectionReason, RuleSetStoreResult } from './data-rules/rule-store.js';

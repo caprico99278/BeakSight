@@ -1,13 +1,12 @@
 // FM2d（設計書 `2026-10-19-beaksight-fewer-manual-steps-design.md` 3A.1）: ワーカーのまとめて実行（ログイン 1 回の後に段を続ける）を、偽の IPC の口と偽のログインの段と
-// 偽の流れで確かめる（本物の子 process と Chromium は `tests/integration/stage-chain-fork-default.test.ts`・`stage-chain-fork-cli.test.ts`。中身は
-// `stage-chain-fork-cases.ts`）。
+// 偽の流れで確かめる（段 1 つの入口は `chain-stage.test.ts`、本物の子 process と Chromium は画面の `full-flow.test.ts`）。
 // - ログインは 1 回。段ごとに `RUN_STARTED`・`FINISHED`（未完了の理由のコードつき）を送り、途中の段の後に親の `NEXT_STAGE`・`CHAIN_END` を待つ。
 // - 次の段の認証の指定の初めの状態は、前の段の持ち越し（factory の最新の状態）。1 分の窓も次の段へ渡す。pacer は同じもの。
 // - 状態の値は IPC に出ない。`CHAIN_END`・止める要求・待つ上限では、次の段を始めない。持ち越しがなければ `FAILED`。
 // - 待っていないときの `NEXT_STAGE`、違う種類の `NEXT_STAGE` は契約の違反。
 import { resolve } from 'node:path';
 import { afterEach, describe, expect, it } from 'vitest';
-import type { AuditRunDependencies, AuditRunOutcome } from '../../src/cli/audit-run.js';
+import type { AuditRunDependencies, AuditRunOptions, AuditRunOutcome } from '../../src/cli/audit-run.js';
 import { EXIT_CODES, FAILURE_EXIT_CODE } from '../../src/cli/exit-codes.js';
 import { FORM_NAVIGATION_SETUP_ITEMS } from '../helpers/auth-setup-samples.js';
 import {type AuthSetup } from '../../src/control/auth/auth-setup-contracts.js';
@@ -24,6 +23,8 @@ import { startAuditWorker, type AuditWorker, type WorkerChannel } from '../../sr
 import type { LoginStageResult } from '../../src/worker/authenticated-login.js';
 import type { DiscoveryRunObserver, DiscoveryRunOutcome, DiscoveryRunRequest } from '../../src/worker/discovery-run.js';
 import type { ReadCheckRunObserver, ReadCheckRunOutcome, ReadCheckRunRequest } from '../../src/worker/read-check-run.js';
+import type { WriteCreateRunObserver, WriteCreateRunOutcome, WriteCreateRunRequest } from '../../src/worker/write-create-run.js';
+import { sampleStartApiWrite, sampleStartUpdateWrite, sampleStartWrite } from './worker-write-samples.js';
 import { createTestConfig } from '../helpers/test-config.js';
 
 const ORIGIN = 'http://127.0.0.1:4173';
@@ -38,6 +39,15 @@ const LOGIN_VALUE = 'chain-login-marker-1';
 /** 監査の段の後の状態の目印（次の段に渡ることを確かめる）。 */
 const AUDIT_VALUE = 'chain-audit-marker-2';
 const DISCOVERY_VALUE = 'chain-discovery-marker-3';
+const READ_VALUE = 'chain-read-marker-4';
+const WRITE_VALUE = 'chain-write-marker-5-';
+const WRITE_RUN = 'RUN-20261022010300' as RunId;
+const WRITE_RUN_2 = 'RUN-20261022010400' as RunId;
+
+/** OP-2: 書き込みの段の結果（照合まで済んだ）。 */
+const writeOutcomeOf = (runId: RunId): WriteCreateRunOutcome => ({
+  kind: 'RAN', runId, runDirectory: resolve(OUTPUT_DIRECTORY, runId), runStatus: 'COMPLETE', exitCode: EXIT_CODES.COMPLETE, result: 'VERIFIED',
+} as unknown as WriteCreateRunOutcome);
 
 const SETUP: AuthSetup = Object.freeze({
   ...FORM_NAVIGATION_SETUP_ITEMS,
@@ -66,7 +76,20 @@ const READ_CHECKS = Object.freeze([{
   definition: { targetIdentityDigest: `sha256:${'c'.repeat(64)}`, parameters: { q: 'x' }, expectations: [{ kind: 'ROW_COUNT_AT_LEAST', count: 1 }] },
 }]);
 
-const chainStart = (): Record<string, unknown> => ({
+/** OP-H: `START` の、チェックした画面の数。 */
+const CHECKED_SCREEN_COUNT = 2;
+
+/** NL-2: `START` の認証の指定（`noLogin` なら、ログインなしの形。`setup` が null）。 */
+const startAuthenticationOf = (noLogin: boolean, setup: AuthSetup | null = SETUP): Record<string, unknown> => {
+  const used = noLogin ? null : setup;
+  return {
+    setup: used,
+    approvedTestOrigins: [ORIGIN],
+    authenticationSha256: workerAuthenticationDigestOf(used, [ORIGIN], { jobKind: 'AUDIT', automatedLogin: null }),
+  };
+};
+
+const chainStart = (writeStages = false, noLogin = false, chained = true): Record<string, unknown> => ({
   protocol: WORKER_PROTOCOL_VERSION,
   type: 'START',
   jobId: 'job-audit',
@@ -74,12 +97,11 @@ const chainStart = (): Record<string, unknown> => ({
   targetConfigPath: TARGET_CONFIG_PATH,
   startNew: false,
   targetConfigSha256: targetConfigDigestOf(TARGET_CONFIG_BYTES),
-  authentication: {
-    setup: SETUP,
-    approvedTestOrigins: [ORIGIN],
-    authenticationSha256: workerAuthenticationDigestOf(SETUP, [ORIGIN], { jobKind: 'AUDIT', automatedLogin: null }),
-  },
-  chain: { stages: ['AUDIT', 'DISCOVERY', 'READ_CHECK'] },
+  authentication: startAuthenticationOf(noLogin),
+  // OP-H: 書き込みの段の印は、チェックした画面の数と一緒。
+  ...(chained
+    ? { chain: { stages: ['AUDIT', 'DISCOVERY', 'READ_CHECK'], ...(writeStages ? { writeStages: true, writeScreenCount: CHECKED_SCREEN_COUNT } : {}) } }
+    : {}),
 });
 
 const auditOutcome: AuditRunOutcome = {
@@ -120,10 +142,13 @@ type ParentReply = (finishedCount: number) => Record<string, unknown> | null;
 interface Run {
   readonly sent: readonly WorkerToParentMessage[];
   readonly exitCode: number;
-  readonly calls: { login: number; audit: number; discovery: number; read: number };
+  readonly calls: { login: number; audit: number; discovery: number; read: number; write: number };
   readonly auditDependencies: readonly AuditRunDependencies[];
+  readonly auditOptions: readonly AuditRunOptions[];
   readonly discoveryRequests: readonly DiscoveryRunRequest[];
   readonly readRequests: readonly ReadCheckRunRequest[];
+  /** OP-2: 書き込みの段の要求。 */
+  readonly writeRequests: readonly WriteCreateRunRequest[];
   /** FM2R の C-1: 発見と READ の段の最初の読み込みの前に待った時間（ms）。 */
   readonly waits: { readonly discovery: number | null; readonly read: number | null };
 }
@@ -154,19 +179,34 @@ async function runWorker(options: {
   /** 監査の段の中で、親から受ける（止める要求など）。 */
   readonly duringAudit?: (emit: (value: unknown) => void) => void;
   readonly nextStageTimeoutMs?: number;
+  /** OP-2: `START` に書き込みの段の印を入れる。 */
+  readonly writeStages?: boolean;
+  /** OP-2: 確かめ直しの依頼を受けたときの親。 */
+  readonly onRecheck?: (emit: (value: unknown) => void) => void;
+  /** NL-2: ログインなしの `START`（`setup` が null）。 */
+  readonly noLogin?: boolean;
+  /** NL-2: まとめて実行でない `START`（監査のジョブだけ）。 */
+  readonly chained?: boolean;
+  /** NL-2: `START` の認証の SHA-256 を、この値に置き換える（食い違いの回）。 */
+  readonly digestOverride?: string;
 }): Promise<Run> {
   const sent: WorkerToParentMessage[] = [];
   const waits: { discovery: number | null; read: number | null } = { discovery: null, read: null };
   const listeners: ((value: unknown) => void)[] = [];
   const emit = (value: unknown): void => listeners.forEach((listener) => listener(value));
-  const calls = { login: 0, audit: 0, discovery: 0, read: 0 };
+  const calls = { login: 0, audit: 0, discovery: 0, read: 0, write: 0 };
+  const writeRequests: WriteCreateRunRequest[] = [];
   const auditDependencies: AuditRunDependencies[] = [];
+  const auditOptions: AuditRunOptions[] = [];
   const discoveryRequests: DiscoveryRunRequest[] = [];
   const readRequests: ReadCheckRunRequest[] = [];
   let finished = 0;
   const channel: WorkerChannel = {
     send: (message) => {
       sent.push(message);
+      if (message.type === 'WRITE_RECHECK_REQUEST') {
+        options.onRecheck?.(emit);
+      }
       if (message.type === 'FINISHED') {
         finished += 1;
         const reply = options.reply(finished);
@@ -188,9 +228,10 @@ async function runWorker(options: {
     exit: () => undefined,
     loadConfig: () => Promise.resolve(config),
     readTargetConfig: () => Promise.resolve(TARGET_CONFIG_BYTES),
-    executeAuditRun: async (_config, dependencies, _options, observer) => {
+    executeAuditRun: async (_config, dependencies, options_, observer) => {
       calls.audit += 1;
       auditDependencies.push(dependencies);
+      auditOptions.push(options_);
       observer.onRunStarted?.({ runId: AUDIT_RUN, runDirectory: resolve(OUTPUT_DIRECTORY, AUDIT_RUN), resumeDecision: { kind: 'NEW_RUN' } });
       options.duringAudit?.(emit);
       if (options.carryAudit !== false) {
@@ -226,16 +267,39 @@ async function runWorker(options: {
       readRequests.push(request);
       waits.read = await request.navigationPacer?.beforeNavigation() ?? null;
       observer.onRunStarted({ runId: READ_RUN, runDirectory: resolve(OUTPUT_DIRECTORY, READ_RUN) });
+      request.stageCarry?.record({
+        latestState: stateWith(READ_VALUE),
+        serviceRequestWindowMs: [4_000],
+        navigation: { lastNavigationStartedAtMs: Date.now(), stageEndedAtMs: Date.now(), minIntervalMs: 0 },
+      });
       return readOutcome;
+    },
+    executeWriteCreate: async (request: WriteCreateRunRequest, observer: WriteCreateRunObserver) => {
+      calls.write += 1;
+      writeRequests.push(request);
+      const runId = (calls.write === 1 ? WRITE_RUN : WRITE_RUN_2);
+      observer.onRunStarted({ runId, runDirectory: resolve(OUTPUT_DIRECTORY, runId) });
+      // 送る直前の確かめ直しと送信の報告は、段ごとに 1 回（段ごとに部品を作り直す）。
+      await request.recheck();
+      request.reportSubmission({ submission: 'SENT', blockReason: null });
+      request.stageCarry?.record({
+        latestState: stateWith(WRITE_VALUE + String(calls.write)),
+        serviceRequestWindowMs: [5_000],
+        navigation: { lastNavigationStartedAtMs: Date.now(), stageEndedAtMs: Date.now(), minIntervalMs: 0 },
+      });
+      return writeOutcomeOf(runId);
     },
     startTimeoutMs: 2_000,
     heartbeatIntervalMs: 1_000,
     ...(options.nextStageTimeoutMs === undefined ? {} : { nextStageTimeoutMs: options.nextStageTimeoutMs }),
   });
   workers.push(worker);
-  emit(chainStart());
+  const start = chainStart(options.writeStages === true, options.noLogin === true, options.chained !== false);
+  emit(options.digestOverride === undefined
+    ? start
+    : { ...start, authentication: { ...(start['authentication'] as Record<string, unknown>), authenticationSha256: options.digestOverride } });
   const exitCode = await worker.exited;
-  return { sent, exitCode, calls, auditDependencies, discoveryRequests, readRequests, waits };
+  return { sent, exitCode, calls, auditDependencies, auditOptions, discoveryRequests, readRequests, writeRequests, waits };
 }
 
 const meaningful = (run: Run): readonly WorkerToParentMessage[] => run.sent.filter(({ type }) => type !== 'HEARTBEAT' && type !== 'READY');
@@ -244,7 +308,7 @@ describe('audit worker session (FM2d): the chained run', () => {
   it('logs in once, runs the audit, the discovery and the READ check, and carries the latest state, the window and the pacer', async () => {
     const run = await runWorker({ reply: advancingParent });
 
-    expect(run.calls).toEqual({ login: 1, audit: 1, discovery: 1, read: 1 });
+    expect(run.calls).toEqual({ login: 1, audit: 1, discovery: 1, read: 1 , write: 0 });
     // 監査の段: ログインの状態から始め、外の pacer と持ち越しの口を渡す（手動のログインでも pacer を渡す）。
     const [auditDependencies] = run.auditDependencies;
     expect(auditDependencies?.authentication?.initialState).toEqual(stateWith(LOGIN_VALUE));
@@ -266,6 +330,10 @@ describe('audit worker session (FM2d): the chained run', () => {
     expect(read?.stageCarry?.serviceRequestWindowMs).toEqual([3_000]);
     expect(read?.navigationPacer).not.toBe(discovery?.navigationPacer);
     expect(run.waits.read ?? 0).toBeGreaterThanOrEqual(DISCOVERY_RAISED_INTERVAL_MS - TIMER_TOLERANCE_MS);
+    // RB-5: どの段も、ワーカーの同じ Browser の lease から借りる。
+    expect(auditDependencies?.browserLease).toBeDefined();
+    expect(discovery?.browserLease).toBe(auditDependencies?.browserLease);
+    expect(read?.browserLease).toBe(auditDependencies?.browserLease);
 
     expect(meaningful(run).map((message) => (message.type === 'RUN_STARTED' ? `RUN_STARTED:${message.runId}` : message.type))).toEqual([
       'AUTH_STATE', `RUN_STARTED:${AUDIT_RUN}`, 'FINISHED', `RUN_STARTED:${DISCOVERY_RUN}`, 'FINISHED', `RUN_STARTED:${READ_RUN}`, 'FINISHED',
@@ -282,9 +350,18 @@ describe('audit worker session (FM2d): the chained run', () => {
     }
   });
 
+  // OP-J（J1。設計書 `2026-10-27-beaksight-one-pass-flow-design.md` 4.1.6）: 操作さがしの段には、直前の点検の段の Run のディレクトリを渡す（その成果物のリンクを読む先に
+  // する。メモリの外の IPC には載せない）。READ の段には渡さない。
+  it('passes the Run directory of the audit stage just before to the discovery stage (OP-J J1)', async () => {
+    const run = await runWorker({ reply: advancingParent });
+    const [discovery] = run.discoveryRequests;
+    expect(discovery?.chainedAuditRunDirectory).toBe(resolve(OUTPUT_DIRECTORY, AUDIT_RUN));
+    expect(JSON.stringify(run.sent)).not.toContain('chainedAuditRunDirectory');
+  });
+
   it('does not start the next stage on CHAIN_END, and exits with the exit code of the finished stage', async () => {
     const run = await runWorker({ reply: () => CHAIN_END });
-    expect(run.calls).toEqual({ login: 1, audit: 1, discovery: 0, read: 0 });
+    expect(run.calls).toEqual({ login: 1, audit: 1, discovery: 0, read: 0 , write: 0 });
     expect(run.exitCode).toBe(EXIT_CODES.PARTIAL);
   });
 
@@ -293,25 +370,25 @@ describe('audit worker session (FM2d): the chained run', () => {
       reply: advancingParent,
       duringAudit: (emit) => emit({ protocol: WORKER_PROTOCOL_VERSION, type: 'STOP', force: false }),
     });
-    expect(run.calls).toEqual({ login: 1, audit: 1, discovery: 0, read: 0 });
+    expect(run.calls).toEqual({ login: 1, audit: 1, discovery: 0, read: 0 , write: 0 });
     expect(run.exitCode).toBe(EXIT_CODES.PARTIAL);
   });
 
   it('does not start the next stage on a stop while it waits for the next stage', async () => {
     const run = await runWorker({ reply: () => ({ protocol: WORKER_PROTOCOL_VERSION, type: 'STOP', force: false }) });
-    expect(run.calls).toEqual({ login: 1, audit: 1, discovery: 0, read: 0 });
+    expect(run.calls).toEqual({ login: 1, audit: 1, discovery: 0, read: 0 , write: 0 });
     expect(run.exitCode).toBe(EXIT_CODES.PARTIAL);
   });
 
   it('ends without the next stage when the parent does not answer in time', async () => {
     const run = await runWorker({ reply: () => null, nextStageTimeoutMs: 50 });
-    expect(run.calls).toEqual({ login: 1, audit: 1, discovery: 0, read: 0 });
+    expect(run.calls).toEqual({ login: 1, audit: 1, discovery: 0, read: 0 , write: 0 });
     expect(run.exitCode).toBe(EXIT_CODES.PARTIAL);
   });
 
   it('fails the next stage when the latest state of the previous stage was not carried over (fail-closed)', async () => {
     const run = await runWorker({ reply: advancingParent, carryAudit: false });
-    expect(run.calls).toEqual({ login: 1, audit: 1, discovery: 0, read: 0 });
+    expect(run.calls).toEqual({ login: 1, audit: 1, discovery: 0, read: 0 , write: 0 });
     expect(meaningful(run).flatMap((message) => (message.type === 'FAILED' ? [message.reason] : []))).toEqual(['UNEXPECTED_FAILURE']);
     expect(run.exitCode).toBe(FAILURE_EXIT_CODE);
   });
@@ -326,5 +403,117 @@ describe('audit worker session (FM2d): the chained run', () => {
     const run = await runWorker({ reply: advancingParent, duringAudit: (emit) => emit(NEXT_DISCOVERY) });
     expect(run.calls.discovery).toBe(0);
     expect(meaningful(run).flatMap((message) => (message.type === 'FAILED' ? [message.reason] : []))).toEqual(['PROTOCOL_VIOLATION']);
+  });
+});
+
+describe('audit worker session (OP-2): the write stages at the end of the chained run', () => {
+  const nextWrite = (jobId: string, jobKind: 'WRITE_CREATE' | 'WRITE_UPDATE', write: Record<string, unknown>): Record<string, unknown> =>
+    ({ protocol: WORKER_PROTOCOL_VERSION, type: 'NEXT_STAGE', jobId, jobKind, write });
+  const recheckAllowed = { protocol: WORKER_PROTOCOL_VERSION, type: 'WRITE_RECHECK_RESULT', allowed: true, reason: null };
+
+  /** 親: 発見 → READ → 登録 → 更新 → 終わり。 */
+  const writingParent: ParentReply = (count) => {
+    switch (count) {
+      case 1: return NEXT_DISCOVERY;
+      case 2: return NEXT_READ;
+      case 3: return nextWrite('job-write-create', 'WRITE_CREATE', sampleStartWrite(ORIGIN));
+      case 4: return nextWrite('job-write-update', 'WRITE_UPDATE', sampleStartUpdateWrite(ORIGIN));
+      default: return CHAIN_END;
+    }
+  };
+
+  /** 確かめ直しの依頼に許しを返す親の口を足した `runWorker`。 */
+  const runWorkerWithRecheck = (options: Parameters<typeof runWorker>[0]): Promise<Run> =>
+    runWorker({ ...options, onRecheck: (emit) => setImmediate(() => emit(recheckAllowed)) });
+
+  it('runs a create and an update stage after the read stages with the one login, carrying the state, and recreates the recheck per stage', async () => {
+    const run = await runWorkerWithRecheck({ reply: writingParent, writeStages: true });
+    expect(run.calls).toEqual({ login: 1, audit: 1, discovery: 1, read: 1, write: 2 });
+    // OP-H: 監査の段の報告に、この後に登録・更新するチェックした画面の数を渡す。
+    expect(run.auditOptions).toEqual([{ startNew: false, plannedWriteScreenCount: CHECKED_SCREEN_COUNT }]);
+    const [create, update] = run.writeRequests;
+    expect(create?.jobId).toBe('job-write-create');
+    expect(create?.authentication.initialState).toEqual(stateWith(READ_VALUE));
+    expect(create?.stageCarry?.serviceRequestWindowMs).toEqual([4_000]);
+    expect(update?.jobId).toBe('job-write-update');
+    expect(update?.authentication.initialState).toEqual(stateWith(`${WRITE_VALUE}1`));
+    // 段ごとに、確かめ直しの依頼 1 回と送信の報告 1 回。
+    const types = meaningful(run).map(({ type }) => type);
+    expect(types.filter((type) => type === 'WRITE_RECHECK_REQUEST')).toHaveLength(2);
+    expect(types.filter((type) => type === 'WRITE_SUBMISSION')).toHaveLength(2);
+    expect(run.exitCode).toBe(EXIT_CODES.COMPLETE);
+    expect(run.sent.every((message) => validateWorkerToParentMessage(message).ok)).toBe(true);
+    const ipc = JSON.stringify(run.sent);
+    for (const marker of [LOGIN_VALUE, READ_VALUE, WRITE_VALUE]) {
+      expect(ipc).not.toContain(marker);
+    }
+  });
+
+  it('does not wait for a write stage without the write stages mark of START (ends after the last read stage)', async () => {
+    const run = await runWorkerWithRecheck({ reply: writingParent, writeStages: false });
+    expect(run.calls).toEqual({ login: 1, audit: 1, discovery: 1, read: 1, write: 0 });
+    expect(run.auditOptions).toEqual([{ startNew: false }]);
+    expect(meaningful(run).filter(({ type }) => type === 'FAILED')).toEqual([]);
+  });
+
+  it('rejects a write stage whose write specification does not pass the checks of START (an API origin START did not approve)', async () => {
+    // `START` は承認したサービスの Origin を持たない。API の送り先の Origin の確かめは、`START` の確かめでだけ行える。
+    const outside = sampleStartApiWrite(ORIGIN);
+    const run = await runWorkerWithRecheck({
+      reply: (count) => (count === 1 ? NEXT_DISCOVERY : count === 2 ? NEXT_READ : count === 3 ? nextWrite('job-write-x', 'WRITE_CREATE', outside) : CHAIN_END),
+      writeStages: true,
+    });
+    expect(run.calls.write).toBe(0);
+    expect(meaningful(run).flatMap((message) => (message.type === 'FAILED' ? [message.reason] : []))).toEqual(['PROTOCOL_VIOLATION']);
+  });
+
+  it('can go to the write stages right after the discovery when there is no READ check (the parent skips it)', async () => {
+    const run = await runWorkerWithRecheck({
+      reply: (count) => (count === 1 ? NEXT_DISCOVERY : count === 2 ? nextWrite('job-write-create', 'WRITE_CREATE', sampleStartWrite(ORIGIN)) : CHAIN_END),
+      writeStages: true,
+    });
+    expect(run.calls).toEqual({ login: 1, audit: 1, discovery: 1, read: 0, write: 1 });
+  });
+
+  // NL-2（設計書 `2026-11-06-beaksight-no-login-test-site-design.md` 3.2 の 3・4）: ログインなしの `START`（`setup` が null）は、ログインの段を呼ばず、空の状態から
+  // 始める。`AUTH_STATE`（`AWAITING_LOGIN` を含む）は送らない。セッションの切れの path は持たない（null）。監査の段の除外は既定の危険な語だけ。段の間の状態の
+  // 受け継ぎは、空の状態でも今のとおり（前の段の最新の状態から始める）。
+  it('runs the chained run without a login: no login stage, no AUTH_STATE, an empty first state and no session lost path (NL-2)', async () => {
+    const run = await runWorkerWithRecheck({ reply: writingParent, writeStages: true, noLogin: true });
+    expect(run.calls).toEqual({ login: 0, audit: 1, discovery: 1, read: 1, write: 2 });
+    const [auditDependencies] = run.auditDependencies;
+    expect(auditDependencies?.authentication?.initialState).toEqual({ cookies: [], origins: [] });
+    expect(auditDependencies?.authentication?.sessionLostPathPrefix).toBeNull();
+    expect(auditDependencies?.authentication?.approvedTestOrigins).toEqual([ORIGIN]);
+    expect(auditDependencies?.authentication?.auditExclusions).toMatchObject({ excludedPathPrefixes: [], auditPathPrefixes: [] });
+    expect(auditDependencies?.authentication?.auditExclusions.dangerousTerms.length).toBeGreaterThan(0);
+    expect(auditDependencies?.authentication?.auditStage).toBeUndefined();
+    expect(auditDependencies?.navigationPacer).toBeDefined();
+    // 段の間の状態の受け継ぎ（前の段の最新の状態）。
+    expect(run.discoveryRequests[0]?.authentication.initialState).toEqual(stateWith(AUDIT_VALUE));
+    expect(run.discoveryRequests[0]?.authentication.sessionLostPathPrefix).toBeNull();
+    expect(run.readRequests[0]?.authentication.initialState).toEqual(stateWith(DISCOVERY_VALUE));
+    expect(run.writeRequests[0]?.authentication.initialState).toEqual(stateWith(READ_VALUE));
+    expect(run.writeRequests[1]?.authentication.initialState).toEqual(stateWith(`${WRITE_VALUE}1`));
+    expect(run.writeRequests.map(({ authentication }) => authentication.sessionLostPathPrefix)).toEqual([null, null]);
+    const types = meaningful(run).map(({ type }) => type);
+    expect(types).not.toContain('AUTH_STATE');
+    expect(types.filter((type) => type === 'WRITE_SUBMISSION')).toHaveLength(2);
+    expect(types).not.toContain('FAILED');
+    expect(run.exitCode).toBe(EXIT_CODES.COMPLETE);
+    expect(run.sent.every((message) => validateWorkerToParentMessage(message).ok)).toBe(true);
+  });
+
+  it('runs a single audit job without a login from the empty state (NL-2)', async () => {
+    const run = await runWorker({ reply: () => null, noLogin: true, chained: false });
+    expect(run.calls).toEqual({ login: 0, audit: 1, discovery: 0, read: 0, write: 0 });
+    expect(run.auditDependencies[0]?.authentication).toMatchObject({ initialState: { cookies: [], origins: [] }, sessionLostPathPrefix: null });
+    expect(meaningful(run).map(({ type }) => type)).toEqual(['RUN_STARTED', 'FINISHED']);
+  });
+
+  it('fails without the login stage when the digest of the START without a login does not match (NL-2)', async () => {
+    const run = await runWorkerWithRecheck({ reply: writingParent, writeStages: true, noLogin: true, digestOverride: 'f'.repeat(64) });
+    expect(run.calls).toEqual({ login: 0, audit: 0, discovery: 0, read: 0, write: 0 });
+    expect(meaningful(run).flatMap((message) => (message.type === 'FAILED' ? [message.reason] : []))).toEqual(['AUTH_SETUP_CHANGED']);
   });
 });

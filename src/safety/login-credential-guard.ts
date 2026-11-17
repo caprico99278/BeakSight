@@ -6,7 +6,11 @@
 //   含まれていれば止める（`carriesLoginCredential`）。token の送信そのもの（承認した送信先）は比べない。
 // - 比べる形は 3 つ（`comparableFormsOf`）: そのまま、URL の符号化（`encodeURIComponent`、その空白（`%20`）を `+` にした形、
 //   `application/x-www-form-urlencoded` の形）、JSON の文字列の符号化（`JSON.stringify` の中身）。URL の符号化の形は、16 進の大文字と小文字を区別
-//   しない。ほかの形（base64、二重の符号化、文字コードの違いなど）は限界。
+//   しない。SFIX-1104（SREV-1104 の C-1）: 加えて、パスワードと「ユーザー名:パスワード」の base64（標準と URL 用、パディングの有無）も比べ
+//   （`base64FormsOf`）、`Authorization`・`Proxy-Authorization` の `Basic` の値は、解いてから比べる（`basicCredentialTextsOf`）。どの段・どの口の比べにも当たる。
+//   SFIX-1104-2（SREV-1104-2 の C1・C2）: base64 の形は、寛容に `%XX` を戻した形でも比べ（`+` を空白に直す形は使わない）、読み取りでない要求では
+//   ユーザー名だけの base64 も比べる（読み取りの要求のユーザー名は、そのままの形も base64 も比べない）。
+//   ほかの形（長い文の途中に混ぜて base64 にした形、二重の符号化、文字コードの違い、暗号化など）は限界。
 // - 空の値は比べない。`MIN_COMPARABLE_CREDENTIAL_LENGTH` より短い値は、部分一致で正しく比べられないので、どの送信にも含まれるとみなす（止めすぎは
 //   安全の側。設計者への報告の閾値。どの要求にも当てるので、短い値ではログインの画面そのものを読めない）。本文を読めない（本文があるのに部品が取れない、file や blob の部品）とき、捨てた部品のときも、含まれるとみなす
 //   （fail-closed）。
@@ -58,6 +62,10 @@ interface ValueForms {
 interface CredentialState {
   passwordForms: ValueForms;
   usernameForms: ValueForms;
+  /** SFIX-1104 の C-1: パスワードと「ユーザー名:パスワード」の base64 の形（大文字と小文字を区別する。空の値は持たない）。 */
+  base64Forms: readonly ComparableForm[];
+  /** SFIX-1104-2（SREV-1104-2 の C2）: ユーザー名だけの base64 の形（読み取りでない要求だけ比べる。空の値は持たない）。 */
+  usernameBase64Forms: readonly ComparableForm[];
   /**
    * T43R2-fix: ユーザー名を区切りと `@` で分けた、`MIN_COMPARABLE_CREDENTIAL_LENGTH` 以上の部分（NFKC と大文字小文字を畳んだ形）。ログインの段の観察の
    * 案と逆向きに比べる（`carriesLoginCredentialInTexts`）。
@@ -152,7 +160,9 @@ export function createLoginCredentialGuard(values: LoginCredentialValues): Login
  */
 export function createPendingLoginCredentialGuard(): LoginCredentialGuard {
   const guard = new LoginCredentialGuard();
-  credentialStates.set(guard, { passwordForms: NO_VALUE_FORMS, usernameForms: NO_VALUE_FORMS, usernameParts: [], discarded: false, armed: false });
+  credentialStates.set(guard, {
+    passwordForms: NO_VALUE_FORMS, usernameForms: NO_VALUE_FORMS, base64Forms: [], usernameBase64Forms: [], usernameParts: [], discarded: false, armed: false,
+  });
   return guard;
 }
 
@@ -183,6 +193,10 @@ export function armLoginCredentialGuard(guard: LoginCredentialGuard, values: Log
   }
   state.passwordForms = valueFormsOf(password);
   state.usernameForms = valueFormsOf(username);
+  // SFIX-1104 の C-1: パスワードと、Basic の認証の形（ユーザー名:パスワード）の base64。
+  state.base64Forms = password.length === 0 ? [] : Object.freeze([...base64FormsOf(password), ...base64FormsOf(`${username}:${password}`)]);
+  // SFIX-1104-2 の C2: ユーザー名だけの base64（読み取りでない要求だけ比べる。ユーザー名を比べる決まりと同じ）。
+  state.usernameBase64Forms = username.length === 0 ? [] : Object.freeze(base64FormsOf(username));
   state.usernameParts = Object.freeze(foldedPartsOf(username).filter((part) => part.length >= MIN_COMPARABLE_CREDENTIAL_LENGTH));
   state.armed = true;
 }
@@ -197,6 +211,8 @@ export function discardLoginCredentialGuard(guard: LoginCredentialGuard): void {
   if (state !== undefined) {
     state.passwordForms = NO_VALUE_FORMS;
     state.usernameForms = NO_VALUE_FORMS;
+    state.base64Forms = [];
+    state.usernameBase64Forms = [];
     state.discarded = true;
   }
 }
@@ -334,6 +350,42 @@ const containsForm = (texts: readonly string[], forms: readonly ComparableForm[]
   return forms.some((form) => (form.caseInsensitive ? lowered : expanded).some((value) => value.includes(form.value)));
 };
 
+/** SFIX-1104 の C-1: base64 の 4 つの形（標準と URL 用の、パディングの有無）。同じ形は 1 つにまとめる。 */
+function base64FormsOf(value: string): readonly ComparableForm[] {
+  const standard = Buffer.from(value, 'utf8').toString('base64');
+  const unpadded = standard.replace(/=+$/u, '');
+  const urlSafe = unpadded.split('+').join('-').split('/').join('_');
+  return [...new Set([standard, unpadded, urlSafe, `${urlSafe}${'='.repeat(standard.length - unpadded.length)}`])]
+    .map((form) => Object.freeze({ value: form, caseInsensitive: false }));
+}
+
+/** SFIX-1104 の C-1: `Basic` の認証の値を運ぶヘッダの名前（小文字）。 */
+const BASIC_AUTHORIZATION_HEADERS: ReadonlySet<string> = new Set(['authorization', 'proxy-authorization']);
+/** `Basic` の値（大文字と小文字を区別しない）。 */
+const BASIC_SCHEME = /^\s*basic\s+(\S+)\s*$/iu;
+
+/** SFIX-1104 の C-1: `Authorization`・`Proxy-Authorization` の `Basic` の値を解いた文字列（標準と URL 用の base64。解けなければ何も足さない）。 */
+const basicCredentialTextsOf = (headers: Readonly<Record<string, string>> | undefined): readonly string[] =>
+  Object.entries(headers ?? {}).flatMap(([name, value]) => {
+    if (typeof value !== 'string' || !BASIC_AUTHORIZATION_HEADERS.has(name.toLowerCase())) {
+      return [];
+    }
+    const encoded = BASIC_SCHEME.exec(value)?.[1];
+    return encoded === undefined ? [] : [Buffer.from(encoded.split('-').join('+').split('_').join('/'), 'base64').toString('utf8')];
+  });
+
+/**
+ * SFIX-1104 の C-1: base64 の形が、文字列のどれかに含まれるか。SFIX-1104-2（SREV-1104-2 の C1）: 文字列は、そのままと、寛容に `%XX` を戻した形
+ * （`encodeURIComponent` や form の符号化で `+`・`/`・`=` が `%2B`・`%2F`・`%3D` になった形）で比べる。`+` を空白に直す形は使わない（base64 の `+` を壊す）。
+ */
+const containsBase64Form = (texts: readonly string[], forms: readonly ComparableForm[]): boolean => {
+  if (forms.length === 0) {
+    return false;
+  }
+  const expanded = texts.flatMap((text) => [text, lenientPercentDecoded(text)]);
+  return forms.some((form) => expanded.some((text) => text.includes(form.value)));
+};
+
 /** 1 つの値が、文字列に含まれるとみなすか（短すぎる値は、どの文字列にも含まれるとみなす）。 */
 const carriedIn = (value: ValueForms, texts: readonly string[]): boolean =>
   value.tooShort || containsForm(texts, value.forms);
@@ -342,6 +394,7 @@ const carriedIn = (value: ValueForms, texts: readonly string[]): boolean =>
  * 要求に、入れた資格情報が含まれるか（ファイルの先頭の説明）。捨てた部品と知らない部品は、含まれるとみなす。値を入れる前の部品は、何も比べない。
  * - パスワード: URL・本文・ヘッダの値・Cookie（読み取りを含むすべての要求）。読めない本文と読めない Cookie は、含まれるとみなす。
  * - ユーザー名: 読み取りでない要求の URL・本文・ヘッダの値だけ。読めない本文は、含まれるとみなす。
+ * - base64（SFIX-1104・SFIX-1104-2）: パスワードと「ユーザー名:パスワード」はすべての要求、ユーザー名だけは読み取りでない要求。`%XX` を戻した形も比べる。
  */
 export function carriesLoginCredential(guard: LoginCredentialGuard, request: LoginCredentialCheckRequest): boolean {
   const state = credentialStates.get(guard);
@@ -353,15 +406,24 @@ export function carriesLoginCredential(guard: LoginCredentialGuard, request: Log
   }
   const headerValues = Object.values(request.headers ?? {}).filter((value): value is string => typeof value === 'string');
   const bodyTexts = request.body.kind === 'TEXT' ? [request.body.text] : [];
-  const requestTexts = [request.url, ...headerValues, ...bodyTexts];
+  // SFIX-1104 の C-1: `Basic` の認証の値は、解いた文字列も比べる。
+  const requestTexts = [request.url, ...headerValues, ...basicCredentialTextsOf(request.headers), ...bodyTexts];
+  const cookieTexts = request.cookies.kind === 'READ' ? request.cookies.texts : [];
+  if (containsBase64Form([...requestTexts, ...cookieTexts], state.base64Forms)) {
+    return true;
+  }
   const passwordCarried = (request.body.kind === 'UNREADABLE' || request.cookies.kind === 'UNREADABLE')
     ? state.passwordForms.forms.length > 0 || state.passwordForms.tooShort
-    : carriedIn(state.passwordForms, [...requestTexts, ...(request.cookies.kind === 'READ' ? request.cookies.texts : [])]);
+    : carriedIn(state.passwordForms, [...requestTexts, ...cookieTexts]);
   if (passwordCarried) {
     return true;
   }
   if (request.readMethod) {
     return false;
+  }
+  // SFIX-1104-2 の C2: 読み取りでない要求では、ユーザー名だけの base64 も比べる（`%XX` を戻した形も）。
+  if (containsBase64Form(requestTexts, state.usernameBase64Forms)) {
+    return true;
   }
   return request.body.kind === 'UNREADABLE'
     ? state.usernameForms.forms.length > 0 || state.usernameForms.tooShort
@@ -378,7 +440,7 @@ export function carriesLoginCredentialInTexts(guard: LoginCredentialGuard, texts
   if (state === undefined || state.discarded || !state.armed) {
     return true;
   }
-  if (carriedIn(state.passwordForms, texts) || carriedIn(state.usernameForms, texts)) {
+  if (carriedIn(state.passwordForms, texts) || carriedIn(state.usernameForms, texts) || containsBase64Form(texts, state.base64Forms)) {
     return true;
   }
   // T43R2-fix（Task 43 の設計書 7 章の最後の行）: 逆向きにも比べる。ユーザー名の部分（区切りと `@` で分けた 4 文字以上）が、文字列の部分（同じ区切りで
@@ -404,5 +466,5 @@ export function carriesLoginCredentialInState(guard: LoginCredentialGuard, carri
     // DEF-139: 引き継ぐ IndexedDB の、データベースの名前と中身の文字列。
     ...carried.origins.flatMap(({ indexedDB }) => (indexedDB ?? []).flatMap(({ name, stores }) => [name, ...nestedTextsOf(stores)])),
   ];
-  return carriedIn(state.passwordForms, texts);
+  return carriedIn(state.passwordForms, texts) || containsBase64Form(texts, state.base64Forms);
 }

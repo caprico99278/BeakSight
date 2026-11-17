@@ -1,6 +1,6 @@
 // T24a（Task 24 の設計書 4.1）: 例外から終了コードへの変換（`classifyCliFailure`）。`main.ts` の扱い（設定のエラー → 4、artifact の書き出しの
-// 失敗と予期しない例外 → 1）を 1 つの関数にしたもの。CLI とワーカーで共用する。CLI の表示が変わらないことは、`tests/unit/cli.test.ts` と
-// `tests/integration/cli-output-parity.test.ts` で確かめる。
+// 失敗と予期しない例外 → 1）を 1 つの関数にしたもの。CLI とワーカーで共用する。CLI の表示は、`tests/unit/cli.test.ts` と
+// `tests/integration/cli-stop-resume.test.ts` で確かめる。
 import { describe, expect, it } from 'vitest';
 import { CONFIG_ERROR_EXIT_CODE, CONFIG_ERROR_OUTCOME, FAILURE_EXIT_CODE } from '../../src/cli/exit-codes.js';
 import { CLI_FAILURE_KINDS, classifyCliFailure } from '../../src/cli/failure.js';

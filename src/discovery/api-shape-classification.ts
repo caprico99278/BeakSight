@@ -13,7 +13,8 @@
 //   DEF-147: 論理削除の鍵の判定は `apiShapeHasSoftDeleteKey`（公開の状態の鍵 status・is_published・published_at などだけなら論理削除にしない）。
 //   観察の印 `stateKeyPresent` の意味（状態の欄の語）は、型の digest に入るので変えない。
 // - T39R-fix（Task 39 の設計書 7 章の T39R の行の M-4・M-5）: 手続きの呼び出しの path の判定は契約（`hasApiProcedureCallSegment`）へ移した。
-//   `Prefer` に閉じた一覧の外の項目がある型と、本文が照合の上限を超えて読めない型は、`API_UPDATE`・`API_CREATE` に当たらず `UNRECOGNIZED`。
+//   `Prefer` に閉じた一覧の外の項目がある型と、本文を読めない型は、`API_UPDATE`・`API_CREATE` に当たらず `UNRECOGNIZED`。L13: 型の作り手が数・長さで
+//   切らないので、`SHAPE_TRUNCATED` は伏せた鍵の名前（値に見える・目印を含む）と、読めない URL の path だけで立つ（省いた数の確かめは、前の記録の型を分け直すときのために残す。LZ-1: 型の digest の項目なので消さない）。
 // - 型の digest は、版の印（`API_SHAPE_DIGEST_FORMAT`）つきの正規化した型（並びを並べ直す。要求の種類は入れない（T37b fix round 1）。ヘッダの名前はページが付けた名前だけを入れる（v2。Task 38 の設計書 7 章））の SHA-256（`createSha256Fingerprint`。鍵を並べた JSON は
 //   `sortedKeysJsonOf`）。Task 38 の承認の digest は、候補の識別の digest とこの digest を結ぶ。
 import {
@@ -22,10 +23,15 @@ import {
   pageHeaderNamesOf,
   // T39R-fix の M-4: 手続きの呼び出しの path の判定は、契約の 1 か所（書き込みの段の照合も使う）。
   hasApiProcedureCallSegment,
+  // DEF-220: 承認した Origin の区分の判定は、契約の 1 か所。
+  isApprovedApiShapeOrigin,
   API_PREFER_KNOWN_VALUES,
   API_SELECTION_QUERY_NAMES,
   API_UPSERT_PREFER_PREFIX,
   API_UPSERT_QUERY_NAMES,
+  // LU-2: filter の形の並べ方と、path の型の最後の `{id}` の判定は、型の契約の 1 か所。
+  compareApiFilterShapes,
+  pathShapeEndsWithRecordId,
   type ApiRequestFilterShape,
   type ApiRequestShape,
 } from '../core/api-request-shape.js';
@@ -36,8 +42,12 @@ import { compareCodeUnits } from '../core/text.js';
 import { isMethodOverrideFieldName } from './candidate-contracts.js';
 import { fieldNameHasStateWord, isApiSoftDeleteKeyName } from './classify.js';
 
-/** 型の digest の版の印。正規化の形を変えるときは版を上げる。 */
-export const API_SHAPE_DIGEST_FORMAT = 'beaksight:api-shape/2';
+/**
+ * 型の digest の版の印。正規化の形を変えるときは版を上げる。v3（LU-2。設計書 `2026-11-02-beaksight-list-row-update-design.md` の K5）: path の型の
+ * 最後の番号の区切りを `{id}` にし、filter の形に `valueIsRecordIdLike` を足した。v4（DEF-220。設計書 `2026-11-08-beaksight-same-origin-api-and-spa-routes-design.md`
+ * 3.1 の 5）: Origin の区分に承認したテストの Origin（`APPROVED_TEST`）を足した。前の版の digest に結んだ承認は、型の digest が変わるので承認し直しになる。
+ */
+export const API_SHAPE_DIGEST_FORMAT = 'beaksight:api-shape/4';
 
 /** 分類の結果の閉じた一覧（probe の結果の `NOT_OBSERVED` は、probe の側が持つ）。 */
 export const API_SHAPE_CLASSIFICATIONS = Object.freeze(['NO_REQUEST', 'NOT_EXECUTABLE', 'API_UPDATE', 'API_CREATE'] as const);
@@ -61,6 +71,8 @@ export const API_SHAPE_NOT_EXECUTABLE_REASONS = Object.freeze([
   'FILTER_MISSING',
   'FILTER_MULTIPLE',
   'FILTER_NOT_PAGE_VALUE',
+  // LU-2（K4）: POST の送り先の path の型の最後が `{id}`（番号のある送り先への POST は、登録にしない）。
+  'CREATE_PATH_HAS_ID',
   'UNRECOGNIZED',
 ] as const);
 export type ApiShapeNotExecutableReason = (typeof API_SHAPE_NOT_EXECUTABLE_REASONS)[number];
@@ -69,6 +81,11 @@ export type ApiShapeNotExecutableReason = (typeof API_SHAPE_NOT_EXECUTABLE_REASO
 export interface ApiShapeObservation {
   readonly shapes: readonly ApiRequestShape[];
   readonly nonReadRequestCount: number;
+  /**
+   * LU-2（設計書 5.2 の 3）: 一覧の行の開き手から開いた入力の保存を押した観察か（probe の記録に開き手があるか）。既定は偽（今の振る舞い）。真のとき、
+   * PATCH の filter の値が番号の形（`valueIsRecordIdLike`）なら、画面の path の値と同じでなくても更新にする。
+   */
+  readonly openedFromRow?: boolean | undefined;
 }
 
 /** 分類の結果（理由は `NOT_EXECUTABLE` のときだけ。型と digest は、分類が見た型があるときだけ）。 */
@@ -119,7 +136,8 @@ const SINGLE_SHAPE_RULES: readonly (readonly [ApiShapeNotExecutableReason, (shap
   ['DELETE_METHOD', (shape) => shape.method === METHOD_DELETE],
   ['PUT_METHOD', (shape) => shape.method === METHOD_PUT],
   ['METHOD_OVERRIDE', (shape) => hasMethodOverride(shape)],
-  ['UNAPPROVED_ORIGIN', (shape) => shape.origin.kind !== 'APPROVED_API'],
+  // DEF-220: 承認したテストの Origin（テスト用のサイト自身の API）も、承認した API の Origin と同じに扱う（判定は契約の 1 か所 `isApprovedApiShapeOrigin`）。
+  ['UNAPPROVED_ORIGIN', (shape) => !isApprovedApiShapeOrigin(shape.origin)],
   ['PROCEDURE_CALL_PATH', (shape) => hasApiProcedureCallSegment(shape.pathShape)],
   ['UPSERT', (shape) => shape.prefer.some((value) => value.startsWith(API_UPSERT_PREFER_PREFIX))
     || shape.queryNames.some((name) => (API_UPSERT_QUERY_NAMES as readonly string[]).includes(name))],
@@ -134,19 +152,66 @@ const SINGLE_SHAPE_RULES: readonly (readonly [ApiShapeNotExecutableReason, (shap
 const onlyKnownPreferItems = (shape: ApiRequestShape): boolean =>
   shape.prefer.every((value) => (API_PREFER_KNOWN_VALUES as readonly string[]).includes(value));
 
-/** query の名前が、閉じた一覧（`select`）だけか（`except` の filter の名前を 1 つ除く）。 */
-const onlySelectionQueryNames = (shape: ApiRequestShape, except: ApiRequestFilterShape | null): boolean => {
+/**
+ * query の名前が、閉じた一覧（`select`）だけか（`except` の filter の名前を 1 つずつ除く。DEF-198: 番号の filter とほかの filter の名前を、それぞれ 1 回）。
+ */
+const onlySelectionQueryNames = (shape: ApiRequestShape, except: readonly ApiRequestFilterShape[]): boolean => {
   if (shape.omittedQueryNameCount > 0) {
     return false;
   }
-  let skipped = except === null;
+  const skipped = new Set<string>();
+  const exceptNames = new Set(except.map(({ name }) => name));
   return shape.queryNames.every((name) => {
-    if (!skipped && except !== null && name === except.name) {
-      skipped = true;
+    if (exceptNames.has(name) && !skipped.has(name)) {
+      skipped.add(name);
       return true;
     }
     return (API_SELECTION_QUERY_NAMES as readonly string[]).includes(name);
   });
+};
+
+/**
+ * DEF-198（設計書 `2026-11-02-beaksight-list-row-update-design.md` 5.9 の 1・2）: 更新の型の filter を、番号の filter（`record`）と、ほかの filter（`others`。
+ * 所属の絞り込みなど。名前の順）に分けた形。
+ */
+export interface ApiUpdateFilters {
+  readonly record: ApiRequestFilterShape;
+  readonly others: readonly ApiRequestFilterShape[];
+}
+
+/**
+ * DEF-198: 更新の型の filter を、番号の filter とほかの filter に分ける（分類と、下書き・確かめが共用する唯一の決まり。純粋）。分けられなければ null。
+ * - filter が 1 つ: その filter が番号の filter（ほかはなし。今の振る舞いのまま。値の確かめは分類が行う）。
+ * - filter が 2 つ以上: 一覧の行から開いた形（`openedFromRow`。番号を印で決められない）でなく、query の名前の切り詰めがなく、どの filter も名前が重ならない
+ *   `eq` で、画面の path の番号と一致する印（`valueMatchesPagePath`）を持つ filter がちょうど 1 つ、ほかの filter の名前が閉じた一覧の query の名前・upsert の
+ *   印・伏せた名前でないときだけ、印の filter を番号の filter にする（並び順 `filters[0]` で選ばない）。
+ * - filter がない: null。
+ */
+export const apiUpdateFiltersOf = (shape: ApiRequestShape, openedFromRow: boolean): ApiUpdateFilters | null => {
+  const { filters } = shape;
+  const [first] = filters;
+  if (first === undefined) {
+    return null;
+  }
+  if (filters.length === 1) {
+    return Object.freeze({ record: first, others: Object.freeze([]) });
+  }
+  const names = filters.map(({ name }) => name);
+  if (openedFromRow || shape.omittedQueryNameCount > 0 || new Set(names).size !== names.length
+    || filters.some(({ operator }) => operator !== 'eq')) {
+    return null;
+  }
+  const records = filters.filter(({ valueMatchesPagePath }) => valueMatchesPagePath);
+  const [record] = records;
+  if (records.length !== 1 || record === undefined) {
+    return null;
+  }
+  const others = filters.filter((filter) => filter !== record);
+  if (others.some(({ name }) => name === REDACTED || (API_SELECTION_QUERY_NAMES as readonly string[]).includes(name)
+    || (API_UPSERT_QUERY_NAMES as readonly string[]).includes(name))) {
+    return null;
+  }
+  return Object.freeze({ record, others: Object.freeze([...others].sort(compareApiFilterShapes)) });
 };
 
 const result = (
@@ -158,6 +223,7 @@ const result = (
 /** 観察した型を分類する（純粋。入力を変えない）。 */
 export const classifyApiShapeObservation = (observation: ApiShapeObservation): ApiShapeClassification => {
   const { shapes, nonReadRequestCount } = observation;
+  const openedFromRow = observation.openedFromRow === true;
   if (nonReadRequestCount <= 0 && shapes.length === 0) {
     return result('NO_REQUEST', null, null);
   }
@@ -182,17 +248,33 @@ export const classifyApiShapeObservation = (observation: ApiShapeObservation): A
   if (hasTruncatedShape(shape)) {
     return result('NOT_EXECUTABLE', 'SHAPE_TRUNCATED', shape);
   }
-  // T39R-fix（M-5）: 本文は、照合と同じ上限（`MAX_API_REQUEST_BODY_BYTES`）の中で読めた object だけ（超えた本文は「読めない」）。`Prefer` は閉じた一覧の値だけ。
+  // T39R-fix（M-5）: 本文は、読めた object だけ（L13: 大きさの上限は撤廃した）。`Prefer` は閉じた一覧の値だけ。
   const executableForm = shape.body.kind === 'OBJECT' && onlyKnownPreferItems(shape);
+  const pathEndsWithId = pathShapeEndsWithRecordId(shape.pathShape);
   if (shape.method === METHOD_PATCH) {
     const [filter, ...rest] = shape.filters;
-    if (filter === undefined) return result('NOT_EXECUTABLE', 'FILTER_MISSING', shape);
-    if (rest.length > 0) return result('NOT_EXECUTABLE', 'FILTER_MULTIPLE', shape);
-    if (filter.operator !== 'eq' || !filter.valueMatchesPagePath) return result('NOT_EXECUTABLE', 'FILTER_NOT_PAGE_VALUE', shape);
-    if (executableForm && onlySelectionQueryNames(shape, filter)) return result('API_UPDATE', null, shape);
+    if (filter === undefined) {
+      // LU-2（A_PATH）: filter がなく、path の型の最後が `{id}` の PATCH は、その番号の行の更新。
+      if (!pathEndsWithId) return result('NOT_EXECUTABLE', 'FILTER_MISSING', shape);
+      if (executableForm && onlySelectionQueryNames(shape, [])) return result('API_UPDATE', null, shape);
+      return result('NOT_EXECUTABLE', 'UNRECOGNIZED', shape);
+    }
+    if (rest.length > 0) {
+      // DEF-198（設計書 5.9 の 1）: 画面の番号と一致する印の filter がちょうど 1 つで、ほかは名前の重ならない `eq` だけなら、更新（番号の filter は印で選ぶ）。
+      // 一覧の行から開いた形と、分けられない形は、今のまま `FILTER_MULTIPLE`。
+      const split = apiUpdateFiltersOf(shape, openedFromRow);
+      if (split !== null && executableForm && onlySelectionQueryNames(shape, [split.record, ...split.others])) return result('API_UPDATE', null, shape);
+      return result('NOT_EXECUTABLE', 'FILTER_MULTIPLE', shape);
+    }
+    // LU-2（A_FILTER）: 一覧の行から開いた入力なら、画面の path の値の代わりに、値が番号の形かを見る。
+    const filterPointsAtRecord = filter.valueMatchesPagePath || (openedFromRow && filter.valueIsRecordIdLike === true);
+    if (filter.operator !== 'eq' || !filterPointsAtRecord) return result('NOT_EXECUTABLE', 'FILTER_NOT_PAGE_VALUE', shape);
+    if (executableForm && onlySelectionQueryNames(shape, [filter])) return result('API_UPDATE', null, shape);
   }
-  if (shape.method === METHOD_POST && shape.filters.length === 0 && executableForm && onlySelectionQueryNames(shape, null)) {
-    return result('API_CREATE', null, shape);
+  if (shape.method === METHOD_POST) {
+    // LU-2（K4）: 番号のある送り先への POST は、登録より更新か操作のことが多いので、登録にしない。
+    if (pathEndsWithId) return result('NOT_EXECUTABLE', 'CREATE_PATH_HAS_ID', shape);
+    if (shape.filters.length === 0 && executableForm && onlySelectionQueryNames(shape, [])) return result('API_CREATE', null, shape);
   }
   return result('NOT_EXECUTABLE', 'UNRECOGNIZED', shape);
 };
@@ -223,20 +305,61 @@ const normalizedShapeOf = (shape: ApiRequestShape): ApiShapeDigestInput => ({
   pathShape: shape.pathShape,
   queryNames: sortedBy(shape.queryNames, compareCodeUnits),
   omittedQueryNameCount: shape.omittedQueryNameCount,
-  filters: sortedBy(shape.filters, (left, right) => compareCodeUnits(left.name, right.name) || compareCodeUnits(left.operator, right.operator)
-    || Number(left.valueMatchesPagePath) - Number(right.valueMatchesPagePath)),
+  filters: sortedBy(shape.filters, compareApiFilterShapes).map(({ name, operator, valueMatchesPagePath, valueIsRecordIdLike }) => ({
+    name,
+    operator,
+    valueMatchesPagePath,
+    valueIsRecordIdLike: valueIsRecordIdLike === true,
+  })),
   contentType: shape.contentType,
   prefer: sortedBy(shape.prefer, compareCodeUnits),
   body: {
     kind: shape.body.kind,
-    keys: sortedBy(shape.body.keys, (left, right) => compareCodeUnits(left.name, right.name) || compareCodeUnits(left.type, right.type)),
+    // ARR-1（設計書 `2026-11-08-beaksight-api-array-keys-design.md` 3.2 の 3）: 一覧の鍵の要素の情報と、一覧の中の印は、持つときだけ項目を足す。
+    // 一覧の鍵のない型は、正規化した JSON が ARR-1 の前と同じなので、digest も同じ（版の印は上げない）。
+    keys: sortedBy(shape.body.keys, (left, right) => compareCodeUnits(left.name, right.name) || compareCodeUnits(left.type, right.type))
+      .map(({ name, type, elements }) => (elements === undefined ? { name, type } : {
+        name,
+        type,
+        elements: {
+          types: sortedBy(elements.types, compareCodeUnits),
+          count: elements.count,
+          nested: elements.nested === true,
+          textOverLimit: elements.textOverLimit === true,
+          // ARR-3（設計書 `2026-11-09-beaksight-api-array-rows-design.md` 2.2 の 5）: 位置の情報は、持つとき（一覧の中に印があり要素が 2 以上）だけ足す。
+          // 要素 1 つの一覧（DEF-226 の形）と一覧のない型の digest は変わらない。
+          ...(elements.positions === undefined ? {} : {
+            positions: elements.positions.map(({ markers, empty, type: positionType, keys: innerKeys }) => ({
+              markers: sortedBy(markers, (left, right) => left - right),
+              empty: empty === true,
+              type: positionType,
+              // ARR-5（設計書 2.4 の 1）: object の行の中の鍵は、持つときだけ足す（scalar の位置の値は変わらない）。
+              ...(innerKeys === undefined ? {} : {
+                keys: sortedBy(innerKeys, (left, right) => compareCodeUnits(left.name, right.name)).map((inner) => ({
+                  name: inner.name,
+                  markers: sortedBy(inner.markers, (left, right) => left - right),
+                  empty: inner.empty === true,
+                  type: inner.type,
+                  ...(inner.textOverLimit === true ? { textOverLimit: true as const } : {}),
+                })),
+              }),
+            })),
+          }),
+        },
+      })),
     omittedKeyCount: shape.body.omittedKeyCount,
     markerKeys: sortedBy(
-      shape.body.markerKeys.map(({ key, markers }) => ({ key, markers: sortedBy(markers, (left, right) => left - right) })),
+      shape.body.markerKeys.map(({ key, markers, inArray }) => ({
+        key,
+        markers: sortedBy(markers, (left, right) => left - right),
+        ...(inArray === true ? { inArray: true } : {}),
+      })),
       (left, right) => compareCodeUnits(left.key, right.key) || compareCodeUnits(left.markers.join(','), right.markers.join(',')),
     ),
     // T37R-fix-A（I-3）: 論理削除の鍵の真偽も、鍵の名前と同じく型の一部として digest に入れる。
     stateKeyPresent: shape.body.stateKeyPresent === true,
+    // ARR-5 fix round 1（SREV-ARR2 の M2）: 同じ鍵が 2 回ある本文の印は、持つときだけ足す（ほかの型の digest は変わらない）。
+    ...(shape.body.duplicateKeyPresent === true ? { duplicateKeyPresent: true } : {}),
   },
 });
 

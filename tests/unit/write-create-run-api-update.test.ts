@@ -12,7 +12,7 @@ import { describe, expect, it } from 'vitest';
 import { actionRunRuleErrors } from '../../src/control/actions/action-api-summary.js';
 import type { ActionRunDocument } from '../../src/control/actions/action-contracts.js';
 import { actionOutcomeOf, fieldsMatchedOf } from '../../src/control/actions/action-outcome.js';
-import { MAX_API_RECORD_ID_BODY_BYTES, apiResponseListLength } from '../../src/control/actions/api-record-id.js';
+import { apiResponseListLength } from '../../src/control/actions/api-record-id.js';
 import {
   apiUpdateEvidenceOf,
   apiUpdateKnownKeptMismatch,
@@ -25,6 +25,8 @@ import { sampleApiSummary, verifiedApiCreateDocuments } from '../helpers/action-
 
 const TARGET = '42';
 const bytes = (text: string): Uint8Array => new TextEncoder().encode(text);
+/** L10: 撤廃した本文の大きさの上限（前の `MAX_API_RECORD_ID_BODY_BYTES`。1 MiB）の写し。 */
+const FORMER_MAX_API_RECORD_ID_BODY_BYTES = 1_048_576;
 
 describe('T41d: the result of an API update (apiUpdateResultOf)', () => {
   // `rowCount` は応答の本文の一覧の要素の数（一覧でなければ null。`apiResponseListLength`）。
@@ -154,7 +156,8 @@ describe('T41R3-fix: the kept values the ledger knows, and a body whose rows can
     expect(isUnreadableApiResponseBody(bytes('updated'))).toBe(true);
     expect(isUnreadableApiResponseBody(bytes('  '))).toBe(true);
     expect(isUnreadableApiResponseBody(new Uint8Array([0x5b, 0xff, 0x5d]))).toBe(true);
-    expect(isUnreadableApiResponseBody(new Uint8Array(MAX_API_RECORD_ID_BODY_BYTES + 1).fill(0x20))).toBe(true);
+    // L10: 本文の大きさの上限（前は 1 MiB の `MAX_API_RECORD_ID_BODY_BYTES`）は撤廃した。前の上限を超える JSON の本文も読める。
+    expect(isUnreadableApiResponseBody(bytes(JSON.stringify([{ id: 1, note: 'x'.repeat(FORMER_MAX_API_RECORD_ID_BODY_BYTES) }])))).toBe(false);
   });
 });
 
@@ -196,6 +199,8 @@ describe('T41d・T41R-fix: the number of the rows of a list as the response body
 
   it('does not read a body that is not UTF-8 or over the limit', () => {
     expect(apiResponseListLength(new Uint8Array([0x5b, 0xff, 0x5d]))).toBeNull();
-    expect(apiResponseListLength(new Uint8Array(MAX_API_RECORD_ID_BODY_BYTES + 1).fill(0x20))).toBeNull();
+    // L10: 前の上限（1 MiB）を超える空白だけの本文は、JSON でないので今どおり読めない。前の上限を超える一覧は数える。
+    expect(apiResponseListLength(new Uint8Array(FORMER_MAX_API_RECORD_ID_BODY_BYTES + 1).fill(0x20))).toBeNull();
+    expect(apiResponseListLength(bytes(JSON.stringify([{ id: 1, note: 'x'.repeat(FORMER_MAX_API_RECORD_ID_BODY_BYTES) }, { id: 2 }])))).toBe(2);
   });
 });

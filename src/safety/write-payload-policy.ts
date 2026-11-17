@@ -10,7 +10,7 @@
  * - (f) 文書の文字コードが分かり、UTF-8 である（Guard が送信の窓を開いた時点に isolated world で読んだ値。読めなければ `null`）。
  * - (b) `Content-Type` が `application/x-www-form-urlencoded`（引数なし）か `multipart/form-data`（`boundary` だけ）で、承認の enctype と同じ。
  * - (g) 本文がある（`hasPostData` と、bytes のある `postDataEntries`）、切れていない（bytes のない部品がない。multipart の終わりの区切りがある）、
- *   上限（`MAX_WRITE_PAYLOAD_BYTES`）を超えない（base64 を decode する前に長さで調べる）、形が正しい。
+ *   形が正しい（L12b: 大きさの上限は置かない。`BODY_TOO_LARGE` は前の記録の読み方のために一覧に残す）。
  * - (c) 欄の名前は、送る欄・承認した候補の hidden と readonly の欄・空の file の欄だけ。同じ名前は 1 回だけ。送る欄はすべてある。
  * - (d) 送る欄の値は、生成した値（改行はブラウザと同じく CR LF にした形）の UTF-8 の bytes と完全に一致する。
  * - (e) file の欄は空（multipart はファイル名も中身もない部品、urlencoded は空の値）。file の部品が file でない欄にある、file の欄が file の
@@ -33,6 +33,8 @@
  *     同じ比べ方。外れたら `CHECKBOX_PAIR_MISMATCH`。組の名前だけが、(c) の「同じ名前は 1 回だけ」の例外。
  *   - 名前は、6 つの一覧（送る欄・hidden と readonly・file・(i)・(j)・(k)）を通して重ならない。method の上書きの欄は、どの一覧にも入れない。
  *     重ねた指定と形の違う指定は `EXPECTATION_INVALID`。
+ * - LU-12a（設計書 `2026-11-02-beaksight-list-row-update-design.md` 5.3 の 2・5.5）: 前の値を後から入れる印（`deferredPriorValues`）のある期待は、前の値を
+ *   入れる（`writeExpectationWithPriorValues`）まで `EXPECTATION_INVALID`。
  * hidden・readonly の欄の値（CSRF のトークンを含む）は、形の確かめのほかに読まず、比べず、返さず、記録しない（名前だけを照らす。method の
  * 上書きの欄と、(i)・(j) の欄だけは値を照らす。その値も返さず、記録しない）。結果は閉じた一覧の語だけで、値・名前・URL を含まない。例外を投げない
  * （どの入力でも語を返す）。
@@ -59,8 +61,7 @@ const MULTIPART: WriteFormEnctype = WRITE_FORM_ENCTYPES[1];
 export const WRITE_METHOD_OVERRIDES = Object.freeze(['PUT', 'PATCH'] as const satisfies readonly MethodOverride[]);
 export type WriteMethodOverride = (typeof WRITE_METHOD_OVERRIDES)[number];
 
-/** 本文の大きさの上限（bytes）。承認の form の hidden の欄（画面の状態の値など）の大きさに余裕を見た値。超えたら読まずに止める。 */
-export const MAX_WRITE_PAYLOAD_BYTES = 1_048_576;
+// L12b（S18）: 本文の大きさの上限（前は 1MiB。超えたら読まずに `BODY_TOO_LARGE`）は撤廃した（定数は LZ-1 で消した）。
 
 /** 送る中身の照合の結果（閉じた一覧）。`ALLOW` のほかは止めた理由。 */
 export const WRITE_PAYLOAD_DECISIONS = Object.freeze([
@@ -142,7 +143,112 @@ export interface WritePayloadExpectation {
   readonly checkedPassthroughFields?: readonly WriteSubmittedField[] | undefined;
   readonly checkboxPairs?: readonly WriteCheckboxPair[] | undefined;
   readonly absentFieldNames?: readonly string[] | undefined;
+  /**
+   * LU-12a（設計書 `2026-11-02-beaksight-list-row-update-design.md` 4.0.1 の K1、5.3 の 2・5.5。API の形の LU-9 と同じ約束）: 前の値を後から入れる印
+   * （一覧の行から開く更新の、押すまで欄のないフォーム）。印のある期待は、前の値に頼る欄（保つ見える欄・値を照らす hidden・組）を持たず
+   * （`checkedPassthroughFields`・`checkboxPairs` は省くか空。保つ見える欄は `submittedFields` に入れない）、照合は前の値を入れるまで
+   * `EXPECTATION_INVALID` で止める（fail-closed）。前の値は `writeExpectationWithPriorValues` で 1 回だけ入れる（Guard の口は
+   * `WriteStageMonitor.supplyFormPriorValues`）。鍵の集合は、期待を作る時に、承認の時の欄の役割から決まる（ページから作らない）。
+   */
+  readonly deferredPriorValues?: WriteDeferredPriorValues | undefined;
 }
+
+/**
+ * LU-12a: 前の値を後から入れる印の中身（どれも名前だけ。名前は、すべての一覧と期待のほかの一覧を通して重ならない）。
+ * - `keptFieldNames`: 保つ見える欄の名前（前の値は `submittedFields` に入る。null は送られない欄で `absentFieldNames` に入る）。
+ * - `checkedPassthroughNames`: 値を照らす hidden の欄の名前（状態の hidden など。前の値は `checkedPassthroughFields` に入る。null は送られない）。
+ * - `keptCheckboxPairNames`: 保つ組の名前（`offValue` と `checkedValue` の両方が前の値）。
+ * - `changedCheckboxPairs`: 変える組の名前と、新しい `checkedValue`（前の値は `offValue` だけ。後から `checkedValue` を変えられない）。
+ * - `nullableFieldNames`（LU-12a fix round 1。設計者の判断 (b)）: 前の値に null（送られない欄）を入れてよい欄の名前。`keptFieldNames` と
+ *   `checkedPassthroughNames` の中の、承認の時の欄の種類が checkbox・radio・select の欄だけ（作り手は `src/browser/write-form-submitter.ts` の
+ *   `updateDeferredPriorValuesOf`。判定は作り手と同じ `isChoiceType`）。この一覧にない欄に null を入れる入力は拒む。
+ */
+export interface WriteDeferredPriorValues {
+  readonly keptFieldNames: readonly string[];
+  readonly checkedPassthroughNames: readonly string[];
+  readonly keptCheckboxPairNames: readonly string[];
+  readonly changedCheckboxPairs: readonly { readonly name: string; readonly checkedValue: string | null }[];
+  readonly nullableFieldNames: readonly string[];
+}
+
+/** LU-12a: 後から入れる前の値の 1 つの欄（null は、ブラウザが送らない欄。チェックしていない checkbox など）。 */
+export interface WritePriorField {
+  readonly name: string;
+  readonly value: string | null;
+}
+
+/** LU-12a: 後から入れる前の値（印の名前ごとに 1 つ。組は、保つ組と変える組の両方）。 */
+export interface WriteSuppliedPriorValues {
+  readonly keptFields: readonly WritePriorField[];
+  readonly checkedPassthroughFields: readonly WritePriorField[];
+  readonly checkboxPairs: readonly WriteCheckboxPair[];
+}
+
+/**
+ * LU-SFIX1（LU-SREV1 の Minor-1）: 呼び手の一覧の、添字の繰り返しによる凍らせた写し（一覧の `map`・`Symbol.iterator` を呼ばない。長さと各項目は 1 回だけ
+ * 読む）。一覧でなければ null。Proxy で `map` を差し替えた一覧からも、写した後に値が変わらない。LU-12a: フォームの前の値の写しも使うので、API の照合の
+ * ファイルからここへ移した（API の照合はここから import する。循環を作らない）。
+ */
+export const indexedListCopyOf = <T>(list: unknown, copyEntry: (entry: unknown) => T): readonly T[] | null => {
+  if (!Array.isArray(list)) {
+    return null;
+  }
+  const source = list as readonly unknown[];
+  const length = source.length;
+  const copy: T[] = [];
+  for (let index = 0; index < length; index += 1) {
+    copy.push(copyEntry(source[index]));
+  }
+  return Object.freeze(copy);
+};
+
+/** LU-12a: 名前と値の項目の写し（`name` と `value` を 1 回だけ読む。値が文字でも null でもなければ、確かめが拒む形の空の object）。 */
+const priorFieldCopyOf = (entry: unknown): unknown => {
+  if (!isRecord(entry)) {
+    return null;
+  }
+  const hasValue = Object.hasOwn(entry, 'value');
+  const { name, value } = entry as { readonly name?: unknown; readonly value?: unknown };
+  return Object.freeze({ name, value: !hasValue ? Object.freeze({}) : value === null || typeof value === 'string' ? value : Object.freeze({}) });
+};
+
+/** LU-12a: 組の項目の写し（3 つの項目を 1 回だけ読む）。 */
+const checkboxPairCopyOf = (entry: unknown): unknown => {
+  if (!isRecord(entry)) {
+    return null;
+  }
+  const { name, offValue, checkedValue } = entry as { readonly name?: unknown; readonly offValue?: unknown; readonly checkedValue?: unknown };
+  return Object.freeze({ name, offValue, checkedValue });
+};
+
+/** LU-12a: 名前の一覧の写し（文字のほかは null。一覧でなければ null）。 */
+const nameListCopyOf = (list: unknown): readonly (string | null)[] | null =>
+  indexedListCopyOf(list, (name) => (typeof name === 'string' ? name : null));
+
+/**
+ * LU-12a: 前の値を後から入れる印の写し（唯一の写し方。Guard の期待の写しと `writeExpectationWithPriorValues` が使う）。項目は 1 回だけ読み、凍らせる。
+ * 形が違えば、確かめが拒む形（空の object、名前は null）に置き換える（印は残す。fail-closed）。
+ */
+export const writeDeferredPriorValuesCopyOf = (mark: unknown): unknown => {
+  if (!isRecord(mark)) {
+    return Object.freeze({});
+  }
+  const { keptFieldNames, checkedPassthroughNames, keptCheckboxPairNames, changedCheckboxPairs, nullableFieldNames } = mark as Partial<Record<keyof WriteDeferredPriorValues, unknown>>;
+  const copied = {
+    nullableFieldNames: nameListCopyOf(nullableFieldNames),
+    keptFieldNames: nameListCopyOf(keptFieldNames),
+    checkedPassthroughNames: nameListCopyOf(checkedPassthroughNames),
+    keptCheckboxPairNames: nameListCopyOf(keptCheckboxPairNames),
+    changedCheckboxPairs: indexedListCopyOf(changedCheckboxPairs, (pair) => {
+      if (!isRecord(pair)) {
+        return null;
+      }
+      const { name, checkedValue } = pair as { readonly name?: unknown; readonly checkedValue?: unknown };
+      return Object.freeze({ name, checkedValue });
+    }),
+  };
+  return Object.values(copied).some((list) => list === null) ? Object.freeze({}) : Object.freeze(copied);
+};
 
 /**
  * CDP の要求の事実（Guard が `Fetch.requestPaused` から作る）と、文書の文字コード。
@@ -230,7 +336,8 @@ const isCheckboxPair = (pair: unknown): boolean => isRecord(pair)
 /** 指定が正しいか（形、enctype、名前の重なり、値の形）。 */
 function isValidExpectation(expectation: WritePayloadExpectation): boolean {
   const { request, submittedFields, passthroughFieldNames, emptyFileFieldNames, methodOverride } = expectation;
-  if (!isRecord(request)) {
+  // LU-12a: 前の値を後から入れる印のある期待は、前の値を入れるまで照らせない（fail-closed）。
+  if (!isRecord(request) || expectation.deferredPriorValues !== undefined) {
     return false;
   }
   if (methodOverride !== undefined && methodOverride !== null && !(WRITE_METHOD_OVERRIDES as readonly unknown[]).includes(methodOverride)) {
@@ -269,6 +376,90 @@ function isValidExpectation(expectation: WritePayloadExpectation): boolean {
     // method の上書きの欄は、値を照らす（名前だけの一覧に入れない）。
     && !names.some((name) => isMethodOverrideFieldName(name as string));
 }
+
+/** LU-12a: 写した名前の一覧と、受けた項目の名前の一覧が、同じ集合か（どちらも重ならない文字）。 */
+const sameNameSet = (expected: readonly unknown[], actual: readonly unknown[]): boolean => {
+  const expectedSet = new Set(expected);
+  return expected.every((name) => typeof name === 'string') && expectedSet.size === expected.length
+    && actual.length === expected.length && new Set(actual).size === actual.length && actual.every((name) => expectedSet.has(name));
+};
+
+/**
+ * LU-12a（設計書 5.3 の 2・5.5）: 前の値を後から入れる印のあるフォームの期待に、前の値を入れた期待（印を外す）。入れられないときは null（純粋。入力を
+ * 変えない。投げない）。
+ * - 期待が印を持ち、前の値に頼る一覧（`checkedPassthroughFields`・`checkboxPairs`）を持たないこと（省くか空）。
+ * - 受けた前の値の名前の集合が、印の集合と完全に一致すること（保つ見える欄、値を照らす hidden、組（保つ組と変える組を合わせた集合）のそれぞれ。足す・減らす・
+ *   違う集合・一覧の間の移し替えは拒む）。変える組の `checkedValue` は印の値と同じであること。
+ * - 値の形（正しい文字、名前の重なり、method の上書きの欄、送る欄が 1 つ以上）は、照合の期待の確かめ（`isValidExpectation`）に任せる（決まりを 2 つ持たない）。
+ * 受けた前の値と期待の一覧は、確かめる前に添字で写して凍らせ（`indexedListCopyOf`。項目は 1 回だけ読む）、返す期待はその写しを持つ。
+ * 置き方は前の値の作り手（`updatePayloadFieldsOf`）と同じ: 保つ見える欄の値は `submittedFields` へ（null は `absentFieldNames` へ）、値を照らす hidden は
+ * `checkedPassthroughFields` へ（null は `absentFieldNames` へ）、組は `checkboxPairs` へ。
+ */
+export const writeExpectationWithPriorValues = (
+  expectation: WritePayloadExpectation,
+  supplied: WriteSuppliedPriorValues,
+): WritePayloadExpectation | null => {
+  try {
+    if (!isRecord(expectation) || !isRecord(supplied)) {
+      return null;
+    }
+    const mark = writeDeferredPriorValuesCopyOf(expectation.deferredPriorValues) as Partial<WriteDeferredPriorValues>;
+    const { keptFieldNames, checkedPassthroughNames, keptCheckboxPairNames, changedCheckboxPairs, nullableFieldNames } = mark;
+    if (keptFieldNames === undefined || checkedPassthroughNames === undefined || keptCheckboxPairNames === undefined || changedCheckboxPairs === undefined
+      || nullableFieldNames === undefined) {
+      return null;
+    }
+    // fix round 1（設計者の判断 (b)）: null を許す名前は、保つ見える欄か値を照らす hidden の名前で、重ならない（組の名前は null を `checkedValue` で表す）。
+    const nullCapable = new Set<unknown>([...keptFieldNames, ...checkedPassthroughNames]);
+    const nullable = new Set<unknown>(nullableFieldNames);
+    if (nullable.size !== nullableFieldNames.length || !nullableFieldNames.every((name) => typeof name === 'string' && nullCapable.has(name))) {
+      return null;
+    }
+    const baseChecked = indexedListCopyOf(expectation.checkedPassthroughFields ?? [], (field) => field);
+    const basePairs = indexedListCopyOf(expectation.checkboxPairs ?? [], (pair) => pair);
+    const submittedFields = indexedListCopyOf(expectation.submittedFields, (field) => (isRecord(field) ? Object.freeze({ name: field['name'], value: field['value'] }) : field));
+    const absentFieldNames = indexedListCopyOf(expectation.absentFieldNames ?? [], (name) => name);
+    const passthroughFieldNames = indexedListCopyOf(expectation.passthroughFieldNames, (name) => name);
+    const emptyFileFieldNames = indexedListCopyOf(expectation.emptyFileFieldNames, (name) => name);
+    if (baseChecked === null || baseChecked.length > 0 || basePairs === null || basePairs.length > 0 || submittedFields === null
+      || absentFieldNames === null || passthroughFieldNames === null || emptyFileFieldNames === null) {
+      return null;
+    }
+    const keptFields = indexedListCopyOf(supplied.keptFields, priorFieldCopyOf) as readonly Partial<Record<keyof WritePriorField, unknown>>[] | null;
+    const checkedFields = indexedListCopyOf(supplied.checkedPassthroughFields, priorFieldCopyOf) as readonly Partial<Record<keyof WritePriorField, unknown>>[] | null;
+    const pairs = indexedListCopyOf(supplied.checkboxPairs, checkboxPairCopyOf) as readonly Partial<Record<keyof WriteCheckboxPair, unknown>>[] | null;
+    if (keptFields === null || checkedFields === null || pairs === null || [...keptFields, ...checkedFields, ...pairs].some((entry) => !isRecord(entry))) {
+      return null;
+    }
+    const changedPairValues = new Map(changedCheckboxPairs.map((pair) => [pair.name, pair.checkedValue] as const));
+    if (!sameNameSet(keptFieldNames, keptFields.map(({ name }) => name))
+      || !sameNameSet(checkedPassthroughNames, checkedFields.map(({ name }) => name))
+      || !sameNameSet([...keptCheckboxPairNames, ...changedCheckboxPairs.map(({ name }) => name)], pairs.map(({ name }) => name))
+      || !pairs.every(({ name, checkedValue }) => !changedPairValues.has(name as string) || changedPairValues.get(name as string) === checkedValue)
+      // fix round 1: null（送られない欄）は、印が null を許す欄だけ（text の欄などに null を入れて、ページがその欄を外した本文を通さない）。
+      || [...keptFields, ...checkedFields].some(({ name, value }) => value === null && !nullable.has(name))) {
+      return null;
+    }
+    const valued = (fields: readonly Partial<Record<keyof WritePriorField, unknown>>[]): readonly WriteSubmittedField[] =>
+      fields.filter(({ value }) => value !== null).map(({ name, value }) => Object.freeze({ name, value }) as WriteSubmittedField);
+    const nulled = (fields: readonly Partial<Record<keyof WritePriorField, unknown>>[]): readonly unknown[] =>
+      fields.filter(({ value }) => value === null).map(({ name }) => name);
+    const request: unknown = expectation.request;
+    const merged: WritePayloadExpectation = Object.freeze({
+      request: (isRecord(request) ? Object.freeze({ origin: request['origin'], path: request['path'], enctype: request['enctype'] }) : request) as WriteRequestShape,
+      submittedFields: Object.freeze([...submittedFields, ...valued(keptFields)]) as readonly WriteSubmittedField[],
+      passthroughFieldNames: passthroughFieldNames as readonly string[],
+      emptyFileFieldNames: emptyFileFieldNames as readonly string[],
+      methodOverride: expectation.methodOverride ?? null,
+      checkedPassthroughFields: Object.freeze([...valued(checkedFields)]),
+      checkboxPairs: pairs as readonly WriteCheckboxPair[],
+      absentFieldNames: Object.freeze([...absentFieldNames, ...nulled(keptFields), ...nulled(checkedFields)]) as readonly string[],
+    });
+    return isValidExpectation(merged) ? merged : null;
+  } catch {
+    return null;
+  }
+};
 
 /** (a) 要求の形。合っていれば `null`。 */
 function requestShapeProblem(request: WriteRequestShape, facts: WriteRequestFacts): WritePayloadBlockReason | null {
@@ -350,7 +541,6 @@ function bodyBytesOf(facts: WriteRequestFacts): { readonly ok: true; readonly by
   if (facts.hasPostData !== true || !Array.isArray(entries) || entries.length === 0) {
     return { ok: false, reason: 'BODY_UNAVAILABLE' };
   }
-  let estimatedBytes = 0;
   for (const entry of entries as readonly unknown[]) {
     const bytes = isRecord(entry) ? entry['bytes'] : undefined;
     if (bytes === undefined) {
@@ -359,10 +549,8 @@ function bodyBytesOf(facts: WriteRequestFacts): { readonly ok: true; readonly by
     if (typeof bytes !== 'string') {
       return { ok: false, reason: 'BODY_MALFORMED' };
     }
-    estimatedBytes += Math.ceil(bytes.length / BASE64_CHARACTERS_PER_QUAD) * BASE64_BYTES_PER_QUAD;
-    if (estimatedBytes > MAX_WRITE_PAYLOAD_BYTES + BASE64_BYTES_PER_QUAD) {
-      return { ok: false, reason: 'BODY_TOO_LARGE' };
-    }
+    // L12b（設計書 `2026-11-09-beaksight-remove-limits-design.md` 6.2。S18）: 本文の大きさの上限（前は 1MiB で `BODY_TOO_LARGE`）は
+    // 置かない（承認した型との照合は今のまま）。
   }
   const pieces: string[] = [];
   for (const entry of entries as readonly { readonly bytes: string }[]) {
@@ -371,8 +559,8 @@ function bodyBytesOf(facts: WriteRequestFacts): { readonly ok: true; readonly by
     }
     pieces.push(Buffer.from(entry.bytes, 'base64').toString('latin1'));
   }
-  const bytes = pieces.join('');
-  return bytes.length > MAX_WRITE_PAYLOAD_BYTES ? { ok: false, reason: 'BODY_TOO_LARGE' } : { ok: true, bytes };
+  // L12b（S18）: 大きさの上限は置かない。
+  return { ok: true, bytes: pieces.join('') };
 }
 
 /** urlencoded の 1 つの名前か値の bytes を decode する（`+` は空白、`%XX` は 1 byte）。形が崩れていれば `null`。 */
@@ -623,7 +811,7 @@ function fieldsProblem(expectation: WritePayloadExpectation, enctype: WriteFormE
  * - urlencoded は、書き込みの段の照合より緩く読む（ページのスクリプトが書く本文。`charset` などの引数、`=` のない組、percent-encode していない文字を許す。
  *   読めない名前と値は、そのままの文字で比べる）。
  * - multipart は、書き込みの段と同じ読み方（ブラウザの書き方）。区切りが正しくない、形が崩れている、なら `null`。
- * - 上限（`MAX_WRITE_PAYLOAD_BYTES`）を超える本文は、調べずに空（AS-c fix round 3）。
+ * - L12b（S18）: 大きさの上限は置かない（前は 1MiB を超える本文を調べずに空にした。AS-c fix round 3）。
  * - 本文が読めない（`readBody` が `UNREADABLE`。multipart のファイルの部品など）、`Content-Type` が読めない
  *   form なら `null`（呼ぶ側が止める。fail-closed）。例外を投げない（想定しない入力も `null`）。
  * - AS-c fix round 2（I-E。設計書 5 章の「AS-R2」の行）: `Content-Type` のない本文（型のない Blob など）は、urlencoded として読む（Rack などのサーバが form と
@@ -654,11 +842,8 @@ export function formMethodOverrideValuesOf(
       return null;
     }
     const bytes = utf8Bytes(body.text);
-    // AS-c fix round 3（AS-R3 の V04・V05。設計書 5 章の「AS-R3 と区切り」の行）: 上限（`MAX_WRITE_PAYLOAD_BYTES`）を超える本文は、本文の `_method` を
-    // 調べない（空。呼ぶ側はヘッダの上書き・method・語を今どおり調べる）。
-    if (bytes.length > MAX_WRITE_PAYLOAD_BYTES) {
-      return [];
-    }
+    // AS-c fix round 3（AS-R3 の V04・V05）: 前は上限（1MiB）を超える本文の `_method` を調べなかった。L12b（S18）: 上限を撤廃し、どの大きさの
+    // 本文の `_method` も調べる（DELETE の上書きの止めが、大きな本文でも働く）。
     if (essence === URLENCODED) {
       return urlencodedMethodOverrideValuesOf(bytes);
     }

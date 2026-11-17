@@ -347,6 +347,29 @@ describe('write results (T30d): the generation history and reopening', () => {
     expect(readScenarioWriteGenerationHistory(database, 'scenario-missing', [])).toEqual({ usedUniqueKeys: [], usedPhoneNumbers: [] });
   });
 
+  // OP-F（安全のレビューの M-1、設計書 4.1.2 の R4）: 送らずに止めた回（`NOT_SENT`。送る前の記録の後に止めた回と、送らずに締めた回）の値は、使った扱いにしない
+  // （送っていないため。値の候補の少ない規則で、次の回が `WRITE_DATA_NOT_GENERATED` にならないように）。送ったか分からない回（`UNKNOWN`）と、まだ締めていない回は、
+  // 使った扱いのまま。
+  it('does not count the unique key of a write that was not sent, and keeps the ones that may have been sent', () => {
+    consumedGrant(0);
+    recordWriteAttempt(database, attemptOf(0));
+    settleWriteResult(database, notSentReport(0));
+    consumedGrant(1);
+    recordWriteAttempt(database, attemptOf(1));
+    expect(closeWriteWithoutSending(database, { grantId: 'grant-1', jobId: 'job-w1', at: writeSlotAt(1, 2 * MINUTE_MS) }))
+      .toMatchObject({ kind: 'SETTLED_NOT_SENT' });
+    consumedGrant(2);
+    recordWriteAttempt(database, attemptOf(2));
+    settleWriteResult(database, sentReport(2, { submission: 'UNKNOWN', httpStatus: null, responseJudgement: null, recordId: null,
+      readVerification: null, submittedAt: null }));
+    consumedGrant(3);
+    recordWriteAttempt(database, attemptOf(3));
+    const keyOf = (slot: number): string => JSON.stringify({ name: `サンプル ${slot}` });
+    for (const fields of [[], ['name']]) {
+      expect(readScenarioWriteGenerationHistory(database, 'scenario-1', fields).usedUniqueKeys, fields.join()).toEqual([keyOf(2), keyOf(3)]);
+    }
+  });
+
   it('keeps the results and the reservations after reopening the database', () => {
     consumedGrant(0);
     recordWriteAttempt(database, attemptOf(0));

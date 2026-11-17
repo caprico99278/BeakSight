@@ -98,9 +98,9 @@ export const READ_CHECK_FACTS: readonly ScenarioReadCheckDefinitionFact[] = Obje
  * セレクタだけ。
  */
 export const FULL_VERIFICATION: ScenarioVerification = Object.freeze<ScenarioVerification>({
-  successCondition: { pathPrefix: '/members/', selector: '.registered' },
-  inputErrorCondition: { pathPrefix: '/members/new', selector: '.error' },
-  recordId: { source: 'URL_PATH_PATTERN', pathPattern: '/members/{id}' },
+  // PL-6a: 成否の条件の代わりに、結果の判定のしかたの印（form の構造の判定）。ID の取り方は ID の型の一覧。
+  resultJudgement: 'FORM_STRUCTURE',
+  recordId: { source: 'URL_PATH_PATTERNS', pathPatterns: ['/members/{id}'] },
   readVerification: {
     readCheckId: 'rc-1',
     revision: 2,

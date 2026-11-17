@@ -6,11 +6,12 @@ import {
   AUDIT_MODES,
   AUTH_STRATEGIES,
   ENVIRONMENT_KINDS,
+  NO_LOGIN_AUTH_STRATEGY,
   type AuditMode,
   type AuthStrategy,
   type EnvironmentKind,
 } from '../../../../src/control/contracts.js';
-import { isExecutableAuditMode, isProfileOperationAllowed } from '../../../../src/control/execution-policy.js';
+import { isProfileOperationAllowed } from '../../../../src/control/execution-policy.js';
 import type { AutomatedLoginResult, AutomatedLoginSubmission } from '../../../../src/control/auth/automated-login-results.js';
 import type { CredentialChangeKind } from '../../../../src/control/credentials/credential-store.js';
 import type { AuthSetupFreshness } from '../../../../src/control/store/auth-setup-store.js';
@@ -19,9 +20,10 @@ import type { EntryCheckEndReason, EntryCheckFormPlacement } from '../../../../s
 import type { WorkerAuthState } from '../../../../src/control/worker-protocol.js';
 import type { AuditJobKind, AuditJobState, WriteReportCheck } from '../../../../src/control/job/job-records.js';
 import type { CredentialEnvironmentState } from '../server/credential-runtime';
-import type { WorkerOutcomeKind } from '../../../../src/control/worker-protocol.js';
+import type { WorkerOutcomeKind, WorkerRequestResourceType } from '../../../../src/control/worker-protocol.js';
 import type { IncompleteReasonCode, RunExecutionEndReason, RunStatus } from '../../../../src/core/contracts.js';
-import { LOCAL_UI_JOB_NEXT_STEPS, nextStepOfIncompleteReason } from '../../../../src/presentation/messages.js';
+import { LOCAL_UI_JOB_NEXT_STEPS, LOCAL_UI_SAFETY_VIOLATION_TEXT, nextStepOfIncompleteReason } from '../../../../src/presentation/messages.js';
+import { HTTP_METHOD_LABELS, HTTP_METHOD_OTHER_LABEL, REQUEST_RESOURCE_TYPE_LABELS } from '../../../../src/presentation/catalog.js';
 import type {
   CandidateClassification,
   CandidateKind,
@@ -42,9 +44,7 @@ import type {
   SideEffectConfirmation,
 } from '../../../../src/control/approval-view.js';
 import type { ScenarioDisplayState } from './scenarios';
-import type { WriteChainState, WriteChainStopReason } from '../server/write-chain-policy';
 import type { ChainStageState, ChainState, ChainStopReason } from '../../../../src/control/job/stage-chain-policy.js';
-import type { NextStepState, ProfileNextStep } from './next-steps';
 import type {
   ExternalDeliveryKind,
   FieldRelationKind,
@@ -72,8 +72,6 @@ import {
   RESPONSE_JUDGEMENT_CATALOG,
   SCENARIO_TRANSPORT_CATALOG,
   SCENARIO_VERIFICATION_ITEM_CATALOG,
-  WRITE_CHAIN_STATE_CATALOG,
-  WRITE_CHAIN_STOP_REASON_CATALOG,
   STAGE_CHAIN_STATE_CATALOG,
   STAGE_CHAIN_STAGE_STATE_CATALOG,
   STAGE_CHAIN_STOP_REASON_CATALOG,
@@ -118,12 +116,11 @@ import {
   CREDENTIAL_ENVIRONMENT_CATALOG,
   AUDIT_JOB_STATE_CATALOG,
   AUDIT_MODE_CATALOG,
+  AUDIT_MODE_NO_LOGIN_CATALOG,
   AUTH_SETUP_FRESHNESS_CATALOG,
   LOGIN_TRANSPORT_CATALOG,
   ENTRY_CHECK_END_REASON_CATALOG,
   ENTRY_CHECK_FORM_PLACEMENT_CATALOG,
-  NEXT_STEP_STATE_CATALOG,
-  PROFILE_NEXT_STEP_CATALOG,
   AUTH_STRATEGY_CATALOG,
   ENVIRONMENT_KIND_CATALOG,
   PROFILE_STATUS_CATALOG,
@@ -144,7 +141,14 @@ export interface DisplayValue {
 /** プロファイルの状態（`src/control/store/profile-records.ts` の `PROFILE_STATUSES` の値）。 */
 export type ProfileStatusValue = keyof typeof PROFILE_STATUS_CATALOG;
 
-export const auditModeDisplay = (mode: AuditMode): DisplayValue => AUDIT_MODE_CATALOG[mode];
+/**
+ * 点検のしかた（監査モード）の表示。NL-3（設計書 `2026-11-06-beaksight-no-login-test-site-design.md` 3.3 の 4）: モードと方式の組から決める（表示面ごとに
+ * 作り直さない）。ログインのないテスト用のサイト（ログインしない方式で、`AUDIT_MODE_NO_LOGIN_CATALOG` にあるテストのモード）は、ログインの語のない表示。
+ */
+export const auditModeDisplay = (mode: AuditMode, auth: AuthStrategy): DisplayValue =>
+  auth === NO_LOGIN_AUTH_STRATEGY && Object.hasOwn(AUDIT_MODE_NO_LOGIN_CATALOG, mode)
+    ? AUDIT_MODE_NO_LOGIN_CATALOG[mode as keyof typeof AUDIT_MODE_NO_LOGIN_CATALOG]
+    : AUDIT_MODE_CATALOG[mode];
 export const environmentDisplay = (environment: EnvironmentKind): DisplayValue => ENVIRONMENT_KIND_CATALOG[environment];
 export const authStrategyDisplay = (auth: AuthStrategy): DisplayValue => AUTH_STRATEGY_CATALOG[auth];
 export const profileStatusDisplay = (status: ProfileStatusValue): DisplayValue => PROFILE_STATUS_CATALOG[status];
@@ -160,10 +164,6 @@ export const runExecutionEndReasonDisplay = (reason: RunExecutionEndReason): Dis
 export const auditJobAuthStateDisplay = (state: WorkerAuthState): DisplayValue => AUDIT_JOB_AUTH_STATE_CATALOG[state];
 /** 保存した認証の設定の新しさ（T25e）。 */
 export const authSetupFreshnessDisplay = (freshness: AuthSetupFreshness): DisplayValue => AUTH_SETUP_FRESHNESS_CATALOG[freshness];
-
-/** T43a: プロファイルの「次にすること」の手順と、その状態（値の一覧は `next-steps.ts`）。 */
-export const profileNextStepDisplay = (step: ProfileNextStep): DisplayValue => PROFILE_NEXT_STEP_CATALOG[step];
-export const nextStepStateDisplay = (state: NextStepState): DisplayValue => NEXT_STEP_STATE_CATALOG[state];
 
 /** T34d: ログインの送り方（フォームの送信・スクリプトの送信）。 */
 export const loginTransportDisplay = (transport: LoginTransport): DisplayValue => LOGIN_TRANSPORT_CATALOG[transport];
@@ -247,12 +247,8 @@ export const AUDIT_MODE_OPTIONS = optionsOf(AUDIT_MODES, AUDIT_MODE_CATALOG);
 export const ENVIRONMENT_OPTIONS = optionsOf(ENVIRONMENT_KINDS, ENVIRONMENT_KIND_CATALOG);
 export const AUTH_STRATEGY_OPTIONS = optionsOf(AUTH_STRATEGIES, AUTH_STRATEGY_CATALOG);
 
-/**
- * 今は監査を実行できない（書き込みが要る）モードか。今実行できるモードの一覧は、`src/control/execution-policy.ts` が唯一の owner
- * （T23R の M5。T24f で画面の写しを消した）。ジョブの管理も、開始の直前に同じ判定を使う。T28b: 書き込みのモードでも、認証の設定・発見・READ の
- * 確かめは使える（監査だけが実行できない。フォームの案内の文言で伝える）。
- */
-export const isNotYetExecutableMode = (mode: AuditMode): boolean => !isExecutableAuditMode(mode);
+// MI-1 の D（MI-5 の報告による設計者の判断）: 書き込みのモードでも監査を始められるようになり、「今は監査を実行できないモードか」
+// （isNotYetExecutableMode）はいつも偽になったので消した。
 
 /**
  * 今実行できる、モードと認証の方式の組み合わせか（T25e。一覧の「監査を始める」を置くか）。判定は `src/control/execution-policy.ts` の
@@ -277,6 +273,10 @@ export const usesReadCheck = (mode: AuditMode, auth: AuthStrategy): boolean => i
  * 自動ログインを使うプロファイルか（T26e。Task 26 の設計書 4.2、4.6。T28b で `src/control/execution-policy.ts` の `CREDENTIAL` の行の判定にした。
  * 認証つきの読み取りの監査と書き込みのモードの、自動ログイン）。資格情報の画面とログインの確かめの案内は、このプロファイルだけに出す。この環境で
  * 暗号化が使えるか（Windows か）は、サーバが判定して画面に渡す（ここでは判定しない。このファイルはブラウザのバンドルにも入る）。
+ * MI-F3（独立レビュー MI-R の Minor 12）: 似た判定の `isAutomatedLoginProfileAuth`（`src/control/auth/credential-destination.ts`）とは意味が違うので、1 つに
+ * まとめない。こちらは「この画面の操作（資格情報・ログインの確かめ）を案内するか」で、モードと方式の組を操作の表（`CREDENTIAL` の行）で見る表示の判定。
+ * あちらは「認証の方式が自動ログインか」だけを見る安全の判定（資格情報の送信先を変えない守り、MI-G の自動ログインの文脈、入口の確かめの後の案の保存の除外）で、
+ * モードによらず効かせる（操作の表の行が変わっても、守りが外れないため）。
  */
 export const usesAutomatedLogin = (mode: AuditMode, auth: AuthStrategy): boolean => isProfileOperationAllowed('CREDENTIAL', mode, auth);
 
@@ -314,10 +314,6 @@ export const scenarioVerificationItemDisplay = (item: ScenarioVerificationItem):
 
 export const recordIdSourceDisplay = (source: RecordIdSource): DisplayValue => RECORD_ID_SOURCE_CATALOG[source];
 
-/** T41g: 「登録してから更新する」の状態と、更新を始めなかった理由。 */
-export const writeChainStateDisplay = (state: WriteChainState): DisplayValue => WRITE_CHAIN_STATE_CATALOG[state];
-export const writeChainStopReasonDisplay = (reason: WriteChainStopReason): DisplayValue => WRITE_CHAIN_STOP_REASON_CATALOG[reason];
-
 /** FM2d・FM2R の Minor 3: まとめて実行の状態、段の状態、止めた理由。 */
 export const stageChainStateDisplay = (state: ChainState): DisplayValue => STAGE_CHAIN_STATE_CATALOG[state];
 export const stageChainStageStateDisplay = (state: ChainStageState): DisplayValue => STAGE_CHAIN_STAGE_STATE_CATALOG[state];
@@ -335,3 +331,39 @@ export const writeReportCheckDisplay = (check: WriteReportCheck): DisplayValue =
  */
 export const runReasonNextStepOf = (code: IncompleteReasonCode): string =>
   (LOCAL_UI_JOB_NEXT_STEPS.runReasons as Partial<Record<IncompleteReasonCode, string>>)[code] ?? nextStepOfIncompleteReason(code);
+
+/**
+ * PL-W（設計書 `doc/design/2026-10-26-beaksight-plain-ui-design.md` 3 章の 2・4）: HTTP の送り方の名前を、画面の日本語の名前にする（GET・POST を生で出さない）。
+ * 名前の言い換えだけで、どれを読み取りとみなすかは決めない（判定は `src/safety/request-policy.ts`）。知らない名前は「そのほかの通信」。
+ */
+export const httpMethodLabel = (method: string): string =>
+  (HTTP_METHOD_LABELS as Readonly<Record<string, string>>)[method.toUpperCase()] ?? HTTP_METHOD_OTHER_LABEL;
+
+/** PL-W: 要求の種類（document・xhr など）を、画面の日本語の名前にする。 */
+export const requestResourceTypeLabel = (resourceType: WorkerRequestResourceType): string => REQUEST_RESOURCE_TYPE_LABELS[resourceType];
+
+/**
+ * PL-W: 安全の違反の記号（`code`。開いた一覧の英大文字の識別子）の頭の語から、起きたことの名前を選ぶ（記号そのものは画面に出さない）。
+ * 長い頭の語を先に見る（`EXTERNAL_SCHEME_` と `UNEXPECTED_WEBSOCKET_` など）。当たらない記号は「思わぬこと」。
+ */
+const SAFETY_VIOLATION_CODE_FAMILY_PREFIXES: readonly (readonly [string, keyof typeof LOCAL_UI_SAFETY_VIOLATION_TEXT.codeFamilies])[] = Object.freeze([
+  ['EXPECTED_CDP_', 'CDP'],
+  ['INTERACTION_', 'INTERACTION'],
+  ['EXTERNAL_SCHEME_', 'EXTERNAL_SCHEME'],
+  ['UNEXPECTED_WEBSOCKET_', 'WEBSOCKET'],
+  ['UNEXPECTED_HTTP_', 'HTTP'],
+  ['WEBSOCKET_', 'WEBSOCKET'],
+  ['REDIRECT_', 'REDIRECT'],
+  ['PASSIVE_GUARD_', 'GUARD'],
+  ['GUARDED_', 'GUARD'],
+  ['GUARD_', 'GUARD'],
+  ['EGRESS_', 'EGRESS'],
+  ['WORKER_', 'WORKER'],
+  ['HTTP_', 'HTTP'],
+  ['CDP_', 'CDP'],
+] as const);
+
+export const safetyViolationCodeLabel = (code: string): string => {
+  const family = SAFETY_VIOLATION_CODE_FAMILY_PREFIXES.find(([prefix]) => code.startsWith(prefix))?.[1] ?? 'OTHER';
+  return LOCAL_UI_SAFETY_VIOLATION_TEXT.codeFamilies[family];
+};

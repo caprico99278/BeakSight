@@ -3,12 +3,15 @@
 // - ログインの段の口（`authSetup`）: 許した Origin と path への、main frame のナビゲーションの POST だけを、残りの回数が 1 以上のときに
 //   ALLOW する。query は問わない（path までで比べる）。path は URL の解析器の正規化（dot segment の解決）の後の値で、大文字と小文字を
 //   区別して完全一致で比べる（percent-encode は decode しない。許す側の一覧なので、違う書き方は止まる側に倒す）。
-// - 監査の段の除外の口（`auditExclusions`）: 許可 Origin への GET と HEAD でも、除外のパス・範囲の外・危険な語に当たる URL を BLOCK する。
+// - 監査の段の除外の口（`auditExclusions`）: 除外のパス・範囲の外・危険な語の比べ方。SD-2 から要求の判定は当てず、BeakSight 自身の移動の前の判定
+//   （`isAuditExcludedUrl`・`isOutsideAuditScope`）が当てる（`judgeWith` で確かめる）。
 // - どちらの口もないときは、今の判定（Task 22 の golden）と同じ。
 // 例の値は、匿名の値（`example.com`、`example.invalid`）だけを使う。
 import { describe, expect, it } from 'vitest';
 import {
   classifyPassiveRequest,
+  isAuditExcludedUrl,
+  isOutsideAuditScope,
   type AuditExclusionPolicy,
   type HttpRequestFacts,
   type LoginStagePolicy,
@@ -31,6 +34,15 @@ const BLOCK_AUDIT_EXCLUDED: PassiveRequestDecision = {
   category: 'AUDIT_EXCLUSION',
   reason: 'AUDIT_EXCLUDED_URL',
 };
+
+/**
+ * SD-2（設計書 `2026-11-16-beaksight-action-based-delete-guard-design.md` 2.4）: 要求の判定は main frame の移動にも除外を当てない。除外の比べ方は、BeakSight 自身の
+ * 移動の前の判定（`isAuditExcludedUrl`）で確かめる（main frame の移動の形の事実は、その判定で当たれば除外。ほかの要求と、当たらない移動は要求の判定のまま）。
+ */
+const judgeWith = (exclusions: AuditExclusionPolicy) => (facts: HttpRequestFacts): PassiveRequestDecision =>
+  (['GET', 'HEAD'].includes(facts.method) && facts.isNavigationRequest && facts.isMainFrame && isAuditExcludedUrl(facts.url, ALLOWED_ORIGINS, exclusions)
+    ? BLOCK_AUDIT_EXCLUDED
+    : classifyPassiveRequest(facts, ALLOWED_ORIGINS, { auditExclusions: exclusions }));
 
 const LOGIN_STAGE: LoginStagePolicy = Object.freeze({
   loginPostEndpoints: Object.freeze([Object.freeze({ origin: 'https://example.com', path: '/login' })]),
@@ -197,9 +209,12 @@ describe('T25b: the policies leave the golden combinations unchanged when they d
     // T26g-1: ログインの段では、許可 Origin の外への GET と HEAD のサブリソースも止める（golden のほかの組み合わせは同じ）。
     const outsideRead = (facts.method === 'GET' || facts.method === 'HEAD') && !facts.isNavigationRequest
       && !facts.url.startsWith('https://example.com/');
+    // SD-2: ログインの段は、許可 Origin の外への main frame の読み取りの移動を今どおり止める（ほかの段は止めない）。
+    const outsideMove = (facts.method === 'GET' || facts.method === 'HEAD') && facts.isNavigationRequest && facts.isMainFrame
+      && !facts.url.startsWith('https://example.com/');
     expect(classifyPassiveRequest(facts, ALLOWED_ORIGINS, { authSetup: LOGIN_STAGE })).toEqual(outsideRead
       ? { action: 'BLOCK', category: 'LOGIN_STAGE', reason: 'OUTSIDE_ALLOWED_ORIGINS' }
-      : classifyPassiveRequest(facts, ALLOWED_ORIGINS));
+      : outsideMove ? BLOCK_EXTERNAL_NAVIGATION : classifyPassiveRequest(facts, ALLOWED_ORIGINS));
   });
 
   it.each(GOLDEN_FACTS)('$method $url (navigation $isNavigationRequest) decides the same with exclusions that do not match', (facts) => {
@@ -228,8 +243,7 @@ const subresource = (method: string, url: string): HttpRequestFacts => ({
 });
 
 describe('T25b: the audit stage exclusions (auditExclusions) of classifyPassiveRequest', () => {
-  const classify = (facts: HttpRequestFacts): PassiveRequestDecision =>
-    classifyPassiveRequest(facts, ALLOWED_ORIGINS, { auditExclusions: EXCLUSIONS });
+  const classify = judgeWith(EXCLUSIONS);
 
   it('allows a GET and a HEAD inside the audit paths that hits no exclusion', () => {
     expect(classify(mainFrameNavigation('GET', 'https://example.com/admin/users?page=2'))).toEqual(ALLOW_INSPECT_REDIRECTS);
@@ -244,10 +258,8 @@ describe('T25b: the audit stage exclusions (auditExclusions) of classifyPassiveR
     ['another excluded path', 'https://example.com/admin/session/end?x=1'],
     ['the excluded path in another letter case', 'https://example.com/admin/LOGOUT'],
     ['the excluded path percent-encoded', 'https://example.com/admin/%6Cogout'],
-  ])('blocks %s for the main frame navigation and the sub request', (_label, url) => {
+  ])('blocks %s for the main frame navigation', (_label, url) => {
     expect(classify(mainFrameNavigation('GET', url))).toEqual(BLOCK_AUDIT_EXCLUDED);
-    expect(classify(subresource('GET', url))).toEqual(BLOCK_AUDIT_EXCLUDED);
-    expect(classify(subresource('HEAD', url))).toEqual(BLOCK_AUDIT_EXCLUDED);
   });
 
   it.each([
@@ -257,7 +269,6 @@ describe('T25b: the audit stage exclusions (auditExclusions) of classifyPassiveR
     ['an encoded slash that leaves the audit path', 'https://example.com/admin%2F..%2Fpublic'],
   ])('blocks a request outside the audit paths: %s', (_label, url) => {
     expect(classify(mainFrameNavigation('GET', url))).toEqual(BLOCK_AUDIT_EXCLUDED);
-    expect(classify(subresource('GET', url))).toEqual(BLOCK_AUDIT_EXCLUDED);
   });
 
   it('does not limit the paths when the audit paths are empty', () => {
@@ -265,9 +276,7 @@ describe('T25b: the audit stage exclusions (auditExclusions) of classifyPassiveR
     expect(classifyPassiveRequest(mainFrameNavigation('GET', 'https://example.com/public/page'), ALLOWED_ORIGINS, {
       auditExclusions: unlimited,
     })).toEqual(ALLOW_INSPECT_REDIRECTS);
-    expect(classifyPassiveRequest(mainFrameNavigation('GET', 'https://example.com/admin/logout'), ALLOWED_ORIGINS, {
-      auditExclusions: unlimited,
-    })).toEqual(BLOCK_AUDIT_EXCLUDED);
+    expect(judgeWith(unlimited)(mainFrameNavigation('GET', 'https://example.com/admin/logout'))).toEqual(BLOCK_AUDIT_EXCLUDED);
   });
 
   it.each([
@@ -282,7 +291,6 @@ describe('T25b: the audit stage exclusions (auditExclusions) of classifyPassiveR
     ['as part of a longer word', 'https://example.com/admin/items/undeleted'],
   ])('blocks a dangerous term %s', (_label, url) => {
     expect(classify(mainFrameNavigation('GET', url))).toEqual(BLOCK_AUDIT_EXCLUDED);
-    expect(classify(subresource('GET', url))).toEqual(BLOCK_AUDIT_EXCLUDED);
   });
 
   it('does not look at the fragment (it is not sent to the server)', () => {
@@ -291,13 +299,17 @@ describe('T25b: the audit stage exclusions (auditExclusions) of classifyPassiveR
 
   it('blocks a URL whose percent-encoding cannot be decoded (fail closed)', () => {
     expect(classify(mainFrameNavigation('GET', 'https://example.com/admin/items?q=%E0%A4%A'))).toEqual(BLOCK_AUDIT_EXCLUDED);
-    expect(classify(subresource('GET', 'https://example.com/admin/%ZZ'))).toEqual(BLOCK_AUDIT_EXCLUDED);
+    expect(classify(mainFrameNavigation('GET', 'https://example.com/admin/%ZZ'))).toEqual(BLOCK_AUDIT_EXCLUDED);
   });
 
-  it('does not apply the exclusions to the requests outside the allowed origins (they keep the current decisions)', () => {
+  // SD-2: 許可 Origin の外への main frame の移動も、要求の判定では止めない（点検の範囲の外は `isOutsideAuditScope` が見分ける）。
+  it('does not apply the exclusions to the requests outside the allowed origins, and leaves a main frame move outside to the scope check', () => {
     expect(classify(subresource('GET', 'https://example.invalid/delete.png'))).toEqual(ALLOW_DIRECT);
     expect(classify(subresource('GET', 'https://example.invalid/public/page'))).toEqual(ALLOW_DIRECT);
-    expect(classify(mainFrameNavigation('GET', 'https://example.invalid/admin/logout'))).toEqual(BLOCK_EXTERNAL_NAVIGATION);
+    expect(classify(mainFrameNavigation('GET', 'https://example.invalid/admin/logout'))).toEqual(ALLOW_INSPECT_REDIRECTS);
+    expect(isOutsideAuditScope('https://example.invalid/admin/logout', ALLOWED_ORIGINS, EXCLUSIONS)).toBe(true);
+    expect(isOutsideAuditScope('https://example.com/admin/logout', ALLOWED_ORIGINS, EXCLUSIONS)).toBe(true);
+    expect(isOutsideAuditScope('https://example.com/admin/users', ALLOWED_ORIGINS, EXCLUSIONS)).toBe(false);
   });
 
   it('keeps the non-read method and the WebSocket decisions first', () => {
@@ -308,10 +320,6 @@ describe('T25b: the audit stage exclusions (auditExclusions) of classifyPassiveR
     })).toEqual({ action: 'BLOCK', category: 'WEBSOCKET', reason: 'PASSIVE_WEBSOCKET' });
   });
 
-  it('blocks an unparsable URL while the exclusions are given (fail closed; without them it is allowed as today)', () => {
-    expect(classify(subresource('GET', 'not a URL'))).toEqual(BLOCK_AUDIT_EXCLUDED);
-    expect(classifyPassiveRequest(subresource('GET', 'not a URL'), ALLOWED_ORIGINS)).toEqual(ALLOW_DIRECT);
-  });
 });
 
 // T25g-1（独立レビュー T25R の C1）: 監査の段の除外は、path の途中の連続した `/`（`/admin//purge`）と、segment の `;` から後の path の
@@ -319,8 +327,7 @@ describe('T25b: the audit stage exclusions (auditExclusions) of classifyPassiveR
 // それらの形（percent-encode の decode と `.` `..` の解決との組み合わせを含む）のどれか 1 つでも除外に当たれば止める。読む範囲は、
 // すべての形が当たらなければ止める。
 describe('T25g-1: the audit stage exclusions are not bypassed by repeated slashes or segment parameters', () => {
-  const classify = (facts: HttpRequestFacts): PassiveRequestDecision =>
-    classifyPassiveRequest(facts, ALLOWED_ORIGINS, { auditExclusions: EXCLUSIONS });
+  const classify = judgeWith(EXCLUSIONS);
 
   it.each([
     ['repeated slashes before the excluded segment', '/admin//session/end'],
@@ -340,8 +347,6 @@ describe('T25g-1: the audit stage exclusions are not bypassed by repeated slashe
   ])('blocks the excluded path with %s', (_label, path) => {
     const url = `https://example.com${path}`;
     expect(classify(mainFrameNavigation('GET', url))).toEqual(BLOCK_AUDIT_EXCLUDED);
-    expect(classify(subresource('GET', url))).toEqual(BLOCK_AUDIT_EXCLUDED);
-    expect(classify(subresource('HEAD', url))).toEqual(BLOCK_AUDIT_EXCLUDED);
   });
 
   it.each([
@@ -352,14 +357,13 @@ describe('T25g-1: the audit stage exclusions are not bypassed by repeated slashe
   ])('blocks a path that leaves the audit paths with %s', (_label, path) => {
     const url = `https://example.com${path}`;
     expect(classify(mainFrameNavigation('GET', url))).toEqual(BLOCK_AUDIT_EXCLUDED);
-    expect(classify(subresource('GET', url))).toEqual(BLOCK_AUDIT_EXCLUDED);
   });
 
   it.each([
     ['repeated slashes', '/admin//items/delete'],
     ['a parameter', '/admin;x=1/items/sign-out'],
   ])('still blocks a dangerous term with %s', (_label, path) => {
-    expect(classify(subresource('GET', `https://example.com${path}`))).toEqual(BLOCK_AUDIT_EXCLUDED);
+    expect(classify(mainFrameNavigation('GET', `https://example.com${path}`))).toEqual(BLOCK_AUDIT_EXCLUDED);
   });
 
   it.each([
@@ -397,8 +401,7 @@ describe('T25g-1 round 1: the audit stage exclusions compare the Unicode-normali
     ...EXCLUSIONS,
     excludedPathPrefixes: [...EXCLUSIONS.excludedPathPrefixes, '/admin/kick'],
   };
-  const classify = (facts: HttpRequestFacts): PassiveRequestDecision =>
-    classifyPassiveRequest(facts, ALLOWED_ORIGINS, { auditExclusions: FOLD_EXCLUSIONS });
+  const classify = judgeWith(FOLD_EXCLUSIONS);
 
   it.each([
     ['the long s (U+017F) in the excluded path', '/admin/%C5%BFession/end'],
@@ -415,7 +418,6 @@ describe('T25g-1 round 1: the audit stage exclusions compare the Unicode-normali
   ])('blocks %s', (_label, path) => {
     const url = `https://example.com${path}`;
     expect(classify(mainFrameNavigation('GET', url))).toEqual(BLOCK_AUDIT_EXCLUDED);
-    expect(classify(subresource('GET', url))).toEqual(BLOCK_AUDIT_EXCLUDED);
   });
 
   it.each([

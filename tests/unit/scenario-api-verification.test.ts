@@ -28,7 +28,8 @@ const apiOf = (recordId: ScenarioApiSpec['recordId']): ScenarioApiSpec => ({
 
 const RESPONSE_KEY = apiOf({ source: 'RESPONSE_BODY_KEY', key: 'id' });
 const NO_RESPONSE_KEY = apiOf(null);
-const WITHOUT_CONDITIONS: ScenarioVerification = { ...FULL_VERIFICATION, successCondition: null, inputErrorCondition: null };
+// PL-6a: 成否の条件の 2 項目は、結果の判定のしかたの印（form は BeakSight が付ける）になった。印のない検証の指定。
+const WITHOUT_CONDITIONS: ScenarioVerification = { ...FULL_VERIFICATION, resultJudgement: null };
 
 describe('T40a-fix: the items of the verification spec an API scenario needs', () => {
   it('names the items of an API scenario (the record id and the READ verification), in the order of the closed list', () => {
@@ -41,9 +42,9 @@ describe('T40a-fix: the items of the verification spec an API scenario needs', (
   });
 
   it.each<readonly [string, ScenarioVerification, Parameters<typeof missingVerificationItemsOf>[1], readonly string[]]>([
-    // API: 成否の条件と入力の誤りの条件は求めない。
+    // API: 結果の判定のしかたの印は求めない（API は null）。
     ['an API scenario without the two conditions (the response body key)', WITHOUT_CONDITIONS, { transport: 'API', api: RESPONSE_KEY }, []],
-    ['an API scenario with the two conditions (they are not used)', FULL_VERIFICATION, { transport: 'API', api: RESPONSE_KEY }, []],
+    ['an API scenario with the mark of a form (not used)', FULL_VERIFICATION, { transport: 'API', api: RESPONSE_KEY }, []],
     // API: ID の取り方はどちらか 1 つ。
     ['an API scenario with the record id of the verification spec only', WITHOUT_CONDITIONS, { transport: 'API', api: NO_RESPONSE_KEY }, []],
     ['an API scenario with the response body key only', { ...WITHOUT_CONDITIONS, recordId: null }, { transport: 'API', api: RESPONSE_KEY }, []],
@@ -52,12 +53,13 @@ describe('T40a-fix: the items of the verification spec an API scenario needs', (
     // API: 照合の READ は求める。
     ['an API scenario without the READ verification', { ...WITHOUT_CONDITIONS, readVerification: null }, { transport: 'API', api: RESPONSE_KEY }, ['readVerification']],
     ['an API scenario with nothing', UNSPECIFIED_VERIFICATION, { transport: 'API', api: NO_RESPONSE_KEY }, ['recordId', 'readVerification']],
-    // FORM（送り方の項目なし・FORM）: 今のまま 4 項目。API の指定は見ない。
-    ['a FORM scenario without the two conditions', WITHOUT_CONDITIONS, { transport: 'FORM' }, ['successCondition', 'inputErrorCondition']],
-    ['a scenario without the transport and the two conditions', WITHOUT_CONDITIONS, {}, ['successCondition', 'inputErrorCondition']],
-    ['a FORM scenario without the record id and an API spec', { ...FULL_VERIFICATION, recordId: null }, { transport: 'FORM', api: RESPONSE_KEY }, ['recordId']],
-    ['a FORM scenario with all four', FULL_VERIFICATION, { transport: 'FORM' }, []],
-    ['a FORM scenario with nothing', UNSPECIFIED_VERIFICATION, {}, SCENARIO_VERIFICATION_ITEMS],
+    // FORM（送り方の項目なし・FORM）: 3 項目（PL-6a）。API の指定は見ない。
+    ['a FORM scenario without the two conditions', WITHOUT_CONDITIONS, { transport: 'FORM' }, ['resultJudgement']],
+    ['a scenario without the transport and the two conditions', WITHOUT_CONDITIONS, {}, ['resultJudgement']],
+    // PL-5 の 9 の (4)（設計書 8.1）: form の ID の取り方は、決められなければ null のまま許可を出す（結果は ID なしの PARTIAL）。不足に数えない。
+    ['a FORM scenario without the record id and an API spec', { ...FULL_VERIFICATION, recordId: null }, { transport: 'FORM', api: RESPONSE_KEY }, []],
+    ['a FORM scenario with all three', FULL_VERIFICATION, { transport: 'FORM' }, []],
+    ['a FORM scenario with nothing', UNSPECIFIED_VERIFICATION, {}, ['resultJudgement', 'readVerification']],
   ])('judges %s', (_label, verification, scenario, missing) => {
     expect(missingVerificationItemsOf(verification, scenario)).toEqual(missing);
   });
@@ -73,7 +75,7 @@ describe('T40a-fix: the items of the verification spec an API scenario needs', (
   });
 
   it('keeps the judgement of a FORM scenario when the transport is not given (fail-closed)', () => {
-    expect(missingVerificationItemsOf(WITHOUT_CONDITIONS)).toEqual(['successCondition', 'inputErrorCondition']);
+    expect(missingVerificationItemsOf(WITHOUT_CONDITIONS)).toEqual(['resultJudgement']);
     expect(missingVerificationItemsOf(FULL_VERIFICATION)).toEqual([]);
   });
 });

@@ -1,7 +1,6 @@
 // T31g-1（Task 31 の設計書 3 章の「更新の前の読み取り」「欄の役割」「値の照らし方」「削除にあたる変更の遮断」「同じ名前の hidden と checkbox の
 // 組」）: 書き込みのフォームの入力と読み取りの owner（`src/browser/write-form-submitter.ts`）の UPDATE の口。本物の Guard（書き込みの段）と、
-// 127.0.0.1 の fixture のサーバ（`tests/helpers/update-form-fixture-server.ts`）で確かめる。Chromium は headless だけ（テストの既定と、CLI の
-// 起動の設定の両方）。
+// 127.0.0.1 の fixture のサーバ（`tests/helpers/update-form-fixture-server.ts`）で確かめる。Chromium はテストの既定の headless。
 // - 前の値の読み取り（`readUpdateFormValues`）: 変える欄と保つ欄の今の値、状態の名前の hidden の値、組の hidden の値だけを返し、CSRF の
 //   hidden・`lock_version` の値を返さない。組の hidden と checkbox が DOM で隣り合わなければ読まない。
 // - 期待の作り手（`updatePayloadFieldsOf`）で作った期待を本物の Guard の照合に通し、入力（`inspectUpdateForm`・`fillWriteForm`・
@@ -9,7 +8,7 @@
 // - 送信の前にページの JS が、保つ欄の値・状態の hidden・組の hidden を書き換える、組の checkbox を外す、`_method` を `DELETE` にする、保つ
 //   select・radio を変える、ないはずの checkbox をチェックする、のどれでも POST は届かない。
 // - 書き込みの段の画面の値が前の値と違う回は、入力の前の確かめで止まる（送らない）。
-// - サーバの記録で回ごとに数え、全部の回の後に `LATE_DELIVERY_SETTLE_MS` だけ待ってもう一度数える。
+// - サーバの記録で回ごとに数える（RB-11: 全部の回の後の数え直しは、ずれの確かめと guard-write-stage の 1 か所に集めた）。
 import type { Browser, BrowserContext, Page } from 'playwright';
 import { afterAll, afterEach, beforeAll, describe, expect, it } from 'vitest';
 import {
@@ -33,7 +32,7 @@ import {
 } from '../../src/safety/passive-request-guard.js';
 import { SafetyLedger } from '../../src/safety/safety-ledger.js';
 import type { WriteFormEnctype } from '../../src/safety/write-payload-policy.js';
-import { launchCliChromium, launchHeadlessChromium } from '../helpers/chromium.js';
+import { DEFAULT_CHROMIUM_LAUNCHERS } from '../helpers/chromium.js';
 import { QUIET_PERIOD_MS } from '../helpers/gate-harness.js';
 import { READ_METHODS } from '../helpers/leak-places.js';
 import {
@@ -49,8 +48,6 @@ import { startWriteSubmissionProxy, type WriteSubmissionProxy } from '../helpers
 
 const VIEWPORT = Object.freeze({ width: 900, height: 700 });
 const NAVIGATION_SETTLE_TIMEOUT_MS = 5_000;
-/** 全部の回の後に、遅れて届く要求を見逃さないために待つ時間（ms。Task 30 の設計書 6 章の「2 秒」）。 */
-const LATE_DELIVERY_SETTLE_MS = 2_000;
 const ROUND_TIMEOUT_MS = 60_000;
 /** 変える欄に入れる新しい値。 */
 const NEW_NAME = '佐藤 花子';
@@ -60,10 +57,6 @@ const ENCTYPES: Readonly<Record<UpdateFormFixtureEnctype, WriteFormEnctype>> = O
   multipart: 'multipart/form-data',
 });
 
-const LAUNCHES = [
-  { name: 'the headless shell (test default)', launch: (): Promise<Browser> => launchHeadlessChromium() },
-  { name: 'the CLI Chromium (launchCliChromium, headless)', launch: (): Promise<Browser> => launchCliChromium() },
-] as const;
 
 const field = (name: string, type: WriteFormFieldSpec['type'], flags: Partial<Pick<WriteFormFieldSpec, 'readonly' | 'hidden' | 'disabled'>> = {}): WriteFormFieldSpec =>
   ({ name, type, readonly: false, hidden: false, disabled: false, ...flags });
@@ -139,15 +132,13 @@ const BLOCKED_VARIANTS: readonly { readonly round: string; readonly variant: Upd
   { round: 'an unchecked checkbox that the page checks', variant: 'js-absent' },
 ];
 
-describe.each(LAUNCHES)('T31g-1: the update form reading and input, with $name', ({ name, launch }) => {
+describe.each(DEFAULT_CHROMIUM_LAUNCHERS)('T31g-1: the update form reading and input, with %s', (name, launch) => {
   let browser: Browser;
   let server: UpdateFormFixtureServer;
   let submissionProxy: WriteSubmissionProxy;
   const contexts: BrowserContext[] = [];
   /** これまでの回で、サーバに届いてよいと確かめた POST（承認の POST だけ）。 */
   const expectedPosts: string[] = [];
-  /** 止めた証拠のあった回。 */
-  const blockedRounds: string[] = [];
 
   beforeAll(async () => {
     browser = await launch();
@@ -221,17 +212,14 @@ describe.each(LAUNCHES)('T31g-1: the update form reading and input, with $name',
     if (!filled.ok) {
       return { page, ledger, monitor, stoppedAt: filled.reason };
     }
-    await Promise.all([
+    // Guard が送信を止めた回は、押した後に送信が始まらないので `SUBMIT_FAILED` になる（FIX-237: 止めた送信を SUBMITTED と言わない）。
+    const [, submitted] = await Promise.all([
       page.waitForEvent('framenavigated', { timeout: NAVIGATION_SETTLE_TIMEOUT_MS }).catch(() => undefined),
-      submitWriteForm(page, inspection.form, { customer_name: NEW_NAME }).then((submitted) => {
-        if (!submitted.ok) {
-          throw new Error(`the submission failed: ${submitted.reason}`);
-        }
-      }),
+      submitWriteForm(page, inspection.form, { customer_name: NEW_NAME }),
     ]);
     await page.waitForLoadState('load', { timeout: NAVIGATION_SETTLE_TIMEOUT_MS }).catch(() => undefined);
     await wait(QUIET_PERIOD_MS);
-    return { page, ledger, monitor, stoppedAt: null };
+    return { page, ledger, monitor, stoppedAt: submitted.ok ? null : submitted.reason };
   };
 
   /** T31R-fix-1（C-1）: 前の値（値を照らす hidden の `lock_version` を含む。CSRF の hidden は読まない）。 */
@@ -293,12 +281,11 @@ describe.each(LAUNCHES)('T31g-1: the update form reading and input, with $name',
     }
     const { ledger, monitor, stoppedAt } = await writeUpdate(variant, 'urlencoded', read.values);
     console.info(`T31g-1 (${name}) ${round}: stopped ${stoppedAt}; server ${JSON.stringify(posts(server.requests))}; monitor ${JSON.stringify(monitor.snapshot())}`);
-    expect(stoppedAt).toBeNull();
+    expect(stoppedAt).toBe('SUBMIT_FAILED');
     expect(posts(server.requests)).toEqual(expectedPosts);
     expect(monitor.submissionReport()).toMatchObject({ submission: 'NOT_SENT', sendAttempts: 0 });
     expect(Object.values(monitor.snapshot().blockedByPayloadReason).reduce((sum, count) => sum + count, 0), `${round}: blocking evidence`).toBe(1);
     expectNoMarker(JSON.stringify([ledger.snapshot(), monitor.snapshot()]));
-    blockedRounds.push(round);
   }, ROUND_TIMEOUT_MS);
 
   it('stops before the input when the form of the write stage has another value than the prior value', async () => {
@@ -311,7 +298,6 @@ describe.each(LAUNCHES)('T31g-1: the update form reading and input, with $name',
     expect(stoppedAt).toBe('PRIOR_VALUE_CHANGED');
     expect(posts(server.requests)).toEqual(expectedPosts);
     expect(monitor.submissionReport()).toMatchObject({ submission: 'NOT_SENT', sendAttempts: 0 });
-    blockedRounds.push('drift');
   }, ROUND_TIMEOUT_MS);
 
   // T31g-1 fix round 1: 状態の語でもあり秘密に見える名前でもある hidden（`state`）がある画面は、値を読めず照らせないので、実行しない（期待を
@@ -334,14 +320,5 @@ describe.each(LAUNCHES)('T31g-1: the update form reading and input, with $name',
     expect(read).toEqual({ ok: false, reason: 'SECRET_LIKE_STATE_FIELD' });
     expect(made).toBeNull();
     expect(updatePayloadFieldsOf(spec, expectedPriorOf(), { customer_name: NEW_NAME })).toEqual({ ok: false, reason: 'SECRET_LIKE_STATE_FIELD' });
-    blockedRounds.push('secret-like state');
-  }, ROUND_TIMEOUT_MS);
-
-  it('after all the rounds, no POST arrives late (counted again after a named wait)', async () => {
-    await wait(LATE_DELIVERY_SETTLE_MS);
-    console.info(`T31g-1 (${name}) late check: blocked rounds ${blockedRounds.length}; server ${JSON.stringify(posts(server.requests))}`);
-    expect(posts(server.requests)).toEqual(expectedPosts);
-    expect(expectedPosts).toHaveLength(2);
-    expect(blockedRounds).toHaveLength(BLOCKED_VARIANTS.length + 2);
   }, ROUND_TIMEOUT_MS);
 });

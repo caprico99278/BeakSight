@@ -14,9 +14,13 @@ import {
   authenticatedRunConfig,
   authSessionLostReason,
   isExcludedCrawlCandidate,
+  isOutsideRunAuditScope,
   isRunNavigationBlocked,
   isSessionLostUrl,
   RUN_NAVIGATION_BLOCK_SCOPES,
+  runCheckpointAuthenticationOf,
+  sessionLostUrlAt,
+  sessionLostUrlOf,
   type RunAuthentication,
 } from '../../src/orchestration/authenticated-run.js';
 import {
@@ -131,6 +135,8 @@ describe('T25c: crawl candidates and the session lost path', () => {
     ['a percent-encoded dangerous word', `${ORIGIN}/admin/%72emove`],
     ['a path outside the audit range', `${ORIGIN}/public/page`],
     ['the session lost path (the login page)', `${ORIGIN}/login?expired=1`],
+    // SD-1（設計書 2026-11-16 2.3）: 巡回の URL の語（既定の除外の語に、区切りが `_` のログアウトの語を足したもの）。
+    ['a URL with the logout word written with an underscore', `${ORIGIN}/admin/sign_out`],
   ] as const)('excludes %s from the crawl candidates (the same judgement as the Guard)', (_case, url) => {
     expect(isExcludedCrawlCandidate(url, allowed, spec)).toBe(true);
   });
@@ -138,6 +144,8 @@ describe('T25c: crawl candidates and the session lost path', () => {
   it.each([
     ['the admin page', `${ORIGIN}/admin`],
     ['an admin sub page', `${ORIGIN}/admin/second?page=2`],
+    // SD-1（設計者の判断 2026-11-16）: 操作の前の判定だけの語（アーカイブ・リセットなど）は、巡回の URL には当てない。
+    ['an archive page', `${ORIGIN}/admin/archive/2024?view=reset`],
   ] as const)('keeps %s as a crawl candidate', (_case, url) => {
     expect(isExcludedCrawlCandidate(url, allowed, spec)).toBe(false);
   });
@@ -200,6 +208,15 @@ describe('CCX-10: the navigation pre-check shared by the crawl and the READ chec
     expect(isRunNavigationBlocked(`${ORIGIN}/admin`, allowed, spec, 'ANY_BLOCK')).toBe(false);
     expect(isRunNavigationBlocked(`${ORIGIN}/login`, allowed, spec, 'ANY_BLOCK')).toBe(true);
   });
+
+  // SD-2（設計書 `2026-11-16-beaksight-action-based-delete-guard-design.md` 2.4）: 読み込んだ画面の URL が点検の範囲の外か（移った画面を点検しない）。
+  it('finds a loaded page outside the audit scope: another origin, an exclusion, a destructive word; not the session lost path (SD-2)', () => {
+    expect(isOutsideRunAuditScope('http://127.0.0.1:4999/admin', allowed, spec)).toBe(true);
+    expect(isOutsideRunAuditScope(`${ORIGIN}/admin/items/1/delete`, allowed, spec)).toBe(true);
+    expect(isOutsideRunAuditScope(`${ORIGIN}/admin/sign_out`, allowed, null)).toBe(true);
+    expect(isOutsideRunAuditScope(`${ORIGIN}/admin`, allowed, spec)).toBe(false);
+    expect(isOutsideRunAuditScope(`${ORIGIN}/login`, allowed, spec)).toBe(false);
+  });
 });
 
 describe('T25c: the execution end and the checkpoint conclusion of a Run stopped by the session loss', () => {
@@ -221,5 +238,43 @@ describe('T25c: the execution end and the checkpoint conclusion of a Run stopped
       hasWrittenCheckpoint: true,
     })).toMatchObject({ action: 'FINISH', state: 'STOPPED' });
     expect(RESUME_REQUEUE_SKIP_REASON_CODES).toContain('AUTH_SESSION_LOST');
+  });
+});
+
+// NL-2（設計書 `2026-11-06-beaksight-no-login-test-site-design.md` 3.2 の 4）: ログインのないテスト用のサイトの Run は、セッションの切れの path を持たない
+// （`sessionLostPathPrefix: null`）。null なら、セッションの切れを判定しない（`/login` のような path へ移っても止まらない）。`"/"` を代わりに渡す形は採らない
+// （どの path も切れになるため）。ほかの守り（監査の段の除外・許可 Origin）は今のまま。
+describe('NL-2: the Run without a login does not judge the session loss', () => {
+  const allowed: ReadonlySet<string> = new Set([ORIGIN]);
+  const noLogin = authentication({
+    initialState: { cookies: [], origins: [] },
+    auditExclusions: { excludedPathPrefixes: [], auditPathPrefixes: [], dangerousTerms: DEFAULT_EXCLUDED_URL_WORDS },
+    sessionLostPathPrefix: null,
+  });
+
+  it('accepts the specification with no session lost path, and still rejects an empty or relative path', () => {
+    expect(() => assertRunAuthentication(noLogin, CONFIG)).not.toThrow();
+    expect(() => assertRunAuthentication({ ...noLogin, sessionLostPathPrefix: '' }, CONFIG)).toThrow(TypeError);
+    expect(() => assertRunAuthentication({ ...noLogin, sessionLostPathPrefix: 'login' }, CONFIG)).toThrow(TypeError);
+    expect(() => assertRunAuthentication({ ...noLogin, sessionLostPathPrefix: undefined }, CONFIG)).toThrow(TypeError);
+  });
+
+  it('never judges a URL as the session loss, and keeps the other judgements of the navigation pre-check', () => {
+    expect(isSessionLostUrl(`${ORIGIN}/login`, null)).toBe(false);
+    const ledger = new SafetyLedger();
+    expect(sessionLostUrlOf({ url: () => `${ORIGIN}/login?expired=1` }, ledger, null, [ORIGIN])).toBeNull();
+    expect(sessionLostUrlAt('settled', { url: () => `${ORIGIN}/login` }, ledger, null)).toBeNull();
+    expect(isExcludedCrawlCandidate(`${ORIGIN}/login?expired=1`, allowed, noLogin)).toBe(false);
+    expect(isRunNavigationBlocked(`${ORIGIN}/login`, allowed, noLogin, 'ANY_BLOCK')).toBe(false);
+    // 危険な語・許可 Origin の外は、今どおり止める。
+    expect(isExcludedCrawlCandidate(`${ORIGIN}/members/1/delete`, allowed, noLogin)).toBe(true);
+    expect(isRunNavigationBlocked('http://127.0.0.1:4999/members', allowed, noLogin, 'ANY_BLOCK')).toBe(true);
+    expect(isReadUrlAllowed(`${ORIGIN}/login`, CONFIG, noLogin)).toBe(true);
+  });
+
+  it('records the Run kind without a session lost path as another kind than any path', () => {
+    const none = runCheckpointAuthenticationOf(noLogin);
+    expect(none).not.toEqual(runCheckpointAuthenticationOf({ ...noLogin, sessionLostPathPrefix: '/' }));
+    expect(none).toEqual(runCheckpointAuthenticationOf({ ...noLogin }));
   });
 });

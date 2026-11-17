@@ -2,6 +2,8 @@
 // T25d（Task 25 の設計書 4.4、4.5）: 認証つきの読み取りの監査（`TEST_AUTH_PASSIVE`）を、手動のログイン（`MANUAL_SESSION`）のときだけ足した。
 // 書き込みの監査（`TEST_APPROVED_WRITE`）は、引き続き実行できない。T26d-2: 自動ログイン（`AUTOMATED_LOGIN`）を、方式として実行できるものに足した
 // （プラットフォームを問わない。Windows だけであることは、ジョブの管理の開始の確かめで強制する。`execution-policy-automated-login.test.ts`）。
+// MI-5（設計書 `2026-10-26-beaksight-minimal-input-ux-design.md` 3 章の判断 1、4.5）: 書き込みのモードのプロファイルでも、読み取りの監査（`AUDIT`）を
+// 始められるようにした（プロファイルを 1 つにする。監査のジョブは、モードにかかわらず読み取りだけ）。
 import { readFileSync } from 'node:fs';
 import { resolve } from 'node:path';
 import { describe, expect, it } from 'vitest';
@@ -25,24 +27,36 @@ import { WORKER_JOB_KINDS } from '../../src/control/worker-protocol.js';
 import { scanSource } from '../architecture/source-scan.js';
 
 describe('executable audit modes', () => {
-  it('lists the public passive audit and the authenticated passive audit, as a frozen subset of the audit modes', () => {
-    expect(EXECUTABLE_AUDIT_MODES).toEqual(['PUBLIC_PASSIVE', 'TEST_AUTH_PASSIVE']);
+  it('lists every audit mode (MI-5: the write mode too), as a frozen subset of the audit modes', () => {
+    expect(EXECUTABLE_AUDIT_MODES).toEqual(['PUBLIC_PASSIVE', 'TEST_AUTH_PASSIVE', 'TEST_APPROVED_WRITE']);
     expect(Object.isFrozen(EXECUTABLE_AUDIT_MODES)).toBe(true);
     expect(EXECUTABLE_AUDIT_MODES.every((mode) => AUDIT_MODES.includes(mode))).toBe(true);
   });
 
-  it('accepts only the listed modes, and rejects the write mode and values that are not modes', () => {
-    expect(AUDIT_MODES.filter(isExecutableAuditMode)).toEqual(['PUBLIC_PASSIVE', 'TEST_AUTH_PASSIVE']);
-    for (const value of ['TEST_APPROVED_WRITE', 'public_passive', '', null, undefined, 1, ['PUBLIC_PASSIVE']]) {
+  it('accepts only the listed modes (MI-5: the write mode too), and rejects values that are not modes', () => {
+    expect(AUDIT_MODES.filter(isExecutableAuditMode)).toEqual(['PUBLIC_PASSIVE', 'TEST_AUTH_PASSIVE', 'TEST_APPROVED_WRITE']);
+    for (const value of ['test_approved_write', 'public_passive', '', null, undefined, 1, ['PUBLIC_PASSIVE']]) {
       expect(isExecutableAuditMode(value), String(value)).toBe(false);
     }
   });
 
-  it('accepts only NONE for the public audit and MANUAL_SESSION and AUTOMATED_LOGIN (T26d-2) for the authenticated audit (T25d)', () => {
+  // NL-1（設計書 `2026-11-06-beaksight-no-login-test-site-design.md` 3.1 の 3）: テストの 2 つのモードは、ログインのない方式（`NONE`）も受ける。
+  it('accepts only NONE for the public audit and NONE, MANUAL_SESSION and AUTOMATED_LOGIN for the authenticated audit (T25d, T26d-2, NL-1) and the write mode (MI-5, NL-1)', () => {
     const accepted = AUDIT_MODES.flatMap((mode) =>
       AUTH_STRATEGIES.filter((auth) => isExecutableAuthStrategy(mode, auth)).map((auth) => `${mode}/${auth}`));
-    expect(accepted).toEqual(['PUBLIC_PASSIVE/NONE', 'TEST_AUTH_PASSIVE/MANUAL_SESSION', 'TEST_AUTH_PASSIVE/AUTOMATED_LOGIN']);
-    for (const [mode, auth] of [['TEST_AUTH_PASSIVE', 'manual_session'], ['TEST_AUTH_PASSIVE', null], [null, 'NONE'], ['constructor', 'NONE']]) {
+    expect(accepted).toEqual([
+      'PUBLIC_PASSIVE/NONE',
+      'TEST_AUTH_PASSIVE/NONE',
+      'TEST_AUTH_PASSIVE/MANUAL_SESSION',
+      'TEST_AUTH_PASSIVE/AUTOMATED_LOGIN',
+      'TEST_APPROVED_WRITE/NONE',
+      'TEST_APPROVED_WRITE/MANUAL_SESSION',
+      'TEST_APPROVED_WRITE/AUTOMATED_LOGIN',
+    ]);
+    for (const [mode, auth] of [
+      ['TEST_AUTH_PASSIVE', 'manual_session'], ['TEST_AUTH_PASSIVE', null], [null, 'NONE'], ['constructor', 'NONE'], ['TEST_APPROVED_WRITE', 'none'],
+      ['PUBLIC_PASSIVE', 'MANUAL_SESSION'],
+    ]) {
       expect(isExecutableAuthStrategy(mode, auth), `${String(mode)}/${String(auth)}`).toBe(false);
     }
   });
@@ -52,9 +66,20 @@ describe('executable audit modes', () => {
   it('requires an auth setup for the authenticated audit (T25d) and the write mode (T28b), not for the public audit', () => {
     expect(AUTH_SETUP_REQUIRED_AUDIT_MODES).toEqual(['TEST_AUTH_PASSIVE', 'TEST_APPROVED_WRITE']);
     expect(Object.isFrozen(AUTH_SETUP_REQUIRED_AUDIT_MODES)).toBe(true);
-    expect(AUDIT_MODES.filter(requiresAuthSetup)).toEqual(['TEST_AUTH_PASSIVE', 'TEST_APPROVED_WRITE']);
+    for (const auth of ['MANUAL_SESSION', 'AUTOMATED_LOGIN'] as const) {
+      expect(AUDIT_MODES.filter((mode) => requiresAuthSetup(mode, auth)), auth).toEqual(['TEST_AUTH_PASSIVE', 'TEST_APPROVED_WRITE']);
+    }
     for (const value of [undefined, null, '', 'constructor', 'test_auth_passive', ['TEST_AUTH_PASSIVE']]) {
-      expect(requiresAuthSetup(value), String(value)).toBe(false);
+      expect(requiresAuthSetup(value, 'MANUAL_SESSION'), String(value)).toBe(false);
+    }
+  });
+
+  // NL-1（設計書 3.1 の 4）: ログインのない方式（`NONE`）のプロファイルは、どのモードでも認証の設定を求めない。ほかの方式の値（一覧にない値を含む）は、
+  // 今までどおりモードで決める（fail-closed。一覧にない方式で、認証の設定を省かない）。
+  it('does not require an auth setup for a profile without login (NL-1), and keeps requiring it for any other auth value', () => {
+    expect(AUDIT_MODES.filter((mode) => requiresAuthSetup(mode, 'NONE'))).toEqual([]);
+    for (const auth of ['none', '', null, undefined, 'constructor', ['NONE']]) {
+      expect(AUDIT_MODES.filter((mode) => requiresAuthSetup(mode, auth)), String(auth)).toEqual(['TEST_AUTH_PASSIVE', 'TEST_APPROVED_WRITE']);
     }
   });
 });
@@ -69,30 +94,35 @@ describe('profile operations by mode (T28b)', () => {
     ['TEST_AUTH_PASSIVE', 'AUTOMATED_LOGIN'],
     ['TEST_APPROVED_WRITE', 'MANUAL_SESSION'],
     ['TEST_APPROVED_WRITE', 'AUTOMATED_LOGIN'],
+    // NL-1（設計書 3.1 の 1、3）: ログインのないテスト用のサイト（保存は loopback の Origin だけ。`profile-policy.ts`）。
+    ['TEST_AUTH_PASSIVE', 'NONE'],
+    ['TEST_APPROVED_WRITE', 'NONE'],
   ] as const satisfies readonly (readonly [AuditMode, AuthStrategy])[];
   const ALLOWED = null;
   const MODE = 'MODE_NOT_EXECUTABLE';
   const AUTH = 'AUTH_STRATEGY_NOT_EXECUTABLE';
   /** 操作ごとの、`PROFILE_KINDS` の順の判定（`null` は許す）。今までの公開監査と認証つきの読み取りの監査の理由は変えない。 */
   const EXPECTED: Readonly<Record<ProfileOperation, readonly (ProfileOperationRejection | null)[]>> = {
-    // 認証つきの監査は、書き込みのモードでは今までどおり始められない（ユーザーの判断の範囲の外）。
-    AUDIT: [ALLOWED, ALLOWED, ALLOWED, MODE, MODE],
+    // MI-5（設計書 3 章の判断 1、4.5）: 認証つきの監査は、書き込みのモードでも始められる（ログインを使う方式。監査のジョブは読み取りだけ）。
+    // NL-1: ログインのないテスト用のサイト（最後の 2 列）も、AUDIT・DISCOVERY・READ_CHECK・SCENARIO・WRITE_CREATE・WRITE_UPDATE・ENTRY_CHECK を許す。
+    // AUTH_SETUP・CREDENTIAL・LOGIN_CHECK は、方式の理由で拒む（ログインをしないので、認証の設定も資格情報もログインの確かめもない）。
+    AUDIT: [ALLOWED, ALLOWED, ALLOWED, ALLOWED, ALLOWED, ALLOWED, ALLOWED],
     // ログインの確かめは、自動ログインのプロファイルだけ（公開の監査と手動のログインは、今までどおり方式の理由）。
-    LOGIN_CHECK: [AUTH, AUTH, ALLOWED, AUTH, ALLOWED],
-    DISCOVERY: [MODE, ALLOWED, ALLOWED, ALLOWED, ALLOWED],
-    READ_CHECK: [MODE, ALLOWED, ALLOWED, ALLOWED, ALLOWED],
-    AUTH_SETUP: [MODE, ALLOWED, ALLOWED, ALLOWED, ALLOWED],
-    CREDENTIAL: [MODE, AUTH, ALLOWED, AUTH, ALLOWED],
+    LOGIN_CHECK: [AUTH, AUTH, ALLOWED, AUTH, ALLOWED, AUTH, AUTH],
+    DISCOVERY: [MODE, ALLOWED, ALLOWED, ALLOWED, ALLOWED, ALLOWED, ALLOWED],
+    READ_CHECK: [MODE, ALLOWED, ALLOWED, ALLOWED, ALLOWED, ALLOWED, ALLOWED],
+    AUTH_SETUP: [MODE, ALLOWED, ALLOWED, ALLOWED, ALLOWED, AUTH, AUTH],
+    CREDENTIAL: [MODE, AUTH, ALLOWED, AUTH, ALLOWED, AUTH, AUTH],
     // T28e fix round 1（Task 28 の設計書 4.6）: 書き込みのシナリオ（作成・変更・承認）は、書き込みのモードだけ（手動のログインと自動ログインの
     // 両方）。シナリオは発見の候補から作るので、発見と同じ方式を許す。画面の出し分けとシナリオの保存の部品が、この行を使う（判定を 1 か所に）。
-    SCENARIO: [MODE, MODE, MODE, ALLOWED, ALLOWED],
+    SCENARIO: [MODE, MODE, MODE, ALLOWED, ALLOWED, MODE, ALLOWED],
     // T30e（Task 30 の設計書 3 章）: 承認された CREATE の書き込みのジョブは、書き込みのモードの、ログインを使うプロファイルだけ（手動のログインと
     // 自動ログインの両方。ほかのモードは、モードの理由で拒む）。
-    WRITE_CREATE: [MODE, MODE, MODE, ALLOWED, ALLOWED],
+    WRITE_CREATE: [MODE, MODE, MODE, ALLOWED, ALLOWED, MODE, ALLOWED],
     // T31e fix round 1（Task 31 の設計書 3 章）: 承認された UPDATE の書き込みのジョブも、CREATE と同じ（書き込みのモードの、ログインを使う方式だけ）。
-    WRITE_UPDATE: [MODE, MODE, MODE, ALLOWED, ALLOWED],
+    WRITE_UPDATE: [MODE, MODE, MODE, ALLOWED, ALLOWED, MODE, ALLOWED],
     // T43c（Task 43 の設計書 4.3）: 入口の確かめは、公開のモードは認証なし（`NONE`）、テストの 2 つのモードはログインを使う方式（ログインはしない）。
-    ENTRY_CHECK: [ALLOWED, ALLOWED, ALLOWED, ALLOWED, ALLOWED],
+    ENTRY_CHECK: [ALLOWED, ALLOWED, ALLOWED, ALLOWED, ALLOWED, ALLOWED, ALLOWED],
   };
 
   it('decides every operation for every storable pair of the mode and the auth strategy with the closed table', () => {
@@ -114,22 +144,25 @@ describe('profile operations by mode (T28b)', () => {
     expect(WORKER_JOB_KINDS.filter((kind) => !(PROFILE_OPERATIONS as readonly string[]).includes(kind))).toEqual([]);
     // 書き込みのモードで許すのは、認証の設定・資格情報・ログインの確かめ・発見・READ の確かめ（10 章の 5）と、書き込みのシナリオ（T28e fix round 1。
     // シナリオは書き込みのモードの機能そのもので、書き込みは実行しない）と、承認された CREATE の書き込み（T30e）と、承認された UPDATE の書き込み
-    // （T31e fix round 1）だけ。
+    // （T31e fix round 1）と、読み取りの監査（MI-5）。
     expect(PROFILE_OPERATIONS.filter((operation) => Object.hasOwn(PROFILE_OPERATION_POLICY[operation], 'TEST_APPROVED_WRITE')))
-      .toEqual(['LOGIN_CHECK', 'DISCOVERY', 'READ_CHECK', 'AUTH_SETUP', 'CREDENTIAL', 'SCENARIO', 'WRITE_CREATE', 'WRITE_UPDATE', 'ENTRY_CHECK']);
-    // T43c: 入口の確かめの行は、公開のモード × `NONE`、テストの 2 つのモード × ログインを使う方式（`NONE` は方式の理由で拒む）。
+      .toEqual(['AUDIT', 'LOGIN_CHECK', 'DISCOVERY', 'READ_CHECK', 'AUTH_SETUP', 'CREDENTIAL', 'SCENARIO', 'WRITE_CREATE', 'WRITE_UPDATE', 'ENTRY_CHECK']);
+    // T43c: 入口の確かめの行は、公開のモード × `NONE`、テストの 2 つのモード × ログインを使う方式。NL-1: テストの 2 つのモードに `NONE` を足した。
     expect(PROFILE_OPERATION_POLICY.ENTRY_CHECK).toEqual({
       PUBLIC_PASSIVE: ['NONE'],
-      TEST_AUTH_PASSIVE: ['MANUAL_SESSION', 'AUTOMATED_LOGIN'],
-      TEST_APPROVED_WRITE: ['MANUAL_SESSION', 'AUTOMATED_LOGIN'],
+      TEST_AUTH_PASSIVE: ['MANUAL_SESSION', 'AUTOMATED_LOGIN', 'NONE'],
+      TEST_APPROVED_WRITE: ['MANUAL_SESSION', 'AUTOMATED_LOGIN', 'NONE'],
     });
-    expect(profileOperationRejectionOf('ENTRY_CHECK', 'TEST_AUTH_PASSIVE', 'NONE')).toBe('AUTH_STRATEGY_NOT_EXECUTABLE');
+    expect(profileOperationRejectionOf('ENTRY_CHECK', 'TEST_AUTH_PASSIVE', 'NONE')).toBeNull();
+    expect(profileOperationRejectionOf('ENTRY_CHECK', 'TEST_AUTH_PASSIVE', 'none')).toBe('AUTH_STRATEGY_NOT_EXECUTABLE');
     expect(profileOperationRejectionOf('ENTRY_CHECK', 'PUBLIC_PASSIVE', 'MANUAL_SESSION')).toBe('AUTH_STRATEGY_NOT_EXECUTABLE');
-    // シナリオと書き込みを許すのは、書き込みのモードだけ。書き込みは、ログインを使う方式だけ（公開の方式 `NONE` は、方式の理由で拒む）。
+    // シナリオと書き込みを許すのは、書き込みのモードだけ。NL-1: 書き込みは、ログインを使う方式と、ログインのない方式（`NONE`。保存は loopback の
+    // Origin だけ）。一覧にない方式の値は、方式の理由で拒む。
     expect(Object.keys(PROFILE_OPERATION_POLICY.SCENARIO)).toEqual(['TEST_APPROVED_WRITE']);
     for (const write of ['WRITE_CREATE', 'WRITE_UPDATE'] as const) {
       expect(Object.keys(PROFILE_OPERATION_POLICY[write]), write).toEqual(['TEST_APPROVED_WRITE']);
-      expect(profileOperationRejectionOf(write, 'TEST_APPROVED_WRITE', 'NONE'), write).toBe('AUTH_STRATEGY_NOT_EXECUTABLE');
+      expect(profileOperationRejectionOf(write, 'TEST_APPROVED_WRITE', 'NONE'), write).toBeNull();
+      expect(profileOperationRejectionOf(write, 'TEST_APPROVED_WRITE', 'none'), write).toBe('AUTH_STRATEGY_NOT_EXECUTABLE');
       expect(isProfileOperationAllowed(write, 'TEST_APPROVED_WRITE', 'AUTOMATED_LOGIN'), write).toBe(true);
       for (const mode of ['PUBLIC_PASSIVE', 'TEST_AUTH_PASSIVE'] as const) {
         for (const auth of ['NONE', 'MANUAL_SESSION', 'AUTOMATED_LOGIN'] as const) {
@@ -162,15 +195,21 @@ describe('profile operations by mode (T28b)', () => {
     }
   });
 
-  it('needs the auth setup only for an operation the mode accepts (the write mode audit does not need it, as it cannot start)', () => {
-    expect(AUDIT_MODES.map((mode) => operationRequiresAuthSetup('AUDIT', mode))).toEqual([false, true, false]);
-    expect(AUDIT_MODES.map((mode) => operationRequiresAuthSetup('DISCOVERY', mode))).toEqual([false, true, true]);
-    expect(AUDIT_MODES.map((mode) => operationRequiresAuthSetup('LOGIN_CHECK', mode))).toEqual([false, true, true]);
-    expect(operationRequiresAuthSetup('DISCOVERY', 'constructor')).toBe(false);
+  it('needs the auth setup only for an operation the mode accepts (MI-5: the write mode audit needs it too)', () => {
+    for (const auth of ['MANUAL_SESSION', 'AUTOMATED_LOGIN'] as const) {
+      expect(AUDIT_MODES.map((mode) => operationRequiresAuthSetup('AUDIT', mode, auth)), auth).toEqual([false, true, true]);
+      expect(AUDIT_MODES.map((mode) => operationRequiresAuthSetup('DISCOVERY', mode, auth)), auth).toEqual([false, true, true]);
+      expect(AUDIT_MODES.map((mode) => operationRequiresAuthSetup('LOGIN_CHECK', mode, auth)), auth).toEqual([false, true, true]);
+    }
+    expect(operationRequiresAuthSetup('DISCOVERY', 'constructor', 'MANUAL_SESSION')).toBe(false);
+    // NL-1（設計書 3.1 の 4）: ログインのない方式は、どの操作・どのモードでも認証の設定が要らない。
+    for (const operation of PROFILE_OPERATIONS) {
+      expect(AUDIT_MODES.map((mode) => operationRequiresAuthSetup(operation, mode, 'NONE')), operation).toEqual([false, false, false]);
+    }
     // T43c: 入口の確かめは、ログインをしないので、どのモードでも認証の設定が要らない（閉じた一覧 `AUTH_SETUP_FREE_OPERATIONS`）。
     expect(AUTH_SETUP_FREE_OPERATIONS).toEqual(['ENTRY_CHECK']);
     expect(Object.isFrozen(AUTH_SETUP_FREE_OPERATIONS)).toBe(true);
-    expect(AUDIT_MODES.map((mode) => operationRequiresAuthSetup('ENTRY_CHECK', mode))).toEqual([false, false, false]);
+    expect(AUDIT_MODES.map((mode) => operationRequiresAuthSetup('ENTRY_CHECK', mode, 'MANUAL_SESSION'))).toEqual([false, false, false]);
   });
 
   // 判定を owner の外に書き直さない（Gate。コメントと文字列の外の本文で、モードの値の文字列を比べない）。

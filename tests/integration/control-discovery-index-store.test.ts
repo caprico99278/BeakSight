@@ -12,7 +12,6 @@ import { afterEach, beforeEach, describe, expect, expectTypeOf, it } from 'vites
 import { MIN_PROFILE_REVISION } from '../../src/control/contracts.js';
 import {
   DISCOVERY_INDEX_DRIFTS,
-  MAX_INDEX_SHAPE_DIGESTS,
   discoveryIndexEntryOf,
   noDiscoveryJobRecordedAfterIn,
   readDiscoveryIndex,
@@ -29,7 +28,6 @@ import { ControlStoreError } from '../../src/control/store/store-errors.js';
 import { notObservedSubmissionProbeOf, type SubmissionProbeRecord } from '../../src/discovery/submission-probe-contracts.js';
 import type { DiscoveredCandidate, DiscoveryCandidate } from '../../src/discovery/candidate-contracts.js';
 import { classifyCandidate } from '../../src/discovery/classify.js';
-import { MAX_DISCOVERY_READ_PAGE_PATHS } from '../../src/discovery/discovery-result.js';
 import { computeCandidateDigests, recordIdSegmentPairsOf, templatedIdentityDigestOf, templatedIdentityDigestsOf } from '../../src/discovery/fingerprint.js';
 import { usableRecordIdOf } from '../../src/control/actions/action-outcome.js';
 import { SAMPLE_ALLOWED_ORIGINS, sampleAction, sampleButton, sampleField, sampleForm } from '../unit/discovery-candidate-samples.js';
@@ -149,7 +147,8 @@ describe('discovery index entries (T27c)', () => {
     expect(discoveryIndexEntryOf(UPDATE).templatedIdentityDigests).toHaveLength(3);
     expect(discoveryIndexEntryOf(BUTTON)).toMatchObject({ actionPath: null, formMethod: null, methodOverride: null, templatedIdentityDigests: [] });
     expect(Object.isFrozen(discoveryIndexEntryOf(SEARCH))).toBe(true);
-    expect(DISCOVERY_INDEX_DRIFTS).toEqual(['NEW', 'CHANGED', 'UNCHANGED', 'MISSING', 'NOT_REVISITED']);
+    // SPEC-1: ドリフトは 3 通り（見えた・消えた・読み直していない）。承認が使うのは MISSING と NOT_REVISITED だけ。
+    expect(DISCOVERY_INDEX_DRIFTS).toEqual(['SEEN', 'MISSING', 'NOT_REVISITED']);
   });
 
   it('has no input for values, tokens, labels, button texts or field names in the types', () => {
@@ -164,9 +163,7 @@ describe('discovery index entries (T27c)', () => {
 describe('recording a discovery job (T27c)', () => {
   it('records new candidates with the first and last job', () => {
     expect(recordDiscoveryCandidates(database, update('job-1', FIRST_AT, [SEARCH, UPDATE, BUTTON]))).toEqual({
-      NEW: sorted(SEARCH.identityDigest, UPDATE.identityDigest, BUTTON.identityDigest),
-      CHANGED: [],
-      UNCHANGED: [],
+      SEEN: sorted(SEARCH.identityDigest, UPDATE.identityDigest, BUTTON.identityDigest),
       MISSING: [],
       NOT_REVISITED: [],
     });
@@ -176,57 +173,47 @@ describe('recording a discovery job (T27c)', () => {
     expect(index.candidates.map(({ identityDigest, drift, firstSeenJobId, lastSeenJobId, lastChangedJobId }) =>
       ({ identityDigest, drift, firstSeenJobId, lastSeenJobId, lastChangedJobId }))).toEqual(
       sorted(SEARCH.identityDigest, UPDATE.identityDigest, BUTTON.identityDigest).map((identityDigest) =>
-        ({ identityDigest, drift: 'NEW', firstSeenJobId: 'job-1', lastSeenJobId: 'job-1', lastChangedJobId: null })),
+        ({ identityDigest, drift: 'SEEN', firstSeenJobId: 'job-1', lastSeenJobId: 'job-1', lastChangedJobId: null })),
     );
     expect(readDiscoveryIndex(database, OTHER_PROFILE_ID)).toEqual({ latestJobId: null, latestSeenAt: null, latestReadPagePaths: [], candidates: [] });
   });
 
-  it('tells new, changed, unchanged and missing candidates in one transaction, and keeps the missing ones', () => {
+  it('tells seen and missing candidates in one transaction, keeps the missing ones, and writes the changed rule digest', () => {
     recordDiscoveryCandidates(database, update('job-1', FIRST_AT, [SEARCH, UPDATE, BUTTON]));
     const NEW_BUTTON = candidateOf(sampleButton({ page: { origin: 'http://127.0.0.1:4173', path: '/admin/other' } }));
     expect(recordDiscoveryCandidates(database, update('job-2', SECOND_AT, [SEARCH_REQUIRED, UPDATE, NEW_BUTTON], PROFILE_ID, ['/admin', '/admin/items', '/admin/items/1', '/admin/other']))).toEqual({
-      NEW: [NEW_BUTTON.identityDigest],
-      CHANGED: [SEARCH.identityDigest],
-      UNCHANGED: [UPDATE.identityDigest],
+      SEEN: sorted(SEARCH.identityDigest, UPDATE.identityDigest, NEW_BUTTON.identityDigest),
       MISSING: [BUTTON.identityDigest],
       NOT_REVISITED: [],
     });
     const second = readDiscoveryIndex(database, PROFILE_ID);
     expect(second.latestJobId).toBe('job-2');
     const byDigest = new Map(second.candidates.map((candidate) => [candidate.identityDigest, candidate]));
+    // 変わった候補は、ドリフトでなく行の値（規則の digest と最後に変わったジョブ）で分かる（承認は digest で比べる）。
     expect(byDigest.get(SEARCH.identityDigest)).toMatchObject({
-      drift: 'CHANGED', ruleDigest: SEARCH_REQUIRED.ruleDigest, firstSeenJobId: 'job-1', firstSeenAt: FIRST_AT, lastSeenJobId: 'job-2',
+      drift: 'SEEN', ruleDigest: SEARCH_REQUIRED.ruleDigest, firstSeenJobId: 'job-1', firstSeenAt: FIRST_AT, lastSeenJobId: 'job-2',
       lastSeenAt: SECOND_AT, lastChangedJobId: 'job-2',
     });
-    expect(byDigest.get(UPDATE.identityDigest)).toMatchObject({ drift: 'UNCHANGED', lastSeenJobId: 'job-2', lastChangedJobId: null });
-    expect(byDigest.get(NEW_BUTTON.identityDigest)).toMatchObject({ drift: 'NEW', firstSeenJobId: 'job-2' });
+    expect(byDigest.get(NEW_BUTTON.identityDigest)).toMatchObject({ drift: 'SEEN', firstSeenJobId: 'job-2' });
     // 消えた候補は消さない（最後に見たジョブで分かる）。
     expect(byDigest.get(BUTTON.identityDigest)).toMatchObject({ drift: 'MISSING', lastSeenJobId: 'job-1', lastSeenAt: FIRST_AT });
     expect(second.candidates).toHaveLength(4);
-
-    // 次のジョブで変わらなければ、変わった印は前のジョブのまま（今のジョブに対しては UNCHANGED）。消えた候補が戻れば、まだある候補になる。
-    expect(recordDiscoveryCandidates(database, update('job-3', THIRD_AT, [SEARCH_REQUIRED, UPDATE, NEW_BUTTON, BUTTON]))).toEqual({
-      NEW: [],
-      CHANGED: [],
-      UNCHANGED: sorted(SEARCH.identityDigest, UPDATE.identityDigest, NEW_BUTTON.identityDigest, BUTTON.identityDigest),
-      MISSING: [],
-      NOT_REVISITED: [],
-    });
+    // 消えた候補が戻れば、見えた候補になる。
+    recordDiscoveryCandidates(database, update('job-3', THIRD_AT, [SEARCH_REQUIRED, UPDATE, NEW_BUTTON, BUTTON]));
     const third = new Map(readDiscoveryIndex(database, PROFILE_ID).candidates.map((candidate) => [candidate.identityDigest, candidate]));
-    expect(third.get(SEARCH.identityDigest)).toMatchObject({ drift: 'UNCHANGED', lastChangedJobId: 'job-2' });
-    expect(third.get(BUTTON.identityDigest)).toMatchObject({ drift: 'UNCHANGED', lastSeenJobId: 'job-3', firstSeenJobId: 'job-1' });
+    expect(third.get(BUTTON.identityDigest)).toMatchObject({ drift: 'SEEN', lastSeenJobId: 'job-3', firstSeenJobId: 'job-1' });
   });
 
   it('keeps the profiles apart', () => {
     recordDiscoveryCandidates(database, update('job-1', FIRST_AT, [SEARCH]));
-    expect(recordDiscoveryCandidates(database, update('job-2', SECOND_AT, [SEARCH, UPDATE], OTHER_PROFILE_ID)).NEW)
+    expect(recordDiscoveryCandidates(database, update('job-2', SECOND_AT, [SEARCH, UPDATE], OTHER_PROFILE_ID)).SEEN)
       .toEqual(sorted(SEARCH.identityDigest, UPDATE.identityDigest));
     expect(readDiscoveryIndex(database, PROFILE_ID).candidates.map(({ identityDigest, drift }) => [identityDigest, drift]))
-      .toEqual([[SEARCH.identityDigest, 'NEW']]);
+      .toEqual([[SEARCH.identityDigest, 'SEEN']]);
   });
 
   it('merges the same candidate given twice, and rejects two entries with one identity but different contents', () => {
-    expect(recordDiscoveryCandidates(database, update('job-1', FIRST_AT, [SEARCH, SEARCH])).NEW).toEqual([SEARCH.identityDigest]);
+    expect(recordDiscoveryCandidates(database, update('job-1', FIRST_AT, [SEARCH, SEARCH])).SEEN).toEqual([SEARCH.identityDigest]);
     const conflicting = [discoveryIndexEntryOf(SEARCH), discoveryIndexEntryOf(SEARCH_REQUIRED)];
     expect(() => recordDiscoveryCandidates(database, { profileId: PROFILE_ID, jobId: 'job-2', at: SECOND_AT, entries: conflicting, readPagePaths: ['/admin/items'] })).toThrow(RangeError);
     expect(readDiscoveryIndex(database, PROFILE_ID).latestJobId).toBe('job-1');
@@ -261,16 +248,14 @@ describe('T27d: the pages read by a job, NOT_REVISITED, and jobs without candida
     recordDiscoveryCandidates(database, update('job-1', FIRST_AT, [SEARCH, UPDATE, BUTTON, OTHER_PAGE_BUTTON]));
     // 2 回目は、`/admin/items` と `/admin` だけを読んだ（`/admin/items/1` と `/admin/other` は読まなかった）。`/admin` の候補は消えた。
     expect(recordDiscoveryCandidates(database, update('job-2', SECOND_AT, [SEARCH], PROFILE_ID, ['/admin', '/admin/items']))).toEqual({
-      NEW: [],
-      CHANGED: [],
-      UNCHANGED: [SEARCH.identityDigest],
+      SEEN: [SEARCH.identityDigest],
       MISSING: [BUTTON.identityDigest],
       NOT_REVISITED: sorted(UPDATE.identityDigest, OTHER_PAGE_BUTTON.identityDigest),
     });
     const index = readDiscoveryIndex(database, PROFILE_ID);
     expect(index).toMatchObject({ latestJobId: 'job-2', latestSeenAt: SECOND_AT, latestReadPagePaths: ['/admin', '/admin/items'] });
     expect(Object.fromEntries(index.candidates.map(({ identityDigest, drift }) => [identityDigest, drift]))).toEqual({
-      [SEARCH.identityDigest]: 'UNCHANGED',
+      [SEARCH.identityDigest]: 'SEEN',
       [BUTTON.identityDigest]: 'MISSING',
       [UPDATE.identityDigest]: 'NOT_REVISITED',
       [OTHER_PAGE_BUTTON.identityDigest]: 'NOT_REVISITED',
@@ -280,9 +265,7 @@ describe('T27d: the pages read by a job, NOT_REVISITED, and jobs without candida
   it('records a job without candidates as the latest job (a job row), and its read pages decide MISSING', () => {
     recordDiscoveryCandidates(database, update('job-1', FIRST_AT, [SEARCH, BUTTON]));
     expect(recordDiscoveryCandidates(database, update('job-2', SECOND_AT, [], PROFILE_ID, ['/admin']))).toEqual({
-      NEW: [],
-      CHANGED: [],
-      UNCHANGED: [],
+      SEEN: [],
       MISSING: [BUTTON.identityDigest],
       NOT_REVISITED: [SEARCH.identityDigest],
     });
@@ -295,7 +278,7 @@ describe('T27d: the pages read by a job, NOT_REVISITED, and jobs without candida
     });
     // 候補のない最初のジョブも、ジョブの行で分かる（読んだ画面もない）。
     expect(recordDiscoveryCandidates(database, update('job-3', THIRD_AT, [], OTHER_PROFILE_ID, []))).toEqual({
-      NEW: [], CHANGED: [], UNCHANGED: [], MISSING: [], NOT_REVISITED: [],
+      SEEN: [], MISSING: [], NOT_REVISITED: [],
     });
     expect(readDiscoveryIndex(database, OTHER_PROFILE_ID)).toEqual({
       latestJobId: 'job-3', latestSeenAt: THIRD_AT, latestReadPagePaths: [], candidates: [],
@@ -306,7 +289,7 @@ describe('T27d: the pages read by a job, NOT_REVISITED, and jobs without candida
     recordDiscoveryCandidates(database, update('job-b', FIRST_AT, [SEARCH, BUTTON]));
     recordDiscoveryCandidates(database, update('job-a', FIRST_AT, [SEARCH], PROFILE_ID, ['/admin', '/admin/items']));
     expect(readDiscoveryIndex(database, PROFILE_ID)).toMatchObject({ latestJobId: 'job-a', latestReadPagePaths: ['/admin', '/admin/items'] });
-    expect(driftsOfIndex()).toEqual({ [SEARCH.identityDigest]: 'UNCHANGED', [BUTTON.identityDigest]: 'MISSING' });
+    expect(driftsOfIndex()).toEqual({ [SEARCH.identityDigest]: 'SEEN', [BUTTON.identityDigest]: 'MISSING' });
   });
 
   it('rejects the second record of the same job by the job row (also a job without candidates), and writes nothing', () => {
@@ -317,12 +300,18 @@ describe('T27d: the pages read by a job, NOT_REVISITED, and jobs without candida
     expect(readDiscoveryIndex(database, PROFILE_ID)).toMatchObject({ latestJobId: 'job-1', latestReadPagePaths: ['/admin'] });
   });
 
-  it('rejects read page paths of another shape, too many, or duplicated, before writing', () => {
+  // LZ-3a: 読み切れた画面の path の数の上限（前は 10,000。管理データの版 21 で CHECK も外した）はない。
+  it('keeps more read page paths than the former limit', () => {
+    const paths = Array.from({ length: 10_001 }, (_value, index) => `/p/${String(index).padStart(6, '0')}`);
+    recordDiscoveryCandidates(database, update('job-1', FIRST_AT, [SEARCH], PROFILE_ID, paths));
+    expect(readDiscoveryIndex(database, PROFILE_ID).latestReadPagePaths).toHaveLength(10_001);
+  });
+
+  it('rejects read page paths of another shape or duplicated, before writing', () => {
     for (const [name, paths] of [
       ['a path without the slash', ['admin']],
       ['a path that is not a string', [1]],
       ['a duplicated path', ['/admin', '/admin']],
-      ['too many paths', Array.from({ length: MAX_DISCOVERY_READ_PAGE_PATHS + 1 }, (_value, index) => `/p/${index}`)],
     ] as const) {
       expect(() => recordDiscoveryCandidates(database, update('job-1', FIRST_AT, [SEARCH], PROFILE_ID, paths as unknown as string[])), name)
         .toThrow(RangeError);
@@ -428,7 +417,7 @@ describe('T31e: the templated identity digests of the discovery index', () => {
       raw.close();
     }
     expect(readDiscoveryIndex(database, PROFILE_ID).candidates.map(({ templatedIdentityDigests }) => templatedIdentityDigests)).toEqual([null]);
-    expect(recordDiscoveryCandidates(database, update('job-2', SECOND_AT, [UPDATE])).UNCHANGED).toEqual([UPDATE.identityDigest]);
+    expect(recordDiscoveryCandidates(database, update('job-2', SECOND_AT, [UPDATE])).SEEN).toEqual([UPDATE.identityDigest]);
     expect(readDiscoveryIndex(database, PROFILE_ID).candidates.map(({ templatedIdentityDigests }) => templatedIdentityDigests))
       .toEqual([templatedIdentityDigestsOf(UPDATE, isRecordIdValue)]);
   });
@@ -492,22 +481,22 @@ describe('T38d: the shape digests of the discovery index', () => {
       entries: entries(probed(UPDATE, SHAPE_B), probed(UPDATE, SHAPE_A), probed(UPDATE, SHAPE_B), UPDATE, BUTTON),
       readPagePaths: ['/admin', '/admin/items/1'],
     });
-    expect(first.NEW).toEqual(sorted(UPDATE.identityDigest, BUTTON.identityDigest));
+    expect(first.SEEN).toEqual(sorted(UPDATE.identityDigest, BUTTON.identityDigest));
     expect(shapeDigestsOf(UPDATE.identityDigest)).toEqual([SHAPE_A, SHAPE_B]);
     expect(shapeDigestsOf(BUTTON.identityDigest)).toEqual([]);
     // 次の発見で、今回の一覧に書き直す（型の違いはドリフトに数えない）。
     const second = recordDiscoveryCandidates(database, {
       ...update('job-2', SECOND_AT, [UPDATE]), entries: entries(probed(UPDATE, SHAPE_C)), readPagePaths: ['/admin/items/1'],
     });
-    expect(second.UNCHANGED).toEqual([UPDATE.identityDigest]);
+    expect(second.SEEN).toEqual([UPDATE.identityDigest]);
     expect(shapeDigestsOf(UPDATE.identityDigest)).toEqual([SHAPE_C]);
     // 変わった候補（規則の digest が違う）も、今回の一覧で書く。
     expect(recordDiscoveryCandidates(database, {
       ...update('job-3', THIRD_AT, [SEARCH]), entries: entries(probed(SEARCH, SHAPE_A)),
-    }).NEW).toEqual([SEARCH.identityDigest]);
+    }).SEEN).toEqual([SEARCH.identityDigest]);
     expect(recordDiscoveryCandidates(database, {
       ...update('job-4', THIRD_AT, [SEARCH_REQUIRED]), entries: entries(probed(SEARCH_REQUIRED, SHAPE_B)),
-    }).CHANGED).toEqual([SEARCH.identityDigest]);
+    }).SEEN).toEqual([SEARCH.identityDigest]);
     expect(shapeDigestsOf(SEARCH.identityDigest)).toEqual([SHAPE_B]);
   });
 
@@ -518,24 +507,32 @@ describe('T38d: the shape digests of the discovery index', () => {
     expect(readDiscoveryIndex(database, PROFILE_ID).latestJobId).toBeNull();
   });
 
-  it('rejects shape digests of another form, unsorted, repeated, or more than the limit after the join, and writes nothing', () => {
+  it('rejects shape digests of another form, unsorted or repeated, and writes nothing', () => {
     const entry = discoveryIndexEntryOf(UPDATE);
     for (const shapeDigests of [
       ['not a digest'],
       [SHAPE_A, SHAPE_A],
       [SHAPE_B, SHAPE_A],
-      [SHAPE_A, SHAPE_B, SHAPE_C, SHAPE_D],
     ]) {
       expect(() => recordDiscoveryCandidates(database, {
         profileId: PROFILE_ID, jobId: 'job-1', at: FIRST_AT, entries: [{ ...entry, shapeDigests }], readPagePaths: ['/admin/items/1'],
       }), JSON.stringify(shapeDigests)).toThrow(RangeError);
     }
-    expect(MAX_INDEX_SHAPE_DIGESTS).toBe(3);
-    expect(() => recordDiscoveryCandidates(database, {
-      profileId: PROFILE_ID, jobId: 'job-1', at: FIRST_AT, readPagePaths: ['/admin/items/1'],
-      entries: [{ ...entry, shapeDigests: [SHAPE_A, SHAPE_B] }, { ...entry, shapeDigests: [SHAPE_C, SHAPE_D] }],
-    })).toThrow(RangeError);
     expect(readDiscoveryIndex(database, PROFILE_ID).latestJobId).toBeNull();
+  });
+
+  // COV-1（網羅の設計書 3.3。押す数の上限を外したので、索引の型の digest の上限も、押す上限から切り離して外した。管理データの版 18）。
+  it('writes more shape digests and key field digests than the old limit of 3, also after the join of one identity (COV-1)', () => {
+    const entry = discoveryIndexEntryOf(UPDATE);
+    const many = Array.from({ length: 12 }, (_, index) => `sha256:${index.toString(16).padStart(2, '0').repeat(32)}`).sort();
+    recordDiscoveryCandidates(database, {
+      profileId: PROFILE_ID, jobId: 'job-1', at: FIRST_AT, readPagePaths: ['/admin/items/1'],
+      entries: [
+        { ...entry, shapeDigests: many.slice(0, 6), keyFieldDigests: many.slice(0, 6) },
+        { ...entry, shapeDigests: [...many.slice(6), SHAPE_A, SHAPE_B, SHAPE_C, SHAPE_D].sort(), keyFieldDigests: many.slice(6) },
+      ],
+    });
+    expect(shapeDigestsOf(UPDATE.identityDigest)).toEqual([...many, SHAPE_A, SHAPE_B, SHAPE_C, SHAPE_D].sort());
   });
 
   it('reads the rows without shape digests (written before version 13) as null, and writes them at the next discovery', () => {

@@ -104,8 +104,6 @@ export const RULE_BLOCK_SENSITIVITIES: readonly RuleBlockSensitivityEntry[] = Ob
   // --- LINK（DOM のリンク。JS とデータが組むことがある） ---
   // 組み立ての途中の href（置き換えられなかった雛形など）が、スクリプトとデータの遮断で残りうる。
   row({ ruleId: 'INVALID_INTERNAL_URL' }, SCRIPT_AND_DATA),
-  // 特殊な scheme のリンクは、遮断で生まれにくい（迷った）。
-  row({ ruleId: 'UNSUPPORTED_URL_SCHEME' }, NOTHING, { doubtful: true }),
   // --- RESOURCE ---
   // サーバが返した応答の事実（`HTTP_4XX` と同じ。設計者の判断。`IMAGE_LOAD_FAILED` の扱いと合わせる）。
   row({ ruleId: 'RESOURCE_4XX' }, NOTHING),
@@ -146,8 +144,13 @@ export const RULE_BLOCK_SENSITIVITIES: readonly RuleBlockSensitivityEntry[] = Ob
   row({ ruleId: 'CONTENT_COLLISION' }, DISPLAYED_ELEMENT),
   row({ ruleId: 'OVERSIZED_FIXED_ELEMENT' }, DISPLAYED_ELEMENT),
   row({ ruleId: 'DYNAMIC_LAYOUT_SHIFT' }, DISPLAYED_ELEMENT),
+  // DEF-210: 通知の枠は、表示された要素（枠を描く資源の遮断で変わりうる）。知らせの Rule も同じ扱い。
+  row({ ruleId: 'NOTIFICATION_NOT_DISMISSIBLE' }, DISPLAYED_ELEMENT),
+  row({ ruleId: 'NOTIFICATION_HANDLED_BEFORE_AUDIT' }, DISPLAYED_ELEMENT),
   // --- ACCESSIBILITY（表示された要素の欠陥。BN-R1 の M-3） ---
   row({ ruleId: 'COLOR_CONTRAST_VIOLATION' }, DISPLAYED_ELEMENT),
+  // AUD-4d: フォーカスで現れるかは、描かれた要素（スタイルとスクリプトの遮断で変わりうる）の事実。
+  row({ ruleId: 'FOCUSED_CONTROL_HIDDEN' }, DISPLAYED_ELEMENT),
   // axe の Rule のうち、意味の上で欠けの指摘のもの（題・lang・main の目印・最上位の見出し・繰り返しを飛ばす手段の欠け）は、`MISSING_TITLE` などと同じ欠けの
   // 指摘のまとまりにする（設計者の判断。同じ欠けが別の区分に分かれないため）。接頭辞の行より先に引く（`ruleBlockSensitivityOf` は同じ ruleId の行を先に見る）。
   // ruleId は、axe のルールの ID を大文字の snake case にした形（`accessibility-rules.ts` の接頭辞 `A11Y_` の後ろ）。

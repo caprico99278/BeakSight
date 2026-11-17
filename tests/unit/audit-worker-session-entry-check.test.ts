@@ -1,5 +1,5 @@
 // T43c（Task 43 の設計書 4.3）: ワーカーの流れの、入口の確かめのジョブ（`ENTRY_CHECK`）の扱いを、偽の IPC の口と偽の入口の確かめの流れで確かめる
-// （本物の Chromium は `entry-check-run.test.ts`、子 process の端から端は `entry-check-job-fork.test.ts`）。
+// （本物の Chromium は `entry-check-run.test.ts`、子 process の端から端は画面の `full-flow.test.ts`）。
 // - ログインの段を呼ばず、監査の中核も呼ばずに、入口の確かめの流れを、ジョブの ID・設定・止める印で呼ぶ（認証の指定は渡さない）。
 // - 観測を IPC に写す: Run を作った → `RUN_STARTED`（新しい Run、出力先からの相対パス）。終わり → `FINISHED`（Run を実行した結果だけ件数の要約。
 //   事実と案と URL を載せない）と、結果の終了コード。Run を実行しなかった結果（`RUN_ACTIVE`）は要約を付けない。
@@ -155,7 +155,7 @@ describe('audit worker session (T43c): the entry check job', () => {
   });
 
   it('sends FINISHED without the summary for a Run that did not run', async () => {
-    const run = await runWorker(() => Promise.resolve({ kind: 'RUN_ACTIVE', activeRunId: null, exitCode: RUN_UNAVAILABLE_EXIT_CODE }));
+    const run = await runWorker(() => Promise.resolve({ kind: 'RUN_ACTIVE', exitCode: RUN_UNAVAILABLE_EXIT_CODE }));
     expect(meaningful(run)).toEqual([{
       protocol: WORKER_PROTOCOL_VERSION,
       type: 'FINISHED',

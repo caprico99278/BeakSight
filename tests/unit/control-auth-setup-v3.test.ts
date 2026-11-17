@@ -20,28 +20,19 @@ import {
   AUDIT_READ_REQUEST_METHODS,
   AUTH_SETUP_VALIDATION_ERROR_CODES,
   AUTOMATED_LOGIN_MAX_LOGIN_ATTEMPTS,
-  DEFAULT_SERVICE_REQUEST_LIMITS,
-  MAX_AUDIT_READ_REQUESTS,
-  MAX_AUDIT_READ_REQUESTS_PER_PAGE_LOAD,
-  MAX_SERVICE_REQUESTS_PER_MINUTE,
-  MAX_SERVICE_REQUESTS_PER_RUN,
   MIN_AUDIT_READ_REQUESTS_PER_PAGE_LOAD,
   MIN_SERVICE_REQUESTS_PER_MINUTE,
   MIN_SERVICE_REQUESTS_PER_RUN,
   LOGIN_SIDE_REQUEST_METHODS,
   LOGIN_TRANSPORTS,
-  MAX_LOGIN_SIDE_REQUESTS,
   MAX_LOGIN_SIDE_REQUESTS_PER_LOGIN_STAGE,
-  MAX_SCRIPT_LOGIN_QUERY_PART_LENGTH,
-  MAX_SCRIPT_LOGIN_REQUIRED_QUERY,
-  MAX_SUCCESS_STORAGE_KEY_PART_LENGTH,
   MIN_LOGIN_SIDE_REQUESTS_PER_LOGIN_STAGE,
   type AuthSetupV3,
   type AuthSetupValidationErrorCode,
   type AuthSetupValidationResult,
 } from '../../src/control/auth/auth-setup-contracts.js';
 import { validateAuthSetup } from '../../src/control/auth/auth-setup-policy.js';
-import { MAX_APPROVED_SERVICE_ORIGINS, SITE_PROFILE_SCHEMA_VERSION, type SiteProfile, type ValidatedSiteProfile } from '../../src/control/contracts.js';
+import { SITE_PROFILE_SCHEMA_VERSION, type SiteProfile, type ValidatedSiteProfile } from '../../src/control/contracts.js';
 import { CONTROL_SCHEMA_NAMES, validateControlDocument } from '../../src/control/control-schema-validator.js';
 import { validateSiteProfile, type ProfileValidationContext } from '../../src/control/profile-policy.js';
 import { createTestConfig } from '../helpers/test-config.js';
@@ -150,20 +141,20 @@ describe('T34a: the auth setup version 3 contract and schema', () => {
     expect(LOGIN_SIDE_REQUEST_METHODS).toEqual(['POST']);
     expect(Object.isFrozen(LOGIN_TRANSPORTS) && Object.isFrozen(LOGIN_SIDE_REQUEST_METHODS)).toBe(true);
     const script = variantOf(propertyOf(V3_SCHEMA, 'scriptLogin'));
-    expect(propertyOf(script, 'requiredQuery')['maxItems']).toBe(MAX_SCRIPT_LOGIN_REQUIRED_QUERY);
+    // L11 で直した: 件数の上限（maxItems）と回数の範囲の最大は撤廃した（回数は安全な整数の範囲まで）。下限と長さの上限は残す。
+    expect(propertyOf(script, 'requiredQuery')['maxItems']).toBeUndefined();
     const query = propertyOf(script, 'requiredQuery').items;
-    expect(propertyOf(query, 'name')['maxLength']).toBe(MAX_SCRIPT_LOGIN_QUERY_PART_LENGTH);
-    expect(propertyOf(query, 'value')['maxLength']).toBe(MAX_SCRIPT_LOGIN_QUERY_PART_LENGTH);
+    expect(propertyOf(query, 'name')['maxLength']).toBeUndefined();
+    expect(propertyOf(query, 'value')['maxLength']).toBeUndefined();
     const side = propertyOf(V3_SCHEMA, 'loginSideRequests');
-    expect(side['maxItems']).toBe(MAX_LOGIN_SIDE_REQUESTS);
+    expect(side['maxItems']).toBeUndefined();
     expect(propertyOf(side.items, 'maxPerLoginStage')['minimum']).toBe(MIN_LOGIN_SIDE_REQUESTS_PER_LOGIN_STAGE);
-    expect(propertyOf(side.items, 'maxPerLoginStage')['maximum']).toBe(MAX_LOGIN_SIDE_REQUESTS_PER_LOGIN_STAGE);
+    expect(propertyOf(side.items, 'maxPerLoginStage')['maximum']).toBe(Number.MAX_SAFE_INTEGER);
     const key = variantOf(propertyOf(V3_SCHEMA, 'successStorageKey'));
-    expect(propertyOf(key, 'prefix')['maxLength']).toBe(MAX_SUCCESS_STORAGE_KEY_PART_LENGTH);
-    expect(propertyOf(key, 'suffix')['maxLength']).toBe(MAX_SUCCESS_STORAGE_KEY_PART_LENGTH);
+    expect(propertyOf(key, 'prefix')['maxLength']).toBeUndefined();
+    expect(propertyOf(key, 'suffix')['maxLength']).toBeUndefined();
     // スクリプトの送信先は method を持たない（`POST` に固定）。
     expect(Object.keys(script.properties ?? {}).sort()).toEqual(['origin', 'path', 'requiredQuery']);
-    expect(MAX_APPROVED_SERVICE_ORIGINS).toBe(4);
   });
 
   it('accepts the version 3 documents in the schema, and rejects a version 3 document without the version 3 properties', () => {
@@ -211,10 +202,6 @@ describe('T34a: validateAuthSetup accepts version 3', () => {
       ['AUTH_SETUP_REQUIRED_QUERY_INVALID']],
     ['a required query name that looks like a secret', { scriptLogin: { ...scriptSetup.scriptLogin, requiredQuery: [{ name: 'password', value: 'x' }] } },
       ['AUTH_SETUP_SECRET_LIKE_VALUE']],
-    ['too many required queries', { scriptLogin: { ...scriptSetup.scriptLogin,
-      requiredQuery: Array.from({ length: MAX_SCRIPT_LOGIN_REQUIRED_QUERY + 1 }, (_, index) => ({ name: `q${index}`, value: 'x' })) } }, ['AUTH_SETUP_LIMIT_EXCEEDED']],
-    ['a too long required query value', { scriptLogin: { ...scriptSetup.scriptLogin,
-      requiredQuery: [{ name: 'grant_type', value: 'x'.repeat(MAX_SCRIPT_LOGIN_QUERY_PART_LENGTH + 1) }] } }, ['AUTH_SETUP_LIMIT_EXCEEDED']],
     // ログインに伴う送信。
     ['a side request on an origin that is not approved', { loginSideRequests: [{ origin: OTHER_ORIGIN, path: '/rpc', method: 'POST', maxPerLoginStage: 1 }] },
       ['AUTH_SETUP_ORIGIN_NOT_APPROVED']],
@@ -222,10 +209,6 @@ describe('T34a: validateAuthSetup accepts version 3', () => {
       ['AUTH_SETUP_SCHEMA_INVALID']],
     ['a side request without a limit', { loginSideRequests: [{ origin: API_ORIGIN, path: '/rpc', method: 'POST', maxPerLoginStage: 0 }] },
       ['AUTH_SETUP_LIMIT_EXCEEDED']],
-    ['a side request above the limit', { loginSideRequests: [{ origin: API_ORIGIN, path: '/rpc', method: 'POST',
-      maxPerLoginStage: MAX_LOGIN_SIDE_REQUESTS_PER_LOGIN_STAGE + 1 }] }, ['AUTH_SETUP_LIMIT_EXCEEDED']],
-    ['too many side requests', { loginSideRequests: Array.from({ length: MAX_LOGIN_SIDE_REQUESTS + 1 }, (_, index) =>
-      ({ origin: API_ORIGIN, path: `/rpc/${index}`, method: 'POST', maxPerLoginStage: 1 })) }, ['AUTH_SETUP_LIMIT_EXCEEDED']],
     ['a duplicated side request', { loginSideRequests: [scriptSetup.loginSideRequests[0], { ...scriptSetup.loginSideRequests[0], maxPerLoginStage: 1 }] },
       ['AUTH_SETUP_LOGIN_SIDE_REQUEST_DUPLICATED']],
     ['a side request to the script target', { loginSideRequests: [{ origin: SERVICE_ORIGIN, path: '/auth/v1/token', method: 'POST', maxPerLoginStage: 1 }] },
@@ -236,11 +219,32 @@ describe('T34a: validateAuthSetup accepts version 3', () => {
     ['a storage key on a service origin', { successStorageKey: { ...scriptSetup.successStorageKey, origin: SERVICE_ORIGIN } }, ['AUTH_SETUP_ORIGIN_NOT_APPROVED']],
     ['a storage key without a prefix and a suffix', { successStorageKey: { origin: TEST_ORIGIN, prefix: '', suffix: '' } }, ['AUTH_SETUP_STORAGE_KEY_INVALID']],
     ['a storage key with a control character', { successStorageKey: { ...scriptSetup.successStorageKey, suffix: '-auth\ttoken' } }, ['AUTH_SETUP_STORAGE_KEY_INVALID']],
-    ['a too long storage key prefix', { successStorageKey: { ...scriptSetup.successStorageKey, prefix: 'x'.repeat(MAX_SUCCESS_STORAGE_KEY_PART_LENGTH + 1) } },
-      ['AUTH_SETUP_LIMIT_EXCEEDED']],
     ['a storage key with a value', { successStorageKey: { ...scriptSetup.successStorageKey, value: 'x' } }, ['AUTH_SETUP_SCHEMA_INVALID']],
   ])('rejects a version 3 setup with %s', (_label, change, codes) => {
     expect(codesOf(validate({ ...scriptSetup, ...change }))).toEqual(codes);
+  });
+
+  // LZ-2: 必須の query の名前と値、成功の鍵の接頭辞と接尾辞の長さの上限（前は 256）は撤廃した。
+  it('accepts a required query value and a storage key prefix longer than the former limit', () => {
+    const result = validate({
+      ...scriptSetup,
+      scriptLogin: { ...scriptSetup.scriptLogin, requiredQuery: [{ name: 'grant_type', value: 'x'.repeat(257) }] },
+      successStorageKey: { ...scriptSetup.successStorageKey, prefix: 'x'.repeat(257) },
+    });
+    expect(result, JSON.stringify(result)).toMatchObject({ ok: true });
+  });
+
+  // L11（設計書 `2026-11-09-beaksight-remove-limits-design.md` 4。設計者の判断 (b)）で直した: 件数の上限と回数の範囲の最大は撤廃した（前は
+  // `AUTH_SETUP_LIMIT_EXCEEDED`）。前の上限を超える件数と回数を受ける。
+  it.each<readonly [string, Record<string, unknown>]>([
+    ['more required queries than the earlier limit', { scriptLogin: { ...scriptSetup.scriptLogin,
+      requiredQuery: Array.from({ length: 5 }, (_, index) => ({ name: `q${index}`, value: 'x' })) } }],
+    ['a side request above the earlier limit per login stage', { loginSideRequests: [{ origin: API_ORIGIN, path: '/rpc', method: 'POST',
+      maxPerLoginStage: MAX_LOGIN_SIDE_REQUESTS_PER_LOGIN_STAGE + 1 }] }],
+    ['more side requests than the earlier limit', { loginSideRequests: Array.from({ length: 9 }, (_, index) =>
+      ({ origin: API_ORIGIN, path: `/rpc/${index}`, method: 'POST', maxPerLoginStage: 1 })) }],
+  ])('accepts a version 3 setup with %s (L11)', (_label, change) => {
+    expect(codesOf(validate({ ...scriptSetup, ...change }))).toEqual([]);
   });
 
   it('rejects a script login for a profile without approved service origins', () => {
@@ -352,30 +356,27 @@ describe('T34R-fix-b: the script login of an automated login profile, and the va
 // - `auditReadRequests`（上限 8）: 監査の段で通す、読み取りのための手続きの呼び出し。`origin` は承認したサービスの Origin か承認したテストの Origin、
 //   `path`、`method`（`POST` だけ）、`maxPerPageLoad`（1〜10）。Origin と path の組の重なりは拒む（`AUTH_SETUP_AUDIT_READ_REQUEST_DUPLICATED`）。
 //   ログインに伴う送信・スクリプトの送信先との重なりは許す（ログインの段と監査の段で、数え方も意味も違うため）。
-// - `serviceRequestLimits`: `perMinute`（1〜600）、`perRun`（1〜10,000）。ないときは上限の値（`DEFAULT_SERVICE_REQUEST_LIMITS`）。DEF-141 で、120・600 から
-//   上げた（前の範囲で保存した値は、そのまま受ける）。
+// - `serviceRequestLimits`: `perMinute`・`perRun`（1 以上）。L11 で上限としては使わなくなり、LZ-3c で既定の値と最大を捨てた。前に保存した設定を読むために、
+//   項目は受けて形を確かめる（使わない）。
 // - `SCRIPT_REQUEST` でないときは、どちらも持てない（`AUTH_SETUP_SCRIPT_LOGIN_NOT_ALLOWED`。スクリプトで送るログインの項目と同じ扱い）。
 describe('T35a: the audit read requests and the service request limits of version 3', () => {
   const READ = { origin: API_ORIGIN, path: '/rest/v1/rpc/list_members', method: 'POST', maxPerPageLoad: 3 } as const;
   const withReads = (change: Record<string, unknown>): Record<string, unknown> => ({ ...scriptSetup, ...change });
 
-  it('has the closed list and the limits of the contract in the schema, and the default limits are the maximum', () => {
+  it('has the closed list and the lower bounds of the contract in the schema', () => {
     expect(AUDIT_READ_REQUEST_METHODS).toEqual(['POST']);
     expect(Object.isFrozen(AUDIT_READ_REQUEST_METHODS)).toBe(true);
-    expect([MAX_AUDIT_READ_REQUESTS, MIN_AUDIT_READ_REQUESTS_PER_PAGE_LOAD, MAX_AUDIT_READ_REQUESTS_PER_PAGE_LOAD]).toEqual([8, 1, 10]);
-    expect([MIN_SERVICE_REQUESTS_PER_MINUTE, MAX_SERVICE_REQUESTS_PER_MINUTE, MIN_SERVICE_REQUESTS_PER_RUN, MAX_SERVICE_REQUESTS_PER_RUN])
-      .toEqual([1, 600, 1, 10_000]);
-    expect(DEFAULT_SERVICE_REQUEST_LIMITS).toEqual({ perMinute: MAX_SERVICE_REQUESTS_PER_MINUTE, perRun: MAX_SERVICE_REQUESTS_PER_RUN });
-    expect(Object.isFrozen(DEFAULT_SERVICE_REQUEST_LIMITS)).toBe(true);
+    // 前の上限の値（`MAX_*`・`DEFAULT_SERVICE_REQUEST_LIMITS`）は L11 で使わなくなり、LZ-3c で捨てた。
+    // L11 で直した: 件数の上限と、回数・要求の上限の範囲の最大は撤廃した（安全な整数の範囲まで。下限は残す）。
     const reads = propertyOf(V3_SCHEMA, 'auditReadRequests');
-    expect(reads['maxItems']).toBe(MAX_AUDIT_READ_REQUESTS);
+    expect(reads['maxItems']).toBeUndefined();
     expect(propertyOf(reads.items, 'maxPerPageLoad')['minimum']).toBe(MIN_AUDIT_READ_REQUESTS_PER_PAGE_LOAD);
-    expect(propertyOf(reads.items, 'maxPerPageLoad')['maximum']).toBe(MAX_AUDIT_READ_REQUESTS_PER_PAGE_LOAD);
+    expect(propertyOf(reads.items, 'maxPerPageLoad')['maximum']).toBe(Number.MAX_SAFE_INTEGER);
     const limits = propertyOf(V3_SCHEMA, 'serviceRequestLimits');
     expect([propertyOf(limits, 'perMinute')['minimum'], propertyOf(limits, 'perMinute')['maximum']])
-      .toEqual([MIN_SERVICE_REQUESTS_PER_MINUTE, MAX_SERVICE_REQUESTS_PER_MINUTE]);
+      .toEqual([MIN_SERVICE_REQUESTS_PER_MINUTE, Number.MAX_SAFE_INTEGER]);
     expect([propertyOf(limits, 'perRun')['minimum'], propertyOf(limits, 'perRun')['maximum']])
-      .toEqual([MIN_SERVICE_REQUESTS_PER_RUN, MAX_SERVICE_REQUESTS_PER_RUN]);
+      .toEqual([MIN_SERVICE_REQUESTS_PER_RUN, Number.MAX_SAFE_INTEGER]);
     // 任意の項目（版 3 の必須の項目は変えない）。
     expect(V3_SCHEMA['required']).not.toContain('auditReadRequests');
     expect(V3_SCHEMA['required']).not.toContain('serviceRequestLimits');
@@ -397,18 +398,6 @@ describe('T35a: the audit read requests and the service request limits of versio
     expect(codesOf(validate(withReads({ auditReadRequests: [] })))).toEqual([]);
   });
 
-  // DEF-141: 前の範囲の上限の値（120・600。前の既定）で保存した設定も、新しい上限の値も、そのまま受ける。
-  it.each([
-    ['the earlier maximum limits', { perMinute: 120, perRun: 600 }],
-    ['the new maximum limits', { perMinute: 600, perRun: 10_000 }],
-    ['the minimum limits', { perMinute: 1, perRun: 1 }],
-  ])('accepts %s as they are', (_label, limits) => {
-    const setup = withReads({ serviceRequestLimits: limits });
-    const result = validate(setup);
-    expect(codesOf(result)).toEqual([]);
-    expect(result.ok && result.setup).toEqual(setup);
-  });
-
   it.each<readonly [string, Record<string, unknown>, readonly AuthSetupValidationErrorCode[]]>([
     ['the read requests of a form navigation setup', { ...formSetup, auditReadRequests: [READ] }, ['AUTH_SETUP_SCRIPT_LOGIN_NOT_ALLOWED']],
     ['an empty read request list of a form navigation setup', { ...formSetup, auditReadRequests: [] }, ['AUTH_SETUP_SCRIPT_LOGIN_NOT_ALLOWED']],
@@ -427,14 +416,9 @@ describe('T35a: the audit read requests and the service request limits of versio
     ['a read request with a dangerous term in another case', withReads({ auditReadRequests: [{ ...READ, path: '/rest/v1/rpc/SignOut' }] }),
       ['AUTH_SETUP_PATH_INVALID']],
     ['a read request of no time per page load', withReads({ auditReadRequests: [{ ...READ, maxPerPageLoad: 0 }] }), ['AUTH_SETUP_LIMIT_EXCEEDED']],
-    ['a read request over the limit per page load', withReads({ auditReadRequests: [{ ...READ, maxPerPageLoad: 11 }] }), ['AUTH_SETUP_LIMIT_EXCEEDED']],
-    ['too many read requests', withReads({ auditReadRequests: Array.from({ length: MAX_AUDIT_READ_REQUESTS + 1 },
-      (_, index) => ({ ...READ, path: `/rest/v1/rpc/read_${index}` })) }), ['AUTH_SETUP_LIMIT_EXCEEDED']],
     ['a read request with GET', withReads({ auditReadRequests: [{ ...READ, method: 'GET' }] }), ['AUTH_SETUP_SCHEMA_INVALID']],
     ['a read request with an extra property', withReads({ auditReadRequests: [{ ...READ, body: 'x' }] }), ['AUTH_SETUP_SCHEMA_INVALID']],
-    ['a limit per minute over the maximum', withReads({ serviceRequestLimits: { perMinute: 601, perRun: 600 } }), ['AUTH_SETUP_LIMIT_EXCEEDED']],
     ['a limit per minute of zero', withReads({ serviceRequestLimits: { perMinute: 0, perRun: 600 } }), ['AUTH_SETUP_LIMIT_EXCEEDED']],
-    ['a limit per Run over the maximum', withReads({ serviceRequestLimits: { perMinute: 120, perRun: 10_001 } }), ['AUTH_SETUP_LIMIT_EXCEEDED']],
     ['limits without the limit per Run', withReads({ serviceRequestLimits: { perMinute: 120 } }), ['AUTH_SETUP_SCHEMA_INVALID']],
   ])('rejects %s', (_name, input, expected) => {
     const result = validate(input);
@@ -442,6 +426,23 @@ describe('T35a: the audit read requests and the service request limits of versio
     for (const error of result.ok ? [] : result.errors) {
       expect(AUTH_SETUP_VALIDATION_ERROR_CODES).toContain(error.code);
     }
+  });
+
+  // L11（設計書 `2026-11-09-beaksight-remove-limits-design.md` 4。設計者の判断 (b)）で直した: 件数の上限と、回数・要求の上限の範囲の最大は撤廃した（前は
+  // `AUTH_SETUP_LIMIT_EXCEEDED`）。前の上限を超える値を受ける。
+  it.each<readonly [string, Record<string, unknown>]>([
+    ['a read request over the earlier limit per page load', withReads({ auditReadRequests: [{ ...READ, maxPerPageLoad: 11 }] })],
+    ['more read requests than the earlier limit', withReads({ auditReadRequests: Array.from({ length: 9 },
+      (_, index) => ({ ...READ, path: `/rest/v1/rpc/read_${index}` })) })],
+    ['a limit per minute over the earlier maximum', withReads({ serviceRequestLimits: { perMinute: 601, perRun: 600 } })],
+    ['a limit per Run over the earlier maximum', withReads({ serviceRequestLimits: { perMinute: 120, perRun: 10_001 } })],
+    // DEF-141: 前の範囲で保存した値（120・600）と、下限の値も、そのまま受ける。
+    ['the earlier maximum limits', withReads({ serviceRequestLimits: { perMinute: 120, perRun: 600 } })],
+    ['the minimum limits', withReads({ serviceRequestLimits: { perMinute: 1, perRun: 1 } })],
+  ])('accepts %s as it is (L11)', (_name, input) => {
+    const result = validate(input);
+    expect(codesOf(result)).toEqual([]);
+    expect(result.ok && result.setup).toEqual(input);
   });
 
   it('puts the errors of the read requests at their pointers', () => {

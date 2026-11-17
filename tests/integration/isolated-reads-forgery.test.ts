@@ -15,7 +15,7 @@ import {
   inspectInteractionCandidateHandle,
   resolveInteractionCandidateHandle,
 } from '../../src/interaction/discover-candidates.js';
-import { launchCliChromium, launchHeadlessChromium } from '../helpers/chromium.js';
+import { chromiumRunsOf, launchCliChromium, launchHeadlessChromium } from '../helpers/chromium.js';
 import { startLoopbackHttpServer, type LoopbackHttpServer } from '../helpers/loopback-server.js';
 import {
   PAGE_FORGERY_KINDS,
@@ -27,10 +27,10 @@ import {
   type PageForgeryKind,
 } from '../helpers/page-forgery.js';
 
-const LAUNCHERS = [
+const LAUNCHERS = chromiumRunsOf([
   ['the default test Chromium', () => launchHeadlessChromium()],
   ['the CLI launch settings', () => launchCliChromium()],
-] as const;
+]);
 
 const STRICT_CSP = "script-src 'self'; require-trusted-types-for 'script'; trusted-types 'none'";
 const LOGIN_ACTION_PATH = '/login';
@@ -44,7 +44,9 @@ const BODY = [
   '<button id="c1" type="button" aria-expanded="false" aria-controls="p1">Open second</button><div id="p1" hidden>second panel</div>',
 ].join('');
 
-describe.each(LAUNCHERS)('T32j-4: the login form check and the interaction candidates read in the isolated world (%s)', (_label, launch) => {
+describe.each(LAUNCHERS)('T32j-4: the login form check and the interaction candidates read in the isolated world (%s)', (label, launch) => {
+  // TEST-TIME-B: セレクタの形の判定（BeakSight の側の判定）は、既定の Chromium だけ。偽りの下の読み取りは 2 つのまま。
+  const itOnDefault = it.runIf(label === LAUNCHERS[0]?.[0]);
   let browser: Browser;
   let server: LoopbackHttpServer;
 
@@ -152,7 +154,7 @@ describe.each(LAUNCHERS)('T32j-4: the login form check and the interaction candi
     });
   });
 
-  it('stops with FORM_UNREADABLE when a selector crosses into a shadow root (Playwright counts it, the standard CSS does not)', async () => {
+  itOnDefault('stops with FORM_UNREADABLE when a selector crosses into a shadow root (Playwright counts it, the standard CSS does not)', async () => {
     const page = await browser.newPage();
     try {
       await page.setContent(`<div id="host"><template shadowrootmode="open"><form method="post" action="${server.origin}${LOGIN_ACTION_PATH}">`
@@ -171,7 +173,7 @@ describe.each(LAUNCHERS)('T32j-4: the login form check and the interaction candi
     } finally { await page.close(); }
   });
 
-  it('stops with FORM_UNREADABLE when a selector is a Playwright-only form (the saved settings stop at the run)', async () => {
+  itOnDefault('stops with FORM_UNREADABLE when a selector is a Playwright-only form (the saved settings stop at the run)', async () => {
     const page = await open('none', false);
     try {
       const selectors: LoginFormSelectors = { ...LOGIN_SELECTORS, submit: '#go:has-text("Sign in")' };

@@ -6,13 +6,12 @@
 // - M-8（設計者の既定）: ユーザー名は、引き継ぐ状態と読み取りでは比べない（ユーザー名で読む SPA、セッションの保存にユーザー名を持つ SPA は成功する）。
 // - T36R-fix（ユーザーの判断。form の要素のないログインの画面）: form の要素のない画面でも、C-1（登録した送信のヘッダ）と C-2（URL にそのまま連結した
 //   空白と `/` を含むパスワード）の持ち出しを止め（`AUTH_RESULT_UNKNOWN`）、パスワードを運ぶ要求はサーバに届かない。
-import type { Browser } from 'playwright';
 import { describe, expect, it } from 'vitest';
 import { wait } from '../../src/core/deadline.js';
 import type { AuditConfig } from '../../src/config/types.js';
 import { AUTH_SETUP_SCHEMA_VERSION_3, AUTOMATED_LOGIN_MAX_LOGIN_ATTEMPTS, type AuthSetupV3 } from '../../src/control/auth/auth-setup-contracts.js';
 import { runAutomatedLoginStage, type AutomatedLoginStageResult } from '../../src/worker/automated-login.js';
-import { launchCliChromium, launchHeadlessChromium } from '../helpers/chromium.js';
+import { BOTH_CHROMIUM_LAUNCHERS } from '../helpers/chromium.js';
 import {
   LEAK_SITE_FORMLESS_QUERY,
   LEAK_SITE_PATHS,
@@ -24,10 +23,6 @@ import {
 } from '../helpers/credential-leak-site.js';
 import { fastRunConfig } from '../helpers/run-harness.js';
 
-const LAUNCHERS: readonly (readonly [string, () => Promise<Browser>])[] = [
-  ['the default test Chromium', () => launchHeadlessChromium()],
-  ['the CLI Chromium', () => launchCliChromium()],
-];
 const TEST_TIMEOUT_MS = 120_000;
 /** 送信の後に結果を待つ時間（ms。テストを速くする）。 */
 const RESULT_TIMEOUT_MS = 10_000;
@@ -50,7 +45,7 @@ interface StageOptions {
   readonly formless?: boolean;
 }
 
-describe.each(LAUNCHERS)('T36R-fix: the carried-over state of the automated script login with %s', (_label, launch) => {
+describe.each(BOTH_CHROMIUM_LAUNCHERS)('T36R-fix: the carried-over state of the automated script login with %s', (_label, launch) => {
   const setupOf = (site: CredentialLeakSite, scenario: LeakSiteScenario, formless: boolean): AuthSetupV3 => ({
     schemaVersion: AUTH_SETUP_SCHEMA_VERSION_3,
     profileId: 'example-script-auto',

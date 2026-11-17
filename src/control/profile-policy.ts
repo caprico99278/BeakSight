@@ -12,12 +12,13 @@
 import type { AuditConfig } from '../config/types.js';
 import { isPortableRelativeArtifactPath } from '../core/artifact-layout.js';
 import { isRecord } from '../core/guards.js';
+import { isSecretLikeText } from '../core/secret-like-text.js';
 import { deepFreeze } from '../core/immutable.js';
 import { hasBidiControl, hasControlOrLineSeparator, hasLoneSurrogate } from '../core/text.js';
 import { canonicalHttpOriginOf, isLoopbackUrl, isOriginInAllowedOrigins } from '../crawl/normalize-url.js';
 import {
-  MAX_ENVIRONMENT_EVIDENCE_REF_LENGTH,
   MIN_PROFILE_REVISION,
+  NO_LOGIN_AUTH_STRATEGY,
   PROFILE_ID_PATTERN,
   type ProfileValidationError,
   type ProfileValidationErrorCode,
@@ -27,7 +28,13 @@ import {
   type ValidatedSiteProfile,
 } from './contracts.js';
 import { validateControlDocument } from './control-schema-validator.js';
-import { AUTH_STRATEGIES_BY_MODE, ENVIRONMENTS_BY_MODE, TEST_ORIGIN_MODES, environmentAcceptsEvidence } from './profile-combinations.js';
+import {
+  AUTH_STRATEGIES_BY_MODE,
+  ENVIRONMENTS_BY_MODE,
+  TEST_ENVIRONMENT,
+  TEST_ORIGIN_MODES,
+  environmentAcceptsEvidence,
+} from './profile-combinations.js';
 import { TARGET_CONFIG_DIRECTORIES, TARGET_CONFIG_EXTENSION } from './target-config-locations.js';
 
 /** 検証の文脈。参照するターゲット JSON を読み込んだ結果（`loadConfig` の結果）を、呼び出し側が渡す。 */
@@ -111,15 +118,13 @@ const isAcceptedTestOriginForm = (value: string): boolean => {
 };
 
 /**
- * 環境の証拠の参照として使えるか: UTF-16 のコード単位で `MAX_ENVIRONMENT_EVIDENCE_REF_LENGTH` 以下（スキーマの maxLength は
- * コードポイントで数えるので、ここで数え直す）、空白とゼロ幅の文字だけでない、制御文字・行と段落の区切り・向きを変える文字を
+ * 環境の証拠の参照として使えるか（LZ-2: 長さの上限は置かない）: 空白とゼロ幅の文字だけでない、制御文字・行と段落の区切り・向きを変える文字を
  * 含まない、対になっていないサロゲートを含まない（T22d。T22R の M1）。書けない文字は `src/core/text.ts` の判定を使う: 制御文字
  * （Cc）と行・段落の区切り（Zl、Zp。U+2028、U+2029）は `hasControlOrLineSeparator`、向きを変える文字は `hasBidiControl`（CCX-3 の
  * 設計者の判断で、ALM（U+061C）を含む）。
  */
 const isUsableEvidenceRef = (value: string): boolean =>
-  value.length <= MAX_ENVIRONMENT_EVIDENCE_REF_LENGTH
-  && !hasLoneSurrogate(value)
+  !hasLoneSurrogate(value)
   && value.replace(EVIDENCE_INVISIBLE_CHARACTERS, '').length > 0
   && !hasControlOrLineSeparator(value)
   && !hasBidiControl(value);
@@ -165,6 +170,53 @@ const testOriginErrors = (profile: SiteProfile, context: ProfileValidationContex
 };
 
 /**
+ * loopback の host の Origin か（文字列でない値・解析できない値は偽。fail-closed）。判定は URL の意味の owner の `isLoopbackUrl`。
+ * NL fix round 1（設計書 6.1 の 2）: ワーカーの契約（`worker-protocol.ts`）の多重の守りも、この判定を使う（複製しない）。
+ */
+export const isLoopbackOrigin = (value: unknown): boolean => {
+  if (typeof value !== 'string') {
+    return false;
+  }
+  const canonical = canonicalHttpOriginOf(value);
+  return canonical !== undefined && isLoopbackUrl(new URL(canonical));
+};
+
+/** 一覧が配列で、すべて loopback の Origin か（配列でない値は偽。fail-closed）。 */
+const allLoopbackOrigins = (values: unknown): boolean => Array.isArray(values) && values.every(isLoopbackOrigin);
+
+/**
+ * ログインのないテスト用のサイトの誤り（NL-1。設計書 `2026-11-06-beaksight-no-login-test-site-design.md` 2 章の設計者の判断、3.1 の 2）。`TEST` の環境の
+ * 認証・書き込みのモードで、ログインしない方式（`NONE`）のときは、`approvedTestOrigins` がすべて loopback でなければ拒む（ログインがないと、テスト環境か
+ * どうかは利用者の申告だけになるので、手元のサイトに限る）。Origin が 1 つもないときは `PROFILE_TEST_ORIGINS_REQUIRED` だけを返す。
+ * NL fix round 1（設計書 6.1 の 1。SREV-NL の I-1）: 承認したサービスの Origin と、ターゲットの設定の `site.allowedOrigins` も、すべて loopback であることを
+ * 求める（設定の許可 Origin に外のサイトがあると、ログインなしでその画面を読み込み、その画面の自動の通信を通してしまう）。ターゲットの設定の許可 Origin を
+ * 読めない（配列でない・空・文字列でない値）ときも拒む（fail-closed）。同じ理由のコード。
+ */
+const noLoginErrors = (profile: SiteProfile, context: ProfileValidationContext): readonly ProfileValidationError[] => {
+  if (
+    profile.environment !== TEST_ENVIRONMENT
+    || profile.auth !== NO_LOGIN_AUTH_STRATEGY
+    || !TEST_ORIGIN_MODES.includes(profile.mode)
+    || profile.approvedTestOrigins.length === 0
+  ) {
+    return [];
+  }
+  const allowedOrigins: unknown = (context as { readonly targetConfig?: { readonly site?: { readonly allowedOrigins?: unknown } } })
+    .targetConfig?.site?.allowedOrigins;
+  if (
+    profile.approvedTestOrigins.every(isLoopbackOrigin)
+    && allLoopbackOrigins(profile.approvedServiceOrigins ?? [])
+    && Array.isArray(allowedOrigins) && allowedOrigins.length > 0 && allLoopbackOrigins(allowedOrigins)
+  ) {
+    return [];
+  }
+  return [errorOf(
+    'PROFILE_NO_LOGIN_REQUIRES_LOOPBACK',
+    `approvedTestOrigins, approvedServiceOrigins and site.allowedOrigins must all be loopback origins for mode ${profile.mode} without login (auth ${profile.auth})`,
+  )];
+};
+
+/**
  * 承認したサービスの Origin の誤り（T34a。Task 34 の設計書 3.1）。テスト環境の 2 つのモードでないプロファイルは、空か項目なしだけ。形は、テスト環境の
  * Origin と同じ決まり（`isAcceptedTestOriginForm`。HTTPS の Origin の正規の直列化か、loopback の host の http）。ターゲット設定の
  * `site.allowedOrigins` に入っている Origin は、テスト環境の Origin と重なるので拒む（サービスの Origin は、クロールの対象を広げない）。件数の上限と
@@ -206,8 +258,14 @@ const evidenceErrors = (profile: SiteProfile): readonly ProfileValidationError[]
   } else if (!isUsableEvidenceRef(evidence)) {
     errors.push(errorOf(
       'PROFILE_ENVIRONMENT_EVIDENCE_REQUIRED',
-      `environmentEvidenceRef must be at most ${MAX_ENVIRONMENT_EVIDENCE_REF_LENGTH} UTF-16 code units, must not be blank or only `
+      'environmentEvidenceRef must not be blank or only '
         + 'zero width characters, and must not contain control characters, line breaks, bidirectional controls or lone surrogates',
+    ));
+  } else if (isSecretLikeText(evidence)) {
+    // PL-F 修正の 1 回目（PL-REV の Minor 2）: 秘密に見える参照（userinfo のある URL、秘密に見える名前の `name=value`、認証の scheme と値）は書かせない。
+    errors.push(errorOf(
+      'ISOLATION_REFERENCE_SECRET_LIKE',
+      'environmentEvidenceRef must not contain a secret-like value (a URL with userinfo, a secret-like name=value pair, or an authorization scheme with a value)',
     ));
   }
   return errors;
@@ -233,6 +291,7 @@ const ruleErrors = (profile: SiteProfile, context: ProfileValidationContext): re
     ...errors,
     ...combinationErrors(profile),
     ...testOriginErrors(profile, context),
+    ...noLoginErrors(profile, context),
     ...serviceOriginErrors(profile, context),
     ...evidenceErrors(profile),
   ];

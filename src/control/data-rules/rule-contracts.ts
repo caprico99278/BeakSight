@@ -8,13 +8,7 @@
 //   保存する文書には入らない（スキーマの enum ではない）。
 // - 合成のメールアドレスと電話番号の形（設計書 2 章の判断 1、3 章。2026-10-13 のユーザーの指示）は、ここの名前つきの定数だけで表す。
 // - 純粋な定義だけのファイル。管理データ・画面・ブラウザ・ワーカーに触れない（`tests/architecture/data-rules-boundary.test.ts`）。
-import {
-  MAX_CONSTRAINT_VALUE_LENGTH,
-  MAX_FIELD_NAME_LENGTH,
-  MAX_OPTION_VALUE_LENGTH,
-  MAX_SELECT_OPTION_VALUES,
-} from '../../discovery/candidate-contracts.js';
-import { MAX_SCENARIO_FIELD_NAMES, MIN_SCENARIO_REVISION, SCENARIO_ID_PATTERN } from '../approval/scenario-contracts.js';
+import { MIN_SCENARIO_REVISION, SCENARIO_ID_PATTERN } from '../approval/scenario-contracts.js';
 import { foldNfkcCase } from '../../core/text.js';
 // PRE42-CC 組 UI-K3（台帳の CC-113）: 値の作り方と出どころの印の一覧（画面のブラウザ側も読む、import を持たない純粋な core のファイル）。ここは公開し直す。
 import {
@@ -51,6 +45,8 @@ export type RuleSetSchemaVersion = typeof RULE_SET_SCHEMA_VERSION;
  * - `FIXED_LIST`（人の固定の一覧の値だけ）、`OUT_OF_TEMPLATE`（テンプレートの外。人の固定の一覧がなければ作らない）。
  * - `DIGIT_CODE`（番号・コード。FM2c）: 欄の pattern が数字だけの固定の桁数（`^\d{7}$`、`[0-9]{4}` など）のとき、その桁数の数字を作る。ほかの
  *   pattern からは作らない（`PATTERN_UNSUPPORTED`）。規則の集まりの版 2 から。
+ * - `GENERIC_TEXT`（作り物の文字。OP-2。設計書 `2026-10-27-beaksight-one-pass-flow-design.md` 4.1 の D10）: テンプレートの外のふつうの文字の欄（名前が業務の語に
+ *   当たらない text・search・textarea）に、`SYNTHETIC_TEXT_PREFIX` と数字の作り物の文字を作る。推した規則を作るときだけ推す（前に承認した規則の値は変えない）。
  */
 export const SEMANTIC_KINDS = Object.freeze([
   'GENERIC_NUMBER',
@@ -77,6 +73,7 @@ export const SEMANTIC_KINDS = Object.freeze([
   'FIXED_LIST',
   'OUT_OF_TEMPLATE',
   'DIGIT_CODE',
+  'GENERIC_TEXT',
 ] as const);
 export type SemanticKind = (typeof SEMANTIC_KINDS)[number];
 
@@ -240,23 +237,10 @@ export const ruleBaseDateWindowOf = (rule: Pick<FieldRule, 'baseDateWindow'>): B
 // 上限
 // ---------------------------------------------------------------------------------------------------------------
 
-/** 欄ごとの規則の最大の件数（送る欄の名前の最大の件数と同じ）。 */
-export const MAX_FIELD_RULES = MAX_SCENARIO_FIELD_NAMES;
+// L13（N28〜N30）: 規則・関係・一意にする欄・固定の値の数と、欄の名前の長さの上限は撤廃した（schema からも外した。定数は LZ-1 で消した）。
 
-/** 欄どうしの関係の最大の件数（欄ごとの規則の最大の件数と同じ）。 */
-export const MAX_FIELD_RELATIONS = MAX_SCENARIO_FIELD_NAMES;
-
-/** 一意にする欄の組の、欄の最大の件数（欄ごとの規則の最大の件数と同じ）。 */
-export const MAX_UNIQUE_KEY_FIELDS = MAX_SCENARIO_FIELD_NAMES;
-
-/** 人の固定の値の一覧の最大の件数（発見の選択肢の値の最大の件数と同じ）。 */
-export const MAX_FIXED_VALUES = MAX_SELECT_OPTION_VALUES;
-
-/** 人の固定の値 1 つの最大長（UTF-16 のコード単位。発見の選択肢の値 1 つの最大長と同じ）。 */
-export const MAX_FIXED_VALUE_LENGTH = MAX_OPTION_VALUE_LENGTH;
-
-/** 範囲（min・max・step）の値 1 つの最大長（UTF-16 のコード単位。欄の制約の属性の値の最大長と同じ）。 */
-export const MAX_RULE_RANGE_VALUE_LENGTH = MAX_CONSTRAINT_VALUE_LENGTH;
+// LZ-2: 人の固定の値 1 つと範囲（min・max・step）の値 1 つの長さの上限（前は `MAX_FIXED_VALUE_LENGTH` 256・`MAX_RULE_RANGE_VALUE_LENGTH` 512）は
+// 撤廃した。
 
 /** 一意にする欄の組が、使った組とぶつかったときの、決定的な作り直しの最大の回数（超えれば `UNIQUE_COMBINATIONS_EXHAUSTED`）。 */
 export const MAX_UNIQUE_RETRIES = 32;
@@ -273,9 +257,6 @@ export const MIN_RULE_SET_REVISION = MIN_SCENARIO_REVISION;
 
 /** 規則の集まりの id とシナリオの id の形（Task 28 の入力の規則の参照と同じ形）。 */
 export const RULE_SET_ID_PATTERN = SCENARIO_ID_PATTERN;
-
-/** 欄の名前の最大長（発見の候補の欄の名前と同じ）。 */
-export const MAX_RULE_FIELD_NAME_LENGTH = MAX_FIELD_NAME_LENGTH;
 
 // ---------------------------------------------------------------------------------------------------------------
 // 合成のメールアドレスと電話番号の形（設計書 2 章の判断 1、3 章）
@@ -329,6 +310,15 @@ export const SYNTHETIC_EMAIL_LOCAL_DIGITS = 10;
 /** 10 進の桁の数から、作る数の上限（`10^digits - 1`）。 */
 const DECIMAL_RADIX = 10;
 export const maxNumberOfDigits = (digits: number): number => DECIMAL_RADIX ** digits - 1;
+
+/** OP-2: 作り物の文字（`GENERIC_TEXT`）の頭（人や物を指さない語。合成のメールアドレスの局所部の頭と同じ語）。 */
+export const SYNTHETIC_TEXT_PREFIX = SYNTHETIC_EMAIL_LOCAL_PREFIX;
+
+/** OP-2: 作り物の文字の、決定的に作る数字の桁の数（値の候補を多くし、送らずに止まった回の値が履歴に入っても尽きないため。設計書 4.1.2 の R4）。 */
+export const SYNTHETIC_TEXT_DIGITS = 8;
+
+/** OP-2: 作り物の文字（`sample` と `SYNTHETIC_TEXT_DIGITS` 桁の数字）。 */
+export const syntheticTextOf = (number: number): string => `${SYNTHETIC_TEXT_PREFIX}${String(number).padStart(SYNTHETIC_TEXT_DIGITS, '0')}`;
 
 /** 合成のメールアドレス（`sample` と `SYNTHETIC_EMAIL_LOCAL_DIGITS` 桁の数字の局所部と、`example.invalid`。T29c）。 */
 export const syntheticEmailAddressOf = (number: number): string =>
@@ -390,7 +380,7 @@ export interface FieldRule {
   /** 人の範囲（なければ null。欄の min・max・step の中だけ）。 */
   readonly range: RuleRange | null;
   /**
-   * 人の固定の値の一覧（`FROM_FIXED_LIST` のときだけ 1〜`MAX_FIXED_VALUES` 件、ほかは空。重ならない）。並びは意味を持つ（digest でも並べ
+   * 人の固定の値の一覧（`FROM_FIXED_LIST` のときだけ 1 件以上（L13: 件数の上限はない）、ほかは空。重ならない）。並びは意味を持つ（digest でも並べ
    * 替えない）。管理データに平文で残る（設計書 10 章の 4。秘密に見える名前の欄は拒む。確かめは T29c・T29d）。
    */
   readonly fixedValues: readonly string[];
@@ -454,6 +444,16 @@ export const relationOriginOf = (relation: Pick<FieldRelation, 'origin'>): RuleO
 
 /** 一意にする欄の組の出どころ（印がなければ人）。 */
 export const uniqueKeyOriginOf = (content: Pick<RuleSetContent, 'uniqueKeyOrigin'>): RuleOrigin => content.uniqueKeyOrigin ?? DEFAULT_RULE_ORIGIN;
+
+/**
+ * SPEC-4（設計書 `2026-11-14-beaksight-slim-and-simplify-design.md` 5.1）: 人が決めた項目を持つ規則の集まりか（欄の規則・関係・一意にする欄の組のどれかの
+ * 出どころが人）。推した規則はすべての項目に `INFERRED` の印を持つので、人の項目は、外した規則の画面で人が保存したものだけ。一覧のチェックは、この規則を
+ * 使わない（推した規則に替えて承認する）。
+ */
+export const ruleSetHasHumanItems = (content: RuleSetContent): boolean =>
+  content.fieldRules.some((rule) => ruleOriginOf(rule) === DEFAULT_RULE_ORIGIN)
+  || content.relations.some((relation) => relationOriginOf(relation) === DEFAULT_RULE_ORIGIN)
+  || (content.uniqueKeyFieldNames.length > 0 && uniqueKeyOriginOf(content) === DEFAULT_RULE_ORIGIN);
 
 /** テンプレートの既定を保存した中身か（印がなければ偽）。 */
 export const templateDefaultsSavedOf = (content: Pick<RuleSetContent, 'templateDefaultsSaved'>): boolean => content.templateDefaultsSaved ?? false;

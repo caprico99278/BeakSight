@@ -20,6 +20,8 @@
  * 指定を渡さない。IPC・設定のファイル・環境変数・起動の引数からは渡せない（この関数は、それらを読まない）。
  * T26d-2: 同じ形で、`automatedLoginStage`（自動ログイン用の Browser の起動 `launchAutomatedLoginBrowser` と時間）と `openCredentialStore`（資格情報の
  * ファイルの部品の作り方。テストは偽の暗号化の部品の部品を渡す）を替えられる。
+ * RB-2（TEST-TIME-B）: 同じ形で、観察の窓の一式の差分（`observationWindows`。前の `testWaits` と SLIM-2 の閉じる前の待ちを寄せた）を替えられる
+ * （Gate `worker-login-hooks` の (n)・(p)、`production-wait-values`）。
  */
 import { readFile } from 'node:fs/promises';
 import { launchChromium } from '../browser/chromium-launch.js';
@@ -31,11 +33,13 @@ import { HEADLESS_CONFIG_OVERRIDES } from '../config/config-overrides.js';
 import { loadConfig } from '../config/load-config.js';
 import { loginOriginOf } from '../control/auth/automated-login-results.js';
 import { createCredentialStore, type CredentialStore } from '../control/credentials/credential-store.js';
+import { observationWindowsOf, type ObservationWindowsOverrides } from '../core/observation-windows.js';
 import type { WorkerToParentMessage } from '../control/worker-protocol.js';
 import { LOGIN_BROWSER_HEADLESS, runLoginStage, type LoginStageDependencies } from './authenticated-login.js';
 import { runAutomatedLoginStage, type AutomatedLoginStageDependencies, type AutomatedLoginStageResult } from './automated-login.js';
 import { startAuditWorker, type WorkerAutomatedLoginStageRequest, type WorkerChannel } from './audit-worker-session.js';
 import { executeDiscoveryRun } from './discovery-run.js';
+import { withCapturedLoginCredential } from './login-credential-capture.js';
 import { executeEntryCheckRun } from './entry-check-run.js';
 import { executeReadCheckRun } from './read-check-run.js';
 import { executeWriteCreateRun } from './write-create-run.js';
@@ -80,6 +84,31 @@ export interface AuditWorkerProcessOptions {
    * 本番の `PRODUCTION_RUN_DEPENDENCIES.launchBrowser`。本番の入口は渡さない（IPC・設定・環境変数からは渡せない）。Guard・Context・上限は変えない。
    */
   readonly launchRunBrowser?: AuditRunDependencies['launchBrowser'];
+  /**
+   * RB-2（TEST-TIME-B）: テストだけの口。観察の窓の一式の差分（本物の時計で待つ観察の長さを短くする）。省略した値は本番の値。本番の入口は渡さない（IPC・設定・
+   * 環境変数からは渡せない）。守りの値（自分の移動の間隔、自動ログインの間隔と回数、押した後の凍結など）は一式にないので替わらない。
+   */
+  readonly observationWindows?: ObservationWindowsOverrides;
+}
+
+/** RB-2: Run の依存と、発見と書き込みの流れ（テストだけの一式があれば、それぞれに渡す。なければ本番の流れと依存のまま）。 */
+interface ObservedFlows {
+  readonly runDependencies: AuditRunDependencies;
+  readonly executeDiscovery: typeof executeDiscoveryRun;
+  readonly executeWriteCreate: typeof executeWriteCreateRun;
+}
+
+/** RB-2: テストだけの一式（`observationWindows`）を、監査の Run の依存と、発見・書き込みの流れの依頼に渡す（1 つの組み立て）。 */
+function withObservationWindows(runDependencies: AuditRunDependencies, overrides: ObservationWindowsOverrides | undefined): ObservedFlows {
+  if (overrides === undefined) {
+    return { runDependencies, executeDiscovery: executeDiscoveryRun, executeWriteCreate: executeWriteCreateRun };
+  }
+  const observationWindows = observationWindowsOf(overrides);
+  return {
+    runDependencies: { ...runDependencies, observationWindows },
+    executeDiscovery: (request, observer) => executeDiscoveryRun({ ...request, observationWindows }, observer),
+    executeWriteCreate: (request, observer) => executeWriteCreateRun({ ...request, observationWindows }, observer),
+  };
 }
 
 /**
@@ -156,6 +185,10 @@ export function runAuditWorkerProcess(target: NodeJS.Process, options: AuditWork
   const loginStage: LoginStageDependencies = { ...PRODUCTION_LOGIN_STAGE_DEPENDENCIES, ...options.loginStage };
   const automatedLoginStage: AutomatedLoginStageDependencies = { ...PRODUCTION_AUTOMATED_LOGIN_STAGE_DEPENDENCIES, ...options.automatedLoginStage };
   const openCredentialStore = options.openCredentialStore ?? createCredentialStore;
+  // FM2d: テストだけの口（`launchRunBrowser`）があれば、Run の Browser の起動だけを替える。RB-2: テストだけの一式があれば、Run と流れに渡す。
+  const flows = withObservationWindows(options.launchRunBrowser === undefined
+    ? PRODUCTION_RUN_DEPENDENCIES
+    : { ...PRODUCTION_RUN_DEPENDENCIES, launchBrowser: options.launchRunBrowser }, options.observationWindows);
   const worker = startAuditWorker({
     channel,
     stderr: streamOutput(target.stderr),
@@ -165,17 +198,22 @@ export function runAuditWorkerProcess(target: NodeJS.Process, options: AuditWork
     // ターゲット JSON は、`loadConfig` と同じく cwd（リポジトリの root）から読む。
     readTargetConfig: (path) => readFile(path),
     executeAuditRun,
-    // FM2d: テストだけの口（`launchRunBrowser`）があれば、Run の Browser の起動だけを替える。
-    runDependencies: options.launchRunBrowser === undefined
-      ? PRODUCTION_RUN_DEPENDENCIES
-      : { ...PRODUCTION_RUN_DEPENDENCIES, launchBrowser: options.launchRunBrowser },
+    runDependencies: flows.runDependencies,
     runLoginStage: (request) => runLoginStage(request, loginStage),
     runAutomatedLoginStage: (request) => runAutomatedLoginWithCredentials(request, automatedLoginStage, openCredentialStore),
+    // OP-1（設計書 `2026-10-27-beaksight-one-pass-flow-design.md` 4.1.3 の 1）: 親が許したときだけ、受け取った資格情報を資格情報のファイルの部品の `register`
+    // で書く（ファイルがすでにあれば部品が拒む）。値は、部品に渡すまでの関数の中だけ。
+    saveCapturedCredential: async ({ credentialRoot, profileId, loginOrigin, credential }) => {
+      const metadata = await withCapturedLoginCredential(credential, (values) =>
+        openCredentialStore(credentialRoot).register({ profileId, loginOrigin, username: values.username, password: values.password }));
+      return metadata.credentialRevision;
+    },
     // T27d: 発見のジョブの流れ（監査の Browser と同じ、CLI の起動の設定の Chromium。`runDependencies.launchBrowser`）。
-    executeDiscovery: executeDiscoveryRun,
+    // RB-2: テストだけの一式がなければ、本番の流れをそのまま渡す。
+    executeDiscovery: flows.executeDiscovery,
     // T27e: READ の確かめのジョブの流れ（監査の Browser と同じ、CLI の起動の設定の Chromium）。
     executeReadCheck: executeReadCheckRun,
-    executeWriteCreate: executeWriteCreateRun,
+    executeWriteCreate: flows.executeWriteCreate,
     // T43c: 入口の確かめのジョブの流れ（監査の Browser と同じ、CLI の起動の設定の Chromium。ログインの段を通さない）。
     executeEntryCheck: executeEntryCheckRun,
   });

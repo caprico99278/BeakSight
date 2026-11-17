@@ -1,6 +1,6 @@
-// T27R2 の I3: 目印の検査（`apps/local-ui/tests/discovery-secret-markers.test.ts`）に足した目印の形（fixture の `markerShapes` の画面。form の中の
+// T27R2 の I3: 目印の検査（`apps/local-ui/tests/discovery-approval-secret-markers.test.ts`）に足した目印の形（fixture の `markerShapes` の画面。form の中の
 // 送信ボタンの `value`、画像の送信ボタンの `alt`、`<label>`（`for` と包む形）、`aria-labelledby`・`aria-describedby`）が、fixture の誤りで空振り
-// していないことを、本物の Chromium（headless だけ。テストの既定と、CLI の起動の設定の両方）と 127.0.0.1 の fixture のサーバで確かめる。
+// していないことを、本物の Chromium（テストの既定だけ）と 127.0.0.1 の fixture のサーバで確かめる。
 // - main world の確かめ: 同じ画面を普通の Context（Guard なし。セッションの Cookie だけ足す）で開き、ページの main world で、目印を置いた要素が
 //   期待の形（送信ボタンが form に属する、ラベルが欄に結び付く、ARIA の参照の先がある）であること、その所の文字に行の目印があることを確かめる
 //   （値はテストの process の中だけ。真偽だけを比べる）。
@@ -13,7 +13,7 @@ import { join } from 'node:path';
 import type { Browser } from 'playwright';
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 import { validateArtifact } from '../../src/core/schema-validator.js';
-import { launchCliChromium, launchHeadlessChromium } from '../helpers/chromium.js';
+import { DEFAULT_CHROMIUM_LAUNCHERS } from '../helpers/chromium.js';
 import {
   DISCOVERY_SITE_EXTRA_PATHS,
   DISCOVERY_SITE_MARKER_SHAPE_IDS,
@@ -24,10 +24,6 @@ import {
 import { runDiscoveryOnSite } from '../helpers/discovery-site-run.js';
 import { READ_METHODS } from '../helpers/leak-places.js';
 
-const LAUNCHERS = [
-  ['the default test Chromium', () => launchHeadlessChromium()],
-  ['the CLI launch settings', () => launchCliChromium()],
-] as const;
 const TEST_TIMEOUT_MS = 120_000;
 /** 目印の形の画面の form の数と、読む画面の数（目印の形の画面だけ。リンクはない）。 */
 const MARKER_SHAPE_FORMS = 3;
@@ -84,7 +80,8 @@ function readShapeFactsInPage(ids: typeof DISCOVERY_SITE_MARKER_SHAPE_IDS): Shap
   };
 }
 
-describe.each(LAUNCHERS)('T27R2 I3: the marker shapes of the discovery fixture are readable and are read by the probe (%s)', (_name, launch) => {
+// TEST-SLIM D2（TEST-POLICY の 3）: fixture の形の確かめなので、既定の Chromium だけで流す。
+describe.each(DEFAULT_CHROMIUM_LAUNCHERS)('T27R2 I3: the marker shapes of the discovery fixture are readable and are read by the probe (%s)', (_name, launch) => {
   let site: DiscoverySite;
   let outputDirectory: string;
 

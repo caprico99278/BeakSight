@@ -20,7 +20,7 @@
  *   分けた形（`const decode = (text) => Buffer.from(text, 'base64')` を `decode(p.bytes)` で呼ぶ）は、`bytes` の項目と decode が同じ呼び出しに
  *   並ばないので見つけられない（レビューで見る）。
  *   S1-F: Guard が単体のテストのために公開した本文の読み口（`writeSubmissionBodyOf`・`apiWriteBodyOf`）を参照するのは、Guard と `tests/unit/` だけ。
- * - (c) 書き込みの段の口（`writeStage`、`WriteStagePolicy`、`GuardWriteStage`、`WriteStageMonitor`、`isAcceptableGuardWriteStage`、
+ * - (c) 書き込みの段の口（`writeStage`、`WriteStagePolicy`、`GuardWriteStage`、`WriteStageMonitor`、`guardWriteStageCopyOf`（LU-SFIX1 で `isAcceptableGuardWriteStage` を置き換えた）、
  *   `createWriteStageContext`）を、決めたファイルのほかから参照しない。入口の `createWriteStageContext(…)` を呼ぶのと、`new WriteStageMonitor(…)` で
  *   部品を作るのは、ワーカーの書き込みの流れ（`WRITE_STAGE_WORKER_FLOW`。T30f が作る）だけ。一覧はここで閉じる（増やすときは設計書を直してから）。
  *   T30c: 書き込みの入力の部品（`src/browser/write-form-submitter.ts`）を一覧に足した（送信の窓を開くために `WriteStageMonitor` の型を受ける。
@@ -49,6 +49,7 @@
  * - (e3) T30R2-fix-1（M-a）: 子 process を起動する `node:child_process` を実行時に参照する（型だけの import を除く）のは、閉じた一覧のファイル
  *   （ワーカーを起動するジョブの管理と、DPAPI の子 process を起動する資格情報の保護）だけ（子 process からサイトへ送る口を作らないため）。
  * - (f) DEF-099 fix: 送り手（`sendWriteSubmissionOnce`）を呼ぶのは Guard の書き込みの段（`src/safety/passive-request-guard.ts`）だけ。
+ * - (f2) DEF-276-relay（REV-DEF276 の M-3）: 文書の WebSocket の中継（`openRelayedWebSocket`）を呼ぶのも Guard だけ（`apps/local-ui/src/**` も調べる）。
  * - `src/**` の読み込みと走査は、このファイルの読み込み時に 1 回だけ。ファイル全体を 1 秒以内に終える。
  */
 import { describe, expect, it } from 'vitest';
@@ -112,8 +113,11 @@ const WRITE_STAGE_NAMES: readonly string[] = [
   'WriteStagePolicy',
   'GuardWriteStage',
   'WriteStageMonitor',
-  'isAcceptableGuardWriteStage',
+  'guardWriteStageCopyOf',
   'createWriteStageContext',
+  // LU-12a: 前の値を後から入れる Guard の口（API の形とフォーム）。
+  'supplyApiPriorValues',
+  'supplyFormPriorValues',
 ];
 const WRITE_STAGE_NAME_PATTERN = new RegExp(String.raw`(?<![\w$])(?:${WRITE_STAGE_NAMES.join('|')})(?![\w$])`, 'gu');
 
@@ -511,8 +515,11 @@ describe('T30b Gate: the write stage boundary', () => {
 
 const EGRESS_PROXY = 'src/safety/egress-proxy.ts';
 const WRITE_SUBMISSION_SENDER = 'src/safety/write-submission-sender.ts';
+/** DEF-276-relay: 出口の中継へのトンネルの部品（送り手と中継が共通に使う。TLS をトンネルの上に張る）と、文書の WebSocket の中継。 */
+const PROXY_TUNNEL = 'src/safety/proxy-tunnel.ts';
+const WEBSOCKET_RELAY = 'src/safety/websocket-relay.ts';
 /** (e) ブラウザの外から送る口を使ってよいファイル（閉じた一覧）。 */
-const OUTBOUND_CLIENT_FILES: readonly string[] = [EGRESS_PROXY, WRITE_SUBMISSION_SENDER];
+const OUTBOUND_CLIENT_FILES: readonly string[] = [EGRESS_PROXY, WRITE_SUBMISSION_SENDER, PROXY_TUNNEL, WEBSOCKET_RELAY];
 /** (e) 送る口の名前（モジュールごと）。`node:https`・`node:http2`・`undici` は、何を import しても送る口とみなす。 */
 const OUTBOUND_NAMED_IMPORTS: Readonly<Record<string, readonly string[]>> = Object.freeze({
   'node:http': ['request', 'get', 'Agent', 'globalAgent', 'ClientRequest'],
@@ -628,6 +635,9 @@ const findChildProcessReferences = (source: ScannedSource): readonly string[] =>
 /** (f) 送り手の参照（`bare`）。 */
 const findSenderReferences = (source: ScannedSource): readonly string[] =>
   [...source.bare.matchAll(/(?<![\w$])sendWriteSubmissionOnce(?![\w$])/gu)].map((match) => match[0]);
+/** (f2) DEF-276-relay（REV-DEF276 の M-3）: 文書の WebSocket の中継（`openRelayedWebSocket`）の参照（`bare`）。 */
+const findRelayReferences = (source: ScannedSource): readonly string[] =>
+  [...source.bare.matchAll(/(?<![\w$])openRelayedWebSocket(?![\w$])/gu)].map((match) => match[0]);
 
 const OUTBOUND_SOURCE_FILES: readonly SourceFile[] = [...SOURCE_FILES, ...loadLocalUiSourceFiles()];
 
@@ -752,6 +762,14 @@ describe('DEF-099 fix: write submission boundary detectors', () => {
       'sendWriteSubmissionOnce',
     ]);
   });
+
+  it('(f2) detects the references to the WebSocket relay, and ignores comments and other names', () => {
+    expect(findRelayReferences(sample('x.ts', 'const relay = openRelayedWebSocket; // openRelayedWebSocket\nawait openRelayedWebSocket(options);'))).toEqual([
+      'openRelayedWebSocket',
+      'openRelayedWebSocket',
+    ]);
+    expect(findRelayReferences(sample('x.ts', "const name = 'openRelayedWebSocket';\nmyOpenRelayedWebSocket();"))).toEqual([]);
+  });
 });
 
 describe('DEF-099 fix Gate: the write submission boundary', () => {
@@ -772,20 +790,31 @@ describe('DEF-099 fix Gate: the write submission boundary', () => {
     expect([...referrers].sort()).toEqual([...CHILD_PROCESS_RUNTIME_FILES].sort());
   });
 
-  it('(e) the sender connects only to the egress proxy, and lays TLS only over that connection', () => {
-    const sender = SOURCE_FILES.find((file) => file.path === WRITE_SUBMISSION_SENDER);
-    const bare = sender?.bare ?? '';
-    const connects = findCallSites(bare, 'netConnect');
-    expect(connects).toHaveLength(1);
-    expect(connects[0]?.argumentText.replace(/\s+/gu, ' ').trim()).toBe('{ host: options.proxy.host, port: options.proxy.port }');
-    const tls = findCallSites(bare, 'tlsConnect');
+  // DEF-276-relay: 文書の WebSocket の中継も、送り手と同じく中継にだけ接続する。TLS は、共通のトンネルの部品が中継の上の接続にだけ張る。
+  it('(e) the sender and the WebSocket relay connect only to the egress proxy, and TLS is laid only over that connection', () => {
+    for (const path of [WRITE_SUBMISSION_SENDER, WEBSOCKET_RELAY]) {
+      const file = SOURCE_FILES.find((source) => source.path === path);
+      const connects = findCallSites(file?.bare ?? '', 'netConnect');
+      expect(connects, path).toHaveLength(1);
+      expect(connects[0]?.argumentText.replace(/\s+/gu, ' ').trim(), path).toBe('{ host: options.proxy.host, port: options.proxy.port }');
+      expect(findCallSites(file?.bare ?? '', 'tlsConnect'), path).toEqual([]);
+      expect(findModuleSpecifiers(file?.code ?? '').filter((specifier) => OUTBOUND_MODULES.test(specifier)), path).toEqual([]);
+    }
+    const tunnel = SOURCE_FILES.find((file) => file.path === PROXY_TUNNEL);
+    expect(findCallSites(tunnel?.bare ?? '', 'netConnect')).toEqual([]);
+    const tls = findCallSites(tunnel?.bare ?? '', 'tlsConnect');
     expect(tls).toHaveLength(1);
     expect(tls[0]?.argumentText).toMatch(/socket:\s*proxySocket/u);
-    expect(findModuleSpecifiers(sender?.code ?? '').filter((specifier) => OUTBOUND_MODULES.test(specifier))).toEqual([]);
+    expect(findModuleSpecifiers(tunnel?.code ?? '').filter((specifier) => OUTBOUND_MODULES.test(specifier))).toEqual([]);
   });
 
   it('(f) only the write stage of the Guard calls the sender', () => {
     const referrers = SOURCE_FILES.filter((file) => file.path !== WRITE_SUBMISSION_SENDER && findSenderReferences(file).length > 0).map(({ path }) => path);
+    expect(referrers).toEqual([GUARD]);
+  });
+
+  it('(f2) only the Guard calls the WebSocket relay', () => {
+    const referrers = OUTBOUND_SOURCE_FILES.filter((file) => file.path !== WEBSOCKET_RELAY && findRelayReferences(file).length > 0).map(({ path }) => path);
     expect(referrers).toEqual([GUARD]);
   });
 });

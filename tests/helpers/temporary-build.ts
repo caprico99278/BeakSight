@@ -1,7 +1,8 @@
 import { spawnSync } from 'node:child_process';
+import { randomUUID } from 'node:crypto';
 import { copyFileSync, cpSync } from 'node:fs';
 import { mkdir, mkdtemp, readdir, rm, stat } from 'node:fs/promises';
-import { join, relative, resolve } from 'node:path';
+import { basename, join, relative, resolve } from 'node:path';
 
 const rootDirectory = process.cwd();
 
@@ -52,6 +53,32 @@ export async function buildIntoTemporaryDirectory(): Promise<TemporaryBuild> {
   }
 
   return { rootDirectory: buildRoot, distDirectory, remove };
+}
+
+/**
+ * TEST-TIME-A: 1 回の vitest で共有する一時ビルドの場所を、`globalSetup`（`shared-temporary-build-setup.ts`）からテストへ渡す名前。
+ * 値は、ビルドの場所（`rootDirectory`・`distDirectory`）か、ビルドに失敗したときの文（`error`）。
+ */
+export const SHARED_TEMPORARY_BUILD_KEY = 'beaksightSharedTemporaryBuild';
+
+/** `SHARED_TEMPORARY_BUILD_KEY` で渡す値（`provide` で渡せる、JSON の形）。 */
+export type SharedTemporaryBuildFacts =
+  | { readonly rootDirectory: string; readonly distDirectory: string }
+  | { readonly error: string };
+
+declare module 'vitest' {
+  export interface ProvidedContext {
+    [SHARED_TEMPORARY_BUILD_KEY]: SharedTemporaryBuildFacts;
+  }
+}
+
+/**
+ * TEST-TIME-A: 一時ビルドの root に置く、テストだけの入口のファイルのパス（入口は `./dist/` を相対で読むので、root の直下に置く）。
+ * ほかのテストのファイルと共有するビルドでも混ざらないよう、名前の前に乱数の id を付ける。入口のパスは、いつもここで作る
+ * （Architecture Gate `tests/architecture/test-suites.test.ts`）。
+ */
+export function buildEntryPath(build: TemporaryBuild, name: string): string {
+  return join(build.rootDirectory, `${randomUUID()}-${basename(name)}`);
 }
 
 /**

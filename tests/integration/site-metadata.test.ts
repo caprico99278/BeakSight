@@ -3,18 +3,16 @@
 import { readFile } from 'node:fs/promises';
 import type { ServerResponse } from 'node:http';
 import type { Browser, BrowserContext, Page } from 'playwright';
-import { afterAll, afterEach, beforeAll, describe, expect, it } from 'vitest';
+import { afterEach, describe, expect, it } from 'vitest';
 import { BrowserContextFactory } from '../../src/browser/context-factory.js';
 import type { MainFrameLoadObservation } from '../../src/browser/main-frame-load.js';
 import type { AuditConfig } from '../../src/config/types.js';
 import type { EvidenceRecordFor } from '../../src/core/contracts.js';
 import { wait } from '../../src/core/deadline.js';
 import type { NormalizedHttpUrlEvidence } from '../../src/core/evidence-types.js';
-import { MAX_SITE_METADATA_TEXT_LENGTH, MAX_SITEMAP_URLS } from '../../src/core/limits.js';
 import { validateArtifact } from '../../src/core/schema-validator.js';
 import {
   collectSiteMetadata,
-  SITE_METADATA_DEFAULT_LIMITS,
   type SiteMetadataOptions,
   type SiteMetadataResult,
 } from '../../src/crawl/site-metadata.js';
@@ -26,7 +24,7 @@ import { skippedPageResult } from '../../src/orchestration/skipped-page.js';
 import { SafetyLedger } from '../../src/safety/safety-ledger.js';
 import { startFixtureServer, type FixtureServer, type FixtureServerOptions } from '../../fixtures/server.js';
 import { browserOpeningPageAfterNewContext } from '../helpers/browser-opening-page.js';
-import { BROWSER_DEFAULT_FAVICON_PATH, launchCliChromium, testContextsOf, useHeadlessChromium } from '../helpers/chromium.js';
+import { BROWSER_DEFAULT_FAVICON_PATH, testContextsOf, useHeadlessChromium } from '../helpers/chromium.js';
 import {
   FROZEN_POPUP_LATE_DELIVERY_SETTLE_MS,
   QUIET_PERIOD_MS,
@@ -149,7 +147,7 @@ interface CollectRun {
 
 async function collect(
   origin: string,
-  overrides: Partial<Pick<SiteMetadataOptions, 'limits' | 'deadlines' | 'beforeNavigation' | 'afterNavigation'>> & {
+  overrides: Partial<Pick<SiteMetadataOptions, 'deadlines' | 'beforeNavigation' | 'afterNavigation'>> & {
     readonly navigationTimeoutMs?: number;
     readonly browser?: Browser;
     readonly createFactory?: (config: AuditConfig) => BrowserContextFactory;
@@ -169,7 +167,6 @@ async function collect(
     pageId: allocator.allocatePageId(),
     allocator,
     clock: () => OBSERVED_AT,
-    ...(overrides.limits === undefined ? {} : { limits: overrides.limits }),
     ...(overrides.deadlines === undefined ? {} : { deadlines: overrides.deadlines }),
     // 間隔の待ちは省略できない（RL-fix）。間隔を確かめないテストは、待たないことを明示して渡す。
     beforeNavigation: overrides.beforeNavigation ?? NO_PACING_WAIT,
@@ -267,34 +264,7 @@ describe('collectSiteMetadata', () => {
     await expectValidPageEvidence(run);
   }, TEST_TIMEOUT_MS);
 
-  it('marks the text and the sitemap URLs as truncated at smaller limits, extracting URLs from the untruncated text', async () => {
-    const server = await startServer();
-    const textOnly = await collect(server.origin, { limits: { maxTextLength: 10 } });
-    expect(robotsOf(textOnly.result).payload).toMatchObject({ text: 'User-agent', textTruncated: true });
-    expect(robotsOf(textOnly.result).payload.text).toHaveLength(10);
-    expect(sitemapOf(textOnly.result).payload).toMatchObject({ textTruncated: true, sitemapUrlsTruncated: false });
-    expect(sitemapOf(textOnly.result).payload.text).toHaveLength(10);
-    // 本文を切り詰めても、URL は切り詰める前の本文から取り出す。
-    expect(sitemapOf(textOnly.result).payload.sitemapUrls).toHaveLength(4);
-    expect(textOnly.result.sitemap?.truncated).toBe(false);
-    await expectValidPageEvidence(textOnly);
-
-    const urlLimit = await collect(server.origin, { limits: { maxSitemapUrls: 2 } });
-    expect(sitemapOf(urlLimit.result).payload).toMatchObject({
-      textTruncated: false,
-      sitemapUrls: [`${server.origin}/crawl/index.html`, `${server.origin}/crawl/level-1.html`],
-      sitemapUrlsTruncated: true,
-    });
-    expect(urlLimit.result.sitemap?.truncated).toBe(true);
-    await expectValidPageEvidence(urlLimit);
-
-    // 差し替えの口は、本番の既定値を変えない。
-    expect(SITE_METADATA_DEFAULT_LIMITS).toEqual({
-      maxTextLength: MAX_SITE_METADATA_TEXT_LENGTH,
-      maxSitemapUrls: MAX_SITEMAP_URLS,
-    });
-    expect(Object.isFrozen(SITE_METADATA_DEFAULT_LIMITS)).toBe(true);
-  }, TEST_TIMEOUT_MS);
+  // LZ-2: 本文の長さの上限は撤廃した（`textTruncated` はいつも偽）。LZ-3a: sitemap の URL の件数の上限も撤廃した（`sitemapUrlsTruncated` はいつも偽）。
 
   it('handles CDATA, entities, comments, external URLs and unnormalizable URLs in the sitemap', async () => {
     const sitemap = [
@@ -323,9 +293,9 @@ describe('collectSiteMetadata', () => {
     expect(payload.outcome).toBe('OK');
     expect(payload.sitemapUrls).toEqual([
       `${server.origin}/plain.html`,
-      // 設定の既定では、query を残さない（`crawl.allowedQueryParameters` が空）。
-      `${server.origin}/cdata.html`,
-      `${server.origin}/entity.html`,
+      // L14: 設定の既定（`crawl.allowedQueryParameters` が空。残す名前を選んでいない）では、query を残す（名前の順に並べ、fragment は捨てる）。
+      `${server.origin}/cdata.html?q=1&x=%3Cy%3E`,
+      `${server.origin}/entity.html?a=1&b=23`,
       // 許可 Origin の外の URL も、事実として残す。
       'https://other.invalid/external.html',
       `${server.origin}/prefixed.html`,
@@ -676,9 +646,6 @@ describe('collectSiteMetadata', () => {
     };
     // 許可 Origin の外の Origin は、取得しない。
     await expect(collectSiteMetadata(base)).rejects.toThrow(RangeError);
-    await expect(collectSiteMetadata({ ...base, origin: server.origin, limits: { maxSitemapUrls: -1 } })).rejects.toThrow(
-      RangeError,
-    );
     await expect(
       collectSiteMetadata({ ...base, origin: server.origin, clock: 'now' as unknown as () => Date }),
     ).rejects.toThrow(TypeError);
@@ -747,18 +714,15 @@ describe('collectSiteMetadata navigation pacing (load control design 4.1, 4.4)',
   it('counts the deadline of each file from the end of the wait, so that a wait longer than the timeout does not fail it', async () => {
     const server = await startServer();
     const waitedMs = SHORT_NAVIGATION_TIMEOUT_MS + 500;
-    let waits = 0;
 
     const run = await collect(server.origin, {
       navigationTimeoutMs: SHORT_NAVIGATION_TIMEOUT_MS,
       beforeNavigation: async () => {
-        waits += 1;
         await wait(waitedMs);
         return waitedMs;
       },
     });
 
-    expect(waits).toBe(2);
     expect(run.result.failures).toEqual([]);
     expect(robotsOf(run.result).payload).toMatchObject({ outcome: 'OK', httpStatus: 200 });
     expect(sitemapOf(run.result).payload).toMatchObject({ outcome: 'OK', httpStatus: 200 });
@@ -807,51 +771,68 @@ describe('collectSiteMetadata observations of the main frame load (site unavaila
     return { observations, afterNavigation: (observation) => observations.push(observation) };
   }
 
-  it('passes the observation of each file to afterNavigation: HTTP 200 for robots.txt and HTTP 503 for sitemap.xml', async () => {
-    const server = await startCustomServer({
-      '/robots.txt': { body: 'User-agent: *\n' },
-      '/sitemap.xml': MAINTENANCE_RESPONSE,
-    });
+  /**
+   * TEST-SLIM D3: 応答の形ごとの、受け口に渡る観測と記録（payload・応答を得られなかった取得）。受け口は判定をしないので、記録は受け口のないときと同じ
+   * （503 は FAILED で応答の status を持つ。DEF-029 の設計書 2.3: 読み込みが例外で終わっても、観測の status が 2xx でなければ、その status の応答として扱い、
+   * 2xx なら応答を得られなかった失敗にする）。sitemap の `{{ORIGIN}}` は、サーバの Origin に替えて比べる。
+   */
+  const ANY_DETAIL = expect.any(String) as unknown;
+  const OBSERVATION_CASES: readonly (readonly [string, {
+    readonly responses: Readonly<Record<string, CustomResponse>>;
+    readonly navigationTimeoutMs?: number;
+    readonly observations: readonly unknown[];
+    readonly robots: Readonly<Record<string, unknown>>;
+    readonly sitemap: Readonly<Record<string, unknown>>;
+    readonly failures: readonly unknown[];
+  }])[] = [
+    ['HTTP 200 for robots.txt and HTTP 503 for sitemap.xml', {
+      responses: { '/robots.txt': { body: 'User-agent: *\n' }, '/sitemap.xml': MAINTENANCE_RESPONSE },
+      observations: [{ navigationOutcome: 'OK', httpStatus: 200, failureDetail: null }, { navigationOutcome: 'OK', httpStatus: 503, failureDetail: null }],
+      robots: { outcome: 'OK', httpStatus: 200 },
+      sitemap: { outcome: 'FAILED', httpStatus: 503, text: null, sitemapUrls: null },
+      failures: [],
+    }],
+    ['a TIMEOUT without an HTTP status when robots.txt does not respond, then sitemap.xml', {
+      responses: {
+        '/robots.txt': { hang: true },
+        '/sitemap.xml': { contentType: 'application/xml', body: '<urlset><url><loc>{{ORIGIN}}/a.html</loc></url></urlset>' },
+      },
+      navigationTimeoutMs: SHORT_NAVIGATION_TIMEOUT_MS,
+      observations: [{ navigationOutcome: 'TIMEOUT', httpStatus: null, failureDetail: ANY_DETAIL }, { navigationOutcome: 'OK', httpStatus: 200, failureDetail: null }],
+      robots: { outcome: 'FAILED', httpStatus: null, text: null },
+      sitemap: { outcome: 'OK', sitemapUrls: ['{{ORIGIN}}/a.html'] },
+      failures: [{ kind: 'ROBOTS_TXT', timedOut: true, detail: ANY_DETAIL }],
+    }],
+    ['the status of a timeout after the headers of a non-2xx response, and a timeout after a 2xx response as before (DEF-029)', {
+      responses: { '/robots.txt': { stallAfterHeaders: true }, '/sitemap.xml': { status: 503, stallAfterHeaders: true } },
+      navigationTimeoutMs: STALL_AFTER_HEADERS_TIMEOUT_MS,
+      observations: [
+        { navigationOutcome: 'TIMEOUT', httpStatus: 200, failureDetail: ANY_DETAIL },
+        { navigationOutcome: 'TIMEOUT', httpStatus: 503, failureDetail: ANY_DETAIL },
+      ],
+      robots: { outcome: 'FAILED', httpStatus: null, text: null },
+      sitemap: { outcome: 'FAILED', httpStatus: 503, text: null, sitemapUrls: null },
+      // 503 は応答として扱うので、応答を得られなかった取得（`failures`）には入らない。
+      failures: [{ kind: 'ROBOTS_TXT', timedOut: true, detail: ANY_DETAIL }],
+    }],
+  ];
+
+  it.each(OBSERVATION_CASES)('passes the observation of each file to afterNavigation and records the files: %s', async (_name, scene) => {
+    const server = await startCustomServer(scene.responses);
     const { observations, afterNavigation } = observationRecorder();
+    const withOrigin = (value: Readonly<Record<string, unknown>>): unknown =>
+      JSON.parse(JSON.stringify(value).replaceAll('{{ORIGIN}}', server.origin));
 
-    const run = await collect(server.origin, { afterNavigation });
+    const run = await collect(server.origin, {
+      afterNavigation,
+      ...(scene.navigationTimeoutMs === undefined ? {} : { navigationTimeoutMs: scene.navigationTimeoutMs }),
+    });
 
-    expect(observations).toEqual([
-      { navigationOutcome: 'OK', httpStatus: 200, failureDetail: null },
-      { navigationOutcome: 'OK', httpStatus: 503, failureDetail: null },
-    ]);
-    for (const observation of observations) {
-      expect(Object.isFrozen(observation)).toBe(true);
-    }
-    // 受け口は判定をしないので、記録は今のとおり（503 は FAILED で、応答の status を持つ）。
-    expect(robotsOf(run.result).payload).toMatchObject({ outcome: 'OK', httpStatus: 200 });
-    expect(sitemapOf(run.result).payload).toMatchObject({ outcome: 'FAILED', httpStatus: 503, text: null, sitemapUrls: null });
-    expect(run.result.failures).toEqual([]);
+    expect(observations).toEqual(scene.observations);
+    expect(robotsOf(run.result).payload).toMatchObject(scene.robots);
+    expect(sitemapOf(run.result).payload).toMatchObject(withOrigin(scene.sitemap) as Record<string, unknown>);
+    expect(run.result.failures).toEqual(scene.failures);
     expect(server.requestedPaths()).toEqual(['/robots.txt', '/sitemap.xml']);
-
-    // 受け口を省略しても、記録は同じ（今のとおり動く）。
-    const without = await collect(server.origin);
-    expect(without.result.records.map(({ payload }) => payload)).toEqual(run.result.records.map(({ payload }) => payload));
-    expect(without.result.failures).toEqual(run.result.failures);
-    await expectValidPageEvidence(run);
-  }, TEST_TIMEOUT_MS);
-
-  it('passes a TIMEOUT without an HTTP status when robots.txt does not respond, and then the observation of sitemap.xml', async () => {
-    const server = await startCustomServer({
-      '/robots.txt': { hang: true },
-      '/sitemap.xml': { contentType: 'application/xml', body: '<urlset><url><loc>{{ORIGIN}}/a.html</loc></url></urlset>' },
-    });
-    const { observations, afterNavigation } = observationRecorder();
-
-    const run = await collect(server.origin, { navigationTimeoutMs: SHORT_NAVIGATION_TIMEOUT_MS, afterNavigation });
-
-    expect(observations).toEqual([
-      { navigationOutcome: 'TIMEOUT', httpStatus: null, failureDetail: expect.any(String) as unknown },
-      { navigationOutcome: 'OK', httpStatus: 200, failureDetail: null },
-    ]);
-    expect(robotsOf(run.result).payload).toMatchObject({ outcome: 'FAILED', httpStatus: null, text: null });
-    expect(run.result.failures).toEqual([{ kind: 'ROBOTS_TXT', timedOut: true, detail: expect.any(String) as unknown }]);
-    expect(sitemapOf(run.result).payload).toMatchObject({ outcome: 'OK', sitemapUrls: [`${server.origin}/a.html`] });
     expect(run.result.ledgerSnapshot?.invariantViolationCount).toBe(0);
     await expectValidPageEvidence(run);
   }, TEST_TIMEOUT_MS);
@@ -899,7 +880,6 @@ describe('collectSiteMetadata observations of the main frame load (site unavaila
     const { observations, afterNavigation } = observationRecorder();
     // Run Coordinator の包み方を模す: 受け口で不調を検知したら、次のファイルの前の待ちで、待たずに例外を投げる。
     let unavailable = false;
-    let waits = 0;
 
     const run = await collect(server.origin, {
       navigationTimeoutMs: SHORT_NAVIGATION_TIMEOUT_MS,
@@ -908,7 +888,6 @@ describe('collectSiteMetadata observations of the main frame load (site unavaila
         unavailable ||= siteUnavailabilityOf(observation) !== null;
       },
       beforeNavigation: async () => {
-        waits += 1;
         if (unavailable) {
           throw new Error(SKIPPED_AFTER_UNAVAILABILITY);
         }
@@ -916,9 +895,8 @@ describe('collectSiteMetadata observations of the main frame load (site unavaila
       },
     });
 
-    expect(waits).toBe(2);
-    expect(observations).toHaveLength(1);
-    // sitemap.xml の読み込みは、サーバに届かない。
+    // 不調を受け口に渡したのは robots.txt だけ。sitemap.xml の読み込みは、サーバに届かない。
+    expect(observations.map(({ navigationOutcome }) => navigationOutcome)).toEqual(['TIMEOUT']);
     expect(server.requestedPaths()).toEqual(['/robots.txt']);
     expect(sitemapOf(run.result).payload).toMatchObject({ outcome: 'FAILED', httpStatus: null, text: null, sitemapUrls: null });
     expect(run.result.failures).toEqual([
@@ -929,76 +907,7 @@ describe('collectSiteMetadata observations of the main frame load (site unavaila
     expect(run.result.ledgerSnapshot?.invariantViolationCount).toBe(0);
     await expectValidPageEvidence(run);
   }, TEST_TIMEOUT_MS);
-
-  // DEF-029 の設計書 2.3: 読み込みが例外で終わっても、観測の status が 2xx でなければ、その status の応答として扱う。2xx なら、今のとおり
-  // 応答を得られなかった失敗にする。
-  it('records the status of a timeout after the headers of a non-2xx response, and keeps a timeout after a 2xx response as before', async () => {
-    const server = await startCustomServer({
-      '/robots.txt': { stallAfterHeaders: true },
-      '/sitemap.xml': { status: 503, stallAfterHeaders: true },
-    });
-    const { observations, afterNavigation } = observationRecorder();
-
-    const run = await collect(server.origin, { navigationTimeoutMs: STALL_AFTER_HEADERS_TIMEOUT_MS, afterNavigation });
-
-    expect(observations).toEqual([
-      { navigationOutcome: 'TIMEOUT', httpStatus: 200, failureDetail: expect.any(String) as unknown },
-      { navigationOutcome: 'TIMEOUT', httpStatus: 503, failureDetail: expect.any(String) as unknown },
-    ]);
-    expect(robotsOf(run.result).payload).toMatchObject({ outcome: 'FAILED', httpStatus: null, text: null });
-    expect(sitemapOf(run.result).payload).toMatchObject({ outcome: 'FAILED', httpStatus: 503, text: null, sitemapUrls: null });
-    // 503 は応答として扱うので、応答を得られなかった取得（`failures`）には入らない。
-    expect(run.result.failures).toEqual([{ kind: 'ROBOTS_TXT', timedOut: true, detail: expect.any(String) as unknown }]);
-    expect(run.result.ledgerSnapshot?.invariantViolationCount).toBe(0);
-    await expectValidPageEvidence(run);
-  }, TEST_TIMEOUT_MS);
 });
 
-// DEF-029 の設計書 2.3、DEF-030: CLI と同じ起動の設定の Chromium は、本文が空の 4xx・5xx の読み込みを、応答を受けた後に
-// `net::ERR_HTTP_RESPONSE_CODE_FAILURE` で失敗にする（テストの既定の headless-shell では、この失敗が起きない）。その場合も、観測の
-// status から、`NOT_FOUND`（404）と `FAILED`（503。`httpStatus` は 503）を導く。
-describe('collectSiteMetadata with the Chromium of the CLI: failures after the response (DEF-029 design 2.3, SU3b)', () => {
-  let cliBrowser: Browser;
-
-  beforeAll(async () => {
-    // EL-12: 本番と同じ起動の部品（`launchCliChromium`）で起動する。
-    cliBrowser = await launchCliChromium();
-  });
-
-  afterAll(async () => {
-    await cliBrowser?.close();
-  });
-
-  it('records an empty 404 robots.txt as NOT_FOUND and an empty 503 sitemap.xml as FAILED with HTTP 503', async () => {
-    const server = await startCustomServer({
-      '/robots.txt': { status: 404, body: '' },
-      '/sitemap.xml': { status: 503, body: '' },
-    });
-    const observations: MainFrameLoadObservation[] = [];
-
-    const run = await collect(server.origin, { browser: cliBrowser, afterNavigation: (observation) => observations.push(observation) });
-
-    // 読み込みは、応答を受けた後に例外で終わった（この Chromium の振る舞いが、このテストの前提）。
-    const responseCodeFailure = expect.stringContaining('net::ERR_HTTP_RESPONSE_CODE_FAILURE') as unknown;
-    expect(observations).toEqual([
-      { navigationOutcome: 'FAILED', httpStatus: 404, failureDetail: responseCodeFailure },
-      { navigationOutcome: 'FAILED', httpStatus: 503, failureDetail: responseCodeFailure },
-    ]);
-    expect(robotsOf(run.result).payload).toEqual({
-      kind: 'ROBOTS_TXT',
-      url: `${server.origin}/robots.txt`,
-      outcome: 'NOT_FOUND',
-      httpStatus: 404,
-      text: null,
-      textTruncated: false,
-      sitemapUrls: null,
-      sitemapUrlsTruncated: false,
-    });
-    expect(sitemapOf(run.result).payload).toMatchObject({ outcome: 'FAILED', httpStatus: 503, text: null, sitemapUrls: null });
-    expect(run.result.failures).toEqual([]);
-    expect(run.result.ledgerSnapshot?.invariantViolationCount).toBe(0);
-    expect(server.requestedPaths()).toEqual(['/robots.txt', '/sitemap.xml']);
-    expect(testContextsOf(cliBrowser)).toHaveLength(0);
-    await expectValidPageEvidence(run);
-  }, TEST_TIMEOUT_MS);
-});
+// DEF-029 の設計書 2.3、DEF-030（CLI と同じ起動の設定の Chromium で、本文が空の 4xx・5xx が応答の後に失敗になる場合）は、SLIM-GROUP で
+// `site-metadata-cli-chromium.test.ts`（Chromium の版を上げるときの束）へ分けた。

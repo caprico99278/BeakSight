@@ -2,68 +2,93 @@ import type { Page } from 'playwright';
 import type { PageId } from '../core/contracts.js';
 import { SUBMIT_CONTROL_TYPES } from '../core/evidence-types.js';
 import type {
+  DomDocumentFieldTruncationEvidence,
   DomEvidence,
-  DomTruncationEvidence,
   DuplicateIdEvidence,
   FormDomEvidence,
   FormFieldEvidence,
   HeadingEvidence,
   ImageDomEvidence,
+  LoadingIndicatorEvidence,
   ScrollPosition,
   SemanticRegionEvidence,
   SemanticRegionKind,
   SubmitControlEvidence,
-  VisibleTextEvidence,
+  VisibleTextSource,
 } from '../core/evidence-types.js';
-import { MAX_URL_LENGTH } from '../core/limits.js';
+import { readInParts } from '../core/read-in-parts.js';
 import { VISIBILITY_CHECK_OPTIONS } from '../core/visibility.js';
 import { composeInPage, type StandardReaders } from '../browser/in-page-readers.js';
+import { collectErrorDisplay } from './error-display-collector.js';
 
-/** DOM の Evidence の上限。超えた分は、件数（`omitted...Count`）か印（`truncated`）を Evidence に残す。 */
-export const DOM_LIMITS = Object.freeze({
-  /** 可視テキスト全体と、aria-hidden の中の可視テキストの最大長（UTF-16 のコード単位）。 */
-  maxVisibleTextLength: 100_000,
-  /** 1つの区分（landmark・その他）の可視テキストの最大長。 */
-  maxRegionTextLength: 10_000,
-  /** 記録する landmark の区分の最大件数（「その他」の区分は含めない）。 */
-  maxRegions: 100,
-  /** 可視テキストを集めるときにたどるノードの最大数。超えた場合は、そこで集めるのをやめる。 */
-  maxTextWalkNodes: 100_000,
-  maxHeadings: 500,
-  maxHeadingTextLength: 1_024,
-  /** title・meta description・lang の最大長。 */
-  maxDocumentTextLength: 1_024,
-  /** canonical・画像のURL・form の action の最大長。 */
-  maxUrlLength: MAX_URL_LENGTH,
-  maxImages: 500,
-  maxAltLength: 1_024,
-  maxForms: 100,
-  maxFieldsPerForm: 200,
-  /** 記録する、どの form にも属さない入力欄の最大件数。 */
-  maxUnassociatedFields: 200,
-  maxSubmitControlsPerForm: 50,
-  maxLabelsPerField: 10,
-  maxLabelTextLength: 1_024,
-  /** 入力欄の type・name、送信ボタンの name・value・text、form の method の最大長。 */
-  maxAttributeLength: 1_024,
-  maxDuplicateIds: 100,
-  maxIdLength: 256,
-});
+/*
+ * COV-6: 件数の上限（見出し・画像・form・欄・送信のコントロール・label・重複の id・区分）と、可視テキストの長さとたどるノードの数の上限は持たない
+ * （すべてを記録する。`omitted...Count` は常に 0、可視テキストの `truncated`・`nodeLimitReached` は常に false）。URL-LEN: URL の長さの上限（前は 2,048）は
+ * 撤廃した。LZ-3b: 値の長さの上限（前の `DOM_LIMITS`。title・meta description・lang・見出し・alt・label・属性 1,024、id 256）も撤廃した。どの値も
+ * 切り詰めない（項目ごとの `truncated` と `truncation.documentFields` は前の記録の形のために残し、いつも偽）。
+ */
 
-interface RawDomEvidence {
+/**
+ * COV-6: ページの中の 1 回の読み取りで返す、一覧（見出し・画像・form・form に属さない欄・重複の id・区分）ごとの件数（自分の処理の上限 C。1 回の
+ * 受け渡しの大きさを抑えるための分け方の単位で、記録の件数の上限ではない）。
+ */
+export const DOM_COLLECTION_PART_SIZE = 500;
+
+/** COV-6: ページの中の 1 回の読み取りで返す、可視テキストと aria-hidden の中の可視テキストの長さ（自分の処理の上限 C。UTF-16 のコード単位）。 */
+export const DOM_TEXT_PART_LENGTH = 100_000;
+
+/** 一覧ごと・テキストごとの、この回に読み始める位置（COV-6）。 */
+export interface DomPartCursor {
+  readonly headings: number;
+  readonly images: number;
+  readonly forms: number;
+  readonly unassociatedFields: number;
+  readonly duplicateIds: number;
+  readonly regions: number;
+  readonly text: number;
+  readonly ariaHiddenText: number;
+}
+
+/** 一覧の部分（続きの位置からの項目と、ページの中の全体の件数）。 */
+interface RawListPart<T> {
+  readonly items: readonly T[];
+  readonly total: number;
+}
+
+/** テキストの部分（続きの位置からの文字と、ページの中の全体の長さ）。 */
+interface RawTextPart {
+  readonly slice: string;
+  readonly total: number;
+}
+
+/** ページの中の 1 回の読み取りの結果。文書の項目とスクロール位置は、どの回も同じものを返す（まとめるときは最初の回のものを使う）。 */
+interface RawDomPart {
   readonly scrollPosition: ScrollPosition;
+  /** EV-1: 見えている読み込み中の表示の数（文書の項目。どの回も同じものを返す）。 */
+  readonly loadingIndicators: LoadingIndicatorEvidence;
   readonly title: string | null;
   readonly metaDescription: string | null;
   readonly canonicalUrl: string | null;
   readonly lang: string | null;
-  readonly headings: readonly HeadingEvidence[];
-  readonly visibleText: VisibleTextEvidence;
-  readonly images: readonly ImageDomEvidence[];
-  readonly forms: readonly FormDomEvidence[];
-  readonly unassociatedFields: readonly FormFieldEvidence[];
-  readonly duplicateIds: readonly DuplicateIdEvidence[];
-  readonly truncation: DomTruncationEvidence;
+  readonly documentFields: DomDocumentFieldTruncationEvidence;
+  readonly source: VisibleTextSource;
+  readonly headings: RawListPart<HeadingEvidence>;
+  readonly images: RawListPart<ImageDomEvidence>;
+  readonly forms: RawListPart<FormDomEvidence>;
+  readonly unassociatedFields: RawListPart<FormFieldEvidence>;
+  readonly duplicateIds: RawListPart<DuplicateIdEvidence>;
+  readonly regions: RawListPart<SemanticRegionEvidence>;
+  readonly text: RawTextPart;
+  readonly ariaHiddenText: RawTextPart;
 }
+
+/** 一覧とテキストの名前（続きの位置の項目と同じ）。 */
+const LIST_PART_NAMES = Object.freeze(['headings', 'images', 'forms', 'unassociatedFields', 'duplicateIds', 'regions'] as const);
+const TEXT_PART_NAMES = Object.freeze(['text', 'ariaHiddenText'] as const);
+
+const FIRST_DOM_PART_CURSOR: DomPartCursor = Object.freeze({
+  headings: 0, images: 0, forms: 0, unassociatedFields: 0, duplicateIds: 0, regions: 0, text: 0, ariaHiddenText: 0,
+});
 
 function assertBoundedList(list: readonly unknown[], max: number, name: string): void {
   if (list.length > max) {
@@ -84,148 +109,150 @@ function assertCount(value: number, name: string): void {
 }
 
 function validateField(field: FormFieldEvidence, name: string): void {
-  assertBoundedText(field.type, DOM_LIMITS.maxAttributeLength, `${name}.type`);
-  assertBoundedText(field.name, DOM_LIMITS.maxAttributeLength, `${name}.name`);
   if (typeof field.visible !== 'boolean') {
     throw new Error(`Invalid browser DOM flag: ${name}.visible`);
   }
-  assertBoundedList(field.labels, DOM_LIMITS.maxLabelsPerField, `${name}.labels`);
-  field.labels.forEach((label, labelIndex) => {
-    assertBoundedText(label, DOM_LIMITS.maxLabelTextLength, `${name}.labels[${labelIndex}]`);
-  });
 }
 
 function freezeField(field: FormFieldEvidence): FormFieldEvidence {
   return Object.freeze({ ...field, labels: Object.freeze([...field.labels]) });
 }
 
-/** ブラウザから受け取った値が上限の範囲にあることを確かめる。ページが組み込みの関数を書き換えた場合に備える。 */
-function validateRawDomEvidence(raw: RawDomEvidence): void {
+/**
+ * ブラウザから受け取った 1 回の部分の大きさ（部分の件数・テキストの部分の長さ。受け渡しの分け方の単位）と数・印の形を確かめる。ページが組み込みの関数を
+ * 書き換えた場合に備える。LZ-3b: 値の長さは確かめない（値の長さの上限はない）。
+ */
+function validateRawDomPart(raw: RawDomPart): void {
   if (!Number.isFinite(raw.scrollPosition.scrollX) || !Number.isFinite(raw.scrollPosition.scrollY)) {
     throw new Error('Invalid browser DOM scroll position');
   }
-  assertBoundedText(raw.title, DOM_LIMITS.maxDocumentTextLength, 'title');
-  assertBoundedText(raw.metaDescription, DOM_LIMITS.maxDocumentTextLength, 'metaDescription');
-  assertBoundedText(raw.canonicalUrl, DOM_LIMITS.maxUrlLength, 'canonicalUrl');
-  assertBoundedText(raw.lang, DOM_LIMITS.maxDocumentTextLength, 'lang');
-  assertBoundedList(raw.headings, DOM_LIMITS.maxHeadings, 'headings');
-  raw.headings.forEach((heading, index) => {
-    assertBoundedText(heading.text, DOM_LIMITS.maxHeadingTextLength, `headings[${index}]`);
-  });
-  assertBoundedText(raw.visibleText.text, DOM_LIMITS.maxVisibleTextLength, 'visibleText.text');
-  assertBoundedText(raw.visibleText.ariaHiddenText, DOM_LIMITS.maxVisibleTextLength, 'visibleText.ariaHiddenText');
-  if (typeof raw.visibleText.nodeLimitReached !== 'boolean') {
-    throw new Error('Invalid browser DOM flag: visibleText.nodeLimitReached');
+  for (const [name, value] of Object.entries(raw.loadingIndicators)) {
+    assertCount(value, `loadingIndicators.${name}`);
   }
-  // landmark の区分の上限に、`other` の区分の1件を加える。
-  assertBoundedList(raw.visibleText.regions, DOM_LIMITS.maxRegions + 1, 'visibleText.regions');
-  assertCount(raw.visibleText.omittedRegionCount, 'visibleText.omittedRegionCount');
-  raw.visibleText.regions.forEach((region, index) => {
-    assertBoundedText(region.text, DOM_LIMITS.maxRegionTextLength, `visibleText.regions[${index}]`);
-  });
-  assertBoundedList(raw.images, DOM_LIMITS.maxImages, 'images');
-  raw.images.forEach((image, index) => {
-    assertBoundedText(image.src, DOM_LIMITS.maxUrlLength, `images[${index}].src`);
-    assertBoundedText(image.resolvedUrl, DOM_LIMITS.maxUrlLength, `images[${index}].resolvedUrl`);
-    assertBoundedText(image.alt, DOM_LIMITS.maxAltLength, `images[${index}].alt`);
-  });
-  assertBoundedList(raw.forms, DOM_LIMITS.maxForms, 'forms');
-  raw.forms.forEach((form, formIndex) => {
-    assertBoundedText(form.method, DOM_LIMITS.maxAttributeLength, `forms[${formIndex}].method`);
-    assertBoundedText(form.action, DOM_LIMITS.maxUrlLength, `forms[${formIndex}].action`);
-    assertCount(form.omittedFieldCount, `forms[${formIndex}].omittedFieldCount`);
-    assertCount(form.omittedSubmitControlCount, `forms[${formIndex}].omittedSubmitControlCount`);
-    assertBoundedList(form.fields, DOM_LIMITS.maxFieldsPerForm, `forms[${formIndex}].fields`);
+  for (const name of LIST_PART_NAMES) {
+    assertBoundedList(raw[name].items, DOM_COLLECTION_PART_SIZE, name);
+    assertCount(raw[name].total, `${name}.total`);
+  }
+  for (const name of TEXT_PART_NAMES) {
+    assertBoundedText(raw[name].slice, DOM_TEXT_PART_LENGTH, name);
+    assertCount(raw[name].total, `${name}.total`);
+  }
+  raw.forms.items.forEach((form, formIndex) => {
     form.fields.forEach((field, index) => {
       validateField(field, `forms[${formIndex}].fields[${index}]`);
     });
-    assertBoundedList(form.submitControls, DOM_LIMITS.maxSubmitControlsPerForm, `forms[${formIndex}].submitControls`);
-    form.submitControls.forEach((control, index) => {
-      const name = `forms[${formIndex}].submitControls[${index}]`;
-      assertBoundedText(control.name, DOM_LIMITS.maxAttributeLength, `${name}.name`);
-      assertBoundedText(control.value, DOM_LIMITS.maxAttributeLength, `${name}.value`);
-      assertBoundedText(control.text, DOM_LIMITS.maxAttributeLength, `${name}.text`);
-    });
   });
-  assertBoundedList(raw.unassociatedFields, DOM_LIMITS.maxUnassociatedFields, 'unassociatedFields');
-  raw.unassociatedFields.forEach((field, index) => {
+  raw.unassociatedFields.items.forEach((field, index) => {
     validateField(field, `unassociatedFields[${index}]`);
   });
-  assertBoundedList(raw.duplicateIds, DOM_LIMITS.maxDuplicateIds, 'duplicateIds');
-  raw.duplicateIds.forEach((duplicate, index) => {
-    assertBoundedText(duplicate.id, DOM_LIMITS.maxIdLength, `duplicateIds[${index}].id`);
+  raw.duplicateIds.items.forEach((duplicate, index) => {
     if (!Number.isSafeInteger(duplicate.count) || duplicate.count < 2) {
       throw new Error(`Invalid browser DOM duplicate id count: ${index}`);
     }
   });
-  const { documentFields } = raw.truncation;
-  for (const [field, truncated] of [
-    ['title', documentFields.title],
-    ['metaDescription', documentFields.metaDescription],
-    ['canonicalUrl', documentFields.canonicalUrl],
-    ['lang', documentFields.lang],
-  ] as const) {
+  for (const [field, truncated] of Object.entries(raw.documentFields)) {
     if (typeof truncated !== 'boolean') {
       throw new Error(`Invalid browser DOM flag: truncation.documentFields.${field}`);
     }
   }
-  assertCount(raw.truncation.omittedHeadingCount, 'truncation.omittedHeadingCount');
-  assertCount(raw.truncation.omittedImageCount, 'truncation.omittedImageCount');
-  assertCount(raw.truncation.omittedFormCount, 'truncation.omittedFormCount');
-  assertCount(raw.truncation.omittedUnassociatedFieldCount, 'truncation.omittedUnassociatedFieldCount');
-  assertCount(raw.truncation.omittedDuplicateIdCount, 'truncation.omittedDuplicateIdCount');
 }
 
-function freezeDomEvidence(raw: RawDomEvidence, pageId: PageId): DomEvidence {
-  validateRawDomEvidence(raw);
-  const headings = Object.freeze(raw.headings.map((heading) => Object.freeze({ ...heading })));
-  const regions = Object.freeze(raw.visibleText.regions.map((region) => Object.freeze({ ...region })));
-  const images = Object.freeze(raw.images.map((image) => Object.freeze({ ...image })));
-  const forms = Object.freeze(raw.forms.map((form) => Object.freeze({
+/** 今の部分の次に読む位置（どの一覧もテキストも読み終えていれば `null`。ページが縮んで部分が空になった一覧は、そこで読み終えたとする）。 */
+function nextDomPartCursor(cursor: DomPartCursor, raw: RawDomPart): DomPartCursor | null {
+  let more = false;
+  const next = { ...cursor };
+  for (const name of LIST_PART_NAMES) {
+    next[name] = cursor[name] + raw[name].items.length;
+    more ||= raw[name].items.length > 0 && next[name] < raw[name].total;
+  }
+  for (const name of TEXT_PART_NAMES) {
+    next[name] = cursor[name] + raw[name].slice.length;
+    more ||= raw[name].slice.length > 0 && next[name] < raw[name].total;
+  }
+  return more ? next : null;
+}
+
+/** 部分ごとの読み取りを、1 つの DOM の Evidence にまとめる（文書の項目とスクロール位置は最初の部分のもの）。 */
+function assembleDomEvidence(parts: readonly RawDomPart[], pageId: PageId): DomEvidence {
+  const [first] = parts;
+  if (first === undefined) {
+    throw new Error('Missing browser DOM part');
+  }
+  const listOf = <T>(name: (typeof LIST_PART_NAMES)[number], freeze: (item: never) => T): readonly T[] =>
+    Object.freeze(parts.flatMap((part) => (part[name].items as readonly never[]).map(freeze)));
+  const headings = listOf('headings', (heading: HeadingEvidence) => Object.freeze({ ...heading }));
+  const regions = listOf('regions', (region: SemanticRegionEvidence) => Object.freeze({ ...region }));
+  const images = listOf('images', (image: ImageDomEvidence) => Object.freeze({ ...image }));
+  const forms = listOf('forms', (form: FormDomEvidence) => Object.freeze({
     ...form,
     fields: Object.freeze(form.fields.map(freezeField)),
     submitControls: Object.freeze(form.submitControls.map((control) => Object.freeze({ ...control }))),
-  })));
-  const unassociatedFields = Object.freeze(raw.unassociatedFields.map(freezeField));
-  const duplicateIds = Object.freeze(raw.duplicateIds.map((duplicate) => Object.freeze({ ...duplicate })));
+  }));
+  const unassociatedFields = listOf('unassociatedFields', freezeField);
+  const duplicateIds = listOf('duplicateIds', (duplicate: DuplicateIdEvidence) => Object.freeze({ ...duplicate }));
+  const textOf = (name: (typeof TEXT_PART_NAMES)[number]): string => parts.map((part) => part[name].slice).join('');
 
   return Object.freeze({
     pageId,
-    scrollPosition: Object.freeze({ scrollX: raw.scrollPosition.scrollX, scrollY: raw.scrollPosition.scrollY }),
-    title: raw.title,
-    metaDescription: raw.metaDescription,
-    canonicalUrl: raw.canonicalUrl,
-    lang: raw.lang,
+    scrollPosition: Object.freeze({ scrollX: first.scrollPosition.scrollX, scrollY: first.scrollPosition.scrollY }),
+    title: first.title,
+    metaDescription: first.metaDescription,
+    canonicalUrl: first.canonicalUrl,
+    lang: first.lang,
     headings,
-    visibleText: Object.freeze({ ...raw.visibleText, regions }),
+    visibleText: Object.freeze({
+      source: first.source,
+      text: textOf('text'),
+      truncated: false,
+      nodeLimitReached: false,
+      ariaHiddenText: textOf('ariaHiddenText'),
+      regions: first.source === 'SEMANTIC_LANDMARKS' ? regions : Object.freeze([]),
+      omittedRegionCount: 0,
+    }),
     images,
     forms,
     unassociatedFields,
     duplicateIds,
     truncation: Object.freeze({
-      ...raw.truncation,
       documentFields: Object.freeze({
-        title: raw.truncation.documentFields.title,
-        metaDescription: raw.truncation.documentFields.metaDescription,
-        canonicalUrl: raw.truncation.documentFields.canonicalUrl,
-        lang: raw.truncation.documentFields.lang,
+        title: first.documentFields.title,
+        metaDescription: first.documentFields.metaDescription,
+        canonicalUrl: first.documentFields.canonicalUrl,
+        lang: first.documentFields.lang,
       }),
+      omittedHeadingCount: 0,
+      omittedImageCount: 0,
+      omittedFormCount: 0,
+      omittedUnassociatedFieldCount: 0,
+      omittedDuplicateIdCount: 0,
+    }),
+    collectedInParts: parts.length,
+    loadingIndicators: Object.freeze({
+      ariaBusyCount: first.loadingIndicators.ariaBusyCount,
+      progressbarCount: first.loadingIndicators.progressbarCount,
+      indeterminateProgressCount: first.loadingIndicators.indeterminateProgressCount,
     }),
   });
 }
 
-/** `collectDomEvidenceReader` の入力（ブラウザ内では import できないため、上限と可視判定の指定と、送信のコントロールの `type` の一覧を渡す）。 */
+/** `collectDomEvidenceReader` の入力（ブラウザ内では import できないため、可視判定の指定と、送信のコントロールの `type` の一覧と、この回の位置と大きさを渡す）。 */
 interface DomEvaluationArgument {
-  readonly limits: typeof DOM_LIMITS;
   readonly visibilityOptions: typeof VISIBILITY_CHECK_OPTIONS;
   readonly submitControlTypes: typeof SUBMIT_CONTROL_TYPES;
+  readonly cursor: DomPartCursor;
+  readonly partSize: number;
+  readonly textPartLength: number;
 }
 
 /**
- * ブラウザ内で、DOM の Evidence（Link 以外）の事実を 1 回の走査で集める（集める内容は `collectDomEvidence` の説明のとおり）。
+ * ブラウザ内で、DOM の Evidence（Link 以外）の事実を 1 回の走査で集め、一覧とテキストを、この回の位置（`cursor`）から部分の大きさまで切り出して返す
+ * （集める内容は `collectDomEvidence` の説明のとおり。COV-6: 走査は毎回すべてを集め、返す部分だけを分ける）。
  * 部品（`R`）を `composeInPage` で組み込んで `page.evaluate` に渡すため、この関数の外にあるものを参照しない。
  */
-function collectDomEvidenceReader(R: StandardReaders, { limits, visibilityOptions, submitControlTypes }: DomEvaluationArgument): RawDomEvidence {
+function collectDomEvidenceReader(
+  R: StandardReaders,
+  { visibilityOptions, submitControlTypes, cursor, partSize, textPartLength }: DomEvaluationArgument,
+): RawDomPart {
   // DOM clobbering（DEF-069）: form の中の名前つきの入力の欄は、form の同じ名前のプロパティとメソッドを隠す（`<input name="method">` で
   // `form.method` が入力の欄になる）。form になりうる要素（文書をたどる途中のすべての要素と、form そのもの）の標準のプロパティとメソッドは、
   // 標準の prototype の getter とメソッドで読む（`src/browser/login-form-submitter.ts` の `readLoginFormFactsInPage` と同じ読み方）。
@@ -268,17 +295,9 @@ function collectDomEvidenceReader(R: StandardReaders, { limits, visibilityOption
     scrollX: window.scrollX + (separateScrollBody?.scrollLeft ?? 0),
     scrollY: window.scrollY + (separateScrollBody?.scrollTop ?? 0),
   };
-  interface Bounded {
-    readonly text: string;
-    readonly truncated: boolean;
-  }
   const normalizeWhitespace = (value: string | null): string => value?.replace(/\s+/gu, ' ').trim() ?? '';
-  const bound = (value: string, max: number): Bounded => (
-    value.length > max ? { text: value.slice(0, max), truncated: true } : { text: value, truncated: false }
-  );
-  const boundNullable = (value: string | null, max: number): { readonly text: string | null; readonly truncated: boolean } => (
-    value === null ? { text: null, truncated: false } : bound(normalizeWhitespace(value), max)
-  );
+  /** URL-LEN・LZ-3b: 値は切り詰めない（空白の正規化だけ）。 */
+  const wholeOf = (value: string | null): string | null => (value === null ? null : normalizeWhitespace(value));
   const hasNonBlankAttribute = (element: Element, name: string): boolean => (
     normalizeWhitespace(getAttributeOf(element, name)).length > 0
   );
@@ -327,28 +346,17 @@ function collectDomEvidenceReader(R: StandardReaders, { limits, visibilityOption
     return visible;
   };
 
-  // テキストの蓄積。区切りの空白は重ねず、長さの上限で切り詰めて印を付ける。
+  // テキストの蓄積。区切りの空白は重ねない。COV-6・LZ-3b: 長さでは切り詰めない。
   interface TextSink {
     readonly parts: string[];
-    length: number;
-    readonly max: number;
-    truncated: boolean;
     lastWasSeparator: boolean;
   }
-  const createSink = (max: number): TextSink => ({ parts: [], length: 0, max, truncated: false, lastWasSeparator: true });
+  const createSink = (): TextSink => ({ parts: [], lastWasSeparator: true });
   const appendText = (sink: TextSink, text: string): void => {
-    if (sink.truncated || text.length === 0) {
-      return;
-    }
-    const remaining = sink.max - sink.length;
-    if (text.length > remaining) {
-      sink.parts.push(text.slice(0, remaining));
-      sink.length = sink.max;
-      sink.truncated = true;
+    if (text.length === 0) {
       return;
     }
     sink.parts.push(text);
-    sink.length += text.length;
     sink.lastWasSeparator = text.endsWith(' ');
   };
   const appendSeparator = (sink: TextSink): void => {
@@ -357,10 +365,7 @@ function collectDomEvidenceReader(R: StandardReaders, { limits, visibilityOption
       sink.lastWasSeparator = true;
     }
   };
-  const finishSink = (sink: TextSink): Bounded => {
-    const text = normalizeWhitespace(sink.parts.join(''));
-    return { text: text.slice(0, sink.max), truncated: sink.truncated };
-  };
+  const finishSink = (sink: TextSink): string => normalizeWhitespace(sink.parts.join(''));
 
   interface RegionAccumulator {
     readonly kind: SemanticRegionKind;
@@ -406,17 +411,15 @@ function collectDomEvidenceReader(R: StandardReaders, { limits, visibilityOption
     readonly ariaHiddenSink: TextSink;
     readonly otherHasExposedText: boolean;
     readonly regions: readonly RegionAccumulator[];
-    readonly budgetExceeded: boolean;
   }
+  // COV-6・LZ-3b: 可視テキスト（本文・区分・aria-hidden の中・見出し・label）は長さで切り詰めず、たどるノードの数でも止めない（本文は返すときに部分に分ける）。
   /** `root` の中の可視テキストを、文書の順に、区分ごとに集める。 */
-  const walkVisibleText = (root: Element, trackRegions: boolean, maxLength: number): WalkResult => {
-    const all = createSink(maxLength);
-    const other = createSink(limits.maxRegionTextLength);
-    const ariaHiddenSink = createSink(limits.maxVisibleTextLength);
+  const walkVisibleText = (root: Element, trackRegions: boolean): WalkResult => {
+    const all = createSink();
+    const other = createSink();
+    const ariaHiddenSink = createSink();
     const regions: RegionAccumulator[] = [];
     let otherHasExposedText = false;
-    let visited = 0;
-    let budgetExceeded = false;
     const sinksFor = (context: WalkContext): TextSink[] => {
       const sinks = [all, ...context.regions.map((region) => region.sink)];
       if (trackRegions && !context.insideLandmark) {
@@ -433,16 +436,11 @@ function collectDomEvidenceReader(R: StandardReaders, { limits, visibilityOption
       ariaHidden: closestOf(root, '[aria-hidden="true"]') !== null,
     };
     const stack: WalkItem[] = [{ kind: 'node', node: root, context: rootContext }];
-    while (stack.length > 0 && !all.truncated) {
+    while (stack.length > 0) {
       const item = stack.pop() as WalkItem;
       if (item.kind === 'separator') {
         sinksFor(item.context).forEach(appendSeparator);
         continue;
-      }
-      visited += 1;
-      if (visited > limits.maxTextWalkNodes) {
-        budgetExceeded = true;
-        break;
       }
       const { node, context } = item;
       if (nodeTypeOf(node) === Node.TEXT_NODE) {
@@ -491,7 +489,7 @@ function collectDomEvidenceReader(R: StandardReaders, { limits, visibilityOption
       if (trackRegions && landmarkKind !== undefined) {
         const region: RegionAccumulator = {
           kind: landmarkKind,
-          sink: createSink(limits.maxRegionTextLength),
+          sink: createSink(),
           ariaHidden,
         };
         regions.push(region);
@@ -509,104 +507,61 @@ function collectDomEvidenceReader(R: StandardReaders, { limits, visibilityOption
         sinksFor(context).forEach(appendSeparator);
       }
     }
-    return { all, other, ariaHiddenSink, otherHasExposedText, regions, budgetExceeded };
+    return { all, other, ariaHiddenSink, otherHasExposedText, regions };
   };
-  const visibleTextOf = (element: Element, maxLength: number): Bounded => {
-    const result = walkVisibleText(element, false, maxLength);
-    const text = finishSink(result.all);
-    return { text: text.text, truncated: text.truncated || result.budgetExceeded };
-  };
+  const visibleTextOf = (element: Element): string => finishSink(walkVisibleText(element, false).all);
 
   const titleElement = queryDocument('title');
   const metaDescription = queryDocument('meta[name="description" i]');
   const canonical = queryDocument('link[rel~="canonical" i]');
-  const title = titleElement === null
-    ? { text: null, truncated: false }
-    : bound(normalizeWhitespace(titleOf(document)), limits.maxDocumentTextLength);
-  const description = metaDescription === null
-    ? { text: null, truncated: false }
-    : boundNullable(metaDescription.getAttribute('content'), limits.maxDocumentTextLength);
-  const canonicalUrl = canonical === null
-    ? { text: null, truncated: false }
-    : boundNullable(canonical.getAttribute('href'), limits.maxUrlLength);
-  const lang = boundNullable(documentElementOf(document).getAttribute('lang'), limits.maxDocumentTextLength);
+  const title = titleElement === null ? null : normalizeWhitespace(titleOf(document));
+  const description = metaDescription === null ? null : wholeOf(metaDescription.getAttribute('content'));
+  const canonicalUrl = canonical === null ? null : wholeOf(canonical.getAttribute('href'));
+  const lang = wholeOf(documentElementOf(document).getAttribute('lang'));
+
+  // COV-6: 一覧は、この回の位置（`cursor`）から部分の件数（`partSize`）までを返し、ページの中の全体の件数を添える。テキストも同じく長さで分ける。
+  const listPart = <T>(items: readonly T[], offset: number) => ({ items: items.slice(offset, offset + partSize), total: items.length });
+  const textPart = (text: string, offset: number) => ({ slice: text.slice(offset, offset + textPartLength), total: text.length });
 
   // 見出しは、可視テキストと同じ可視判定と走査で集め、見えるものだけを記録する。見出しの要素が可視であるか、
   // 可視テキストがあれば（visibility:hidden の見出しの中に visibility:visible の子がある場合）、見える見出しとする。
   // display:none の祖先の中の見出しは、どちらにも当たらない。
   const visibleHeadings: HeadingEvidence[] = [];
-  let visibleHeadingCount = 0;
   for (const element of queryDocumentAll('h1, h2, h3, h4, h5, h6')) {
-    const text = visibleTextOf(element, limits.maxHeadingTextLength);
-    if (!isVisible(element) && text.text.length === 0) {
+    const text = visibleTextOf(element);
+    if (!isVisible(element) && text.length === 0) {
       continue;
     }
-    visibleHeadingCount += 1;
-    if (visibleHeadings.length < limits.maxHeadings) {
-      visibleHeadings.push({ level: Number.parseInt(element.tagName.slice(1), 10), text: text.text, truncated: text.truncated });
-    }
+    visibleHeadings.push({ level: Number.parseInt(element.tagName.slice(1), 10), text, truncated: false });
   }
-  const headings = visibleHeadings;
 
   const body = documentBody;
-  const walk = body === null ? null : walkVisibleText(body, true, limits.maxVisibleTextLength);
-  const allText = walk === null ? { text: '', truncated: false } : finishSink(walk.all);
+  const walk = body === null ? null : walkVisibleText(body, true);
+  const allText = walk === null ? '' : finishSink(walk.all);
   const landmarkRegions = (walk?.regions ?? [])
-    .map((region): SemanticRegionEvidence => {
-      const text = finishSink(region.sink);
-      return { kind: region.kind, text: text.text, ariaHidden: region.ariaHidden, truncated: text.truncated };
-    })
+    .map((region): SemanticRegionEvidence => ({ kind: region.kind, text: finishSink(region.sink), ariaHidden: region.ariaHidden, truncated: false }))
     .filter((region) => region.text.length > 0);
-  const otherText = walk === null ? { text: '', truncated: false } : finishSink(walk.other);
-  const retainedLandmarkRegions = landmarkRegions.slice(0, limits.maxRegions);
-  const regions: SemanticRegionEvidence[] = otherText.text.length > 0
-    ? [
-        ...retainedLandmarkRegions,
-        {
-          kind: 'other',
-          text: otherText.text,
-          ariaHidden: !(walk?.otherHasExposedText ?? false),
-          truncated: otherText.truncated,
-        },
-      ]
-    : retainedLandmarkRegions;
-  const ariaHiddenText = walk === null ? { text: '', truncated: false } : finishSink(walk.ariaHiddenSink);
-  // 文字数による切り詰め（`truncated`）と、ノード数の上限（`nodeLimitReached`）は、別の印で記録する（R4 の M2）。
-  const nodeLimitReached = walk?.budgetExceeded ?? false;
-  const visibleText: VisibleTextEvidence = landmarkRegions.length > 0
-    ? {
-        source: 'SEMANTIC_LANDMARKS',
-        text: allText.text,
-        truncated: allText.truncated,
-        nodeLimitReached,
-        ariaHiddenText: ariaHiddenText.text,
-        regions,
-        omittedRegionCount: landmarkRegions.length - retainedLandmarkRegions.length,
-      }
-    : {
-        source: 'BODY_FALLBACK',
-        text: allText.text,
-        truncated: allText.truncated,
-        nodeLimitReached,
-        ariaHiddenText: ariaHiddenText.text,
-        regions: [],
-        omittedRegionCount: 0,
-      };
+  const otherText = walk === null ? '' : finishSink(walk.other);
+  const source: VisibleTextSource = landmarkRegions.length > 0 ? 'SEMANTIC_LANDMARKS' : 'BODY_FALLBACK';
+  // landmark の区分（文書の順）と、最後に `other` の区分。landmark の区分がなければ区分は記録しない（`BODY_FALLBACK`）。
+  const regions: SemanticRegionEvidence[] = source === 'BODY_FALLBACK'
+    ? []
+    : otherText.length > 0
+      ? [...landmarkRegions, { kind: 'other', text: otherText, ariaHidden: !(walk?.otherHasExposedText ?? false), truncated: false }]
+      : landmarkRegions;
+  const ariaHiddenText = walk === null ? '' : finishSink(walk.ariaHiddenSink);
 
   const imageElements = [...imagesOf(document)];
-  const images = imageElements.slice(0, limits.maxImages).map((image): ImageDomEvidence => {
-    const src = boundNullable(image.getAttribute('src'), limits.maxUrlLength);
+  const images = imageElements.slice(cursor.images, cursor.images + partSize).map((image): ImageDomEvidence => {
     const resolved = image.currentSrc.length > 0 ? image.currentSrc : image.src;
-    const resolvedUrl = resolved.length > 0 ? bound(resolved, limits.maxUrlLength) : { text: null, truncated: false };
-    const alt = boundNullable(image.getAttribute('alt'), limits.maxAltLength);
     return {
-      src: src.text,
-      resolvedUrl: resolvedUrl.text,
-      alt: alt.text,
+      src: wholeOf(image.getAttribute('src')),
+      resolvedUrl: resolved.length > 0 ? resolved : null,
+      alt: wholeOf(image.getAttribute('alt')),
       complete: image.complete,
       naturalWidth: image.naturalWidth,
       naturalHeight: image.naturalHeight,
-      truncated: src.truncated || resolvedUrl.truncated || alt.truncated,
+      truncated: false,
     };
   });
 
@@ -623,65 +578,50 @@ function collectDomEvidenceReader(R: StandardReaders, { limits, visibilityOption
     || element instanceof HTMLTextAreaElement
   );
   const fieldEvidence = (field: FieldElement): FormFieldEvidence => {
-    const type = bound(field instanceof HTMLTextAreaElement ? 'textarea' : field.type, limits.maxAttributeLength);
-    const name = bound(normalizeWhitespace(field.getAttribute('name')), limits.maxAttributeLength);
-    const labelElements = [...(field.labels ?? [])];
-    let labelsTruncated = labelElements.length > limits.maxLabelsPerField;
-    const labels = labelElements
-      .slice(0, limits.maxLabelsPerField)
-      .map((label) => {
-        const text = visibleTextOf(label, limits.maxLabelTextLength);
-        labelsTruncated ||= text.truncated;
-        return text.text;
-      })
+    const labels = [...(field.labels ?? [])]
+      .map(visibleTextOf)
       .filter((label) => label.length > 0);
     return {
-      type: type.text,
-      name: name.text,
+      type: field instanceof HTMLTextAreaElement ? 'textarea' : field.type,
+      name: normalizeWhitespace(field.getAttribute('name')),
       required: field.required,
       visible: isVisible(field),
       labels,
       hasAriaLabel: hasNonBlankAttribute(field, 'aria-label'),
       hasAriaLabelledby: hasNonBlankAttribute(field, 'aria-labelledby'),
       hasTitle: hasNonBlankAttribute(field, 'title'),
-      truncated: type.truncated || name.truncated || labelsTruncated,
+      truncated: false,
     };
   };
   const formElements = [...formsOf(document)];
-  const forms = formElements.slice(0, limits.maxForms).map((form): FormDomEvidence => {
-    const fieldElements = [...formElementsOf(form)].filter(isField);
-    const fields = fieldElements.slice(0, limits.maxFieldsPerForm).map(fieldEvidence);
-    const ownedSubmitControls = submitControlCandidates.filter((control) => control.form === form);
-    const submitControls = ownedSubmitControls
-      .slice(0, limits.maxSubmitControlsPerForm)
+  const forms = formElements.slice(cursor.forms, cursor.forms + partSize).map((form): FormDomEvidence => {
+    const fields = [...formElementsOf(form)].filter(isField).map(fieldEvidence);
+    const submitControls = submitControlCandidates
+      .filter((control) => control.form === form)
       .map((control): SubmitControlEvidence => {
         const rawText = control instanceof HTMLButtonElement ? control.innerText : control.value;
-        const name = bound(normalizeWhitespace(control.getAttribute('name')), limits.maxAttributeLength);
-        const value = bound(normalizeWhitespace(control.value), limits.maxAttributeLength);
-        const text = bound(normalizeWhitespace(rawText), limits.maxAttributeLength);
         return {
           type: control.type === 'image' ? 'image' : 'submit',
-          name: name.text,
-          value: value.text,
-          text: text.text,
-          truncated: name.truncated || value.truncated || text.truncated,
+          name: normalizeWhitespace(control.getAttribute('name')),
+          value: normalizeWhitespace(control.value),
+          text: normalizeWhitespace(rawText),
+          truncated: false,
         };
       });
-    const method = bound(normalizeWhitespace(formMethodOf(form)).toLowerCase(), limits.maxAttributeLength);
-    const action = bound(normalizeWhitespace(getAttributeOf(form, 'action')), limits.maxUrlLength);
     return {
-      method: method.text,
-      action: action.text,
+      method: normalizeWhitespace(formMethodOf(form)).toLowerCase(),
+      // URL-LEN: action は切り詰めない。
+      action: normalizeWhitespace(getAttributeOf(form, 'action')),
       fields,
       submitControls,
-      omittedFieldCount: fieldElements.length - fields.length,
-      omittedSubmitControlCount: ownedSubmitControls.length - submitControls.length,
-      truncated: method.truncated || action.truncated,
+      omittedFieldCount: 0,
+      omittedSubmitControlCount: 0,
+      truncated: false,
     };
   });
 
   // `forms` に記録されない入力欄（R4 の N2）。どの form にも属さない入力欄と、open な shadow root の中の入力欄（R'2 の m4。
-  // shadow root の中の form は `document.forms` に含まれない）を、文書の順（shadow root の中は host の位置）で、上限までを記録する。
+  // shadow root の中の form は `document.forms` に含まれない）を、文書の順（shadow root の中は host の位置）で記録する。
   const unassociatedFieldElements: FieldElement[] = [];
   const collectUnassociatedFields = (root: Document | ShadowRoot, insideShadowRoot: boolean): void => {
     for (const element of root instanceof Document ? queryDocumentAll('*') : root.querySelectorAll('*')) {
@@ -695,7 +635,9 @@ function collectDomEvidenceReader(R: StandardReaders, { limits, visibilityOption
     }
   };
   collectUnassociatedFields(document, false);
-  const unassociatedFields = unassociatedFieldElements.slice(0, limits.maxUnassociatedFields).map(fieldEvidence);
+  const unassociatedFields = unassociatedFieldElements
+    .slice(cursor.unassociatedFields, cursor.unassociatedFields + partSize)
+    .map(fieldEvidence);
 
   // 重複している id。空の id は id として扱わない。
   const idCounts = new Map<string, number>();
@@ -706,37 +648,29 @@ function collectDomEvidenceReader(R: StandardReaders, { limits, visibilityOption
     }
   }
   const duplicatedIds = [...idCounts].filter(([, count]) => count > 1);
-  const duplicateIds = duplicatedIds.slice(0, limits.maxDuplicateIds).map(([id, count]): DuplicateIdEvidence => {
-    const bounded = bound(id, limits.maxIdLength);
-    return { id: bounded.text, count, truncated: bounded.truncated };
-  });
+  const duplicateIds = duplicatedIds.map(([id, count]): DuplicateIdEvidence => ({ id, count, truncated: false }));
+
+  // EV-1・EV-3: 見えている読み込み中の表示の数（読み方は部品の 1 か所。落ち着きの待ちと同じ）。
+  const loadingIndicators: LoadingIndicatorEvidence = R.loadingIndicatorsIn(visibilityOptions);
 
   return {
     scrollPosition,
-    title: title.text,
-    metaDescription: description.text,
-    canonicalUrl: canonicalUrl.text,
-    lang: lang.text,
-    headings,
-    visibleText,
-    images,
-    forms,
-    unassociatedFields,
-    duplicateIds,
-    truncation: {
-      // 項目ごとに記録する（R''2 の m4）。切り詰めた canonical の URL を、Rule が元の URL と取り違えないようにする。
-      documentFields: {
-        title: title.truncated,
-        metaDescription: description.truncated,
-        canonicalUrl: canonicalUrl.truncated,
-        lang: lang.truncated,
-      },
-      omittedHeadingCount: visibleHeadingCount - headings.length,
-      omittedImageCount: imageElements.length - images.length,
-      omittedFormCount: formElements.length - forms.length,
-      omittedUnassociatedFieldCount: unassociatedFieldElements.length - unassociatedFields.length,
-      omittedDuplicateIdCount: duplicatedIds.length - duplicateIds.length,
-    },
+    loadingIndicators,
+    title,
+    metaDescription: description,
+    canonicalUrl,
+    lang,
+    // LZ-3b: 文書の項目は切り詰めない（項目ごとの印は前の記録の形のために残し、いつも偽）。
+    documentFields: { title: false, metaDescription: false, canonicalUrl: false, lang: false },
+    source,
+    headings: listPart(visibleHeadings, cursor.headings),
+    images: { items: images, total: imageElements.length },
+    forms: { items: forms, total: formElements.length },
+    unassociatedFields: { items: unassociatedFields, total: unassociatedFieldElements.length },
+    duplicateIds: listPart(duplicateIds, cursor.duplicateIds),
+    regions: listPart(regions, cursor.regions),
+    text: textPart(allText, cursor.text),
+    ariaHiddenText: textPart(ariaHiddenText, cursor.ariaHiddenText),
   };
 }
 const collectDomEvidenceInPage = composeInPage(collectDomEvidenceReader);
@@ -747,14 +681,23 @@ const collectDomEvidenceInPage = composeInPage(collectDomEvidenceReader);
  * 可視テキストと見出しの「目に見えるか」の判定は `checkVisibility(VISIBILITY_CHECK_OPTIONS)` だけで行う。テキストノードは、
  * `display: contents` ではない最も近い祖先の要素で判定する。
  * `aria-hidden` は可視判定に使わず、別の項目（`ariaHidden`、`ariaHiddenText`）として記録する。
+ * COV-6: 件数と本文の長さで打ち切らない。ページの中の読み取りを、一覧ごとに `DOM_COLLECTION_PART_SIZE` 件、テキストごとに `DOM_TEXT_PART_LENGTH` 字に
+ * 分け、続きの位置から読み直して（`readInParts`）全部を 1 つの記録にまとめる。分けた回数を `collectedInParts` に残す。
  */
 export async function collectDomEvidence(page: Page, pageId: PageId): Promise<DomEvidence> {
-  // ブラウザ内では import できないため、送信のコントロールの `type` の一覧（`SUBMIT_CONTROL_TYPES`）は引数で渡す。
-  const raw = await page.evaluate(collectDomEvidenceInPage, {
-    limits: DOM_LIMITS,
-    visibilityOptions: VISIBILITY_CHECK_OPTIONS,
-    submitControlTypes: SUBMIT_CONTROL_TYPES,
+  const parts = await readInParts(FIRST_DOM_PART_CURSOR, async (cursor: DomPartCursor) => {
+    // ブラウザ内では import できないため、送信のコントロールの `type` の一覧（`SUBMIT_CONTROL_TYPES`）は引数で渡す。
+    const part = await page.evaluate(collectDomEvidenceInPage, {
+      visibilityOptions: VISIBILITY_CHECK_OPTIONS,
+      submitControlTypes: SUBMIT_CONTROL_TYPES,
+      cursor,
+      partSize: DOM_COLLECTION_PART_SIZE,
+      textPartLength: DOM_TEXT_PART_LENGTH,
+    });
+    validateRawDomPart(part);
+    return { part, next: nextDomPartCursor(cursor, part) };
   });
 
-  return freezeDomEvidence(raw, pageId);
+  // AUD-7: 画面の誤りの表示の手がかりも、同じ時点で読む（読めなければ `FAILED`。DOM の記録は止めない）。
+  return Object.freeze({ ...assembleDomEvidence(parts, pageId), errorDisplay: await collectErrorDisplay(page) });
 }

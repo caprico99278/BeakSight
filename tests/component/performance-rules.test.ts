@@ -141,6 +141,13 @@ describe('PERFORMANCE_RULES', () => {
     expect(ruleById('POOR_LCP').evaluate(input([record]))).toHaveLength(1);
   });
 
+  it('EV-1: スクロールの段の前の LCP があれば、その値で判定する（スクロールの後に大きくなった値では指摘しない）', () => {
+    const base = performanceRecord({ ...allUnobserved(), LCP: observed(5200) });
+    const before = (value: number): EvidenceRecord => ({ ...base, payload: { ...base.payload, lcpBeforeScroll: observed(value) } } as EvidenceRecord);
+    expect(ruleById('POOR_LCP').evaluate(input([before(1200)]))).toEqual([]);
+    expect(ruleById('POOR_LCP').evaluate(input([before(4500)]))[0]?.message).toContain('4500 ms');
+  });
+
   it('別のビューポートの Evidence は、判定に使わない', () => {
     const record = performanceRecord({ ...allUnobserved(), LCP: observed(5200) }, { viewport: 'mobile' });
     expect(ruleById('POOR_LCP').evaluate(input([record]))).toEqual([]);

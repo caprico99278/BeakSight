@@ -84,6 +84,9 @@ describe('T40b-2: the URL of the {id} page of the verification READ of an API wr
   it('builds the URL of the start origin and the path with a usable record id', () => {
     expect(recordPageReadTargetOf(pageReadCheck(), '7', config, authentication)).toEqual({ ok: true, url: `${ORIGIN}/admin/members/7` });
     expect(recordPageReadTargetOf(pageReadCheck(), 'abc_D-9', config, authentication)).toEqual({ ok: true, url: `${ORIGIN}/admin/members/abc_D-9` });
+    // L12b（設計者の判断 2）: 長さの上限は撤廃した（300 文字の ID も組み立てる）。
+    expect(recordPageReadTargetOf(pageReadCheck(), 'x'.repeat(300), config, authentication))
+      .toEqual({ ok: true, url: `${ORIGIN}/admin/members/${'x'.repeat(300)}` });
   });
 
   it.each([
@@ -100,7 +103,9 @@ describe('T40b-2: the URL of the {id} page of the verification READ of an API wr
     expect(recordPageReadTargetOf(pageReadCheck(), '7', config, outside)).toMatchObject({ ok: false, detail: 'REQUEST_POLICY' });
   });
 
-  it.each(['', '..', 'a/b', 'a.b', '%2e', 'a b', '会員', 'x'.repeat(65)])('does not build the URL for the unusable record id %j', (recordId) => {
+  // L12b（設計書 `2026-11-09-beaksight-remove-limits-design.md` 6.2。設計者の判断 1・2）: 登録の ID の長さの上限は撤廃したので、長すぎる例は外した
+  // （使える文字の決まりだけで止める）。
+  it.each(['', '..', 'a/b', 'a.b', '%2e', 'a b', '会員'])('does not build the URL for the unusable record id %j', (recordId) => {
     expect(recordPageReadTargetOf(pageReadCheck(), recordId, config, authentication)).toEqual({ ok: false, detail: 'URL_NOT_BUILT', url: null });
   });
 
@@ -118,8 +123,24 @@ describe('T40b-2: the URL of the {id} page of the verification READ of an API wr
     }
   });
 
+  // OP-R（設計書 `2026-10-27-beaksight-one-pass-flow-design.md` 4.1.9 の R1）: API の登録の一覧の画面（`{id}` のない画面の path。IPC が登録の画面の 1 つ上だけを
+  // 受ける）は、ID を入れずに、その画面を読む。親が入れた対象の画面と、画面の path の確かめと事前の判定は、`{id}` の型と同じくかけ直す。
+  it('builds the URL of the list page without the record id, and checks it again as the {id} page (OP-R R1)', () => {
+    const list = pageReadCheck({
+      targetPage: { origin: ORIGIN, path: '/admin/members' },
+      definition: { targetPagePath: '/admin/members', parameters: {}, expectations: [{ kind: 'TEXT_CONTAINS', text: 'x' }] },
+    });
+    expect(recordPageReadTargetOf(list, '7', config, authentication)).toEqual({ ok: true, url: `${ORIGIN}/admin/members` });
+    const excluded = { ...authentication, auditExclusions: { ...authentication.auditExclusions, excludedPathPrefixes: ['/admin/members'] } };
+    expect(recordPageReadTargetOf(list, '7', config, excluded)).toEqual({ ok: false, detail: 'REQUEST_POLICY', url: `${ORIGIN}/admin/members` });
+    expect(recordPageReadTargetOf(pageReadCheck({ ...list, targetPage: { origin: ORIGIN, path: '/admin' } }), '7', config, authentication))
+      .toEqual({ ok: false, detail: 'URL_NOT_BUILT', url: null });
+    expect(recordPageReadTargetOf(pageReadCheck({ ...list, targetPage: { origin: OTHER_ORIGIN, path: '/admin/members' } }), '7', config, authentication))
+      .toEqual({ ok: false, detail: 'URL_NOT_BUILT', url: null });
+  });
+
   it('keeps rejecting a page path definition in the verification READ of a form write (T37d, the decision 5), without reading', async () => {
-    const checked = await verifyReadCheck(null as never, null as never, pageReadCheck(), {
+    const checked = await verifyReadCheck(null as never, pageReadCheck(), {
       config, allowedQueryParameters: new Set(), authentication,
     });
     expect(checked).toMatchObject({ evidence: { state: 'EXECUTED', result: 'READ_BLOCKED_BY_POLICY', detail: 'REQUEST_POLICY', url: null }, violation: false });

@@ -2,17 +2,18 @@
  * ML-b-2（設計書 `doc/design/2026-10-19-beaksight-manual-login-pass-through-design.md` の 2.3）: 手動のログインの成功から設定を自動で登録する結果
  * （`loginStage.autoRegistration`）は、ジョブの管理がジョブの終わりの後に背後で書く。終わったジョブの画面は、結果が書かれるまで、短い間だけ読み直しを
  * 続ける（T41g-2 の「登録中」の読み直しと同じ考え）。判定（`apps/local-ui/src/display/job-polling.ts` の `awaitsAutoRegistration`）を確かめる。
+ * - PL-3（PL-2 の持ち越し。DEF-179）: 前は終わりの時刻を UTC の 14 桁の文字列で受けたので、画面に返す ISO 8601 の `finishedAt` を渡すと、いつも偽になった。
+ *   終わりの時刻は、呼び出し側（画面のサーバ）が管理データから読んだ時刻（ミリ秒。`finishedAtMs`）で受ける（文字列の形に依らない）。
  */
 import { describe, expect, it } from 'vitest';
 import { MINUTE_MS } from '../../../src/core/time-units.js';
 import { AUDIT_JOB_AUTO_REGISTRATION_WAIT_MS, awaitsAutoRegistration } from '../src/display/job-polling';
 
-const FINISHED_AT = '20261019010000';
 const FINISHED_AT_MS = Date.UTC(2026, 9, 19, 1, 0, 0);
 const PASSED = Object.freeze({ requests: [], unlisted: 1 });
 const ended = Object.freeze({
   active: false,
-  finishedAt: FINISHED_AT,
+  finishedAtMs: FINISHED_AT_MS,
   loginStage: { scriptLogin: null, blockedRequests: null, passedRequests: PASSED },
 });
 
@@ -30,7 +31,7 @@ describe('ML-b-2: the finished job screen waits a short time for the automatic r
     expect(awaitsAutoRegistration({ ...ended, loginStage: { ...ended.loginStage, autoRegistration: saved } }, FINISHED_AT_MS)).toBe(false);
     expect(awaitsAutoRegistration({ ...ended, loginStage: { scriptLogin: null, blockedRequests: PASSED } }, FINISHED_AT_MS)).toBe(false);
     expect(awaitsAutoRegistration({ ...ended, loginStage: null }, FINISHED_AT_MS)).toBe(false);
-    expect(awaitsAutoRegistration({ ...ended, active: true, finishedAt: null }, FINISHED_AT_MS)).toBe(false);
-    expect(awaitsAutoRegistration({ ...ended, finishedAt: null }, FINISHED_AT_MS)).toBe(false);
+    expect(awaitsAutoRegistration({ ...ended, active: true, finishedAtMs: null }, FINISHED_AT_MS)).toBe(false);
+    expect(awaitsAutoRegistration({ ...ended, finishedAtMs: null }, FINISHED_AT_MS)).toBe(false);
   });
 });

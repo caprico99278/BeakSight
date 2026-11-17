@@ -4,6 +4,7 @@ import type {
   ConsoleEvidence,
   DomEvidence,
   EffectiveAuditConfig,
+  FocusCheckEvidence,
   InteractionEvidence,
   LayoutEvidencePayload,
   LinkDiscoveryEvidence,
@@ -20,7 +21,10 @@ import type {
 } from './evidence-types.js';
 // 型だけの import（実行時の依存はない。`status.ts` は、このファイルの型と値を使う）。
 import type { RunStatusInput } from './status.js';
+import type { RunPages } from './run-page-store.js';
+import type { ProgressWatchEnd } from './progress-watch.js';
 import type { AuditSendPolicyName } from './audit-send-policy.js';
+import type { RunPageScopeRecord } from './audit-page-scope.js';
 // 未完了の理由の確かめ（`isIncompleteReason`）が使う。`guards.ts` は何も import しない。
 import { isRecord } from './guards.js';
 
@@ -96,9 +100,27 @@ export const INCOMPLETE_REASON_CODES = Object.freeze([
   'PAGE_NAVIGATION_LIMIT_REACHED',
   /**
    * DEF-130-fix: ビューポートの Context で、1 画面の読み込みあたりの、ページが出す文書でない要求（画像・`fetch`・`xhr` など）を、Guard が上限
-   * （`src/safety/passive-request-guard.ts` の `PAGE_SUBRESOURCE_REQUEST_LIMIT`）で止めた（画面がデータを描き切れず、読み切れていない）。`detail` は `null`。
+   * （前は 1,000）で止めた（画面がデータを描き切れず、読み切れていない）。`detail` は `null`。L10（S5）で上限を撤廃したので今は付かない（前の記録の
+   * 読み方のために一覧に残す）。
    */
   'PAGE_SUBRESOURCE_LIMIT_REACHED',
+  /**
+   * DEF-210（通知の枠の設計書 3.2.1 の 4）: 通知の枠の閉じるボタンを押した期間に、ページが main frame の移動（読み込み直し・フォームの送信を含む）を試み、Guard が
+   * 止めた。誤りの画面を測らないため、そのビューポート（幅の走査ではその幅）の測りをしない。読み込み直しはしない。`detail` は `null`。
+   */
+  'NOTIFICATION_DISMISSAL_NAVIGATION_BLOCKED',
+  /**
+   * DEF-250 の c: Passive の page の段の間に、ページが main frame で外部スキーム（mailto など）へ移ろうとしたか、文書が誤りの画面に替わった（閉じた）ので、残りの
+   * 段を始めずに、そのビューポートを終えた（終える前に集めた証拠は残る。Mobile と次のページは続ける）。判定は `src/orchestration/stress-width-end.ts` の
+   * `auditDocumentLeftCause`。`detail` は `<段>:<原因>`（原因は `EXTERNAL_SCHEME`・`DOCUMENT_GONE`）。
+   */
+  'DOCUMENT_LEFT_DURING_AUDIT',
+  /**
+   * DEF-225: 画面を開くと、ファイルのダウンロードになった（添付の形の応答など）。Guard はダウンロードを止めて取り消し、main frame の移動は失敗した（違反ではない。
+   * `src/safety/passive-request-guard.ts` の `pageLoadFactsOf` の `mainFrameDownloadBlocked`）。そのビューポートは読めず、同じ URL をほかのビューポートで読み直さない。
+   * `detail` は `null`。
+   */
+  'DOWNLOAD_RESPONSE',
   /** Run Status の入力 `preflightFailed`。 */
   'PREFLIGHT_FAILED',
   /**
@@ -205,6 +227,17 @@ export const INCOMPLETE_REASON_CODES = Object.freeze([
    * Run Status は、SKIPPED のページがあるので、`deriveRunStatus` が `PARTIAL` と導く（このコードでは決めない）。
    */
   'SERVICE_REQUEST_LIMIT_REACHED',
+  /**
+   * L0（設計書 `2026-11-09-beaksight-remove-limits-design.md` 5 の 1）: 進みの見張り（`src/core/progress-watch.ts`）が、ブラウザからの応答・ページの通信・
+   * 画面の変化のどれもない状態が反応なしの長さ（`PROGRESS_WATCH_QUIET_LIMIT_MS`）続いたため、その段を「応答しなかった」として終えた。それまでに集めた
+   * 記録は残し、次へ進む。`detail` は段の名前（`PageAuditStage`）。
+   */
+  'STAGE_UNRESPONSIVE',
+  /**
+   * L0: 進みの見張りが、段の中身の進み（応答・分けて読む回）がなく、ページの自発の変化（時計・アニメーションなどの周期的な変化）だけが反応なしの長さ
+   * 続いたため、その段を「静まらない」として終えた。それまでに集めた記録は残し、次へ進む。`detail` は段の名前。
+   */
+  'STAGE_NEVER_QUIET',
 ] as const);
 export type IncompleteReasonCode = (typeof INCOMPLETE_REASON_CODES)[number];
 
@@ -224,9 +257,15 @@ export const PAGE_AUDIT_STAGES = Object.freeze([
   'accessibility',
   'performance',
   'screenshot',
+  // AUD-2d: 落ち着いた後の確かめ直し（DOM が静まるまで待ち、見出しを読み直し、1 回目に違反のあった axe のルールだけを流し直す）。
+  'recheck',
+  // AUD-4d: 画面の外の、フォーカスできる要素にフォーカスを当てて読む（ほかの証拠を集め終えた後。ページの JS が状態を変えても、後の証拠を汚さないため）。
+  'focus-check',
   'links',
   'interaction-discovery',
   'interaction',
+  // COV-4 の区切り 3: 見るだけの点検の操作で開いた状態に、今の段（DOM・layout・axe・フォーカスの確かめ・画像）を、読み込み直さずに当てる。
+  'opened-state',
   'safety',
   'rules',
 ] as const);
@@ -292,6 +331,8 @@ export interface EvidencePayloadByType {
   readonly scroll: ScrollEvidence;
   readonly metadata: MetadataEvidence;
   readonly safety: SafetyEventsEvidence;
+  /** AUD-4d: 画面の外の、フォーカスできる要素のフォーカスの確かめ（段 `focus-check`）。 */
+  readonly focus: FocusCheckEvidence;
 }
 
 /**
@@ -312,6 +353,7 @@ export const EVIDENCE_TYPES = Object.freeze([
   'scroll',
   'metadata',
   'safety',
+  'focus',
 ] as const satisfies readonly (keyof EvidencePayloadByType)[]);
 export type EvidenceType = (typeof EVIDENCE_TYPES)[number];
 
@@ -326,14 +368,185 @@ export interface EvidenceRecordFor<TType extends EvidenceType> {
   readonly viewport: ViewportProfile | null;
   readonly observedAt: string;
   readonly payload: EvidencePayloadByType[TType];
+  /**
+   * AUD-2a（整理の文書 `2026-11-09-beaksight-audit-precision-triage.md` の AUD-2a）: 集めた状態と時刻（Page Auditor のビューポートの Evidence だけ）。
+   * 前の Run の記録と、ビューポートによらない Evidence にはない。バンドルと記録にだけ出す（画面と HTML の本文には出さない）。
+   */
+  readonly capture?: EvidenceCapture;
+}
+
+/**
+ * AUD-2a: ビューポートの読み込みの状態 ID（`<pageId>:<ビューポート>:<試行>`）。同じ読み込みで集めた Evidence は、同じ値を持つ。作るのは `evidenceStateIdOf` だけ。
+ */
+export type EvidenceStateId = string;
+
+/** AUD-2a: 状態 ID を作る（唯一の作り方）。`attempt` は、Run Coordinator の試行の番号（1 から）。 */
+export const evidenceStateIdOf = (pageId: PageId, viewport: ViewportProfile, attempt: number, openedStateIndex: number | null = null): EvidenceStateId => {
+  const loadStateId = `${pageId}:${viewport}:${String(attempt)}`;
+  return openedStateIndex === null ? loadStateId : openedEvidenceStateIdOf(loadStateId, openedStateIndex);
+};
+
+/** COV-4 の区切り 3: 読み込みの状態 ID から、その読み込みで操作して開いた状態の ID（`:state-<番号>`。番号は 1 から）。 */
+export const openedEvidenceStateIdOf = (loadStateId: EvidenceStateId, openedStateIndex: number): EvidenceStateId =>
+  `${loadStateId}:state-${String(openedStateIndex)}`;
+
+/**
+ * AUD-2a: 状態 ID の形（page の schema の `pattern` と同じ）。COV-4 の区切り 3: 見るだけの点検の操作で開いた状態は、その読み込みの状態 ID に `:state-<番号>`
+ * （1 から）を付ける。
+ */
+export const EVIDENCE_STATE_ID_PATTERN = /^PAGE-[0-9]{6,}:(?:desktop|mobile):[1-9][0-9]*(?::state-[1-9][0-9]*)?$/u;
+
+/** AUD-2a: 集めたときの、文書のスクロールの位置（CSS ピクセル）。 */
+export interface EvidenceCaptureScrollPosition {
+  readonly x: number;
+  readonly y: number;
+}
+
+/**
+ * AUD-2a: 1 つの Evidence を集めた状態と時刻。
+ * - `phase`: 集めた段の名前（`PAGE_AUDIT_STAGES` の閉じた一覧。network・console は読み込みから集めた `navigation`）。
+ * - `startedAt`・`finishedAt`: 段を始めた時刻と終えた時刻（ISO 8601。Desktop の layout は、幅の走査の後に包んでも、測った時刻）。
+ * - `url`: 段を終えたときの main frame の URL（読めなければ `null`）。`scrollPosition`: 段を終えたときの位置（読めなければ `null`）。
+ */
+export interface EvidenceCapture {
+  readonly stateId: EvidenceStateId;
+  readonly phase: PageAuditStage;
+  readonly startedAt: string;
+  readonly finishedAt: string;
+  readonly url: string | null;
+  readonly scrollPosition: EvidenceCaptureScrollPosition | null;
+}
+
+/**
+ * AUD-2a: 見張りが段を終えた理由の閉じた一覧（記録の `settling.watchEnd` の値。page の schema の enum と対にする）。値の意味の owner は
+ * `src/core/progress-watch.ts` の `ProgressWatchEnd`（`satisfies` で、その型の値だけであることを確かめる）。
+ */
+export const VIEWPORT_SETTLING_WATCH_ENDS = Object.freeze(['STAGE_UNRESPONSIVE', 'STAGE_NEVER_QUIET', 'RUN_TIME_LIMIT'] as const satisfies readonly ProgressWatchEnd[]);
+
+/**
+ * AUD-2b（整理の文書 `2026-11-09-beaksight-audit-precision-triage.md` の AUD-2b）: 読み込みの段の閉じた一覧（この順に進む。判定は `src/browser/page-settling.ts`）。
+ * - `AFTER_DOM_CONTENT_LOADED`: DOM の準備ができた（`domcontentloaded`）。
+ * - `LOADING`: 文書かデータ（fetch・XHR）を読んでいる。
+ * - `AFTER_DATA`: データが届いた（途中の数が 0、または静まりの窓の間にデータの通信が動かなかった）が、高さか DOM がまだ変わる。
+ * - `SETTLED`: 高さが静まり、DOM の変化も静まり、データも届いた。
+ */
+export const PAGE_LOAD_PHASES = Object.freeze(['AFTER_DOM_CONTENT_LOADED', 'LOADING', 'AFTER_DATA', 'SETTLED'] as const);
+export type PageLoadPhase = (typeof PAGE_LOAD_PHASES)[number];
+
+/** AUD-2b: 読み込みの段が変わった時刻（ISO 8601）。 */
+export interface PageLoadPhaseRecord {
+  readonly phase: PageLoadPhase;
+  readonly at: string;
+}
+
+/** AUD-2a: 安定の判定の結果の状態（判定を終えた・途中で終えた・段を終えられなかった）。 */
+export const VIEWPORT_SETTLING_STATUSES = Object.freeze(['SETTLED', 'PARTIAL', 'NOT_COMPLETED'] as const);
+export type ViewportSettlingStatus = (typeof VIEWPORT_SETTLING_STATUSES)[number];
+
+/**
+ * AUD-2a: ビューポートの安定の判定（`page-settling.ts`。L0・L1 の見張りつき）の結果。`reason` は判定の理由（`DOM_AND_HEIGHT_STABLE` など。段を終えられなければ
+ * `null`）、`elapsedMs` は段の経過、`observationCount` は観測の数、`lastScrollHeight` は最後の観測の文書の高さ（観測がなければ `null`）、`watchEnd` は見張りが段を
+ * 終えた理由（`ProgressWatchEnd` の値。終えなければ `null`）。
+ */
+export interface ViewportSettlingRecord {
+  readonly status: ViewportSettlingStatus;
+  readonly reason: string | null;
+  readonly elapsedMs: number;
+  readonly observationCount: number;
+  readonly lastScrollHeight: number | null;
+  readonly watchEnd: ProgressWatchEnd | null;
+  /** AUD-2b: 読み込みの段の移り変わり（変わった時だけ。AUD-2b の前の記録にはない）。 */
+  readonly loadPhases?: readonly PageLoadPhaseRecord[];
+}
+
+/**
+ * AUD-2d（整理の文書 `2026-11-09-beaksight-audit-precision-triage.md` の AUD-2d）: 落ち着いた後の確かめ直しの印の閉じた一覧。
+ * - `PERSISTENT`: 1 回目にも確かめ直しにもある（続く）。
+ * - `INITIAL_ONLY`: 1 回目だけにある（初めの骨組みの時だけ。確かめ直しでは消えた）。
+ * - `LATE`: 確かめ直しだけにある（後から出た）。
+ */
+export const RECHECK_STATES = Object.freeze(['PERSISTENT', 'INITIAL_ONLY', 'LATE'] as const);
+export type RecheckState = (typeof RECHECK_STATES)[number];
+
+/** AUD-2d: 確かめ直しの状態（確かめ直した・確かめ直さなかった）。 */
+export const VIEWPORT_RECHECK_STATUSES = Object.freeze(['RECHECKED', 'NOT_RECHECKED'] as const);
+export type ViewportRecheckStatus = (typeof VIEWPORT_RECHECK_STATUSES)[number];
+
+/**
+ * AUD-2d: 確かめ直さなかった理由の閉じた一覧（1 回目の DOM を読めなかった・確かめ直しの段を終えられなかった）。AUD-2e: 1 回目に axe の違反がない
+ * ビューポートも、axe（全部のルール）と主の layout を確かめ直す（`RECHECKED`）。`axeRuleIds` が空になるのは、どちらの回にも違反がないとき（axe を止めた設定を含む）。
+ */
+export const RECHECK_SKIP_REASONS = Object.freeze(['FIRST_PASS_NOT_COMPLETED', 'STAGE_NOT_COMPLETED'] as const);
+export type RecheckSkipReason = (typeof RECHECK_SKIP_REASONS)[number];
+
+/** AUD-2d: 確かめ直した指摘の印（Finding の `fingerprint` で結ぶ。`LATE` は 1 回目の Finding がないので、確かめ直しの評価の fingerprint）。 */
+export interface RecheckFindingRecord {
+  readonly fingerprint: string;
+  readonly ruleId: string;
+  readonly state: RecheckState;
+}
+
+/** AUD-2d: 読み直した見出しの印（見出しの段と文字で結ぶ）。 */
+export interface RecheckHeadingRecord {
+  readonly level: number;
+  readonly text: string;
+  readonly state: RecheckState;
+}
+
+/**
+ * AUD-2d: 落ち着いた後の確かめ直しの表（ビューポートの記録の 1 か所。表示用モデルとバンドルは、これを読むだけ）。読み込み直さない。`axeRuleIds` は、1 回目か確かめ直しで違反のあった axe のルール（AUD-2e。確かめ直しの axe は全部のルールで流す）。
+ * 見出しと指摘の印は、変わらないものも含めて全部（`PERSISTENT` を含む）。確かめ直さなかったら `reason` に理由を書き、表は空。
+ */
+export interface ViewportRecheckRecord {
+  readonly status: ViewportRecheckStatus;
+  readonly reason: RecheckSkipReason | null;
+  readonly stateId: EvidenceStateId;
+  readonly startedAt: string;
+  readonly finishedAt: string;
+  /** 確かめ直しの前の、DOM が静まるまでの待ち（`settling` と同じ形。待たなかったら `null`）。 */
+  readonly settling: ViewportSettlingRecord | null;
+  readonly axeRuleIds: readonly string[];
+  readonly findings: readonly RecheckFindingRecord[];
+  readonly headings: readonly RecheckHeadingRecord[];
+  /**
+   * EV-3: 確かめ直しで読み直した画面の準備の状態（`pageReadyOf`。確かめ直した（`RECHECKED`）ときだけ。前の版の記録にはない）。1 回目の状態の DOM の記録と
+   * 合わせて、内容の指摘を「初めだけ」（確かめ直しの印 `INITIAL_ONLY`）・「完成した後も続く」・「準備が終わらない」（偽）に分ける。
+   */
+  readonly pageReady?: boolean;
+}
+
+/** AUD-2a: ビューポートの通知の枠の扱い（主の読み込み。閉じた数・隠した数・見た枠の digest）。 */
+export interface ViewportNotificationHandlingRecord {
+  readonly dismissedCount: number;
+  readonly hiddenCount: number;
+  readonly digests: readonly string[];
 }
 
 export type EvidenceRecord = {
   readonly [TType in EvidenceType]: EvidenceRecordFor<TType>;
 }[EvidenceType];
 
+/**
+ * Finding の版。1.1（AUD-9a）で `groupingKeys` を足した。新しい Finding は 1.1。1.0 は欄のない古い Run の Finding（読むだけ）。
+ * schema の URN は `urn:beaksight:schema:finding:1.0` のまま（足すだけの変更なので、page と audit の schema の参照を変えない）。
+ */
+export const FINDING_SCHEMA_VERSIONS = Object.freeze(['finding-schema/1.0', 'finding-schema/1.1'] as const);
+export type FindingSchemaVersion = (typeof FINDING_SCHEMA_VERSIONS)[number];
+export const CURRENT_FINDING_SCHEMA_VERSION: FindingSchemaVersion = 'finding-schema/1.1';
+
+/** Finding のまとめの鍵の 1 つ（AUD-9a。許可の一覧は `src/audit/finding-grouping-keys.ts`）。 */
+export interface FindingGroupingKeyRecord {
+  readonly name: string;
+  readonly value: string;
+}
+
 export interface Finding {
-  readonly schemaVersion: 'finding-schema/1.0';
+  readonly schemaVersion: FindingSchemaVersion;
+  /**
+   * AUD-9a: 同じ UI の繰り返しを後でまとめるための鍵。Rule の同一性の要素のうち、selector の類と Rule の識別だけを、同じ値で残す（fingerprint の入力とは別のもの）。
+   * 1.1 の Finding は必ず持つ（空の配列もある）。1.0 の Finding（古い Run）にはない。
+   */
+  readonly groupingKeys?: readonly FindingGroupingKeyRecord[];
   readonly findingId: FindingId;
   readonly fingerprint: string;
   readonly ruleId: string;
@@ -375,14 +588,20 @@ export interface ViewportAuditResult {
    */
   readonly navigationOutcome: NavigationOutcomeKind | null;
   /**
-   * DEF-129: そのビューポートの Context で、Guard が通した（サーバへ送った）main frame の文書の要求の数（BeakSight 自身の読み込み、リダイレクトの続き、
-   * ページが始めた読み込みを含む）。読み込まなかったビューポートと、Guard のない読み込み・前の書き手の成果物にはない。
+   * DEF-129・T37R2-fix・DEF-130-fix: そのビューポートの Context で、Guard が通した main frame の文書・子の frame の文書・文書でない要求の数。SPEC-1 で
+   * 書くのをやめた（どの表示も読まなかった）。前の書き手の成果物を読むために型だけ残す。
    */
   readonly documentRequests?: number;
-  /** T37R2-fix: 同じ Context で、Guard が通した子の frame の文書の要求の数（別の数）。`documentRequests` と同じときに書く。 */
   readonly childFrameDocumentRequests?: number;
-  /** DEF-130-fix: 同じ Context で、Guard が通した文書でない要求の数（別の数）。`documentRequests` と同じときに書く。 */
   readonly subresourceRequests?: number;
+  /** AUD-2a: このビューポートの読み込みの状態 ID（`evidenceStateIdOf`）。前の Run の記録にはない。 */
+  readonly stateId?: EvidenceStateId;
+  /** AUD-2a: 安定の判定の結果（判定の段を始めなかったビューポートと、前の Run の記録にはない）。 */
+  readonly settling?: ViewportSettlingRecord;
+  /** AUD-2a: 通知の枠の扱い（扱いの段を始めなかったビューポートと、前の Run の記録にはない）。 */
+  readonly notificationHandling?: ViewportNotificationHandlingRecord;
+  /** AUD-2d: 落ち着いた後の確かめ直しの表（収集をしなかったビューポートと、前の Run の記録にはない）。 */
+  readonly recheck?: ViewportRecheckRecord;
 }
 
 export interface PageAuditResult {
@@ -415,96 +634,10 @@ export interface PageSafetySummary {
   readonly invariantViolations: readonly SafetyInvariantViolationSummary[];
   /** どれかの Ledger の記録が上限で不完全になったか（`SafetyLedgerRecordLimits.truncated`）。 */
   readonly recordTruncated: boolean;
-}
-
-/**
- * ページ本体の要求の観察の結果の状態の閉じた一覧（サイトの不調で止めたときの診断の記録の設計書 2.1）。
- * - `OBSERVED`: 観察した（記録した文書の要求が0件の場合を含む）。
- * - `NOT_OBSERVED`: 観察を始められなかった（CDP の session を開けない、`Network.enable` が失敗した、始める処理が期限までに終わらない）。
- */
-export const NAVIGATION_DIAGNOSTICS_STATUSES = Object.freeze(['OBSERVED', 'NOT_OBSERVED'] as const);
-export type NavigationDiagnosticsStatus = (typeof NAVIGATION_DIAGNOSTICS_STATUSES)[number];
-
-/**
- * 1回の読み込み（Passive のビューポートの読み込み、幅の走査の1つの幅、Interaction の1つの候補）の間の、ページ本体の要求の観察の結果
- * （サイトの不調で止めたときの診断の記録の設計書 2.1、2.2）。
- * 作るのは `startNavigationDiagnostics`（`src/browser/navigation-diagnostics.ts`）だけである。判定はしない（サイトの不調の判定は
- * `src/orchestration/site-availability.ts`）。要求と応答の header の中身と、本文は持たない。
- * 時刻は、すべて `Date.now()` と同じ基準の ms（UNIX エポックからのミリ秒）である。
- */
-export type NavigationDiagnostics = ObservedNavigationDiagnostics | NotObservedNavigationDiagnostics;
-
-/** 観察した結果。 */
-export interface ObservedNavigationDiagnostics {
-  readonly status: Extract<NavigationDiagnosticsStatus, 'OBSERVED'>;
-  /** 観察を始めた時刻（`Network.enable` が終わった時刻）。 */
-  readonly observationStartedAtMs: number;
-  /** 観察を終えた時刻（読み込みの後に、観察を止めた時刻）。 */
-  readonly observationEndedAtMs: number;
-  /** main frame の文書の要求（発行の順）。上限は `MAX_NAVIGATION_DIAGNOSTICS_DOCUMENT_REQUESTS`。 */
-  readonly documentRequests: readonly NavigationDocumentRequestDiagnostics[];
-  /** 上限を超えたため（文書の要求の上限か、事象の上限に達した後）、記録しなかった文書の要求の数。 */
-  readonly omittedDocumentRequestCount: number;
-  /** 記録した文書の要求の事象のうち、事象の上限（`MAX_NAVIGATION_DIAGNOSTICS_EVENTS`）を超えたため、記録しなかった事象の数。 */
-  readonly omittedEventCount: number;
-}
-
-/** 観察を始められなかった結果。 */
-export interface NotObservedNavigationDiagnostics {
-  readonly status: Extract<NavigationDiagnosticsStatus, 'NOT_OBSERVED'>;
-  /** 始められなかった理由（上限 `MAX_ERROR_MESSAGE_LENGTH` 付きのメッセージ）。 */
-  readonly reason: string;
-}
-
-/**
- * main frame の文書の要求1つ（CDP の同じ要求の ID）。リダイレクトは、同じ要求の続き（`hops` の次の要素）として記録する。
- * 読み込みの終わり（`Network.loadingFinished`）と失敗（`Network.loadingFailed`）は、要求の全体（最後の `hops`）に対するものである。
- */
-export interface NavigationDocumentRequestDiagnostics {
-  /** 最初の要求と、リダイレクトでたどった要求（発行の順）。少なくとも1つある。 */
-  readonly hops: readonly NavigationDocumentRequestHop[];
-  /** 読み込みが終わった時刻（`Network.loadingFinished` を受けた時刻）。受けていなければ `null`。 */
-  readonly loadingFinishedAtMs: number | null;
-  /** 読み込みの失敗（`Network.loadingFailed`）。受けていなければ `null`。 */
-  readonly loadingFailure: NavigationDocumentLoadingFailure | null;
-}
-
-/** 文書の要求の1回分（最初の要求か、リダイレクトでたどった要求）。 */
-export interface NavigationDocumentRequestHop {
-  /** 要求の URL（上限 `MAX_URL_LENGTH`）。 */
-  readonly url: string;
-  /** 要求の method（上限 `MAX_HTTP_METHOD_LENGTH`）。 */
-  readonly method: string;
-  /** `url` か `method` を上限で切り詰めたか。 */
-  readonly truncated: boolean;
-  /** ページが要求を発行した時刻（`Network.requestWillBeSent` の `wallTime`。なければ、受けた時刻）。 */
-  readonly issuedAtMs: number;
-  /**
-   * 要求のヘッダをネットワークへ送った時刻（`Network.requestWillBeSentExtraInfo` を受けた時刻）。受けていなければ `null`
-   * （要求がネットワークへ送られていない。キャッシュや内部のリダイレクトのように、ネットワークに出ない要求も `null`）。
-   */
-  readonly requestHeadersSentAtMs: number | null;
-  /**
-   * 応答のヘッダを受けた時刻（`Network.responseReceivedExtraInfo`、`Network.responseReceived`、リダイレクトの応答の、最初に受けたもの）。
-   * 受けていなければ `null`。
-   */
-  readonly responseHeadersReceivedAtMs: number | null;
-  /** 応答の HTTP の status。応答を受けていなければ `null`。 */
-  readonly httpStatus: number | null;
-  /** 応答の接続先の IP アドレス（`remoteIPAddress`）。応答を受けていない場合と、IP アドレスでない場合は `null`。 */
-  readonly remoteIpAddress: string | null;
-  /** 応答の接続先の port（`remotePort`）。応答を受けていない場合と、0以上の安全な整数でない場合は `null`。 */
-  readonly remotePort: number | null;
-}
-
-/** 文書の要求の読み込みの失敗（`Network.loadingFailed`）。 */
-export interface NavigationDocumentLoadingFailure {
-  /** 失敗を受けた時刻。 */
-  readonly failedAtMs: number;
-  /** 失敗の理由（例: `net::ERR_ABORTED`。上限 `MAX_ERROR_MESSAGE_LENGTH`）。 */
-  readonly errorText: string;
-  /** ブラウザが取り消したか（`canceled`）。 */
-  readonly canceled: boolean;
+  /** SAFE-2 の 4: frame の判定の失敗の記録の数（違反でない。`frameClassificationFailures.count` の合計。飽和）。 */
+  readonly frameClassificationFailureCount: number;
+  /** SAFE-2 の 4: 読み取りの main frame の移動の失敗の記録の数（違反でない。`readNavigationFailures.count` の合計。飽和）。 */
+  readonly readNavigationFailureCount: number;
 }
 
 /** `PageAuditor.audit(url, pageId)` の戻り値（Task 14〜17 の設計書 4.5.1）。 */
@@ -530,57 +663,6 @@ export interface PageAuditOutcome {
    * 持たない）。組み立てられなかったときと、検知しなかったときは `null`。省略は `null` と同じ。Page の結果の JSON には含めない。
    */
   readonly authSessionLoss?: SessionLossEvidence | null;
-  /**
-   * 各ビューポートの読み込み（Passive、幅の走査の各幅、Interaction の各候補）の間の、ページ本体の要求の観察の結果（サイトの不調で止めた
-   * ときの診断の記録の設計書 2.1、2.2。2026-10-07 の改訂）。始めなかったビューポート（SKIPPED のビューポート）は `null`。
-   * ページの結果（`PageAuditResult`）と Evidence には含めない（診断の記録だけに使う）。
-   */
-  readonly navigationDiagnostics: Readonly<Record<ViewportProfile, ViewportNavigationDiagnostics | null>>;
-}
-
-/**
- * 1つのビューポートの診断の記録に持つ、幅の走査の幅ごとの観察の結果の最大の数（サイトの不調で止めたときの診断の記録の設計書 2.3）。
- * 設定の `viewports.stressWidths` の数に上限はないので、記録の数だけをここで止める（Page Auditor は、この数までの幅の観察を記録し、
- * 超えた幅の観察は記録しない）。診断の記録のスキーマ（`schemas/site-unavailable-diagnostic.schema.json`）の `stressWidths` の
- * `maxItems` と一致する。
- * 値の根拠: 既定の幅は 5 つで、幅はそれぞれページの読み込み直しなので、ふつうの設定は 10 幅に満たない。320px から 1920px まで 25px
- * おきに調べる密な走査（65 幅）に近い数まで余裕を取った（設計者の決定）。
- */
-export const MAX_STRESS_WIDTH_NAVIGATION_DIAGNOSTICS = 64;
-
-/**
- * 1つのビューポートの、ページ本体の要求の観察の結果（サイトの不調で止めたときの診断の記録の設計書 2.2 の 2026-10-07 の改訂）。
- * Passive の読み込みに加えて、幅の走査の幅ごと（幅の値つき。読み込みを始めた幅だけ、読み込んだ順）と、Interaction の候補ごと
- * （候補の順の番号つき。読み込みを始めた候補だけ、監査した順）の観察を持つ。幅の走査と Interaction は Desktop だけで行うので、
- * Mobile では、どちらも空である。
- */
-export interface ViewportNavigationDiagnostics {
-  /**
-   * Passive の読み込みの間の観察の結果。Passive の読み込みを始めなかった（Context と page を作れなかった）ビューポートは `null`
-   * （そのビューポートでは、幅の走査と Interaction も行わないので、下の2つは空）。
-   */
-  readonly passive: NavigationDiagnostics | null;
-  /** 幅の走査の、読み込みを始めた幅ごとの観察の結果（読み込んだ順。上限は `MAX_STRESS_WIDTH_NAVIGATION_DIAGNOSTICS`）。 */
-  readonly stressWidths: readonly StressWidthNavigationDiagnostics[];
-  /**
-   * Interaction の、対象のページの読み込みを始めた候補ごとの観察の結果（監査した順。上限は、候補の数の上限
-   * `INTERACTION_CANDIDATE_LIMITS.maxCandidates`、`src/safety/interaction-policy.ts`）。
-   */
-  readonly interactionCandidates: readonly InteractionCandidateNavigationDiagnostics[];
-}
-
-/** 幅の走査の1つの幅の読み込みの観察の結果。 */
-export interface StressWidthNavigationDiagnostics {
-  /** 幅（CSS ピクセル。設定の `viewports.stressWidths` の値）。 */
-  readonly width: number;
-  readonly diagnostics: NavigationDiagnostics;
-}
-
-/** Interaction の1つの候補の、対象のページの読み込みの観察の結果。 */
-export interface InteractionCandidateNavigationDiagnostics {
-  /** 候補の順の番号（候補の発見の順。0 から）。 */
-  readonly index: number;
-  readonly diagnostics: NavigationDiagnostics;
 }
 
 /** 実行の環境の事実（設計書 18.1、Task 14〜17 の設計書 5.5）。ビューポート・locale・timezone・headed は `effectiveConfig` にある。 */
@@ -653,10 +735,8 @@ export interface SafetyInvariantViolationRequest {
 export const JOB_SAFETY_VIOLATION_STAGES = Object.freeze(['CONTEXT_OPEN', 'PAGE_LOAD', 'SUBMISSION_PROBE', 'CONTEXT_CLOSE'] as const);
 export type JobSafetyViolationStage = (typeof JOB_SAFETY_VIOLATION_STAGES)[number];
 
-/** DEF-144: 残す違反の一覧の最大の数（IPC の 1 通に収める。数 `invariantViolationCount` は全体）。スキーマの `maxItems` と同じ。 */
-export const MAX_JOB_SAFETY_VIOLATION_ENTRIES = 16;
-/** DEF-144: 違反の文の最大の長さ（文字。IPC の `FAILED` の詳細と同じ大きさ）。スキーマの `maxLength` と同じ。 */
-export const MAX_JOB_SAFETY_VIOLATION_MESSAGE_LENGTH = 1_024;
+// LZ-3a: 残す違反の一覧の数の上限（前は `MAX_JOB_SAFETY_VIOLATION_ENTRIES` 16）は撤廃した（スキーマにも `maxItems` を置かない）。
+// LZ-2: 違反の文の長さの上限（前は `MAX_JOB_SAFETY_VIOLATION_MESSAGE_LENGTH` 1,024）は撤廃した。
 
 /** DEF-144: probe の押下の中の違反の、押した候補（値を持たない）。 */
 export interface JobSafetyViolationPress {
@@ -668,9 +748,10 @@ export interface JobSafetyViolationPress {
 
 /**
  * DEF-144: 発見と READ の確かめのジョブの違反の中身（`discovery.json`・`read-evidence.json` の `safetyViolation`、IPC の `FINISHED` の要約、ジョブの画面）。
- * 違反の一覧と数と記録の不完全は、`run.json` の `safety` と同じ形（`PageSafetySummary`）。値（本文、query の値、Cookie、token）を持たない。
+ * 違反の一覧と数と記録の不完全は、`run.json` の `safety` と同じ形（`PageSafetySummary`）。値（本文、query の値、Cookie、token）を持たない。SAFE-2 の 4: 違反でない
+ * 記録の数（`frameClassificationFailureCount`・`readNavigationFailureCount`）は、違反の中身に持たない（違反の形は変えない）。
  */
-export interface JobSafetyViolation extends PageSafetySummary {
+export interface JobSafetyViolation extends Omit<PageSafetySummary, 'frameClassificationFailureCount' | 'readNavigationFailureCount'> {
   /** 違反が起きた画面の path（query・fragment は持たない。値に見える区切りは伏せる。読めない URL は空）。 */
   readonly pagePath: string;
   readonly stage: JobSafetyViolationStage;
@@ -700,6 +781,13 @@ export interface RunSafetySummary {
    * 必ず持つ。任意の項目で、持たない古い `run.json` は `READ_ONLY`（通した数 0）と読む。
    */
   readonly auditSend?: RunAuditSendSummary;
+  /**
+   * SAFE-2 の 4: 違反にしない止めた記録の数（frame の判定の失敗・読み取りの main frame の移動の失敗。Ledger の snapshot の `count` の合計。飽和）と、外部スキーム
+   * への移動の試みの記録の数。新しい Run は必ず持つ。任意の項目で、持たない古い `run.json` は 0 と読む。
+   */
+  readonly frameClassificationFailureCount?: number;
+  readonly readNavigationFailureCount?: number;
+  readonly externalSchemeNavigationCount?: number;
 }
 
 /** AS-b: `run.json` の `safety.auditSend`（扱いと通した数。値は持たない）。集計は `summarizeRunSafety` の 1 か所。 */
@@ -758,8 +846,8 @@ export interface RunLoadRequests {
 export interface RunLoad {
   /** 実効の設定の `crawl.minNavigationIntervalMs`（ページの読み込みの開始の最小の間隔。ms）。 */
   readonly minNavigationIntervalMs: number;
-  /** 実効の設定の `crawl.maxInteractionsPerPage`（1ページで監査する Interaction の候補の上限）。 */
-  readonly maxInteractionsPerPage: number;
+  /** 実効の設定の `crawl.maxInteractionsPerPage`（1ページで監査する Interaction の候補の上限）。L14: 指定していなければ持たない（上限なし）。 */
+  readonly maxInteractionsPerPage?: number;
   /**
    * 間隔の判定に使った読み込みの開始の回数（`NavigationPacer.snapshot().navigationCount`）。待った後に読み込みを始められなかった
    * 場合も含むので、実際の読み込みの回数より多いことがある（多めに数える側）。
@@ -812,6 +900,17 @@ export const SESSION_KEY_LOST_DETAIL = 'session-key';
 export type SessionKeyLostDetail = typeof SESSION_KEY_LOST_DETAIL;
 
 /**
+ * DEF-233（設計書 `2026-11-09-beaksight-discovery-token-refresh-design.md` 2.3）: 承認したサービスの Origin から 401 を受け、その画面が描けなかったことで、
+ * セッションの切れとみなした（Run の理由 `AUTH_SESSION_LOST` の `detail`、発見と READ の確かめの成果物の `endReasonDetail`。この値の owner）。
+ */
+export const SERVICE_UNAUTHORIZED_DETAIL = 'SERVICE_UNAUTHORIZED';
+export type ServiceUnauthorizedDetail = typeof SERVICE_UNAUTHORIZED_DETAIL;
+
+/** DEF-233: セッションの切れの詳しい理由の閉じた一覧（鍵の消失・サービスの 401。path による切れは詳しい理由を持たない）。 */
+export const SESSION_LOST_DETAILS = Object.freeze([SESSION_KEY_LOST_DETAIL, SERVICE_UNAUTHORIZED_DETAIL] as const);
+export type SessionLostDetail = (typeof SESSION_LOST_DETAILS)[number];
+
+/**
  * 区分ごとの、直近の1分（`LOAD_PEAK_WINDOW_MS`、`src/crawl/load-meter.ts`）に終わった要求の件数（サイトへの負荷の制御の設計書 4.8）。
  * 数えるのは `LoadMeter` だけで、`LoadMeter.recentPerMinute()` がこの形の値を返す。値は 0 以上の整数。
  */
@@ -835,8 +934,8 @@ export interface RunProgressReport {
   readonly pagesFinished: number;
   /** 発見したページの数（開始の URL を含む。`CrawlFrontier.discoveredCount`）。 */
   readonly pagesDiscovered: number;
-  /** 設定の `crawl.maxPages`。 */
-  readonly maxPages: number;
+  /** 設定の `crawl.maxPages`。L14 の後の段: 利用者が指定したときだけ持つ（ないときは上限なし。表示は「指定なし」）。 */
+  readonly maxPages?: number;
   /** この実行の開始からの経過時間（ms。注入した `now` で測る。0 以上）。 */
   readonly elapsedMs: number;
   /** 間隔の判定に使った読み込みの開始の回数（`NavigationPacer.snapshot().navigationCount`。`RunLoad.navigationCount` と同じ意味）。 */
@@ -847,6 +946,12 @@ export interface RunProgressReport {
   readonly requests: RunLoadRequests;
   /** 区分ごとの、直近の1分に終わった要求の件数（`LoadMeter.recentPerMinute()`）。 */
   readonly recentPerMinute: RunLoadRecentPerMinute;
+  /**
+   * L0（設計書 `2026-11-09-beaksight-remove-limits-design.md` 5 の 1）: 今監査を始めたページの URL。ページを始めた知らせ
+   * （`RunCoordinatorDependencies.onPageStarted`）だけが持つ（止まったページが、最後の進み具合の記録に残るようにするため）。ページを終えた後の
+   * 進み具合と、発見・READ の確かめの進み具合は持たない（項目がない）。認証つきの Run では伏せ字（`redactUrlSecrets`）の後の値。
+   */
+  readonly currentPageUrl?: string;
 }
 
 /** クロールの上限に達したか。 */
@@ -929,6 +1034,11 @@ export interface RunSummary {
    * DEF-138: セッションの切れで止まった実行は、その証拠（`sessionLoss`）も持つ（フォームの送信のログインの監査は、証拠だけを持つ）。
    */
   readonly authentication?: RunAuthenticationRecord;
+  /**
+   * WSO: 点検の範囲（任意の項目。「チェックした画面だけ」の Run だけが持つ。読む画面の数だけで、URL は持たない）。サイトの全部の画面の Run と、前の書き手の
+   * `run.json` は持たない。
+   */
+  readonly pageScope?: RunPageScopeRecord;
 }
 
 /** T44c: ページの未完了の理由ごとのページの数（`RunSummary.pageIncompleteReasonCounts` の 1 件）。 */
@@ -974,11 +1084,13 @@ export interface RunRetryRecord {
  * 確定した Run（Task 14〜17 の設計書 5.6.1）。`RunCoordinator.run()` の戻り値で、Task 16 の artifact の書き出しに渡す。
  * audit.json（`schemas/audit.schema.json`）の最上位の `run`・`pages`・`findings` にあたる。audit.json の `schemaVersion` は、
  * artifact の書き出しが付ける。
+ * MEM-3（DEF-266）: `pages` の形は型の引数（`TPages`）。既定は配列（テストと今の呼び出し側）。本番の Run は、圧縮して持つ置き場所
+ * （`src/core/run-page-store.ts` の `RunPageStore`）にする。読む側は `forEachRunPage` でなめる。
  */
-export interface AuditRunResult {
+export interface AuditRunResult<TPages extends RunPages = readonly PageAuditResult[]> {
   readonly run: RunSummary;
   /** URL の発見の順。監査しなかった URL の `SKIPPED` の結果も含む。 */
-  readonly pages: readonly PageAuditResult[];
+  readonly pages: TPages;
   /** Page rule と Cross-page rule のすべての Finding。 */
   readonly findings: readonly Finding[];
   /**
@@ -1043,4 +1155,17 @@ export interface RunExecution {
   readonly finishedAt: string;
   /** 実行の終わり方。 */
   readonly endReason: RunExecutionEndReason;
+  /**
+   * DEF-200（設計書 `2026-11-04-beaksight-login-session-design.md` 3.4）: この実行が、ログインの切れの後に、自動ログインでログインし直して自動で始めた実行の印と、
+   * その時点のログインし直しの回数（段ごとに 1 から）。ほかの実行と、前の版の `run.json` は持たない（任意）。新しい終わり方の値は足さない。
+   */
+  readonly automaticRelogin?: RunExecutionAutomaticRelogin;
+}
+
+/** DEF-200: 段ごとのログインし直しの回数の上限（1 回の段で 2 回まで。自動ログインの全体の上限は別に守る）。 */
+export const MAX_AUTOMATIC_RELOGINS_PER_STAGE = 2;
+
+/** DEF-200: ログインし直して自動で始めた実行の印（回数は 1 から `MAX_AUTOMATIC_RELOGINS_PER_STAGE` まで）。 */
+export interface RunExecutionAutomaticRelogin {
+  readonly count: number;
 }

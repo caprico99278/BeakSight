@@ -10,7 +10,7 @@
 import { readFileSync } from 'node:fs';
 import { resolve } from 'node:path';
 import { describe, expect, it } from 'vitest';
-import { ACTION_BLOCK_REASONS, MAX_SUBMITTED_VALUE_LENGTH, SUBMISSION_STATES } from '../../src/control/actions/action-contracts.js';
+import { ACTION_BLOCK_REASONS, SUBMISSION_STATES } from '../../src/control/actions/action-contracts.js';
 import { FORM_NAVIGATION_SETUP_ITEMS } from '../helpers/auth-setup-samples.js';
 import {type AuthSetup } from '../../src/control/auth/auth-setup-contracts.js';
 import {
@@ -20,7 +20,6 @@ import {
   WORKER_WRITE_BLOCK_REASONS,
   WORKER_WRITE_CREATE_JOB_KIND,
   WORKER_WRITE_RECHECK_REJECTION_REASONS,
-  WORKER_WRITE_RECHECK_TIMEOUT_MS,
   WORKER_WRITE_SUBMISSION_STATES,
   targetConfigDigestOf,
   validateParentToWorkerMessage,
@@ -88,15 +87,20 @@ const withWrite = (overrides: Record<string, unknown>): Record<string, unknown> 
 
 describe('T30e: the write job messages and lists', () => {
   it('raises the protocol version and adds the message types at the end of each direction', () => {
-    expect(WORKER_PROTOCOL_VERSION).toBe('beaksight-worker-message/2');
+    expect(WORKER_PROTOCOL_VERSION).toBe('beaksight-worker-message/9'); // WSO: チェックした画面だけの段の並びと読む画面で版 9。DEF-200: ログインし直す段の指定（`RELOGIN_STAGE`）と、自動ログインの段の通した一覧（DEF-194）で版 8。 OP-2: 書き込みの段で版 4。DEF-180: 前の読み込みの時刻で版 5。OP-H: チェックした画面の数で版 6。OP-L: 保存できなかった理由で版 7
     // ML-a: 「ログインを終えた」（`LOGIN_CONFIRMED`）を、親 → 子の最後に足した。FM2d: まとめて実行の `NEXT_STAGE`・`CHAIN_END` を、その後に足した。
-    expect(PARENT_TO_WORKER_MESSAGE_TYPES).toEqual(['START', 'STOP', 'WRITE_RECHECK_RESULT', 'LOGIN_CONFIRMED', 'NEXT_STAGE', 'CHAIN_END']);
-    expect(WORKER_TO_PARENT_MESSAGE_TYPES.slice(-2)).toEqual(['WRITE_RECHECK_REQUEST', 'WRITE_SUBMISSION']);
+    // OP-1: ログインの直後の登録の往復（`CREDENTIAL_SAVE_ALLOWED`・`LOGIN_REGISTERED`・`LOGIN_REGISTRATION_SKIPPED`、子 → 親の `CREDENTIAL_SAVED`）を、それぞれの最後に足した。
+    expect(PARENT_TO_WORKER_MESSAGE_TYPES).toEqual([
+      'START', 'STOP', 'WRITE_RECHECK_RESULT', 'LOGIN_CONFIRMED', 'NEXT_STAGE', 'CHAIN_END',
+      'CREDENTIAL_SAVE_ALLOWED', 'LOGIN_REGISTERED', 'LOGIN_REGISTRATION_SKIPPED',
+      // DEF-200: ログインし直す段の指定を、親 → 子の最後に足した。
+      'RELOGIN_STAGE',
+    ]);
+    expect(WORKER_TO_PARENT_MESSAGE_TYPES.slice(-3)).toEqual(['WRITE_RECHECK_REQUEST', 'WRITE_SUBMISSION', 'CREDENTIAL_SAVED']);
     expect(WORKER_WRITE_CREATE_JOB_KIND).toBe('WRITE_CREATE');
     expect(WORKER_WRITE_RECHECK_REJECTION_REASONS).toEqual(['GRANT_INVALID', 'FACTS_UNAVAILABLE', 'RECHECK_REPEATED']);
     expect(WORKER_WRITE_SUBMISSION_STATES).toBe(SUBMISSION_STATES);
     expect(WORKER_WRITE_BLOCK_REASONS).toBe(ACTION_BLOCK_REASONS);
-    expect(WORKER_WRITE_RECHECK_TIMEOUT_MS).toBe(10_000);
   });
 
   it('has no property for a credential, a cookie, a CSRF token or a hidden value in the write specification', () => {
@@ -110,7 +114,28 @@ describe('T30e: START of a write job', () => {
   it('accepts WRITE_CREATE with the authentication and the write specification', () => {
     expect(errorsOf(start(WORKER_WRITE_CREATE_JOB_KIND, { write: write() }))).toEqual([]);
     expect(errorsOf(withWrite({ request: { ...(write().request as object), methodOverride: 'PATCH', enctype: 'multipart/form-data' } }))).toEqual([]);
-    expect(errorsOf(withWrite({ verification: { ...(write().verification as object), recordId: { source: 'ELEMENT', selector: '#id' } } }))).toEqual([]);
+    // PL-6a（設計書 `2026-10-26-beaksight-plain-ui-design.md` 8.1）: form の ID の取り方は ID の型の一覧（LZ-3c: 前の 2 つまでの上限はない）。人が入れる CSS セレクタ
+    // （`ELEMENT`）と、型 1 つの API の取り方は受けない。結果の判定のしかたの印は構造の判定だけ（成否の条件の項目は受けない）。
+    expect(errorsOf(withWrite({
+      verification: { ...(write().verification as object), recordId: { source: 'URL_PATH_PATTERNS', pathPatterns: ['/members/{id}', '/members/{id}/edit', '/c/{id}'] } },
+    }))).toEqual([]);
+    for (const verification of [
+      { ...(write().verification as object), recordId: { source: 'ELEMENT', selector: '#id' } },
+      { ...(write().verification as object), recordId: { source: 'URL_PATH_PATTERN', pathPattern: '/members/{id}' } },
+      { ...(write().verification as object), resultJudgement: null },
+      { ...(write().verification as object), successCondition: { pathPrefix: '/members/', selector: null } },
+    ]) {
+      expect(errorsOf(withWrite({ verification })).length, JSON.stringify(verification)).toBeGreaterThan(0);
+    }
+  });
+
+  // L13（N28・N30）: 候補の欄・送る値の数と名前の長さに上限を置かない（前は 200 個・256 文字）。
+  it('accepts more than 200 candidate fields and values, and long field names', () => {
+    const names = [...Array.from({ length: 201 }, (_value, index) => `f${String(index)}`), 'n'.repeat(300)];
+    expect(errorsOf(withWrite({
+      candidateFields: names.map((name) => field(name)),
+      values: Object.fromEntries(names.map((name) => [name, 'v'])),
+    }))).toEqual([]);
   });
 
   it('requires the write specification and the authentication for WRITE_CREATE, and allows it for no other kind', () => {
@@ -135,12 +160,14 @@ describe('T30e: START of a write job', () => {
     ['a value of a file field', { values: { name: 'x', attachment: 'y' } }],
     ['a value of the method override field', { values: { name: 'x', _method: 'DELETE' } }],
     ['a value of a secret-like name', { candidateFields: [field('name'), field('access_token')], values: { name: 'x', access_token: 'y' } }],
-    ['a too long value', { values: { name: 'x'.repeat(MAX_SUBMITTED_VALUE_LENGTH + 1) } }],
+    // L12b（設計書 `2026-11-09-beaksight-remove-limits-design.md` 6.2。S18）: 値の長さの上限（前は `MAX_SUBMITTED_VALUE_LENGTH`）を撤廃したので、長い値は拒まない。
     ['a bad grant id', { grantId: 'Grant 1' }],
     ['a bad scenario revision', { scenarioRevision: 0 }],
     ['a bad candidate digest', { candidate: { identityDigest: 'sha256:x', ruleDigest: RULE_DIGEST } }],
     ['a missing verification item', { verification: { successCondition: { pathPrefix: '/a', selector: null }, inputErrorCondition: { pathPrefix: '/b', selector: null } } }],
-    ['a null verification item', { verification: { ...(write().verification as object), recordId: null } }],
+    // PL-5 の 9 の (4)（設計書 8.1）: form の ID の取り方の null は受ける（決められなかった登録。ワーカーは ID を取らず、結果は ID なしの PARTIAL）。
+    // 結果の判定のしかたの印の null は今どおり拒む。
+    ['a null verification item', { verification: { ...(write().verification as object), resultJudgement: null } }],
     ['a verification READ with a secret-like parameter', { readVerification: { ...(write().readVerification as object),
       definition: { targetIdentityDigest: DIGEST, parameters: { password: 'x' }, expectations: [{ kind: 'ROW_COUNT_EQUALS', count: 1 }] } } }],
     // T37d（設計者の判断 5）: 書き込みの照合の READ に、画面の path の定義は使わない（対象の画面が path と同じでも拒む）。
@@ -246,18 +273,21 @@ describe('T31f: START of an update write job', () => {
     }
   });
 
-  it('has only the target, the templated digest and the field roles in the update block (no value of a kept field, no prior value)', () => {
+  // LU-12b（一覧の行の更新の設計書 5.5。ユーザーの判断 2026-11-03「台帳との比べをフォームの形にも広げる」）: 形 B の更新だけ、保つ欄の台帳の最後の値
+  // （`knownKeptValues`。API の形と同じ名前と扱い）と行の選び方（`listRow`）を持つ。ほかの、前の値・今の値に見える名前の項目は、今のとおり持たない。
+  it('has only the target, the templated digest, the field roles and the list row items in the update block (no prior value)', () => {
     const startWrite = (SCHEMA.$defs as Record<string, Record<string, unknown>>)['startWrite'] ?? {};
     const update = ((startWrite['properties'] as Record<string, unknown>)['update'] ?? {}) as Record<string, unknown>;
-    expect(Object.keys(update['properties'] as object).sort()).toEqual(['changedFieldNames', 'keptFieldNames', 'targetRecordId', 'templatedIdentityDigest']);
+    expect(Object.keys(update['properties'] as object).sort())
+      .toEqual(['changedFieldNames', 'keptFieldNames', 'knownKeptValues', 'listRow', 'targetRecordId', 'templatedIdentityDigest']);
     expect(update['additionalProperties']).toBe(false);
-    expect(propertyNamesWithWords(startWrite, ['previous', 'prior', 'before', 'keptvalue', 'currentvalue'])).toEqual([]);
+    expect(propertyNamesWithWords(startWrite, ['previous', 'prior', 'before', 'keptvalue', 'currentvalue'])).toEqual(['knownkeptvalues']);
   });
 
   it.each<readonly [string, Record<string, unknown>]>([
     ['a target that is not a record id', { update: updateOf({ targetRecordId: '4/2' }) }],
     ['an empty target', { update: updateOf({ targetRecordId: '' }) }],
-    ['a too long target', { update: updateOf({ targetRecordId: 'a'.repeat(65) }) }],
+    // L12b（設計書 `2026-11-09-beaksight-remove-limits-design.md` 6.2。設計者の判断 1・2）: 対象の ID の長さの上限は撤廃したので、「長すぎる対象」の例は外した。
     ['a bad templated digest', { update: updateOf({ templatedIdentityDigest: 'sha256:x' }) }],
     ['no changed field', { update: updateOf({ changedFieldNames: [] }), values: {} }],
     ['a changed field without a value', { update: updateOf({ changedFieldNames: ['email', 'name', 'newsletter'] }), values: { name: 'x', email: 'y' } }],
@@ -288,6 +318,66 @@ describe('T31f: START of an update write job', () => {
   });
 });
 
+// LU-12b（設計書 `2026-11-02-beaksight-list-row-update-design.md` 4.0 の D5、5.5 の最後の段）: フォームの一覧の行の更新（形 B）の `START`。書き込みの画面は一覧の
+// 画面の path（番号を求めない）、送信先は最後の区切りが対象の ID、`update.listRow`（一覧の path・開き手・行を選ぶ値）と `update.knownKeptValues`（保つ欄の
+// 台帳の最後の値）を持つ。どちらも一覧の行の更新でだけ持てる。
+describe('LU-12b: START of a list row form update', () => {
+  const OPENER = `sha256:${'5'.repeat(64)}`;
+  const listRowWrite = (overrides: Record<string, unknown> = {}, update: Record<string, unknown> = {}): Record<string, unknown> => {
+    const base = sampleStartUpdateWrite(ORIGIN);
+    return {
+      ...base,
+      request: { ...(base['request'] as object), path: `/members/${SAMPLE_UPDATE_TARGET_RECORD_ID}` },
+      formPage: { origin: ORIGIN, path: '/members' },
+      update: {
+        ...(base['update'] as Record<string, unknown>),
+        knownKeptValues: [{ key: 'newsletter', value: 'on' }],
+        listRow: { listPagePath: '/members', openerIdentityDigest: OPENER, rowKeyValue: 'sample-row@example.invalid' },
+        ...update,
+      },
+      ...overrides,
+    };
+  };
+  const listRowStart = (overrides: Record<string, unknown> = {}, update: Record<string, unknown> = {}): Record<string, unknown> =>
+    start('WRITE_UPDATE', { write: listRowWrite(overrides, update) });
+
+  it('accepts the list row form update with the list page as the page and the target at the end of the destination', () => {
+    expect(errorsOf(listRowStart())).toEqual([]);
+    expect(errorsOf(listRowStart({}, { knownKeptValues: [] }))).toEqual([]);
+  });
+
+  it.each<readonly [string, Record<string, unknown>, Record<string, unknown>]>([
+    ['a page that is not the list page of the list row', { formPage: { origin: ORIGIN, path: '/others' } }, {}],
+    ['a list page path with a template', { formPage: { origin: ORIGIN, path: '/members/{id}' } },
+      { listRow: { listPagePath: '/members/{id}', openerIdentityDigest: OPENER, rowKeyValue: 'x' } }],
+    ['a destination without the target', { request: { formMethod: 'POST', methodOverride: 'PATCH', origin: ORIGIN, path: '/members/43', enctype: 'application/x-www-form-urlencoded' } }, {}],
+    ['a destination whose last segment is not the target',
+      { request: { formMethod: 'POST', methodOverride: 'PATCH', origin: ORIGIN, path: `/members/${SAMPLE_UPDATE_TARGET_RECORD_ID}/save`, enctype: 'application/x-www-form-urlencoded' } }, {}],
+    ['no ledger values of the kept fields', {}, { knownKeptValues: undefined }],
+    ['a ledger value of a field that is not kept', {}, { knownKeptValues: [{ key: 'name', value: 'x' }] }],
+    ['a ledger value twice', {}, { knownKeptValues: [{ key: 'newsletter', value: 'on' }, { key: 'newsletter', value: 'on' }] }],
+    ['an empty row key value', {}, { listRow: { listPagePath: '/members', openerIdentityDigest: OPENER, rowKeyValue: '' } }],
+    ['a bad opener digest', {}, { listRow: { listPagePath: '/members', openerIdentityDigest: 'sha256:x', rowKeyValue: 'x' } }],
+    ['another item in the list row', {}, { listRow: { listPagePath: '/members', openerIdentityDigest: OPENER, rowKeyValue: 'x', rowKeyField: 'email' } }],
+  ])('rejects a list row form update with %s', (_label, overrides, update) => {
+    expect(errorsOf(listRowStart(overrides, update))).not.toEqual([]);
+  });
+
+  it('allows the ledger values of the kept fields for a list row form update only', () => {
+    const plain = sampleStartUpdateWrite(ORIGIN);
+    const withKnown = { ...plain, update: { ...(plain['update'] as Record<string, unknown>), knownKeptValues: [{ key: 'newsletter', value: 'on' }] } };
+    expect(errorsOf(start('WRITE_UPDATE', { write: withKnown }))).not.toEqual([]);
+  });
+
+  it('writes no row key value, no target and no field name into the errors', () => {
+    const errors = errorsOf(listRowStart({ formPage: { origin: ORIGIN, path: '/others' } }, { knownKeptValues: [{ key: 'name', value: 'sample-secret-like' }] }));
+    expect(errors).not.toEqual([]);
+    for (const word of ['sample-row@example.invalid', 'sample-secret-like', SAMPLE_UPDATE_TARGET_RECORD_ID, 'newsletter']) {
+      expect(errors.join(' ')).not.toContain(word);
+    }
+  });
+});
+
 // T32d（Task 32 の設計書 4.1 の「承認の要約の受け渡し」）: 書き込みの指定の承認の要約（`write.approvalFacts`）。親が実行の許可を消費した後に、開始の
 // 時点の事実を入れる（ワーカーは照らさずに成果物 `approval-summary.json` に書き写す）。形は成果物のスキーマの事実の形（`approval-summary` の
 // `$defs/facts`）を `$ref` で使う（書き写さない）。書き込みの指定のシナリオ・版・許可・プロファイル・種類と食い違う事実は拒む（fail-closed）。
@@ -314,7 +404,6 @@ describe('T32d: the approval facts of the write specification', () => {
     ['approval facts with the document items of the worker', { approvalFacts: factsOf({ jobId: 'job-write' }) }],
     ['approval facts with an approver other than the local operator', { approvalFacts: factsOf({
       approval: { ...((write()['approvalFacts'] as Record<string, unknown>)['approval'] as object), approver: 'someone' } }) }],
-    ['approval facts with a cumulative count above the default limit', { approvalFacts: factsOf({ cumulativeAtStart: { used: 21, limit: 20 } }) }],
     ['approval facts with a reservation of two writes', { approvalFacts: factsOf({ reservationAtStart: { count: 2, reservedAt: '20261015000000' } }) }],
     ['approval facts with a bad consumption time', { approvalFacts: factsOf({
       grantAtStart: { ...((write()['approvalFacts'] as Record<string, unknown>)['grantAtStart'] as object), consumedAt: null } }) }],

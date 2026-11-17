@@ -1,6 +1,8 @@
 // FM2d（設計書 `2026-10-19-beaksight-fewer-manual-steps-design.md` 3A.1、5 章の 2026-10-22 の FM2d の Blocker の行）: まとめて実行の決まり
 // （`src/control/job/stage-chain-policy.ts`。純粋な関数と閉じた一覧だけ）。
-// - 段の並びはモードで決める（`TEST_AUTH_PASSIVE`: 監査 → 発見 → READ、`TEST_APPROVED_WRITE`: 発見 → READ、公開の監査: なし）。
+// - 段の並びはモードで決める（`TEST_AUTH_PASSIVE`: 監査 → 発見 → READ、公開の監査: なし）。MI-5（設計書
+//   `2026-10-26-beaksight-minimal-input-ux-design.md` 4.5）: 書き込みのモードでも監査を始められるので、`TEST_APPROVED_WRITE` も監査 → 発見 → READ にした
+//   （前は発見 → READ）。
 // - 次の段へ進むか: 進むのは `COMPLETE` と、止める理由のない `PARTIAL`（ページ・時間の上限、ページ単位の理由）。止める理由は閉じた一覧（利用者の停止、Safety の
 //   違反、サイトの不調、セッションの切れ、`FAILED`、サービスの要求の上限、改訂の変化）。
 // - READ の確かめは、定義が 1 件以上のときだけ。0 件なら「行わなかった」（失敗にしない）。
@@ -27,9 +29,9 @@ const ran = (overrides: Partial<ChainAdvanceInput> = {}): ChainAdvanceInput => (
 });
 
 describe('FM2d: the stages of the chained run by the mode', () => {
-  it('chains the audit, the discovery and the READ check in TEST_AUTH_PASSIVE, and the discovery and the READ check in TEST_APPROVED_WRITE', () => {
+  it('chains the audit, the discovery and the READ check in TEST_AUTH_PASSIVE and in TEST_APPROVED_WRITE (MI-5)', () => {
     expect(chainStagesOfMode('TEST_AUTH_PASSIVE')).toEqual(['AUDIT', 'DISCOVERY', 'READ_CHECK']);
-    expect(chainStagesOfMode('TEST_APPROVED_WRITE')).toEqual(['DISCOVERY', 'READ_CHECK']);
+    expect(chainStagesOfMode('TEST_APPROVED_WRITE')).toEqual(['AUDIT', 'DISCOVERY', 'READ_CHECK']);
     expect(chainStagesOfMode('PUBLIC_PASSIVE')).toBeNull();
   });
 });
@@ -78,8 +80,16 @@ describe('FM2d: whether the chained run goes to the next stage', () => {
     expect(continuing).toEqual([
       'DEADLINE_EXCEEDED', 'EVALUATION_FAILED', 'PAGE_CLOSED', 'NAVIGATION_FAILED', 'DOM_READINESS_FAILED', 'SCROLL_TARGET_UNRESOLVED', 'SCROLL_NOT_ADVANCED',
       'INNER_SCROLL_CONTAINER_NOT_TRAVERSED', 'INNER_SCROLL_SCAN_LIMIT_REACHED', 'SCROLL_TARGET_UNSTABLE', 'POSITION_NOT_AT_ORIGIN', 'LAYOUT_COMPARISON_LIMIT_REACHED',
-      'RESOURCE_LIMIT_REACHED', 'INVALID_BROWSER_DATA', 'PAGE_NAVIGATION_LIMIT_REACHED', 'PAGE_SUBRESOURCE_LIMIT_REACHED', 'MAX_PAGES_REACHED', 'MAX_DEPTH_REACHED',
+      'RESOURCE_LIMIT_REACHED', 'INVALID_BROWSER_DATA', 'PAGE_NAVIGATION_LIMIT_REACHED', 'PAGE_SUBRESOURCE_LIMIT_REACHED',
+      // DEF-210: 通知の枠の閉じる押下の移動を止めた（ページ単位の理由）。
+      'NOTIFICATION_DISMISSAL_NAVIGATION_BLOCKED',
+      // DEF-250 の c: 点検の途中で、画面が外部スキームへ移ろうとしたか、誤りの画面に替わった（ページ単位の理由）。
+      'DOCUMENT_LEFT_DURING_AUDIT',
+      // DEF-225: 開くとファイルのダウンロードになる画面（ページ単位の理由）。
+      'DOWNLOAD_RESPONSE', 'MAX_PAGES_REACHED', 'MAX_DEPTH_REACHED',
       'MAX_RUNTIME_REACHED', 'COLLECTOR_INCOMPLETE', 'RULE_EVALUATION_FAILED', 'PAGE_CRASHED',
+      // L0: 進みの見張りが段を終えた（ページ単位の理由）。
+      'STAGE_UNRESPONSIVE', 'STAGE_NEVER_QUIET',
     ]);
     // 一覧にない値（型の外から来たもの）は、止める側に倒す。
     expect(chainAdvanceDecisionOf(ran({ stageRunStatus: 'PARTIAL', incompleteReasonCodes: ['NOT_A_CODE' as never] })))
@@ -102,6 +112,10 @@ describe('FM2d: whether the chained run goes to the next stage', () => {
       'STAGE_FAILED',
       'PROFILE_REVISION_CHANGED',
       'NEXT_STAGE_REJECTED',
+      // OP-2: 書き込みの段の結果が分からない。
+      'WRITE_RESULT_UNKNOWN',
+      // OP-F: チェックした画面のうち、試せなかった画面があった。
+      'WRITE_NOT_TRIED',
     ]);
   });
 });

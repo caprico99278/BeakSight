@@ -15,7 +15,7 @@ import {
 import type { DiscoveredCandidate, DiscoveryCandidate } from '../../src/discovery/candidate-contracts.js';
 import { classifyCandidate } from '../../src/discovery/classify.js';
 import { computeCandidateDigests } from '../../src/discovery/fingerprint.js';
-import { MAX_READ_CHECK_PARAMETER_VALUE_LENGTH, type ReadCheckDefinition } from '../../src/discovery/read-check-contracts.js';
+import type { ReadCheckDefinition } from '../../src/discovery/read-check-contracts.js';
 import { SAMPLE_ALLOWED_ORIGINS, sampleAction, sampleField, sampleForm } from './discovery-candidate-samples.js';
 
 const candidateOf = (discovered: DiscoveredCandidate): DiscoveryCandidate => ({
@@ -63,7 +63,6 @@ describe('READ check definition validation (T27c)', () => {
       'READ_PARAMETER_NOT_ALLOWED',
       'READ_CANDIDATE_UNKNOWN',
       'READ_CANDIDATE_NOT_READ',
-      'READ_CHECK_LIMIT_EXCEEDED',
       'READ_CHECK_PROFILE_NOT_FOUND',
       'READ_CHECK_NOT_FOUND',
       'READ_CHECK_REVISION_CONFLICT',
@@ -183,7 +182,6 @@ describe('READ check definition validation (T27c)', () => {
       null,
       'definition',
       definition({ expectations: [{ kind: 'STATUS_EQUALS' }] }),
-      definition({ parameters: { q: 'x'.repeat(MAX_READ_CHECK_PARAMETER_VALUE_LENGTH + 1) } }),
       definition({ note: 'extra' }),
     ]) {
       const codes = codesOf(validateReadCheckDefinition(input, READ_CANDIDATE));

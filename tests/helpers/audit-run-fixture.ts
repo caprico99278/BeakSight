@@ -35,6 +35,7 @@ import {
   INTERACTION_REASON_CODES_BY_STATUS,
   PAGE_SCHEMA_VERSION,
   SAFETY_EVENT_KINDS,
+  type CssColorEvidence,
   type DomEvidence,
   type InteractionCandidateEvidence,
   type InteractionChangeEvidence,
@@ -50,6 +51,7 @@ import {
   type ScreenshotCaptureType,
 } from '../../src/core/evidence-types.js';
 import { createEvidenceId, createFindingId, createPageId, createRunId, createSha256Fingerprint } from '../../src/core/ids.js';
+import { createRunPageStore, runPagesArrayOf, type RunPages, type RunPageStore } from '../../src/core/run-page-store.js';
 import type { RunStatusInput } from '../../src/core/status.js';
 import { SafetyLedger, safetyEventsEvidenceFromSnapshot } from '../../src/safety/safety-ledger.js';
 import { createTestConfig } from './test-config.js';
@@ -223,6 +225,7 @@ function interactionCandidate(candidateId: string, accessibleName: string): Inte
     type: 'button',
     disabled: false,
     visible: true,
+    destructiveAction: false,
     boundingBox: { x: 8, y: 8, width: 100, height: 20, top: 8, right: 108, bottom: 28, left: 8 },
   };
 }
@@ -618,7 +621,7 @@ export function runSummary(overrides: Partial<RunSummary> = {}): RunSummary {
     incompleteReasons: [],
     load: {
       minNavigationIntervalMs: createTestConfig(FIXTURE_ORIGIN).crawl.minNavigationIntervalMs,
-      maxInteractionsPerPage: createTestConfig(FIXTURE_ORIGIN).crawl.maxInteractionsPerPage,
+      // L14: 1 ページの操作の上限は、指定したときだけ書く（テストの設定は指定しない）。
       navigationCount: 0,
       pacingWaitMs: 0,
       requests: {
@@ -709,6 +712,85 @@ export function auditRun(options: AuditRunOptions = {}): AuditRunResult {
     findings: options.findings ?? pages.flatMap((value) => value.findings),
     statusInput: runStatusInput(options.statusInput),
   };
+}
+
+/** COV-6: `collectedInPartsAuditRun` の件数（今までの件数の上限を超える数）。 */
+export const COLLECTED_IN_PARTS_SAMPLE_COUNTS = Object.freeze({ links: 3_000, axeNodes: 150, colorSamples: 1_500, headings: 600 });
+
+/**
+ * COV-6: 件数の上限で打ち切らずに分けて集めた、新しい形の記録の見本。既定の Run の PAGE-000001 に、`collectedInParts` を持つリンク・色・DOM の
+ * Evidence と、要素 150 件の axe の Evidence（`omittedNodeCount` 0）を足し、axe の要素ごとの Finding（ACCESSIBILITY）を付ける。
+ */
+export function collectedInPartsAuditRun(): AuditRunResult {
+  const counts = COLLECTED_IN_PARTS_SAMPLE_COUNTS;
+  const links = record('link', 20, PAGE_1, 'desktop', {
+    links: Array.from({ length: counts.links }, (_value, index) => {
+      const url = fixtureUrl(`/items/${index}`);
+      return {
+        sourcePageId: PAGE_1,
+        anchorText: `Item ${index}`,
+        ariaLabel: null,
+        title: null,
+        rawHref: `/items/${index}`,
+        normalized: { ok: true as const, url },
+        admission: { kind: 'INTERNAL_NAVIGABLE' as const, url },
+        truncated: false,
+      };
+    }),
+    omittedLinkCount: 0,
+    collectedInParts: 2,
+  });
+  const axe = record('accessibility', 21, PAGE_1, 'desktop', {
+    status: 'COMPLETE',
+    frameScope: 'SAME_ORIGIN_ONLY',
+    scrollPosition: { scrollX: 0, scrollY: 0 },
+    violations: [{
+      ruleId: 'image-alt',
+      impact: 'critical',
+      help: 'Images must have alternate text',
+      helpUrl: 'https://dequeuniversity.invalid/rules/image-alt',
+      tags: ['wcag2a'],
+      nodes: Array.from({ length: counts.axeNodes }, (_value, index) => ({
+        impact: 'critical' as const,
+        targetSelectors: [`#image-${index}`],
+        failureSummary: 'Fix any of the following: ...',
+        htmlSnippet: `<img id="image-${index}">`,
+        truncated: false,
+      })),
+      omittedNodeCount: 0,
+    }],
+    incomplete: [],
+  });
+  const red: CssColorEvidence = { css: 'rgba(200, 0, 0, 1)', red: 200, green: 0, blue: 0, alpha: 1 };
+  const white: CssColorEvidence = { css: 'rgba(255, 255, 255, 1)', red: 255, green: 255, blue: 255, alpha: 1 };
+  const color = record('color', 22, PAGE_1, 'desktop', {
+    scrollPosition: { scrollX: 0, scrollY: 0 },
+    textSamples: Array.from({ length: counts.colorSamples }, (_value, index) => ({
+      selector: `#text-${index}`,
+      text: `Text ${index}`,
+      foreground: { status: 'OBSERVED' as const, color: red },
+      background: { status: 'OBSERVED' as const, color: white },
+      contrast: { status: 'OBSERVED' as const, ratio: 4.5, effectiveForeground: red },
+      boundingArea: 10,
+      visibleArea: 10,
+      truncated: false,
+    })),
+    textSamplesTruncated: false,
+    foregroundDistribution: [{ color: red, area: counts.colorSamples * 10, proportion: 1, sampleCount: counts.colorSamples }],
+    omittedDistributionEntryCount: 0,
+    observedArea: counts.colorSamples * 10,
+    collectedInParts: 2,
+  });
+  const desktopDom = dom(23, PAGE_1, 'desktop', JAPANESE_TEXT.repeat(4_000), {
+    headings: Array.from({ length: counts.headings }, (_value, index) => ({ level: 2, text: `見出し ${index}`, truncated: false })),
+    collectedInParts: 2,
+  });
+  const axeFindings = Array.from({ length: counts.axeNodes }, (_value, index) => finding(100 + index, 'ERROR', 'ACCESSIBILITY', PAGE_1, [idOf(axe)], {
+    ruleId: 'A11Y_IMAGE_ALT',
+    message: `axe のルール「image-alt」の違反を検出しました（impact: critical、対象: #image-${index}）。`,
+  }));
+  const evidence = [metadata(1, PAGE_1), desktopDom, links, axe, color, screenshot(3, PAGE_1, 'desktop', 'VIEWPORT'), safety(8, PAGE_1, 'desktop')];
+  return auditRun({ pages: [page(PAGE_1, '/', 'AUDITED', evidence, axeFindings)] });
 }
 
 /** BN-c・BN-d: `beaksightBlockAuditRun` の止めた script の URL と、止めた要求の失敗の理由。 */
@@ -831,4 +913,28 @@ export function edgeCaseAuditRun(): AuditRunResult {
     findings: [...findings],
     statusInput: runStatusInput({ incompleteReasons: structuredClone(incompleteReasons), notVerifiedRequiredWork: 1 }),
   };
+}
+
+// ---------------------------------------------------------------------------------------------------------------
+// MEM-3: ページの結果の置き場所（`src/core/run-page-store.ts`）
+// ---------------------------------------------------------------------------------------------------------------
+
+/** ページの並びを、置き場所に入れたもの（要約は `summaryOf` で作る。省略は `null`）。 */
+export async function storeOf<TSummary = null>(
+  pages: readonly PageAuditResult[],
+  summaryOf: (page: PageAuditResult) => TSummary = () => null as TSummary,
+): Promise<RunPageStore<TSummary>> {
+  const store = createRunPageStore<TSummary>();
+  for (const value of pages) {
+    await store.add(value, summaryOf(value));
+  }
+  return store;
+}
+
+/** ページの並び（配列か置き場所）の、全部のページ（テストで中身を確かめるため。全部を戻す）。 */
+export const pagesArrayOf = async (pages: RunPages): Promise<readonly PageAuditResult[]> => runPagesArrayOf(pages);
+
+/** 確定した Run の、ページを配列に戻したもの（Run Coordinator が返す置き場所の Run を、今の形で確かめるため）。 */
+export async function auditRunArrayOf(result: AuditRunResult<RunPages>): Promise<AuditRunResult> {
+  return { ...result, pages: await runPagesArrayOf(result.pages) };
 }

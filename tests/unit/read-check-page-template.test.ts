@@ -12,6 +12,7 @@ import {
   type ReadCheckPageContext,
 } from '../../src/control/read-check-policy.js';
 import {
+  readListPagePathOf,
   READ_CHECK_PAGE_TEMPLATE_SAMPLE_ID,
   isReadCheckPageTemplatePath,
   readCheckPageTemplateUrlOf,
@@ -37,7 +38,12 @@ describe('T38c: the page path template of a READ check definition (the contract)
     expect(readCheckPageTemplateUrlOf(ORIGIN, TEMPLATE, 'abc_D-9', isUsableRecordId)).toBe(`${ORIGIN}/admin/members/abc_D-9`);
     expect(READ_CHECK_PAGE_TEMPLATE_SAMPLE_ID).toBe('1');
     expect(isUsableRecordId(READ_CHECK_PAGE_TEMPLATE_SAMPLE_ID)).toBe(true);
-    for (const recordId of ['', '..', 'a/b', '%2e', 'a b', 'a?b', 'a#b', '会員', 'x'.repeat(65)]) {
+    // L12b（設計書 `2026-11-09-beaksight-remove-limits-design.md` 6.2 と L12b の設計者の判断 1・2）: 登録の ID の長さの上限（前は 64 文字、その後 256 文字）は
+    // 撤廃した。READ の画面の path にも、65 文字・300 文字の ID を入れる。使える文字の決まりは今のまま。
+    for (const length of [65, 300]) {
+      expect(readCheckPageTemplateUrlOf(ORIGIN, TEMPLATE, 'x'.repeat(length), isUsableRecordId)).toBe(`${ORIGIN}/admin/members/${'x'.repeat(length)}`);
+    }
+    for (const recordId of ['', '..', 'a/b', '%2e', 'a b', 'a?b', 'a#b', '会員']) {
       expect(readCheckPageTemplateUrlOf(ORIGIN, TEMPLATE, recordId, isUsableRecordId), recordId).toBeNull();
     }
     // 型でない path、2 つの `{id}`、正規の形でない path は組み立てない。
@@ -92,5 +98,20 @@ describe('T38c: the verification READ of a page path template at the write start
     expect(readVerificationTargetRejectionOf(page('/admin/members/1'), 'FORM')).toBe(WRITE_READ_VERIFICATION_PAGE_TARGET);
     expect(readVerificationTargetRejectionOf(candidate, 'FORM')).toBeNull();
     expect(readVerificationTargetRejectionOf(candidate, 'API')).toBeNull();
+  });
+});
+
+// OP-R（設計書 `2026-10-27-beaksight-one-pass-flow-design.md` 4.1.9 の R1・R2）: 一覧の画面は、登録の画面の path の 1 つ上（唯一の判定 `readListPagePathOf`）。
+describe('OP-R: the list page path one above the create page', () => {
+  it.each([
+    ['/admin/members/new', '/admin/members'],
+    ['/admin/members/new/', '/admin/members'],
+    ['/admin/x/create', '/admin/x'],
+  ])('takes the list page of %s', (createPath, listPath) => {
+    expect(readListPagePathOf(createPath)).toBe(listPath);
+  });
+
+  it.each(['/new', '/', '', 'admin/members/new', '/admin/members/12', '/admin/{id}/new'])('has no list page for %j', (createPath) => {
+    expect(readListPagePathOf(createPath)).toBeNull();
   });
 });

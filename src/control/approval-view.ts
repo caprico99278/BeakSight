@@ -3,11 +3,11 @@
 // - 画面のコードは `src/control/approval/` を直接 import しない（`tests/architecture/local-ui-boundary.test.ts` の (j)）。画面は、ここから型と値を
 //   読む（書き写さない）。意味の owner は、それぞれの `src/control/approval/` のファイルのまま（ここは名前を公開し直すだけで、判断を持たない）。
 // - 公開しないもの（`tests/architecture/approval-ssot.test.ts` の (d)）: 承認の期限の 1 日の長さ（期限の計算は `approval-validity.ts` だけが使う。
-//   T28a の Gate (b)）、実行の許可の消費・確かめ直しと予約の状態の変更（ジョブの管理が書き込みのジョブの中で使う）、入力の規則の参照を付ける口
-//   （Task 29）。
-// - T30g（Task 30 の設計書 3 章、T30g の Blocker の判断（案 A））: 実行の許可の発行（`issueExecutionGrant`）と、連続の上限の予定
-//   （`writeScheduleOf`）を公開する。発行を呼べる画面のコードは、書き込みの開始の Server Function のファイル 1 つだけ（Gate `approval-ssot` の (e)）。
-//   検証の指定の閉じた一覧と未指定の項目の判定（`missingVerificationItemsOf`）も、画面の入力と表示のために公開する。
+//   T28a の Gate (b)）、実行の許可の発行・消費・確かめ直しと予約の状態の変更（ジョブの管理が書き込みの段の前と書き込みのジョブの中で使う）、入力の
+//   規則の参照を付ける口（Task 29）。
+// - T30g（Task 30 の設計書 3 章、T30g の Blocker の判断（案 A））で実行の許可の発行（`issueExecutionGrant`）を公開したが、SPEC-4 で書き込みの開始の
+//   画面を外したので、公開しない名前に戻した（Gate `approval-ssot` の (d)）。検証の指定の閉じた一覧と未指定の項目の判定
+//   （`missingVerificationItemsOf`）は、画面の入力と表示のために公開する。
 // - 値（関数と閉じた一覧）は、画面のサーバ（`apps/local-ui/src/server/`）だけが読む。ブラウザ側の画面のコードは、ここから型だけを import する
 //   （値はサーバの Server Function が返す。ここから読み込む部品は Node の部品を使う）。
 
@@ -28,9 +28,7 @@ export {
   UPDATE_SCENARIO_KIND,
   // FM2R の Minor 13: 下書きの状態の名前つきの定数。
   DRAFT_SCENARIO_STATE,
-  // T30g: 検証の指定の入力と表示、連続の上限の表示。
-  MAX_WRITES_PER_DAY,
-  MIN_WRITE_INTERVAL_MS,
+  // T30g: 検証の指定の入力と表示（連続の上限の表示は LZ-3c で捨てた）。
   RECORD_ID_SOURCES,
   SCENARIO_VERIFICATION_ITEMS,
   // T40R-fix-B（M-2）: 送り方の値の名前つきの定数（画面のサーバが使う）。
@@ -45,6 +43,8 @@ export {
   scenarioApiKeyFieldsOfProbe,
   // DEF-147: API のシナリオの公開の状態にあたる鍵（承認の画面と作成の画面の注意の印）。
   scenarioApiPublicationStateKeysOf,
+  // OP-2: 更新のシナリオの台帳（チェックの保存が、画面の登録と更新を結ぶ）。
+  updateLedgerScenarioIdOf,
 } from './approval/scenario-contracts.js';
 export type {
   ApprovalBoundFacts,
@@ -66,9 +66,11 @@ export type {
   RecordIdSource,
   ScenarioReadVerification,
   ScenarioRecordIdSpec,
-  ScenarioResultCondition,
   ScenarioVerification,
   ScenarioVerificationItem,
+  // PL-6a: form の登録の ID の取り方と、検証の指定の ID の取り方。
+  FormRecordIdSpec,
+  ScenarioVerificationRecordId,
   VerificationBinding,
   VerificationExpectation,
   VerificationExpectationKind,
@@ -87,6 +89,8 @@ export {
   // T40a-fix: 送り方ごとの、検証の指定で求める項目（画面の表示も同じ一覧に従う）。
   requiredVerificationItemsOf,
   unconfirmedSideEffectsOf,
+  // MI-6: 4 項目をすべて確かめた副作用の確認（承認のダイアログが入れる値。画面は、承認のときの前提の例に使う）。
+  CONFIRMED_SIDE_EFFECTS,
   validateScenarioDraft,
   // T41e-2: その型から API のシナリオを作れない理由（候補の一覧の入口で示す。下書きの確かめと同じ判定）。
   apiScenarioShapeRejectionOf,
@@ -104,7 +108,11 @@ export {
   SCENARIO_UPDATE_INPUT_REASONS,
   UNCONFIRMED_SIDE_EFFECTS,
   apiScenarioFormOf,
+  // OP-2: 規則 F で決めた更新の下書きを、自動の下書きが組み立てる。
+  apiScenarioDraftInputOf,
   isUsableRecordIdSegment,
+  // LU-13 fix round 1（D3）: サイトの画面の一覧が、名前のない開き手だけの更新の画面を見分ける。
+  isUnnamedOpenerUpdateOf,
 } from './approval/api-scenario-draft.js';
 export type {
   ApiScenarioExistingScenario,
@@ -128,6 +136,7 @@ export {
   autoDraftInferredItemsOf,
   autoDraftReadCheckChoiceOf,
   autoDraftReadVerificationOf,
+  isAutoDraftListPageChoice,
   autoDraftScenarioIdOf,
 } from './approval/api-scenario-autodraft.js';
 export type {
@@ -143,8 +152,25 @@ export type {
   AutoDraftScenarioFact,
   AutoDraftUpdatePlan,
   AutoDraftUpdatePreset,
+  AutoDraftUpdateResultStatus,
 } from './approval/api-scenario-autodraft.js';
 export type { DraftValue, DraftValueGround, DraftValueOrigin } from './approval/draft-value-origin.js';
+
+// PL-6b（設計書 `2026-10-26-beaksight-plain-ui-design.md` 8 章、8.1）: フォームの形の自動の下書き、API の形と共通の決まり、書き換えの検証の指定の台帳からの写し。
+export { FORM_AUTO_DRAFT_GAPS, FORM_UNUSABLE_SCREEN_REASONS, formRecordIdOf, formRecordIdFromUpdateOf, formTextFieldNamesOf, formAnswerReadChoiceOf, formAnswerReadVerificationOf, formAutoDraftPlanOf, formCandidateRejectionOf, formScenarioProbeDraftOf, formUpdateDraftPresetOf } from './approval/form-scenario-autodraft.js';
+export type { FormAutoDraftCreatePlan, FormAutoDraftGap, FormAutoDraftPlan, FormAutoDraftUpdatePlan, FormAutoDraftUpdatePreset } from './approval/form-scenario-autodraft.js';
+export {
+  autoDraftRecordIdTemplatesOf,
+  autoDraftScreenMayNotifyOf,
+  formAutoDraftRowsOf,
+  isAutoDraftRecordIdSegment,
+  // OP-F（M-3）: 行の「知らせを送ることがある」の 1 行と、更新の知らせをチェックが確かめたかの判定（1 か所）。
+  updateNotifyConfirmedByCheckOf,
+  writeScreenMayNotifyOf,
+} from './approval/autodraft-shared.js';
+export type { AutoDraftDefinitionFact, FormAutoDraftRow } from './approval/autodraft-shared.js';
+export { UPDATE_VERIFICATION_COPY_UNAVAILABLE_REASONS, updateVerificationCopyOf } from './approval/update-verification-copy.js';
+export type { UpdateVerificationCopy, UpdateVerificationCopyUnavailableReason } from './approval/update-verification-copy.js';
 
 export { APPROVAL_INVALIDITY_REASONS } from './approval/approval-validity.js';
 export type { ApprovalInvalidityReason, ApprovalValidity } from './approval/approval-validity.js';
@@ -162,15 +188,13 @@ export {
   COUNTED_WRITE_RESERVATION_STATES,
   EXECUTION_GRANT_REJECTION_REASONS,
   usedCumulativeWrites,
-  writeScheduleOf,
 } from './approval/execution-grant.js';
-export type { ExecutionGrantRejectionReason, WriteSchedule } from './approval/execution-grant.js';
+export type { ExecutionGrantRejectionReason } from './approval/execution-grant.js';
 
 export {
   SCENARIO_STORE_REJECTION_REASONS,
   approveScenario,
   createScenario,
-  issueExecutionGrant,
   listScenarios,
   readApprovalReceipts,
   readScenario,
@@ -183,6 +207,8 @@ export {
   // T41e-2: API の UPDATE の台帳の結び付きの誤り（開始の画面。発行の確かめ直しと同じ部品）。
   readApiUpdateLedgerBindingRejection,
   readUsedCumulativeWrites,
+  // PL-6b: 照合の専用の印で参照される READ の定義（フォームの形の自動の下書きが、同じ照合の専用の定義を使い回すかの判定に使う）。
+  readVerificationOnlyReadCheckIds,
   readWriteReservations,
   revokeScenarioApproval,
   updateScenario,
@@ -198,3 +224,18 @@ export type {
   ScenarioView,
   WriteReservationView,
 } from './approval/scenario-store.js';
+// OP-2 の修正の 3 回目: 更新の自動の下書きとチェックの範囲の承認（画面のサーバとジョブの管理が共有する 1 か所）。
+export {
+  apiUpdateAutoDraftOf,
+  approveForCheck,
+  attachInferredRules,
+  autoDraftReadCheckFactsOf,
+  autoDraftScenarioFactsOf,
+  draftUpdateForCreate,
+  formUpdateAutoDraftOf,
+  humanRulesAttachedOf,
+  replaceHumanRules,
+} from './approval/update-autodraft.js';
+// LU-7 fix round 3: 一覧の行の更新の、台帳の登録の毎回違う欄（開始の画面が、許可の発行と同じ唯一の判定に渡す。LU-8 で公開した読み出し）。
+export { readLedgerUniqueEachRunFieldNames } from './approval/scenario-facts.js';
+export type { AutoDraftClock, InferredRulesAttachment, UpdateAutoDraftFacts, UpdateAutoDraftOutcome } from './approval/update-autodraft.js';

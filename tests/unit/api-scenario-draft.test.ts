@@ -13,7 +13,9 @@ import {
   DRAFT_PROBE_PATH_TEMPLATE,
   apiScenarioDraftInputOf,
   apiScenarioFormOf,
+  isUnnamedOpenerUpdateOf,
   isUsableRecordIdSegment,
+  listRowOpenerOf,
   type ApiScenarioExistingScenario,
 } from '../../src/control/approval/api-scenario-draft.js';
 import {
@@ -28,6 +30,7 @@ import {
   DEFAULT_MAX_CUMULATIVE_CREATES,
   RECORD_ID_PLACEHOLDER,
   SIDE_EFFECT_CONFIRMATIONS,
+  type ScenarioReadVerification,
 } from '../../src/control/approval/scenario-contracts.js';
 import { validateScenarioDraft, type ScenarioDraftContext } from '../../src/control/approval/scenario-policy.js';
 import { apiRequestShapeOf, type ApiRequestShape } from '../../src/core/api-request-shape.js';
@@ -181,8 +184,11 @@ describe('FM2a: the proposal of an API scenario (the behaviour of the create scr
     expect(form.kind).toBe('UPDATE');
     expect(form.filterName).toBe('id');
     expect(form.formPathTemplates).toEqual(['/admin/members/{id}/edit']);
-    // 同じ表の API の登録だけ（別の表、事実のない登録、更新のシナリオは出さない）。
-    expect(form.ledgerOptions).toEqual([{ scenarioId: LEDGER_ID, pagePath: NEW_PATH }]);
+    // 同じ表の API の登録だけ（別の表、事実のない登録、更新のシナリオは出さない）。MI-7（設計書 `2026-10-26-beaksight-minimal-input-ux-design.md`
+    // 4.6）: 台帳の照合の READ を渡していないので、照合の READ は台帳から埋められない（理由つき）。
+    expect(form.ledgerOptions).toEqual([
+      { scenarioId: LEDGER_ID, pagePath: NEW_PATH, readVerification: { status: 'UNAVAILABLE', reason: 'LEDGER_READ_VERIFICATION_MISSING' } },
+    ]);
     expect(form.proposal).toMatchObject({
       request: { method: 'PATCH', pathShape: '/rest/v1/members' },
       filterName: 'id',
@@ -257,6 +263,45 @@ describe('FM2a: the proposal of an API scenario (the behaviour of the create scr
   });
 });
 
+// MI-7（設計書 `2026-10-26-beaksight-minimal-input-ux-design.md` 4.6、6 章の受け入れ条件 7）: 更新の照合の READ は、台帳の登録のシナリオの照合の READ の
+// 定義から埋める（比べる欄は、人が選んだ変える欄から画面が選ぶ）。台帳に照合の READ がない・定義を使えないときは、理由を返す（人が作る）。
+describe('MI-7: the READ verification of an UPDATE filled from the ledger', () => {
+  const TEMPLATE_CHECK = { readCheckId: 'rc-template', revision: 3, targetPagePath: '/admin/members/{id}' } as const;
+  const CANDIDATE_CHECK = { readCheckId: 'rc-candidate', revision: 1, targetPagePath: null } as const;
+  const LEDGER_READ = Object.freeze({
+    readCheckId: TEMPLATE_CHECK.readCheckId,
+    revision: 2,
+    bindings: [],
+    expectations: [{ kind: 'TEXT_CONTAINS', fieldName: 'email' }, { kind: 'ROW_COUNT_EQUALS', count: 1 }],
+  } as const);
+  const ledgerOf = (readVerification: ScenarioReadVerification | null, readChecks = [TEMPLATE_CHECK, CANDIDATE_CHECK]) =>
+    apiScenarioFormOf({
+      profileId: PROFILE_ID,
+      candidate: UPDATE_CANDIDATE,
+      context: CONTEXT,
+      scenarios: [{ scenarioId: LEDGER_ID, kind: 'CREATE', pagePath: NEW_PATH, readVerification }],
+      readChecks,
+    }).form?.ledgerOptions[0]?.readVerification;
+
+  it('copies the definition (at its current revision) and the expectations of the ledger READ verification of a page template', () => {
+    expect(ledgerOf(LEDGER_READ)).toEqual({
+      status: 'FROM_LEDGER',
+      readCheckId: TEMPLATE_CHECK.readCheckId,
+      revision: TEMPLATE_CHECK.revision,
+      expectations: [{ kind: 'TEXT_CONTAINS', fieldName: 'email' }, { kind: 'ROW_COUNT_EQUALS', count: 1 }],
+    });
+  });
+
+  it('returns the reason when the ledger has no READ verification, or its definition cannot be used for the update', () => {
+    expect(ledgerOf(null)).toEqual({ status: 'UNAVAILABLE', reason: 'LEDGER_READ_VERIFICATION_MISSING' });
+    // 取り消した定義（今の定義にない）。
+    expect(ledgerOf(LEDGER_READ, [CANDIDATE_CHECK])).toEqual({ status: 'UNAVAILABLE', reason: 'LEDGER_READ_CHECK_UNUSABLE' });
+    // 候補を読む定義（結び付けを更新の欄に写せない）。
+    expect(ledgerOf({ ...LEDGER_READ, readCheckId: CANDIDATE_CHECK.readCheckId, bindings: [{ parameterName: 'q', fieldName: 'name' }] }))
+      .toEqual({ status: 'UNAVAILABLE', reason: 'LEDGER_READ_CHECK_UNUSABLE' });
+  });
+});
+
 describe('FM2a: the origin mark of a draft value', () => {
   it('has the closed lists, one origin by ground, and the texts of every origin and ground', () => {
     expect(DRAFT_VALUE_ORIGINS).toEqual(['DETERMINED', 'INFERRED', 'HUMAN']);
@@ -280,5 +325,32 @@ describe('FM2a: the origin mark of a draft value', () => {
     expect(value).toEqual({ value: 'id', origin: 'INFERRED', ground: 'RECORD_ID_KEY_FROM_UPDATE_FILTER' });
     expect(Object.isFrozen(value)).toBe(true);
     expect(draftValueOf(['email'], 'HUMAN_CHOICE').origin).toBe('HUMAN');
+  });
+});
+
+// LU-13 fix round 1（設計書 `2026-11-02-beaksight-list-row-update-design.md` 4.0 の D3、5.6）: 更新の候補が、名前のない開き手（アイコンだけ）から出たものか。
+// 判定の事実は、一覧の行の更新の開き手（`listRowOpenerOf`）と同じ `opener.hasName`（フォームは `rowOpener.hasName`）。
+describe('LU-13 fix round 1: an update candidate that opens only from an opener without a name', () => {
+  const LIST_PATH = '/admin/members';
+  const OPENER_DIGEST = 'sha256:opener';
+  const openerProbeOf = (hasName: boolean): SubmissionProbeRecord =>
+    observedSubmissionProbeOf({ shapes: [shapeOf(LIST_PATH, 'PATCH', `${API}/rest/v1/members?id=eq.1&select=*`, MEMBER_BODY)], nonReadRequestCount: 1, readRequestCount: 0,
+      unrecordedShapeCount: 0 }, { filledFieldCount: MARKED_FIELDS.length, skippedFieldCount: 0 }, MARKED_FIELDS, [],
+    { identityDigest: OPENER_DIGEST, hasName, openerWords: [] });
+
+  it('is true only for an update from an opener without a name', () => {
+    const unnamed = buttonOf(LIST_PATH, openerProbeOf(false));
+    const named = buttonOf(LIST_PATH, openerProbeOf(true));
+    expect(unnamed.submissionProbe?.result).toBe('API_UPDATE');
+    expect(isUnnamedOpenerUpdateOf(unnamed)).toBe(true);
+    expect(listRowOpenerOf(unnamed.submissionProbe as SubmissionProbeRecord)).toBeNull();
+    expect(isUnnamedOpenerUpdateOf(named)).toBe(false);
+    expect(listRowOpenerOf(named.submissionProbe as SubmissionProbeRecord)).toMatchObject({ identityDigest: OPENER_DIGEST, hasName: true });
+    // 開き手のない更新・登録は当たらない。
+    expect(isUnnamedOpenerUpdateOf(UPDATE_CANDIDATE)).toBe(false);
+    expect(isUnnamedOpenerUpdateOf(CREATE_CANDIDATE)).toBe(false);
+    // フォームの形: 同じ行の開き手（`rowOpener`）の名前で決める。
+    expect(isUnnamedOpenerUpdateOf({ ...buttonOf(LIST_PATH, undefined), rowOpener: { identityDigest: OPENER_DIGEST, hasName: false, openerWords: [] } })).toBe(true);
+    expect(isUnnamedOpenerUpdateOf({ ...buttonOf(LIST_PATH, undefined), rowOpener: { identityDigest: OPENER_DIGEST, hasName: true, openerWords: [] } })).toBe(false);
   });
 });

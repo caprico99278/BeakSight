@@ -160,8 +160,8 @@
       longToggle.className = `btn-base ${LONG_UTILITIES}`;
       longToggle.addEventListener('click', () => longToggle.classList.toggle('is-open'));
 
-      // class が4096文字を超え、click で is-open の class を切り替えるトグル。ARIA の状態は持たない。
-      // is-open は先頭の近くに差し込むので、class 専用の上限で切り詰めた値でも、変化は見える。
+      // class が4096文字（前の class の長さの上限）を超え、click で is-open の class を切り替えるトグル。ARIA の状態は持たない。
+      // class の値は切り詰めずに記録するので（L10）、長い class でも、名前ごとの変化（is-open）を根拠にできる。
       const hugeToggle = document.querySelector('#huge-class-toggle');
       let hugeOpen = false;
       const renderHugeToggle = () => {

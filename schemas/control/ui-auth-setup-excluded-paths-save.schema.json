@@ -1,0 +1,12 @@
+{
+  "$id": "urn:beaksight:schema:control:ui-auth-setup-excluded-paths-save:1",
+  "description": "Local UI Server Function input: save only the excluded paths of the stored auth setup of one profile, from the audit start screen (minimal input design 4.3; MI-F3). The server reads the stored auth setup, replaces excludedPaths only and saves it with saveAuthSetup (validateAuthSetup). expectedRevision is the profile revision the screen read. The limits of the paths are checked by validateAuthSetup.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["profileId", "expectedRevision", "excludedPaths"],
+  "properties": {
+    "profileId": { "$ref": "urn:beaksight:schema:control:profile:1#/properties/profileId" },
+    "expectedRevision": { "$ref": "urn:beaksight:schema:control:profile:1#/properties/revision" },
+    "excludedPaths": { "type": "array", "items": { "type": "string" } }
+  }
+}

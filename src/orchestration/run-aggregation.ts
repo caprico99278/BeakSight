@@ -38,7 +38,12 @@ const emptyCounts = (): { -readonly [Key in keyof ViewportPageCounts]: number } 
 });
 
 /** ページの状態ごとの、ページの数（`auditedPageCount` などの元）。 */
-export function countPagesByStatus(pages: readonly PageAuditResult[]): ViewportPageCounts {
+/**
+ * MEM-3b: 数え上げが読むページの項目（本体か、要約 `RunPageSummary`。どちらも同じ数になる）。Interaction の結果は `evidence` の Interaction の Evidence だけを読む。
+ */
+type CountedPage = Pick<PageAuditResult, 'status' | 'viewports' | 'incompleteReasons' | 'evidence'>;
+
+export function countPagesByStatus(pages: readonly Pick<CountedPage, 'status'>[]): ViewportPageCounts {
   const counts = emptyCounts();
   for (const page of pages) {
     counts[PAGE_COUNT_KEYS[page.status]] += 1;
@@ -47,7 +52,7 @@ export function countPagesByStatus(pages: readonly PageAuditResult[]): ViewportP
 }
 
 /** ビューポートごとの、ビューポートの状態ごとの数（`viewportPageCounts`）。 */
-export function countViewportPages(pages: readonly PageAuditResult[]): Readonly<Record<ViewportProfile, ViewportPageCounts>> {
+export function countViewportPages(pages: readonly Pick<CountedPage, 'viewports'>[]): Readonly<Record<ViewportProfile, ViewportPageCounts>> {
   const counts = Object.fromEntries(VIEWPORT_PROFILES.map((profile) => [profile, emptyCounts()])) as Record<
     ViewportProfile,
     ReturnType<typeof emptyCounts>
@@ -65,7 +70,9 @@ export function countViewportPages(pages: readonly PageAuditResult[]): Readonly<
  * でない）の、ページとビューポートの理由を、ページごとに理由 1 回で数える（SKIPPED のページの理由は Run の理由にある）。理由のコードの一覧
  * （`INCOMPLETE_REASON_CODES`）の順。理由を持つページがなければ空。
  */
-export function countPagesByIncompleteReason(pages: readonly PageAuditResult[]): readonly PageIncompleteReasonCount[] {
+export function countPagesByIncompleteReason(
+  pages: readonly Pick<CountedPage, 'status' | 'viewports' | 'incompleteReasons'>[],
+): readonly PageIncompleteReasonCount[] {
   const counts = new Map<IncompleteReasonCode, number>();
   for (const page of pages) {
     if (page.status === 'SKIPPED') continue;
@@ -84,7 +91,7 @@ export function countPagesByIncompleteReason(pages: readonly PageAuditResult[]):
 }
 
 /** 状態が `PARTIAL` のビューポートの数（Run Status の入力 `incompleteCollectorCount`）。 */
-export function countPartialViewports(pages: readonly PageAuditResult[]): number {
+export function countPartialViewports(pages: readonly Pick<CountedPage, 'viewports'>[]): number {
   return pages.reduce(
     (count, page) => count + VIEWPORT_PROFILES.filter((profile) => page.viewports[profile].status === 'PARTIAL').length,
     0,
@@ -111,7 +118,7 @@ export interface InteractionOutcomeCounts {
 }
 
 /** 各ページの `interaction` の Evidence から、Interaction の結果を数える。 */
-export function countInteractionOutcomes(pages: readonly PageAuditResult[]): InteractionOutcomeCounts {
+export function countInteractionOutcomes(pages: readonly Pick<CountedPage, 'evidence'>[]): InteractionOutcomeCounts {
   let executionFailed = 0;
   let checkNotCompleted = 0;
   let notVerifiable = 0;
@@ -153,8 +160,17 @@ export function summarizeRunSafety(input: {
   readonly snapshots: readonly SafetyLedgerSnapshot[];
   readonly auditSendPolicy: AuditSendPolicyName;
 }): RunSafetySummary {
-  const byMethod = new Map<string, number>();
-  const blocked: { -readonly [Key in keyof SafetyBlockedActionCounts]: number } = {
+  return new RunSafetyTotals().summary(input, input.snapshots);
+}
+
+/**
+ * MEM-3c（DEF-266。D7）: Run の Safety の要約（`summarizeRunSafety`）の、snapshot を受け取った順に足し込む形。再開のときに、保存のページの snapshot を全部持たずに
+ * 足し込むために使う。足し込んだ snapshot の順に `summarizeRunSafety` へ渡したときと、同じ要約になる（数の和と飽和の和は順によらない。違反の一覧は足した順）。
+ * 違反と記録の切り詰めは、snapshot ごとに `summarizePageSafety` で集計してから足す。
+ */
+export class RunSafetyTotals {
+  readonly #byMethod = new Map<string, number>();
+  readonly #blocked: { -readonly [Key in keyof SafetyBlockedActionCounts]: number } = {
     requests: 0,
     navigations: 0,
     externalActions: 0,
@@ -162,30 +178,45 @@ export function summarizeRunSafety(input: {
     downloads: 0,
     webSockets: 0,
   };
-  let excludedInteractionCandidateCount = 0;
-  let passedRequests = 0;
-  let passedOtherOriginRequests = 0;
-  let passedWebSockets = 0;
-  let passedWebSocketsOutsideGuard = 0;
-  let passedDangerousWebSockets = 0;
-  const passedByMethod = new Map<string, number>();
-  for (const snapshot of input.snapshots) {
+  #excludedInteractionCandidateCount = 0;
+  #externalSchemeNavigationCount = 0;
+  #passedRequests = 0;
+  #passedOtherOriginRequests = 0;
+  #passedWebSockets = 0;
+  #passedWebSocketsOutsideGuard = 0;
+  #passedDangerousWebSockets = 0;
+  readonly #passedByMethod = new Map<string, number>();
+  #invariantViolationCount = 0;
+  readonly #invariantViolations: ReturnType<typeof summarizePageSafety>['invariantViolations'][number][] = [];
+  #recordTruncated = false;
+  #frameClassificationFailureCount = 0;
+  #readNavigationFailureCount = 0;
+  #hasInvariantViolation = false;
+
+  /** 足した snapshot のどれかが、不変条件の違反を持つか（`invariantViolationCount` が 0 より大きい）。 */
+  get hasInvariantViolation(): boolean {
+    return this.#hasInvariantViolation;
+  }
+
+  /** snapshot を 1 つ足す。 */
+  add(snapshot: SafetyLedgerSnapshot): this {
     // AS-c: 通した WebSocket の接続の数。
-    passedWebSockets = saturatingAdd(passedWebSockets, snapshot.passedAuditSendWebSockets?.count ?? 0);
+    this.#passedWebSockets = saturatingAdd(this.#passedWebSockets, snapshot.passedAuditSendWebSockets?.count ?? 0);
     // AS-c fix round 1: そのうち Guard の route を通らずに開いた数と、危険な語に当たる数（記録がない snapshot は 0。LG-4: 記録は数を必ず持つ）。
-    passedWebSocketsOutsideGuard = saturatingAdd(passedWebSocketsOutsideGuard, snapshot.passedAuditSendWebSockets?.outsideGuard ?? 0);
-    passedDangerousWebSockets = saturatingAdd(passedDangerousWebSockets, snapshot.passedAuditSendWebSockets?.dangerous ?? 0);
+    this.#passedWebSocketsOutsideGuard = saturatingAdd(this.#passedWebSocketsOutsideGuard, snapshot.passedAuditSendWebSockets?.outsideGuard ?? 0);
+    this.#passedDangerousWebSockets = saturatingAdd(this.#passedDangerousWebSockets, snapshot.passedAuditSendWebSockets?.dangerous ?? 0);
     const passed = snapshot.passedAuditSendRequests;
     if (passed !== undefined) {
-      passedRequests = saturatingAdd(passedRequests, passed.count);
+      this.#passedRequests = saturatingAdd(this.#passedRequests, passed.count);
       // AS-c: ほかの Origin へ通した数（LG-4: 記録は数を必ず持つ）。
-      passedOtherOriginRequests = saturatingAdd(passedOtherOriginRequests, passed.otherOrigins);
+      this.#passedOtherOriginRequests = saturatingAdd(this.#passedOtherOriginRequests, passed.otherOrigins);
       for (const [method, count] of Object.entries(passed.byMethod)) {
-        passedByMethod.set(method, saturatingAdd(passedByMethod.get(method) ?? 0, count));
+        this.#passedByMethod.set(method, saturatingAdd(this.#passedByMethod.get(method) ?? 0, count));
       }
     }
+    const blocked = this.#blocked;
     for (const [method, count] of Object.entries(snapshot.blockedRequestsByMethod)) {
-      byMethod.set(method, (byMethod.get(method) ?? 0) + count);
+      this.#byMethod.set(method, (this.#byMethod.get(method) ?? 0) + count);
       blocked.requests += count;
     }
     blocked.requests += snapshot.blockedInteractionRequests.length;
@@ -194,35 +225,87 @@ export function summarizeRunSafety(input: {
     blocked.popups += snapshot.blockedPopups.length;
     blocked.downloads += snapshot.blockedDownloads.length;
     blocked.webSockets += snapshot.blockedWebSockets.length + snapshot.blockedInteractionWebSockets.length;
-    excludedInteractionCandidateCount += snapshot.excludedInteractionCandidates.length;
+    this.#excludedInteractionCandidateCount += snapshot.excludedInteractionCandidates.length;
+    this.#externalSchemeNavigationCount += snapshot.externalSchemeNavigations.length;
+    const safety = summarizePageSafety([snapshot]);
+    this.#invariantViolationCount = saturatingAdd(this.#invariantViolationCount, safety.invariantViolationCount);
+    this.#invariantViolations.push(...safety.invariantViolations);
+    this.#recordTruncated ||= safety.recordTruncated;
+    this.#frameClassificationFailureCount = saturatingAdd(this.#frameClassificationFailureCount, safety.frameClassificationFailureCount);
+    this.#readNavigationFailureCount = saturatingAdd(this.#readNavigationFailureCount, safety.readNavigationFailureCount);
+    this.#hasInvariantViolation ||= snapshot.invariantViolationCount > 0;
+    return this;
   }
-  const blockedRequestsByMethod = Object.assign(
-    Object.create(null) as Record<string, number>,
-    Object.fromEntries([...byMethod].sort(([left], [right]) => compareCodeUnits(left, right))),
-  );
-  const safety = summarizePageSafety(input.snapshots);
-  return deepFreeze({
-    guardEnabled: input.guardEnabled,
-    blockedRequestsByMethod,
-    blockedActions: blocked,
-    excludedInteractionCandidateCount,
-    invariantViolationCount: safety.invariantViolationCount,
-    // DEF-144: 違反に結びつく要求（あるときだけ。method・Origin・path。値なし）も写す。
-    invariantViolations: safety.invariantViolations.map(({ code, message, request }) => ({
-      code, message, ...(request === undefined ? {} : { request: { ...request } }),
-    })),
-    recordTruncated: safety.recordTruncated,
-    auditSend: {
-      policy: input.auditSendPolicy,
-      passedRequests,
-      passedRequestsByMethod: Object.assign(
+
+  /** ほかの足し込み（`other`）を、その順のまま、この後に足す（`other` は変えない）。 */
+  addTotals(other: RunSafetyTotals): this {
+    for (const [method, count] of other.#passedByMethod) {
+      this.#passedByMethod.set(method, saturatingAdd(this.#passedByMethod.get(method) ?? 0, count));
+    }
+    for (const [method, count] of other.#byMethod) {
+      this.#byMethod.set(method, (this.#byMethod.get(method) ?? 0) + count);
+    }
+    for (const key of Object.keys(this.#blocked) as (keyof SafetyBlockedActionCounts)[]) {
+      this.#blocked[key] += other.#blocked[key];
+    }
+    this.#excludedInteractionCandidateCount += other.#excludedInteractionCandidateCount;
+    this.#externalSchemeNavigationCount += other.#externalSchemeNavigationCount;
+    this.#passedRequests = saturatingAdd(this.#passedRequests, other.#passedRequests);
+    this.#passedOtherOriginRequests = saturatingAdd(this.#passedOtherOriginRequests, other.#passedOtherOriginRequests);
+    this.#passedWebSockets = saturatingAdd(this.#passedWebSockets, other.#passedWebSockets);
+    this.#passedWebSocketsOutsideGuard = saturatingAdd(this.#passedWebSocketsOutsideGuard, other.#passedWebSocketsOutsideGuard);
+    this.#passedDangerousWebSockets = saturatingAdd(this.#passedDangerousWebSockets, other.#passedDangerousWebSockets);
+    this.#invariantViolationCount = saturatingAdd(this.#invariantViolationCount, other.#invariantViolationCount);
+    this.#invariantViolations.push(...other.#invariantViolations);
+    this.#recordTruncated ||= other.#recordTruncated;
+    this.#frameClassificationFailureCount = saturatingAdd(this.#frameClassificationFailureCount, other.#frameClassificationFailureCount);
+    this.#readNavigationFailureCount = saturatingAdd(this.#readNavigationFailureCount, other.#readNavigationFailureCount);
+    this.#hasInvariantViolation ||= other.#hasInvariantViolation;
+    return this;
+  }
+
+  /**
+   * 足したものの後に `extraSnapshots` を足したときの、Run の Safety の要約（この足し込みは変えない）。`guardEnabled` と `auditSendPolicy` は
+   * `summarizeRunSafety` と同じ。
+   */
+  summary(
+    input: { readonly guardEnabled: boolean; readonly auditSendPolicy: AuditSendPolicyName },
+    extraSnapshots: readonly SafetyLedgerSnapshot[] = [],
+  ): RunSafetySummary {
+    const totals = new RunSafetyTotals().addTotals(this);
+    for (const snapshot of extraSnapshots) {
+      totals.add(snapshot);
+    }
+    return deepFreeze({
+      guardEnabled: input.guardEnabled,
+      blockedRequestsByMethod: Object.assign(
         Object.create(null) as Record<string, number>,
-        Object.fromEntries([...passedByMethod].sort(([left], [right]) => compareCodeUnits(left, right))),
+        Object.fromEntries([...totals.#byMethod].sort(([left], [right]) => compareCodeUnits(left, right))),
       ),
-      passedOtherOriginRequests,
-      passedWebSockets,
-      passedWebSocketsOutsideGuard,
-      passedDangerousWebSockets,
-    },
-  });
+      blockedActions: { ...totals.#blocked },
+      excludedInteractionCandidateCount: totals.#excludedInteractionCandidateCount,
+      invariantViolationCount: totals.#invariantViolationCount,
+      // DEF-144: 違反に結びつく要求（あるときだけ。method・Origin・path。値なし）も写す。
+      invariantViolations: totals.#invariantViolations.map(({ code, message, request }) => ({
+        code, message, ...(request === undefined ? {} : { request: { ...request } }),
+      })),
+      recordTruncated: totals.#recordTruncated,
+      // SAFE-2 の 4: 違反にしない止めた記録の数と、外部スキームへの移動の試みの数（止めた記録として、報告に数で出す）。
+      frameClassificationFailureCount: totals.#frameClassificationFailureCount,
+      readNavigationFailureCount: totals.#readNavigationFailureCount,
+      externalSchemeNavigationCount: totals.#externalSchemeNavigationCount,
+      auditSend: {
+        policy: input.auditSendPolicy,
+        passedRequests: totals.#passedRequests,
+        passedRequestsByMethod: Object.assign(
+          Object.create(null) as Record<string, number>,
+          Object.fromEntries([...totals.#passedByMethod].sort(([left], [right]) => compareCodeUnits(left, right))),
+        ),
+        passedOtherOriginRequests: totals.#passedOtherOriginRequests,
+        passedWebSockets: totals.#passedWebSockets,
+        passedWebSocketsOutsideGuard: totals.#passedWebSocketsOutsideGuard,
+        passedDangerousWebSockets: totals.#passedDangerousWebSockets,
+      },
+    });
+  }
 }

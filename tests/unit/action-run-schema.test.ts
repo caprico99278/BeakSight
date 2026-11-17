@@ -7,21 +7,12 @@
 import { describe, expect, it } from 'vitest';
 import {
   ACTION_RUN_SCHEMA_VERSION,
-  MAX_SUBMITTED_VALUE_LENGTH,
   type ActionRunDocument,
 } from '../../src/control/actions/action-contracts.js';
-import {
-  MAX_RECORD_ID_LENGTH,
-  MAX_RESULT_CONDITION_PATH_LENGTH,
-  MAX_SCENARIO_FIELD_NAMES,
-  MAX_VERIFICATION_SELECTOR_LENGTH,
-  SCENARIO_ID_PATTERN,
-} from '../../src/control/approval/scenario-contracts.js';
+import { SCENARIO_ID_PATTERN } from '../../src/control/approval/scenario-contracts.js';
 import { PROFILE_ID_PATTERN } from '../../src/control/contracts.js';
 import { MAX_UNIQUE_RETRIES } from '../../src/control/data-rules/rule-contracts.js';
-import { MAX_SAFE_RECORD_ID_LENGTH } from '../../src/control/actions/action-outcome.js';
 import { validateArtifact } from '../../src/core/schema-validator.js';
-import { MAX_CANDIDATE_FIELDS, MAX_FIELD_NAME_LENGTH } from '../../src/discovery/candidate-contracts.js';
 import { blockedDocuments, verifiedCreateDocuments } from '../helpers/action-report-samples.js';
 import { prop, propertyNamesWithWords, readSchemaFile, SECRET_PROPERTY_WORDS, type JsonSchema } from '../helpers/schema-test-support.js';
 
@@ -45,20 +36,27 @@ describe('action-run.json schema (T30a)', () => {
     expect(schema.$id).toBe('urn:beaksight:schema:action-run:1.0');
     // T40c: 書き手は 1.1 を書き、読み手は 1.0 と 1.1 を受ける（版の一覧とスキーマの enum の一致は `action-run-v11.test.ts`）。
     expect(prop(schema, 'schemaVersion').enum).toContain(ACTION_RUN_SCHEMA_VERSION);
-    expect(ACTION_RUN_SCHEMA_VERSION).toBe('action-run-schema/1.1');
+    // PL-6a: 書き手は 1.2 を書き、読み手は 1.1 と 1.2 を受ける。
+    expect(ACTION_RUN_SCHEMA_VERSION).toBe('action-run-schema/1.2');
+    expect(prop(schema, 'schemaVersion').enum).toEqual(['action-run-schema/1.1', 'action-run-schema/1.2']);
   });
 
   it('matches the limits and the shapes with the named constants', () => {
     expect(defs.id?.pattern).toBe(SCENARIO_ID_PATTERN.source);
     expect(prop(schema, 'profileId').pattern).toBe(PROFILE_ID_PATTERN.source);
     const values = prop(schema, 'submittedValues');
-    expect(values.maxProperties).toBe(MAX_SCENARIO_FIELD_NAMES);
-    expect((values.propertyNames as JsonSchema).maxLength).toBe(MAX_FIELD_NAME_LENGTH);
-    expect((values.additionalProperties as JsonSchema).maxLength).toBe(MAX_SUBMITTED_VALUE_LENGTH);
+    // L13（N28・N30）: 送った値の数と名前の長さの上限（前は 200・256）はない。
+    expect(values.maxProperties).toBeUndefined();
+    expect((values.propertyNames as JsonSchema).maxLength).toBeUndefined();
+    // L12b（設計書 `2026-11-09-beaksight-remove-limits-design.md` 6.2。S18）: 送った値の長さの上限（前は `MAX_SUBMITTED_VALUE_LENGTH`）を撤廃した。
+    expect((values.additionalProperties as JsonSchema).maxLength).toBeUndefined();
     expect(prop(prop(schema, 'seedRecord'), 'attempt').maximum).toBe(MAX_UNIQUE_RETRIES);
-    expect(prop(defs.condition, 'pathPrefix').maxLength).toBe(MAX_RESULT_CONDITION_PATH_LENGTH);
-    expect((prop(defs.condition, 'selector').anyOf ?? [])[0]?.maxLength).toBe(MAX_VERIFICATION_SELECTOR_LENGTH);
-    expect((prop(schema, 'recordId').anyOf ?? [])[0]?.maxLength).toBe(MAX_RECORD_ID_LENGTH);
+    // URL-LEN: path の前方一致の長さの上限（前は 2,048）はない。
+    expect(prop(defs.condition, 'pathPrefix').maxLength).toBeUndefined();
+    // LZ-2: セレクタの長さの上限（前は 256）もない。
+    expect((prop(defs.condition, 'selector').anyOf ?? [])[0]?.maxLength).toBeUndefined();
+    // L12b（設計者の判断 2）: 登録の ID の長さの上限（前は `MAX_RECORD_ID_LENGTH` の 256）は撤廃した。
+    expect((prop(schema, 'recordId').anyOf ?? [])[0]?.maxLength).toBeUndefined();
   });
 
   it('refers to the runId of run.json without changing the run schema', () => {
@@ -104,8 +102,7 @@ describe('action-run.json schema (T30a)', () => {
     ['an unknown submission state', verifiedRun({ submission: 'MAYBE' as never })],
     ['a non-string submitted value', verifiedRun({ submittedValues: { name: 1 } as never })],
     ['an empty submitted field name', verifiedRun({ submittedValues: { '': 'x' } })],
-    ['a too long submitted value', verifiedRun({ submittedValues: { name: 'x'.repeat(MAX_SUBMITTED_VALUE_LENGTH + 1) } })],
-    ['a too long record id', verifiedRun({ recordId: 'x'.repeat(MAX_RECORD_ID_LENGTH + 1) })],
+    // L12b（S18）: 送った値の長さの上限を撤廃したので、長い値は拒まない（下の受ける場合の表）。
     ['an empty record id', verifiedRun({ recordId: '' })],
     ['a bad HTTP status', verifiedRun({ httpStatus: 99 })],
     ['a bad seed', verifiedRun({ seedRecord: { ...verifiedRun().seedRecord, seed: 'xyz' as never } })],
@@ -114,10 +111,11 @@ describe('action-run.json schema (T30a)', () => {
     ['a bad run id', verifiedRun({ runId: 'run-1' })],
     ['a bad timestamp', verifiedRun({ finishedAt: '2026-10-13T00:00:00Z' })],
     ['a RESERVED reservation (not settled)', verifiedRun({ reservationState: 'RESERVED' as never })],
-    ['a condition path prefix without "/"', verifiedRun({
-      // T40c: 成否の条件は API の記録で null を許す型になったので、FORM の見本の値を型どおりに写してから上書きする。
-      resultConditions: { inputErrorCondition: { pathPrefix: '/members/new', selector: null }, successCondition: { pathPrefix: 'members', selector: null } },
-    })],
+    // PL-6a: 版 1.2 の結果の判定のしかたの印は、閉じた一覧の値だけ（成否の条件の項目は持てない）。
+    ['an unknown result judgement', verifiedRun({ resultJudgement: 'SUCCESS_CONDITION' as never })],
+    ['a 1.2 run with the result conditions of 1.1', {
+      ...verifiedRun(), resultConditions: { successCondition: { pathPrefix: '/members/', selector: null }, inputErrorCondition: { pathPrefix: '/members', selector: null } },
+    }],
     ['a not sent run without a block reason', blockedRun({ blockReason: null })],
     ['a not sent run with a response', blockedRun({ httpStatus: 200 })],
     ['a not sent run with a response judgement', blockedRun({ responseJudgement: 'SUCCESS' })],
@@ -153,11 +151,14 @@ describe('action-run.json schema: the update block (T31f)', () => {
     const update = prop(schema, 'update');
     expect(update.additionalProperties).toBe(false);
     expect(Object.keys(update.properties ?? {}).sort()).toEqual(['targetRecordId', 'updateEvidence']);
-    expect(prop(update, 'targetRecordId').maxLength).toBe(MAX_SAFE_RECORD_ID_LENGTH);
-    expect(prop(defs.updateEvidence, 'fields').maxItems).toBe(MAX_CANDIDATE_FIELDS);
-    expect(prop(defs.updateEvidenceField, 'fieldName').maxLength).toBe(MAX_FIELD_NAME_LENGTH);
+    // L12b（設計者の判断 2）: 対象のレコードの ID の長さの上限（前は `MAX_SAFE_RECORD_ID_LENGTH`）は撤廃した。
+    expect(prop(update, 'targetRecordId').maxLength).toBeUndefined();
+    // L13（N28・N30）: 欄の数と名前の長さの上限（前は 200・256）はない。
+    expect(prop(defs.updateEvidence, 'fields').maxItems).toBeUndefined();
+    expect(prop(defs.updateEvidenceField, 'fieldName').maxLength).toBeUndefined();
+    // L12b（S18）: 前の値と新しい値の長さの上限を撤廃した。
     for (const key of ['previousValue', 'newValue']) {
-      expect((prop(defs.updateEvidenceField, key).anyOf ?? [])[0]?.maxLength, key).toBe(MAX_SUBMITTED_VALUE_LENGTH);
+      expect((prop(defs.updateEvidenceField, key).anyOf ?? [])[0]?.maxLength, key).toBeUndefined();
     }
     expect(schema.required).not.toContain('update');
   });
@@ -170,6 +171,9 @@ describe('action-run.json schema: the update block (T31f)', () => {
       { result: 'PARTIAL', reason: 'UPDATE_POSTCHECK_UNDETERMINED' })],
     ['an update with another record id', updatedRun(undefined, { recordId: '43', result: 'UNKNOWN', reason: 'RECORD_ID_MISMATCH' })],
     ['a blocked update', { ...blockedRun(), update: { targetRecordId: 'rec_42-a', updateEvidence: null } }],
+    // L12b（設計者の判断 2）: 登録の ID と対象のレコードの ID の長さの上限は撤廃した。
+    ['an update with a target and a record id of 300 characters', updatedRun({ targetRecordId: 'a'.repeat(300), updateEvidence: evidence },
+      { recordId: 'a'.repeat(300) })],
   ])('accepts %s', async (_label, document) => {
     expect(await validateArtifact('action-run', document)).toEqual({ ok: true });
   });
@@ -177,7 +181,6 @@ describe('action-run.json schema: the update block (T31f)', () => {
   it.each<readonly [string, unknown]>([
     ['a target that is not a record id', updatedRun({ targetRecordId: '4/2', updateEvidence: evidence })],
     ['an empty target', updatedRun({ targetRecordId: '', updateEvidence: evidence })],
-    ['a too long target', updatedRun({ targetRecordId: 'a'.repeat(MAX_SAFE_RECORD_ID_LENGTH + 1), updateEvidence: evidence })],
     ['an update block without the evidence item', updatedRun({ targetRecordId: '42' })],
     ['an update block with the kept values', updatedRun({ targetRecordId: '42', updateEvidence: evidence, keptValues: { email: 'x' } })],
     ['evidence with another property', updatedRun({ targetRecordId: '42', updateEvidence: { ...evidence, note: 'x' } })],
@@ -189,8 +192,15 @@ describe('action-run.json schema: the update block (T31f)', () => {
     ['a field whose match is not a boolean', updatedRun({ targetRecordId: '42', updateEvidence: fieldOf({ matched: 'yes' }) })],
     ['a field with an empty name', updatedRun({ targetRecordId: '42', updateEvidence: fieldOf({ fieldName: '' }) })],
     ['a field with a value of a hidden field', updatedRun({ targetRecordId: '42', updateEvidence: fieldOf({ hiddenValue: 'x' }) })],
-    ['a too long new value', updatedRun({ targetRecordId: '42', updateEvidence: fieldOf({ newValue: 'x'.repeat(MAX_SUBMITTED_VALUE_LENGTH + 1) }) })],
   ])('rejects %s', async (_label, document) => {
     expect((await validateArtifact('action-run', document)).ok).toBe(false);
+  });
+
+  // L12b（設計書 `2026-11-09-beaksight-remove-limits-design.md` 6.2。S18）: 値の長さの上限（前は `MAX_SUBMITTED_VALUE_LENGTH`）を撤廃した。長い値も書ける。
+  it.each<[string, unknown]>([
+    ['a submitted value longer than the former limit', verifiedRun({ submittedValues: { name: 'x'.repeat(8_193) } })],
+    ['a new value longer than the former limit', updatedRun({ targetRecordId: '42', updateEvidence: fieldOf({ newValue: 'x'.repeat(8_193) }) })],
+  ])('accepts %s (L12b)', async (_label, document) => {
+    expect(await validateArtifact('action-run', document)).toEqual({ ok: true });
   });
 });

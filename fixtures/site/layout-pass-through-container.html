@@ -1,0 +1,31 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8">
+    <title>Pass-through fixed container fixture</title>
+    <style>
+      * { box-sizing: border-box; }
+      body { margin: 0; font-family: sans-serif; font-size: 16px; line-height: 1.25; }
+      main { width: 400px; padding: 8px; }
+      main p { margin: 0 0 8px; }
+      /* 全面の透明な入れ物（背景・枠線・影がなく、押下を受けない）。描くのは中の小さな枠だけ。 */
+      #pass-through-layer { position: fixed; inset: 0; z-index: 40; pointer-events: none; }
+      /* 入れ物の中の小さな固定の枠（右下）。 */
+      #corner-box {
+        position: fixed; right: 8px; bottom: 8px; width: 160px; height: 100px; z-index: 41;
+        background: #fff; border: 1px solid #333; pointer-events: auto;
+      }
+    </style>
+  </head>
+  <body>
+    <main>
+      <h1 id="page-heading">Sample page</h1>
+      <p id="intro">This paragraph explains the page in plain words for the test.</p>
+      <p id="detail">Another paragraph with more plain words, filling the first screen.</p>
+      <p id="corner-text">This paragraph sits at the lower right and is covered by the small box.</p>
+    </main>
+    <div id="pass-through-layer">
+      <div id="corner-box">Small box</div>
+    </div>
+  </body>
+</html>

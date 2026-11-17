@@ -10,6 +10,7 @@
 import {
   OBSERVATION_STATUSES,
   PARTIAL_FAILURE_REASONS,
+  type EvidenceCapture,
   type EvidenceId,
   type IncompleteReasonCode,
   type InteractionStatus,
@@ -17,6 +18,7 @@ import {
   type PageId,
   type PartialFailureReason,
   type ViewportProfile,
+  type ViewportRecheckRecord,
 } from './contracts.js';
 import type { AuditSendPolicyName } from './audit-send-policy.js';
 
@@ -48,8 +50,11 @@ export interface ScrollPosition {
  * 候補（文書、body、内側のスクロール領域）のうち、スクロールできる量（`scrollHeight - clientHeight`）が最も大きいものを
  * たどる（2026-09-23 R4 の N1）。文書と body は、最初にどちらかがスクロールできると分かった時点で、量の大きいほうに決める
  * （同じなら文書）。完了と判定する前に、候補の量を測り直す（R'2 の I-1）。文書と body のうち、たどっていないほうが大きく
- * なっていれば、1回だけ対象を切り替えてたどり直す。内側の領域が最も大きければ、その領域はたどらずに
- * `INNER_SCROLL_CONTAINER_NOT_TRAVERSED` を返す。
+ * なっていれば、1回だけ対象を切り替えてたどり直す。内側の領域が最も大きければ、文書（か body）をたどった後に、その領域
+ * （最も大きい1つ）を文書と同じ決まり（1回の動きの量、落ち着きの待ち、期限）でたどり、元の位置へ戻す（DEF-207）。たどりきれな
+ * かった場合（期限、位置が進まない、領域が文書から外れた）は `INNER_SCROLL_CONTAINER_NOT_TRAVERSED` を返す。内側の領域の測定は
+ * `observations` に記録しない（`scrollTarget` は文書か body だけ）。COMPLETE で、`innerScrollScan.representative` のスクロール
+ * できる量が `finalSnapshot` の量より大きければ、その領域をたどったことを表す。2つ目以降の内側の領域はたどらない。
  */
 export const SCROLL_TARGETS = Object.freeze(['SCROLLING_ELEMENT', 'BODY'] as const);
 export type ScrollTargetEvidence = (typeof SCROLL_TARGETS)[number];
@@ -108,8 +113,9 @@ export interface InnerScrollScanEvidence {
  * `tests/unit/schema-enum-consistency.test.ts`）。
  * - `SCROLL_TARGET_UNRESOLVED`: 内容の高さがビューポートより大きいのに、スクロールする要素を特定できない。
  * - `SCROLL_NOT_ADVANCED`: スクロールを要求しても位置が進まない、または一度もスクロールせずに内容がビューポートより大きい。
- * - `INNER_SCROLL_CONTAINER_NOT_TRAVERSED`: 候補のうちスクロールできる量が最も大きいのが内側のスクロール領域である。
- *   controlled scroll は内側の領域をたどらない（文書も body もスクロールできない場合は、量0とみなして比べる）。
+ * - `INNER_SCROLL_CONTAINER_NOT_TRAVERSED`: 候補のうちスクロールできる量が最も大きいのが内側のスクロール領域で、その領域を
+ *   たどりきれなかった（期限に当たった、位置が進まない、領域が見つからない・文書から外れた。DEF-207）。文書も body も
+ *   スクロールできない場合は、量0とみなして比べる。
  * - `INNER_SCROLL_SCAN_LIMIT_REACHED`: 文書も body もスクロールできず、内側のスクロール領域を探す走査が上限に達したため、
  *   領域がないと確かめられない（文書か body をたどった場合は、走査が上限に達しても、その事実を `innerScrollScan` に
  *   記録するだけで、この理由にはしない）。
@@ -123,17 +129,77 @@ export const SCROLL_INCOMPLETE_REASONS = Object.freeze([
   'INNER_SCROLL_CONTAINER_NOT_TRAVERSED',
   'INNER_SCROLL_SCAN_LIMIT_REACHED',
   'SCROLL_TARGET_UNSTABLE',
+  // L9（設計書 `2026-11-09-beaksight-remove-limits-design.md` 5 の 1）: 期限を受けないときは、進みの見張りが段を終えた理由になる。
+  'STAGE_UNRESPONSIVE',
+  'STAGE_NEVER_QUIET',
 ] as const satisfies readonly IncompleteReasonCode[]);
 export type ScrollIncompleteReason = (typeof SCROLL_INCOMPLETE_REASONS)[number];
 
-/** 終了時に文書の先頭（0, 0）へ戻せなかった理由の閉じた一覧。 */
+/**
+ * L9: controlled scroll が `COMPLETE` で終えた理由の閉じた一覧。
+ * - `BOTTOM_AND_HEIGHT_STABLE`: 最下部で、高さが落ち着いた。
+ * - `NO_NEW_STRUCTURE`: 最下部の近くで読み込まれた内容が、新しい作り（`scrollStructureSignaturesOf` の印）を出さなくなった（伸び続ける画面の止め方）。
+ */
+export const SCROLL_COMPLETE_REASONS = Object.freeze(['BOTTOM_AND_HEIGHT_STABLE', 'NO_NEW_STRUCTURE'] as const);
+export type ScrollCompleteReason = (typeof SCROLL_COMPLETE_REASONS)[number];
+
+/**
+ * L9（COV-5・AUD-5）: 内側のスクロール領域 1 つをたどるのを止めた理由の閉じた一覧。
+ * - `BOTTOM_AND_HEIGHT_STABLE`・`NO_NEW_STRUCTURE`: 文書と同じ決まりで、たどり終えた。
+ * - `NOT_ADVANCED`: 動かすよう求めても位置が進まない。`DISCONNECTED`: 領域が文書から外れた。`NOT_FOUND`: 探したときの領域を、たどる前に見失った。
+ * - `STAGE_UNRESPONSIVE`・`STAGE_NEVER_QUIET`: 進みの見張りが段を終えた。`DEADLINE_EXCEEDED`: 呼ぶ側の期限か Run の時間の上限。
+ * - `EVALUATION_FAILED`・`PAGE_CLOSED`: 読み取りが失敗した、ページが閉じた。
+ */
+export const INNER_SCROLL_STOP_REASONS = Object.freeze([
+  'BOTTOM_AND_HEIGHT_STABLE',
+  'NO_NEW_STRUCTURE',
+  'NOT_ADVANCED',
+  'STAGE_UNRESPONSIVE',
+  'STAGE_NEVER_QUIET',
+  'DEADLINE_EXCEEDED',
+  'DISCONNECTED',
+  'NOT_FOUND',
+  'EVALUATION_FAILED',
+  'PAGE_CLOSED',
+] as const);
+export type InnerScrollStopReason = (typeof INNER_SCROLL_STOP_REASONS)[number];
+
+/** L9（COV-5・AUD-5）: 内側のスクロール領域 1 つをたどった記録（見つけた全部の領域の、文書の順）。 */
+export interface InnerScrollContainerEvidence {
+  /** 領域の CSS の selector（文書の根からの位置。open な shadow root の中など、位置で表せない領域は `null`）。 */
+  readonly selector: string | null;
+  /** たどる前の位置（`scrollTop`）。測る前に止まった場合は `null`。 */
+  readonly originTop: number | null;
+  readonly clientHeight: number | null;
+  readonly initialScrollHeight: number | null;
+  readonly finalScrollHeight: number | null;
+  /** 到達した最大の位置（`scrollTop`）。 */
+  readonly maxScrollTop: number | null;
+  /** 最下部まで届いたか。 */
+  readonly reachedBottom: boolean;
+  /** 動かした回数。 */
+  readonly stepCount: number;
+  /** 高さが増えた回数。 */
+  readonly heightGrowthCount: number;
+  readonly stopReason: InnerScrollStopReason;
+  /** 元の位置に戻せたか（測る前に止まった、戻せたか確かめられなかった場合は `null`）。 */
+  readonly restored: boolean | null;
+}
+
+/** 終了時に文書の先頭（0, 0）へ戻せなかった理由の閉じた一覧。L9: 見張りが段を終えたときは、戻すのを待たないので、その理由になる。 */
 export const SCROLL_RESTORATION_FAILURE_REASONS = Object.freeze([
   ...PARTIAL_FAILURE_REASONS,
   'POSITION_NOT_AT_ORIGIN',
+  'STAGE_UNRESPONSIVE',
+  'STAGE_NEVER_QUIET',
 ] as const satisfies readonly IncompleteReasonCode[]);
 export type ScrollRestorationFailureReason = (typeof SCROLL_RESTORATION_FAILURE_REASONS)[number];
 
-/** 終了時に文書の先頭（0, 0）へ戻せたかどうか。 */
+/**
+ * 終了時に文書の先頭（0, 0）へ戻せたかどうか。内側のスクロール領域をたどった場合（DEF-207）は、その領域を元の位置へ戻せた
+ * かどうかも含める。文書を戻せて内側の領域を戻せなかったときは、内側の理由（`POSITION_NOT_AT_ORIGIN` など）を記録し、
+ * `position`（文書の位置の欄）は `null` にする。
+ */
 export type ScrollRestorationEvidence =
   | Readonly<{ status: 'RESTORED'; position: Readonly<ScrollPosition> }>
   | Readonly<{
@@ -161,6 +227,11 @@ interface ScrollEvidenceFacts {
   readonly restoration: ScrollRestorationEvidence;
   /** 内側のスクロール領域を探した結果（最後に探したもの）。探す前に終わった場合は `null`。 */
   readonly innerScrollScan: Readonly<InnerScrollScanEvidence> | null;
+  /**
+   * L9（COV-5・AUD-5）: 見つけた全部の内側のスクロール領域をたどった記録（文書の順）。任意の欄（この欄のない古い記録は、最も大きい 1 つだけを
+   * たどった版）。
+   */
+  readonly innerScrollContainers?: readonly Readonly<InnerScrollContainerEvidence>[] | undefined;
 }
 
 /**
@@ -169,7 +240,7 @@ interface ScrollEvidenceFacts {
  */
 export type ScrollEvidence = Readonly<ScrollEvidenceFacts & {
   readonly status: 'COMPLETE';
-  readonly reason: 'BOTTOM_AND_HEIGHT_STABLE';
+  readonly reason: ScrollCompleteReason;
   readonly finalSnapshot: Readonly<ScrollObservationEvidence>;
 }> | Readonly<ScrollEvidenceFacts & {
   readonly status: 'PARTIAL';
@@ -235,7 +306,7 @@ export interface NetworkRequestEvidence extends RequestOriginFlags {
   readonly redirectFromRequestId: string | null;
   readonly redirectToRequestId: string | null;
   readonly redirectChainRequestIds: readonly string[];
-  /** URL・メソッド・ヘッダの値のどれかを上限で切り詰めたか。 */
+  /** メソッド・ヘッダの値のどれかを上限で切り詰めたか（設計者の判断 2026-11-11 から、URL は切り詰めない。前の版の記録では URL の切り詰めも含む）。 */
   readonly truncated: boolean;
 }
 
@@ -248,8 +319,55 @@ export interface NetworkResponseEvidence extends RequestOriginFlags {
   readonly contentLengthHeader: string | null;
   readonly timing: NetworkTimingEvidence;
   readonly transferSize: ResponseTransferSizeEvidence;
-  /** URL・ヘッダの値のどれかを上限で切り詰めたか。 */
+  /** ヘッダの値を上限で切り詰めたか（設計者の判断 2026-11-11 から、URL は切り詰めない。前の版の記録では URL の切り詰めも含む）。 */
   readonly truncated: boolean;
+  /** AUD-7: 4xx・5xx の応答の文脈（本文の要旨と、承認したサービスの Origin か）。2xx・3xx の応答と、前の版の記録にはない。 */
+  readonly errorContext?: ResponseErrorContextEvidence;
+}
+
+/**
+ * AUD-7: 誤りの応答の本文の要旨の形の閉じた一覧。`JSON` は許した最上位の鍵だけ、`TEXT`（text/plain）は先頭だけ、`HTML` は `<title>` だけ。
+ * 要旨の値は、記録とバンドルにだけ出す（画面と HTML の本文には出さない）。
+ */
+export const RESPONSE_BODY_SUMMARY_FORMATS = Object.freeze(['JSON', 'TEXT', 'HTML'] as const);
+export type ResponseBodySummaryFormat = (typeof RESPONSE_BODY_SUMMARY_FORMATS)[number];
+
+/** AUD-7: 要旨を作らなかった理由の閉じた一覧（空の本文・扱わない種類・解析できない JSON・本文を読めない）。 */
+export const RESPONSE_BODY_SUMMARY_NONE_REASONS = Object.freeze(['EMPTY_BODY', 'UNSUPPORTED_CONTENT_TYPE', 'UNPARSABLE_JSON', 'UNREADABLE'] as const);
+export type ResponseBodySummaryNoneReason = (typeof RESPONSE_BODY_SUMMARY_NONE_REASONS)[number];
+
+/** AUD-7: 要旨の値の型の閉じた一覧（JSON の値の型。text と title は `string`）。 */
+export const RESPONSE_SUMMARY_VALUE_TYPES = Object.freeze(['string', 'number', 'boolean', 'null', 'object', 'array'] as const);
+export type ResponseSummaryValueType = (typeof RESPONSE_SUMMARY_VALUE_TYPES)[number];
+
+/** AUD-7: 要旨の 1 つの値。秘密に見える値（`isSecretLikeText`）は `value` を `null` にし、印（`secretLike`）だけを残す。 */
+export interface ResponseSummaryFieldEvidence {
+  readonly key: string;
+  readonly valueType: ResponseSummaryValueType;
+  readonly value: string | null;
+  readonly secretLike: boolean;
+  /** 値を長さで切ったか（本文を保存しないための守り）。 */
+  readonly truncated: boolean;
+}
+
+export type ResponseBodySummaryEvidence =
+  | {
+      readonly status: 'OBSERVED';
+      readonly format: ResponseBodySummaryFormat;
+      readonly fields: readonly ResponseSummaryFieldEvidence[];
+    }
+  | {
+      readonly status: 'NONE';
+      readonly reason: ResponseBodySummaryNoneReason;
+      /** 本文を読めなかったときの理由の文（`UNREADABLE` だけ）。 */
+      readonly errorText: string | null;
+    };
+
+/** AUD-7: 4xx・5xx の応答の文脈（Collector が記録する事実。区分は Rule の側が決める）。 */
+export interface ResponseErrorContextEvidence {
+  readonly bodySummary: ResponseBodySummaryEvidence;
+  /** 承認したサービスの Origin への要求の応答か（スクリプトで送るログインの監査の段の Origin。ほかの Run では常に false）。 */
+  readonly approvedService: boolean;
 }
 
 export interface NetworkFailureEvidence extends RequestOriginFlags {
@@ -259,7 +377,7 @@ export interface NetworkFailureEvidence extends RequestOriginFlags {
   readonly resourceType: string;
   readonly errorText: string;
   readonly timing: NetworkTimingEvidence;
-  /** URL・メソッド・エラー文のどれかを上限で切り詰めたか。 */
+  /** メソッド・エラー文のどれかを上限で切り詰めたか（設計者の判断 2026-11-11 から、URL は切り詰めない。前の版の記録では URL の切り詰めも含む）。 */
   readonly truncated: boolean;
   /**
    * BN-a（設計書 3.1 の 3）: BeakSight が止めた要求の失敗か（切り詰める前の `errorText` を、`src/core/blocked-by-client-failures.ts` の
@@ -270,11 +388,51 @@ export interface NetworkFailureEvidence extends RequestOriginFlags {
   readonly phase: BlockedEventPhase;
 }
 
+/** 同じ口のくり返しの記録の、代表の 1 件（URL と時間の内訳）。 */
+export interface NetworkRepeatedReadSampleEvidence {
+  readonly url: string;
+  readonly timing: NetworkTimingEvidence;
+}
+
+/**
+ * 同じ口への、成功した読み取りのくり返しを数でまとめた記録（設計者の判断 2026-11-11。要求を出し続ける画面で、要求ごとの記録がメモリを使い続けないため）。
+ * - まとめる鍵は、口（method・Origin・path。`requestEndpointKeyOf` と同じ。query と fragment は見ない）・資源の種類・status・main frame の要求か。失敗か・
+ *   失敗の理由も鍵の一部だが、まとめるのは成功した読み取りだけなので、いつも「失敗でない」（記録に欄を持たない）。
+ * - まとめるのは、読み取り（GET・HEAD）で、文書の読み込みでなく、リダイレクトに関わらず、status が 4xx・5xx でない要求だけ。HTTP の誤り・失敗・止めた要求は、
+ *   今までどおり 1 件ずつ `requests`・`responses`・`failures` に残す（Rule が指摘を作る元）。
+ * - 最初の 1 件は、`requests`・`responses` に 1 件の記録として残る（`firstRequestId`）。2 件目からは、ここに数えるだけで、1 件ずつの記録は残さない。
+ */
+export interface NetworkRepeatedReadEvidence {
+  readonly method: string;
+  readonly origin: string;
+  readonly path: string;
+  readonly resourceType: string;
+  readonly status: number;
+  readonly isMainFrame: boolean | null;
+  /** まとめた要求の数（最初の 1 件を含む。2 以上）。 */
+  readonly count: number;
+  /** 最初の 1 件の要求の ID（`requests`・`responses` に残る記録）。 */
+  readonly firstRequestId: string;
+  /** 最初の 1 件の URL と時間の内訳。 */
+  readonly first: NetworkRepeatedReadSampleEvidence;
+  /** いちばん遅かった 1 件（`timing.responseEnd` が最も大きいもの。同じなら先のもの）の URL と時間の内訳。 */
+  readonly slowest: NetworkRepeatedReadSampleEvidence;
+  /** 最初と最後の要求の始まりの時刻（`timing.startTime`。エポックからの ms）。 */
+  readonly firstStartTime: number;
+  readonly lastStartTime: number;
+  /** 転送量の合計（読めた要求の数と、その合計のバイト数）。 */
+  readonly transfer: { readonly observedCount: number; readonly totalBytes: number };
+  /** query の値の違いの数（違う query の文字列がいくつあったか。query のない要求も 1 つの値として数える）。 */
+  readonly distinctQueryCount: number;
+}
+
 export interface NetworkEvidence {
   readonly requests: readonly NetworkRequestEvidence[];
   readonly responses: readonly NetworkResponseEvidence[];
   readonly failures: readonly NetworkFailureEvidence[];
-  /** 件数の上限（`MAX_NETWORK_REQUESTS`）を超えたため記録しなかったリクエストの件数。 */
+  /** 同じ口の成功した読み取りのくり返しをまとめた記録（2 件以上のものだけ）。なければ欄を持たない（前の版の記録にもない）。 */
+  readonly repeatedReads?: readonly NetworkRepeatedReadEvidence[];
+  /** 件数の上限（前は 2,000）を超えたため記録しなかったリクエストの件数。L2: 上限を置かないので、新しい記録では常に 0（古い記録を読むために残す）。 */
   readonly omittedRequestCount: number;
   /** 記録しなかったリクエストに対する response の件数。 */
   readonly omittedResponseCount: number;
@@ -336,7 +494,7 @@ export type NormalizedHttpUrlEvidence = string & { readonly __brand: 'Normalized
  * - `INVALID_URL`: URL として解析できない、または http(s) なのに Origin やホストがない。
  * - `UNSUPPORTED_SCHEME`: http(s) 以外の scheme（正規化で使う。受け入れ判定では `SPECIAL_SCHEME_RECORD_ONLY` として記録する）。
  * - `CREDENTIALS_NOT_ALLOWED`: 認証情報（ユーザー名・パスワード）を含む。基準URLから引き継いだ場合を含む。
- * - `URL_TOO_LONG`: 正規化した URL が `MAX_URL_LENGTH`（`src/core/limits.ts`）より長い。
+ * - `URL_TOO_LONG`: 前の記録の読み方のためだけに残す（L14・URL-LEN: 長さでは拒まないので、今は使わない。成果物の schema の enum にあるので、LZ-1 でも消さない）。
  */
 export const URL_REJECTION_REASONS = Object.freeze([
   'INVALID_URL',
@@ -365,29 +523,39 @@ export type LinkAdmissionEvidence =
   | { readonly kind: 'REJECTED_INVALID'; readonly rawUrl: string; readonly reason: UrlRejectionReason };
 
 /**
- * 1つのアンカーの Evidence。文字列は、上限（`src/crawl/discover-links.ts` の `LINK_LIMITS`）までに切り詰める。
- * URL の文字列（`rawHref`、`normalized` と `admission` の `rawUrl`、`scheme`）の上限は `MAX_URL_LENGTH`。
- * 正規化済みの URL（`normalized.url`、`admission.url`）は、上限を超えるものを正規化で受け入れない（`URL_TOO_LONG`）ので、
- * 切り詰めない。
+ * 1つのアンカーの Evidence。文字（`anchorText`・`ariaLabel`・`title`）は切り詰めない（LZ-3b。前は 1,024 まで）。
+ * URL の文字列（`rawHref`、`normalized` と `admission` の値）も切り詰めない（URL-LEN）。
  */
 export interface LinkEvidence {
   readonly sourcePageId: PageId;
   readonly anchorText: string;
   readonly ariaLabel: string | null;
   readonly title: string | null;
+  /**
+   * REV-SD の M-1: リンクの中の画像の `alt`（空でないもの。文書の順）。巡回の移動の操作の前の判定（`linkTextHasDestructiveWord`）がリンクの文字と合わせて見る。
+   * 画像の `alt` のないリンクと、前の版の記録にはない。
+   */
+  readonly imageAlts?: readonly string[];
   readonly rawHref: string;
   readonly normalized: LinkNormalizationEvidence;
   readonly admission: LinkAdmissionEvidence;
-  /** `anchorText`・`ariaLabel`・`title`・`rawHref`・`rawUrl`・`scheme` のどれかを上限で切り詰めたか。 */
+  /** 古い版の記録を読むためだけに残す: 文字を上限で切り詰めたか（LZ-3b の後の記録では常に false）。 */
   readonly truncated: boolean;
 }
 
 /** 1ページの `discoverLinks()` の結果（link の Evidence の payload）。 */
 export interface LinkDiscoveryEvidence {
-  /** 文書の順の、先頭から上限（`LINK_LIMITS.maxLinks`）までのリンク。 */
+  /** 文書の順のすべてのリンク（COV-6: 件数の上限で打ち切らない。古い版の記録は先頭から 2,000 件まで）。 */
   readonly links: readonly LinkEvidence[];
-  /** 件数の上限を超えたため記録しなかったリンク（`a[href]`）の件数。 */
+  /** 古い版の記録を読むためだけに残す: 件数の上限を超えたため記録しなかったリンク（`a[href]`）の件数（COV-6 の後の記録では常に 0）。 */
   readonly omittedLinkCount: number;
+  /** COV-6: ページの中の読み取りを分けた回数（1 以上。古い版の記録にはない）。 */
+  readonly collectedInParts?: number;
+  /**
+   * COV-4（網羅の設計書 3.3 の iframe の行）: 許可 Origin の中の子の frame の文書の URL（正規化したもの。frame の木の順。重なりなし）。巡回が、その文書を
+   * ページとして読む。前の版の記録にはない。
+   */
+  readonly frames?: readonly NormalizedHttpUrlEvidence[];
 }
 
 // ---------------------------------------------------------------------------------------------------------------
@@ -400,7 +568,7 @@ export interface LinkDiscoveryEvidence {
 export interface HeadingEvidence {
   readonly level: number;
   readonly text: string;
-  /** `text` を長さの上限で切り詰めたか、見出しの中をたどるノードの数が上限に達したか。 */
+  /** 古い版の記録を読むためだけに残す: `text` を長さの上限で切り詰めたか（LZ-3b の後の記録では常に false）。 */
   readonly truncated: boolean;
 }
 
@@ -423,7 +591,7 @@ export interface SemanticRegionEvidence {
    * `aria-hidden="true"` の中にあること。
    */
   readonly ariaHidden: boolean;
-  /** `text` を長さの上限で切り詰めたか。 */
+  /** 古い版の記録を読むためだけに残す: `text` を長さの上限で切り詰めたか（COV-6 の後の記録では常に false）。 */
   readonly truncated: boolean;
 }
 
@@ -432,15 +600,15 @@ export interface VisibleTextEvidence {
   readonly source: VisibleTextSource;
   /** body の中の可視テキスト（`checkVisibility(VISIBILITY_CHECK_OPTIONS)` が真の要素のテキスト）を、文書の順に並べたもの。 */
   readonly text: string;
-  /** `text` を長さの上限（`maxVisibleTextLength`）で切り詰めたか。ノード数の上限は `nodeLimitReached` に記録する。 */
+  /** 古い版の記録を読むためだけに残す: `text` を長さの上限で切り詰めたか（COV-6 の後の記録では常に false）。 */
   readonly truncated: boolean;
-  /** たどるノードの数が上限（`maxTextWalkNodes`）に達し、残りのノードをたどらなかったか。 */
+  /** 古い版の記録を読むためだけに残す: たどるノードの数が上限に達し、残りをたどらなかったか（COV-6 の後の記録では常に false）。 */
   readonly nodeLimitReached: boolean;
   /** `text` のうち、`aria-hidden="true"` の中にある部分。 */
   readonly ariaHiddenText: string;
   /** landmark の区分（文書の順）と、最後に `other` の区分。 */
   readonly regions: readonly SemanticRegionEvidence[];
-  /** 件数の上限により記録しなかった、テキストのある landmark の区分の数。 */
+  /** 古い版の記録を読むためだけに残す: 件数の上限により記録しなかった、テキストのある landmark の区分の数（COV-6 の後の記録では常に 0）。 */
   readonly omittedRegionCount: number;
 }
 
@@ -453,7 +621,7 @@ export interface ImageDomEvidence {
   readonly complete: boolean;
   readonly naturalWidth: number;
   readonly naturalHeight: number;
-  /** `src`・`resolvedUrl`・`alt` のいずれかを長さの上限で切り詰めたか。 */
+  /** 古い版の記録を読むためだけに残す: `alt` を長さの上限で切り詰めたか（LZ-3b の後の記録では常に false）。 */
   readonly truncated: boolean;
 }
 
@@ -472,7 +640,7 @@ export interface FormFieldEvidence {
   readonly hasAriaLabelledby: boolean;
   /** 空白以外の値を持つ `title` 属性があるか。 */
   readonly hasTitle: boolean;
-  /** `type`・`name`・`labels` のいずれかを上限で切り詰めたか。 */
+  /** 古い版の記録を読むためだけに残す: `type`・`name`・`labels` のいずれかを上限で切り詰めたか（LZ-3b の後の記録では常に false）。 */
   readonly truncated: boolean;
 }
 
@@ -485,7 +653,7 @@ export interface SubmitControlEvidence {
   readonly name: string;
   readonly value: string;
   readonly text: string;
-  /** `name`・`value`・`text` のいずれかを長さの上限で切り詰めたか。 */
+  /** 古い版の記録を読むためだけに残す: `name`・`value`・`text` のいずれかを長さの上限で切り詰めたか（LZ-3b の後の記録では常に false）。 */
   readonly truncated: boolean;
 }
 
@@ -494,9 +662,10 @@ export interface FormDomEvidence {
   readonly action: string;
   readonly fields: readonly FormFieldEvidence[];
   readonly submitControls: readonly SubmitControlEvidence[];
+  /** 古い版の記録を読むためだけに残す（この 2 つの件数は、COV-6 の後の記録では常に 0）。 */
   readonly omittedFieldCount: number;
   readonly omittedSubmitControlCount: number;
-  /** `method`・`action` を長さの上限で切り詰めたか。 */
+  /** 古い版の記録を読むためだけに残す: `method`・`action` を長さの上限で切り詰めたか（LZ-3b の後の記録では常に false）。 */
   readonly truncated: boolean;
 }
 
@@ -504,15 +673,15 @@ export interface DuplicateIdEvidence {
   readonly id: string;
   /** 同じ `id` を持つ要素の数（2以上）。 */
   readonly count: number;
-  /** `id` を長さの上限で切り詰めたか。 */
+  /** 古い版の記録を読むためだけに残す: `id` を長さの上限で切り詰めたか（LZ-3b の後の記録では常に false）。 */
   readonly truncated: boolean;
 }
 
 /**
  * 文書の項目ごとに、長さの上限で切り詰めたか（R''2 の m4）。キーは `DomEvidence` の項目の名前と同じ。
- * 上限は、`title`・`metaDescription`・`lang` が `maxDocumentTextLength`、`canonicalUrl` が `maxUrlLength`
- * （`src/evidence/dom-collector.ts` の `DOM_LIMITS`）。切り詰めた canonical の URL は、元の URL と異なるので、
- * Rule（例: `INVALID_CANONICAL_URL`）は `canonicalUrl` の印を見て判定する。
+ * LZ-3b: どの項目も切り詰めない（印は常に false。前の記録の読み方のために項目は残す。前の上限は `title`・`metaDescription`・`lang` が 1,024）。
+ * URL-LEN: `canonicalUrl` も切り詰めない。前の記録で切り詰めた canonical の URL は、
+ * 元の URL と異なるので、Rule（例: `INVALID_CANONICAL_URL`）は `canonicalUrl` の印を見て判定する。
  */
 export interface DomDocumentFieldTruncationEvidence {
   readonly title: boolean;
@@ -559,8 +728,44 @@ export interface DomEvidence {
   readonly unassociatedFields: readonly FormFieldEvidence[];
   /** 重複している `id` の値と件数（最初に現れた順）。 */
   readonly duplicateIds: readonly DuplicateIdEvidence[];
+  /** COV-6 の後の記録では、件数（`omitted*Count`）は常に 0。文書の項目ごとの長さの切り詰めの印は今までどおり。 */
   readonly truncation: DomTruncationEvidence;
+  /** COV-6: ページの中の読み取りを分けた回数（1 以上。古い版の記録にはない）。 */
+  readonly collectedInParts?: number;
+  /** AUD-7: 画面の誤りの表示の手がかり（前の版の記録にはない）。 */
+  readonly errorDisplay?: ErrorDisplayEvidence;
+  /** EV-1: 見えている読み込み中の表示の数（前の版の記録にはない。EV-3 が準備の状態に使う）。 */
+  readonly loadingIndicators?: LoadingIndicatorEvidence;
 }
+
+/**
+ * EV-1: 見えている読み込み中の表示の数。`ariaBusyCount` は `aria-busy="true"` の要素、`progressbarCount` は `role="progressbar"` と `progress` の要素、
+ * `indeterminateProgressCount` は、そのうち値のないもの（値のない `progress` と、EV-3 から `aria-valuenow` のない `role="progressbar"`）。どれも、見える
+ * （`checkVisibility`）ものだけ。読み方はページの中の部品 `loadingIndicatorsIn` の 1 か所、準備の決め方は `src/core/page-readiness.ts`。
+ */
+export interface LoadingIndicatorEvidence {
+  readonly ariaBusyCount: number;
+  readonly progressbarCount: number;
+  readonly indeterminateProgressCount: number;
+}
+
+/**
+ * AUD-7: 誤りの語（`ERROR_DISPLAY_WORDS`）を探す所の閉じた一覧。role=alert・aria-live=assertive・見出し・aria-invalid の欄の近くの文字。
+ * 本文のどこかに語があるだけでは、誤りの表示としない。
+ */
+export const ERROR_DISPLAY_SOURCES = Object.freeze(['ALERT', 'ASSERTIVE_LIVE', 'HEADING', 'INVALID_FIELD'] as const);
+export type ErrorDisplaySource = (typeof ERROR_DISPLAY_SOURCES)[number];
+
+/** AUD-7: 誤りの語が見つかった所と、見つかった語（文そのものは残さない）。 */
+export interface ErrorDisplayMatchEvidence {
+  readonly source: ErrorDisplaySource;
+  readonly words: readonly string[];
+}
+
+/** AUD-7: 画面の誤りの表示の手がかり（`OBSERVED` の `matches` は語が見つかった所だけ。空なら、誤りの表示はなかった）。 */
+export type ErrorDisplayEvidence =
+  | { readonly status: 'OBSERVED'; readonly matches: readonly ErrorDisplayMatchEvidence[] }
+  | { readonly status: 'FAILED'; readonly errorText: string };
 
 // ---------------------------------------------------------------------------------------------------------------
 // Layout
@@ -615,6 +820,13 @@ export interface VisibilityEvidence {
   readonly hiddenAttribute: boolean;
   readonly ariaHidden: boolean;
   readonly clientRectCount: number;
+  /**
+   * DEF-205: 要素自身か祖先の `clip`（絶対配置の要素の `rect(...)`）・`clip-path`（`inset(...)`・`circle(...)`・`ellipse(...)`）で、描く面が 0 になるか
+   * （視覚的に隠す手法。`clip: rect(0 0 0 0)`・`clip-path: inset(50%)` など）。事実だけで、判定に使うかは Rule が決める（`TEXT_CLIPPING`・
+   * `ELEMENT_OUTSIDE_VIEWPORT` が外す）。読めない書き方（`calc()`・`polygon()` など）は偽。`position: fixed` の要素は、祖先の値を引き継がない。
+   * 記録するのは layout の collector だけ。記録のない前の版の Evidence は、偽と同じに扱う（今までどおり数える）。
+   */
+  readonly clippedToZeroArea?: boolean;
 }
 
 export interface LayoutDocumentEvidence {
@@ -681,8 +893,8 @@ export interface ZeroSizeInteractiveEvidence {
    * 子孫に、可視で大きさのある（幅と高さが `VISUALLY_HIDDEN_MAX_DIMENSION_PX` より大きい）要素があるか（float の画像や absolute の子など）。
    * 1 px 以下の子孫（visually hidden のテキストなど）は、数えない。
    * 要素自身が、大きさが0の方向を overflow で切り取る場合は、子孫が見えないので false。
-   * 子孫の走査が上限（`maxRenderedDescendantScan`）に達した場合は、判定できないものとして false にし、
-   * `LayoutTruncationEvidence.renderedDescendantScanLimitReachedCount` に数える。
+   * COV-6 の後は、子孫の数で打ち切らずにすべてを見る（古い記録では、上限 256 に達したものを false にし、
+   * `LayoutTruncationEvidence.renderedDescendantScanLimitReachedCount` に数えた）。
    */
   readonly hasRenderedDescendant: boolean;
   /** selector を上限で切り詰めたか。 */
@@ -691,7 +903,14 @@ export interface ZeroSizeInteractiveEvidence {
 
 export interface ClippedTextEvidence {
   readonly selector: string;
+  /**
+   * 表示の値（空白を整えた `innerText`）。EV-4: 閉じた選択の部品（`select` で `multiple` でなく `size` が 1 以下）は、選んだ選択肢の文字（全部の選択肢を
+   * つなげない。選んだものがなければ空）。
+   */
   readonly text: string;
+  /** EV-4: 要素の名前（小文字）と `role` の属性（なければ `null`）。この項目より前の記録にはない。 */
+  readonly tagName?: string;
+  readonly role?: string | null;
   readonly rect: RectangleEvidence;
   readonly visibility: VisibilityEvidence;
   readonly overflowX: string;
@@ -719,12 +938,109 @@ export interface ClippedTextEvidence {
    * 横方向に箱と重ならず、箱の外に丸ごと出ている行（カルーセルの隠れたスライドなど）は、数えない。
    * 見えない子孫のテキスト（`VISIBILITY_CHECK_OPTIONS` の可視判定で見えない要素の中のもの。`visibility:hidden` や `opacity:0`）は、
    * 判定に使わない（RT12r2 の M1）。
-   * テキストのノードの走査が上限（`maxClippedTextNodeScan`）に達した場合は、判定できないものとして false にし、
-   * `LayoutTruncationEvidence.clippedTextNodeScanLimitReachedCount` に数える。
+   * COV-6 の後は、テキストのノードの数で打ち切らずにすべてを見る（古い記録では、上限 256 に達したものを false にし、
+   * `LayoutTruncationEvidence.clippedTextNodeScanLimitReachedCount` に数えた）。
    */
   readonly partiallyClippedText: boolean;
-  /** selector かテキストを上限で切り詰めたか。 */
+  /** 古い版の記録を読むためだけに残す: selector かテキストを上限で切り詰めたか（LZ-2・LZ-3b の後の記録では常に false）。 */
   readonly truncated: boolean;
+  /** AUD-4a: 省略の書き方の計算値（この項目より前に記録した Evidence にはない）。 */
+  readonly clippingStyle?: ClippedTextStyleEvidence;
+  /**
+   * AUD-4a: 行の高さ（px）。`line-height` の計算値が px ならその値、`normal` などは箱の中の最初のテキストの行の矩形の高さ。求められなければ null。
+   * この項目より前に記録した Evidence にはない。
+   */
+  readonly lineHeightPx?: number | null;
+  /** AUD-4a: 箱の中に見える行の数（内容の高さ（`clientHeight` から上下の padding を引いた値）÷ `lineHeightPx`。端数を残す）。求められなければ null。 */
+  readonly visibleLineCount?: number | null;
+  /**
+   * AUD-4a: 効いている行数の省略の行の数（`-webkit-line-clamp` は `display` が `-webkit-box`・`-webkit-inline-box`（Chromium の計算値では
+   * `flow-root`・`inline-flow-root`）で `-webkit-box-orient` が `vertical` のとき、`line-clamp` は正の整数のとき）。効いていなければ null。
+   */
+  readonly lineClampCount?: number | null;
+  /** AUD-4a: `aria-expanded="false"` で、`aria-controls` がこの要素か祖先の id を指す操作要素があるか（閉じた折りたたみ）。 */
+  readonly collapsedByControl?: boolean;
+  /**
+   * AUD-4a: 意図した省略の形の区分（`INTENDED_CLIPPING_KINDS`。当たらなければ null）。書き方の事実だけで決める区分で、Finding から外すかは
+   * Rule（`TEXT_CLIPPING`）が見切れの方向と見える行の数で決める。外したものは、この区分で Evidence に残る（画面には出さない）。
+   */
+  readonly intendedClipping?: IntendedClippingKind | null;
+}
+
+/**
+ * AUD-4a: 意図した省略の形の区分（閉じた一覧。当てはめる順に並べる）。
+ * - `COLLAPSED`: 閉じた折りたたみの中（`collapsedByControl`）。
+ * - `LINE_CLAMP`: 行数の省略が効いている（`lineClampCount` が null でない）。
+ * - `INTENDED_ELLIPSIS`: `text-overflow: ellipsis` で、折り返さない（`white-space` が `nowrap`・`pre`）。
+ */
+export const INTENDED_CLIPPING_KINDS = Object.freeze(['INTENDED_ELLIPSIS', 'LINE_CLAMP', 'COLLAPSED'] as const);
+export type IntendedClippingKind = (typeof INTENDED_CLIPPING_KINDS)[number];
+
+/** AUD-4a: 見切れの候補の、省略の書き方の計算値（ブラウザの値のまま。対応しない性質は空の文字列）。 */
+export interface ClippedTextStyleEvidence {
+  readonly textOverflow: string;
+  readonly whiteSpace: string;
+  readonly webkitLineClamp: string;
+  readonly lineClamp: string;
+  readonly display: string;
+  readonly webkitBoxOrient: string;
+  readonly maxHeight: string;
+}
+
+/**
+ * AUD-3b（整理の文書 `doc/design/2026-11-09-beaksight-audit-precision-triage.md` の AUD-3b・3c）: hit-test の点の要素と、覆う要素・覆われる要素との関係の閉じた一覧。
+ * 覆われる要素の側を先に見る（覆われる要素が覆う要素の子孫でも `COVERED`・`COVERED_DESCENDANT` にする）。
+ */
+export const OVERLAP_HIT_RELATIONS = Object.freeze(['COVERED', 'COVERED_DESCENDANT', 'OVERLAY', 'OVERLAY_DESCENDANT', 'OTHER'] as const);
+export type OverlapHitRelation = (typeof OVERLAP_HIT_RELATIONS)[number];
+
+/**
+ * AUD-3b: hit-test の対象の閉じた一覧。`COVERED` は重なりの組（覆われる要素がある）、`BENEATH` は固定要素だけの事実（下にある、祖先でない要素を見る）。
+ */
+export const OVERLAP_HIT_TARGETS = Object.freeze(['COVERED', 'BENEATH'] as const);
+export type OverlapHitTarget = (typeof OVERLAP_HIT_TARGETS)[number];
+
+/** AUD-3b: hit-test の点の要素の 1 つの事実（描画と押下の事実。値はページの中の計算値の文字列のまま）。 */
+export interface OverlapHitLayerEvidence {
+  readonly selector: string;
+  readonly relation: OverlapHitRelation;
+  readonly position: string;
+  readonly zIndex: string;
+  readonly pointerEvents: string;
+  /** 要素と祖先の `opacity` の積。 */
+  readonly effectiveOpacity: number;
+  readonly visibility: string;
+  readonly backgroundColor: string;
+  readonly hasBackgroundImage: boolean;
+  /** 要素そのものが描く面があるか（DEF-204 の `paintsOwnSurfaceOf`）。 */
+  readonly paintsOwnSurface: boolean;
+}
+
+/** AUD-3b: hit-test の 1 つの点（ビューポートの座標）の事実。 */
+export interface OverlapHitPointEvidence {
+  readonly x: number;
+  readonly y: number;
+  /** 最前面の要素の関係（点に要素がなければ `null`）。 */
+  readonly topRelation: OverlapHitRelation | null;
+  /** 最前面から、対象（覆われる要素か、固定要素の下の要素）の手前までの要素（上から順。覆う要素の祖先は除く）。 */
+  readonly layers: readonly OverlapHitLayerEvidence[];
+  /** 対象が、その点の要素の並び（`elementsFromPoint`）にあったか。 */
+  readonly targetFound: boolean;
+  /** 対象の要素の selector（なければ `null`）。 */
+  readonly targetSelector: string | null;
+}
+
+/**
+ * AUD-3b: 固定要素の重なりの hit-test の事実（Collector は区分を決めない。区分は `src/audit/fixed-overlap-classes.ts`）。点は、交わり（固定要素だけなら、要素と
+ * ビューポートの交わり）の中心と、内側に寄せた四隅。この項目より前に記録した Evidence にはない。
+ */
+export interface OverlapHitTestEvidence {
+  readonly target: OverlapHitTarget;
+  readonly points: readonly OverlapHitPointEvidence[];
+  /** 覆う要素そのものの事実（`pointer-events: none` で hit-test に出ないときも、描画の事実を読むため）。`relation` は `OVERLAY`。 */
+  readonly overlay: OverlapHitLayerEvidence;
+  /** モーダルの印（覆う要素か祖先の、開いたモーダルの `dialog`・`aria-modal="true"`）。 */
+  readonly modal: { readonly dialogModal: boolean; readonly ariaModal: boolean };
 }
 
 export interface FixedHeadingOverlapEvidence {
@@ -745,6 +1061,33 @@ export interface FixedHeadingOverlapEvidence {
   readonly intersection: RectangleEvidence & { readonly area: number };
   /** どちらかの selector を上限で切り詰めたか。 */
   readonly truncated: boolean;
+  /** AUD-3b: hit-test の事実（覆う要素は `overlaySelector`、覆われる要素は見出し）。この項目より前の Evidence にはない。 */
+  readonly hitTest?: OverlapHitTestEvidence;
+  /** EV-1: 覆われる要素（見出し）のいちばん近い、縦にスクロールできる祖先（なければ、前の版の記録と同じく、ない）。 */
+  readonly coveredScrollContainer?: ScrollContainerEvidence;
+}
+
+/**
+ * EV-1: 要素のいちばん近い、縦にスクロールできる祖先（文書の根と body を除く。`overflow-y` が `auto`・`scroll`・`overlay` で、内容が箱より高い）。
+ * 固定の枠の覆いの「スクロールすれば見える」の判定が、文書の量に加えて使う。
+ */
+export interface ScrollContainerEvidence {
+  readonly selector: string;
+  /** 祖先の矩形（ビューポートの座標）。 */
+  readonly rect: RectangleEvidence;
+  readonly scrollTop: number;
+  /** 縦に動かせる量の全体（`scrollHeight - clientHeight`）。 */
+  readonly scrollRangeY: number;
+}
+
+/**
+ * EV-1: 重なりの組の、行ごとの矩形（`getClientRects`）の重なりの事実。`area` は行の矩形どうしの交わりの面積の和。`pointCount` は、ビューポートの中の交わりの
+ * 中心の点の数、`bothHitPointCount` は、そのうち両方の要素（か子孫）が hit-test に出た点の数。
+ */
+export interface LineOverlapEvidence {
+  readonly area: number;
+  readonly pointCount: number;
+  readonly bothHitPointCount: number;
 }
 
 /** 重なりの候補の片方の要素の事実。 */
@@ -775,6 +1118,12 @@ export interface ElementOverlapEvidence {
   readonly intersection: RectangleEvidence & { readonly area: number };
   /** どちらかの selector を上限で切り詰めたか。 */
   readonly truncated: boolean;
+  /** AUD-3b: 片方だけが固定要素の組の hit-test の事実（覆う要素は固定要素の側）。ほかの組と、この項目より前の Evidence にはない。 */
+  readonly hitTest?: OverlapHitTestEvidence;
+  /** EV-1: 片方だけが固定要素の組の、覆われる側のいちばん近い縦のスクロールの祖先（なければ、ない）。 */
+  readonly coveredScrollContainer?: ScrollContainerEvidence;
+  /** EV-1: どちらも固定要素でない組の、行ごとの矩形の重なり（前の版の記録にはない）。 */
+  readonly lineOverlap?: LineOverlapEvidence;
 }
 
 /** 可視で大きさのある固定要素（`position: fixed | sticky`）と、ビューポートに対する面積の比。 */
@@ -788,13 +1137,24 @@ export interface FixedElementEvidence extends LayoutElementEvidence {
   readonly viewportAreaRatio: number;
   /** selector を上限で切り詰めたか。 */
   readonly truncated: boolean;
+  /**
+   * DEF-204（設計書 `2026-11-06-beaksight-notification-overlay-design.md` 3.5）: 要素そのものが描く面があるか（背景の色が透明でない、背景の画像、
+   * 枠線、輪郭、影、背後のぼかし、自分の文字、疑似要素の内容、画像・埋め込み・入力の欄のどれか。判定は `paintsOwnSurfaceOf`）。
+   * この項目より前に記録した Evidence にはない（ないときは、描く面があるものとして扱う）。
+   */
+  readonly paintsOwnSurface?: boolean;
+  /** DEF-204: `pointer-events` の計算値（この項目より前に記録した Evidence にはない）。 */
+  readonly pointerEvents?: string;
+  /** AUD-3b: 要素の面の上の点の hit-test の事実（対象は `BENEATH`）。この項目より前に記録した Evidence にはない。 */
+  readonly hitTest?: OverlapHitTestEvidence;
 }
 
 /**
  * 上限により記録しなかった候補の件数と、走査を止めた印。
+ * COV-6 の後の記録では、候補を件数の上限で打ち切らないので、`omitted*Count` は常に 0（古い記録を読むためだけに残す）。
  * 収集が期限で止まった場合（`PARTIAL`）は、止まるまでに見つけた分だけを数える。
- * `overlapComparisonLimitReached` が true の場合、重なりの件数（`omittedFixedHeadingOverlapCount`、
- * `omittedElementOverlapCount`）は、比べた組の中で見つけた分だけを数える。
+ * 古い記録で `overlapComparisonLimitReached` が true の場合、重なりの件数（`omittedFixedHeadingOverlapCount`、
+ * `omittedElementOverlapCount`）は、比べた組の中で見つけた分だけを数える。COV-6 の後は、走査の印も常に偽と 0。
  */
 export interface LayoutTruncationEvidence {
   readonly omittedOutsideViewportCount: number;
@@ -803,7 +1163,7 @@ export interface LayoutTruncationEvidence {
   readonly omittedFixedHeadingOverlapCount: number;
   readonly omittedElementOverlapCount: number;
   readonly omittedFixedElementCount: number;
-  /** 重なりの走査のどれかが、比べる組の上限（`maxOverlapComparisons`）に達して止まったか。 */
+  /** 重なりの走査のどれかが、比べる組の上限（200,000）に達して止まったか。COV-6 の後は上限を撤廃したので常に偽（古い記録を読むために残す）。 */
   readonly overlapComparisonLimitReached: boolean;
   /** 記録した見切れの候補のうち、テキストのノードの走査が上限に達し、`partiallyClippedText` を判定できなかったものの件数。 */
   readonly clippedTextNodeScanLimitReachedCount: number;
@@ -815,6 +1175,7 @@ export interface LayoutEvidence {
   /** 収集した時点の文書のスクロール位置（定義は `ScrollPosition`）。 */
   readonly scrollPosition: ScrollPosition;
   readonly document: LayoutDocumentEvidence;
+  /** 横にはみ出す要素の一覧（REC-1 の後。前の記録は、縦だけにはみ出す要素も持つ）。 */
   readonly boxesOutsideViewport: readonly OutsideViewportEvidence[];
   readonly zeroSizeInteractive: readonly ZeroSizeInteractiveEvidence[];
   readonly clippedText: readonly ClippedTextEvidence[];
@@ -822,6 +1183,11 @@ export interface LayoutEvidence {
   readonly elementOverlaps: readonly ElementOverlapEvidence[];
   readonly fixedElements: readonly FixedElementEvidence[];
   readonly truncation: LayoutTruncationEvidence;
+  /**
+   * COV-6: ページの中の読み取りを分けた回数（1 以上。古い版の記録にはない）。候補の一覧（はみ出し・大きさ0の操作要素・見切れ・固定要素と見出しの重なり・
+   * 主要要素どうしの重なり・固定要素）は、件数の上限で打ち切らずに、`LAYOUT_COLLECTION_PART_SIZE` 件ずつ分けて全部を集める。
+   */
+  readonly collectedInParts?: number;
 }
 
 /**
@@ -856,7 +1222,14 @@ export const STRESS_LAYOUT_FAILURE_REASONS = Object.freeze([
 ] as const satisfies readonly IncompleteReasonCode[]);
 export type StressLayoutFailureReason = (typeof STRESS_LAYOUT_FAILURE_REASONS)[number];
 
-export type StressLayoutEvidence =
+/**
+ * AUD-2a の限界の直し（AUD-2b・2d の指示書の 3）: 幅の走査の 1 つの幅の結果。`capture` は、その幅を集めた状態と時刻（段は `stress-layout`、状態 ID は
+ * Desktop の読み込みのもの、時刻はその幅の範囲）。前の Run の記録にはない。
+ */
+export type StressLayoutEvidence = StressLayoutResultEvidence & Readonly<{ capture?: EvidenceCapture }>;
+
+/** 幅の走査の 1 つの幅の結果（集めた状態と時刻を除いた形）。 */
+export type StressLayoutResultEvidence =
   | Readonly<{ width: number; height: number; status: 'COMPLETE'; layout: LayoutEvidence }>
   | Readonly<{
     width: number;
@@ -883,6 +1256,73 @@ export type StressLayoutEvidence =
 export interface LayoutEvidencePayload {
   readonly primary: LayoutCollectionResult;
   readonly stressSweep: readonly StressLayoutEvidence[] | null;
+  /**
+   * DEF-210（設計書 `2026-11-06-beaksight-notification-overlay-design.md` 3.3）: 通知の枠が Run の中で初めて出たビューポートで、枠を閉じる（隠す）前に測った
+   * layout。覆いの規則（`FIXED_ELEMENT_OCCLUSION`）だけが、1 回だけ評価する。初めてでない枠だけのとき、枠がないときと、この項目より前の Evidence にはない。
+   */
+  readonly beforeNotificationDismissal?: LayoutCollectionResult;
+  /** DEF-210（設計書 3.6）: 主のビューポートの読み込みで見つけた通知の枠と、閉じた・隠した事実。この項目より前の Evidence にはない。 */
+  readonly notificationOverlay?: NotificationOverlayEvidence;
+  /** DEF-210: 幅の走査の各幅で見つけた通知の枠と、閉じた・隠した事実（幅の順）。走査をしなかったときと、この項目より前の Evidence にはない。 */
+  readonly stressNotificationOverlays?: readonly StressNotificationOverlayEvidence[];
+}
+
+/**
+ * 通知の枠の見分けの状態（設計書 3.1。見分けは `src/interaction/notification-overlay.ts` の `classifyNotificationFrames`）。
+ * - `DISMISSIBLE`: 閉じるボタンがあり、描く面がビューポートの閾値以下（閉じる対象）。
+ * - `TOO_LARGE`: 閉じるボタンはあり、描く面がビューポートの閾値を超える（全面のモーダル）。NO-2 fix round 1（設計書 3.1 の 4 の改訂）: ほかの枠と同じく閉じるボタンを押す。
+ * - `CLOSE_BUTTON_DISABLED`: 閉じるボタンが、どれも押せない。
+ * - `NO_CLOSE_BUTTON`: 閉じるボタンがない。
+ */
+export const NOTIFICATION_FRAME_STATUSES = Object.freeze(['DISMISSIBLE', 'TOO_LARGE', 'CLOSE_BUTTON_DISABLED', 'NO_CLOSE_BUTTON'] as const);
+export type NotificationFrameStatus = (typeof NOTIFICATION_FRAME_STATUSES)[number];
+
+/**
+ * 通知の枠を CSS で隠した理由（設計書 3.4。閉じられない枠）。
+ * - `NOT_DISMISSED`: 閉じるボタンを押しても、待つ時間の後に残っていた。
+ * - `CLOSE_BUTTON_DISABLED`: 閉じるボタンが押せない。
+ * - `NO_CLOSE_BUTTON`: 閉じるボタンがなく、描く面がビューポートの閾値の面積を超えて覆う。
+ */
+export const NOTIFICATION_FRAME_HIDDEN_REASONS = Object.freeze(['NOT_DISMISSED', 'CLOSE_BUTTON_DISABLED', 'NO_CLOSE_BUTTON'] as const);
+export type NotificationFrameHiddenReason = (typeof NOTIFICATION_FRAME_HIDDEN_REASONS)[number];
+
+/** 見つけた通知の枠 1 つの事実（識別は digest だけ。値・URL・画面の path を持たない）。 */
+export interface NotificationFrameEvidence {
+  readonly digest: string;
+  readonly status: NotificationFrameStatus;
+  /** 閉じるボタンを押したか。 */
+  readonly pressed: boolean;
+  /** 押した後、待つ時間までに閉じるボタンが見えなくなったか。 */
+  readonly dismissed: boolean;
+  /** CSS で隠したか。隠そうとして隠せなかったときは false で、`hiddenReason` は残す。 */
+  readonly hidden: boolean;
+  /** 閉じられない枠の理由（閉じられない枠でなければ null）。 */
+  readonly hiddenReason: NotificationFrameHiddenReason | null;
+  /** この Run（このビューポートの種類）で初めて見た枠か（設計書 3.3）。 */
+  readonly firstSeen: boolean;
+}
+
+/** 通知の枠を読めたかの状態。 */
+export const NOTIFICATION_OVERLAY_READ_STATUSES = Object.freeze(['READ', 'FAILED'] as const);
+export type NotificationOverlayReadStatus = (typeof NOTIFICATION_OVERLAY_READ_STATUSES)[number];
+
+/** 1 回の読み込みで見つけた通知の枠と、閉じた・隠した事実（設計書 3.6）。 */
+export interface NotificationOverlayEvidence {
+  /** 枠を読めたか（読めなかったときは、押さず、隠さない）。 */
+  readonly readStatus: NotificationOverlayReadStatus;
+  readonly frames: readonly NotificationFrameEvidence[];
+  /** 押した閉じるボタンの数（上限は `NOTIFICATION_DISMISSAL_LIMITS.maxPressesPerPage`）。 */
+  readonly pressCount: number;
+  /** 押したことで画面（main frame）が移ったか（移った後は、ほかの枠を押さず、隠さない）。 */
+  readonly navigated: boolean;
+  /** 読み取りを上限で止めたか。 */
+  readonly truncated: boolean;
+}
+
+/** 幅の走査の 1 つの幅の、通知の枠の事実。 */
+export interface StressNotificationOverlayEvidence {
+  readonly width: number;
+  readonly overlay: NotificationOverlayEvidence;
 }
 
 // ---------------------------------------------------------------------------------------------------------------
@@ -929,7 +1369,7 @@ export interface TextColorSampleEvidence {
   readonly contrast: ContrastPairEvidence;
   readonly boundingArea: number;
   readonly visibleArea: number;
-  /** `text` か `selector` を長さの上限で切り詰めたか。 */
+  /** 古い版の記録を読むためだけに残す: `text` か `selector` を長さの上限で切り詰めたか（LZ-3b の後の記録では常に false）。 */
   readonly truncated: boolean;
 }
 
@@ -949,12 +1389,14 @@ export interface ColorEvidence {
    * 可視要素は `checkVisibility(VISIBILITY_CHECK_OPTIONS)` が真の要素。`aria-hidden` は判定に使わない。
    */
   readonly textSamples: readonly TextColorSampleEvidence[];
-  /** 標本の件数の上限に達した後にも、標本にできる要素があったか（その要素は `textSamples` に含まれない）。 */
+  /** 古い版の記録を読むためだけに残す: 標本の件数の上限に達し、記録しなかった標本があったか（COV-6 の後の記録では常に false）。 */
   readonly textSamplesTruncated: boolean;
   readonly foregroundDistribution: readonly ForegroundDistributionEvidence[];
-  /** 件数の上限により `foregroundDistribution` に記録しなかった色の数。 */
+  /** 古い版の記録を読むためだけに残す: 件数の上限により `foregroundDistribution` に記録しなかった色の数（COV-6 の後の記録では常に 0）。 */
   readonly omittedDistributionEntryCount: number;
   readonly observedArea: number;
+  /** COV-6: ページの中の読み取りを分けた回数（1 以上。古い版の記録にはない）。 */
+  readonly collectedInParts?: number;
 }
 
 // ---------------------------------------------------------------------------------------------------------------
@@ -1192,14 +1634,38 @@ export interface PerformanceEvidenceFacts {
   readonly telemetryCandidates: readonly Readonly<TelemetryCandidateEvidence>[];
   /** Network Evidence の照合の前に期限を過ぎた場合は `null`。 */
   readonly truncation: Readonly<PerformanceTruncationEvidence> | null;
+  /**
+   * AUD-6c: 観測の時間（文書の読み込みの始まりから、値を読んだ時までの ms。ページの中の `performance.now()`）。読めなかったときは `null`。前の版の記録にはない。
+   */
+  readonly observedForMs?: number | null;
+  /** AUD-6c: 測る前に BeakSight がページにした操作（Page Auditor が渡す。前の版の記録と、渡されない読み取りにはない）。 */
+  readonly operationsBeforeMeasurement?: PerformanceOperationsEvidence;
+  /**
+   * EV-1: scroll の段の前に読んだ LCP（Page Auditor が渡す。`POOR_LCP` は、あればこの値で判定する。スクロールで後から描かれた塊を LCP に数えないため）。
+   * 前の版の記録と、scroll の段の前に読まなかった読み取りにはない。
+   */
+  readonly lcpBeforeScroll?: Readonly<WebVitalEvidence<LCPAttributionEvidence>>;
 }
 
-/** performance の収集が途中で止まった理由の閉じた一覧。 */
+/** AUD-6c: 性能の値を測る前に、BeakSight がページにした操作。 */
+export interface PerformanceOperationsEvidence {
+  /** 縦に動かして確かめた（scroll の段を行った）か。 */
+  readonly scrolled: boolean;
+  /** 通知の枠の閉じるボタンを押したか。 */
+  readonly notificationFramePressed: boolean;
+}
+
+/**
+ * performance の収集が途中で止まった理由の閉じた一覧。L2（設計書 `2026-11-09-beaksight-remove-limits-design.md` 5 の 1）: 期限を受けないときは、
+ * 進みの見張りが読み取りを終えた理由（`STAGE_UNRESPONSIVE`・`STAGE_NEVER_QUIET`）になる。
+ */
 export const PERFORMANCE_INCOMPLETE_REASONS = Object.freeze([
   'DEADLINE_EXCEEDED',
   'EVALUATION_FAILED',
   'INVALID_BROWSER_DATA',
   'RESOURCE_LIMIT_REACHED',
+  'STAGE_UNRESPONSIVE',
+  'STAGE_NEVER_QUIET',
 ] as const satisfies readonly IncompleteReasonCode[]);
 export type PerformanceIncompleteReason = (typeof PERFORMANCE_INCOMPLETE_REASONS)[number];
 
@@ -1219,22 +1685,159 @@ export type PerformanceEvidence = Readonly<PerformanceEvidenceFacts & {
 export const ACCESSIBILITY_IMPACTS = Object.freeze(['minor', 'moderate', 'serious', 'critical'] as const);
 export type AccessibilityImpact = (typeof ACCESSIBILITY_IMPACTS)[number] | null;
 
-/** accessibility の収集が途中で止まった理由の閉じた一覧。 */
+/**
+ * accessibility の収集が途中で止まった理由の閉じた一覧。L2（設計書 `2026-11-09-beaksight-remove-limits-design.md` 5 の 1）: 期限を受けないときは、
+ * 進みの見張りが読み取りを終えた理由（`STAGE_UNRESPONSIVE`・`STAGE_NEVER_QUIET`）になる。
+ */
 export const ACCESSIBILITY_INCOMPLETE_REASONS = Object.freeze([
   'DEADLINE_EXCEEDED',
   'EVALUATION_FAILED',
-] as const satisfies readonly PartialFailureReason[]);
+  'STAGE_UNRESPONSIVE',
+  'STAGE_NEVER_QUIET',
+] as const satisfies readonly IncompleteReasonCode[]);
 export type AccessibilityIncompleteReason = (typeof ACCESSIBILITY_INCOMPLETE_REASONS)[number];
 export type AccessibilityTargetSelector = string | readonly string[];
+
+/** AUD-8: axe の確かめが入っていた一覧（`any`・`all`・`none`）の閉じた一覧。 */
+export const ACCESSIBILITY_CHECK_GROUPS = Object.freeze(['any', 'all', 'none'] as const);
+export type AccessibilityCheckGroup = (typeof ACCESSIBILITY_CHECK_GROUPS)[number];
+
+/** AUD-8: 確かめを axe が報告した結果（違反の要素の確かめは `FAILED`、要確認の要素の確かめは `UNDETERMINED`）の閉じた一覧。 */
+export const ACCESSIBILITY_CHECK_RESULTS = Object.freeze(['FAILED', 'UNDETERMINED'] as const);
+export type AccessibilityCheckResult = (typeof ACCESSIBILITY_CHECK_RESULTS)[number];
+
+/** AUD-8: 確かめの data の 1 つの値（許可した欄だけ。文字列・数・真偽・null だけを残す）。 */
+export type AccessibilityCheckDataValue = string | number | boolean | null;
+
+/** AUD-8: axe の対象ごとの確かめ 1 つ（`data` は、Rule ごとの許可の一覧 `ACCESSIBILITY_CHECK_DATA_ALLOWLIST` の欄だけ）。 */
+export interface AccessibilityCheckEvidence {
+  readonly id: string;
+  readonly group: AccessibilityCheckGroup;
+  readonly result: AccessibilityCheckResult;
+  /** 測れない理由など、axe の文言の鍵（例: `bgImage`・`bgGradient`・`bgOverlap`・`fgAlpha`・`pseudoContent`・`complexTextShadows`）。なければ `null`。 */
+  readonly messageKey: string | null;
+  readonly data: Readonly<Record<string, AccessibilityCheckDataValue>>;
+}
+
+/** AUD-8: 1 つの値の長さで切った欄（`field` は要素の Evidence の中の JSON Pointer。例: `/failureSummary`、`/targetSelectors/0`、`/checks/0/data/fgColor`）。 */
+export interface AccessibilityValueTruncationEvidence {
+  readonly field: string;
+  readonly originalLength: number;
+  readonly keptLength: number;
+}
+
+/** AUD-8（4-3）: 無効の手がかりがどこにあったか（要素そのもの・祖先）の閉じた一覧。手がかりがなければ、欄は `null`。 */
+export const ACCESSIBILITY_DISABLED_PLACES = Object.freeze(['SELF', 'ANCESTOR'] as const);
+export type AccessibilityDisabledPlace = (typeof ACCESSIBILITY_DISABLED_PLACES)[number];
+
+/** AUD-8（4-3）: 無効の事実を読まなかった理由の閉じた一覧（要素が見つからなかった・読めなかった）。 */
+export const ACCESSIBILITY_DISABLED_FACTS_UNREAD_STATUSES = Object.freeze(['NOT_FOUND', 'NOT_READ'] as const);
+export type AccessibilityDisabledFactsUnreadStatus = (typeof ACCESSIBILITY_DISABLED_FACTS_UNREAD_STATUSES)[number];
+
+/**
+ * AUD-8（4-3）: 色差の対象の、無効の事実。`READ` のほかは、要素が見つからなかった（`NOT_FOUND`）・読めなかった（`NOT_READ`）。
+ * - `disabledForAssistiveTech`: 支援技術に無効と伝わる（`:disabled` に当たる、`aria-disabled="true"`（祖先を含む）、`inert`（祖先を含む））。主の件数から外す。
+ * - `disabledStateNotExposed`: 見た目だけ無効（`pointer-events: none` か `cursor: not-allowed`）なのに、支援技術に無効と伝わらない。Finding は残す。
+ * - `axDisabled`: アクセシビリティの木の disabled（AUD-4b: CDP の Accessibility で読む。読めなければ `null`）。真なら、支援技術に無効と伝わる。
+ */
+export type AccessibilityDisabledFactsEvidence =
+  | {
+    readonly status: 'READ';
+    readonly matchesDisabled: boolean;
+    readonly disabledAttribute: AccessibilityDisabledPlace | null;
+    readonly ariaDisabled: AccessibilityDisabledPlace | null;
+    readonly inert: AccessibilityDisabledPlace | null;
+    readonly axDisabled: boolean | null;
+    readonly pointerEvents: string;
+    readonly cursor: string;
+    readonly tabIndexNegative: boolean;
+    readonly disabledForAssistiveTech: boolean;
+    readonly disabledStateNotExposed: boolean;
+  }
+  | { readonly status: AccessibilityDisabledFactsUnreadStatus };
+
+/** AUD-8（4-3）: 主の件数から外す印の閉じた一覧（支援技術に無効と伝わるのに axe が数えた要素）。 */
+export const ACCESSIBILITY_COUNT_EXCLUSIONS = Object.freeze(['DISABLED_FOR_ASSISTIVE_TECH'] as const);
+export type AccessibilityCountExclusion = (typeof ACCESSIBILITY_COUNT_EXCLUSIONS)[number];
 
 export interface AccessibilityNodeEvidence {
   readonly impact: AccessibilityImpact;
   readonly targetSelectors: readonly AccessibilityTargetSelector[];
   readonly failureSummary: string | null;
   readonly htmlSnippet: string;
-  /** selector・`failureSummary`・HTML の抜粋のどれかを上限で切り詰めたか。 */
+  /** selector・`failureSummary`・HTML の抜粋・確かめの data のどれかを上限で切り詰めたか（どの欄かは `truncations`）。 */
   readonly truncated: boolean;
+  /** AUD-8: 確かめ（`any`・`all`・`none` の順）。古い版の記録にはない。 */
+  readonly checks?: readonly AccessibilityCheckEvidence[];
+  /** AUD-8: 値の長さで切った欄（切らなければ空）。古い版の記録にはない。 */
+  readonly truncations?: readonly AccessibilityValueTruncationEvidence[];
+  /** AUD-8: 色差の Rule の要素の無効の事実（ほかの Rule の要素は `null`）。古い版の記録にはない。 */
+  readonly disabledFacts?: AccessibilityDisabledFactsEvidence | null;
+  /** AUD-8: 主の件数から外す印（外さなければ `null`）。古い版の記録にはない。 */
+  readonly countExclusion?: AccessibilityCountExclusion | null;
+  /**
+   * AUD-3d の続き: 違反の要素（axe の target）の矩形（ビューポートの座標。読んだ位置は `AccessibilityEvidence.regionScrollPosition`）。読めなかった要素は理由。
+   * 要確認（incomplete）の要素と、古い版の記録にはない。
+   */
+  readonly region?: AccessibilityTargetRegionEvidence;
+  /**
+   * AUD-4b: 名前の不一致（`label-content-name-mismatch`）の違反の要素の、AX（ブラウザのアクセシビリティの木）の名前の文脈。ほかの Rule の要素と、古い版の記録には
+   * ない。
+   */
+  readonly nameContext?: AccessibilityNameContextEvidence;
+  /**
+   * EV-1: 色差の Rule の要素の、確かめの data の前景と背景の色（`fgColor`・`bgColor`）から計算した、丸める前のコントラスト比。色を読めない要素・ほかの Rule の
+   * 要素・古い版の記録にはない。
+   */
+  readonly computedContrastRatio?: number;
 }
+
+/**
+ * AUD-4b: AX を読めなかった理由の閉じた一覧。
+ * - `NOT_FOUND`: target の selector で要素が見つからなかった。
+ * - `IN_FRAME`: iframe の中の要素（読まない）。
+ * - `IN_SHADOW`: shadow root の中の要素（CDP の DOM の selector では引けないので読まない）。
+ * - `NOT_READ`: 読み取りが使えなかった（session を開けない・命令の失敗・形の違い）。
+ */
+export const ACCESSIBILITY_AX_UNREADABLE_REASONS = Object.freeze(['NOT_FOUND', 'IN_FRAME', 'IN_SHADOW', 'NOT_READ'] as const);
+export type AccessibilityAxUnreadableReason = (typeof ACCESSIBILITY_AX_UNREADABLE_REASONS)[number];
+
+/** AUD-4b: AX の名前の命名元（CDP の `AXValueSource` の `type` と、属性なら属性の名前）。 */
+export interface AccessibilityAxNameSource {
+  /** `attribute`・`contents`・`relatedElement`・`placeholder`・`implicit`・`style` など（CDP の値のまま）。 */
+  readonly type: string;
+  readonly attribute: string | null;
+}
+
+/**
+ * AUD-4b: AX で読んだ、要素の名前の文脈（算出した名前・役割・無効の状態・命名元・見えるラベルの文字のかたまり）。読めなければ理由。
+ * `labelSegments` は、要素の下の AX の文字の節（無視されない `StaticText`）の名前を、木の順に並べたもの（見えるラベルの文字。補足の文字の区分は Rule の側が決める）。
+ */
+export type AccessibilityNameContextEvidence =
+  | Readonly<{
+    status: 'READ';
+    axName: string | null;
+    axRole: string | null;
+    axDisabled: boolean;
+    nameSource: AccessibilityAxNameSource | null;
+    labelSegments: readonly string[];
+  }>
+  | Readonly<{ status: 'UNREADABLE'; reason: AccessibilityAxUnreadableReason }>;
+
+/**
+ * AUD-3d の続き: axe の target の矩形を読めなかった理由の閉じた一覧。
+ * - `NOT_FOUND`: target の selector で要素が見つからなかった（axe の後に消えた・変わったなど）。
+ * - `IN_FRAME`: iframe の中の要素（ビューポートの座標に直せないので読まない）。
+ * - `NO_BOX`: 要素の箱がない（大きさが 0、または描かれていない）。
+ * - `NOT_READ`: 読み取りが使えなかった（失敗・見張りの終わり）。
+ */
+export const ACCESSIBILITY_TARGET_REGION_REASONS = Object.freeze(['NOT_FOUND', 'IN_FRAME', 'NO_BOX', 'NOT_READ'] as const);
+export type AccessibilityTargetRegionReason = (typeof ACCESSIBILITY_TARGET_REGION_REASONS)[number];
+
+/** AUD-3d の続き: axe の target の矩形（読めた）か、読めなかった理由。 */
+export type AccessibilityTargetRegionEvidence =
+  | Readonly<{ status: 'READ'; rect: RectangleEvidence }>
+  | Readonly<{ status: 'UNREADABLE'; reason: AccessibilityTargetRegionReason }>;
 
 export interface AccessibilityRuleEvidence {
   readonly ruleId: string;
@@ -1243,7 +1846,7 @@ export interface AccessibilityRuleEvidence {
   readonly helpUrl: string;
   readonly tags: readonly string[];
   readonly nodes: readonly AccessibilityNodeEvidence[];
-  /** 件数の上限（`maxNodesPerRule`）を超えたため記録しなかった要素の件数。 */
+  /** 古い版の記録を読むためだけに残す: 件数の上限を超えたため記録しなかった要素の件数（COV-6 の後の記録では常に 0）。 */
   readonly omittedNodeCount: number;
 }
 
@@ -1263,11 +1866,18 @@ interface AccessibilityEvidenceFacts {
   readonly incomplete: readonly AccessibilityIncompleteEvidence[];
 }
 
-export type AccessibilityEvidence = Readonly<AccessibilityEvidenceFacts & {
+/** AUD-3d の続き: 違反の要素の矩形を読んだときの、文書のスクロール位置（読まなかった記録と古い版の記録にはない）。 */
+interface AccessibilityRegionFacts {
+  readonly regionScrollPosition?: ScrollPosition | null;
+  /** EV-1: 判定した axe の版（axe の結果の `testEngine.version`。読めなかった記録と古い版の記録にはない）。 */
+  readonly axeVersion?: string;
+}
+
+export type AccessibilityEvidence = Readonly<AccessibilityEvidenceFacts & AccessibilityRegionFacts & {
   readonly status: 'COMPLETE';
   /** 収集した時点（axe を実行する直前）の文書のスクロール位置（定義は `ScrollPosition`）。 */
   readonly scrollPosition: ScrollPosition;
-}> | Readonly<AccessibilityEvidenceFacts & {
+}> | Readonly<AccessibilityEvidenceFacts & AccessibilityRegionFacts & {
   readonly status: 'PARTIAL';
   readonly reason: AccessibilityIncompleteReason;
   /** 収集した時点の文書のスクロール位置。位置を読む前に止まった場合と、読めなかった場合は `null`。 */
@@ -1314,6 +1924,11 @@ export interface InteractionCandidateEvidence {
   readonly type: string | null;
   readonly disabled: boolean;
   readonly visible: boolean;
+  /**
+   * SD-1（設計書 `2026-11-16-beaksight-action-based-delete-guard-design.md` 2.2）: 削除に関する操作か（操作の前の判定 `src/discovery/destructive-action.ts` の
+   * `isDestructiveAction` の結果）。真の候補は押さない（`DESTRUCTIVE_ACTION_SKIPPED`）。前の版の記録にはない（スキーマでは任意）。
+   */
+  readonly destructiveAction: boolean;
   readonly boundingBox: InteractionBoundingBoxEvidence;
 }
 
@@ -1332,6 +1947,8 @@ export const INTERACTION_REJECTION_REASONS = Object.freeze([
   'DISABLED',
   'NOT_VISIBLE',
   'MALFORMED_CANDIDATE',
+  // SD-1（設計書 `2026-11-16-beaksight-action-based-delete-guard-design.md` 2.3）: 削除に関する操作（消す・取り消すなど）なので押さない。
+  'DESTRUCTIVE_ACTION_SKIPPED',
 ] as const);
 
 /** Interaction の候補を実行しない理由。`src/safety/interaction-policy.ts` の `InteractionRejectionReason` は、この型の別名。 */
@@ -1355,9 +1972,8 @@ export interface InteractionChangeEvidence {
    */
   readonly changedAttributes: readonly string[];
   /**
-   * `changedAttributes` を件数の上限で切り詰めたか（F17、F16 の発見事項7）。true の場合、`changedAttributes` にない、
-   * 変わった属性の名前がある（持続の確認では、どちらかの観測で切り詰めていれば、ある可能性があるとして true にする）。
-   * 切り詰めていない場合と、`attributes` が根拠でない場合は false。
+   * `changedAttributes` を件数の上限で切り詰めたか（F17）。L2 で上限を撤廃し、SPEC-5 で持続の確認もやめたので、今の版はいつも false を書く。
+   * 前の版の記録を読むために、スキーマの必須の欄として残す（消すのは記録の形の版を上げる段）。
    */
   readonly changedAttributesTruncated: boolean;
   /**
@@ -1393,7 +2009,8 @@ export const INTERACTION_NOT_VERIFIABLE_REASON_CODES = Object.freeze([
   'INITIAL_LOAD_DURING_LOAD',
   'INITIAL_LOAD_AFTER_LOAD',
   'INITIAL_LOAD_BEFORE_RENDER',
-  // 凍結の前の下準備（スクロール・hover・focus・落ち着くのを待つ）。
+  // 凍結の前の下準備（SPEC-5: 書くのは `SCROLL_PREPARATION_DEADLINE`・`SCROLL_PREPARATION_FAILED` だけ。focus・安定の確認・作業量・期限の
+  // 細かい区別のコードは、前の版の記録を読むため。`INTERACTION_LEGACY_NOT_VERIFIABLE_REASON_CODES`）。
   'SCROLL_PREPARATION_DEADLINE',
   'SCROLL_PREPARATION_DOM_WORK_EXHAUSTED',
   /** 詳細は、整えたエラーの文言（残らなければ null）。HOVER・FOCUS の `_FAILED` も同じ。 */
@@ -1438,7 +2055,8 @@ export const INTERACTION_NOT_VERIFIABLE_REASON_CODES = Object.freeze([
   'DEADLINE_BEFORE_EXACT_NODE_CLICK',
   /** click の期限切れ。詳細は、整えた click のエラーの文言（残らなければ null）。ほかの click の失敗は `CLICK_FAILED`。 */
   'CLICK_TIMED_OUT',
-  // click の後の観測。
+  // click の後の観測（SPEC-5: 書くのは `DEADLINE_DURING_POST_CONDITION_OBSERVATION`（押した後の期限切れ）・`NO_OBSERVABLE_CHANGE`・
+  // `RETAINED_IDENTITY_LOST` だけ。ほかは前の版の記録を読むため）。
   'DEADLINE_BEFORE_POST_CONDITION_OBSERVATION',
   'DEADLINE_DURING_POST_CONDITION_OBSERVATION',
   'PERSISTENCE_CHECK_DEADLINE',
@@ -1451,8 +2069,62 @@ export const INTERACTION_NOT_VERIFIABLE_REASON_CODES = Object.freeze([
   'RETAINED_INSPECTION_TEXT_NODE_LIMIT_REACHED',
   /** 詳細は、切断の後の identityStatus の値。 */
   'RETAINED_IDENTITY_LOST',
+  // L5（INV-LIMITS の表 A の T11・T21。設計者の判断 2026-11-10）: 利用者が期限を指定していない操作を、L0 の進みの見張りが終えた（全く反応がない・静まらない）。
+  'STAGE_UNRESPONSIVE',
+  'STAGE_NEVER_QUIET',
+  // COV-4 の区切り 3（入れ子の開いた状態。設計者の判断 2026-11-10）: 開いた状態まで押し直す並びを、同じ構造の鍵の状態まで再現できなかった。
+  'TRAIL_NOT_REPRODUCED',
 ] as const);
+/** NOT_VERIFIABLE の理由のコード（読めるコードの全部。前の版の記録のコードを含む）。 */
 export type InteractionNotVerifiableReasonCode = (typeof INTERACTION_NOT_VERIFIABLE_REASON_CODES)[number];
+
+/**
+ * SPEC-5（設計書 2026-11-14 5.1）: 前の版だけが書いた NOT_VERIFIABLE の理由のコード（読むだけ）。押した後の確かめを 1 回の観察で決めるようにしたので、
+ * 今の版は書かない。中断した Run の再開（`checkpoint-page` は page の schema で読む）と、前の Run の記録を読むために、閉じた一覧とスキーマに残す。
+ * 説明は 1 つにまとめる（`src/presentation/messages.ts`）。区分は、記録の `notVerifiableKind` をそのまま使う。
+ */
+export const INTERACTION_LEGACY_NOT_VERIFIABLE_REASON_CODES = Object.freeze([
+  'SCROLL_PREPARATION_DOM_WORK_EXHAUSTED',
+  'SCROLL_PREPARATION_SETTLE_DEADLINE',
+  'HOVER_PREPARATION_DEADLINE',
+  'HOVER_PREPARATION_FAILED',
+  'FOCUS_PREPARATION_DEADLINE',
+  'FOCUS_PREPARATION_FAILED',
+  'FOCUS_PREPARATION_DOM_WORK_EXHAUSTED',
+  'FOCUS_PREPARATION_TARGET_DISCONNECTED',
+  'FOCUS_PREPARATION_CANDIDATE_LIMIT_REACHED',
+  'FOCUS_PREPARATION_TEXT_NODE_LIMIT_REACHED',
+  'FOCUS_PREPARATION_STATE_CHANGED',
+  'FOCUS_PREPARATION_STATE_UNCOMPARABLE',
+  'STABILITY_CHECK_DEADLINE',
+  'STABILITY_CHECK_DOM_WORK_EXHAUSTED',
+  'STABILITY_CHECK_TARGET_DISCONNECTED',
+  'STABILITY_CHECK_CANDIDATE_LIMIT_REACHED',
+  'STABILITY_CHECK_TEXT_NODE_LIMIT_REACHED',
+  'DEADLINE_AFTER_SAFETY_FREEZE',
+  'DEADLINE_DURING_CANDIDATE_REDISCOVERY',
+  'DOM_WORK_EXHAUSTED',
+  'CANDIDATE_REDISCOVERY_INCOMPLETE',
+  'DEADLINE_BEFORE_TARGET_HANDLE_ACQUISITION',
+  'DEADLINE_DURING_TARGET_HANDLE_ACQUISITION',
+  'TARGET_HANDLE_RESOLUTION_DOM_WORK_EXHAUSTED',
+  'DEADLINE_DURING_TARGET_FACT_COLLECTION',
+  'TARGET_INSPECTION_DOM_WORK_EXHAUSTED',
+  'TARGET_INSPECTION_CANDIDATE_LIMIT_REACHED',
+  'TARGET_INSPECTION_TEXT_NODE_LIMIT_REACHED',
+  'DEADLINE_DURING_EXACT_NODE_ADMISSION',
+  'DEADLINE_BEFORE_POST_CONDITION_OBSERVATION',
+  'PERSISTENCE_CHECK_DEADLINE',
+  'GEOMETRY_ONLY_CHANGED_WHILE_SCROLLED',
+  'GEOMETRY_ONLY_CHANGED_SCROLL_UNCOMPARABLE',
+  'GEOMETRY_ONLY_CHANGED',
+  'RETAINED_INSPECTION_DOM_WORK_EXHAUSTED',
+  'RETAINED_INSPECTION_CANDIDATE_LIMIT_REACHED',
+  'RETAINED_INSPECTION_TEXT_NODE_LIMIT_REACHED',
+] as const satisfies readonly InteractionNotVerifiableReasonCode[]);
+export type InteractionLegacyNotVerifiableReasonCode = (typeof INTERACTION_LEGACY_NOT_VERIFIABLE_REASON_CODES)[number];
+/** 今の版が書く NOT_VERIFIABLE の理由のコード。区分は `src/interaction/isolated-auditor.ts` の `INTERACTION_NOT_VERIFIABLE_REASONS` が決める。 */
+export type InteractionWrittenNotVerifiableReasonCode = Exclude<InteractionNotVerifiableReasonCode, InteractionLegacyNotVerifiableReasonCode>;
 
 /** VERIFIED の理由のコード。 */
 export const INTERACTION_VERIFIED_REASON_CODES = Object.freeze(['OBSERVABLE_STATE_CHANGED'] as const);
@@ -1545,6 +2217,38 @@ export interface InteractionEvidence {
    * 最終の `status` が `BLOCKED_BY_SAFETY` になった場合は null。
    */
   readonly notVerifiableKind: InteractionNotVerifiableKind | null;
+  /**
+   * COV-4 の区切り 3: 操作の後の文書の URL（正規化していない。文書が替わらずに URL が変わったら、巡回の辺にする）。前の版の記録と、読めなかったときはない。
+   */
+  readonly postInteractionUrl?: string;
+  /** COV-4 の区切り 3: 操作で開いた状態の監査（`VERIFIED` の操作だけ。前の版の記録にはない）。 */
+  readonly openedState?: OpenedStateEvidence;
+  /**
+   * COV-4 の区切り 3（入れ子の開いた状態）: この候補を押す前に、開いた状態まで押し直した押下の並び（候補の ID と、同じ ID の中の順番）。主の画面の候補にはない。
+   */
+  readonly pressTrail?: readonly { readonly candidateId: string; readonly ordinal: number }[];
+}
+
+/**
+ * COV-4 の区切り 3: 開いた状態の監査の結果の閉じた一覧（監査した・同じ構造の鍵の状態を前に監査したので監査しなかった・見張りに終えられて途中まで）。
+ */
+export const OPENED_STATE_STATUSES = Object.freeze(['AUDITED', 'SAME_STRUCTURE_SEEN', 'PARTIAL'] as const);
+export type OpenedStateStatus = (typeof OPENED_STATE_STATUSES)[number];
+
+/** COV-4 の区切り 3: 操作で開いた状態の監査の事実。 */
+export interface OpenedStateEvidence {
+  /** 開いた状態の状態 ID（`evidenceStateIdOf` の `:state-<番号>` の形）。 */
+  readonly stateId: string;
+  /** 開いた状態の構造の鍵（`openedStateStructureKeyOf`）。 */
+  readonly structureKey: string;
+  readonly status: OpenedStateStatus;
+  /** 開いた状態の記録で評価した指摘のうち、開く前の画面と fingerprint が同じで除いた数。 */
+  readonly duplicateFindingCount: number;
+  /**
+   * 開いた状態の、落ち着いた後の確かめ直し（AUD-2d・2e。読み込み直さない。形はビューポートの記録の `recheck` と同じ。指摘の印はこの表から引く）。確かめ直しを
+   * 当てなかった（同じ構造で監査しなかった・前の版の記録）ときはない。
+   */
+  readonly recheck?: ViewportRecheckRecord;
 }
 
 // ---------------------------------------------------------------------------------------------------------------
@@ -1552,6 +2256,116 @@ export interface InteractionEvidence {
 // ---------------------------------------------------------------------------------------------------------------
 
 /** スクリーンショットの撮り方の閉じた一覧。 */
+// ---------------------------------------------------------------------------------------------------------------
+// Focus（AUD-4d: 画面の外の、フォーカスできる要素のフォーカスの確かめ）
+// ---------------------------------------------------------------------------------------------------------------
+
+/**
+ * AUD-4d: 1 つの要素のフォーカスの確かめの事実（矩形はビューポートの座標）。フォーカスを当てる前に画面の外にあった（全体がビューポートの左か上か右の外、または
+ * 大きさが 1px 以下の）、フォーカスできる要素だけ。判定（現れるか・隠れたままか）は Rule の側（`src/audit/focus-check.ts`）が決める。
+ */
+export interface FocusCheckItemEvidence {
+  readonly selector: string;
+  /** 要素の名前（小文字）。 */
+  readonly tagName: string;
+  /** フォーカスを当てる前の矩形。 */
+  readonly beforeRect: RectangleEvidence;
+  /** フォーカスが当たったか（`document.activeElement` がその要素になったか）。 */
+  readonly focused: boolean;
+  /** フォーカスを当てた後の矩形（読めなければ `null`）。 */
+  readonly afterRect: RectangleEvidence | null;
+  /** フォーカスを当てた後に描かれて見えるか（`checkVisibility` と、実効の不透明度が 0 より大きい）。 */
+  readonly visibleAfterFocus: boolean;
+  /**
+   * フォーカスを当てた後に押せるか（ビューポートの中の矩形の点のどれかで、最前面がその要素か子孫）。EV-1 より前の記録は、中心の 1 点だけで読んだ。
+   */
+  readonly hitAfterFocus: boolean;
+  /** フォーカスしても隠れたままの要素で撮った、フォーカスを当てたままの viewport の画像の Evidence の ID（撮らなかったら `null`）。 */
+  readonly screenshotEvidenceId: EvidenceId | null;
+  /** EV-1: 操作の方法（`DIRECT_FOCUS` は、要素に直に、スクロールを止めずにフォーカスを当てた）。前の版の記録にはない。 */
+  readonly operation?: FocusCheckOperation;
+  /** EV-1: hit-test の点の数と、最前面がその要素か子孫だった点の数。前の版の記録にはない。 */
+  readonly hitTestPointCount?: number;
+  readonly hitPointCount?: number;
+  /**
+   * EV-1: フォーカスの前と後の、文書とスクロールの祖先（内から外の順）の位置。`afterRect` と画像は、後の位置で読んだ。確かめの後に、前の位置へ戻す。
+   * 前の版の記録にはない（そのときは、文書を動かさずに読んだ）。
+   */
+  readonly scroll?: FocusCheckScrollEvidence;
+}
+
+/** EV-1: フォーカスの確かめの操作の方法の閉じた一覧。 */
+export const FOCUS_CHECK_OPERATIONS = Object.freeze(['DIRECT_FOCUS'] as const);
+export type FocusCheckOperation = (typeof FOCUS_CHECK_OPERATIONS)[number];
+
+/** EV-1: スクロールの祖先 1 つの、前と後の位置。 */
+export interface ScrollAncestorPositionEvidence {
+  readonly selector: string;
+  readonly before: { readonly scrollLeft: number; readonly scrollTop: number };
+  readonly after: { readonly scrollLeft: number; readonly scrollTop: number };
+}
+
+/** EV-1: フォーカスの前と後の、文書とスクロールの祖先の位置。 */
+export interface FocusCheckScrollEvidence {
+  readonly document: { readonly before: ScrollPosition; readonly after: ScrollPosition };
+  readonly ancestors: readonly ScrollAncestorPositionEvidence[];
+}
+
+/** AUD-4d: フォーカスの確かめの状態の閉じた一覧（`PARTIAL` は、途中で読めなくなった。それまでの要素だけ）。 */
+export const FOCUS_CHECK_STATUSES = Object.freeze(['COMPLETE', 'PARTIAL'] as const);
+export type FocusCheckStatus = (typeof FOCUS_CHECK_STATUSES)[number];
+
+/** AUD-4d: 1 つの時点（主の読み込みの最後、幅の走査の幅）のフォーカスの確かめ。 */
+export interface FocusCheckEvidence {
+  readonly status: FocusCheckStatus;
+  readonly viewportWidth: number;
+  readonly viewportHeight: number;
+  /** 読んだときの文書のスクロール位置。 */
+  readonly scrollPosition: ScrollPosition;
+  readonly items: readonly FocusCheckItemEvidence[];
+  /** 幅の走査の幅なら、その幅（px）。主の読み込みにはない。 */
+  readonly stressWidth?: number;
+  /**
+   * EV-4（設計書 `2026-11-16-beaksight-finding-evidence-design.md` 3.4）: 主の読み込みの、axe の `scrollable-region-focusable` の要素ごとの、キーボードの
+   * 実操作の結果（axe の静的な判定とは別の記録）。axe の要素の順。主の読み込みのほか（幅の走査・開いた状態）と、この項目より前の記録にはない。
+   */
+  readonly scrollableRegions?: readonly ScrollableRegionKeyboardEvidence[];
+}
+
+/**
+ * EV-4: 横にスクロールする領域のキーボードの実操作の結果の閉じた一覧。
+ * - `REACHED_AND_MOVED`: Tab で届き、矢印のキーで位置が動いた。
+ * - `REACHED_NOT_MOVED`: Tab で届いたが、矢印のキーで位置が動かなかった。
+ * - `NOT_REACHED`: Tab で届かなかった（前のフォーカスできる要素から Tab を押していき、領域を越えた・ほかへ移った）。
+ * - `NOT_TRIED`: 試せなかった（文書の selector で引けない要素・見つからない・スクロールの余地がない・前にも後にも起点にできる要素がない・操作の失敗）。
+ *   値が変わりうる所でキーを止めたときも含む（起点と領域の間の、値を入れる要素にフォーカスが来た・領域の子孫にフォーカスが来た・同じ要素に戻った）。
+ *   REV-EV4: 影の木の中のフォーカスも深くたどって見る。フォーカスが枠（iframe）に入った・起点と領域の間に準備の時点でなかった要素へ移ったときも含む。
+ * - `KEY_TRIGGERED_NAVIGATION`（REV-EV4）: キーを押した間に、ページが画面を移そうとした（main frame の文書の移動か、ポップアップ）。Guard が止めて記録し、
+ *   画面は移らない（その画面の点検は続ける）。
+ */
+export const SCROLLABLE_REGION_KEYBOARD_OUTCOMES = Object.freeze([
+  'REACHED_AND_MOVED', 'REACHED_NOT_MOVED', 'NOT_REACHED', 'NOT_TRIED', 'KEY_TRIGGERED_NAVIGATION',
+] as const);
+
+/** EV-4: キーボードの実操作を試す領域を見つける axe のルールの ID（その指摘の ruleId は `A11Y_SCROLLABLE_REGION_FOCUSABLE`）。 */
+export const SCROLLABLE_REGION_AXE_RULE_ID = 'scrollable-region-focusable';
+export type ScrollableRegionKeyboardOutcome = (typeof SCROLLABLE_REGION_KEYBOARD_OUTCOMES)[number];
+
+/** EV-4: 1 つの領域のキーボードの実操作の記録（値を変えず、確かめた後に位置とフォーカスを元へ戻した）。 */
+export interface ScrollableRegionKeyboardEvidence {
+  /** axe の要素の selector の並び（`AccessibilityNodeEvidence.targetSelectors` と同じ値。指摘の目印 `target` と照らす）。 */
+  readonly targetSelectors: readonly AccessibilityTargetSelector[];
+  readonly outcome: ScrollableRegionKeyboardOutcome;
+  /** 押したキーの順（例: `Tab`・`ArrowRight`。前にフォーカスできる要素がなく、後の要素から戻ったら `Shift+Tab`）。試せなかったら、それまでに押したキー。 */
+  readonly keys: readonly string[];
+  /** 矢印のキーを押す前と後の、領域の位置（押さなかったら `null`）。 */
+  readonly region: ScrollAncestorPositionEvidence | null;
+  /** 領域まで動かした前と後の、文書とスクロールの祖先の位置（動かせなかったら `null`）。 */
+  readonly scroll: FocusCheckScrollEvidence | null;
+  /** 領域まで動かして撮った画像（撮らない設定・撮れなかったら `null`）。 */
+  readonly screenshotEvidenceId: EvidenceId | null;
+}
+
 export const SCREENSHOT_CAPTURE_TYPES = Object.freeze(['VIEWPORT', 'FULL_PAGE'] as const);
 export type ScreenshotCaptureType = (typeof SCREENSHOT_CAPTURE_TYPES)[number];
 
@@ -1563,6 +2377,79 @@ export interface ScreenshotEvidence {
   readonly captureType: ScreenshotCaptureType;
   /** 撮影の直前に読んだ文書のスクロール位置（定義は `ScrollPosition`）。先頭へ戻せなかった場合は、その位置。 */
   readonly scrollPosition: ScrollPosition;
+  /**
+   * AUD-3d: 幅の走査の幅の viewport の画像なら、その幅（px）。layout を読んだ直後に、その幅の page で撮る（状態 ID は Desktop の読み込みのもの）。主の画像と、
+   * この項目より前の Evidence にはない。
+   */
+  readonly stressWidth?: number;
+  /**
+   * EV-2（設計書 `2026-11-16-beaksight-finding-evidence-design.md` 3.2）: 対象まで動かして（フォーカスの確かめは、フォーカスの後の位置のまま）撮った画像なら、
+   * 撮ったときに測り直した対象の記録（部品 `revealAndCapture`）。先頭へ戻さずに撮るので、`scrollPosition` は撮った位置。ほかの画像と、前の版の記録にはない。
+   */
+  readonly reveal?: RevealCaptureEvidence;
+}
+
+/** EV-2: 撮った画像の範囲に、対象が入ったかの閉じた一覧（全部・一部・入らない。機械で決める）。 */
+export const TARGET_IMAGE_INCLUSIONS = Object.freeze(['INSIDE', 'PARTIAL', 'OUTSIDE'] as const);
+export type TargetImageInclusion = (typeof TARGET_IMAGE_INCLUSIONS)[number];
+
+/** EV-2: 対象まで動かして撮る所（重なり・固定の枠の覆い・フォーカス）の閉じた一覧。EV-4: 文字の見切れと、横にスクロールする領域を足した。 */
+export const REVEAL_PURPOSES = Object.freeze(['ELEMENT_OVERLAP', 'FIXED_ELEMENT_OCCLUSION', 'FOCUS', 'TEXT_CLIPPING', 'SCROLLABLE_REGION'] as const);
+export type RevealPurpose = (typeof REVEAL_PURPOSES)[number];
+
+/**
+ * EV-2: 測った位置の閉じた一覧。`TARGET` は対象が画面の中に入るまで動かした位置、`END` は文書と覆われる要素のスクロールの祖先を末尾まで動かした位置（覆いだけ）、
+ * `AS_IS` は動かさない位置（フォーカスの後の位置）。REV-EV12 の I-1: `ONE_SCREEN` は、文書を初めの位置から、対象が画面に残る範囲（対象の上端が画面の上端に
+ * 来るまで。多くても 1 画面分）だけ動かした位置（覆いだけ。初めの位置だけの覆いを見分ける）。
+ */
+export const REVEAL_POSITIONS = Object.freeze(['TARGET', 'END', 'AS_IS', 'ONE_SCREEN'] as const);
+export type RevealPosition = (typeof REVEAL_POSITIONS)[number];
+
+/** EV-2: 対象まで動かして撮る対象の指定（ページの中で selector で引き直す）。 */
+export interface RevealTargetSpec {
+  readonly purpose: RevealPurpose;
+  /** 対象の要素の selector（重なりは 2 つの要素、覆いは覆われる要素、フォーカスは要素）。 */
+  readonly selectors: readonly string[];
+  /** 覆いだけ: 覆う固定の要素の selector。 */
+  readonly overlaySelector?: string;
+}
+
+/** EV-2: 1 つの対象を、1 つの位置で測り直した記録。 */
+export interface RevealedTargetEvidence extends RevealTargetSpec {
+  readonly position: RevealPosition;
+  /** 対象の要素を、全部ページの中で引き直せたか。 */
+  readonly found: boolean;
+  /** 動かす前と後の、文書と、動かした要素のスクロールの祖先（内から外の順）の位置（後の位置で測って撮り、撮った後に前の位置へ戻した）。 */
+  readonly scroll: FocusCheckScrollEvidence;
+  /** 測り直した対象の矩形（viewport の座標。重なりは 2 つの要素の交わり。分けて撮った回は、その回の部分）。引き直せなければ `null`。 */
+  readonly rect: RectangleEvidence | null;
+  /** 対象の要素ごとの矩形（`selectors` の順。引き直せなかった要素は `null`）。 */
+  readonly elementRects: readonly (RectangleEvidence | null)[];
+  /** 要素ごとの行ごとの矩形（`getClientRects`）の数（`selectors` の順）。 */
+  readonly lineRectCounts: readonly number[];
+  /** `rect` のうち、viewport とスクロールの祖先の箱で切り取った後に見える部分（なければ `null`）。 */
+  readonly visibleRect: RectangleEvidence | null;
+  /** hit-test の点の数と、最前面が対象の要素（重なりはどちらか）か子孫だった点の数。 */
+  readonly hitTestPointCount: number;
+  readonly hitPointCount: number;
+  /** 覆いだけ: 最前面が覆う要素か子孫だった点の数と、覆う要素が描かれて画面と交わるか。 */
+  readonly coveredPointCount?: number;
+  readonly overlayPresent?: boolean;
+  /** 覆いだけ: 覆われる要素が押す部品（リンク・ボタン・入力欄）か、無効でないか。 */
+  readonly control?: { readonly interactive: boolean; readonly enabled: boolean };
+  /** 撮った画像の範囲（viewport）に、`rect` が入ったか。 */
+  readonly inclusion: TargetImageInclusion;
+  /** 対象が viewport より大きく、分けて撮った回なら、その番号（0 から）と回の数。 */
+  readonly segment?: { readonly index: number; readonly count: number };
+}
+
+/** EV-2: 対象まで動かして撮った 1 枚の画像の、測り直しの記録。 */
+export interface RevealCaptureEvidence {
+  /** 撮った viewport の大きさ（画像の大きさ）。 */
+  readonly viewportWidth: number;
+  readonly viewportHeight: number;
+  /** この画像に写る対象（同じ帯に入る複数の対象は 1 枚にまとめる）。 */
+  readonly targets: readonly RevealedTargetEvidence[];
 }
 
 // ---------------------------------------------------------------------------------------------------------------
@@ -1592,9 +2479,9 @@ interface SiteMetadataEvidenceBase {
   readonly outcome: SiteMetadataOutcome;
   /** 応答の HTTP ステータス。応答を得られなかった場合は `null`。 */
   readonly httpStatus: number | null;
-  /** 本文（`MAX_SITE_METADATA_TEXT_LENGTH` までで切り詰める）。本文がない場合は `null`。 */
+  /** 本文（LZ-2: 切り詰めない）。本文がない場合は `null`。 */
   readonly text: string | null;
-  /** 本文を上限で切り詰めたか。本文が `null` なら偽。 */
+  /** 前は、本文を上限で切り詰めたか。LZ-2 で上限を撤廃したので、今はいつも偽（前の記録の形のために残す）。 */
   readonly textTruncated: boolean;
 }
 
@@ -1609,14 +2496,14 @@ export interface RobotsTxtMetadataEvidence extends SiteMetadataEvidenceBase {
 export interface SitemapXmlMetadataEvidence extends SiteMetadataEvidenceBase {
   readonly kind: Extract<SiteMetadataKind, 'SITEMAP_XML'>;
   /**
-   * `<loc>` の値を `normalizeUrl` で正規化した値（`MAX_SITEMAP_URLS` 件までで切り詰める）。切り詰める前の本文から取り出す。
+   * `<loc>` の値を `normalizeUrl` で正規化した値（LZ-3a: 件数で切り詰めない）。
    * 正規化できない値は含めない。
    * 結果が `OK` でない場合と、本文から URL を取り出せなかった場合（根の要素が `<urlset>` でない。sitemap の index を含む）は `null`。
    */
   readonly sitemapUrls: readonly string[] | null;
   /**
-   * `sitemapUrls` が、sitemap のすべての `<loc>` を含んでいないか（件数の上限で切り詰めた、など）。`sitemapUrls` が `null` なら偽。
-   * 真の場合、Cross-page rule は `DISCOVERED_URL_NOT_IN_SITEMAP` を判定しない。
+   * `sitemapUrls` が、sitemap のすべての `<loc>` を含んでいないか。真の場合、Cross-page rule は `DISCOVERED_URL_NOT_IN_SITEMAP` を判定しない。
+   * LZ-3a: 件数で切り詰めないので、今はいつも偽（前の記録を読むために残す）。
    */
   readonly sitemapUrlsTruncated: boolean;
 }
@@ -1642,15 +2529,20 @@ export type MetadataEvidence = RobotsTxtMetadataEvidence | SitemapXmlMetadataEvi
  *   （`src/safety/passive-request-guard.ts` の `PAGE_INITIATED_NAVIGATION_LIMIT_PER_FRAME`）を超えた（Passive の段だけ）。main frame は BeakSight 自身の
  *   読み込みの後から、子の frame（T37R2-fix）はその frame の最初の文書の後から数える。
  * - `PAGE_SUBRESOURCE_LIMIT_REACHED`（DEF-130-fix）: 1 画面の読み込みあたりの、ページが出す文書でない要求（画像・`fetch`・`xhr` など）が、上限
- *   （`src/safety/passive-request-guard.ts` の `PAGE_SUBRESOURCE_REQUEST_LIMIT`）を超えた（Passive の段だけ。数え始めは BeakSight 自身の読み込みか、
+ *   （前は 1,000。L10 で撤廃したので今は止めない）を超えた（Passive の段だけ。数え始めは BeakSight 自身の読み込みか、
  *   その Context の最初の文書）。
  * - `AUDIT_SEND_OVER_LIMIT`（AS-a。設計書 `2026-10-19-beaksight-audit-send-policy-design.md` 2.2）: 監査の段の送信の扱い `PASS_EXCEPT_DELETE` で、通せる
- *   読み取りでない要求が、その読み込み（Context）で通す数の上限（`src/safety/passive-request-guard.ts` の `AUDIT_SEND_MAX_PASSED_PER_CONTEXT`）を超えた
+ *   読み取りでない要求が、その読み込み（Context）で通す数の上限（前は 60。L10 で撤廃したので今は止めない。前の記録を読むために値を残す）を超えた
  *   （その扱いを選んだ Passive の段だけ）。
  * - `PAGE_LEAVE_REQUEST_LIMIT_REACHED`（T44R の I-1。Task 44 の設計書の履歴の「T44R …と設計者の判断」の行）: 監査の段の送信の扱い `PASS_EXCEPT_DELETE` で、
- *   閉じる前にページを離れ始めた後に、ページが出す文書でない要求が 1 回の離れ方あたりの上限（`src/safety/passive-request-guard.ts` の
- *   `PAGE_LEAVE_REQUEST_LIMIT`）を超えたか、そのページの文書の読み込み（ページが始めた移動、ポップアップが opener を戻す移動）だった。そのページの読み取りの
+ *   閉じる前にページを離れ始めた後に、ページが出す文書でない要求が 1 回の離れ方あたりの上限（前は 30。L10 で
+ *   撤廃した）を超えたか、そのページの文書の読み込み（ページが始めた移動、ポップアップが opener を戻す移動）だった。そのページの読み取りの
  *   判定は、離れる前に終わっている（読み切れない画面にはしない）。
+ * - `NOTIFICATION_DISMISSAL_RESTRICTED`（DEF-210。通知の枠の設計書 3.2.1）: 通知の枠の閉じる押下の期間の決まりで止めた（main frame の移動、見るだけの点検の
+ *   許可の外の Origin への送信と資格情報つきの送信、操作さがしの凍結の読み取りの決まりに当たらない要求）。判定は `src/safety/request-policy.ts` の
+ *   `notificationPressDecisionOf`。
+ * - `SCROLL_KEY_PRESS_RESTRICTED`（REV-EV4。設計書 `2026-11-16-beaksight-finding-evidence-design.md` 3.4）: 横にスクロールする領域のキーの押下の期間に、
+ *   ページが始めた main frame の移動（BeakSight の操作が起こしたものとして止めた。違反にしない）。判定は `scrollKeyPressDecisionOf`。
  */
 export const BLOCKED_REQUEST_REASONS = Object.freeze([
   'NON_READ_METHOD',
@@ -1660,6 +2552,8 @@ export const BLOCKED_REQUEST_REASONS = Object.freeze([
   'PAGE_SUBRESOURCE_LIMIT_REACHED',
   'AUDIT_SEND_OVER_LIMIT',
   'PAGE_LEAVE_REQUEST_LIMIT_REACHED',
+  'NOTIFICATION_DISMISSAL_RESTRICTED',
+  'SCROLL_KEY_PRESS_RESTRICTED',
 ] as const);
 
 /** Passive の Guard が、許可Originの外へのメインフレームの遷移を遮断した理由の閉じた一覧。 */
@@ -1685,9 +2579,16 @@ export const WORKER_CONNECT_POLICY_REASON = 'WORKER_CONNECT_POLICY';
  * - `PASSIVE_WEBSOCKET`: ページの中の WebSocket（Context の `routeWebSocket`）。
  * - `WORKER_CONNECT_POLICY`: Worker の中の WebSocket（CSP。`WORKER_CONNECT_POLICY_REASON`）。
  * - `AUDIT_SEND_OVER_LIMIT`（AS-c）: 監査の段の送信の扱い `PASS_EXCEPT_DELETE` で通せる接続が、その読み込み（Context）の上限
- *   （`src/safety/passive-request-guard.ts` の `AUDIT_SEND_MAX_WEBSOCKETS_PER_CONTEXT`）を超えた。
+ *   （前は 10。L10 で撤廃したので今は止めない。前の記録を読むために値を残す）を超えた。
+ * - `WEBSOCKET_SEND_QUEUE_FULL`（DEF-276-relay。REV-DEF276 の M-2）: 操作さがしの画面の文書の WebSocket の中継で、ページの送りがサーバへ書き出せずに
+ *   たまる量の上限（`WEBSOCKET_RELAY_MAX_SEND_QUEUE_BYTES`）を超えたので、その接続を閉じた。
  */
-export const BLOCKED_WEBSOCKET_REASONS = Object.freeze(['PASSIVE_WEBSOCKET', WORKER_CONNECT_POLICY_REASON, 'AUDIT_SEND_OVER_LIMIT'] as const);
+export const BLOCKED_WEBSOCKET_REASONS = Object.freeze([
+  'PASSIVE_WEBSOCKET',
+  WORKER_CONNECT_POLICY_REASON,
+  'AUDIT_SEND_OVER_LIMIT',
+  'WEBSOCKET_SEND_QUEUE_FULL',
+] as const);
 
 /** Interaction の凍結中に、ページが起こした通信・遷移・popup・WebSocket を遮断した理由の閉じた一覧。 */
 export const INTERACTION_FROZEN_REASONS = Object.freeze(['INTERACTION_FROZEN'] as const);
@@ -1804,9 +2705,15 @@ export type BlockedEventPhase = (typeof BLOCKED_EVENT_PHASES)[number];
  * LG-4（テストの組の設計書 3.7.3、3.7.5）: 印のない `page-schema/1.0` と、その読み替えの口は捨てた（前の版の page.json を持つ保存は読まない）。
  */
 export const PAGE_SCHEMA_VERSION = 'page-schema/1.1';
-/** BN-a: 読める page.json の版（スキーマの `schemaVersion` の値と同じ。LG-4 で今の版だけになった）。 */
-export const PAGE_READABLE_SCHEMA_VERSIONS = Object.freeze([PAGE_SCHEMA_VERSION] as const);
-export type PageSchemaVersion = (typeof PAGE_READABLE_SCHEMA_VERSIONS)[number];
+/**
+ * REC-3: ディスクに書く page.json（と保存のページの `result`）の版。メモリの形（`page-schema/1.1`）の、同じ形の繰り返しを短くした形
+ * （`src/core/page-record-codec.ts`）。書くときに 2.0 にし、読むときに 1.1 の形に戻す。
+ */
+export const PAGE_RECORD_SCHEMA_VERSION = 'page-schema/2.0';
+/** BN-a: スキーマが受ける page の版（スキーマの `schemaVersion` の値と同じ。メモリの形の 1.1 と、ディスクの形の 2.0）。 */
+export const PAGE_READABLE_SCHEMA_VERSIONS = Object.freeze([PAGE_SCHEMA_VERSION, PAGE_RECORD_SCHEMA_VERSION] as const);
+/** メモリの形（`PageAuditResult`）の版。 */
+export type PageSchemaVersion = typeof PAGE_SCHEMA_VERSION;
 
 /**
  * BN-a: 要求を止めた事象（止めた要求・止めた移動・止めた WebSocket・監査の段の除外）が持つ時点（`phase`）。必須（LG-4: 時点のない前の版の記録は読まない）。
@@ -1869,6 +2776,48 @@ export interface BlockedClosingRequestsRecord {
 }
 
 /**
+ * SAFE-2 の 4（違反の区分の (3)。設計者の判断）: Guard が移動の frame の種類（main frame か、子の frame か）を判定できなかった 1 件（前は違反
+ * `FRAME_CLASSIFICATION_FAILED`）。ブラウザが止めていて、外へは何も渡っていないので、違反にせず、Context も閉じない。
+ * - `url`: 移動の先の URL（認証情報は伏せ字にし、Ledger の上限の長さまで切り詰める。外部スキームの URL のこともある）。
+ * - `phase`: Interaction の凍結の前（`PASSIVE`）か後（`INTERACTION`）か（`EXTERNAL_SCHEME_NAVIGATION_PHASES` と同じ値）。
+ */
+export interface FrameClassificationFailureEvent {
+  readonly url: string;
+  readonly phase: (typeof EXTERNAL_SCHEME_NAVIGATION_PHASES)[number];
+}
+
+/**
+ * SAFE-2 の 4: frame の判定の失敗の記録（`SafetyEventsEvidence.frameClassificationFailures`）。1 件でもあった Ledger の記録にだけ現れる。`count` は、記録の上限を
+ * 超えた分も数える（飽和）。`events` の上限は Ledger の事象の上限（超えた分は `recordLimits.droppedEventCount` に数えるが、`truncated` にはしない）。SAFETY の
+ * Finding（違反の指摘）にはしない（止めた記録として数に出す）。
+ */
+export interface FrameClassificationFailuresRecord {
+  readonly count: number;
+  readonly events: readonly FrameClassificationFailureEvent[];
+}
+
+/**
+ * SAFE-2 の 4（DEF-145 のとおり、届いたか分からない読み取り）: 許した読み取り（GET・HEAD）の main frame の移動の配送が失敗した 1 件（前は違反
+ * `HTTP_MAIN_FRAME_DELIVERY_FAILED`。読み取りでない method の失敗は、今どおり違反）。読み取りなので、届いても届かなくても安全の決まりに反しない。
+ * - `method`: 要求の method（`GET`・`HEAD`）。
+ * - `url`: 要求の URL の Origin と path（query・fragment・値は持たない。Origin を作れない URL は空）。
+ * - `errorText`: 失敗の理由（Chromium のエラーの文。上限の長さまで切り詰める）。
+ * - `phase`: Interaction の凍結の前（`PASSIVE`）か後（`INTERACTION`）か。
+ */
+export interface ReadNavigationFailureEvent {
+  readonly method: string;
+  readonly url: string;
+  readonly errorText: string;
+  readonly phase: (typeof EXTERNAL_SCHEME_NAVIGATION_PHASES)[number];
+}
+
+/** SAFE-2 の 4: 読み取りの main frame の移動の失敗の記録（`SafetyEventsEvidence.readNavigationFailures`。形と数え方は `FrameClassificationFailuresRecord` と同じ）。 */
+export interface ReadNavigationFailuresRecord {
+  readonly count: number;
+  readonly events: readonly ReadNavigationFailureEvent[];
+}
+
+/**
  * 監査の段の除外で遮断した読み取りの要求（T25b round 1。Task 25 の設計書 4.2）。値や本文は持たない。
  * - `method`、`url`: 要求の method と URL（ほかの要求の記録と同じく、Ledger の上限の長さまで切り詰める）。
  * - `mainFrameNavigation`: main frame のナビゲーションか（偽は、サブの frame の要求と、ナビゲーションでない要求）。
@@ -1921,6 +2870,12 @@ export interface BlockedInteractionRequestEvent {
   readonly method: string;
   readonly url: string;
   readonly reason: (typeof BLOCKED_INTERACTION_REQUEST_REASONS)[number];
+  /**
+   * DEF-215: 中継が CONNECT の受け入れ（DEF-125）で拒んだ、要求の前の接続（Guard が通した要求がまだない宛先へ、Chromium が先に張ろうとした接続）の印。
+   * 拒んだトンネルには何も流れていない（要求は送られていない）ので、読み取り以外の送信の遮断（`SAFETY_NON_READ_REQUEST_BLOCKED`）には数えない。拒否の動き
+   * そのものと、記録（`method` は `CONNECT`、`url` は `host:port`、理由は `GUARD_BYPASS_EGRESS`）は変えない。ほかの記録には付けない（任意の項目）。
+   */
+  readonly preRequestConnection?: true;
 }
 
 /** 操作中に遮断したナビゲーション。理由は `INTERACTION_FROZEN_REASONS` のまま（リクエストとは別の型。DEF-039・DEF-040 の設計書 2.1.3）。 */
@@ -1930,9 +2885,19 @@ export interface BlockedInteractionNavigationEvent {
   readonly reason: (typeof INTERACTION_FROZEN_REASONS)[number];
 }
 
+/**
+ * ポップアップを止めた理由の閉じた一覧。
+ * - `INTERACTION_FROZEN`: Interaction の凍結中に開いたポップアップ。
+ * - `NOTIFICATION_DISMISSAL_RESTRICTED`（fix round 3。通知の枠の設計書 3.2.2 の 4）: 通知の枠の閉じる押下の期間に開いたポップアップ（Guard が閉じる）。
+ * - `SCROLL_KEY_PRESS_RESTRICTED`（REV-EV4）: 横にスクロールする領域のキーの押下の期間に開いたポップアップ（Guard が閉じる。違反にしない）。
+ */
+export const BLOCKED_POPUP_REASONS = Object.freeze([
+  ...INTERACTION_FROZEN_REASONS, 'NOTIFICATION_DISMISSAL_RESTRICTED', 'SCROLL_KEY_PRESS_RESTRICTED',
+] as const);
+
 export interface BlockedPopupEvent {
   readonly url: string;
-  readonly reason: (typeof INTERACTION_FROZEN_REASONS)[number];
+  readonly reason: (typeof BLOCKED_POPUP_REASONS)[number];
 }
 
 /** ブロックしたダウンロード。`reason` でフェーズを区別する（`BLOCKED_DOWNLOAD_REASONS`）。 */
@@ -1982,7 +2947,7 @@ export interface SafetyLedgerRecordLimits {
   readonly droppedEventCount: number;
   /** 上限のために `blockedRequestsByMethod` で数えられなかったブロックの件数。 */
   readonly uncountedBlockedRequestCount: number;
-  /** 上限の長さまで切り詰めて記録した文字列の件数。イベント自体は記録されるので `truncated` にはしない。 */
+  /** 前は、上限の長さまで切り詰めて記録した文字列の件数。LZ-2 で切り詰めなくなったので、いつも 0（前の記録の形のために残す）。 */
   readonly truncatedTextCount: number;
   /** 上限に達した記録の分類（各1回、到達順）。 */
   readonly reachedCategories: readonly string[];
@@ -2040,13 +3005,17 @@ export interface SafetyEventsEvidence {
    * 事象の一覧（配列）ではないので、`SAFETY_EVENT_KINDS` には含めない（SAFETY の Finding にしない）。
    */
   readonly blockedClosingRequests?: BlockedClosingRequestsRecord;
+  /** SAFE-2 の 4: frame の判定の失敗の記録（1 件でもあった Ledger の記録にだけ現れる。SAFETY の Finding にしない）。 */
+  readonly frameClassificationFailures?: FrameClassificationFailuresRecord;
+  /** SAFE-2 の 4: 読み取りの main frame の移動の失敗の記録（1 件でもあった Ledger の記録にだけ現れる。SAFETY の Finding にしない）。 */
+  readonly readNavigationFailures?: ReadNavigationFailuresRecord;
 }
 
 /**
  * BN-a（設計書 3.1 の 4）: safety の Evidence のもとになった読み込みの種類の閉じた一覧。
  * - `PAGE_AUDIT`: ページの監査の読み込み（Desktop と Mobile の Passive の Context）。
  * - `STRESS_WIDTH`: 幅の走査の 1 つの幅の読み込み（`width` は、その幅の CSS px）。
- * - `INTERACTION`: Interaction の 1 つの候補の隔離した読み込み（`candidateIndex` は、候補の発見の順の番号で 0 から。診断の記録の候補の番号と同じ）。
+ * - `INTERACTION`: Interaction の 1 つの候補の隔離した読み込み（`candidateIndex` は、候補の発見の順の番号で 0 から）。
  */
 export const SAFETY_EVIDENCE_LOAD_KINDS = Object.freeze(['PAGE_AUDIT', 'STRESS_WIDTH', 'INTERACTION'] as const);
 export type SafetyEvidenceLoadKind = (typeof SAFETY_EVIDENCE_LOAD_KINDS)[number];
@@ -2208,28 +3177,36 @@ export interface EffectiveAuditConfig {
     readonly allowedOrigins: readonly string[];
   };
   readonly crawl: {
-    readonly maxPages: number;
-    readonly maxDepth: number;
-    /** 正の整数（ミリ秒。Task 14〜17 の設計書 4.5.7）。 */
-    readonly maxRuntimeMs: number;
-    /** 正の整数（ミリ秒。Task 14〜17 の設計書 4.5.7）。 */
-    readonly navigationTimeoutMs: number;
-    /** 正の整数（ミリ秒。Task 14〜17 の設計書 4.5.7）。 */
-    readonly overallPageTimeoutMs: number;
-    /** 正の整数（ミリ秒。Task 14〜17 の設計書 4.5.7）。 */
-    readonly resourceSettlingTimeoutMs: number;
-    /** 正の整数（ミリ秒）。 */
-    readonly interactionTimeoutMs: number;
+    /** L14 の後の段: ページの数の上限。利用者が指定したときだけ持つ（ないときは上限なし）。 */
+    readonly maxPages?: number;
+    /**
+     * L14（設計書 `2026-11-09-beaksight-remove-limits-design.md` 6 の L14）: リンクをたどる深さの上限。利用者が指定したときだけ持つ（ないときは上限なし）。
+     * 以下の `?` の項目も同じく、利用者が指定したときだけ効く（既定の値を持たない）。
+     */
+    readonly maxDepth?: number;
+    /**
+     * 1 回の起動の時間の上限。正の整数（ミリ秒。Task 14〜17 の設計書 4.5.7）。L14 の後の段: 利用者が指定したときだけ持つ（ないときは期限なし。
+     * 進みの見張りで待つ）。
+     */
+    readonly maxRuntimeMs?: number;
+    /** 正の整数（ミリ秒）。L14: ないときは期限なし（進みの見張りで待つ）。 */
+    readonly navigationTimeoutMs?: number;
+    /** 正の整数（ミリ秒）。L1 から使わない（前の記録・設定の読み方のために残す）。 */
+    readonly overallPageTimeoutMs?: number;
+    /** 正の整数（ミリ秒）。L1 から使わない（前の記録・設定の読み方のために残す）。 */
+    readonly resourceSettlingTimeoutMs?: number;
+    /** 正の整数（ミリ秒）。L14: ないときは Interaction の部品の中の期限（L5 で撤廃）。 */
+    readonly interactionTimeoutMs?: number;
     /**
      * ページの読み込みの最小の間隔。0 以上の整数（ミリ秒。サイトへの負荷の制御の設計書 3.2、4.2）。
      * 許可 Origin にループバックでないものがあれば、`src/config/validate-config.ts` の下限以上でなければならない。
      */
     readonly minNavigationIntervalMs: number;
     /**
-     * 1つのページで Interaction で監査する候補の数の上限。1 以上、`INTERACTION_CANDIDATE_LIMITS.maxCandidates` 以下の整数
-     * （サイトへの負荷の制御の設計書 3.2、4.2）。
+     * 1つのページで Interaction で監査する候補の数の上限（利用者が指定したときだけ）。1 以上の整数（サイトへの負荷の制御の設計書 3.2、4.2）。
+     * L14: ないときは上限なし。L10: 候補の数の上限（前は 100）と比べる確かめは撤廃した。
      */
-    readonly maxInteractionsPerPage: number;
+    readonly maxInteractionsPerPage?: number;
     readonly allowedQueryParameters: readonly string[];
   };
   readonly browser: {
@@ -2296,19 +3273,10 @@ export type SessionLossStorageKind = (typeof SESSION_LOSS_STORAGE_KINDS)[number]
 export const SESSION_LOSS_KEY_CHANGES = Object.freeze(['REMOVED', 'ADDED'] as const);
 export type SessionLossKeyChange = (typeof SESSION_LOSS_KEY_CHANGES)[number];
 
-/** main frame の文書の要求の経路の記録の上限（リダイレクトの各段とクライアントの側の移動。超えた分は数だけ）。 */
-export const MAX_SESSION_LOSS_REDIRECT_PATHS = 10;
-/**
- * 止めた要求の形の行の上限（ログインの段の止めた一覧 `MAX_LOGIN_STAGE_BLOCKED_REQUESTS` と同じ上限。一致は `tests/unit/session-loss-evidence.test.ts`。
- * 超えた行は数だけ）。
- */
-export const MAX_SESSION_LOSS_BLOCKED_REQUESTS = 8;
-/**
- * 鍵の名前の違いの 1 行の、接頭辞と接尾辞の案の上限（ログインの段の観察の `MAX_LOGIN_OBSERVED_STORAGE_KEY_NAMES` と同じ上限。一致は同じテスト）。
- */
-export const MAX_SESSION_LOSS_KEY_SHAPES = 4;
-/** path の表記（path と query の名前）の最大長（UTF-16 のコード単位。記録する URL の上限と同じ）。 */
-export const MAX_SESSION_LOSS_PATH_LENGTH = 2_048;
+// LZ-3a: 経路の段（前は `MAX_SESSION_LOSS_REDIRECT_PATHS` 10）・止めた要求の形の行（前は `MAX_SESSION_LOSS_BLOCKED_REQUESTS` 8）・鍵の名前の違いの 1 行の案
+// （前は `MAX_SESSION_LOSS_KEY_SHAPES` 4）の数の上限は撤廃した（スキーマにも maxItems を置かない）。`redirectPathsOmitted`・`blockedRequestsUnlisted` は前の記録の
+// 形のために残す（止めた要求の Origin を作れない URL は今も数だけ）。
+// LZ-2: 段階の名前と method の文の長さの上限（前は `MAX_SESSION_LOSS_PATH_LENGTH` 2,048）は撤廃した。
 /** 鍵の名前の違いの行の上限（置き場所 3（DEF-139 から）× Origin の区別 3 × 向き 2）。 */
 export const MAX_SESSION_LOSS_STORAGE_KEY_CHANGES = SESSION_LOSS_STORAGE_KINDS.length * SESSION_LOSS_ORIGIN_KINDS.length * SESSION_LOSS_KEY_CHANGES.length;
 

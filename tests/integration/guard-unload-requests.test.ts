@@ -5,7 +5,7 @@
 //   （`chromiumLaunchOptions`。`chrome.exe` の新しい headless）の両方で確かめる（漏れは、どちらでも起きた）。
 // - 127.0.0.1 の fixture のサーバだけを使う。別のプロセスの iframe（OOPIF）は、`--site-per-process` と、同じサーバの別のホスト名
 //   （`localhost`）で作る。
-// - 場面: `fetchLater()`、Guard が許可 Origin の外への main frame の移動を止めた後、Interaction の凍結の前、OOPIF の自己移動。どれも、
+// - 場面: `fetchLater()`、許可 Origin の外へページが自分で移るとき（FIN-1・SD-2: 移動は止めない）、Interaction の凍結の前、OOPIF の自己移動。どれも、
 //   サーバに届かず、`blockedRequests` に残り、違反 0。TS-f: Passive でページ自身が同じ Origin へ移る場面は `safety-gates.test.ts` の
 //   GATE-S01（DEF-042）に、Guard なしで届く対照は `gate-fixtures.test.ts` の DEF-042（両方の Chromium）に、まとめた。
 // - 記録は 1 要求につき 1 回（CDP の段階と route の両方で記録しない）。route が見た要求は、検証の記録のために出力する。
@@ -21,7 +21,7 @@ import {
   installPassiveRequestGuard,
 } from '../../src/safety/passive-request-guard.js';
 import { SafetyLedger } from '../../src/safety/safety-ledger.js';
-import { launchCliChromium, launchHeadlessChromium, oopifTargetUrls, SITE_PER_PROCESS_ARGS } from '../helpers/chromium.js';
+import { BOTH_CHROMIUM_LAUNCHERS, oopifTargetUrls, SITE_PER_PROCESS_ARGS } from '../helpers/chromium.js';
 import { crossSiteFramePath, crossSiteOriginOf, NAVIGATION_TARGET_PAGE } from '../helpers/external-scheme-fixture.js';
 import {
   createGateFactory,
@@ -40,39 +40,11 @@ import {
 } from '../helpers/gate-harness.js';
 
 const viewport: Viewport = Object.freeze({ width: 900, height: 700 });
-/** DEF-042 の設計書 2.4: 700 個の画像を一度に読む fixture（`fixtures/site/`）と、その画像のパス。 */
-const MANY_RESOURCES_PAGE = '/many-resources.html';
-const MANY_RESOURCES_IMAGE_PATH = '/unsized-image.svg';
-/** fixture が読む資源の数の下限（設計書 2.4 の「600 以上」。実際の数は fixture の `data-total` から読む）。 */
-const MANY_RESOURCES_MIN_COUNT = 600;
-/** 700 個の画像の読み込みを待つ上限（ms）と、そのテストの期限（ms）。負荷の高い環境でも終わる余裕を取った値で、製品の値ではない。 */
-const MANY_RESOURCES_LOAD_TIMEOUT_MS = 20_000;
-const MANY_RESOURCES_TEST_TIMEOUT_MS = 40_000;
 /** DEF-042 の設計書 2.4: 別のホスト名へ、独自ヘッダつきの GET（事前確認が要る）と単純な GET を行う fixture と、単純な GET の先。 */
 const CORS_PREFLIGHT_PAGE = '/cors-preflight-fetch.html';
 const CORS_SIMPLE_TARGET_PAGE = '/popup-target.html';
 
-/** Chromium の起動の仕方（名前と、追加の引数を受けて起動する関数）。 */
-interface ChromiumLaunch {
-  readonly name: string;
-  launch(extraArgs: readonly string[]): Promise<Browser>;
-}
-
-const CHROMIUM_LAUNCHES: readonly ChromiumLaunch[] = [
-  {
-    name: 'the headless shell (test default)',
-    launch: (extraArgs) => launchHeadlessChromium({ args: extraArgs }),
-  },
-  {
-    name: 'the CLI Chromium (chromiumLaunchOptions, headless)',
-    launch: (extraArgs) => {
-      // EL-12: 本番と同じ起動の部品（`launchCliChromium`）で起動する。
-      return launchCliChromium({ args: extraArgs });
-    },
-  },
-];
-
-describe.each(CHROMIUM_LAUNCHES)('DEF-042: the leaving requests of a page that navigates itself are stopped by the Guard, with $name', ({ name, launch }) => {
+describe.each(BOTH_CHROMIUM_LAUNCHERS)('DEF-042: the leaving requests of a page that navigates itself are stopped by the Guard, with %s', (name, launch) => {
   let server: FixtureServer;
   let browser: Browser;
   /** `--site-per-process` の Chromium（OOPIF の場面だけで使う）。 */
@@ -83,8 +55,8 @@ describe.each(CHROMIUM_LAUNCHES)('DEF-042: the leaving requests of a page that n
 
   beforeAll(async () => {
     server = await startFixtureServer();
-    browser = await launch([]);
-    isolatedBrowser = await launch(SITE_PER_PROCESS_ARGS);
+    browser = await launch();
+    isolatedBrowser = await launch({ args: SITE_PER_PROCESS_ARGS });
     factory = createGateFactory(browser, server.origin);
     isolatedFactory = createGateFactory(isolatedBrowser, server.origin);
   });
@@ -124,34 +96,24 @@ describe.each(CHROMIUM_LAUNCHES)('DEF-042: the leaving requests of a page that n
     expect(result.allRoundsWindow.nonReadCounters()).toEqual(NO_NON_READ_REQUESTS);
   }, UNLOAD_BEACON_SELF_NAVIGATION_TEST_TIMEOUT_MS);
 
-  it('Passive: after the Guard blocks the main frame navigation outside the allowed Origin, the leaving POST never reaches the allowed Origin (experiment 7)', async () => {
+  // FIN-1（SD-2 の 2.4）: 許可 Origin の外への main frame の移動は止めない（届く）。READ_ONLY の Context なので、離れるときの POST は届かない。
+  it('Passive: when the page leaves by itself to outside the allowed Origin (not stopped), the leaving POST never reaches the allowed Origin (experiment 7)', async () => {
     const crossSiteTarget = `${crossSiteOriginOf(server.origin)}${NAVIGATION_TARGET_PAGE}`;
     const result = await runGuardedSelfNavigationRounds(
       () => openGuardedPassiveSession(factory, viewport),
       server,
       unloadBeaconSelfNavigationPath('cross-site'),
-      (_page, ledger) => ledger.snapshot().blockedNavigations.length > 0,
-      // DEF-095: 混雑の下（CLI の Chromium）では、移動を止めた後、ページが離れる POST を出す前にエラーの画面（`chrome-error://chromewebdata/`）へ
-      // 移り、`blockedRequests` が空の回がある（その回も届いた要求は 0、違反 0）。移動を止めた記録（`EXTERNAL_MAIN_FRAME_NAVIGATION`）も止めた証拠に
-      // 数える。離れる POST を止めた記録が残る回は、その中身を下で確かめる。
-      {
-        evidence: (round) => round.blockedRequests.length > 0
-          || round.blockedNavigations.some((entry) => entry.reason === 'EXTERNAL_MAIN_FRAME_NAVIGATION'),
-      },
+      pageUrlIs(crossSiteTarget),
     );
-    logSelfNavigationRounds(`Passive blocked cross-site navigation (${name})`, result);
+    logSelfNavigationRounds(`Passive cross-site navigation (${name})`, result);
 
     expect(result.failedRounds).toEqual([]);
     expect(result.rounds.every((round) => round.delivered === 0)).toBe(true);
     expect(result.rounds.every((round) => round.blockedRequests.every((entry) => (
       entry.method === 'POST' && entry.url === urlOf(UNLOAD_BEACON_TARGET_PATH) && entry.reason === 'NON_READ_METHOD'
     )))).toBe(true);
-    expect(result.rounds.map((round) => round.blockedNavigations)).toEqual(result.rounds.map(() => [
-      // BN-a: 止めた時点（読み込みの最中）も記録する。
-      { method: 'GET', url: crossSiteTarget, reason: 'EXTERNAL_MAIN_FRAME_NAVIGATION', phase: 'LOAD' },
-    ]));
+    expect(result.rounds.flatMap((round) => round.blockedNavigations)).toEqual([]);
     expect(result.allRoundsWindow.count(null, UNLOAD_BEACON_TARGET_PATH)).toBe(0);
-    expect(result.allRoundsWindow.count('GET', NAVIGATION_TARGET_PAGE)).toBe(0);
     expect(result.allRoundsWindow.nonReadCounters()).toEqual(NO_NON_READ_REQUESTS);
   }, UNLOAD_BEACON_SELF_NAVIGATION_TEST_TIMEOUT_MS);
 
@@ -231,33 +193,11 @@ describe.each(CHROMIUM_LAUNCHES)('DEF-042: the leaving requests of a page that n
     expect(window.requestLines()).toEqual(['GET /page-auditor-non-read-requests.html']);
   });
 
-  /**
-   * DEF-042 の設計書 2.4（Guard の作業の上限）: すべての要求が Guard の作業になるので、700 個の画像を一度に読むページでも、要求の横取りの
-   * 作業の上限（`MAX_PENDING_GUARD_REQUEST_TASKS`）を超えず（`GUARD_TASK_LIMIT_REACHED` にならず）、違反 0 で読める。
-   */
-  it('Passive: a page that loads 700 images at once is loaded with no violation (the Guard request task limit is not reached)', async () => {
-    const session = await openGuardedPassiveSession(factory, viewport);
-    const window = openServerWindow(server);
-    try {
-      await session.page.goto(urlOf(MANY_RESOURCES_PAGE), { waitUntil: 'load' });
-      const total = Number(await session.page.evaluate(() => document.documentElement.dataset['total']));
-      expect(total).toBeGreaterThanOrEqual(MANY_RESOURCES_MIN_COUNT);
-      await expect.poll(
-        () => session.page.evaluate(() => Number(document.documentElement.dataset['settled'])),
-        { timeout: MANY_RESOURCES_LOAD_TIMEOUT_MS },
-      ).toBe(total);
-      await wait(QUIET_PERIOD_MS);
-
-      expect(session.ledger.snapshot().invariantViolations).toEqual([]);
-      expect(session.ledger.snapshot().blockedRequests).toEqual([]);
-      expect(window.count('GET', MANY_RESOURCES_IMAGE_PATH)).toBe(total);
-    } finally {
-      expect(await session.close()).toEqual([]);
-    }
-  }, MANY_RESOURCES_TEST_TIMEOUT_MS);
+  // SLIM: 700 個の画像を一度に読む場面（Guard の作業の上限 `GUARD_TASK_LIMIT_REACHED`）は、上限を撤廃した（L10 の N22）ので消した。上限で断らないことは
+  // `passive-request-guard.test.ts` の L10（N22）の場面が確かめる。ふだんの読み込みが Guard で変わらないことの代表は、下の CORS の事前確認の場面。
 
   /**
-   * DEF-042 の設計書 2.4（CORS の事前確認）: 許可 Origin の外（同じサーバの別のホスト名）への、独自ヘッダつきの GET の事前確認（OPTIONS）は、
+   * DEF-042 の設計書 2.4（CORS の事前確認）:許可 Origin の外（同じサーバの別のホスト名）への、独自ヘッダつきの GET の事前確認（OPTIONS）は、
    * Guard が Playwright と同じく 204 で満たし、サーバに届かず、記録しない。本体の GET は進み、サーバに届く。単純な GET も今までどおり届く。
    * fixture のサーバは CORS の応答のヘッダ（`Access-Control-Allow-Origin`）を返さないので、ページのスクリプトからは本体の応答を読めず、
    * fetch は失敗する（ブラウザが応答をページに渡さない）。届いたことは、サーバの記録（GET が 1 件、OPTIONS が 0 件）で確かめる。

@@ -1,5 +1,5 @@
 // T41d（Task 41 の設計書 3.4、4 章、5 章の 1〜4）: ワーカーの API の更新の書き込みの流れ（`src/worker/write-create-run.ts` の `executeWriteCreateRun` に、送り方
-// API の UPDATE の書き込みの指定を渡す）を、同じ process の中で、本物の Chromium（テストの既定の headless と、CLI の起動の設定の両方）と 127.0.0.1 の fixture
+// API の UPDATE の書き込みの指定を渡す）を、同じ process の中で、本物の Chromium（テストの既定の headless）と 127.0.0.1 の fixture
 // （`startSpaAuthSite` の form のない会員の更新の画面）で確かめる結合テスト。ログインの段は通さず、fixture が出したセッションを認証つきの Run の指定で渡す。
 // - シナリオは本番の部品（`createScenario`）で、本物の発見の成果物から作る（変える鍵は名前、保つ鍵はメールアドレスと備考、filter は `id`）。開始の口（T41b）が
 //   できるまでは、開始の指定をテストの中で組み立てる（約束の形: `api` はシナリオの API の指定のまま、`values` は変える鍵だけ、`update: { targetRecordId }`）。
@@ -21,7 +21,6 @@ import { readFileSync } from 'node:fs';
 import { mkdir, mkdtemp, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import type { Browser } from 'playwright';
 import { afterAll, afterEach, beforeAll, describe, expect, it } from 'vitest';
 import { loadConfig } from '../../src/config/load-config.js';
 import { actionRunMatchesWriteStart } from '../../src/control/actions/action-api-summary.js';
@@ -52,7 +51,7 @@ import {
   spaApiWriteConfigOf,
   spaRunAuthenticationOf,
 } from '../helpers/api-write-scenario.js';
-import { launchCliChromium, launchHeadlessChromium } from '../helpers/chromium.js';
+import { DEFAULT_CHROMIUM_LAUNCHERS, launchHeadlessChromium, useSharedRunBrowser } from '../helpers/chromium.js';
 import { READ_METHODS } from '../helpers/leak-places.js';
 import { cliTargetConfig } from '../helpers/run-harness.js';
 import {
@@ -61,26 +60,19 @@ import {
   spaMemberEditPathOf,
   startSpaAuthSite,
   type SpaAuthSite,
-  type SpaHostileMemberSave,
-  type SpaMemberUpdateResponse,
 } from '../helpers/spa-auth-site-fixture.js';
+import { settleLateDeliveries } from '../helpers/loopback-server.js';
+import { TEST_OBSERVATION_WINDOWS } from '../helpers/test-waits.js';
 import { readWriteReportFiles } from '../helpers/write-report-checks.js';
 
-const LAUNCHERS: readonly (readonly [string, () => Promise<Browser>])[] = [
-  ['the default test Chromium', () => launchHeadlessChromium()],
-  ['the CLI Chromium', () => launchCliChromium()],
-];
 const SUITE_TIMEOUT_MS = 300_000;
 const TEST_TIMEOUT_MS = 120_000;
 const NAVIGATION_INTERVAL_MS = 300;
 const RESULT_TIMEOUT_MS = 5_000;
 const LATE_DELIVERY_SETTLE_MS = 1_500;
-/** T41R-fix: 値が長く遅れて入る場面の遅れ（ms。T41R の再現と同じ）。 */
-const LONG_DELAYS_MS = [1_500, 2_500] as const;
 /** T41R2-fix: 保つ欄のメールアドレスだけを遅れて入れる時間（ms。T41R2 の再現と同じ）。 */
 const KEPT_EMAIL_DELAY_MS = 2_500;
-/** T41R3-fix（M-1）: 開いたままの要求のあるページの 1 回の書き込みの時間の上限（ms。待ちを省く前は約 22〜27 秒）。 */
-const HELD_REQUEST_RUN_LIMIT_MS = 17_000;const PROFILE_ID = 'example-t41d';
+const PROFILE_ID = 'example-t41d';
 const CREATE_SCENARIO_ID = 'scenario-api-create-t41d';
 const UPDATE_SCENARIO_ID = 'scenario-api-update-t41d';
 const READ_CHECK_ID = 'rc-api-t41d';
@@ -168,7 +160,7 @@ beforeAll(async () => {
       submitterIdentityDigest: update.candidate.identityDigest,
       api: updateApi,
       values: { name },
-      verification: { successCondition: null, inputErrorCondition: null, recordId: null },
+      verification: { resultJudgement: null, recordId: null },
       readVerification: {
         ...base.readVerification,
         definition: { ...base.readVerification.definition, expectations: [{ kind: 'TEXT_CONTAINS', text: name }] },
@@ -186,7 +178,9 @@ afterAll(async () => {
   if (directory !== '') await rm(directory, { recursive: true, force: true });
 }, SUITE_TIMEOUT_MS);
 
-describe.each(LAUNCHERS)('T41d: the API update write flow with %s', (label, launch) => {
+describe.each(DEFAULT_CHROMIUM_LAUNCHERS)('T41d: the API update write flow with %s', (label, launchChromium) => {
+  // SLIM-2（X7）: 書き込みの流れごとに Chromium を起こさず、1 つの Browser を共有する（Context は流れごと）。
+  const launch = useSharedRunBrowser(launchChromium);
   let expectedPatches = 0;
   let patchesBefore = 0;
   let nonReadsBefore = 0;
@@ -213,7 +207,8 @@ describe.each(LAUNCHERS)('T41d: the API update write flow with %s', (label, laun
   });
 
   afterAll(async () => {
-    await wait(LATE_DELIVERY_SETTLE_MS);
+    // TEST-TIME-B（案 9）: どの回も Browser を閉じた後なので、受けている途中の要求が 0 になってから短い余白だけ待つ（上限は前の固定の待ち）。
+    await settleLateDeliveries(LATE_DELIVERY_SETTLE_MS, site);
     expect(memberPatches() - patchesBefore).toBe(expectedPatches);
     expect(nonReads() - nonReadsBefore).toBe(expectedPatches);
   }, TEST_TIMEOUT_MS);
@@ -248,6 +243,7 @@ describe.each(LAUNCHERS)('T41d: the API update write flow with %s', (label, laun
       },
       reportSubmission: (report) => reports.push(report),
       resultTimeoutMs: RESULT_TIMEOUT_MS,
+      observationWindows: TEST_OBSERVATION_WINDOWS,
     }, { onRunStarted: () => undefined, onSessionLost: () => undefined });
     if (outcome.kind !== 'RAN') throw new Error(`the write flow did not run: ${outcome.kind}`);
     const text = readFileSync(artifactFilePath(outcome.runDirectory, ACTION_RUN_ARTIFACT_FILE_NAME), 'utf8');
@@ -282,49 +278,13 @@ describe.each(LAUNCHERS)('T41d: the API update write flow with %s', (label, laun
     expect(run.outcome).toMatchObject({ runStatus: 'COMPLETE', result: 'VERIFIED' });
   }, TEST_TIMEOUT_MS);
 
-  it.each<[string, () => void]>([
-    ['the body has only the changed field', () => site.setMemberUpdateChangedOnly(true)],
-    ['the server answers 204 without a body', () => site.setMemberUpdateResponse('noContent')],
-    ['the page fills the values later', () => site.setMemberValuesDelayed(true)],
-  ])(`verifies when %s (${label})`, async (_name, prepare) => {
-    prepare();
-    const run = await runWrite();
-    expectedPatches += 1;
-    expect(site.memberOf(targetId)?.name).toBe(nameFor(caseNumber));
-    expect(run.document).toMatchObject({ submission: 'SENT', recordId: String(targetId), result: 'VERIFIED', reason: 'READ_VERIFICATION_MATCHED' });
-  }, TEST_TIMEOUT_MS);
+  // RB-11: 応答の本文の形（変えた欄だけ・204 の本文なし）からの判定は、単体 `write-create-run-api-update`（`apiUpdateResultOf`・本文の読み方）が、値を遅れて
+  // 入れる画面で落ち着いた値を読む輪は、単体 `api-write-field-values`（`settledFieldValues`）が確かめる。
 
-  it.each<[string, SpaHostileMemberSave]>([
-    ['rewrites a kept value', 'keptValueRewrite'],
-    ['rewrites the filter', 'filterRewrite'],
-  ])(`does not send when the page %s: PAYLOAD_MISMATCH, no PATCH (${label})`, async (_name, hostile) => {
-    site.setHostileMemberSave(hostile);
-    const before = site.memberOf(targetId);
-    const run = await runWrite();
-    expect(run.document).toMatchObject({ submission: 'NOT_SENT', blockReason: 'PAYLOAD_MISMATCH', result: 'BLOCKED', reservationState: 'RELEASED' });
-    expect(site.memberOf(targetId)).toEqual(before);
-  }, TEST_TIMEOUT_MS);
+  // RB-14a: ページが保つ値・filter を書き換えた本文の照合（PAYLOAD_MISMATCH）は、guard-api-write-stage（保つ鍵の書き換え・filter の書き換え）が確かめる。
 
-  it.each<[string, () => void, Partial<ActionRunDocument>]>([
-    ['a side effect of the server on a kept field', () => site.setMemberUpdateSideEffect(true), { result: 'UNKNOWN', reason: 'UNEXPECTED_FIELD_CHANGE' }],
-    ['an empty list (no row updated)', () => site.setMemberUpdateResponse('emptyRows'), { result: 'UNKNOWN', reason: 'NO_CONDITION_MATCHED' }],
-    ['another record id in the body', () => site.setMemberUpdateResponse('otherRecordId'), { result: 'UNKNOWN', reason: 'RECORD_ID_MISMATCH' }],
-    // T41R-fix（I-2）: 2 行の一覧（2 行以上を更新した。どの行が変わったか分からない）。
-    ['a list of two rows in the body', () => site.setMemberUpdateResponse('twoRows'), { result: 'UNKNOWN', reason: 'MULTIPLE_CONDITIONS_MATCHED' }],
-    // T41R2-fix（M-1）: 行の数が分からない本文（読む上限を超える 2 行、JSON でない本文）。
-    ['a list of two rows over the read limit', () => site.setMemberUpdateResponse('largeTwoRows'), { result: 'UNKNOWN', reason: 'NO_CONDITION_MATCHED' }],
-    ['a body that is not JSON', () => site.setMemberUpdateResponse('notJson'), { result: 'UNKNOWN', reason: 'NO_CONDITION_MATCHED' }],
-    ['a 400', () => site.setMemberUpdateResponse('clientError' satisfies SpaMemberUpdateResponse), { result: 'FAILED', reason: 'INPUT_ERROR' }],
-    ['a 503', () => site.setMemberUpdateResponse('serverError'), { result: 'UNKNOWN', reason: 'SERVER_ERROR' }],
-    ['no response', () => site.setMemberUpdateResponse('noResponse'), { result: 'UNKNOWN', reason: 'NO_RESPONSE' }],
-  ])(`does not claim a success for %s (${label})`, async (_name, prepare, expected) => {
-    prepare();
-    const run = await runWrite();
-    expectedPatches += 1;
-    expect(run.document).toMatchObject({ submission: 'SENT', update: { targetRecordId: String(targetId) }, ...expected });
-    expect(run.document.result).not.toBe('VERIFIED');
-    expect(run.outcome).toMatchObject({ runStatus: 'PARTIAL' });
-  }, TEST_TIMEOUT_MS);
+  // RB-11: 応答と更新の後の照合からの判定（保つ欄の副作用・2 行の本文・応答なし）は、単体 `write-create-run-api-update`（49・80）・`action-outcome` と、
+  // 応答のない送信の記録（`write-run-loop`）、送り手の NO_RESPONSE（`write-submission-sender-fetch`）が確かめる。
 
   // T41R-fix（Task 41 の設計書 8 章の「T41R の途中の報告」の C-1・I-1）: 値を遅れて入れる画面で、保つ欄を空で上書きする PATCH を送らない。場面ごとに新しい
   // 対象の会員（保つ欄に値がある）を足す（前の場面の書き込みが後の場面に残らないように）。
@@ -354,67 +314,15 @@ describe.each(LAUNCHERS)('T41d: the API update write flow with %s', (label, laun
     expect(site.memberOf(target.id)).toEqual(target.before);
   }, TEST_TIMEOUT_MS);
 
-  // T41R3-fix（C-3）: 保つ欄に仮の値（「読み込み中」）を出してから本当の値を入れる画面。仮の値は台帳の値と違うので送らない。
-  it(`does not send when the page shows a placeholder in a kept field before the real value: PRECHECK_FAILED (${label})`, async () => {
-    site.setMemberPlaceholderEmail(KEPT_EMAIL_DELAY_MS);
-    const target = freshTarget(true);
-    const run = await runWrite(target.change);
-    expect(run.document).toMatchObject({
-      submission: 'NOT_SENT', blockReason: 'PRECHECK_FAILED', precheckDetail: 'KNOWN_KEPT_VALUE_MISMATCH', result: 'BLOCKED', reservationState: 'RELEASED',
-    });
-    expect(site.memberOf(target.id)).toEqual(target.before);
-  }, TEST_TIMEOUT_MS);
+  // RB-14a: 保つ欄の仮の値（T41R3-fix の C-3）と、BeakSight の外で変わった保つ値で送らない判定は、単体 write-create-run-api-update（台帳の値と違う保つ鍵）が
+  // 確かめる。本物の画面からその判定へ渡る代表は、上の遅れて入る保つ欄の場面。
 
-  // T41R3-fix: BeakSight の外で保つ値が変わったレコード（台帳の値と違う）は、送らない。
-  it(`does not send when a kept value was changed outside BeakSight: PRECHECK_FAILED (${label})`, async () => {
-    const target = freshTarget(true);
-    site.setMemberValues(target.id, { note: '外で変えた備考' });
-    const before = site.memberOf(target.id);
-    const run = await runWrite(target.change);
-    expect(run.document).toMatchObject({
-      submission: 'NOT_SENT', blockReason: 'PRECHECK_FAILED', precheckDetail: 'KNOWN_KEPT_VALUE_MISMATCH', result: 'BLOCKED', reservationState: 'RELEASED',
-    });
-    expect(site.memberOf(target.id)).toEqual(before);
-  }, TEST_TIMEOUT_MS);
+  // RB-11: 開いたままの要求のある画面で、要求が止む待ちの上限に届いたら残りの読み取りでその待ちを省く輪（T41R3-fix M-1）と、値の読み取りが遅れて答える
+  // 画面で保つ欄を空で上書きしない判定は、単体 `api-write-field-values`（`settledFieldValuesWhenQuiet` の上限と知らせ）と `write-create-run-api-update`
+  // （押してよいかの判定）が確かめる。
 
-  it(`verifies on a page that keeps a request open when the values are filled at once, without waiting again for the requests (${label})`, async () => {
-    site.setMemberHoldRequest(true);
-    const target = freshTarget(true);
-    const startedAt = Date.now();
-    const run = await runWrite(target.change);
-    const elapsedMs = Date.now() - startedAt;
-    expectedPatches += 1;
-    expect(run.document).toMatchObject({ submission: 'SENT', result: 'VERIFIED', reason: 'READ_VERIFICATION_MATCHED', recordId: String(target.id) });
-    expect(site.memberOf(target.id)).toEqual({ ...target.before, name: nameFor(caseNumber) });
-    // T41R3-fix（M-1）: 一度要求が止む待ちの上限に届いた画面は、残りの読み取りでその待ちを省く（省く前は 1 回に約 22〜27 秒）。
-    expect(elapsedMs).toBeLessThan(HELD_REQUEST_RUN_LIMIT_MS);
-  }, TEST_TIMEOUT_MS);
-
-  it.each(LONG_DELAYS_MS)(`does not empty a kept field when the read of the values answers %i ms later: verifies or does not send (${label})`, async (delayMs) => {
-    site.setMemberDetailDelay(delayMs);
-    const target = freshTarget();
-    const run = await runWrite(target.change);
-    const sent = run.document.submission !== 'NOT_SENT';
-    expectedPatches += sent ? 1 : 0;
-    expect(site.memberOf(target.id)).toMatchObject({ email: target.before?.email, note: target.before?.note });
-    if (sent) {
-      expect(run.document).toMatchObject({ result: 'VERIFIED', reason: 'READ_VERIFICATION_MATCHED' });
-      expect(site.memberOf(target.id)?.name).toBe(nameFor(caseNumber));
-    } else {
-      expect(run.document).toMatchObject({ blockReason: 'PRECHECK_FAILED', result: 'BLOCKED' });
-    }
-  }, TEST_TIMEOUT_MS);
-
-  it.each(LONG_DELAYS_MS)(`does not send when the page fills the values %i ms after the read by a timer only: PRECHECK_FAILED (${label})`, async (delayMs) => {
-    site.setMemberValuesDelayed(true, delayMs);
-    const target = freshTarget();
-    const run = await runWrite(target.change);
-    expect(run.document).toMatchObject({
-      submission: 'NOT_SENT', blockReason: 'PRECHECK_FAILED', precheckDetail: 'PRIOR_VALUES_EMPTY', result: 'BLOCKED', reservationState: 'RELEASED',
-    });
-    expect(site.memberOf(target.id)).toEqual(target.before);
-  }, TEST_TIMEOUT_MS);
-
+  // RB-14a: タイマーだけで値を遅れて入れる画面（PRIOR_VALUES_EMPTY）は、単体 write-create-run-api-update（印の欄がみな空の読み取り）と
+  // api-write-field-values（落ち着いた値の読み）が確かめる。本物の画面の代表は、次の場面。
   it(`does not send when every marked field of the prior read is empty: PRECHECK_FAILED (${label})`, async () => {
     const emptyId = site.addMember('', { email: '', note: '' });
     const before = site.memberOf(emptyId);
@@ -435,17 +343,6 @@ describe.each(LAUNCHERS)('T41d: the API update write flow with %s', (label, laun
     expect(site.memberOf(target.id)).toEqual(target.before);
   }, TEST_TIMEOUT_MS);
 
-  // T41R-fix-2（設計書 8 章の「T41R-fix の報告（設計者の判断）」）: 読み直しの後、押す時にページが保つ値を変えても、送る瞬間に Guard が前の値と照らして
-  // 止める（PATCH は 0 回）。確かめ直しは押す前に 1 回。
-  it(`does not send when the page changes a kept value at the press after the reread: PAYLOAD_MISMATCH, no PATCH (${label})`, async () => {
-    site.setMemberKeptRewriteOnPress(true);
-    const target = freshTarget();
-    const run = await runWrite(target.change);
-    expect(run.document).toMatchObject({ submission: 'NOT_SENT', blockReason: 'PAYLOAD_MISMATCH', result: 'BLOCKED', reservationState: 'RELEASED' });
-    expect(run.rechecks).toBe(1);
-    // 止めた証拠: 送る中身の照合で止めた数が 1 以上。
-    const guard = run.evidence['guard'] as { readonly blockedByPayloadReason: Readonly<Record<string, number>> };
-    expect(Object.values(guard.blockedByPayloadReason).reduce((sum, count) => sum + count, 0)).toBeGreaterThanOrEqual(1);
-    expect(site.memberOf(target.id)).toEqual(target.before);
-  }, TEST_TIMEOUT_MS);
+  // RB-14a: 読み直しの後、押す時にページが保つ値を変えた本文を、送る瞬間に Guard が前の値と照らして止めること（T41R-fix-2）は、guard-api-write-stage（保つ鍵の
+  // 値の書き換え・送る直前の書き換え）が確かめる。
 });

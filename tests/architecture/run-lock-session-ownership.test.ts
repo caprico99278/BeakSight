@@ -1,12 +1,8 @@
 /**
- * 出力先の開始のロック、ロックの判定、セッションの切れの判定、内部のリンクの取り出しの Architecture Gate（CCX-6。共通化の台帳の CC-070）。
- * - (a) ロックの判定 `judgeRunLock(` を呼ぶのは、owner（`src/core/process-lock.ts`）と、決まった利用者（出力先の開始のロックと動いている Run の
- *   確かめ `src/orchestration/output-start-lock.ts`、Run のロックの保存のセッション `run-checkpoint-session.ts`、画面のサーバのロック
- *   `src/control/job/instance-lock.ts`）だけ。CLI の監査とワーカーの Run は、`output-start-lock.ts` を呼ぶ。
- * - (b) 古いロックの取り直し（`takeOverStaleLock(`、`acquireLockTakingOverStale(`）を呼ぶのは、owner と `output-start-lock.ts`、
- *   `run-checkpoint-session.ts` だけ。
- * - (c) 書き手の出力先の開始のロックの口（`acquireOutputStartLock(`、`takeOverOutputStartLock(`、`readOutputStartLock(`、
- *   `releaseOutputStartLock(`、`rewriteOutputStartLock(`）を呼ぶのは、`output-start-lock.ts` だけ（定義は `ArtifactWriter`）。
+ * 出力先の監査中の印（SPEC-2 の作り直し。OS が放す排他）、セッションの切れの判定、内部のリンクの取り出しの Architecture Gate（CCX-6。共通化の
+ * 台帳の CC-070）。
+ * - (a) 出力先の排他を取る `acquireRunExclusion(`（owner は `src/core/run-exclusion.ts`）を呼ぶのは、CLI の監査（`src/cli/audit-run.ts`）と
+ *   ワーカーの Run の始め方（`src/worker/worker-run-session.ts`、発見の続きの Run `src/worker/discovery-run.ts`）だけ（閉じた一覧）。
  * - (d) セッションの切れの path の判定 `isSessionLostUrl(` を呼ぶのは、owner（`src/orchestration/authenticated-run.ts`）だけ。読み込みの後の
  *   判定 `sessionLostUrlOf(` を呼ぶのは、owner の時機の補助（`sessionLostUrlAt`。DF-3）と、書き込みのジョブの流れ（`src/worker/write-create-run.ts`。
  *   書き込みの段の判定で、読み取りの時機の一覧の外）だけ。時機の補助 `sessionLostUrlAt(` を呼ぶのは、Page Auditor とワーカーの 1 画面の読み込み
@@ -22,11 +18,9 @@
  * - (g) 発見の 1 画面分の記録の形（`incompleteReasons: readonly IncompleteReason[]` と `candidates: readonly DiscoveryCandidate[]` を持つ型）を
  *   宣言するのは、純粋な成果物の部品（`src/discovery/discovery-result.ts` の `DiscoveryReadPageRecord`）だけ（PRE42-CC 組 5b。CC-070 (a)。
  *   発見の入口 `discover-page.ts` は、この型を使う）。
- * - (h) ロックのファイルの作成（SR-1-F、DEF-168）: `open(…, 'wx')`（`writeFile(…, { flag: 'wx' })` を含む）で新しく作るのは、書き出しの途中の
- *   一時ファイル（第 1 引数が `temporary…` の名前）だけ。ロックのファイルそのものを `wx` で作ってから中身を書く形（中身のないロックが外から
- *   見える）は、`src/` のどこにも書かない。ロックのファイルは、部品 `createLockFileExclusively`（`src/core/lock-file.ts`。一時ファイルに書いて
- *   `link` で作る）で作り、それを呼ぶのは書き手（`src/report/artifact-writer.ts`。作成と、動かしてしまった他人のロックの戻しと、取り直しの札
- *   の作成。DEF-170）だけ。
+ * - (h) ファイルの排他的な作成（SR-1-F、DEF-168）: `open(…, 'wx')`（`writeFile(…, { flag: 'wx' })` を含む）で新しく作るのは、書き出しの途中の
+ *   一時ファイル（第 1 引数が `temporary…` の名前）だけ。ファイルを `wx` で作ってから中身を書く形（中身のないファイルが外から見え、ロックに
+ *   使うと古いと判定される）は、`src/` のどこにも書かない（SPEC-2 の作り直しで、ロックのファイルそのものもなくなった）。
  * - `src/**` の読み込みは、このファイルの読み込み時に 1 回だけ行う。判定は、`fs`、正規表現、文字列の走査だけで行う（AST・TypeScript の
  *   コンパイラ API・外部ツール・子プロセス・`dist/` を使わない）。呼び出しはコメントと文字列リテラルの中を見ない（近似の検査である）。
  */
@@ -35,10 +29,8 @@ import { findCallSites, loadSourceFiles, scanSource, sourceFileAt, unusedExclusi
 
 const SOURCE_FILES = loadSourceFiles();
 
-const PROCESS_LOCK_OWNER = 'src/core/process-lock.ts';
-const OUTPUT_START_LOCK = 'src/orchestration/output-start-lock.ts';
-const RUN_CHECKPOINT_SESSION = 'src/orchestration/run-checkpoint-session.ts';
-const INSTANCE_LOCK = 'src/control/job/instance-lock.ts';
+/** (a) 出力先の排他を取ってよいファイル（閉じた一覧）。 */
+const RUN_EXCLUSION_USERS: readonly string[] = ['src/cli/audit-run.ts', 'src/worker/worker-run-session.ts', 'src/worker/discovery-run.ts'];
 const AUTHENTICATED_RUN = 'src/orchestration/authenticated-run.ts';
 const PAGE_AUDITOR = 'src/orchestration/page-auditor.ts';
 const WORKER_RUN_SESSION = 'src/worker/worker-run-session.ts';
@@ -66,18 +58,7 @@ interface CallRule {
 }
 
 const CALL_RULES: readonly CallRule[] = [
-  { name: 'judgeRunLock', allowed: [PROCESS_LOCK_OWNER, OUTPUT_START_LOCK, RUN_CHECKPOINT_SESSION, INSTANCE_LOCK] },
-  // DEF-172: 猶予つきの判定（判定の部品は 1 つ）を呼ぶのは、owner と出力先の確かめだけ（保存のセッションは `takeOverStaleLock` を通す）。
-  { name: 'judgeRunLockWithGrace', allowed: [PROCESS_LOCK_OWNER, OUTPUT_START_LOCK] },
-  // SR-1-F5: いくつものロックをまとめて判定する形（待つのは 1 回だけ）も、同じ決まり。
-  { name: 'judgeRunLocksWithGrace', allowed: [PROCESS_LOCK_OWNER, OUTPUT_START_LOCK] },
-  { name: 'takeOverStaleLock', allowed: [PROCESS_LOCK_OWNER, OUTPUT_START_LOCK, RUN_CHECKPOINT_SESSION] },
-  { name: 'acquireLockTakingOverStale', allowed: [PROCESS_LOCK_OWNER, OUTPUT_START_LOCK, RUN_CHECKPOINT_SESSION] },
-  { name: 'acquireOutputStartLock', allowed: [OUTPUT_START_LOCK] },
-  { name: 'takeOverOutputStartLock', allowed: [OUTPUT_START_LOCK] },
-  { name: 'readOutputStartLock', allowed: [OUTPUT_START_LOCK] },
-  { name: 'releaseOutputStartLock', allowed: [OUTPUT_START_LOCK] },
-  { name: 'rewriteOutputStartLock', allowed: [OUTPUT_START_LOCK] },
+  { name: 'acquireRunExclusion', allowed: RUN_EXCLUSION_USERS },
   { name: 'isSessionLostUrl', allowed: [AUTHENTICATED_RUN] },
   // DF-3: 読み取りの流れは、時機の補助（`sessionLostUrlAt`）を通す。書き込みのジョブは、書き込みの段の判定（DF-3 の範囲の外）なので今のまま。
   { name: 'sessionLostUrlOf', allowed: [AUTHENTICATED_RUN, WRITE_CREATE_RUN] },
@@ -157,14 +138,8 @@ const pageRecordDeclarationCount = (bare: string): number =>
     .filter(([, body = '']) => PAGE_RECORD_MEMBERS.every((member) => member.test(body)))
     .length;
 
-/** (h) ロックのファイルの作成の部品の owner と、書き手（ファイルの操作を渡して呼ぶ唯一のファイル）。 */
-const LOCK_FILE_OWNER = 'src/core/lock-file.ts';
+/** (h) 書き手（一時ファイルを `wx` で作る）。 */
 const ARTIFACT_WRITER = 'src/report/artifact-writer.ts';
-/**
- * (h) 書き手が部品を呼ぶ数（ロックの作成 `#acquireLockFile`、動かしてしまった他人のロックの戻し `#restoreMovedLock`、取り直しの札の作成
- * `createExclusiveFile`。DEF-170）。
- */
-const ARTIFACT_WRITER_LOCK_CREATIONS = 3;
 
 /** (h) `wx` の文字列（`code` に当てる。コメントの中は見ない）。 */
 const EXCLUSIVE_FLAG_PATTERN = /(['"`])wx\1/gu;
@@ -211,30 +186,9 @@ describe('run lock and session lost ownership detectors (CCX-6)', () => {
   const asFile = (path: string, source: string): Pick<SourceFile, 'path' | 'bare'> => ({ path, bare: scanSource(source).bare });
   const rule = (name: string): CallRule => CALL_RULES.find((candidate) => candidate.name === name) ?? { name, allowed: [] };
 
-  it('detects the lock judgement and the takeover written outside the owners, as before CCX-6', () => {
-    const cliCopy = asFile('src/cli/audit-run.ts', [
-      'if (judgeRunLock(lock, { nowMs: host.nowMs, bootedAtMs: host.bootedAtMs, isProcessRunning }) === \'ACTIVE\') {',
-      '  const takeover = await takeOverStaleLock({ acquire, takeOver }, acquisition.existing, lock, judgement);',
-      '}',
-    ].join('\n'));
-    const workerCopy = asFile('src/worker/worker-run-session.ts', [
-      'const result = await acquireLockTakingOverStale({',
-      '  acquire: async (value) => await writer.acquireOutputStartLock(outputDirectory, value),',
-      '  takeOver: async (judged, value) => writer.takeOverOutputStartLock(outputDirectory, judged, value),',
-      '}, lock, judgement);',
-      'if (isOwnRunLock(await writer.readOutputStartLock(outputDirectory), lock)) {',
-      '  await writer.releaseOutputStartLock(outputDirectory, createdDirectory);',
-      '}',
-    ].join('\n'));
-    expect(callViolations([cliCopy], rule('judgeRunLock'))).toEqual(['src/cli/audit-run.ts: judgeRunLock(']);
-    expect(callViolations([cliCopy], rule('takeOverStaleLock'))).toEqual(['src/cli/audit-run.ts: takeOverStaleLock(']);
-    expect(CALL_RULES.flatMap((candidate) => callViolations([workerCopy], candidate))).toEqual([
-      'src/worker/worker-run-session.ts: acquireLockTakingOverStale(',
-      'src/worker/worker-run-session.ts: acquireOutputStartLock(',
-      'src/worker/worker-run-session.ts: takeOverOutputStartLock(',
-      'src/worker/worker-run-session.ts: readOutputStartLock(',
-      'src/worker/worker-run-session.ts: releaseOutputStartLock(',
-    ]);
+  it('detects the exclusion taken outside the closed list of users', () => {
+    const copy = asFile('src/worker/read-check-run.ts', 'const exclusion = await acquireRunExclusion(outputDirectory);');
+    expect(callViolations([copy], rule('acquireRunExclusion'))).toEqual(['src/worker/read-check-run.ts: acquireRunExclusion(']);
   });
 
   it('detects the session lost judgement written outside the owner, as before CCX-6', () => {
@@ -271,11 +225,11 @@ describe('run lock and session lost ownership detectors (CCX-6)', () => {
 
   it('ignores definitions, comments and strings', () => {
     const ignored = asFile('src/report/artifact-writer.ts', [
-      'async acquireOutputStartLock(outputDirectory: string, lock: object): Promise<OutputStartLockAcquisition> {',
-      '  // judgeRunLock(lock, judgement) は呼び出し側',
+      'async writeRun(run: AuditRunResult): Promise<void> {',
+      '  // acquireRunExclusion(outputDirectory) は呼び出し側',
       "  const text = 'isSessionLostUrl(url, prefix)';",
       '}',
-      'export function judgeRunLock(lock: unknown, current: RunLockJudgementInput): RunLockState {',
+      'export async function acquireRunExclusion(outputDirectory: string): Promise<RunExclusion> {',
       '}',
     ].join('\n'));
     expect(CALL_RULES.flatMap((candidate) => callViolations([ignored], candidate))).toEqual([]);
@@ -371,10 +325,9 @@ describe('run lock and session lost ownership (CCX-6, CC-070)', () => {
   });
 
   it('the allowed users of the shared parts call them (the rules are not stale)', () => {
-    // DEF-172: 出力先の開始のロックと動いている Run の確かめは、猶予つきの判定（`judgeRunLockWithGrace`）を使う。
-    expect(callCount(sourceFile(OUTPUT_START_LOCK).bare, 'judgeRunLocksWithGrace')).toBeGreaterThan(0);
-    expect(callCount(sourceFile(OUTPUT_START_LOCK).bare, 'acquireLockTakingOverStale')).toBeGreaterThan(0);
-    expect(callCount(sourceFile(OUTPUT_START_LOCK).bare, 'acquireOutputStartLock')).toBeGreaterThan(0);
+    for (const path of RUN_EXCLUSION_USERS) {
+      expect(callCount(sourceFile(path).bare, 'acquireRunExclusion'), path).toBeGreaterThan(0);
+    }
     expect(callCount(sourceFile(AUTHENTICATED_RUN).bare, 'isSessionLostUrl')).toBeGreaterThan(0);
     // DF-3: 判定は owner の時機の補助が呼び、Page Auditor とワーカーの 1 画面の読み込みは補助を呼ぶ。
     expect(callCount(sourceFile(AUTHENTICATED_RUN).bare, 'sessionLostUrlOf')).toBeGreaterThan(0);
@@ -414,10 +367,12 @@ describe('run lock and session lost ownership (CCX-6, CC-070)', () => {
 
     expect(offenders).toEqual([]);
     expect(internalNavigableFilterCount(sourceFile(INTERNAL_NAVIGABLE_LINKS).code)).toBe(1);
-    expect(INTERNAL_NAVIGABLE_USERS.filter((path) => callCount(sourceFile(path).bare, 'internalNavigableUrlsOf') === 0)).toEqual([]);
+    // SD-1: 巡回で移る側（Run Coordinator・発見の流れ）は、削除の語のリンクを除く同じ部品の入口（`crawlableLinkUrlsOf`）を呼ぶ。
+    expect(INTERNAL_NAVIGABLE_USERS.filter((path) => callCount(sourceFile(path).bare, 'internalNavigableUrlsOf') === 0
+      && callCount(sourceFile(path).bare, 'crawlableLinkUrlsOf') === 0)).toEqual([]);
   });
 
-  it('(h) creates with wx only temporary files in src/, and creates the lock files only through createLockFileExclusively', () => {
+  it('(h) creates with wx only temporary files in src/', () => {
     expect(exclusiveOpenViolations(SOURCE_FILES)).toEqual([]);
     // 除外は使われている（使われなくなった除外は誤り）。
     const exceptionKey = ({ path, reason }: ExclusiveFlagException): string => `${path}: ${reason}`;
@@ -427,12 +382,6 @@ describe('run lock and session lost ownership (CCX-6, CC-070)', () => {
     expect(unusedExclusionsOf(EXCLUSIVE_FLAG_EXCEPTIONS.map(exceptionKey), usedExceptions)).toEqual([]);
     // 書き手は、一時ファイルを `wx` で作る（走査が空でない）。
     expect([...sourceFile(ARTIFACT_WRITER).code.matchAll(TEMPORARY_EXCLUSIVE_OPEN_PATTERN)].length).toBeGreaterThan(0);
-    expect(SOURCE_FILES.filter((file) => callCount(file.bare, 'createLockFileExclusively') > 0).map((file) => file.path)).toEqual([ARTIFACT_WRITER]);
-    expect(callCount(sourceFile(ARTIFACT_WRITER).bare, 'createLockFileExclusively')).toBe(ARTIFACT_WRITER_LOCK_CREATIONS);
-    expect(localDefinitionPattern('createLockFileExclusively').test(sourceFile(LOCK_FILE_OWNER).bare)).toBe(true);
-    // 部品は、一時ファイルに書いてから `link` で作る（`open` で作らない）。
-    expect(/\boperations\.writeNew\s*\([\s\S]*?\boperations\.link\s*\(/u.test(sourceFile(LOCK_FILE_OWNER).bare)).toBe(true);
-    expect(/\bopen\s*\(/u.test(sourceFile(LOCK_FILE_OWNER).bare)).toBe(false);
   });
 
   it('(g) only the pure discovery result part declares the page record shape, and the discovery entry uses it', () => {

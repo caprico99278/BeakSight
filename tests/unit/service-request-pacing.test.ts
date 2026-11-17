@@ -8,7 +8,6 @@
 //   発見・READ の結果の `authentication` と、再開の保存に残る（前の実行の数に足す）。
 // 時刻と待ちは注入する（実際には待たない）。例の値は、匿名の値（`example.invalid`）だけを使う。
 import { describe, expect, it } from 'vitest';
-import type { AuditStageServiceRequests } from '../../src/browser/context-factory.js';
 import { LOAD_PEAK_WINDOW_MS } from '../../src/crawl/load-meter.js';
 import { createNavigationPacer, withAdditionalNavigationWait, type NavigationPacer } from '../../src/crawl/navigation-pacer.js';
 import { sameJobAuthenticationSummary } from '../../src/discovery/discovery-result.js';
@@ -22,7 +21,6 @@ import {
 
 const START_MS = 5_000_000;
 const INTERVAL_MS = 5_000;
-const SERVICE_ORIGIN = 'https://service.example.invalid';
 
 /** 偽の時計。`sleep(ms)` は、すぐに時刻を `ms` だけ進めて終わる。 */
 class FakeTime {
@@ -87,10 +85,11 @@ describe('DEF-141: the additional wait before the next load, layered on the navi
     expect(time.sleeps).toEqual([1_000, INTERVAL_MS - 1_000]);
   });
 
-  it('passes the other operations to the pacer', () => {
+  it('passes the other operations to the pacer', async () => {
     const calls: string[] = [];
     const pacer: NavigationPacer = {
       beforeNavigation: async () => 0,
+      waitUntilNextNavigationDue: async () => { calls.push('due'); return 3; },
       snapshot: () => ({ navigationCount: 7, totalWaitMs: 8, lastNavigationStartedAtMs: 9 }),
       raiseMinimumInterval: (ms) => { calls.push(`raise ${String(ms)}`); },
       recordDocumentRequestSent: () => { calls.push('sent'); },
@@ -98,7 +97,9 @@ describe('DEF-141: the additional wait before the next load, layered on the navi
     const paced = withAdditionalNavigationWait(pacer, { source: fixedSource([]), sleep: async () => undefined, onWait: () => undefined });
     paced.raiseMinimumInterval(10);
     paced.recordDocumentRequestSent();
-    expect(calls).toEqual(['raise 10', 'sent']);
+    // DEF-236: 見せたままの待ちも、包んだ部品にそのまま渡す。
+    await expect(paced.waitUntilNextNavigationDue()).resolves.toBe(3);
+    expect(calls).toEqual(['raise 10', 'sent', 'due']);
     expect(paced.snapshot()).toEqual({ navigationCount: 7, totalWaitMs: 8, lastNavigationStartedAtMs: 9 });
     expect(Object.isFrozen(paced)).toBe(true);
   });
@@ -123,20 +124,14 @@ describe('DEF-141: the additional wait before the next load, layered on the navi
 });
 
 describe('DEF-141: the paced pacer shared by the Run Coordinator, the discovery and the read check', () => {
-  const auditStage: AuditStageServiceRequests = {
-    approvedServiceOrigins: [SERVICE_ORIGIN],
-    auditReadRequests: [],
-    scriptLogin: { origin: SERVICE_ORIGIN, path: '/auth/v1/token', requiredQuery: [{ name: 'grant_type', value: 'password' }] },
-    serviceRequestLimits: { perMinute: 2, perRun: 100 },
-  };
-
   it('does not wrap the pacer without the audit stage', () => {
     const time = new FakeTime();
     const pacer = createNavigationPacer({ minIntervalMs: 0, now: time.now, sleep: time.sleep });
     expect(serviceRequestPacedNavigationPacer(pacer, null, time.sleep, () => undefined)).toBe(pacer);
   });
 
-  it('waits by the per minute limit before the next load, records the counts and notifies the totals of the whole Run', async () => {
+  // L11 で直した: 1 分あたりの上限で待つことは撤廃した。上限を超える数を出しても待たず、知らせもしない。前の実行の待ちの記録は、そのまま残る。
+  it('does not wait by the per minute limit before the next load (L11), and keeps the counts of the whole Run', async () => {
     const time = new FakeTime();
     const previous = {
       registeredReadRequestsAllowed: 0,
@@ -149,7 +144,7 @@ describe('DEF-141: the paced pacer shared by the Run Coordinator, the discovery 
       serviceRequestPacingWaits: 2,
       serviceRequestPacingWaitMs: 70_000,
     };
-    const state = createAuditStageRunState(auditStage, time.now, previous);
+    const state = createAuditStageRunState(time.now, previous);
     const pacer = createNavigationPacer({ minIntervalMs: 0, now: time.now, sleep: time.sleep });
     const notices: ServiceRequestPacingNotice[] = [];
     const paced = serviceRequestPacedNavigationPacer(pacer, state, time.sleep, (notice) => notices.push(notice));
@@ -157,15 +152,11 @@ describe('DEF-141: the paced pacer shared by the Run Coordinator, the discovery 
     // 1 回の読み込みで、上限を超える数を出した（断らない）。
     expect([state.budget.tryConsume(), state.budget.tryConsume(), state.budget.tryConsume()]).toEqual([true, true, true]);
     time.nowMs += 10_000;
-    expect(await paced.beforeNavigation()).toBe(LOAD_PEAK_WINDOW_MS - 10_000);
-    expect(notices).toEqual([{ kind: 'SERVICE_REQUEST_PACING_WAIT', waitMs: LOAD_PEAK_WINDOW_MS - 10_000, waitCount: 3, totalWaitMs: 120_000 }]);
-    expect(Object.isFrozen(notices[0])).toBe(true);
-    expect(auditStageCountsOf(state)).toMatchObject({ serviceRequestsAdmitted: 7, serviceRequestPacingWaits: 3, serviceRequestPacingWaitMs: 120_000 });
-    const summary = runAuthenticationSummaryOf(state);
-    expect(summary).toMatchObject({ serviceRequestLimitReached: false, serviceRequestPacingWaits: 3, serviceRequestPacingWaitMs: 120_000 });
-    // 待った後は、窓の中の数が上限を下回るので、待たない。
     expect(await paced.beforeNavigation()).toBe(0);
-    expect(notices).toHaveLength(1);
+    expect(notices).toEqual([]);
+    expect(auditStageCountsOf(state)).toMatchObject({ serviceRequestsAdmitted: 7, serviceRequestPacingWaits: 2, serviceRequestPacingWaitMs: 70_000 });
+    const summary = runAuthenticationSummaryOf(state);
+    expect(summary).toMatchObject({ serviceRequestLimitReached: false, serviceRequestPacingWaits: 2, serviceRequestPacingWaitMs: 70_000 });
   });
 
   // LG-4: 数のない前の版の保存は読まない（`checkpoint` のスキーマが数を必須にした）ので、0 から数える確かめは捨てた。

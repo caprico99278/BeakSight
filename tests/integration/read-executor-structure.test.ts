@@ -3,22 +3,18 @@
 // - 主な領域: `main` がちょうど 1 つならそれ、なければ（2 つ以上も）`body`。`nav`・`header`・`footer`・`aside` の中の構造は数えない。
 // - 表: ほかの表の中の表は数えず、`tbody` の `td` を持つ `tr` を行とする（見出しの行、`thead` の行は数えない）。一覧: ほかの一覧と表の中のものは
 //   数えず、子の `li` を数える。詳細: `dl`（と、その中の `div`）の `dt` → 次の最初の `dd`。
-// - 見えている文字（空白をまとめる）。上限に達したら `limitReached`。ページが DOM の名前を名前つきの要素や `document` の自分のプロパティで
+// - 見えている文字（空白をまとめる）。L4: 件数・長さの上限で打ち切らない（`limitReached` は立たない）。ページが DOM の名前を名前つきの要素や `document` の自分のプロパティで
 //   上書きしても（DOM clobbering）、読み方は変わらない。
 // サーバは使わない（ページは `setContent` で作る）。
 import type { Browser, Page } from 'playwright';
 import { afterAll, beforeAll, describe, expect, it } from 'vitest';
-import { MAX_READ_DETAIL_ENTRIES, MAX_READ_STRUCTURES, readPageStructure } from '../../src/discovery/read-executor.js';
+import { readPageStructure } from '../../src/discovery/read-executor.js';
 import type { ReadPageStructure } from '../../src/discovery/read-check-evaluation.js';
-import { launchCliChromium, launchHeadlessChromium } from '../helpers/chromium.js';
+import { DEFAULT_CHROMIUM_LAUNCHERS } from '../helpers/chromium.js';
 
-const LAUNCHERS = [
-  ['the default test Chromium', () => launchHeadlessChromium()],
-  ['the CLI launch settings', () => launchCliChromium()],
-] as const;
 const READ_TIMEOUT_MS = 10_000;
 
-describe.each(LAUNCHERS)('T27e: reading the structure of a READ result page (%s)', (_name, launch) => {
+describe.each(DEFAULT_CHROMIUM_LAUNCHERS)('T27e: reading the structure of a READ result page (%s)', (_name, launch) => {
   let browser: Browser;
   let page: Page;
 
@@ -86,12 +82,20 @@ describe.each(LAUNCHERS)('T27e: reading the structure of a READ result page (%s)
     expect(structure).toMatchObject({ region: 'MAIN', tableRowCounts: [1], detailEntries: [{ term: '名前', value: '本当の値' }] });
   });
 
-  it('marks the limit when there are too many structures or details', async () => {
+  // L4（INV-LIMITS の N32）: 構造・詳細の項目・詳細の文字の数と長さで打ち切らない（前の上限を超えても全部を読み、上限の印を立てない）。
+  it('reads every structure and detail, more than the former limits, without the limit mark', async () => {
+    /** L4 の前の上限（構造 200・詳細の項目 500。定数は LZ-1 で消した）。 */
+    const MAX_READ_STRUCTURES = 200;
+    const MAX_READ_DETAIL_ENTRIES = 500;
     const tables = '<table><tbody><tr><td>1</td></tr></tbody></table>'.repeat(MAX_READ_STRUCTURES + 1);
-    expect((await structureOf(`<main>${tables}</main>`)).limitReached).toBe(true);
-    const details = `<dl>${'<dt>a</dt><dd>b</dd>'.repeat(MAX_READ_DETAIL_ENTRIES + 1)}</dl>`;
+    const many = await structureOf(`<main>${tables}</main>`);
+    expect(many.limitReached).toBe(false);
+    expect(many.tableRowCounts).toHaveLength(MAX_READ_STRUCTURES + 1);
+    const longValue = 'v'.repeat(2_000);
+    const details = `<dl>${'<dt>a</dt><dd>b</dd>'.repeat(MAX_READ_DETAIL_ENTRIES + 1)}<dt>long</dt><dd>${longValue}</dd></dl>`;
     const structure = await structureOf(`<main>${details}</main>`);
-    expect(structure.limitReached).toBe(true);
-    expect(structure.detailEntries).toHaveLength(MAX_READ_DETAIL_ENTRIES);
+    expect(structure.limitReached).toBe(false);
+    expect(structure.detailEntries).toHaveLength(MAX_READ_DETAIL_ENTRIES + 2);
+    expect(structure.detailEntries.at(-1)).toEqual({ term: 'long', value: longValue });
   });
 });

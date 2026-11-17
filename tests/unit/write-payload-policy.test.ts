@@ -11,7 +11,6 @@
 // 例の値は、匿名の値（`example.com`、`example.invalid`）だけを使う。
 import { describe, expect, it } from 'vitest';
 import {
-  MAX_WRITE_PAYLOAD_BYTES,
   WRITE_FORM_ENCTYPES,
   WRITE_METHOD_OVERRIDES,
   WRITE_PAYLOAD_DECISIONS,
@@ -119,7 +118,6 @@ describe('T30b: the closed lists of the write payload check', () => {
     ]);
     expect(WRITE_METHOD_OVERRIDES).toEqual(['PUT', 'PATCH']);
     expect(WRITE_FORM_ENCTYPES).toEqual([URLENCODED, MULTIPART]);
-    expect(MAX_WRITE_PAYLOAD_BYTES).toBe(1_048_576);
   });
 });
 
@@ -326,9 +324,12 @@ describe('T30b: (g) the body', () => {
     expect(check(expectationOf(MULTIPART), factsOf(MULTIPART_CONTENT_TYPE, multipartBody(VALID_MULTIPART_PARTS, false)))).toBe('BODY_INCOMPLETE');
   });
 
-  it('blocks a body over the limit before decoding it', () => {
-    const large = `${body}&${'x'.repeat(MAX_WRITE_PAYLOAD_BYTES)}`;
-    expect(check(expectationOf(URLENCODED), factsOf(URLENCODED, large))).toBe('BODY_TOO_LARGE');
+  // L12b（設計書 `2026-11-09-beaksight-remove-limits-design.md` 6.2。S18）: 大きさの上限（前は `BODY_TOO_LARGE`）を撤廃した。大きな本文も、承認した型との照合に
+  // かける（ここでは、余分な欄の形の誤りとして止まる）。
+  it('checks a body over the former limit against the approval instead of blocking it by the size (L12b)', () => {
+    /** 前の上限（1MiB）。 */
+    const large = `${body}&${'x'.repeat(1_048_576)}`;
+    expect(check(expectationOf(URLENCODED), factsOf(URLENCODED, large))).toBe('BODY_MALFORMED');
   });
 
   it.each<[string, string]>([

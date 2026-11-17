@@ -282,8 +282,7 @@ export const filterAuthenticatedState = (
 export const LOGIN_STATE_NAME_OUTCOMES = Object.freeze(['CARRIED', 'OUTSIDE_APPROVED'] as const);
 export type LoginStateNameOutcome = (typeof LOGIN_STATE_NAME_OUTCOMES)[number];
 
-/** 置き場所ごとの行の上限（同じ行はまとめて数える。超えた行は数だけ）。 */
-export const MAX_LOGIN_STATE_NAME_ROWS = 16;
+// LZ-3a: 置き場所ごとの行の数の上限（前は `MAX_LOGIN_STATE_NAME_ROWS` 16。超えた行は数だけにした）は撤廃した（同じ行は今どおりまとめて数える）。
 /** Cookie のドメインの最大長（UTF-16 のコード単位。DNS の名前の上限と先頭の `.`）。超えるドメインは伏せる。 */
 export const MAX_LOGIN_STATE_NAME_DOMAIN_LENGTH = 254;
 /** Cookie の path の最大長（UTF-16 のコード単位）。超える path は伏せる。 */
@@ -335,22 +334,19 @@ const recordedPathOf = (path: string): string => {
   return isWritableText(redacted, MAX_LOGIN_STATE_NAME_PATH_LENGTH) ? redacted : REDACTED_PATH_SEGMENT;
 };
 
-/** 行をまとめ、上限までの行と、行にしなかった数にする。 */
-const cappedRowsOf = <Row extends { readonly count: number }>(rows: readonly Omit<Row, 'count'>[]): LoginStateNameList<Row> => {
+/** 行をまとめる（LZ-3a: 行の数の上限はない。`unlisted` は前の記録の形のために残し、0）。 */
+const mergedRowsOf = <Row extends { readonly count: number }>(rows: readonly Omit<Row, 'count'>[]): LoginStateNameList<Row> => {
   const merged = new Map<string, { row: Omit<Row, 'count'>; count: number }>();
-  let unlisted = 0;
   for (const row of rows) {
     const key = JSON.stringify(row);
     const existing = merged.get(key);
     if (existing !== undefined) {
       existing.count += 1;
-    } else if (merged.size < MAX_LOGIN_STATE_NAME_ROWS) {
-      merged.set(key, { row, count: 1 });
     } else {
-      unlisted += 1;
+      merged.set(key, { row, count: 1 });
     }
   }
-  return { rows: [...merged.values()].map(({ row, count }) => ({ ...row, count }) as unknown as Row), unlisted };
+  return { rows: [...merged.values()].map(({ row, count }) => ({ ...row, count }) as unknown as Row), unlisted: 0 };
 };
 
 const outcomeOf = (carried: boolean): LoginStateNameOutcome => (carried ? 'CARRIED' : 'OUTSIDE_APPROVED');
@@ -373,7 +369,7 @@ export const authenticatedStateNameRecordOf = (
     return deepFreeze({ cookies: EMPTY_NAME_LIST, localStorage: EMPTY_NAME_LIST, indexedDB: EMPTY_NAME_LIST });
   }
   const hosts = approvedHostsOf([...input.approvedTest, ...input.approvedService]);
-  const cookies = cappedRowsOf<LoginStateCookieNameRow>(cookieDecisionsOf(input.copy, hosts).map(({ cookie, carried }) => ({
+  const cookies = mergedRowsOf<LoginStateCookieNameRow>(cookieDecisionsOf(input.copy, hosts).map(({ cookie, carried }) => ({
     domain: recordedDomainOf(cookie.domain),
     path: recordedPathOf(cookie.path),
     hostOnly: !cookie.domain.startsWith(DOMAIN_COOKIE_PREFIX),
@@ -384,9 +380,9 @@ export const authenticatedStateNameRecordOf = (
     const origin = canonicalHttpOriginOf(entry.origin);
     return origin === undefined ? [] : [{ entry, origin, carried: carriedPartsOf(entry, input) }];
   });
-  const localStorage = cappedRowsOf<LoginStateStorageNameRow>(entries.flatMap(({ entry, origin, carried }) =>
+  const localStorage = mergedRowsOf<LoginStateStorageNameRow>(entries.flatMap(({ entry, origin, carried }) =>
     entry.localStorage.map(({ name }) => ({ origin, shape: storageKeyShapeOf(name), outcome: outcomeOf(carried.localStorage) }))));
-  const indexedDB = cappedRowsOf<LoginStateStorageNameRow>(entries.flatMap(({ entry, origin, carried }) =>
+  const indexedDB = mergedRowsOf<LoginStateStorageNameRow>(entries.flatMap(({ entry, origin, carried }) =>
     entry.indexedDB.map(({ name }) => ({ origin, shape: storageKeyShapeOf(name), outcome: outcomeOf(carried.indexedDB) }))));
   return deepFreeze({ cookies, localStorage, indexedDB });
 };

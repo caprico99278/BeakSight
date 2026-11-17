@@ -33,12 +33,12 @@
         { "type": "null" }
       ]
     },
-    "target": { "anyOf": [{ "type": "string", "maxLength": 256 }, { "type": "null" }] },
-    "fields": { "type": "array", "maxItems": 200, "items": { "$ref": "#/$defs/field" } },
+    "target": { "anyOf": [{ "type": "string" }, { "type": "null" }] },
+    "fields": { "type": "array", "items": { "$ref": "#/$defs/field" } },
     "submitterWords": {
       "type": "array",
       "uniqueItems": true,
-      "maxItems": 68,
+      "maxItems": 72,
       "items": {
         "enum": [
           "logout",
@@ -81,6 +81,10 @@
           "抹消",
           "中止",
           "ログアウト",
+          "signoff",
+          "sign-off",
+          "ログオフ",
+          "サインアウト",
           "search",
           "filter",
           "find",
@@ -125,7 +129,10 @@
           "INCOMPLETE_LIMIT_REACHED",
           "INCOMPLETE_PAGE_NAVIGATION_LIMIT",
           "INCOMPLETE_PAGE_SUBRESOURCE_LIMIT",
-          "SERVICE_READ_REFUSED"
+          "NOTIFICATION_DISMISSAL_NAVIGATION_BLOCKED",
+          "SERVICE_READ_REFUSED",
+          "STAGE_UNRESPONSIVE",
+          "STAGE_NEVER_QUIET"
         ]
       }
     },
@@ -168,6 +175,10 @@
     "submissionProbe": {
       "description": "Optional (T37c; Task 37 design 3.4): the result of the submission probe (pressed in the frozen Context; nothing is sent). Only the candidates that were probe targets have it. Not part of the identity or the rule digest. The contract is src/discovery/submission-probe-contracts.ts.",
       "$ref": "#/$defs/submissionProbe"
+    },
+    "rowOpener": {
+      "description": "Optional (LU-11; list row update design 5.4-4, D5): the opener (a named row editor button) of the list row that holds this form, or of the table row just before the hidden row that holds it. The same shape as the opener of a submission probe. Only when exactly one opener is in the row. Never a value or the content of a row. Not part of the identity or the rule digest. Absent in the candidates written before LU-11.",
+      "$ref": "#/$defs/submissionProbe/properties/opener"
     }
   },
   "allOf": [
@@ -203,8 +214,8 @@
       "additionalProperties": false,
       "required": ["origin", "path"],
       "properties": {
-        "origin": { "type": "string", "minLength": 1, "maxLength": 2048 },
-        "path": { "type": "string", "pattern": "^/", "maxLength": 2048 }
+        "origin": { "type": "string", "minLength": 1 },
+        "path": { "type": "string", "pattern": "^/" }
       }
     },
     "action": {
@@ -212,9 +223,9 @@
       "additionalProperties": false,
       "required": ["origin", "path", "queryNames"],
       "properties": {
-        "origin": { "type": "string", "minLength": 1, "maxLength": 2048 },
-        "path": { "type": "string", "pattern": "^/", "maxLength": 2048 },
-        "queryNames": { "type": "array", "maxItems": 50, "items": { "type": "string", "maxLength": 256 } }
+        "origin": { "type": "string", "minLength": 1 },
+        "path": { "type": "string", "pattern": "^/" },
+        "queryNames": { "type": "array", "items": { "type": "string" } }
       }
     },
     "constraints": {
@@ -222,13 +233,13 @@
       "additionalProperties": false,
       "required": ["pattern", "min", "max", "step", "minlength", "maxlength", "autocomplete"],
       "properties": {
-        "pattern": { "anyOf": [{ "type": "string", "maxLength": 512 }, { "type": "null" }] },
-        "min": { "anyOf": [{ "type": "string", "maxLength": 512 }, { "type": "null" }] },
-        "max": { "anyOf": [{ "type": "string", "maxLength": 512 }, { "type": "null" }] },
-        "step": { "anyOf": [{ "type": "string", "maxLength": 512 }, { "type": "null" }] },
-        "minlength": { "anyOf": [{ "type": "string", "maxLength": 512 }, { "type": "null" }] },
-        "maxlength": { "anyOf": [{ "type": "string", "maxLength": 512 }, { "type": "null" }] },
-        "autocomplete": { "anyOf": [{ "type": "string", "maxLength": 512 }, { "type": "null" }] }
+        "pattern": { "anyOf": [{ "type": "string" }, { "type": "null" }] },
+        "min": { "anyOf": [{ "type": "string" }, { "type": "null" }] },
+        "max": { "anyOf": [{ "type": "string" }, { "type": "null" }] },
+        "step": { "anyOf": [{ "type": "string" }, { "type": "null" }] },
+        "minlength": { "anyOf": [{ "type": "string" }, { "type": "null" }] },
+        "maxlength": { "anyOf": [{ "type": "string" }, { "type": "null" }] },
+        "autocomplete": { "anyOf": [{ "type": "string" }, { "type": "null" }] }
       }
     },
     "field": {
@@ -248,7 +259,7 @@
         "hasValue"
       ],
       "properties": {
-        "name": { "type": "string", "maxLength": 256 },
+        "name": { "type": "string" },
         "tag": { "enum": ["input", "select", "textarea"] },
         "type": {
           "enum": [
@@ -282,7 +293,7 @@
         "constraints": { "$ref": "#/$defs/constraints" },
         "options": {
           "anyOf": [
-            { "type": "array", "maxItems": 50, "items": { "type": "string", "maxLength": 256 } },
+            { "type": "array", "items": { "type": "string" } },
             { "type": "null" }
           ]
         },
@@ -364,13 +375,25 @@
                 "FILTER_MISSING",
                 "FILTER_MULTIPLE",
                 "FILTER_NOT_PAGE_VALUE",
+                "CREATE_PATH_HAS_ID",
                 "UNRECOGNIZED",
                 "EXTERNAL_SCHEME",
+                "OPENER_SIDE_REQUEST",
                 "PAGE_CHANGED",
                 "PRESS_LIMIT_REACHED",
                 "TARGET_NOT_FOUND",
                 "PRESS_FAILED",
-                "CONTEXT_CLOSED_BY_GUARD"
+                "CONTEXT_CLOSED_BY_GUARD",
+                "SAME_IDENTITY_PRESSED",
+                "SAME_WORDS_NO_REQUEST",
+                "DISABLED_SUBMITTER",
+                "SHARED_LAYOUT_PRESSED",
+                "DISABLED_FILL_LIMIT_REACHED",
+                "SAME_STATE_PRESSED",
+                "STAGE_UNRESPONSIVE",
+                "STAGE_NEVER_QUIET",
+                "COVERED_BY_OTHER",
+                "DESTRUCTIVE_ACTION_SKIPPED"
               ]
             },
             { "type": "null" }
@@ -386,18 +409,54 @@
         "inputFields": {
           "description": "Optional (T38a; Task 38 design 3.1): the fields the probe filled or selected before the press (for a BUTTON candidate, the fields outside the forms). The name attribute, the unique CSS on the screen (T43c builder, a Playwright-parsable shape) and the field type; the marker is the number of the marker of the press (0-based for each press; null for a selected field). Never a value. Absent in the probes written before T38a.",
           "type": "array",
-          "maxItems": 200,
           "items": {
             "type": "object",
             "additionalProperties": false,
             "required": ["name", "selector", "type", "marker"],
             "properties": {
-              "name": { "anyOf": [{ "type": "string", "minLength": 1, "maxLength": 256 }, { "type": "null" }] },
-              "selector": { "anyOf": [{ "type": "string", "minLength": 1, "maxLength": 512 }, { "type": "null" }] },
+              "name": { "anyOf": [{ "type": "string", "minLength": 1 }, { "type": "null" }] },
+              "selector": { "anyOf": [{ "type": "string", "minLength": 1 }, { "type": "null" }] },
               "type": { "$ref": "#/$defs/field/properties/type" },
-              "marker": { "anyOf": [{ "type": "integer", "minimum": 0, "maximum": 31 }, { "type": "null" }] }
+              "marker": { "anyOf": [{ "type": "integer", "minimum": 0 }, { "type": "null" }] }
             }
           }
+        },
+        "opener": {
+          "description": "Optional (LU-4; list row update design 5.1-2): the opener (a row editor button) pressed before the probe pressed this target after the re-read. The identity digest of the opener candidate, whether the opener has a name (the visible text, aria-label or title) and its opener words. Never a value or the content of a row. Absent in the probes not pressed after an opener and in the probes written before LU-4.",
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["identityDigest", "hasName", "openerWords"],
+          "properties": {
+            "identityDigest": { "$ref": "#/$defs/digest" },
+            "hasName": { "type": "boolean" },
+            "openerWords": { "type": "array", "uniqueItems": true, "maxItems": 3, "items": { "enum": ["編集", "修正", "edit"] } }
+          }
+        },
+        "stage": {
+          "description": "Optional (COV-1; coverage by state design 3.3, DEF-238 design 3.1-2): the stage (the order in which the state of the screen, its structure key, first appeared; 2 or more) of a probe pressed or seen after a press changed the screen, and the presses on the same screen before this press (the stage, the candidate identity digest and the order among the candidates of the same digest). Never a value. Absent on the first stage and in the probes written before COV-1.",
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["number", "priorPresses"],
+          "properties": {
+            "number": { "type": "integer", "minimum": 2, "maximum": 9007199254740991 },
+            "priorPresses": {
+              "type": "array",
+              "items": {
+                "type": "object",
+                "additionalProperties": false,
+                "required": ["stage", "identityDigest", "ordinal"],
+                "properties": {
+                  "stage": { "type": "integer", "minimum": 1, "maximum": 9007199254740991 },
+                  "identityDigest": { "$ref": "#/$defs/digest" },
+                  "ordinal": { "$ref": "#/$defs/count" }
+                }
+              }
+            }
+          }
+        },
+        "chainEnd": {
+          "description": "Optional (COV-2c; coverage by state design, SREV-COV I-1): the press only added parts of a make already seen on the screen (no new structure signature), so the probe did not take the screen after the press as a new state and closed the chain of presses there (NO_NEW_STRUCTURE). Never a value. Absent otherwise and in the probes written before COV-2c.",
+          "enum": ["NO_NEW_STRUCTURE"]
         }
       },
       "allOf": [
@@ -422,8 +481,10 @@
                   "FILTER_MISSING",
                   "FILTER_MULTIPLE",
                   "FILTER_NOT_PAGE_VALUE",
+                  "CREATE_PATH_HAS_ID",
                   "UNRECOGNIZED",
-                  "EXTERNAL_SCHEME"
+                  "EXTERNAL_SCHEME",
+                  "OPENER_SIDE_REQUEST"
                 ]
               }
             }
@@ -434,7 +495,7 @@
           "then": {
             "type": "object",
             "properties": {
-              "reason": { "enum": ["PAGE_CHANGED", "PRESS_LIMIT_REACHED", "TARGET_NOT_FOUND", "PRESS_FAILED", "CONTEXT_CLOSED_BY_GUARD"] },
+              "reason": { "enum": ["PAGE_CHANGED", "PRESS_LIMIT_REACHED", "TARGET_NOT_FOUND", "PRESS_FAILED", "CONTEXT_CLOSED_BY_GUARD", "SAME_IDENTITY_PRESSED", "SAME_WORDS_NO_REQUEST", "DISABLED_SUBMITTER", "SHARED_LAYOUT_PRESSED", "DISABLED_FILL_LIMIT_REACHED", "SAME_STATE_PRESSED", "STAGE_UNRESPONSIVE", "STAGE_NEVER_QUIET", "COVERED_BY_OTHER", "DESTRUCTIVE_ACTION_SKIPPED"] },
               "shape": { "type": "null" }
             }
           }
@@ -478,7 +539,7 @@
       ],
       "properties": {
         "method": { "type": "string", "pattern": "^(?:[A-Z]+|\\[REDACTED\\])$", "maxLength": 32 },
-        "resourceType": { "type": "string", "pattern": "^[a-z]+$", "maxLength": 64 },
+        "resourceType": { "type": "string", "pattern": "^[a-z]+$" },
         "origin": {
           "oneOf": [
             {
@@ -487,30 +548,36 @@
               "required": ["kind", "index"],
               "properties": { "kind": { "const": "APPROVED_API" }, "index": { "$ref": "#/$defs/count" } }
             },
+            {
+              "type": "object",
+              "additionalProperties": false,
+              "required": ["kind", "index"],
+              "properties": { "kind": { "const": "APPROVED_TEST" }, "index": { "$ref": "#/$defs/count" } }
+            },
             { "type": "object", "additionalProperties": false, "required": ["kind"], "properties": { "kind": { "const": "ALLOWED" } } },
             { "type": "object", "additionalProperties": false, "required": ["kind"], "properties": { "kind": { "const": "OTHER" } } }
           ]
         },
-        "pathShape": { "type": "string", "minLength": 1, "maxLength": 1024 },
-        "queryNames": { "type": "array", "maxItems": 32, "items": { "type": "string", "maxLength": 64 } },
+        "pathShape": { "type": "string", "minLength": 1 },
+        "queryNames": { "type": "array", "items": { "type": "string" } },
         "omittedQueryNameCount": { "$ref": "#/$defs/count" },
         "filters": {
           "type": "array",
-          "maxItems": 32,
           "items": {
             "type": "object",
             "additionalProperties": false,
             "required": ["name", "operator", "valueMatchesPagePath"],
             "properties": {
-              "name": { "type": "string", "maxLength": 64 },
+              "name": { "type": "string" },
               "operator": { "enum": ["eq", "OTHER"] },
-              "valueMatchesPagePath": { "type": "boolean" }
+              "valueMatchesPagePath": { "type": "boolean" },
+              "valueIsRecordIdLike": { "description": "Optional (LU-2; list row update design 5.2): whether the operator is of the closed list and the value is a record number (digits or a UUID). Never the value. Absent in the shapes written before LU-2.", "type": "boolean" }
             }
           }
         },
-        "headerNames": { "type": "array", "maxItems": 64, "items": { "type": "string", "maxLength": 64 } },
+        "headerNames": { "type": "array", "items": { "type": "string" } },
         "omittedHeaderNameCount": { "$ref": "#/$defs/count" },
-        "contentType": { "anyOf": [{ "type": "string", "maxLength": 100 }, { "type": "null" }] },
+        "contentType": { "anyOf": [{ "type": "string" }, { "type": "null" }] },
         "prefer": {
           "type": "array",
           "uniqueItems": true,
@@ -538,34 +605,88 @@
         "kind": { "enum": ["NONE", "UNREADABLE", "NOT_JSON", "OBJECT", "ARRAY", "SCALAR"] },
         "keys": {
           "type": "array",
-          "maxItems": 64,
           "items": {
             "type": "object",
             "additionalProperties": false,
             "required": ["name", "type"],
             "properties": {
-              "name": { "type": "string", "maxLength": 64 },
-              "type": { "enum": ["string", "number", "boolean", "null", "object", "array"] }
+              "name": { "type": "string" },
+              "type": { "enum": ["string", "number", "boolean", "null", "object", "array"] },
+              "elements": {
+                "description": "ARR-1 (DEF-226): only for a key whose value is an array. The set of the JSON types of the elements, the count, whether an element is an object or an array, and whether a text element is longer than the limit. Never a value.",
+                "type": "object",
+                "additionalProperties": false,
+                "required": ["types", "count", "nested", "textOverLimit"],
+                "properties": {
+                  "types": {
+                    "type": "array",
+                    "maxItems": 6,
+                    "uniqueItems": true,
+                    "items": { "enum": ["string", "number", "boolean", "null", "object", "array"] }
+                  },
+                  "count": { "$ref": "#/$defs/count" },
+                  "nested": { "type": "boolean" },
+                  "textOverLimit": { "type": "boolean" },
+                  "positions": {
+                    "description": "ARR-3 (DEF-234): only for an array with a marker in its elements and 2 or more elements (no upper limit since L13 fix round 1; ARR-5: 1 or more for an array with an object element). For each element in order: the marker numbers in it, whether it is an empty value (an empty text or null), and its JSON type. Never a value.",
+                    "type": "array",
+                    "minItems": 1,
+                    "items": {
+                      "type": "object",
+                      "additionalProperties": false,
+                      "required": ["markers", "empty", "type"],
+                      "properties": {
+                        "markers": { "type": "array", "items": { "type": "integer", "minimum": 0 } },
+                        "empty": { "type": "boolean" },
+                        "type": { "enum": ["string", "number", "boolean", "null", "object", "array"] },
+                        "keys": {
+                          "description": "ARR-5 (DEF-234): only for an object element (any number of inner keys since L13 fix round 1; the records before it had none for a row over 16 inner keys). For each inner key in name order: the name (hidden like a top-level key), the marker numbers in its value, whether it is an empty value, its JSON type, and whether a text is longer than the limit. Never a value.",
+                          "type": "array",
+                          "items": {
+                            "type": "object",
+                            "additionalProperties": false,
+                            "required": ["name", "markers", "empty", "type"],
+                            "properties": {
+                              "name": { "type": "string" },
+                              "markers": { "type": "array", "items": { "type": "integer", "minimum": 0 } },
+                              "empty": { "type": "boolean" },
+                              "type": { "enum": ["string", "number", "boolean", "null", "object", "array"] },
+                              "textOverLimit": { "const": true }
+                            }
+                          }
+                        }
+                      }
+                    }
+                  }
+                }
+              }
             }
           }
         },
         "omittedKeyCount": { "$ref": "#/$defs/count" },
         "markerKeys": {
           "type": "array",
-          "maxItems": 64,
           "items": {
             "type": "object",
             "additionalProperties": false,
             "required": ["key", "markers"],
             "properties": {
-              "key": { "type": "string", "maxLength": 64 },
-              "markers": { "type": "array", "maxItems": 32, "items": { "type": "integer", "minimum": 0, "maximum": 31 } }
+              "key": { "type": "string" },
+              "markers": { "type": "array", "items": { "type": "integer", "minimum": 0 } },
+              "inArray": {
+                "description": "ARR-1 (DEF-226): the markers were found in the elements of an array value (only true; absent otherwise).",
+                "const": true
+              }
             }
           }
         },
         "stateKeyPresent": {
           "description": "T37R-fix-A (I-3): whether any top-level key is a soft-delete state key, judged on the names before hiding and truncation. Only the truth value; never the name.",
           "type": "boolean"
+        },
+        "duplicateKeyPresent": {
+          "description": "ARR-5 fix round 1 (SREV-ARR2 M2): only when an object of the body (the top level or in a list) has the same key twice in the text. Never the name.",
+          "const": true
         }
       }
     }

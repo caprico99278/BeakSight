@@ -178,6 +178,12 @@ export const saveRuleSet = (database: ControlDatabase, input: RuleSetSave): Rule
   return withWriteTransaction(database, (writer) => saveIn(database, writer, checked));
 };
 
+/** 規則の集まりの id の頭（シナリオごとに 1 つ。シナリオの id をつなぐ）。OP-2 の修正の 3 回目: 画面の `data-rule-facts.ts` から移した（推した規則を付ける口が共有する）。 */
+const DEFAULT_RULE_SET_ID_PREFIX = 'rules-';
+
+/** シナリオの規則の集まりの id（画面の保存の口と、推した規則を付ける口が使う 1 か所）。 */
+export const defaultRuleSetIdOf = (scenarioId: string): string => `${DEFAULT_RULE_SET_ID_PREFIX}${scenarioId}`;
+
 /**
  * 規則を保存し、別のトランザクションでシナリオに参照を付け直す（2 段の手順）。1 段目で拒めば、2 段目は行わない。2 段目で拒まれても（版の衝突など）、
  * 1 段目の規則の版は残る。

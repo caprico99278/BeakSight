@@ -6,7 +6,8 @@
 // - 今の名前つきの一覧と定数が、基準の文の CHECK の値と等しいこと（並びも同じ。前は、名前つきの一覧が公開した時点の写しで「始まる」ことだけを確かめた表も
 //   ある）。等しくなくなったら、版 18 から後の段を足して、その段のテストで確かめる。
 import { createHash } from 'node:crypto';
-import { readFileSync } from 'node:fs';
+import { mkdirSync, readFileSync } from 'node:fs';
+import { dirname } from 'node:path';
 import { describe, expect, it } from 'vitest';
 import {
   ACTION_BLOCK_REASONS,
@@ -18,12 +19,9 @@ import {
   SETTLED_RESERVATION_STATES,
   SUBMISSION_STATES,
 } from '../../src/control/actions/action-contracts.js';
-import { MAX_SAFE_RECORD_ID_LENGTH } from '../../src/control/actions/action-outcome.js';
 import {
   APPROVAL_RECEIPT_KINDS,
   DEFAULT_MAX_CREATES_PER_RUN,
-  MAX_RECORD_ID_LENGTH,
-  MAX_SCENARIO_API_PATH_LENGTH,
   MIN_SCENARIO_LIMIT,
   MIN_SCENARIO_REVISION,
   SCENARIO_API_METHODS,
@@ -38,7 +36,6 @@ import {
 } from '../../src/control/auth/automated-login-results.js';
 import { MIN_PROFILE_REVISION } from '../../src/control/contracts.js';
 import { MIN_RULE_SET_REVISION } from '../../src/control/data-rules/rule-contracts.js';
-import { MAX_INDEX_SHAPE_DIGESTS } from '../../src/control/job/discovery-index-store.js';
 import {
   ACTIVE_AUDIT_JOB_STATES,
   AUDIT_JOB_FAILURE_REASONS,
@@ -49,28 +46,23 @@ import {
   CREDENTIAL_EVENT_KINDS,
   FINAL_AUDIT_JOB_STATES,
   MAX_CONTROL_INSTANCE_PORT,
-  MAX_LOGIN_STAGE_SUMMARY_LENGTH,
-  MAX_SESSION_LOSS_RECORD_LENGTH,
   MIN_CONTROL_INSTANCE_PORT,
   WRITE_REPORT_CHECKS,
 } from '../../src/control/job/job-records.js';
 import { CONTROL_SCHEMA_V17 } from '../../src/control/store/control-schema-v17.js';
 import { closeControlDatabase, openControlDatabase } from '../../src/control/store/control-database.js';
-import { CONTROL_DB_APPLICATION_ID, CONTROL_SCHEMA_BASE, CONTROL_SCHEMA_VERSION } from '../../src/control/store/migrations.js';
+import { CONTROL_DB_APPLICATION_ID, CONTROL_SCHEMA_BASE, CONTROL_SCHEMA_VERSION, runControlMigrations } from '../../src/control/store/migrations.js';
 import { PROFILE_CHANGE_KINDS, PROFILE_STATUSES } from '../../src/control/store/profile-records.js';
 import {
   MAX_WORKER_EXIT_CODE,
   MAX_WORKER_MESSAGE_PATH_LENGTH,
-  MAX_WORKER_NOTICE_URL_LENGTH,
   WORKER_AUTH_STATES,
   WORKER_LOGIN_FORM_INVALID_REASONS,
   WORKER_OUTCOME_KINDS,
   WORKER_RUN_STATUSES,
   WORKER_WRITE_JOB_KINDS,
 } from '../../src/control/worker-protocol.js';
-import { MAX_API_SHAPE_PATH_LENGTH } from '../../src/core/api-request-shape.js';
 import { AUDIT_SEND_POLICIES, DEFAULT_AUDIT_SEND_POLICY } from '../../src/core/audit-send-policy.js';
-import { MAX_URL_LENGTH } from '../../src/core/limits.js';
 import { SCENARIO_KINDS } from '../../src/core/scenario-kind.js';
 import { COMPACT_UTC_TIMESTAMP_LENGTH } from '../../src/core/utc-timestamp.js';
 import {
@@ -78,11 +70,9 @@ import {
   CANDIDATE_REASON_CLASSIFICATIONS,
   CANDIDATE_REASON_CODES,
   FORM_METHODS,
-  MAX_CANDIDATE_URL_PART_LENGTH,
   METHOD_OVERRIDE_VALUES,
 } from '../../src/discovery/candidate-contracts.js';
-import { MAX_DISCOVERY_READ_PAGE_PATHS } from '../../src/discovery/discovery-result.js';
-import { MAX_READ_CHECK_PAGE_PATH_LENGTH, READ_CHECK_RESULTS } from '../../src/discovery/read-check-contracts.js';
+import { READ_CHECK_RESULTS } from '../../src/discovery/read-check-contracts.js';
 import { inListsOf, schemaShapeOf, useControlStoreWorkspace } from '../helpers/control-store-schema.js';
 
 /** 写し取った形（LG-2 の前の版 1→17 の段で作った管理データ）。 */
@@ -103,6 +93,19 @@ const CONTROL_SCHEMA_V17_STATEMENTS = CONTROL_SCHEMA_V17.statements;
 const CONTROL_SCHEMA_V17_VERSION = CONTROL_SCHEMA_V17.version;
 /** 0 か 1 の列の値。 */
 const FLAG_VALUES = ['0', '1'];
+/** COV-1: 版 17 の索引の型の digest の件数の上限（公開した時点の写し。版 18 で外した）。 */
+const V17_MAX_INDEX_SHAPE_DIGESTS = 3;
+/** L12b: 版 17 の対象のレコードの ID の長さの上限（公開した時点の写し。版 19 で外した。`control-store-migrations.test.ts`）。 */
+const V17_MAX_TARGET_RECORD_ID_LENGTH = 64;
+/** L12b（設計者の判断 2）: 版 17 の登録の ID の長さの上限（公開した時点の写し。前の `MAX_RECORD_ID_LENGTH`。版 19 で外した）。 */
+const V17_MAX_RECORD_ID_LENGTH = 256;
+/** URL-LEN: 版 17 の URL と URL の path の長さの上限と、URL を含む JSON の全体の長さの上限（公開した時点の写し。版 20 で外した）。 */
+const V17_MAX_URL_LENGTH = 2_048;
+const V17_MAX_URL_PATH_LENGTH = 1_024;
+const V17_MAX_LOGIN_STAGE_SUMMARY_LENGTH = 32_768;
+const V17_MAX_SESSION_LOSS_RECORD_LENGTH = 65_536;
+/** LZ-3a: 版 17 の読み切れた画面の path の数の上限（公開した時点の写し。前の `MAX_DISCOVERY_READ_PAGE_PATHS`。版 21 で外した）。 */
+const V17_MAX_DISCOVERY_READ_PAGE_PATHS = 10_000;
 
 const workspace = useControlStoreWorkspace('beaksight-control-base-schema-');
 
@@ -144,7 +147,7 @@ describe('Control store base version 17 (LG-2): the frozen statements', () => {
 });
 
 describe('Control store base version 17 (LG-2): the shape of a new database', () => {
-  it('creates the same shape as the fixture copied from the database built through versions 1 to 17', () => {
+  it('opens a new database at the latest version', () => {
     const database = openControlDatabase(workspace.databasePath());
     try {
       expect(database.foundSchemaVersion).toBe(0);
@@ -152,7 +155,13 @@ describe('Control store base version 17 (LG-2): the shape of a new database', ()
     } finally {
       closeControlDatabase(database);
     }
+  });
+
+  it('creates the same shape as the fixture copied from the database built through versions 1 to 17 (the base only)', () => {
+    // COV-1: 版 18 から後の段は、それぞれの段のテスト（`control-store-migrations.test.ts`）が確かめる。ここは基準の版だけを流す。
+    mkdirSync(dirname(workspace.databasePath()), { recursive: true });
     const connection = workspace.rawConnection();
+    expect(runControlMigrations(connection, [])).toEqual({ foundSchemaVersion: 0, schemaVersion: CONTROL_SCHEMA_V17_VERSION });
     const pragmaOf = (name: string): unknown => (connection.prepare(`PRAGMA ${name}`).get() as Record<string, unknown>)[name];
     expect(FIXTURE.applicationId).toBe(CONTROL_DB_APPLICATION_ID);
     expect(pragmaOf('application_id')).toBe(FIXTURE.applicationId);
@@ -240,27 +249,27 @@ describe('Control store base version 17 (LG-2): the named lists and numbers are 
       ['profiles', `length(updated_at) = ${COMPACT_UTC_TIMESTAMP_LENGTH}`],
       ['control_instance', `slot = ${CONTROL_INSTANCE_SLOT}`],
       ['control_instance', `port BETWEEN ${MIN_CONTROL_INSTANCE_PORT} AND ${MAX_CONTROL_INSTANCE_PORT}`],
-      ['discovery_candidates', `length(page_path) BETWEEN 1 AND ${MAX_CANDIDATE_URL_PART_LENGTH}`],
-      ['discovery_candidates', `json_array_length(shape_digests) <= ${MAX_INDEX_SHAPE_DIGESTS}`],
-      ['discovery_candidates', `json_array_length(key_field_digests) <= ${MAX_INDEX_SHAPE_DIGESTS}`],
-      ['discovery_jobs', `json_array_length(read_page_paths) <= ${MAX_DISCOVERY_READ_PAGE_PATHS}`],
+      ['discovery_candidates', `length(page_path) BETWEEN 1 AND ${V17_MAX_URL_LENGTH}`],
+      // COV-1: 版 17 の写しの数（3。押す上限と結び付いていた）。版 18 で外した（`control-store-migrations.test.ts`）。
+      ['discovery_candidates', `json_array_length(shape_digests) <= ${V17_MAX_INDEX_SHAPE_DIGESTS}`],
+      ['discovery_candidates', `json_array_length(key_field_digests) <= ${V17_MAX_INDEX_SHAPE_DIGESTS}`],
+      ['discovery_jobs', `json_array_length(read_page_paths) <= ${V17_MAX_DISCOVERY_READ_PAGE_PATHS}`],
       ['scenarios', `revision >= ${MIN_SCENARIO_REVISION}`],
       ['write_reservations', `count BETWEEN ${MIN_SCENARIO_LIMIT} AND ${DEFAULT_MAX_CREATES_PER_RUN}`],
-      ['execution_grants', `length(target_record_id) BETWEEN 1 AND ${MAX_SAFE_RECORD_ID_LENGTH}`],
+      ['execution_grants', `length(target_record_id) BETWEEN 1 AND ${V17_MAX_TARGET_RECORD_ID_LENGTH}`],
       ['rule_sets', `revision >= ${MIN_RULE_SET_REVISION}`],
       ['jobs', `length(run_directory) BETWEEN 1 AND ${MAX_WORKER_MESSAGE_PATH_LENGTH}`],
       ['jobs', `exit_code BETWEEN 0 AND ${MAX_WORKER_EXIT_CODE}`],
-      ['jobs', `length(session_lost_url) BETWEEN 1 AND ${MAX_WORKER_NOTICE_URL_LENGTH}`],
-      ['jobs', `length(login_stage_summary) <= ${MAX_LOGIN_STAGE_SUMMARY_LENGTH}`],
-      ['jobs', `length(session_loss) <= ${MAX_SESSION_LOSS_RECORD_LENGTH}`],
-      ['read_checks', `length(target_page_path) BETWEEN 1 AND ${MAX_READ_CHECK_PAGE_PATH_LENGTH}`],
-      ['write_results', `length(target_record_id) BETWEEN 1 AND ${MAX_SAFE_RECORD_ID_LENGTH}`],
+      ['jobs', `length(session_lost_url) BETWEEN 1 AND ${V17_MAX_URL_LENGTH}`],
+      ['jobs', `length(login_stage_summary) <= ${V17_MAX_LOGIN_STAGE_SUMMARY_LENGTH}`],
+      ['jobs', `length(session_loss) <= ${V17_MAX_SESSION_LOSS_RECORD_LENGTH}`],
+      ['read_checks', `length(target_page_path) BETWEEN 1 AND ${V17_MAX_URL_PATH_LENGTH}`],
+      ['write_results', `length(target_record_id) BETWEEN 1 AND ${V17_MAX_TARGET_RECORD_ID_LENGTH}`],
       ['write_results', `http_status BETWEEN ${MIN_HTTP_STATUS} AND ${MAX_HTTP_STATUS}`],
-      ['write_results', `length(record_id) BETWEEN 1 AND ${MAX_RECORD_ID_LENGTH}`],
-      ['write_results', `length(api_origin) BETWEEN 1 AND ${MAX_URL_LENGTH}`],
-      ['write_results', `length(api_path_shape) BETWEEN 1 AND ${MAX_API_SHAPE_PATH_LENGTH}`],
+      ['write_results', `length(record_id) BETWEEN 1 AND ${V17_MAX_RECORD_ID_LENGTH}`],
+      ['write_results', `length(api_origin) BETWEEN 1 AND ${V17_MAX_URL_LENGTH}`],
+      ['write_results', `length(api_path_shape) BETWEEN 1 AND ${V17_MAX_URL_PATH_LENGTH}`],
     ];
     expect(fragments.filter(([table, fragment]) => !statementOf(table).includes(fragment))).toEqual([]);
-    expect(MAX_SCENARIO_API_PATH_LENGTH).toBe(MAX_API_SHAPE_PATH_LENGTH);
   });
 });

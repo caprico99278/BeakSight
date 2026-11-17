@@ -17,7 +17,6 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import {
   ALLOW_ALL_EGRESS_UPSTREAMS,
   EGRESS_PROXY_STATES,
-  MAX_EGRESS_UPSTREAM_ADDRESS_ENTRIES,
   startEgressProxy,
   type EgressProxy,
   type EgressRejection,
@@ -52,8 +51,6 @@ interface ProxiedResponse {
 const LOOPBACK_ONLY: EgressUpstreamPolicy = (host) => host === '127.0.0.1';
 /** 127.0.0.1 と、`localhost` とその下の名前を許す上流の方針（DEF-085 fix round 2 のテスト。どれもループバック）。 */
 const LOOPBACK_NAMES: EgressUpstreamPolicy = (host) => host === '127.0.0.1' || host === 'localhost' || host.endsWith('.localhost');
-/** 上限つきの表のテスト（上限より 1 つ多い CONNECT）の期限（ms）。 */
-const BOUNDED_TABLE_TEST_TIMEOUT_MS = 30_000;
 
 /** 「ソケットが閉じた」ことを待つ上限（ms）。期限の値ではなく、確かめのための余裕である。 */
 const SOCKET_CLOSE_WAIT_MS = 2_000;
@@ -611,41 +608,6 @@ describe('egress proxy (design 2.1.1)', () => {
         lookupSpy.mockRestore();
       }
     });
-
-    it('PASS_THROUGH: remembers the upstream address of each connected host and port (absolute-form and CONNECT), and BAD_GATEWAY does not', async () => {
-      const passing = await startModeProxy('PASS_THROUGH');
-      const gateway = await startModeProxy();
-      const port = await portOfClosedOrigin();
-
-      await requestThroughProxy(passing, 'GET', `http://127.0.0.1:${upstream.port}/remember`);
-      await settled(requestThroughProxy(passing, 'GET', `http://127.0.0.1:${port}/refused`));
-      const tunnel = await connectThroughProxy(passing, `localhost:${upstream.port}`);
-      tunnel.socket?.destroy();
-      await requestThroughProxy(gateway, 'GET', `http://127.0.0.1:${upstream.port}/not-remembered`);
-
-      expect(passing.upstreamAddressOf('127.0.0.1', upstream.port)).toEqual({ address: '127.0.0.1', port: upstream.port });
-      expect(passing.upstreamAddressOf('LOCALHOST', upstream.port)).toEqual({ address: '127.0.0.1', port: upstream.port });
-      // 接続できなかった上流と、接続していない host と port は、覚えていない。
-      expect(passing.upstreamAddressOf('127.0.0.1', port)).toBeNull();
-      expect(passing.upstreamAddressOf('127.0.0.1', upstream.port + 1)).toBeNull();
-      // 中継自身の待ち受けのアドレスは、上流の相手のアドレスにならない。
-      expect(passing.upstreamAddressOf('127.0.0.1', upstream.port)?.port).not.toBe(passing.port);
-      expect(gateway.upstreamAddressOf('127.0.0.1', upstream.port)).toBeNull();
-    });
-
-    it(`PASS_THROUGH: keeps at most MAX_EGRESS_UPSTREAM_ADDRESS_ENTRIES (${MAX_EGRESS_UPSTREAM_ADDRESS_ENTRIES}) addresses, dropping the oldest`, async () => {
-      const proxy = await startModeProxy('PASS_THROUGH');
-      // 同じ上流に、別の名前（`<n>.localhost`）で、上限より 1 つ多く接続する（名前ごとに 1 件を覚える）。
-      for (let index = 0; index <= MAX_EGRESS_UPSTREAM_ADDRESS_ENTRIES; index += 1) {
-        const tunnel = await connectThroughProxy(proxy, `n${index}.localhost:${upstream.port}`);
-        tunnel.socket?.destroy();
-      }
-
-      expect(proxy.upstreamAddressOf('n0.localhost', upstream.port)).toBeNull();
-      expect(proxy.upstreamAddressOf('n1.localhost', upstream.port)).toEqual({ address: '127.0.0.1', port: upstream.port });
-      expect(proxy.upstreamAddressOf(`n${MAX_EGRESS_UPSTREAM_ADDRESS_ENTRIES}.localhost`, upstream.port))
-        .toEqual({ address: '127.0.0.1', port: upstream.port });
-    }, BOUNDED_TABLE_TEST_TIMEOUT_MS);
 
     it('PASS_THROUGH: treats localhost. and a name under it with the trailing dot (app.localhost.) as the loopback, without asking the OS (round 3 M4)', async () => {
       const lookupSpy = vi.spyOn(dns, 'lookup');

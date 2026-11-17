@@ -274,3 +274,113 @@ describe('T36R2-fix: the state check before arming, and the percent decoding wit
     expect(carriesLoginCredential(guard, readRequest(`${READ_URL}?x=%FF%FE%C3`))).toBe(false);
   });
 });
+
+// SFIX-1104（SREV-1104 の C-1 の 1）: パスワードと「ID:パスワード」の base64（標準と URL 用、パディングの有無）も比べる。`Authorization`・`Proxy-Authorization` の
+// `Basic` の値は解いてから比べる。どの段・どの口の比べにも当たる（読み取りの要求でも）。
+describe('SFIX-1104: the comparison of the base64 forms and the Basic authorization values', () => {
+  const READ_URL = 'https://app.example.invalid/r/read';
+  type CheckedRequest = Parameters<typeof carriesLoginCredential>[1];
+  const request = (overrides: Partial<CheckedRequest>): CheckedRequest =>
+    ({ url: READ_URL, readMethod: true, body: NONE, headers: {}, cookies: NO_COOKIES, ...overrides });
+  const urlSafe = (value: string): string => value.split('+').join('-').split('/').join('_');
+  const unpadded = (value: string): string => value.replace(/=+$/u, '');
+  // パディングと URL 用の文字（`+`・`/`）が出る値を選ぶ。
+  const B64_PASSWORD = 'Zq9>>?Kx~~7Lp';
+  const guard = (): LoginCredentialGuard => guardOf(USERNAME, B64_PASSWORD);
+  const forms = (value: string): readonly (readonly [string, string])[] => [
+    ['the standard form', base64(value)],
+    ['the URL-safe form', urlSafe(base64(value))],
+    ['the standard form without padding', unpadded(base64(value))],
+    ['the URL-safe form without padding', unpadded(urlSafe(base64(value)))],
+  ];
+
+  it('chooses a password whose base64 has padding and the URL-safe letters', () => {
+    expect(base64(B64_PASSWORD)).toMatch(/=$/u);
+    expect(base64(B64_PASSWORD)).toMatch(/[+/]/u);
+    expect(base64(`${USERNAME}:${B64_PASSWORD}`)).toMatch(/[+/=]/u);
+  });
+
+  it.each(forms(B64_PASSWORD))('finds the password carried in %s in the body, the URL, a header and a cookie', (_name, encoded) => {
+    expect(carriesLoginCredential(guard(), request({ readMethod: false, body: text(`{"p":"${encoded}"}`) }))).toBe(true);
+    expect(carriesLoginCredential(guard(), request({ url: `${READ_URL}?p=${encoded}` }))).toBe(true);
+    expect(carriesLoginCredential(guard(), request({ headers: { 'x-p': encoded } }))).toBe(true);
+    expect(carriesLoginCredential(guard(), request({ cookies: cookieTextsOf([{ name: 'p', value: encoded }]) }))).toBe(true);
+  });
+
+  it.each(forms(`${USERNAME}:${B64_PASSWORD}`))('finds "ID:password" carried in %s', (_name, encoded) => {
+    expect(carriesLoginCredential(guard(), request({ readMethod: false, body: text(encoded) }))).toBe(true);
+    expect(carriesLoginCredential(guard(), request({ headers: { 'x-c': encoded } }))).toBe(true);
+  });
+
+  it.each([['Authorization'], ['authorization'], ['Proxy-Authorization']])('decodes the Basic value of %s on a read and a non-read request', (name) => {
+    for (const encoded of [base64(`${USERNAME}:${B64_PASSWORD}`), unpadded(urlSafe(base64(`someone:${B64_PASSWORD}`)))]) {
+      expect(carriesLoginCredential(guard(), request({ headers: { [name]: `Basic ${encoded}` } }))).toBe(true);
+      expect(carriesLoginCredential(guard(), request({ readMethod: false, headers: { [name]: `basic  ${encoded} ` } }))).toBe(true);
+    }
+  });
+
+  it('finds the base64 forms in the carried-over state', () => {
+    const stateWith = (value: string) => ({ cookies: [], origins: [{ localStorage: [{ name: 'k', value }] }] });
+    expect(carriesLoginCredentialInState(guard(), stateWith(base64(B64_PASSWORD)))).toBe(true);
+    expect(carriesLoginCredentialInState(guard(), stateWith(unpadded(urlSafe(base64(`${USERNAME}:${B64_PASSWORD}`)))))).toBe(true);
+  });
+
+  it('does not find the credentials in an unrelated Basic value, a Bearer value or another base64 text', () => {
+    expect(carriesLoginCredential(guard(), request({ headers: { Authorization: `Basic ${base64('someone:other-secret')}` } }))).toBe(false);
+    expect(carriesLoginCredential(guard(), request({ headers: { Authorization: `Bearer ${base64('a-token-value')}` } }))).toBe(false);
+    expect(carriesLoginCredential(guard(), request({ headers: { Authorization: 'Basic !!not-base64!!' } }))).toBe(false);
+    expect(carriesLoginCredential(guard(), request({ readMethod: false, body: text(base64('an unrelated text')) }))).toBe(false);
+  });
+});
+
+// SFIX-1104-2（SREV-1104-2 の C1・C2）: base64 の形は、`%XX` を戻した形（`encodeURIComponent`・form の符号化）でも比べる。ユーザー名だけの base64 は、
+// 読み取りでない要求だけ比べる（読み取りの要求のユーザー名は比べない決まりのまま。M1）。
+describe('SFIX-1104-2: the base64 forms in the percent-encoded texts, and the base64 of the user name on a non-read request', () => {
+  const READ_URL = 'https://app.example.invalid/r/read';
+  type CheckedRequest = Parameters<typeof carriesLoginCredential>[1];
+  const request = (overrides: Partial<CheckedRequest>): CheckedRequest =>
+    ({ url: READ_URL, readMethod: true, body: NONE, headers: {}, cookies: NO_COOKIES, ...overrides });
+  // base64 に `+`・`/`・`=` が出る値。
+  const SYMBOL_PASSWORD = 'Zq9>>?Kx~~7Lp';
+  const guard = (): LoginCredentialGuard => guardOf(USERNAME, SYMBOL_PASSWORD);
+
+  it('chooses values whose base64 changes under encodeURIComponent', () => {
+    expect(encodeURIComponent(base64(SYMBOL_PASSWORD))).not.toBe(base64(SYMBOL_PASSWORD));
+    expect(encodeURIComponent(base64(`${USERNAME}:${SYMBOL_PASSWORD}`))).not.toBe(base64(`${USERNAME}:${SYMBOL_PASSWORD}`));
+  });
+
+  it.each([['the password', SYMBOL_PASSWORD], ['"ID:password"', `${USERNAME}:${SYMBOL_PASSWORD}`]])(
+    'finds the base64 of %s in an encodeURIComponent query value on a read and a non-read request',
+    (_name, value) => {
+      const url = `${READ_URL}?d=${encodeURIComponent(base64(value))}`;
+      expect(carriesLoginCredential(guard(), request({ url }))).toBe(true);
+      expect(carriesLoginCredential(guard(), request({ url, readMethod: false }))).toBe(true);
+    },
+  );
+
+  it.each([['the password', SYMBOL_PASSWORD], ['"ID:password"', `${USERNAME}:${SYMBOL_PASSWORD}`]])(
+    'finds the base64 of %s in a form-urlencoded body and a percent-encoded header and cookie',
+    (_name, value) => {
+      expect(carriesLoginCredential(guard(), request({ readMethod: false, body: text(new URLSearchParams({ d: base64(value) }).toString()) }))).toBe(true);
+      expect(carriesLoginCredential(guard(), request({ readMethod: false, body: text(`d=${encodeURIComponent(base64(value))}`) }))).toBe(true);
+      expect(carriesLoginCredential(guard(), request({ headers: { 'x-d': encodeURIComponent(base64(value)) } }))).toBe(true);
+      expect(carriesLoginCredential(guard(), request({ cookies: cookieTextsOf([{ name: 'd', value: encodeURIComponent(base64(value)) }]) }))).toBe(true);
+    },
+  );
+
+  it('finds the base64 of the user name only on a non-read request (a header, the body and the query, also percent-encoded)', () => {
+    const encoded = base64(USERNAME);
+    expect(carriesLoginCredential(guard(), request({ readMethod: false, headers: { 'X-Debug': encoded } }))).toBe(true);
+    expect(carriesLoginCredential(guard(), request({ readMethod: false, body: text(JSON.stringify({ d: encoded })) }))).toBe(true);
+    expect(carriesLoginCredential(guard(), request({ readMethod: false, url: `${READ_URL}?d=${encodeURIComponent(encoded)}` }))).toBe(true);
+    expect(carriesLoginCredential(guard(), request({ readMethod: false, headers: { 'x-d': encoded.replace(/=+$/u, '') } }))).toBe(true);
+    // 読み取りの要求では、ユーザー名（と、その base64・ユーザー名だけの Basic）は比べない（M1）。
+    expect(carriesLoginCredential(guard(), request({ headers: { 'X-Debug': encoded } }))).toBe(false);
+    expect(carriesLoginCredential(guard(), request({ headers: { Authorization: `Basic ${encoded}` } }))).toBe(false);
+  });
+
+  it('does not find an unrelated base64 text, encoded or not', () => {
+    const other = base64('an unrelated text?>~');
+    expect(carriesLoginCredential(guard(), request({ readMethod: false, url: `${READ_URL}?d=${encodeURIComponent(other)}`, body: text(other) }))).toBe(false);
+  });
+});

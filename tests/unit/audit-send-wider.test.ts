@@ -1,14 +1,13 @@
 // AS-c（設計書 `doc/design/2026-10-19-beaksight-audit-send-policy-design.md` 5 章の「ユーザーの言葉と選択（AS-c）」「AS-c の Blocker」の行）: 監査の段の送信の扱い
 // `PASS_EXCEPT_DELETE` で、次を変える（既定の `READ_ONLY`、口のない判定は変えない）。
 // - 送り先の Origin の制限をなくす（DELETE・危険な語・文書のナビゲーションの POST・上限は今のまま止める）。
-// - WebSocket の接続を通す（危険な語の path・除外は止める。1 つの Context の上限 `AUDIT_SEND_MAX_WEBSOCKETS_PER_CONTEXT` を超えたら `AUDIT_SEND_OVER_LIMIT`）。
+// - WebSocket の接続を通す（危険な語の path・除外は止める。数の上限は L10 で撤廃した）。
 //   接続の形（Origin、path、数）を Safety Ledger に記録する（query・送受信・値は記録しない）。
 // - スクリプトで送るログインの監査の段の token の更新（`TOKEN_REFRESH`）を通す（サービスの Origin へ送らない Context は今どおり止める）。
 // - ほかの Origin へ通した数を、Safety Ledger の通した要求の記録に数える。
 // 例の値は、匿名の値（`example.com`、`example.invalid`）だけを使う。
 import { describe, expect, it } from 'vitest';
 import { runSummaryLines } from '../../src/cli/output.js';
-import { BLOCKED_WEBSOCKET_REASONS } from '../../src/core/evidence-types.js';
 import { summarizeRunSafety } from '../../src/orchestration/run-aggregation.js';
 import { formatCount } from '../../src/presentation/format.js';
 import { AUDIT_SEND_TEXT } from '../../src/presentation/messages.js';
@@ -17,12 +16,9 @@ import { buildReportViewModel } from '../../src/report/view-model.js';
 import { auditRun, runSummary } from '../helpers/audit-run-fixture.js';
 import {
   AUDIT_SEND_CONNECT_POLICY,
-  AUDIT_SEND_MAX_WEBSOCKETS_PER_CONTEXT,
   WORKER_CONNECT_POLICY,
   WORKER_CONNECT_POLICY_INIT_SCRIPT,
   connectPolicyInitScriptOf,
-  isGuardAuditSend,
-  type GuardAuditSend,
 } from '../../src/safety/passive-request-guard.js';
 import {
   classifyPassiveRequest,
@@ -43,12 +39,11 @@ const DANGEROUS_TERMS = Object.freeze(['logout', 'delete', 'remove', 'cancel']);
 const TOKEN_PATH = '/auth/v1/token';
 const MARKER = 'marker-value-should-not-appear';
 
-/** 口（`remainingWebSockets` が `null` なら、WebSocket の残りの数を持たない口）。 */
-const auditSend = (remainingPasses = 1, remainingWebSockets: number | null = 1): AuditSendPolicy => ({
+/** 口（`webSockets` が偽なら、WebSocket の印を持たない口）。 */
+const auditSend = (webSockets = true): AuditSendPolicy => ({
   approvedServiceOrigins: [SERVICE_ORIGIN],
   dangerousTerms: DANGEROUS_TERMS,
-  remainingPasses,
-  ...(remainingWebSockets === null ? {} : { remainingWebSockets }),
+  ...(webSockets ? { webSockets: true } : {}),
 });
 
 const facts = (method: string, url: string, isNavigationRequest = false, isMainFrame = false): HttpRequestFacts =>
@@ -69,14 +64,14 @@ describe('AS-c: no Origin restriction for the page requests with PASS_EXCEPT_DEL
     expect(decide(facts('PUT', 'http://127.0.0.1:9/api/save'))).toEqual(PASSED);
   });
 
-  it('keeps blocking DELETE, navigations (form posts), dangerous terms and the limit, also for another Origin', () => {
-    expect(decide(facts('DELETE', `${OTHER_ORIGIN}/api/session`))).toEqual(NON_READ);
-    expect(decide(facts('POST', `${OTHER_ORIGIN}/form`, true, true))).toEqual(NON_READ);
-    expect(decide(facts('POST', `${OTHER_ORIGIN}/form`, true, false))).toEqual(NON_READ);
-    expect(decide(facts('POST', `${OTHER_ORIGIN}/api/logout`))).toEqual(NON_READ);
+  // RB-4b: form の送信（文書のナビゲーション）も通す。SD-2（設計書 `2026-11-16-beaksight-action-based-delete-guard-design.md` 2.4）: DELETE・危険な語・許可 Origin の
+  // 外への main frame の移動も止めない。
+  it('keeps blocking a non-http URL, and passes DELETE, dangerous terms and a main frame form post to another Origin', () => {
+    expect(decide(facts('DELETE', `${OTHER_ORIGIN}/api/session`))).toEqual(PASSED);
+    expect(decide(facts('POST', `${OTHER_ORIGIN}/form`, true, true))).toEqual({ ...PASSED, delivery: 'INSPECT_REDIRECTS' });
+    expect(decide(facts('POST', `${OTHER_ORIGIN}/form`, true, false))).toEqual(PASSED);
+    expect(decide(facts('POST', `${OTHER_ORIGIN}/api/logout`))).toEqual(PASSED);
     expect(decide(facts('POST', 'not a url'))).toEqual(NON_READ);
-    expect(decide(facts('POST', `${OTHER_ORIGIN}/collect`), { auditSend: auditSend(0) }))
-      .toEqual({ action: 'BLOCK', category: 'REQUEST', reason: 'AUDIT_SEND_OVER_LIMIT' });
   });
 
   it('does not change the request policy without the option (READ_ONLY)', () => {
@@ -106,31 +101,26 @@ describe('AS-c: the token refresh with PASS_EXCEPT_DELETE', () => {
 });
 
 describe('AS-c: WebSocket connections with PASS_EXCEPT_DELETE', () => {
-  it('passes a WebSocket connection to any Origin while connections remain', () => {
+  it('passes a WebSocket connection to any Origin', () => {
     expect(decide(socket('wss://example.com/realtime/v1/websocket?apikey=x'))).toEqual(SOCKET_PASSED);
     expect(decide(socket('ws://127.0.0.1:9/socket'))).toEqual(SOCKET_PASSED);
     expect(decide(socket(`wss://other.example.invalid/socket`))).toEqual(SOCKET_PASSED);
   });
 
-  it('blocks a dangerous or excluded path, and blocks with AUDIT_SEND_OVER_LIMIT when nothing remains', () => {
-    expect(decide(socket('wss://example.com/logout/socket'))).toEqual(SOCKET_BLOCKED);
-    expect(decide(socket('wss://example.com/socket?action=cancel'))).toEqual(SOCKET_BLOCKED);
+  // SD-2: 危険な語と読まないパスの接続も通す。`ws:`・`wss:` でない接続は今どおり止める。
+  it('passes a dangerous or excluded path, and blocks a URL that is not a WebSocket', () => {
+    expect(decide(socket('wss://example.com/logout/socket'))).toEqual(SOCKET_PASSED);
     expect(decide(socket('wss://example.com/admin/danger/socket'), {
       auditSend: auditSend(),
       auditExclusions: { excludedPathPrefixes: ['/admin/danger'], auditPathPrefixes: [], dangerousTerms: [] },
-    })).toEqual(SOCKET_BLOCKED);
+    })).toEqual(SOCKET_PASSED);
     expect(decide(socket('not a url'))).toEqual(SOCKET_BLOCKED);
-    expect(decide(socket('wss://example.com/socket'), { auditSend: auditSend(1, 0) }))
-      .toEqual({ action: 'BLOCK', category: 'WEBSOCKET', reason: 'AUDIT_SEND_OVER_LIMIT' });
-    // HTTP の残りの数とは別に数える。
-    expect(decide(socket('wss://example.com/socket'), { auditSend: auditSend(0, 1) })).toEqual(SOCKET_PASSED);
   });
 
-  it('keeps blocking without the option, without the WebSocket count, and with the login or write stage (fail-closed)', () => {
+  it('keeps blocking without the option, without the WebSocket mark, and with the write stage', () => {
     expect(decide(socket('wss://example.com/socket'), {})).toEqual(SOCKET_BLOCKED);
-    expect(decide(socket('wss://example.com/socket'), { auditSend: auditSend(1, null) })).toEqual(SOCKET_BLOCKED);
-    const authSetup = { loginPostEndpoints: [{ origin: APP_ORIGIN, path: '/login' }], remainingPosts: 1 };
-    expect(decide(socket('wss://example.com/socket'), { auditSend: auditSend(), authSetup })).toEqual(SOCKET_BLOCKED);
+    expect(decide(socket('wss://example.com/socket'), { auditSend: auditSend(false) })).toEqual(SOCKET_BLOCKED);
+    // RB-14b: ログインの段の口と送信の扱いの口は、一緒に作れない（型）。
     const writeStage = { writeEndpoint: { origin: APP_ORIGIN, path: '/members' }, remainingPosts: 1 };
     expect(decide(socket('wss://example.com/socket'), { auditSend: auditSend(), writeStage })).toEqual(SOCKET_BLOCKED);
   });
@@ -154,19 +144,6 @@ describe('AS-c: WebSocket connections with PASS_EXCEPT_DELETE', () => {
     expect(connectPolicyInitScriptOf(WORKER_CONNECT_POLICY)).toBe(WORKER_CONNECT_POLICY_INIT_SCRIPT);
     expect(connectPolicyInitScriptOf(AUDIT_SEND_CONNECT_POLICY)).toContain(JSON.stringify(AUDIT_SEND_CONNECT_POLICY));
     expect(WORKER_CONNECT_POLICY_INIT_SCRIPT).not.toContain('ws:');
-  });
-
-  it('adds AUDIT_SEND_OVER_LIMIT to the blocked WebSocket reasons', () => {
-    expect(BLOCKED_WEBSOCKET_REASONS).toContain('AUDIT_SEND_OVER_LIMIT');
-  });
-
-  it('accepts the WebSocket limit of the Guard option up to the named constant', () => {
-    const valid: GuardAuditSend = { policy: 'PASS_EXCEPT_DELETE', approvedServiceOrigins: [], dangerousTerms: DANGEROUS_TERMS };
-    expect(AUDIT_SEND_MAX_WEBSOCKETS_PER_CONTEXT).toBe(10);
-    expect(isGuardAuditSend({ ...valid, maxWebSocketsPerContext: 1 })).toBe(true);
-    expect(isGuardAuditSend({ ...valid, maxWebSocketsPerContext: AUDIT_SEND_MAX_WEBSOCKETS_PER_CONTEXT })).toBe(true);
-    expect(isGuardAuditSend({ ...valid, maxWebSocketsPerContext: AUDIT_SEND_MAX_WEBSOCKETS_PER_CONTEXT + 1 })).toBe(false);
-    expect(isGuardAuditSend({ ...valid, maxWebSocketsPerContext: 0 })).toBe(false);
   });
 });
 

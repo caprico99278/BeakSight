@@ -99,6 +99,13 @@ export const jsonValueOf = (value: string | null, type: ApiJsonValueType): JsonV
   return value === TRUE_TEXT ? converted(true) : value === FALSE_TEXT ? converted(false) : failed('NOT_A_BOOLEAN');
 };
 
+/**
+ * ARR-2（設計書 `2026-11-08-beaksight-api-array-keys-design.md` 3.3 の 1、3.4 の 1）: 欄に対応づけた鍵の、生成した値を変える JSON の型（唯一の決まり）。
+ * 一覧の鍵（array）は、文字の欄の値を 1 つの要素として持つ（本文は `[生成した値]`）ので、要素の型の string。ほかの型は鍵の型のまま。入力の規則の判定・生成、
+ * IPC の確かめ、書き込みの段の照合が使う。
+ */
+export const apiKeyFieldValueTypeOf = (type: ApiJsonValueType): ApiJsonValueType => (type === 'array' ? 'string' : type);
+
 /** 値が、鍵の JSON の型に変えられるか。 */
 export const isJsonValueConvertible = (value: string | null, type: ApiJsonValueType): boolean => jsonValueOf(value, type).ok;
 

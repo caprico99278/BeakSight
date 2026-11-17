@@ -6,8 +6,12 @@
 //   秘密（画面のサーバの token）、URL の userinfo と query・fragment の値と値に見える path の区切り（core の `redactServiceOriginUrl`）、秘密に見える
 //   header の名前の後の値と、秘密に見える名前の `name=value` の値（core の `secret-query-names.ts`）を伏せる。
 // - ファイルの大きさの上限（`UI_SERVER_LOG_MAX_BYTES`）を超えるときは、古い行を捨てて新しい行を残す。書けなくても投げない（終わりの処理を止めない）。
+// - OP-P（P3）: 起動のときに 1 行（`START`）書く。その前に、前の起動の行の後に終わりの記録（予期しない例外・止める決まり・process の終わり）がなければ、
+//   そのことを 1 行（`PREVIOUS_END_UNRECORDED`。前の起動の時刻だけ）書く（強制の終わりなど、記録の前に process が消えた終わりも、次の起動で残る）。
+//   止める決まりを受けたことは、終わりの処理の前に 1 行（`STOP_REQUESTED`）書く（終わりの記録には数えない）。どれも理由のコードと数だけで、値は書かない。
 // - 終わる直前にも書けるように、同期で書く。ファイルの読み書きそのものは、呼び出し側が渡す部品（`UiServerLogFiles`）が行う（`src/**` のファイルの
 //   書き込みは ArtifactWriter だけ。GATE-ARCH08。画面のサーバの部品 `apps/local-ui/src/server/ui-server-log-file.ts` が `node:fs` で渡す）。
+import { isRecord } from '../core/guards.js';
 import { REDACTED } from '../core/redaction.js';
 import { isSecretLikeHeaderName, isSecretUrlQueryParameterName } from '../core/secret-query-names.js';
 import { redactServiceOriginUrl } from '../core/url-redaction.js';
@@ -23,8 +27,11 @@ const MAX_STACK_LINE_LENGTH = 500;
 /** 上限を超えたときに残す割合（上限の半分）。 */
 const KEPT_FRACTION = 2;
 
-/** 止める決まりの終わり方（Ctrl+C、SIGTERM、画面を閉じた、ほか）。 */
-export const UI_SERVER_END_REASONS = Object.freeze(['CTRL_C', 'SIGTERM', 'UI_CLOSED', 'OTHER'] as const);
+/**
+ * 止める決まりの終わり方（Ctrl+C、SIGTERM、画面を閉じた（閉じた知らせの後）、OP-P: 画面の知らせが途絶えた（隠れたタブの凍結など）、コンソールの窓を
+ * 閉じた（Windows の SIGHUP）、Ctrl+Break（Windows の SIGBREAK）、ほか）。
+ */
+export const UI_SERVER_END_REASONS = Object.freeze(['CTRL_C', 'SIGTERM', 'UI_CLOSED', 'UI_SILENT', 'CONSOLE_CLOSED', 'CTRL_BREAK', 'OTHER'] as const);
 export type UiServerEndReason = (typeof UI_SERVER_END_REASONS)[number];
 
 /** 予期しない例外の出どころ（Node の `uncaughtExceptionMonitor` の `origin`）。 */
@@ -41,11 +48,19 @@ export type UiServerLogRecord =
     readonly runningJobs: number;
   }
   | { readonly kind: 'SHUTDOWN'; readonly reason: UiServerEndReason; readonly immediate: boolean; readonly runningJobs: number }
+  /** OP-P: 起動した（待ち受けの後）。 */
+  | { readonly kind: 'START' }
+  /** OP-P: 前の起動の行の後に、終わりの記録がなかった（前の起動の時刻。分からなければ null）。 */
+  | { readonly kind: 'PREVIOUS_END_UNRECORDED'; readonly previousStartedAt: string | null }
+  /** OP-P: 止める決まりを受けた（終わりの処理の前。終わりの記録には数えない）。 */
+  | { readonly kind: 'STOP_REQUESTED'; readonly reason: UiServerEndReason; readonly runningJobs: number }
   | { readonly kind: 'EXIT'; readonly exitCode: number; readonly runningJobs: number }
   | { readonly kind: 'WORKER_EXITED'; readonly jobId: string; readonly jobKind: string; readonly exitCode: number | null; readonly signal: string | null };
 
 /** 終わりの記録の種類（これを書いた後は、process の終わりの行を書かない）。 */
 const END_RECORD_KINDS: ReadonlySet<UiServerLogRecord['kind']> = new Set(['UNEXPECTED_ERROR', 'SHUTDOWN']);
+/** OP-P: 前の起動の終わりとして数える種類（終わりの記録と、process の終わり）。 */
+const PREVIOUS_END_KINDS: ReadonlySet<string> = new Set([...END_RECORD_KINDS, 'EXIT']);
 
 /** 記録の部品。 */
 export interface UiServerLog {
@@ -53,6 +68,8 @@ export interface UiServerLog {
   write(record: UiServerLogRecord): void;
   /** 終わりの記録を書いていなければ、process の終わりを 1 行書く（`process.on('exit')` から呼ぶ。投げない）。 */
   recordExit(exitCode: number, runningJobs: number): void;
+  /** OP-P: 起動の行を書く（前の起動の終わりの記録がなければ、その前に 1 行書く。投げない）。 */
+  recordStart(): void;
 }
 
 /** 記録のファイルの読み書き（同期。呼び出し側が渡す。どれも、できなければ投げてよい）。 */
@@ -213,5 +230,45 @@ export const createUiServerLog = (options: UiServerLogOptions): UiServerLog => {
         write({ kind: 'EXIT', exitCode, runningJobs });
       }
     },
+    recordStart() {
+      const previous = previousStartWithoutEnd(options.files, options.path);
+      if (previous !== null) {
+        write({ kind: 'PREVIOUS_END_UNRECORDED', previousStartedAt: previous.startedAt });
+      }
+      write({ kind: 'START' });
+    },
   };
+};
+
+/**
+ * OP-P: 記録の最後の起動の行の後に、終わりの記録（予期しない例外・止める決まり・process の終わり）がなければ、その起動の時刻（分からなければ null）。
+ * 起動の行がない・終わりの記録がある・読めないときは null。種類と時刻のほかは読まない。
+ */
+const previousStartWithoutEnd = (files: UiServerLogFiles, path: string): { readonly startedAt: string | null } | null => {
+  let lines: readonly string[];
+  try {
+    lines = files.read(path).split('\n').filter((line) => line.length > 0);
+  } catch {
+    return null;
+  }
+  for (let index = lines.length - 1; index >= 0; index -= 1) {
+    let record: unknown;
+    try {
+      record = JSON.parse(lines[index] ?? '');
+    } catch {
+      continue;
+    }
+    if (!isRecord(record)) {
+      continue;
+    }
+    const kind = record['kind'];
+    if (typeof kind === 'string' && PREVIOUS_END_KINDS.has(kind)) {
+      return null;
+    }
+    if (kind === 'START') {
+      const at = record['at'];
+      return { startedAt: typeof at === 'string' ? at : null };
+    }
+  }
+  return null;
 };

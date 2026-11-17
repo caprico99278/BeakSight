@@ -11,7 +11,9 @@
  *    form の外）だけで探す。送信の要素は、form の中なら送信のボタン（`button[type=submit]`・`input[type=submit]`）、form の外なら `button`・
  *    `input[type=submit|button]`・`role="button"`（`href` のある要素と、`href` のある `a`・`area` の中の要素は除く。ログインの form の事前の確かめと
  *    同じ受け方）。3 つがちょうど 1 つずつなら、form の置き方（同じ form の中・3 つとも外・混ざっている）。パスワードの欄の form の method と、action の
- *    属性があるときの action（送信の要素の `formmethod`・`formaction` を含む）。**欄の値は読まない**（`value` を読まない）。
+ *    属性があるときの action（送信の要素の `formmethod`・`formaction` を含む）。**欄の値は読まない**（`value` を読まない）。この決まりの例外は、
+ *    手動のログインの段で人が入れた ID とパスワードを受け取る部品（`login-credential-capture.ts`。OP-1 の D2）の 1 つだけ（名前つき。Gate
+ *    `tests/architecture/worker-login-hooks.test.ts` の (aa) が範囲を固定する）。
  * 3. 候補がちょうど 1 つの欄だけ、純粋な部品（`src/discovery/entry-check-selectors.ts`）で候補の CSS を組み立て、認証の設定として受ける形
  *    （`isAcceptedEntrySelector`）に絞り、isolated world でもう 1 回、文書と open な shadow root の中で当たる数と、当たった要素が読んだ要素かを数える。
  *    ちょうど 1 つに当たる最初の CSS を、その欄の案にする。

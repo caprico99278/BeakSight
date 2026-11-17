@@ -5,8 +5,6 @@
 // SU2b: 幅の走査と Interaction の候補の読み込みでも不調を検知し、その段階の残りの読み込みと、次のビューポートを始めない。
 // 作り方は `tests/integration/page-auditor.test.ts` に合わせる（Guard の付いた本物の factory、テストの設定、pacer）。サーバは、
 // テストの中の 127.0.0.1 のサーバで、ページのパスへの GET の回数ごとに振る舞いを変える。読み込みの期限は短くする。
-// D1（サイトの不調で止めたときの診断の記録の設計書 2.1、2.2）: Passive の各ビューポートの読み込みの観察（`navigationDiagnostics`）を、
-// ページの結果（`PageAuditResult`）と Evidence の外に持つ。始めなかったビューポートは `null`。
 import { mkdtemp, rm } from 'node:fs/promises';
 import type { ServerResponse } from 'node:http';
 import { tmpdir } from 'node:os';
@@ -20,10 +18,7 @@ import type {
   EvidenceRecordFor,
   EvidenceType,
   IncompleteReason,
-  NavigationDiagnostics,
-  NavigationDocumentRequestDiagnostics,
   PageAuditOutcome,
-  ViewportNavigationDiagnostics,
   ViewportProfile,
 } from '../../src/core/contracts.js';
 import type { NormalizedHttpUrlEvidence } from '../../src/core/evidence-types.js';
@@ -34,7 +29,7 @@ import { IdAllocator } from '../../src/orchestration/id-allocator.js';
 import { PageAuditor, type PageAuditAttempt, type PageAuditorDependencies } from '../../src/orchestration/page-auditor.js';
 import { SafetyLedger } from '../../src/safety/safety-ledger.js';
 import { testContextsOf, useHeadlessChromium } from '../helpers/chromium.js';
-import { LOOPBACK_HOST, startLoopbackHttpServer } from '../helpers/loopback-server.js';
+import { startLoopbackHttpServer } from '../helpers/loopback-server.js';
 import { createTestNavigationPacer } from '../helpers/navigation-pacer.js';
 import { createTestConfig, type TestConfigOverrides } from '../helpers/test-config.js';
 
@@ -59,23 +54,14 @@ const OK_STATUS = 200;
 const NOT_FOUND_STATUS = 404;
 /** そのページだけの不具合のことが多いので、サイトの不調にしない 5xx（設計書 2章）。 */
 const INTERNAL_SERVER_ERROR_STATUS = 500;
-/** サイトの不調の代表として返す status（503 Service Unavailable。`SITE_UNAVAILABLE_HTTP_STATUSES` の1つ）。 */
-const SERVICE_UNAVAILABLE_STATUS = 503;
 
 /** 幅の走査をしない設定と、Interaction をしない設定（ページのパスへの GET を、各ビューポートの読み込みだけにする）。 */
 const PASSIVE_LOADS_ONLY: TestConfigOverrides = {
   viewports: { stressWidths: [] },
   audit: { interactions: false },
 };
-/** 幅の走査を1つの幅で行う設定（不調の後に、幅の走査の読み込みがサーバに届かないことを確かめる）。 */
-const ONE_STRESS_WIDTH: TestConfigOverrides = { viewports: { stressWidths: [320] } };
 /** 幅の走査の2つの幅（SU2b）。どちらも、主要な2つのビューポートの幅ではないので、走査で調べる。 */
 const STRESS_WIDTHS = [320, 768] as const;
-/**
- * 幅の走査を2つの幅で行う設定（SU2b。1つ目の幅の読み込みで不調を検知した後に、2つ目の幅の読み込みがサーバに届かないことを確かめる）。
- * Interaction は既定のとおり行う。
- */
-const TWO_STRESS_WIDTHS: TestConfigOverrides = { viewports: { stressWidths: [...STRESS_WIDTHS] } };
 /** 幅の走査をしない設定（SU2b。ページのパスへの GET を、各ビューポートの読み込みと、Interaction の候補の読み込みだけにする）。 */
 const NO_STRESS_WIDTHS: TestConfigOverrides = { viewports: { stressWidths: [] } };
 /** 幅の走査を2つの幅で行い、Interaction をしない設定（SU2b の対照。ページのパスへの GET を、各ビューポートと各幅の読み込みにする）。 */
@@ -89,16 +75,16 @@ const TWO_STRESS_WIDTHS_WITHOUT_INTERACTIONS: TestConfigOverrides = {
  */
 const CANDIDATE_COUNT = 3;
 
-/** Passive の収集（4. DOM の準備の待ち、controlled scroll、5. 各 collector）の Evidence の種類。 */
-const COLLECTION_EVIDENCE_TYPES = [
-  'scroll', 'dom', 'layout', 'color', 'accessibility', 'performance', 'screenshot', 'link', 'interaction',
-] as const satisfies readonly EvidenceType[];
 /** 収集をしなかったビューポートにも残る Evidence の種類（network、console、Safety）。種類の名前の順。 */
 const NON_COLLECTION_EVIDENCE_TYPES = ['console', 'network', 'safety'] as const satisfies readonly EvidenceType[];
 
 const SITE_UNAVAILABLE_SKIPPED: IncompleteReason = { code: 'SITE_UNAVAILABLE', detail: null };
-const SAFETY_VIOLATION_ABORT: IncompleteReason = { code: 'SAFETY_VIOLATION_ABORT', detail: null };
 const NAVIGATION_TIMEOUT: IncompleteReason = { code: 'NAVIGATION_FAILED', detail: 'TIMEOUT' };
+/**
+ * L1（設計書 `2026-11-09-beaksight-remove-limits-design.md` 6 の L1）: Passive の読み込みの期限は撤廃し、進みの見張りが応答の続かない読み込みを見放す。見放した
+ * 読み込みは、この理由を先に残し、前と同じ時間切れ（`NAVIGATION_TIMEOUT`）の観測でサイトの不調を判定する（期待を直した理由）。
+ */
+const NAVIGATION_UNRESPONSIVE: IncompleteReason = { code: 'STAGE_UNRESPONSIVE', detail: 'navigation' };
 
 /** ページのパスへの GET への振る舞い。 */
 type PageResponse =
@@ -256,6 +242,9 @@ async function auditSite(server: SiteServer, options: SiteAuditOptions = {}): Pr
     screenshotRootDirectory,
     navigationPacer: pacer,
     safetyViolationRecorded: options.safetyViolationRecorded ?? (() => false),
+    // L1: Passive の読み込みは、期限（`navigationTimeoutMs`）ではなく進みの見張りで見放す。時間切れを起こすために、反応なしの長さを短くする（ヘッダの後に
+    // 本文を止める読み込みでも、応答の事象を受けてから見放す長さ）。
+    progressWatchQuietLimitMs: STALL_AFTER_HEADERS_NAVIGATION_TIMEOUT_MS,
   });
   const pageUrl = normalized(`${server.origin}${PAGE_PATH}`, config);
   const outcome = await auditor.audit(pageUrl, allocator.allocatePageId(), options.attempt);
@@ -310,56 +299,6 @@ async function expectPageSchema(outcome: PageAuditOutcome): Promise<void> {
   await expect(validateArtifact('page', JSON.parse(JSON.stringify(outcome.result)) as unknown)).resolves.toEqual({ ok: true });
 }
 
-/**
- * ビューポートの Passive の読み込みの観察で、記録した唯一の main frame の文書の要求（D1。診断の記録の設計書 2.1、2.2）。観察できたこと、
- * 文書の要求が1つだけで、リダイレクトがなく、数だけを数えた分がないことも確かめる。
- */
-function onlyObservedDocumentRequest(outcome: PageAuditOutcome, viewport: ViewportProfile): NavigationDocumentRequestDiagnostics {
-  return onlyDocumentRequestOf(outcome.navigationDiagnostics[viewport]?.passive ?? null, `${viewport} Passive`);
-}
-
-/**
- * 1つの読み込みの観察（`diagnostics`。Passive、幅の走査の幅、Interaction の候補のどれか）で、記録した唯一の main frame の文書の要求（D3）。
- * 観察できたこと、文書の要求が1つだけで、リダイレクトがなく、数だけを数えた分がないことも確かめる。
- */
-function onlyDocumentRequestOf(diagnostics: NavigationDiagnostics | null | undefined, label: string): NavigationDocumentRequestDiagnostics {
-  expect(diagnostics?.status, `${label} navigation diagnostics: ${JSON.stringify(diagnostics)}`).toBe('OBSERVED');
-  if (diagnostics?.status !== 'OBSERVED') {
-    throw new Error(`the ${label} load was not observed`);
-  }
-  expect(diagnostics.documentRequests).toHaveLength(1);
-  expect(diagnostics.omittedDocumentRequestCount).toBe(0);
-  expect(diagnostics.omittedEventCount).toBe(0);
-  const [request] = diagnostics.documentRequests;
-  expect(request?.hops).toHaveLength(1);
-  return request as NavigationDocumentRequestDiagnostics;
-}
-
-/** `viewport` のビューポートの観察の結果（D3。始めなかったビューポートは `null` なので、あることを確かめて返す）。 */
-function viewportDiagnosticsOf(outcome: PageAuditOutcome, viewport: ViewportProfile): ViewportNavigationDiagnostics {
-  const diagnostics = outcome.navigationDiagnostics[viewport];
-  expect(diagnostics, `${viewport} navigation diagnostics`).not.toBeNull();
-  return diagnostics as ViewportNavigationDiagnostics;
-}
-
-/**
- * 文書の要求の1回分が、要求のヘッダを送り、`status` の応答を受けたことを確かめる（D3）。`status` が `null` なら、応答（ヘッダ）を受けて
- * いないこと（要求はネットワークへ送られたが、応答がない）を確かめる。
- */
-function expectHeadersSentAndResponse(request: NavigationDocumentRequestDiagnostics, pageUrl: string, status: number | null): void {
-  const [hop] = request.hops;
-  expect(hop).toMatchObject({ url: pageUrl, method: 'GET', httpStatus: status });
-  expect(hop?.requestHeadersSentAtMs).toEqual(expect.any(Number));
-  expect(hop?.requestHeadersSentAtMs as number).toBeGreaterThanOrEqual(hop?.issuedAtMs ?? Number.POSITIVE_INFINITY);
-  if (status === null) {
-    expect(hop?.responseHeadersReceivedAtMs).toBeNull();
-    expect(request.loadingFinishedAtMs).toBeNull();
-  } else {
-    expect(hop?.responseHeadersReceivedAtMs).toEqual(expect.any(Number));
-    expect(hop?.remoteIpAddress).toBe(LOOPBACK_HOST);
-  }
-}
-
 describe('PageAuditor stops the page when the Passive load detects site unavailability (design 3.1)', () => {
   it('marks Desktop FAILED for a load without a response, does not start Mobile, and keeps the network Evidence', async () => {
     const server = await startSiteServer([NO_RESPONSE]);
@@ -371,12 +310,13 @@ describe('PageAuditor stops the page when the Passive load detects site unavaila
       requestedUrl: pageUrl,
       httpStatus: null,
       status: 'FAILED',
-      incompleteReasons: [NAVIGATION_TIMEOUT, { code: 'SITE_UNAVAILABLE', detail: 'passive:TIMEOUT' }],
+      incompleteReasons: [NAVIGATION_UNRESPONSIVE, NAVIGATION_TIMEOUT, { code: 'SITE_UNAVAILABLE', detail: 'passive:TIMEOUT' }],
       navigationOutcome: 'TIMEOUT',
     });
     expect(result.viewports.mobile).toEqual(skippedViewport(pageUrl, SITE_UNAVAILABLE_SKIPPED));
     expect(result.status).toBe('FAILED');
     expect(result.incompleteReasons).toEqual([
+      NAVIGATION_UNRESPONSIVE,
       NAVIGATION_TIMEOUT,
       { code: 'SITE_UNAVAILABLE', detail: 'passive:TIMEOUT' },
       SITE_UNAVAILABLE_SKIPPED,
@@ -398,68 +338,9 @@ describe('PageAuditor stops the page when the Passive load detects site unavaila
     expect(retry.calls()).toBe(0);
     expect(outcome.safety.invariantViolationCount).toBe(0);
     await expectPageSchema(outcome);
-
-    // D1: Desktop の読み込みの観察は、要求のヘッダを送ったが、応答（ヘッダ）がなかったことを記録する。始めなかった Mobile は `null`。
-    const desktop = onlyObservedDocumentRequest(outcome, 'desktop');
-    expect(desktop.hops[0]).toMatchObject({ url: pageUrl, responseHeadersReceivedAtMs: null, httpStatus: null });
-    expect(desktop.hops[0]?.requestHeadersSentAtMs).toEqual(expect.any(Number));
-    expect(desktop.loadingFinishedAtMs).toBeNull();
-    expect(outcome.navigationDiagnostics.mobile).toBeNull();
-    // 観察の結果は、ページの結果と Evidence に入れない。
-    expect(result).not.toHaveProperty('navigationDiagnostics');
-    expect(JSON.stringify(result)).not.toContain('requestHeadersSentAtMs');
   }, AUDIT_TEST_TIMEOUT_MS);
 
-  it('marks Desktop FAILED for a 503 with a body without collecting, and the stress sweep load does not reach the server', async () => {
-    const server = await startSiteServer([documentWith(SERVICE_UNAVAILABLE_STATUS)]);
-    const { outcome, pageUrl, pacer } = await auditSite(server, { overrides: ONE_STRESS_WIDTH });
-    const { result } = outcome;
-
-    // 読み込みは `OK`（503 の応答を受けた）だが、不調なので FAILED にする。
-    expect(result.viewports.desktop).toMatchObject({
-      status: 'FAILED',
-      navigationOutcome: 'OK',
-      httpStatus: SERVICE_UNAVAILABLE_STATUS,
-      incompleteReasons: [{ code: 'SITE_UNAVAILABLE', detail: `passive:HTTP ${SERVICE_UNAVAILABLE_STATUS}` }],
-    });
-    expect(result.viewports.mobile).toEqual(skippedViewport(pageUrl, SITE_UNAVAILABLE_SKIPPED));
-    expect(outcome.siteUnavailableDetail).toBe(`desktop:passive:HTTP ${SERVICE_UNAVAILABLE_STATUS}`);
-
-    // 収集（DOM の準備の待ち、scroll、各 collector、幅の走査、Interaction）をしない。network、console、Safety の Evidence はある。
-    expect(evidenceTypesOf(outcome, 'desktop')).toEqual([...NON_COLLECTION_EVIDENCE_TYPES]);
-    for (const type of COLLECTION_EVIDENCE_TYPES) {
-      expect(evidenceOf(outcome, type, 'desktop'), `desktop ${type}`).toHaveLength(0);
-    }
-    // 幅の走査の Context を作らないので、Safety の Evidence は Passive の Context の1つだけである。
-    expect(evidenceOf(outcome, 'safety', 'desktop')).toHaveLength(1);
-    expect(evidenceTypesOf(outcome, 'mobile')).toEqual([]);
-
-    // 幅の走査と Mobile の読み込みは、サーバに届かない。
-    expect(server.pageGets()).toBe(1);
-    expect(pacer.snapshot().navigationCount).toBe(1);
-    await expectPageSchema(outcome);
-  }, AUDIT_TEST_TIMEOUT_MS);
-
-  it('audits Desktop with a 200 and marks Mobile FAILED for a 503, with the Mobile detail', async () => {
-    const server = await startSiteServer([documentWith(OK_STATUS), documentWith(SERVICE_UNAVAILABLE_STATUS)]);
-    const { outcome } = await auditSite(server, { overrides: PASSIVE_LOADS_ONLY });
-    const { result } = outcome;
-
-    expect(result.viewports.desktop).toMatchObject({ navigationOutcome: 'OK', httpStatus: OK_STATUS });
-    expect(result.viewports.desktop.status).not.toBe('FAILED');
-    expect(result.viewports.desktop.incompleteReasons.map((reason) => reason.code)).not.toContain('SITE_UNAVAILABLE');
-    expect(evidenceOf(outcome, 'dom', 'desktop')).toHaveLength(1);
-    expect(result.viewports.mobile).toMatchObject({
-      status: 'FAILED',
-      navigationOutcome: 'OK',
-      httpStatus: SERVICE_UNAVAILABLE_STATUS,
-      incompleteReasons: [{ code: 'SITE_UNAVAILABLE', detail: `passive:HTTP ${SERVICE_UNAVAILABLE_STATUS}` }],
-    });
-    expect(evidenceTypesOf(outcome, 'mobile')).toEqual([...NON_COLLECTION_EVIDENCE_TYPES]);
-    expect(outcome.siteUnavailableDetail).toBe(`mobile:passive:HTTP ${SERVICE_UNAVAILABLE_STATUS}`);
-    expect(server.pageGets()).toBe(2);
-    await expectPageSchema(outcome);
-  }, AUDIT_TEST_TIMEOUT_MS);
+  // RB-10: 503 で集めず Mobile を始めない順と、Mobile の 503 の詳細は、偽の口の単体（`tests/unit/page-auditor-steps.test.ts`）へ移した。
 });
 
 describe('PageAuditor goes on with the page when the Passive load is not site unavailability (design 2.2, 3.1)', () => {
@@ -480,7 +361,7 @@ describe('PageAuditor goes on with the page when the Passive load is not site un
         status: 'FAILED',
         navigationOutcome: 'TIMEOUT',
         httpStatus: null,
-        incompleteReasons: [NAVIGATION_TIMEOUT],
+        incompleteReasons: [NAVIGATION_UNRESPONSIVE, NAVIGATION_TIMEOUT],
       });
       const [network] = evidenceOf(outcome, 'network', viewport);
       expect(network?.payload.requests.some((request) => request.url === pageUrl)).toBe(true);
@@ -519,99 +400,7 @@ describe('PageAuditor goes on with the page when the Passive load is not site un
   );
 });
 
-describe('PageAuditor records the navigation diagnostics of the Passive loads (site unavailable diagnostics design 2.1, 2.2)', () => {
-  it('records the request, the response, and the end of the Passive load of both viewports for a normal page', async () => {
-    const server = await startSiteServer([documentWith(OK_STATUS)]);
-    const { outcome, pageUrl } = await auditSite(server, { overrides: PASSIVE_LOADS_ONLY });
-    const { result } = outcome;
-
-    for (const viewport of ['desktop', 'mobile'] as const) {
-      expect(result.viewports[viewport]).toMatchObject({ navigationOutcome: 'OK', httpStatus: OK_STATUS });
-      expect(result.viewports[viewport].status).not.toBe('FAILED');
-      const request = onlyObservedDocumentRequest(outcome, viewport);
-      expect(request.hops[0]).toMatchObject({ url: pageUrl, method: 'GET', httpStatus: OK_STATUS, remoteIpAddress: LOOPBACK_HOST });
-      expect(request.hops[0]?.requestHeadersSentAtMs).toEqual(expect.any(Number));
-      expect(request.hops[0]?.responseHeadersReceivedAtMs).toEqual(expect.any(Number));
-      expect(request.loadingFinishedAtMs).toEqual(expect.any(Number));
-      expect(request.loadingFailure).toBeNull();
-      expect(evidenceOf(outcome, 'dom', viewport)).toHaveLength(1);
-    }
-    expect(result).not.toHaveProperty('navigationDiagnostics');
-    expect(JSON.stringify(result)).not.toContain('requestHeadersSentAtMs');
-    expect(outcome.siteUnavailableDetail).toBeNull();
-    expect(outcome.safety.invariantViolationCount).toBe(0);
-    expect(server.pageGets()).toBe(2);
-    await expectPageSchema(outcome);
-    // D3: 幅の走査と Interaction をしない設定なので、どちらのビューポートも、幅ごとと候補ごとの観察は空である。
-    for (const viewport of ['desktop', 'mobile'] as const) {
-      expect(viewportDiagnosticsOf(outcome, viewport)).toMatchObject({ stressWidths: [], interactionCandidates: [] });
-    }
-  }, AUDIT_TEST_TIMEOUT_MS);
-
-  // D3（設計書 2.2 の 2026-10-07 の改訂）: 幅の走査の各幅と、Interaction の各候補の読み込みも観察し、幅ごと（幅の値つき）と候補ごと
-  // （候補の順の番号つき）に持つ。監査の結果（ページの結果、Evidence）は変えない。
-  it('records the observation of every stress width and every interaction candidate of a normal page, outside the page result', async () => {
-    const server = await startSiteServer([CANDIDATES_DOCUMENT]);
-    const { outcome, pageUrl } = await auditSite(server, { overrides: TWO_STRESS_WIDTHS });
-    const { result } = outcome;
-
-    expect(result.viewports.desktop).toMatchObject({ navigationOutcome: 'OK', httpStatus: OK_STATUS });
-    expect(result.viewports.desktop.status).not.toBe('FAILED');
-    expect(evidenceOf(outcome, 'layout', 'desktop')[0]?.payload.stressSweep?.map(({ width }) => width)).toEqual([...STRESS_WIDTHS]);
-    expect(evidenceOf(outcome, 'interaction', 'desktop')).toHaveLength(CANDIDATE_COUNT);
-    expect(outcome.siteUnavailableDetail).toBeNull();
-    // Desktop、2つの幅、3つの候補、Mobile の読み込みが、サーバに届く。
-    expect(server.pageGets()).toBe(2 + STRESS_WIDTHS.length + CANDIDATE_COUNT);
-    await expectPageSchema(outcome);
-
-    const desktop = viewportDiagnosticsOf(outcome, 'desktop');
-    expectHeadersSentAndResponse(onlyDocumentRequestOf(desktop.passive, 'desktop Passive'), pageUrl, OK_STATUS);
-    expect(desktop.stressWidths.map(({ width }) => width)).toEqual([...STRESS_WIDTHS]);
-    for (const { width, diagnostics } of desktop.stressWidths) {
-      expectHeadersSentAndResponse(onlyDocumentRequestOf(diagnostics, `stress width ${width}`), pageUrl, OK_STATUS);
-    }
-    expect(desktop.interactionCandidates.map(({ index }) => index)).toEqual(Array.from({ length: CANDIDATE_COUNT }, (_, index) => index));
-    for (const { index, diagnostics } of desktop.interactionCandidates) {
-      expectHeadersSentAndResponse(onlyDocumentRequestOf(diagnostics, `interaction candidate ${index}`), pageUrl, OK_STATUS);
-    }
-    // Mobile は、幅の走査と Interaction をしない。
-    expect(viewportDiagnosticsOf(outcome, 'mobile')).toMatchObject({ stressWidths: [], interactionCandidates: [] });
-    expectHeadersSentAndResponse(onlyObservedDocumentRequest(outcome, 'mobile'), pageUrl, OK_STATUS);
-    // 観察の結果は、ページの結果と Evidence に入れない。
-    expect(JSON.stringify(result)).not.toContain('stressWidths');
-    expect(JSON.stringify(result)).not.toContain('interactionCandidates');
-    expect(Object.isFrozen(desktop.stressWidths)).toBe(true);
-    expect(Object.isFrozen(desktop.interactionCandidates)).toBe(true);
-  }, AUDIT_TEST_TIMEOUT_MS);
-});
-
-describe('PageAuditor prefers the safety violation to site unavailability for the next viewport (design 3.1)', () => {
-  it('skips Mobile with SAFETY_VIOLATION_ABORT when a violation is recorded after a Desktop load without a response', async () => {
-    const server = await startSiteServer([NO_RESPONSE]);
-    let checks = 0;
-    // Desktop の読み込みがサーバに届いた後（Desktop の監査の間）に、違反が記録されたとみなす。
-    const violationRecorded = (): boolean => {
-      checks += 1;
-      return server.pageGets() > 0;
-    };
-    const { outcome, pageUrl } = await auditSite(server, {
-      overrides: PASSIVE_LOADS_ONLY,
-      safetyViolationRecorded: violationRecorded,
-    });
-    const { result } = outcome;
-
-    expect(checks).toBeGreaterThan(0);
-    expect(result.viewports.desktop.incompleteReasons)
-      .toEqual([NAVIGATION_TIMEOUT, { code: 'SITE_UNAVAILABLE', detail: 'passive:TIMEOUT' }]);
-    expect(result.viewports.mobile).toEqual(skippedViewport(pageUrl, SAFETY_VIOLATION_ABORT));
-    expect(result.incompleteReasons).toContainEqual(SAFETY_VIOLATION_ABORT);
-    expect(result.incompleteReasons).not.toContainEqual(SITE_UNAVAILABLE_SKIPPED);
-    // 最初に検知した不調の詳細は、そのまま持つ（Run を止める理由の優先は、Run Coordinator が決める）。
-    expect(outcome.siteUnavailableDetail).toBe('desktop:passive:TIMEOUT');
-    expect(server.pageGets()).toBe(1);
-    await expectPageSchema(outcome);
-  }, AUDIT_TEST_TIMEOUT_MS);
-});
+// RB-10: 違反を不調より先に見る順は、`tests/unit/page-audit-plan.test.ts` へ移した。
 
 /** ビューポートの理由のうち、理由のコードが `SITE_UNAVAILABLE` のもの。 */
 function siteUnavailableReasonsOf(outcome: PageAuditOutcome, viewport: ViewportProfile): IncompleteReason[] {
@@ -627,101 +416,9 @@ function interactionStopped(reason: string, remaining: number): IncompleteReason
 // 次のビューポートも始めない。新しい読み込みをしない残りの段階（配色、accessibility、performance、スクリーンショット、Link）は、
 // 今までどおり行うので、ビューポートは FAILED ではなく PARTIAL になる。
 describe('PageAuditor stops the page when the stress sweep or an interaction candidate load detects site unavailability (design 3.1)', () => {
-  it('does not start the next stress width, the interaction candidates, nor Mobile after a 503 of the first stress width', async () => {
-    const server = await startSiteServer([CANDIDATES_DOCUMENT, documentWith(SERVICE_UNAVAILABLE_STATUS)]);
-    const retry = countingAttempt();
-    const { outcome, pageUrl, pacer } = await auditSite(server, { overrides: TWO_STRESS_WIDTHS, attempt: retry.attempt });
-    const { result } = outcome;
-    const stageDetail = `stress-layout:HTTP ${SERVICE_UNAVAILABLE_STATUS}`;
-
-    // Passive の読み込みは 200 で、収集した。幅の走査の段階は、不調で止まった。Interaction の候補は、1つも始めない。
-    expect(result.viewports.desktop).toMatchObject({ status: 'PARTIAL', navigationOutcome: 'OK', httpStatus: OK_STATUS });
-    expect(siteUnavailableReasonsOf(outcome, 'desktop')).toEqual([{ code: 'SITE_UNAVAILABLE', detail: stageDetail }]);
-    expect(result.viewports.desktop.incompleteReasons).toContainEqual({
-      code: 'COLLECTOR_INCOMPLETE',
-      detail: 'stress-layout:SITE_UNAVAILABLE',
-    });
-    expect(result.viewports.desktop.incompleteReasons).toContainEqual(interactionStopped('SITE_UNAVAILABLE', CANDIDATE_COUNT));
-    expect(result.viewports.mobile).toEqual(skippedViewport(pageUrl, SITE_UNAVAILABLE_SKIPPED));
-    expect(outcome.siteUnavailableDetail).toBe(`desktop:${stageDetail}`);
-
-    // 新しい読み込みをしない残りの段階の Evidence は、今までどおりある。幅の走査の結果は、段階が止まったので記録しない。
-    for (const type of ['dom', 'layout', 'color', 'accessibility', 'performance', 'screenshot', 'link'] as const) {
-      expect(evidenceOf(outcome, type, 'desktop').length, `desktop ${type}`).toBeGreaterThan(0);
-    }
-    expect(evidenceOf(outcome, 'layout', 'desktop')[0]?.payload.stressSweep).toBeNull();
-    expect(evidenceOf(outcome, 'interaction', 'desktop')).toHaveLength(0);
-    // Safety の Evidence は、Passive の Context と、1つ目の幅のセッションの2つだけである（2つ目の幅のセッションを作らない）。
-    expect(evidenceOf(outcome, 'safety', 'desktop')).toHaveLength(2);
-    expect(evidenceTypesOf(outcome, 'mobile')).toEqual([]);
-
-    // 2つ目の幅、Interaction の候補、Mobile の読み込みは、サーバに届かない。読み込みの間隔の待ちも、Desktop と1つ目の幅の2回だけ。
-    expect(server.pageGets()).toBe(2);
-    expect(pacer.snapshot().navigationCount).toBe(2);
-    // Desktop で不調を検知したので、再試行の判断を呼ばない。
-    expect(retry.calls()).toBe(0);
-    expect(outcome.safety.invariantViolationCount).toBe(0);
-    await expectPageSchema(outcome);
-
-    // D3: Desktop の観察は、Passive（200）と、始めた1つ目の幅（503。幅の値つき）だけを持つ。候補は始めていない。Mobile は `null`。
-    const desktop = viewportDiagnosticsOf(outcome, 'desktop');
-    expectHeadersSentAndResponse(onlyDocumentRequestOf(desktop.passive, 'desktop Passive'), pageUrl, OK_STATUS);
-    expect(desktop.stressWidths.map(({ width }) => width)).toEqual([STRESS_WIDTHS[0]]);
-    expectHeadersSentAndResponse(
-      onlyDocumentRequestOf(desktop.stressWidths[0]?.diagnostics, `stress width ${STRESS_WIDTHS[0]}`),
-      pageUrl,
-      SERVICE_UNAVAILABLE_STATUS,
-    );
-    expect(desktop.interactionCandidates).toEqual([]);
-    expect(outcome.navigationDiagnostics.mobile).toBeNull();
-    expect(JSON.stringify(result)).not.toContain('stressWidths');
-  }, AUDIT_TEST_TIMEOUT_MS);
-
-  it('does not start the next interaction candidates nor Mobile after a 503 of the first candidate load', async () => {
-    const server = await startSiteServer([CANDIDATES_DOCUMENT, documentWith(SERVICE_UNAVAILABLE_STATUS)]);
-    const retry = countingAttempt();
-    const { outcome, pageUrl, pacer } = await auditSite(server, { overrides: NO_STRESS_WIDTHS, attempt: retry.attempt });
-    const { result } = outcome;
-    const stageDetail = `interaction:HTTP ${SERVICE_UNAVAILABLE_STATUS}`;
-
-    expect(result.viewports.desktop).toMatchObject({ status: 'PARTIAL', navigationOutcome: 'OK', httpStatus: OK_STATUS });
-    expect(siteUnavailableReasonsOf(outcome, 'desktop')).toEqual([{ code: 'SITE_UNAVAILABLE', detail: stageDetail }]);
-    expect(result.viewports.desktop.incompleteReasons).toContainEqual(interactionStopped('SITE_UNAVAILABLE', CANDIDATE_COUNT - 1));
-    expect(result.viewports.mobile).toEqual(skippedViewport(pageUrl, SITE_UNAVAILABLE_SKIPPED));
-    expect(outcome.siteUnavailableDetail).toBe(`desktop:${stageDetail}`);
-
-    // 1つ目の候補の結果は、今までどおり記録する。残りの段階の Evidence もある。
-    expect(evidenceOf(outcome, 'interaction', 'desktop')).toHaveLength(1);
-    for (const type of ['dom', 'layout', 'color', 'screenshot', 'link'] as const) {
-      expect(evidenceOf(outcome, type, 'desktop').length, `desktop ${type}`).toBeGreaterThan(0);
-    }
-    // Safety の Evidence は、Passive の Context と、1つ目の候補の Context の2つだけである。
-    expect(evidenceOf(outcome, 'safety', 'desktop')).toHaveLength(2);
-    expect(evidenceTypesOf(outcome, 'mobile')).toEqual([]);
-
-    // 2つ目以降の候補と Mobile の読み込みは、サーバに届かない。
-    expect(server.pageGets()).toBe(2);
-    expect(pacer.snapshot().navigationCount).toBe(2);
-    expect(retry.calls()).toBe(0);
-    expect(outcome.safety.invariantViolationCount).toBe(0);
-    await expectPageSchema(outcome);
-
-    // D3: Desktop の観察は、Passive（200）と、始めた1つ目の候補（503。候補の順の番号つき）だけを持つ。幅の走査はしていない。
-    const desktop = viewportDiagnosticsOf(outcome, 'desktop');
-    expectHeadersSentAndResponse(onlyDocumentRequestOf(desktop.passive, 'desktop Passive'), pageUrl, OK_STATUS);
-    expect(desktop.stressWidths).toEqual([]);
-    expect(desktop.interactionCandidates.map(({ index }) => index)).toEqual([0]);
-    expectHeadersSentAndResponse(
-      onlyDocumentRequestOf(desktop.interactionCandidates[0]?.diagnostics, 'interaction candidate 0'),
-      pageUrl,
-      SERVICE_UNAVAILABLE_STATUS,
-    );
-    expect(outcome.navigationDiagnostics.mobile).toBeNull();
-    expect(JSON.stringify(result)).not.toContain('interactionCandidates');
-  }, AUDIT_TEST_TIMEOUT_MS);
-
-  // D3: 応答しない候補の読み込み（読み込みの期限で止まる）でも、その候補の観察に「要求のヘッダを送った、応答なし」が記録される。
-  it('records in the observation of the first candidate that the headers were sent without a response, when the candidate load does not respond', async () => {
+  // RB-10: 503 の幅・候補の後に次の幅・候補・Mobile を始めない順は、偽の口の単体（`tests/unit/page-auditor-steps.test.ts`）へ移した。
+  // 応答しない候補の読み込み（読み込みの期限で止まる）は、`interaction:TIMEOUT` として止める。
+  it('stops at interaction:TIMEOUT when the first candidate load does not respond', async () => {
     const server = await startSiteServer([CANDIDATES_DOCUMENT, NO_RESPONSE]);
     const { outcome, pageUrl, pacer } = await auditSite(server, { overrides: NO_STRESS_WIDTHS });
     const { result } = outcome;
@@ -736,24 +433,11 @@ describe('PageAuditor stops the page when the stress sweep or an interaction can
     expect(server.pageGets()).toBe(2);
     expect(pacer.snapshot().navigationCount).toBe(2);
     await expectPageSchema(outcome);
-
-    const desktop = viewportDiagnosticsOf(outcome, 'desktop');
-    expectHeadersSentAndResponse(onlyDocumentRequestOf(desktop.passive, 'desktop Passive'), pageUrl, OK_STATUS);
-    expect(desktop.stressWidths).toEqual([]);
-    expect(desktop.interactionCandidates.map(({ index }) => index)).toEqual([0]);
-    // 候補の文書の要求は、ヘッダをネットワークへ送ったが、応答（ヘッダ）を受けていない（サイト側か経路の問題と分かる）。
-    expectHeadersSentAndResponse(
-      onlyDocumentRequestOf(desktop.interactionCandidates[0]?.diagnostics, 'interaction candidate 0'),
-      pageUrl,
-      null,
-    );
-    expect(outcome.navigationDiagnostics.mobile).toBeNull();
   }, AUDIT_TEST_TIMEOUT_MS);
 
-  // D3R の Minor-4: 応答しない幅の読み込み（幅の走査の期限で止まる）でも、その幅の観察に「要求のヘッダを送った、応答なし」が記録される。
-  // 幅の走査の期限は、ページの期限から導かれる（`collectorAtMs`）ので、ページの期限（`crawl.overallPageTimeoutMs`）を短くする。
+  // 応答しない幅の読み込みは、`stress-layout:TIMEOUT` として止める。
   // Interaction をしない設定なので、候補の予算との関係の検証（`validateInteractionCandidateBudget`）には掛からない。
-  it('records in the observation of the first stress width that the headers were sent without a response, when the width load does not respond', async () => {
+  it('stops at stress-layout:TIMEOUT when the first stress width load does not respond', async () => {
     const server = await startSiteServer([documentWith(OK_STATUS), NO_RESPONSE]);
     const retry = countingAttempt();
     const { outcome, pageUrl, pacer } = await auditSite(server, {
@@ -762,15 +446,16 @@ describe('PageAuditor stops the page when the stress sweep or an interaction can
     });
     const { result } = outcome;
 
-    // 不調の判定と結果は、今までどおり（幅の読み込みの時間切れは `stress-layout:TIMEOUT`）。幅の走査の結果（1つ目の幅は読み込みの期限切れ、
-    // 2つ目の幅は始めない）も、観察を始めない場合と同じである。
+    // 幅の読み込みの時間切れは `stress-layout:TIMEOUT`。幅の走査の結果は、1つ目の幅は読み込みの期限切れ、2つ目の幅は始めない。
     expect(result.viewports.desktop).toMatchObject({ navigationOutcome: 'OK', httpStatus: OK_STATUS });
     expect(result.viewports.desktop.status).not.toBe('SKIPPED');
     expect(siteUnavailableReasonsOf(outcome, 'desktop')).toEqual([{ code: 'SITE_UNAVAILABLE', detail: 'stress-layout:TIMEOUT' }]);
+    // L1（設計書 `2026-11-09-beaksight-remove-limits-design.md` 6 の L1）: 期待を直した。幅の走査の期限（ページの期限から導いた）は撤廃したので、応答しない
+    // 幅の読み込みは、進みの見張りが「応答しなかった」とし（残りの幅は始めない）、読み込みは部品の中の期限（Playwright の既定。L2 の範囲）の時間切れで終わる。
     expect(evidenceOf(outcome, 'layout', 'desktop')[0]?.payload.stressSweep).toEqual([
-      expect.objectContaining({ width: STRESS_WIDTHS[0], status: 'FAILED', stage: 'NAVIGATION', reason: 'DEADLINE_EXCEEDED' }),
-      expect.objectContaining({ width: STRESS_WIDTHS[1], status: 'FAILED', stage: 'NOT_STARTED', reason: 'DEADLINE_EXCEEDED' }),
+      expect.objectContaining({ width: STRESS_WIDTHS[0], status: 'FAILED', stage: 'NAVIGATION', reason: 'NAVIGATION_FAILED' }),
     ]);
+    expect(result.viewports.desktop.incompleteReasons).toContainEqual({ code: 'STAGE_UNRESPONSIVE', detail: 'stress-layout' });
     expect(result.viewports.mobile).toEqual(skippedViewport(pageUrl, SITE_UNAVAILABLE_SKIPPED));
     expect(outcome.siteUnavailableDetail).toBe('desktop:stress-layout:TIMEOUT');
     // 2つ目の幅と Mobile の読み込みは、サーバに届かない。
@@ -779,18 +464,6 @@ describe('PageAuditor stops the page when the stress sweep or an interaction can
     expect(retry.calls()).toBe(0);
     expect(outcome.safety.invariantViolationCount).toBe(0);
     await expectPageSchema(outcome);
-
-    const desktop = viewportDiagnosticsOf(outcome, 'desktop');
-    expectHeadersSentAndResponse(onlyDocumentRequestOf(desktop.passive, 'desktop Passive'), pageUrl, OK_STATUS);
-    expect(desktop.stressWidths.map(({ width }) => width)).toEqual([STRESS_WIDTHS[0]]);
-    // 幅の文書の要求は、ヘッダをネットワークへ送ったが、応答（ヘッダ）を受けていない（サイト側か経路の問題と分かる）。
-    expectHeadersSentAndResponse(
-      onlyDocumentRequestOf(desktop.stressWidths[0]?.diagnostics, `stress width ${STRESS_WIDTHS[0]}`),
-      pageUrl,
-      null,
-    );
-    expect(desktop.interactionCandidates).toEqual([]);
-    expect(outcome.navigationDiagnostics.mobile).toBeNull();
   }, AUDIT_TEST_TIMEOUT_MS);
 });
 

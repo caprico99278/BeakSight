@@ -12,7 +12,6 @@ import {
   AUDIT_MODES,
   AUTH_STRATEGIES,
   ENVIRONMENT_KINDS,
-  MAX_ENVIRONMENT_EVIDENCE_REF_LENGTH,
   MIN_PROFILE_REVISION,
   PROFILE_VALIDATION_ERROR_CODES,
   SITE_PROFILE_SCHEMA_VERSION,
@@ -83,8 +82,8 @@ const testAuthProfile = {
 const codesOf = (result: ProfileValidationResult): readonly ProfileValidationErrorCode[] =>
   result.ok ? [] : [...new Set(result.errors.map((error) => error.code))].sort();
 
-const expectAccepted = (input: unknown): SiteProfile => {
-  const result = validateSiteProfile(input, context);
+const expectAccepted = (input: unknown, using: ProfileValidationContext = context): SiteProfile => {
+  const result = validateSiteProfile(input, using);
   expect(result, JSON.stringify(result)).toMatchObject({ ok: true });
   if (!result.ok) {
     throw new Error('unreachable');
@@ -92,8 +91,12 @@ const expectAccepted = (input: unknown): SiteProfile => {
   return result.profile;
 };
 
-const expectRejectedWith = (input: unknown, expected: readonly ProfileValidationErrorCode[]): void => {
-  const result = validateSiteProfile(input, context);
+const expectRejectedWith = (
+  input: unknown,
+  expected: readonly ProfileValidationErrorCode[],
+  using: ProfileValidationContext = context,
+): void => {
+  const result = validateSiteProfile(input, using);
   expect(result.ok).toBe(false);
   expect(codesOf(result)).toEqual([...expected].sort());
   if (!result.ok) {
@@ -123,26 +126,29 @@ const profileFor = (environment: EnvironmentKind, mode: AuditMode, auth: AuthStr
 /**
  * 設計書 4.3 の組み合わせの表（環境 × モード × 認証の 18 通り）と、拒否のコードの対応。空の一覧は「受ける」。
  * - 環境とモードの誤り（RF1: `PUBLIC` と認証・書き込みのモード）は `PROFILE_MODE_ENVIRONMENT_MISMATCH`。
- * - モードと認証の誤り（`PUBLIC_PASSIVE` に認証、認証・書き込みのモードに `NONE`）は `PROFILE_AUTH_MISMATCH`。
+ * - モードと認証の誤り（`PUBLIC_PASSIVE` に認証）は `PROFILE_AUTH_MISMATCH`。
  * - 両方に当たるものは、両方のコード。
+ * - NL-1（設計書 `2026-11-06-beaksight-no-login-test-site-design.md` 3.1 の 1、2）: 認証・書き込みのモードに `NONE` は、組み合わせとしては受けるが、
+ *   `TEST` の環境では `approvedTestOrigins` がすべて loopback のときだけ受ける。この表の例の Origin（`TEST_ORIGIN`）は loopback でないので、
+ *   `PROFILE_NO_LOGIN_REQUIRES_LOOPBACK` で拒む（loopback で受ける例は、下の NL-1 の describe）。`PUBLIC` の環境では、今までどおり環境の理由で拒む。
  */
 const COMBINATION_TABLE: readonly (readonly [EnvironmentKind, AuditMode, AuthStrategy, readonly ProfileValidationErrorCode[]])[] = [
   ['PUBLIC', 'PUBLIC_PASSIVE', 'NONE', []],
   ['PUBLIC', 'PUBLIC_PASSIVE', 'MANUAL_SESSION', ['PROFILE_AUTH_MISMATCH']],
   ['PUBLIC', 'PUBLIC_PASSIVE', 'AUTOMATED_LOGIN', ['PROFILE_AUTH_MISMATCH']],
-  ['PUBLIC', 'TEST_AUTH_PASSIVE', 'NONE', ['PROFILE_AUTH_MISMATCH', 'PROFILE_MODE_ENVIRONMENT_MISMATCH']],
+  ['PUBLIC', 'TEST_AUTH_PASSIVE', 'NONE', ['PROFILE_MODE_ENVIRONMENT_MISMATCH']],
   ['PUBLIC', 'TEST_AUTH_PASSIVE', 'MANUAL_SESSION', ['PROFILE_MODE_ENVIRONMENT_MISMATCH']],
   ['PUBLIC', 'TEST_AUTH_PASSIVE', 'AUTOMATED_LOGIN', ['PROFILE_MODE_ENVIRONMENT_MISMATCH']],
-  ['PUBLIC', 'TEST_APPROVED_WRITE', 'NONE', ['PROFILE_AUTH_MISMATCH', 'PROFILE_MODE_ENVIRONMENT_MISMATCH']],
+  ['PUBLIC', 'TEST_APPROVED_WRITE', 'NONE', ['PROFILE_MODE_ENVIRONMENT_MISMATCH']],
   ['PUBLIC', 'TEST_APPROVED_WRITE', 'MANUAL_SESSION', ['PROFILE_MODE_ENVIRONMENT_MISMATCH']],
   ['PUBLIC', 'TEST_APPROVED_WRITE', 'AUTOMATED_LOGIN', ['PROFILE_MODE_ENVIRONMENT_MISMATCH']],
   ['TEST', 'PUBLIC_PASSIVE', 'NONE', []],
   ['TEST', 'PUBLIC_PASSIVE', 'MANUAL_SESSION', ['PROFILE_AUTH_MISMATCH']],
   ['TEST', 'PUBLIC_PASSIVE', 'AUTOMATED_LOGIN', ['PROFILE_AUTH_MISMATCH']],
-  ['TEST', 'TEST_AUTH_PASSIVE', 'NONE', ['PROFILE_AUTH_MISMATCH']],
+  ['TEST', 'TEST_AUTH_PASSIVE', 'NONE', ['PROFILE_NO_LOGIN_REQUIRES_LOOPBACK']],
   ['TEST', 'TEST_AUTH_PASSIVE', 'MANUAL_SESSION', []],
   ['TEST', 'TEST_AUTH_PASSIVE', 'AUTOMATED_LOGIN', []],
-  ['TEST', 'TEST_APPROVED_WRITE', 'NONE', ['PROFILE_AUTH_MISMATCH']],
+  ['TEST', 'TEST_APPROVED_WRITE', 'NONE', ['PROFILE_NO_LOGIN_REQUIRES_LOOPBACK']],
   ['TEST', 'TEST_APPROVED_WRITE', 'MANUAL_SESSION', []],
   ['TEST', 'TEST_APPROVED_WRITE', 'AUTOMATED_LOGIN', []],
 ];
@@ -192,7 +198,7 @@ describe('T22b: validateSiteProfile accepts the rows of the table and their vari
     ['an http loopback origin [::1]', { ...testAuthProfile, approvedTestOrigins: ['http://[::1]:4173'] }],
     ['several approved origins', { ...testAuthProfile, approvedTestOrigins: [TEST_ORIGIN, LOOPBACK_TEST_ORIGIN] }],
     ['approved write with automated login', { ...testAuthProfile, mode: 'TEST_APPROVED_WRITE', auth: 'AUTOMATED_LOGIN' }],
-    ['the longest evidence reference', { ...testAuthProfile, environmentEvidenceRef: 'e'.repeat(MAX_ENVIRONMENT_EVIDENCE_REF_LENGTH) }],
+    ['an evidence reference longer than the former limit', { ...testAuthProfile, environmentEvidenceRef: 'e'.repeat(201) }],
     ['an evidence reference of one character', { ...testAuthProfile, environmentEvidenceRef: 'e' }],
     ['an evidence reference with inner spaces', { ...testAuthProfile, environmentEvidenceRef: 'isolation check 1' }],
     ['the largest safe revision', { ...publicProfile, revision: Number.MAX_SAFE_INTEGER }],
@@ -221,7 +227,6 @@ describe('T22b: validateSiteProfile rejects a profile of the wrong shape with PR
     ['a profile id starting with a hyphen', { ...publicProfile, profileId: '-example' }],
     ['a profile id of 64 characters', { ...publicProfile, profileId: `a${'-'.repeat(63)}` }],
     ['an empty evidence reference', { ...testAuthProfile, environmentEvidenceRef: '' }],
-    ['a too long evidence reference', { ...testAuthProfile, environmentEvidenceRef: 'e'.repeat(MAX_ENVIRONMENT_EVIDENCE_REF_LENGTH + 1) }],
     ['duplicate approved origins', { ...testAuthProfile, approvedTestOrigins: [TEST_ORIGIN, TEST_ORIGIN] }],
     ['null', null],
     ['an array', [publicProfile]],
@@ -391,10 +396,6 @@ describe('T22b: validateSiteProfile checks the environment evidence reference', 
     ['a lone low surrogate', 'evidence\udc00ref'],
     ['a high surrogate at the end', 'evidence\ud83d'],
     ['a low surrogate at the start', '\ude00evidence'],
-    [
-      'more UTF-16 code units than the maximum (astral characters)',
-      ASTRAL_CHARACTER.repeat(MAX_ENVIRONMENT_EVIDENCE_REF_LENGTH / ASTRAL_CHARACTER.length + 1),
-    ],
   ])('rejects an evidence reference with %s', (_name, environmentEvidenceRef) => {
     expectRejectedWith({ ...testAuthProfile, environmentEvidenceRef }, ['PROFILE_ENVIRONMENT_EVIDENCE_REQUIRED']);
     expectRejectedWith(
@@ -404,10 +405,8 @@ describe('T22b: validateSiteProfile checks the environment evidence reference', 
   });
 
   it.each([
-    [
-      'astral characters up to the maximum UTF-16 code units',
-      ASTRAL_CHARACTER.repeat(MAX_ENVIRONMENT_EVIDENCE_REF_LENGTH / ASTRAL_CHARACTER.length),
-    ],
+    // LZ-2: 長さの上限（前は 200）はない。
+    ['astral characters beyond the former limit', ASTRAL_CHARACTER.repeat(101)],
     ['a surrogate pair inside', `evidence-${ASTRAL_CHARACTER}-ref`],
     ['non-ASCII letters', '\u691c\u8a3c-1'],
   ])('accepts an evidence reference with %s', (_name, environmentEvidenceRef) => {
@@ -416,6 +415,23 @@ describe('T22b: validateSiteProfile checks the environment evidence reference', 
 
   it('rejects an evidence reference on a PUBLIC profile (the PUBLIC environment has no evidence)', () => {
     expectRejectedWith({ ...publicProfile, environmentEvidenceRef: 'evidence/ref' }, ['PROFILE_MODE_ENVIRONMENT_MISMATCH']);
+  });
+
+  // PL-F 修正の 1 回目（PL-REV の Minor 2）: 秘密に見える参照は、詳しい内容の編集でも拒む（判定は `isSecretLikeText`）。
+  it.each([
+    ['a secret-like name and its value', 'password=hunter2'],
+    ['a Bearer scheme and its value', 'Bearer abcdefghijklmnopqrstuvwxyz0123456789'],
+    ['a URL with userinfo', 'https://user:pass@example.invalid/x'],
+  ])('rejects a secret-like evidence reference (%s)', (_name, environmentEvidenceRef) => {
+    expectRejectedWith({ ...testAuthProfile, environmentEvidenceRef }, ['ISOLATION_REFERENCE_SECRET_LIKE']);
+    expectRejectedWith({ ...testAuthProfile, mode: 'TEST_APPROVED_WRITE', environmentEvidenceRef }, ['ISOLATION_REFERENCE_SECRET_LIKE']);
+  });
+
+  it.each([
+    ['a URL with an ordinary query', 'https://wiki.example.invalid/page?id=3'],
+    ['a reference that contains auth in a word', 'auth-server-isolation'],
+  ])('accepts an evidence reference that is not secret-like (%s)', (_name, environmentEvidenceRef) => {
+    expectAccepted({ ...testAuthProfile, environmentEvidenceRef });
   });
 });
 
@@ -429,13 +445,118 @@ describe('T22b: validateSiteProfile reports every rule that fails', () => {
         environmentEvidenceRef: null,
       },
       [
-        'PROFILE_AUTH_MISMATCH',
         'PROFILE_ENVIRONMENT_EVIDENCE_REQUIRED',
         'PROFILE_MODE_ENVIRONMENT_MISMATCH',
         'PROFILE_TARGET_PATH_INVALID',
         'PROFILE_TEST_ORIGINS_REQUIRED',
       ],
     );
+    // NL-1: 書き込みのモードの `NONE` は、組み合わせの誤りでなくなった。認証の誤りは、公開の監査に認証の方式の組み合わせで、ほかの誤りと一緒に返す。
+    expectRejectedWith(
+      { ...profileFor('PUBLIC', 'PUBLIC_PASSIVE', 'MANUAL_SESSION'), targetConfigPath: '../outside.json', approvedTestOrigins: [TEST_ORIGIN] },
+      ['PROFILE_AUTH_MISMATCH', 'PROFILE_TARGET_PATH_INVALID', 'PROFILE_TEST_ORIGIN_INVALID'],
+    );
+    // NL-1: ログインのない書き込みのモードで、loopback でない Origin は、ほかの誤りと一緒に返す。
+    expectRejectedWith(
+      {
+        ...profileFor('TEST', 'TEST_APPROVED_WRITE', 'NONE'),
+        targetConfigPath: '../outside.json',
+        approvedTestOrigins: [LOOPBACK_TEST_ORIGIN, 'http://example.invalid'],
+        environmentEvidenceRef: null,
+      },
+      [
+        'PROFILE_ENVIRONMENT_EVIDENCE_REQUIRED',
+        'PROFILE_NO_LOGIN_REQUIRES_LOOPBACK',
+        'PROFILE_TARGET_PATH_INVALID',
+        'PROFILE_TEST_ORIGIN_INVALID',
+      ],
+    );
+  });
+});
+
+// NL-1（設計書 `2026-11-06-beaksight-no-login-test-site-design.md` 2 章の設計者の判断、3.1 の 1、2）: ログインのないテスト用のサイト。`TEST` の環境の
+// 認証・書き込みのモードで `auth: NONE` は、`approvedTestOrigins` がすべて loopback（`localhost`・`127.0.0.1`・`[::1]`）のときだけ受ける。1 つでも
+// loopback でなければ `PROFILE_NO_LOGIN_REQUIRES_LOOPBACK` で拒む（本番のサイトへ書き込む取り違えを起こさない）。ログインを使う方式は、今までどおり。
+describe('NL-1: validateSiteProfile accepts a test profile without login only on loopback origins', () => {
+  const noLoginProfile = (mode: AuditMode, approvedTestOrigins: readonly string[]): SiteProfile => ({
+    ...profileFor('TEST', mode, 'NONE'),
+    approvedTestOrigins: [...approvedTestOrigins],
+  });
+  const MODES = ['TEST_AUTH_PASSIVE', 'TEST_APPROVED_WRITE'] as const;
+  /** NL fix round 1（設計書 6.1 の 1）: 設定の許可 Origin もすべて loopback のターゲット。 */
+  const loopbackContext = (extraAllowed: readonly string[] = []): ProfileValidationContext => ({
+    targetConfig: {
+      ...targetConfig,
+      site: { startUrl: `${LOOPBACK_TEST_ORIGIN}/`, allowedOrigins: [LOOPBACK_TEST_ORIGIN, 'http://localhost:4173', 'http://[::1]:4173', ...extraAllowed] },
+    },
+  });
+
+  it.each(MODES.flatMap((mode) => [
+    [mode, [LOOPBACK_TEST_ORIGIN]],
+    [mode, ['http://localhost:4173']],
+    [mode, ['http://[::1]:4173']],
+    [mode, [LOOPBACK_TEST_ORIGIN, 'http://localhost:4173', 'http://[::1]:4173']],
+  ] as const))('accepts %s + NONE on the loopback origins %j', (mode, origins) => {
+    const accepted = expectAccepted(noLoginProfile(mode, origins), loopbackContext());
+    expect(accepted.auth).toBe('NONE');
+    expect(accepted.approvedTestOrigins).toEqual(origins);
+  });
+
+  it.each(MODES.flatMap((mode) => [
+    [mode, [TEST_ORIGIN], ['PROFILE_NO_LOGIN_REQUIRES_LOOPBACK']],
+    [mode, [LOOPBACK_TEST_ORIGIN, TEST_ORIGIN], ['PROFILE_NO_LOGIN_REQUIRES_LOOPBACK']],
+    // http の loopback でない host は、形の誤りと一緒に返す。
+    [mode, ['http://127.0.0.2:4173'], ['PROFILE_NO_LOGIN_REQUIRES_LOOPBACK', 'PROFILE_TEST_ORIGIN_INVALID']],
+    [mode, [LOOPBACK_TEST_ORIGIN, 'http://example.invalid'], ['PROFILE_NO_LOGIN_REQUIRES_LOOPBACK', 'PROFILE_TEST_ORIGIN_INVALID']],
+    // 解析できない値は loopback でない（fail-closed）。
+    [mode, ['not a url'], ['PROFILE_NO_LOGIN_REQUIRES_LOOPBACK', 'PROFILE_TEST_ORIGIN_INVALID']],
+  ] as const))('rejects %s + NONE on the origins %j with %j', (mode, origins, codes) => {
+    expectRejectedWith(noLoginProfile(mode, origins), codes);
+  });
+
+  it('keeps requiring at least one origin and the evidence reference for a test profile without login', () => {
+    for (const mode of MODES) {
+      expectRejectedWith(noLoginProfile(mode, []), ['PROFILE_TEST_ORIGINS_REQUIRED']);
+      expectRejectedWith({ ...noLoginProfile(mode, [LOOPBACK_TEST_ORIGIN]), environmentEvidenceRef: null }, ['PROFILE_ENVIRONMENT_EVIDENCE_REQUIRED'], loopbackContext());
+    }
+  });
+
+  // NL fix round 1（設計書 6.1 の 1。SREV-NL の I-1）: 承認したサービスの Origin と、ターゲットの設定の `site.allowedOrigins` も、すべて loopback であることを求める
+  // （設定の許可 Origin に外のサイトがあると、ログインなしでその画面を読み込み、その画面の自動の通信を通してしまう）。同じ理由のコード。
+  it.each(MODES)('rejects %s + NONE when a target allowed origin or a service origin is not loopback', (mode) => {
+    const loopbackOnly = noLoginProfile(mode, [LOOPBACK_TEST_ORIGIN]);
+    expectRejectedWith(loopbackOnly, ['PROFILE_NO_LOGIN_REQUIRES_LOOPBACK'], loopbackContext([TEST_ORIGIN]));
+    expectRejectedWith(loopbackOnly, ['PROFILE_NO_LOGIN_REQUIRES_LOOPBACK'], loopbackContext(['http://127.0.0.2:4173']));
+    expectRejectedWith({ ...loopbackOnly, approvedServiceOrigins: ['https://api.example.invalid'] }, ['PROFILE_NO_LOGIN_REQUIRES_LOOPBACK'], loopbackContext());
+    expectRejectedWith({ ...loopbackOnly, approvedServiceOrigins: ['http://127.0.0.1:5173', 'https://api.example.invalid'] }, ['PROFILE_NO_LOGIN_REQUIRES_LOOPBACK'], loopbackContext());
+    // loopback のサービスの Origin は受ける。
+    expectAccepted({ ...loopbackOnly, approvedServiceOrigins: ['http://127.0.0.1:5173'] }, loopbackContext());
+    // ログインを使う方式は、今どおり外の許可 Origin とサービスの Origin を受ける。
+    expectAccepted({ ...profileFor('TEST', mode, 'MANUAL_SESSION'), approvedTestOrigins: [LOOPBACK_TEST_ORIGIN], approvedServiceOrigins: ['https://api.example.invalid'] },
+      loopbackContext([TEST_ORIGIN]));
+  });
+
+  it.each(MODES)('rejects %s + NONE when the target allowed origins cannot be read as loopback (fail-closed)', (mode) => {
+    const profile = noLoginProfile(mode, [LOOPBACK_TEST_ORIGIN]);
+    const broken = (allowedOrigins: unknown): ProfileValidationContext =>
+      ({ targetConfig: { ...targetConfig, site: { startUrl: `${LOOPBACK_TEST_ORIGIN}/`, allowedOrigins } } } as unknown as ProfileValidationContext);
+    for (const allowedOrigins of [[LOOPBACK_TEST_ORIGIN, 'not a url'], [LOOPBACK_TEST_ORIGIN, 42]]) {
+      const result = validateSiteProfile(profile, broken(allowedOrigins));
+      expect(result.ok, JSON.stringify(allowedOrigins)).toBe(false);
+      expect(codesOf(result)).toContain('PROFILE_NO_LOGIN_REQUIRES_LOOPBACK');
+    }
+  });
+
+  it('keeps accepting the login strategies on origins that are not loopback', () => {
+    for (const mode of MODES) {
+      for (const auth of ['MANUAL_SESSION', 'AUTOMATED_LOGIN'] as const) {
+        expectAccepted({ ...profileFor('TEST', mode, auth), approvedTestOrigins: [TEST_ORIGIN] });
+      }
+    }
+  });
+
+  it('registers the new code in the closed list of the validation error codes', () => {
+    expect(PROFILE_VALIDATION_ERROR_CODES).toContain('PROFILE_NO_LOGIN_REQUIRES_LOOPBACK');
   });
 });
 
@@ -772,9 +893,10 @@ describe('T34a: validateSiteProfile checks the approved service origins', () => 
     expectRejectedWith({ ...testAuthProfile, approvedServiceOrigins: [SERVICE_ORIGIN, LOOPBACK_TEST_ORIGIN] }, ['PROFILE_SERVICE_ORIGIN_INSIDE_TARGET']);
   });
 
-  it('rejects more service origins than the limit and duplicated service origins as the wrong shape', () => {
-    expectRejectedWith({ ...testAuthProfile, approvedServiceOrigins: ['https://a.example.invalid', 'https://b.example.invalid',
-      'https://c.example.invalid', 'https://d.example.invalid', 'https://e.example.invalid'] }, ['PROFILE_SCHEMA_INVALID']);
+  // L11（設計書 `2026-11-09-beaksight-remove-limits-design.md` 4）で直した: 件数の上限（前は 4）は撤廃した。5 つ以上も受ける。重なりは今どおり形の誤り。
+  it('accepts more service origins than the earlier limit (L11), and rejects duplicated service origins as the wrong shape', () => {
+    expectAccepted({ ...testAuthProfile, approvedServiceOrigins: ['https://a.example.invalid', 'https://b.example.invalid',
+      'https://c.example.invalid', 'https://d.example.invalid', 'https://e.example.invalid'] });
     expectRejectedWith({ ...testAuthProfile, approvedServiceOrigins: [SERVICE_ORIGIN, SERVICE_ORIGIN] }, ['PROFILE_SCHEMA_INVALID']);
   });
 
@@ -784,5 +906,21 @@ describe('T34a: validateSiteProfile checks the approved service origins', () => 
   ] as const)('rejects service origins on a %s public-passive profile', (_environment, profile) => {
     expectRejectedWith({ ...profile, approvedServiceOrigins: [SERVICE_ORIGIN] }, ['PROFILE_SERVICE_ORIGIN_INVALID']);
     expectAccepted({ ...profile, approvedServiceOrigins: [] });
+  });
+});
+
+// OP-1 の修正の 1 回目（設計書 `2026-10-27-beaksight-one-pass-flow-design.md` 4.1.3 の 2）: プロファイルの任意の項目 `loginPreference`（毎回手でログインするか）。
+// 省いた今のプロファイルは、そのまま読め、`AUTOMATIC` とみなす。
+describe('OP-1: the login preference of a profile', () => {
+  it('accepts the two values and the profile without the item (AUTOMATIC)', async () => {
+    const { LOGIN_PREFERENCES, loginPreferenceOf } = await import('../../src/control/contracts.js');
+    expect(LOGIN_PREFERENCES).toEqual(['AUTOMATIC', 'MANUAL_EVERY_TIME']);
+    expect(loginPreferenceOf(expectAccepted(testAuthProfile))).toBe('AUTOMATIC');
+    expect(loginPreferenceOf(expectAccepted({ ...testAuthProfile, loginPreference: 'MANUAL_EVERY_TIME' }))).toBe('MANUAL_EVERY_TIME');
+    expect(loginPreferenceOf(expectAccepted({ ...testAuthProfile, loginPreference: 'AUTOMATIC' }))).toBe('AUTOMATIC');
+  });
+
+  it('rejects another value', () => {
+    expectRejectedWith({ ...testAuthProfile, loginPreference: 'NEVER' }, ['PROFILE_SCHEMA_INVALID']);
   });
 });

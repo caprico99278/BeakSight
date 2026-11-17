@@ -8,7 +8,6 @@ import { describe, expect, it } from 'vitest';
 import {  AUTH_SETUP_SCHEMA_VERSION_3,
   AUTOMATED_LOGIN_MAX_LOGIN_ATTEMPTS,
   MAX_LOGIN_ATTEMPTS,
-  MAX_SUCCESS_SELECTOR_LENGTH,
   type AuthSetup,
 } from '../../../src/control/auth/auth-setup-contracts.js';
 import { FORM_NAVIGATION_SETUP_ITEMS } from '../../../tests/helpers/auth-setup-samples.js';
@@ -228,8 +227,9 @@ describe('T26e: the automated login errors are split by the form fields', () => 
     ['passwordSelector', withAutomated({ passwordSelector: '#a\nb' }), { code: 'AUTH_SETUP_SELECTOR_INVALID', field: 'passwordSelector', line: null }],
     [
       'submitSelector',
-      withAutomated({ submitSelector: `#${'s'.repeat(MAX_SUCCESS_SELECTOR_LENGTH)}` }),
-      { code: 'AUTH_SETUP_LIMIT_EXCEEDED', field: 'submitSelector', line: null },
+      // LZ-2: セレクタの長さの上限は撤廃した（前は長すぎるセレクタで `AUTH_SETUP_LIMIT_EXCEEDED`）。
+      withAutomated({ submitSelector: '   ' }),
+      { code: 'AUTH_SETUP_SELECTOR_INVALID', field: 'submitSelector', line: null },
     ],
     [
       'usernameSelector',
@@ -414,14 +414,14 @@ describe('T35d: the audit stage items of the version 3 auth setup are split by t
     ],
     [
       'servicePerMinute',
-      // DEF-141: 1 分あたりの上限は 600 まで（前は 120 まで）。
-      withScriptSetup({ serviceRequestLimits: { perMinute: 601, perRun: 300 } }),
+      // L11 で直した: 上限の範囲の最大は撤廃したので、下限（1）を下回る値で、誤りの欄の対応を確かめる。
+      withScriptSetup({ serviceRequestLimits: { perMinute: 0, perRun: 300 } }),
       { code: 'AUTH_SETUP_LIMIT_EXCEEDED', field: 'servicePerMinute', line: null },
     ],
     [
       'servicePerRun',
-      // DEF-141: 1 回の Run あたりの上限は 10,000 まで（前は 600 まで）。
-      withScriptSetup({ serviceRequestLimits: { perMinute: 30, perRun: 10_001 } }),
+      // L11 で直した: 上限の範囲の最大は撤廃したので、下限（1）を下回る値で確かめる。
+      withScriptSetup({ serviceRequestLimits: { perMinute: 30, perRun: 0 } }),
       { code: 'AUTH_SETUP_LIMIT_EXCEEDED', field: 'servicePerRun', line: null },
     ],
   ] as const)('puts the error on the field %s', (_field, input, expected) => {
