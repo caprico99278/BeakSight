@@ -8,15 +8,20 @@
  * http(s) でない URL（読み込む前の `about:blank`・誤りの画面・閉じる前に離れた先）は判定しない（範囲の外にしない）。
  * Page Auditor（Desktop・Mobile・幅の走査の各幅・Interaction の Context）と、ワーカーの 1 画面の読み込み（操作さがし・READ の確かめ・入口の確かめ・書き込みの前の確かめ）が使う。
  */
-import { normalizeUrl } from '../crawl/normalize-url.js';
+import { normalizeUrl, withRequestedQueryOnSamePath } from '../crawl/normalize-url.js';
 import type { PageNavigationResult } from './page-navigation.js';
 
 /** 範囲の判定（呼ぶ側が Run の範囲で作る。真なら範囲の外）。 */
 export type AuditScopeJudge = (url: string) => boolean;
 
-/** `url` が範囲の外なら、その URL。http(s) でない URL と範囲の中の URL は `null`。 */
-export function auditScopeLeftUrl(url: string, isOutside: AuditScopeJudge): string | null {
-  return /^https?:/iu.test(url) && isOutside(url) ? url : null;
+/**
+ * `url` が範囲の外なら、その URL。http(s) でない URL と範囲の中の URL は `null`。
+ * DEF-304（設計書 `2026-11-20-beaksight-audit-precision-and-scope-design.md` 2.1）: 読み込みを頼んだ URL（`requestedUrl`）と Origin と path が同じで、query だけが
+ * 違うとき（画面自身が読み込みの後に query を変えた）は、今の query を判定に使わず、頼んだ URL の query に置き換えて判定する（危険な語は、頼んだ URL の query と
+ * path で今どおり見る。Origin・読まないパス・読む範囲・セッションの切れは path で決まるので今どおり）。path が違えば、今の URL をそのまま判定する。
+ */
+export function auditScopeLeftUrl(url: string, isOutside: AuditScopeJudge, requestedUrl: string): string | null {
+  return /^https?:/iu.test(url) && isOutside(withRequestedQueryOnSamePath(url, requestedUrl)) ? url : null;
 }
 
 /** 見張る page（Playwright の page の形だけ。main frame の移動の事象と、今の URL）。 */
@@ -49,21 +54,21 @@ export function isPageInAuditScope(page: object): boolean {
   return (WATCHES.get(page)?.outsideUrl() ?? null) === null;
 }
 
-/** 1 画面の main frame の移動を見張る（読み込みの前に付ける）。`isOutside` がなければ見張らない。 */
-export function watchAuditScope(page: AuditScopeWatchedPage, isOutside: AuditScopeJudge | undefined): AuditScopeWatch {
+/** 1 画面の main frame の移動を見張る（`requestedUrl` は読み込みを頼んだ URL）。`isOutside` がなければ見張らない。 */
+export function watchAuditScope(page: AuditScopeWatchedPage, isOutside: AuditScopeJudge | undefined, requestedUrl: string): AuditScopeWatch {
   if (isOutside === undefined) {
     return UNWATCHED;
   }
-  const watch = startWatch(page, isOutside);
+  const watch = startWatch(page, isOutside, requestedUrl);
   WATCHES.set(page, watch);
   return watch;
 }
 
-function startWatch(page: AuditScopeWatchedPage, isOutside: AuditScopeJudge): AuditScopeWatch {
+function startWatch(page: AuditScopeWatchedPage, isOutside: AuditScopeJudge, requestedUrl: string): AuditScopeWatch {
   let left: string | null = null;
   let watching = true;
   const judge = (url: string): void => {
-    left ??= auditScopeLeftUrl(url, isOutside);
+    left ??= auditScopeLeftUrl(url, isOutside, requestedUrl);
   };
   const listener = (frame: { url(): string }): void => {
     if (frame === page.mainFrame()) judge(frame.url());

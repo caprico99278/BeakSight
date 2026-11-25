@@ -81,6 +81,8 @@ export const SCENARIO_DRAFT_REJECTION_REASONS = Object.freeze([
   // ARR-5 fix round 1（SREV-ARR2 の M1・M2）: 一覧の位置の道が、ほかの鍵・ほかの道と重なる。本文の object に同じ鍵が 2 回ある。
   'SCENARIO_API_ARRAY_PATH_CONFLICT',
   'SCENARIO_API_BODY_KEY_DUPLICATE',
+  // WBF（DEF-291 の B1）: 欄に目印を入れて押したのに、見た送信のどの鍵にも目印がない登録の型（保存の前の確かめの送信など。本当の保存は見ていない）。
+  'SCENARIO_API_FIELD_VALUES_NOT_SENT',
 ] as const);
 export type ScenarioDraftRejectionReason = (typeof SCENARIO_DRAFT_REJECTION_REASONS)[number];
 

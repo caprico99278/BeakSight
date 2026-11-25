@@ -1,5 +1,6 @@
 import type { EvidenceId, EvidencePayloadByType, Severity } from '../core/contracts.js';
 import type {
+  ClippedTextEvidence,
   LayoutEvidence,
   NotificationFrameHiddenReason,
   NotificationOverlayEvidence,
@@ -10,6 +11,7 @@ import type { FindingFingerprintIdentityField } from '../core/ids.js';
 import { compareCodeUnits, truncateText } from '../core/text.js';
 import { formatDecimal, formatPercent, formatPixels } from '../presentation/format.js';
 import {
+  ELEMENT_OVERLAP_TEXT,
   FIXED_OCCLUSION_REVEAL_TEXT,
   FIXED_OVERLAP_READ_TARGET_TEXT,
   FIXED_OVERLAP_TEXT,
@@ -27,16 +29,20 @@ import {
   layoutSourcesOfPayload,
   occlusionFindingViewOf,
   occlusionRevealOf,
+  occlusionTargetsInViewport,
   oversizedFindingViewOf,
+  revealedTargetsInState,
   type ClassifiedOcclusionPair,
   type FixedOverlapFindingView,
   type LayoutScope,
   type OcclusionLayoutKind,
 } from './fixed-overlap-classes.js';
+import { findingClassKeyOf } from './finding-grouping-keys.js';
 import { OVERLAP_MIN_AREA_RATIO, overlapFindingPairsOf, type OverlapRuleId } from './overlap-pairs.js';
 import {
   LINE_CLAMP_VISIBLE_LINE_TOLERANCE,
   MAX_IGNORED_CLIPPED_OVERFLOW_PX,
+  cutScrollRegionsOf,
   isClippedToZeroArea,
   textClippingDirectionsOf,
 } from './text-clipping.js';
@@ -115,6 +121,10 @@ const layoutDraft = ({ ruleId, severity, message, evidenceId, identityFields }: 
   identityFields,
 });
 
+/** AUD-5: 下書きに、fingerprint に入れない鍵（区分の鍵など。`FindingDraft.linkKeys`）を足す（なければ、そのまま）。 */
+const withLinkKeys = (draft: FindingDraft, linkKeys: readonly FindingFingerprintIdentityField[] | undefined): FindingDraft =>
+  (linkKeys === undefined || linkKeys.length === 0 ? draft : { ...draft, linkKeys });
+
 const layoutRule = (
   ruleId: string,
   severity: Severity,
@@ -131,21 +141,17 @@ const layoutRule = (
 });
 
 /** 1つの layout の判定の結果（Evidence の ID と、幅の情報を付ける前のもの）。 */
-type LayoutJudgement = Omit<LayoutDraftSpec, 'ruleId' | 'severity' | 'evidenceId'>;
+type LayoutJudgement = Omit<LayoutDraftSpec, 'ruleId' | 'severity' | 'evidenceId'> & {
+  /** AUD-5: fingerprint に入れない鍵（区分の鍵など）。省略は、なし。 */
+  readonly linkKeys?: readonly FindingFingerprintIdentityField[];
+};
 
 /**
  * EV-2（設計書 `2026-11-16-beaksight-finding-evidence-design.md` 3.2）: layout の Evidence と同じ状態・同じ幅で、対象まで動かして撮った画像の測り直しの記録
  * （その画像の Evidence の `reveal`）。状態のない前の版の Evidence は、空。
  */
-const revealsOf = (input: PageRuleInput, evidenceId: EvidenceId, stressWidth: number | null): readonly RevealedTargetEvidence[] => {
-  const stateId = input.evidence.find((record) => record.evidenceId === evidenceId)?.capture?.stateId;
-  if (stateId === undefined) {
-    return [];
-  }
-  return evidenceOfType(input, 'screenshot')
-    .filter((record) => record.capture?.stateId === stateId && (record.payload.stressWidth ?? null) === stressWidth)
-    .flatMap((record) => record.payload.reveal?.targets ?? []);
-};
+const revealsOf = (input: PageRuleInput, evidenceId: EvidenceId, stressWidth: number | null): readonly RevealedTargetEvidence[] =>
+  revealedTargetsInState(input.evidence, input.evidence.find((record) => record.evidenceId === evidenceId)?.capture?.stateId, stressWidth);
 
 /**
  * layout の事実を1つずつ判定する Rule。判定（`judge`）は `primary` と幅ごとの結果で同じものを使い、
@@ -160,14 +166,14 @@ const layoutFactRule = (
   judge: (layout: LayoutEvidence, reveals: readonly RevealedTargetEvidence[]) => readonly LayoutJudgement[],
 ): AuditRule => layoutRule(ruleId, severity, plainMessage, (input, draft) =>
   layoutsOf(input, scope).flatMap(({ evidenceId, layout, stressWidth }) =>
-    judge(layout, revealsOf(input, evidenceId, stressWidth)).map(({ message, identityFields }) => (stressWidth === null
+    judge(layout, revealsOf(input, evidenceId, stressWidth)).map(({ message, identityFields, linkKeys }) => withLinkKeys(stressWidth === null
       ? draft({ message, evidenceId, identityFields })
       : draft({
         // BN-c: 文の形は `stressWidthFindingMessageText` の 1 か所（幅の読み込みと指摘の結び付けも、同じ関数で照らす）。
         message: stressWidthFindingMessageText(formatPixels(stressWidth), message),
         evidenceId,
         identityFields: [...identityFields, { name: STRESS_WIDTH_IDENTITY_FIELD_NAME, value: String(stressWidth) }],
-      })))));
+      }), linkKeys))));
 
 // ---------------------------------------------------------------------------------------------------------------
 // DOCUMENT_HORIZONTAL_OVERFLOW
@@ -268,14 +274,17 @@ const elementOutsideViewport = layoutFactRule('ELEMENT_OUTSIDE_VIEWPORT', 'WARN'
 
 const overlapRule = (ruleId: OverlapRuleId, subject: string, plainMessage: string) =>
   layoutFactRule(ruleId, 'WARN', plainMessage, 'PRIMARY_AND_STRESS_SWEEP', (layout) =>
-    overlapFindingPairsOf(layout, ruleId).map(({ firstSelector, secondSelector, overlapArea, ratio }) => ({
+    overlapFindingPairsOf(layout, ruleId).map(({ firstSelector, secondSelector, overlapArea, ratio, intendedPlacement }) => ({
       message: `${subject} ${firstSelector} と ${secondSelector} が重なっています（重なりの面積 `
         + `${formatDecimal(overlapArea)} px²。小さい方の要素の面積の ${formatPercent(ratio)} で、`
-        + `しきい値 ${formatPercent(OVERLAP_MIN_AREA_RATIO)} を超えています）。`,
+        + `しきい値 ${formatPercent(OVERLAP_MIN_AREA_RATIO)} を超えています）。`
+        // AUD-5（S-02）: 画像の上に意図して置いた押せる部品の候補は、文で分け、区分の鍵を付ける（確信度は候補群で下げる。重さは変えない）。
+        + (intendedPlacement ? ELEMENT_OVERLAP_TEXT.intendedPlacementNote : ''),
       identityFields: [
         { name: 'firstSelector', value: firstSelector },
         { name: 'secondSelector', value: secondSelector },
       ],
+      ...(intendedPlacement ? { linkKeys: [findingClassKeyOf('INTENDED_PLACEMENT')] } : {}),
     })));
 
 // ---------------------------------------------------------------------------------------------------------------
@@ -288,29 +297,45 @@ const overlapRule = (ruleId: OverlapRuleId, subject: string, plainMessage: strin
  */
 const textClipping = layoutFactRule('TEXT_CLIPPING', 'WARN',
   '文字の一部が、欄からはみ出して切れています。最後まで読めないところがあります。',
-  'PRIMARY', (layout) =>
-  layout.clippedText.flatMap((clipped) => {
-    const directions = textClippingDirectionsOf(clipped);
-    if (directions === null) {
-      return [];
-    }
-    const details: string[] = [];
-    const { horizontal, vertical } = directions;
-    if (horizontal) {
-      details.push(`横方向: overflow-x: ${clipped.overflowX}、表示の幅 ${formatPixels(clipped.clientWidth)}、`
-        + `内容の幅 ${formatPixels(clipped.scrollWidth)}`);
-    }
-    if (vertical) {
-      details.push(`縦方向: overflow-y: ${clipped.overflowY}、表示の高さ ${formatPixels(clipped.clientHeight)}、`
-        + `内容の高さ ${formatPixels(clipped.scrollHeight)}`);
-    }
-    const excerpt = truncateText(clipped.text, CLIPPED_TEXT_EXCERPT_LENGTH);
-    const text = `${excerpt.text}${excerpt.truncated || clipped.truncated ? '…' : ''}`;
-    return [{
-      message: `要素 ${clipped.selector} のテキストが見切れています（${details.join('。')}）。テキストの先頭: 「${text}」`,
-      identityFields: [{ name: 'selector', value: clipped.selector }],
-    }];
-  }));
+  'PRIMARY', (layout) => {
+    // S-06: 端が外枠で切れる内側のスクロール領域は、その領域を対象に 1 件（入れ子の外枠で同じ領域を 2 回数えない）。
+    const reportedRegions = new Set<string>();
+    return layout.clippedText.flatMap((clipped) => [...textClippingFindingOf(clipped), ...cutScrollRegionsOf(clipped).flatMap((region) => {
+      if (reportedRegions.has(region.selector)) {
+        return [];
+      }
+      reportedRegions.add(region.selector);
+      return [{
+        message: `要素 ${region.selector} の内側のスクロール領域の端が、外枠 ${clipped.selector} で切れています（外枠の overflow-y: ${clipped.overflowY}、`
+          + `overflow-x: ${clipped.overflowX}）。スクロールしても、切れた所は見えません。`,
+        identityFields: [{ name: 'selector', value: region.selector }],
+      }];
+    })]);
+  });
+
+/** `TEXT_CLIPPING`: 外枠の中の文字が見切れる指摘（指摘にしなければ空）。 */
+function textClippingFindingOf(clipped: ClippedTextEvidence): readonly LayoutJudgement[] {
+  const directions = textClippingDirectionsOf(clipped);
+  if (directions === null) {
+    return [];
+  }
+  const details: string[] = [];
+  const { horizontal, vertical } = directions;
+  if (horizontal) {
+    details.push(`横方向: overflow-x: ${clipped.overflowX}、表示の幅 ${formatPixels(clipped.clientWidth)}、`
+      + `内容の幅 ${formatPixels(clipped.scrollWidth)}`);
+  }
+  if (vertical) {
+    details.push(`縦方向: overflow-y: ${clipped.overflowY}、表示の高さ ${formatPixels(clipped.clientHeight)}、`
+      + `内容の高さ ${formatPixels(clipped.scrollHeight)}`);
+  }
+  const excerpt = truncateText(clipped.text, CLIPPED_TEXT_EXCERPT_LENGTH);
+  const text = `${excerpt.text}${excerpt.truncated || clipped.truncated ? '…' : ''}`;
+  return [{
+    message: `要素 ${clipped.selector} のテキストが見切れています（${details.join('。')}）。テキストの先頭: 「${text}」`,
+    identityFields: [{ name: 'selector', value: clipped.selector }],
+  }];
+}
 
 // ---------------------------------------------------------------------------------------------------------------
 // FIXED_ELEMENT_OCCLUSION
@@ -394,12 +419,15 @@ const judgeFixedElementOcclusion = (
   return [...summaries].map(([overlaySelector, summary]) => {
     // EV-2: 動かして測り直した結果（末尾でも隠れる・スクロールで避けられる・初めの位置だけ）を文に足し、「押せません」は結果で言えるときだけにする。
     const reveal = occlusionRevealOf(summary.pairs, reveals);
+    // RVP-2: 対象が画像の外に出るときは、「隠しています」と言い切らず、計った数の事実だけを書く。
+    const inImage = occlusionTargetsInViewport(summary.pairs, layout.document.viewportWidth, layout.document.viewportHeight);
     return {
       message: `先頭の位置で、固定要素 ${overlaySelector}（position: ${summary.overlayPosition}）が、主要要素 `
         + `${summary.coveredSelectors.size} 件を覆っています。最も大きく覆われた要素は ${summary.largestSelector} で、`
         + `ビューポートの中に見えている面積の ${formatPercent(summary.largestRatio)} が重なっています`
-        + `（しきい値 ${formatPercent(FIXED_OCCLUSION_MIN_COVERED_RATIO)}）。${fixedOverlapSentenceOf(occlusionFindingViewOf(summary.pairs), reveal.pressBlocked)}`
-        + (reveal.outcome === null ? '' : FIXED_OCCLUSION_REVEAL_TEXT[reveal.outcome]),
+        + `（しきい値 ${formatPercent(FIXED_OCCLUSION_MIN_COVERED_RATIO)}）。`
+        + (inImage ? fixedOverlapSentenceOf(occlusionFindingViewOf(summary.pairs), reveal.pressBlocked) : '')
+        + (!inImage || reveal.outcome === null ? '' : FIXED_OCCLUSION_REVEAL_TEXT[reveal.outcome]),
       identityFields: [{ name: 'overlaySelector', value: overlaySelector }],
     };
   });
@@ -514,11 +542,17 @@ const NOTIFICATION_NOT_DISMISSIBLE_MESSAGES: Readonly<Record<NotificationFrameHi
   NO_CLOSE_BUTTON: '画面の大きな部分を覆う通知の枠に、閉じるボタンがありません。',
 });
 
-/** 主の読み込みと幅の走査の、通知の枠の事実（主の読み込みが先。幅の順）。 */
-const notificationOverlaysOf = (payload: EvidencePayloadByType['layout']): readonly NotificationOverlayEvidence[] => [
-  ...(payload.notificationOverlay === undefined ? [] : [payload.notificationOverlay]),
-  ...(payload.stressNotificationOverlays ?? []).map(({ overlay }) => overlay),
+/** 主の読み込みと幅の走査の、通知の枠の事実と、読んだ幅（主の読み込みは `null`。主の読み込みが先。幅の順）。 */
+const notificationOverlaySourcesOf = (
+  payload: EvidencePayloadByType['layout'],
+): readonly { readonly overlay: NotificationOverlayEvidence; readonly stressWidth: number | null }[] => [
+  ...(payload.notificationOverlay === undefined ? [] : [{ overlay: payload.notificationOverlay, stressWidth: null }]),
+  ...(payload.stressNotificationOverlays ?? []).map(({ overlay, width }) => ({ overlay, stressWidth: width })),
 ];
+
+/** 主の読み込みと幅の走査の、通知の枠の事実（主の読み込みが先。幅の順）。 */
+const notificationOverlaysOf = (payload: EvidencePayloadByType['layout']): readonly NotificationOverlayEvidence[] =>
+  notificationOverlaySourcesOf(payload).map(({ overlay }) => overlay);
 
 /**
  * DEF-210（設計書 `2026-11-06-beaksight-notification-overlay-design.md` 3.4）: 閉じられない通知の枠（押しても残る、閉じるボタンが押せない、閉じるボタンがなく
@@ -528,18 +562,33 @@ const notificationNotDismissible = layoutRule('NOTIFICATION_NOT_DISMISSIBLE', 'W
   'ページの通知の枠を閉じられません。画面の一部が、ずっと覆われたままになります。',
   (input, draft) => evidenceOfType(input, 'layout').flatMap((record) => {
     const reasons = new Map<string, NotificationFrameHiddenReason>();
-    for (const overlay of notificationOverlaysOf(record.payload)) {
+    // S-03a: 「隠しました」は、実際に隠した（`hidden`）枠だけ（隠せなかった・期限切れ・移動の後は付けない）。RVP-3: 隠した所（主の読み込みは `null`、
+    // 幅の走査は幅）も、読み込んだ順に残す。
+    const hiddenAt = new Map<string, (number | null)[]>();
+    for (const { overlay, stressWidth } of notificationOverlaySourcesOf(record.payload)) {
       for (const frame of overlay.frames) {
         if (frame.hiddenReason !== null && !reasons.has(frame.digest)) {
           reasons.set(frame.digest, frame.hiddenReason);
         }
+        if (frame.hiddenReason !== null && frame.hidden && !(hiddenAt.get(frame.digest) ?? []).includes(stressWidth)) {
+          hiddenAt.set(frame.digest, [...(hiddenAt.get(frame.digest) ?? []), stressWidth]);
+        }
       }
     }
-    return [...reasons].map(([digest, reason]) => draft({
-      message: `${NOTIFICATION_NOT_DISMISSIBLE_MESSAGES[reason]}点検のために、その枠を隠しました。`,
-      evidenceId: record.evidenceId,
-      identityFields: [{ name: NOTIFICATION_FRAME_IDENTITY_FIELD_NAME, value: digest }],
-    }));
+    // RVP-3: 隠した所の、隠す前の画像（同じ状態・同じ幅）を参照に足す。
+    const beforeHideShots = evidenceOfType(input, 'screenshot')
+      .filter((shot) => shot.payload.beforeNotificationHide === true && shot.capture?.stateId === record.capture?.stateId);
+    return [...reasons].map(([digest, reason]) => {
+      const places = hiddenAt.get(digest) ?? [];
+      const shots = places.flatMap((width) => beforeHideShots.filter((shot) => (shot.payload.stressWidth ?? null) === width).map((shot) => shot.evidenceId));
+      const value = draft({
+        message: `${NOTIFICATION_NOT_DISMISSIBLE_MESSAGES[reason]}${places.length === 0 ? '' : NOTIFICATION_OVERLAY_TEXT.hiddenAt(places.map((width) =>
+          (width === null ? NOTIFICATION_OVERLAY_TEXT.primaryPlace : NOTIFICATION_OVERLAY_TEXT.stressWidthPlace(formatPixels(width)))))}`,
+        evidenceId: record.evidenceId,
+        identityFields: [{ name: NOTIFICATION_FRAME_IDENTITY_FIELD_NAME, value: digest }],
+      });
+      return shots.length === 0 ? value : { ...value, evidenceRefs: [...value.evidenceRefs, ...shots] };
+    });
   }));
 
 /**

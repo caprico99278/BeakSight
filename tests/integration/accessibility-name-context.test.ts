@@ -3,9 +3,12 @@
 // 動かさない）。色差の要素の AX の無効の状態も読む。AX を読んでも、サーバへの要求は増えない。
 import type { Browser } from 'playwright';
 import { afterEach, describe, expect, it } from 'vitest';
+import { ACCESSIBILITY_RULES } from '../../src/audit/accessibility-rules.js';
 import { labelInNameOf } from '../../src/audit/label-in-name.js';
 import { BrowserContextFactory } from '../../src/browser/context-factory.js';
-import type { AccessibilityNodeEvidence } from '../../src/core/evidence-types.js';
+import type { AccessibilityNodeEvidence, NormalizedHttpUrlEvidence } from '../../src/core/evidence-types.js';
+import { createEvidenceId, createPageId } from '../../src/core/ids.js';
+import { DISABLED_STATE_TEXT } from '../../src/presentation/messages.js';
 import { readAccessibilityAxFacts } from '../../src/evidence/accessibility-ax.js';
 import { collectAccessibilityEvidence } from '../../src/evidence/accessibility-collector.js';
 import { SafetyLedger } from '../../src/safety/safety-ledger.js';
@@ -25,6 +28,13 @@ const PAGE = '<!doctype html><html lang="ja"><head><meta charset="utf-8"><link r
   // 無効の操作と有効の操作（色差が足りない文字）。
   + '<button id="off" disabled style="color: #aaa; background: #fff">押せない</button>'
   + '<button id="on" style="color: #aaa; background: #fff">押せる</button>'
+  // S-01a: `display: contents` の入れ物の中の文字は 1 回だけ。別の節の同じ文字は両方数える。
+  + '<button id="dup" aria-label="x"><span style="display:contents"><span>保存</span></span><span>保存</span></button>'
+  // RVP-4: 名前のない、無効のボタンと有効のボタン。
+  + '<button id="noname-off" disabled></button><button id="noname-on"></button>'
+  // RVP-5: 名前の参照先がない・見えない（空）・見える（空白だけ）入力欄。
+  + '<input id="ref-missing" aria-labelledby="no-such-label"><input id="ref-hidden" aria-labelledby="hidden-label"><span id="hidden-label" hidden></span>'
+  + '<input id="ref-visible" aria-labelledby="blank-label"><span id="blank-label"> </span>'
   + '</main></body></html>';
 
 let browser: Browser;
@@ -59,7 +69,7 @@ describe('AUD-4b: the name context of the label-in-name violations from the acce
       await page.goto(`${origin}/name-context`, { waitUntil: 'load' });
       const before = requestCount;
       const evidence = await collectAccessibilityEvidence(page);
-      const axDirect = await readAccessibilityAxFacts(page, [[ '#off' ], [ '#on' ], [ '#missing' ]]);
+      const axDirect = await readAccessibilityAxFacts(page, [[ '#off' ], [ '#on' ], [ '#missing' ], [ '#dup' ]]);
       // AX を読んでも（axe の後の読み取りを含む）、サーバへの要求は増えない。
       expect(requestCount).toBe(before);
 
@@ -90,6 +100,23 @@ describe('AUD-4b: the name context of the label-in-name violations from the acce
         expect.objectContaining({ status: 'READ', axDisabled: true }),
         expect.objectContaining({ status: 'READ', axDisabled: false }),
         { status: 'UNREADABLE', reason: 'NOT_FOUND' },
+        expect.objectContaining({ status: 'READ', labelSegments: ['保存', '保存'] }),
+      ]);
+
+      // RVP-4: 無効のボタンの名前の指摘にだけ、無効の状態で見つけた文が付く。
+      const record = { evidenceId: createEvidenceId('accessibility', 1), type: 'accessibility', pageId: createPageId(1), viewport: 'desktop',
+        observedAt: '2026-11-24T00:00:00.000Z', payload: evidence } as const;
+      const drafts = ACCESSIBILITY_RULES.flatMap((rule) => rule.evaluate({ pageId: createPageId(1), pageUrl: `${origin}/name-context` as NormalizedHttpUrlEvidence,
+        viewport: 'desktop', evidence: [record] }));
+      const noteOf = (selector: string) => drafts.find((draft) => draft.ruleId === 'A11Y_BUTTON_NAME'
+        && draft.identityFields.some(({ value }) => value === JSON.stringify([selector])))?.message.includes(DISABLED_STATE_TEXT.nameRuleDisabledNote);
+      expect([noteOf('#noname-off'), noteOf('#noname-on')]).toEqual([true, false]);
+      // RVP-5: 名前の参照先の数と、見えるか（ない・見えない・見える）。
+      const named = evidence.violations.flatMap((rule) => rule.nodes);
+      expect(['#ref-missing', '#ref-hidden', '#ref-visible'].map((selector) => nodeOf(named, selector)?.labelledBy)).toEqual([
+        { idCount: 1, foundCount: 0, visibility: 'MISSING' },
+        { idCount: 1, foundCount: 1, visibility: 'HIDDEN' },
+        { idCount: 1, foundCount: 1, visibility: 'VISIBLE' },
       ]);
     });
   }, TEST_TIMEOUT_MS);

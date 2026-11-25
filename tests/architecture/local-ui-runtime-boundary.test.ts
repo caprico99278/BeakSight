@@ -7,6 +7,8 @@
  * - (2) 本番の値を作る `productionLocalUiRuntimeOptions` と、場所からリポジトリの root を決める `repositoryRootOf` を使うのは owner だけ（1 か所）。
  * - (3) owner は、環境変数と起動の引数（`process.env`・`process.argv`）を読まない（利用者が触れる口から根を変えられない）。
  * - (4) ワーカーの入口の本番の値（`audit-worker.js` の名前）を画面のコードに書くのは owner だけ。
+ * - (5) 端末のメモリの読み取りの差し替え（ジョブの管理のオプション `machineMemory`）を渡す製品のコードはない。ジョブの管理は、渡されなければ端末の今の値を読む
+ *   （REV-PAR の m-5。テストだけが値を差し込む）。
  */
 import { readFileSync } from 'node:fs';
 import { join } from 'node:path';
@@ -31,6 +33,9 @@ const INSTALL_NAME = 'installLocalUiRuntime';
 const OWNER_ONLY_NAMES: readonly string[] = ['productionLocalUiRuntimeOptions', 'repositoryRootOf'];
 const WORKER_ENTRY_NAME = 'audit-worker.js';
 const ARGUMENT_READS = /\bprocess\s*\.\s*(?:env|argv)\b/u;
+/** REV-PAR の m-5: 端末のメモリの読み取りの差し替えの口（ジョブの管理のオプション）と、その定義の場所。 */
+const MACHINE_MEMORY_OPTION = 'machineMemory';
+const JOB_MANAGER_PATH = 'src/control/job/audit-job-manager.ts';
 
 /** 製品のコード（パスと走査の結果）。読み込みは 1 回だけ。 */
 const PRODUCTION_FILES: readonly (ScannedSource & { readonly path: string })[] = [
@@ -72,6 +77,16 @@ describe('local-ui-runtime-boundary: the data root and the worker entry are inst
       sample('apps/local-ui/src/server/audit-jobs.ts', "const path = join(root, 'dist', 'worker', 'audit-worker.js');"),
       sample('apps/local-ui/src/server/control-store.ts', 'const root = repositoryRootOf(import.meta.url);'),
     ])).toEqual(['apps/local-ui/src/server/audit-jobs.ts: audit-worker.js', 'apps/local-ui/src/server/control-store.ts: repositoryRootOf']);
+  });
+
+  // REV-PAR の m-5: 本番の入口（画面のサーバのジョブの管理 `localUiAuditJobs`）は、端末のメモリの読み取りを差し替えず、ジョブの管理の既定（端末の今の値）を使う。
+  it('(5) no production code passes machineMemory; the job manager defaults to the machine values', () => {
+    const passes = (files: readonly (ScannedSource & { readonly path: string })[]): readonly string[] =>
+      files.filter((file) => file.path !== JOB_MANAGER_PATH && countIdentifier(file.bare, MACHINE_MEMORY_OPTION) > 0).map((file) => file.path);
+    expect(passes(PRODUCTION_FILES)).toEqual([]);
+    expect(PRODUCTION_FILES.find((file) => file.path === JOB_MANAGER_PATH)?.code).toContain('options.machineMemory ?? readMachineMemory');
+    expect(passes([sample('apps/local-ui/src/server/audit-jobs.ts', 'createAuditJobManager({ database, machineMemory: () => memory });')]))
+      .toEqual(['apps/local-ui/src/server/audit-jobs.ts']);
   });
 
   it('(3) the owner reads neither the environment variables nor the command arguments', () => {

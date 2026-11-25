@@ -14,7 +14,8 @@
 // - 値は持たない（I22）: 本文はメモリの中で型を作るためだけに読み、型と数だけを残す。型を作る部品の例外は、文を残さずに数える。
 // - Guard のほかから書けないよう、状態はこのファイルの中だけ（`observationStates`）に置く。`observationAdmitsFrozenPreflight`・
 //   `recordObservedFrozenRequest`・`recordObservedFrozenPreflight`・`attachSubmissionObservation` は Guard だけが呼ぶ。
-import { apiRequestShapeOf, type ApiRequestBody, type ApiRequestOriginShape, type ApiRequestShape } from '../core/api-request-shape.js';
+import { apiEndpointShapeKeyOf, apiRequestShapeOf, type ApiRequestBody, type ApiRequestOriginShape, type ApiRequestShape } from '../core/api-request-shape.js';
+import { requestEndpointPartsOf } from '../core/request-endpoint-key.js';
 import { fieldNameHasStateWord } from '../discovery/classify.js';
 import { hasAllowedOrigin, isReadMethod } from './request-policy.js';
 import { requestCarriesMarker } from './write-stage-unexpected-requests.js';
@@ -211,6 +212,21 @@ function originShapeOf(url: string, state: ObservationState): ApiRequestOriginSh
     return { kind: 'APPROVED_TEST', index: testIndex };
   }
   return hasAllowedOrigin(url, new Set(state.allowedOrigins)) ? { kind: 'ALLOWED' } : { kind: 'OTHER' };
+}
+
+/**
+ * QUIET-3（設計書 `2026-11-24-beaksight-discovery-stuck-step-design.md` 2.3）: 要求の口の鍵（`requestEndpointKeyOf`）を、この口の型と突き合わせる鍵
+ * （`apiShapeEndpointKeyOf`）にする（Origin の区分はこの口の一覧で決める）。読めない鍵は null。投げない。
+ */
+export function observedEndpointShapeKeyOf(observation: SubmissionObservation, endpointKey: string): string | null {
+  const state = observationStates.get(observation);
+  const parts = requestEndpointPartsOf(endpointKey);
+  if (state === undefined || parts === null) return null;
+  try {
+    return apiEndpointShapeKeyOf(parts.method, originShapeOf(`${parts.origin}/`, state), parts.pathname);
+  } catch {
+    return null;
+  }
 }
 
 /** Guard が凍結の段の事前確認を満たした（観察の間だけ数える）。 */

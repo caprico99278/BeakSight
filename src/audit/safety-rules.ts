@@ -1,7 +1,7 @@
 import type { EvidenceId } from '../core/contracts.js';
 import type { SafetyEventsEvidence } from '../core/evidence-types.js';
 import { listText } from '../presentation/messages.js';
-import { isReadMethod } from '../safety/request-policy.js';
+import { isReadMethod, SCROLL_KEY_PRESS_BLOCK_REASON } from '../safety/request-policy.js';
 import type { AuditRule, FindingDraft, PageRuleInput, RulePlainMessageOwner } from './rule.js';
 import { distinctSorted, evidenceOfType } from './rule-helpers.js';
 
@@ -122,7 +122,8 @@ export const SAFETY_RULES: readonly AuditRule[] = Object.freeze([
   safetyRule({
     ruleId: 'SAFETY_WEBSOCKET_BLOCKED',
     plainMessage: 'サイトとつなぎっぱなしにする通信を、安全のために止めました。',
-    facts: (payload) => [...payload.blockedWebSockets, ...payload.blockedInteractionWebSockets]
+    // FRETWS（設計書 `2026-11-25-beaksight-discovery-sibling-press-design.md` 2.2）: 窓を開くボタンの押す期間に止めた接続は、BeakSight の押下の記録なので数えない。
+    facts: (payload) => [...payload.blockedWebSockets.filter((event) => event.reason !== SCROLL_KEY_PRESS_BLOCK_REASON), ...payload.blockedInteractionWebSockets]
       .map((event) => ({ sample: event.url, kind: event.reason })),
     describe: (count, kinds, sample) =>
       `WebSocket の接続を ${count} 件遮断しました（理由: ${kinds}、例: ${sample}）。`,

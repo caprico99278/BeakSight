@@ -132,7 +132,7 @@ const readOutcome: ReadCheckRunOutcome = {
   runDirectory: resolve(OUTPUT_DIRECTORY, READ_RUN),
   runStatus: 'COMPLETE',
   exitCode: EXIT_CODES.COMPLETE,
-  summary: { checks: 1, executed: 1 },
+  summary: { checks: 1, executed: 1, searchChecks: 0, searchCheckErrors: 0 },
   endReason: 'COMPLETED',
 };
 

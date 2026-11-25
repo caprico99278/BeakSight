@@ -23,7 +23,14 @@ import {
   findingCategoriesInSection,
   sortByDisplayOrder,
 } from '../../src/presentation/catalog.js';
-import { describeIncompleteReason, describeInteractionReason, nextStepOfIncompleteReason } from '../../src/presentation/messages.js';
+import { formatInteger } from '../../src/presentation/format.js';
+import {
+  describeIncompleteReason,
+  describeInteractionReason,
+  nextStepOfIncompleteReason,
+  samenessPageText,
+  samenessSummaryText,
+} from '../../src/presentation/messages.js';
 import { buildReportViewModel, type ReportViewModel } from '../../src/report/view-model.js';
 import {
   FIXTURE_ORIGIN,
@@ -916,5 +923,34 @@ describe('buildReportViewModel: immutability', () => {
 
   it('builds the same model from the same Run (deterministic)', () => {
     expect(JSON.stringify(buildReportViewModel(auditRun()))).toBe(JSON.stringify(buildReportViewModel(auditRun())));
+  });
+});
+
+// DUP（設計書 `2026-11-18-beaksight-same-structure-pages-design.md` 3 章）: 軽い点検と省いた画面を、まとめの 1 文と画面ごとの 1 文で伝える。省いた画面の Mobile は、
+// まだ見ていない数に入れない。
+describe('buildReportViewModel: the pages of the same template (DUP)', () => {
+  const sameMobile = (path: string) => ({
+    status: 'SKIPPED' as const, requestedUrl: url(path), finalUrl: null, httpStatus: null, navigationOutcome: null,
+    incompleteReasons: [{ code: 'SAME_CONTENT_AS_EARLIER_PAGE' as const, detail: PAGE_1 }],
+  });
+  const model = buildReportViewModel(buildAuditRun({
+    pages: [
+      page(PAGE_1, '/customers/1'),
+      page(PAGE_2, '/customers/2', 'AUDITED', [], [], { sameness: { depth: 'LIGHT', sameAs: PAGE_1 } }),
+      page(PAGE_3, '/customers/1?returnTo=a', 'AUDITED', [], [], {
+        sameness: { depth: 'SAME', sameAs: PAGE_1 },
+        viewports: { desktop: page(PAGE_3, '/customers/1?returnTo=a').viewports.desktop, mobile: sameMobile('/customers/1?returnTo=a') },
+      }),
+    ],
+  }));
+
+  it('says how many pages were audited lightly or skipped, and for each such page which page it is the same as', () => {
+    expect(model.summary.samenessNote).toBe(samenessSummaryText(1, 1, formatInteger));
+    expect(model.pages.map(({ samenessNote }) => samenessNote)).toEqual([
+      null,
+      samenessPageText('LIGHT', url('/customers/1')),
+      samenessPageText('SAME', url('/customers/1')),
+    ]);
+    expect(model.summary.evidenceSufficiency.uncollectedViewportCount).toBe(0);
   });
 });

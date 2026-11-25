@@ -2,7 +2,7 @@
 // （`CoverageQueue`）に寄せ、画面の上限をなくした。本物の発見の流れ（`executeDiscoveryRun`。Guard・凍結・押す部品）と、127.0.0.1 の仮のサイト
 // （`tests/helpers/coverage-site.ts`。一般の文言）で確かめる。押して出させた書き込みの到着（サーバの記録）は、2 つの Chromium の両方で 0。
 // - 番号だけ違う同じ作りの画面を全部読み、押すのは最初の 1 つだけ（ほかは `SAME_STATE_PRESSED`）。
-// - 状態の語だけ違う画面（確定・取り消し済み）は、両方で押す。
+// - 状態の語だけ違う画面（確定・取り消し済み）は、PSKIP から、data を除いた path が同じなので、前の画面で押した同じボタンを押し直さない（理由を残す）。
 // - query の一覧の続きのページを、新しいリンクが出る間は読む。日付の「次へ」で空の日が続くと閉じる（読む数が増え続けない）。
 // - 予約の画面で、拠点と時間の枠の両方を押す（文字のないボタンを段をまたいで同じ候補とみなさない）。段が移った後に、元の状態の残りを押す（読み込み直し）。
 // - 押した数が 3 を超えても、読み込み直しが働く。
@@ -51,10 +51,15 @@ describe.each(DEFAULT_CHROMIUM_LAUNCHERS)('COV-2: the discovery widens the cover
       expect(itemProbes.filter((candidate) => candidate.submissionProbe?.reason === 'SAME_STATE_PRESSED')).toHaveLength(3);
 
       // 状態の語だけ違う画面は、両方で押す。
-      for (const path of ['/orders/1', '/orders/2']) {
-        const [order] = readOf(document, path);
-        expect(order?.record.candidates.filter(pressed).length, path).toBeGreaterThan(0);
-      }
+      // PSKIP: data を除いた path が同じ画面（`/orders/1` と `/orders/2`）では、前の画面で押した同じボタンを押し直さない（`SAME_STATE_PRESSED`）。その画面に
+      // だけあるボタンは押す（押していない候補は、押し直さない同じボタンだけ）。
+      const [firstOrder] = readOf(document, '/orders/1');
+      const [secondOrder] = readOf(document, '/orders/2');
+      expect(firstOrder?.record.candidates.filter(pressed).length, '/orders/1').toBeGreaterThan(0);
+      const secondButtons = secondOrder?.record.candidates.filter((candidate) => candidate.kind === 'BUTTON') ?? [];
+      expect(secondButtons.length, '/orders/2').toBeGreaterThan(0);
+      expect(secondButtons.filter((candidate) => !pressed(candidate)).map((candidate) => candidate.submissionProbe?.reason), '/orders/2')
+        .toEqual(secondButtons.filter((candidate) => !pressed(candidate)).map(() => 'SAME_STATE_PRESSED'));
 
       // query の一覧の続きのページを全部読む。日付の「次へ」は、空の日が続くと閉じる。
       expect(readPages(document).filter((page) => pathOf(page.url) === '/list').map((page) => new URL(page.url).search).sort())

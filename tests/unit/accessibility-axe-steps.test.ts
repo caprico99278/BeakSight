@@ -40,4 +40,27 @@ describe('collectAccessibilityWith: the steps of the axe read through the port',
     expect(evidence).toMatchObject({ status: 'COMPLETE', violations: [], incomplete: [] });
     expect(calls).toEqual(['scroll', 'axe']);
   });
+
+  // AUD-6（S-10）: axe が切り詰めた抜粋の印、重複 ID の他の出現の目印（selector だけ）、名前の規則の違反の要素の名前の根拠を残す。
+  it('keeps the truncation by axe, the selectors of the related nodes, and the name source of an element without a name', async () => {
+    const analyzed = { incomplete: [], violations: [
+      { id: 'duplicate-id', impact: 'minor', help: 'h', helpUrl: 'u', tags: [], nodes: [{
+        impact: 'minor', target: ['#dup'], html: '<div id="dup" class="card" ...>', failureSummary: null,
+        any: [{ id: 'duplicate-id', data: 'dup', relatedNodes: [{ target: ['main > #dup'], html: '<p id="dup">本文</p>' }] }], all: [], none: [],
+      }] },
+      { id: 'button-name', impact: 'critical', help: 'h', helpUrl: 'u', tags: [], nodes: [{
+        impact: 'critical', target: ['#icon'], html: '<button id="icon"></button>', failureSummary: null, any: [], all: [], none: [],
+      }] },
+    ] } as unknown as Awaited<ReturnType<AccessibilityAxePort['analyze']>>;
+    const context = { status: 'READ', axName: null, axRole: 'button', axDisabled: false, nameSource: { type: 'contents', attribute: null }, labelSegments: [] } as const;
+    const evidence = await collectAccessibilityWith(portOf({
+      analyze: async () => analyzed,
+      readAxFacts: async () => ({ contrastAxDisabled: [], nameContexts: [context] }),
+    }, []), SIGNALS);
+    const [duplicate, button] = evidence.violations.map((rule) => rule.nodes[0]);
+    expect(duplicate).toMatchObject({ truncated: true, truncationKind: 'SOURCE_TRUNCATED' });
+    expect(JSON.stringify(duplicate?.checks)).toContain('main > #dup');
+    expect(JSON.stringify(duplicate?.checks)).not.toContain('本文');
+    expect(button).toMatchObject({ truncated: false, nameContext: { nameSource: { type: 'contents' } } });
+  });
 });

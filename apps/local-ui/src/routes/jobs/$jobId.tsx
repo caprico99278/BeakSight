@@ -13,6 +13,7 @@ import {
 } from '../../../../../src/presentation/format.js';
 import {
   AUDIT_JOB_FAILURE_REASON_DESCRIPTIONS,
+  AUDIT_JOB_START_REJECTION_DESCRIPTIONS,
   AUDIT_JOB_STOP_DIALOG_BODIES,
   AUDIT_JOB_STOP_REJECTION_DESCRIPTIONS,
   AUDIT_JOB_STOP_REQUESTED_TEXTS,
@@ -47,12 +48,14 @@ import {
 import { MINUTE_MS } from '../../../../../src/core/time-units.js';
 import { AdvancedSettings } from '../../components/AdvancedSettings';
 import { ConfirmDialog } from '../../components/ConfirmDialog';
+import { DownloadAllArtifacts } from '../../components/DownloadAllArtifacts';
 import { EntryCheckFacts, EntryCheckOutcome } from '../../components/EntryCheckResult';
 import { ProfileJobEndReason, RunEndReasons, profileJobEndHasNextStep } from '../../components/JobEndReasons';
 import { arrivedFromJobSearch } from '../../components/JobArrival';
 import { StageChainSteps, StageChainStopNotice } from '../../components/StageChainPanel';
 import { ExternalSchemeProbes, JobSafetyViolation, JobSafetyViolationDetails } from '../../components/JobSafetyViolation';
 import { PageIncompleteReasons } from '../../components/PageIncompleteReasons';
+import { SearchCheckOutcomePanel } from '../../components/SearchCheckOutcome';
 import { LoginStageObservationPanel, LoginStageQueryCell, LoginStageRegisterCell } from '../../components/LoginStageObservation';
 import { NextStepLinks } from '../../components/NextSteps';
 import { Notice } from '../../components/Notice';
@@ -100,6 +103,7 @@ import {
   WORKER_AUDIT_JOB_KIND,
   WORKER_ENTRY_CHECK_JOB_KIND,
   WORKER_LOGIN_CHECK_JOB_KIND,
+  WORKER_READ_CHECK_JOB_KIND,
 } from '../../../../../src/core/audit-job-values.js';
 // PRE42-CC 組 UI-K2（CC-113）: 認証の状態、まとめて実行の状態の値も、純粋な core の owner から読む（書き写さない。文字列で比べない）。
 import { RUNNING_CHAIN_STATE } from '../../../../../src/core/stage-chain-states.js';
@@ -222,9 +226,19 @@ function ResultLine({ job }: Readonly<{ job: AuditJobDetailView }>) {
 /** 待つ間の進み具合の 1 行（13 章の 11。見積もりはサーバの `progressRemainingMs` の値を分に切り上げるだけ）。 */
 function ProgressEstimate({ estimate }: Readonly<{ estimate: NonNullable<AuditJobDetailView['summary']['estimate']> }>) {
   const minutes = Math.max(1, Math.ceil(estimate.remainingMs / MINUTE_MS));
+  // DPROG: 点検はページの語、操作さがしは画面の語（見積もった作業の種類はサーバが決める）。
+  // RCA-8: 見るだけの確かめは検索の語（確かめた検索 N / 全部 M）。
+  const line = estimate.jobKind === WORKER_AUDIT_JOB_KIND
+    ? LOCAL_UI_JOB_SUMMARY_TEXT.progressEstimate
+    : estimate.jobKind === WORKER_READ_CHECK_JOB_KIND ? LOCAL_UI_JOB_SUMMARY_TEXT.searchProgressEstimate : LOCAL_UI_JOB_SUMMARY_TEXT.stageProgressEstimate;
+  // DSEED2: 連鎖の操作さがしは、見つけた画面を点検から引き継いだ画面と新しく見つけた画面に分けて言う（分けるかはサーバが決める）。
+  const split = estimate.pagesTotalSplit;
+  const totalText = split === undefined
+    ? formatInteger(estimate.pagesTotal)
+    : LOCAL_UI_AUDIT_TEXT.job.screensDiscoveredSplit(formatInteger(estimate.pagesTotal), formatInteger(split.fromAuditStage), formatInteger(split.newlyFound));
   return (
     <p data-testid="job-progress-estimate">
-      {LOCAL_UI_JOB_SUMMARY_TEXT.progressEstimate(formatInteger(estimate.pagesFinished), formatInteger(estimate.pagesTotal), formatInteger(minutes))}
+      {line(formatInteger(estimate.pagesFinished), totalText, formatInteger(minutes))}
     </p>
   );
 }
@@ -378,12 +392,57 @@ function JobFacts({ job }: Readonly<{ job: AuditJobDetailView }>) {
   );
 }
 
-/** 進み具合の数（最後の進み具合の知らせを、既存の書式で示す。値は事実のまま、計算しない）。 */
+/**
+ * DPROG: 操作さがし（と見るだけの確かめ）の段の進み具合（確かめた画面・見つけた画面・経過とバーだけ。値は事実のまま、計算しない）。
+ */
+function StageProgress({ kind, report }: Readonly<{ kind: AuditJobDetailView['jobKind']; report: NonNullable<AuditJobDetailView['lastProgress']> }>) {
+  const text = LOCAL_UI_AUDIT_TEXT.job;
+  // RCA-8: 見るだけの確かめは、確かめた検索・全部の検索の語（数はこの段のワーカーが数えた検索の確かめの組）。
+  const search = kind === WORKER_READ_CHECK_JOB_KIND;
+  return (
+    <section className="panel" data-testid="job-stage-progress" data-kind={kind}>
+      <h2 className="panel-heading">{text.stageProgressHeading(auditJobKindDisplay(kind).label)}</h2>
+      <progress
+        className="progress"
+        value={report.pagesFinished}
+        max={Math.max(report.pagesDiscovered, report.pagesFinished, 1)}
+        aria-label={search ? text.searchesProgressLabel : text.screensProgressLabel}
+      />
+      <dl className="facts">
+        <dt>{search ? text.searchesFinished : text.screensFinished}</dt>
+        <dd data-testid="job-screens-finished">{formatCount(report.pagesFinished)}</dd>
+        <dt>{search ? text.searchesTotal : text.screensDiscovered}</dt>
+        {/* DSEED2: 連鎖の操作さがしは、点検から引き継いだ画面と新しく見つけた画面に分けて出す（数はワーカーの分け方のまま）。 */}
+        <dd data-testid="job-screens-discovered">
+          {report.pagesDiscoveredSplit === undefined
+            ? formatCount(report.pagesDiscovered)
+            : text.screensDiscoveredSplit(
+              formatCount(report.pagesDiscovered), formatCount(report.pagesDiscoveredSplit.fromAuditStage), formatCount(report.pagesDiscoveredSplit.newlyFound),
+            )}
+        </dd>
+        <dt>{CLI_TEXT.progress.elapsed}</dt>
+        <dd>{formatElapsedTime(report.elapsedMs)}</dd>
+      </dl>
+    </section>
+  );
+}
+
+/**
+ * 進み具合の数（最後の進み具合の知らせを、既存の書式で示す。値は事実のまま、計算しない）。DPROG: まとめて実行の連鎖が動いている間は、点検の数を出さず、
+ * 動いている段の進み具合（`chainStageProgress`）を出す。操作さがしの作業の画面も、段の語で出す。
+ */
 function Progress({ job }: Readonly<{ job: AuditJobDetailView }>) {
   const text = LOCAL_UI_AUDIT_TEXT.job;
+  if (job.summary.chainStage !== null) {
+    const stage = job.chainStageProgress;
+    return stage === null ? null : <StageProgress kind={stage.kind} report={stage.progress} />;
+  }
   const report = job.lastProgress;
   if (report === null) {
     return null;
+  }
+  if (job.jobKind !== WORKER_AUDIT_JOB_KIND) {
+    return <StageProgress kind={job.jobKind} report={report} />;
   }
   return (
     <section className="panel">
@@ -815,6 +874,8 @@ function JobArtifacts({ job }: Readonly<{ job: AuditJobDetailView }>) {
   return (
     <section className="panel">
       <h2 className="panel-heading">{text.artifactsHeading}</h2>
+      {/* DLALL: 一覧に出ているファイルの全部を、一覧の順に 1 つずつダウンロードする（2 つ以上のときだけ出る）。 */}
+      <DownloadAllArtifacts hrefs={artifacts.map(({ href }) => href)} />
       <ul className="link-list" data-testid="job-artifacts">
         {artifacts.map((artifact) => {
           const link = ARTIFACT_LINKS[artifact.kind];
@@ -941,6 +1002,8 @@ function JobDetailPage() {
     <PageFrame title={kind.label} trail={trail}>
       <section className="panel" aria-live="polite" data-testid="job-summary-panel">
         <ResultLine job={job} />
+        {/* RCA-8（検索の確かめの設計書 2.4）: 見るだけの確かめの作業は、ためした検索の数と、開けなかった検索の一覧（操作さがしの 5xx も）。 */}
+        {job.jobKind !== WORKER_READ_CHECK_JOB_KIND || job.searchCheck === null ? null : <SearchCheckOutcomePanel outcome={job.searchCheck} />}
         {/* WSO: 「チェックした画面だけ」の点検は、点検する範囲を 1 行で言う。 */}
         {job.stageChain === null || job.stageChain.pageScope === null ? null :<p data-testid="job-checked-screens-only">{LOCAL_UI_JOB_SUMMARY_TEXT.checkedScreensOnly}</p>}
         {/* 書き込みの作業は、サイトに書いたこと（テスト用のサイトに 1 件だけ）を必ず出す（7 章）。 */}
@@ -957,6 +1020,15 @@ function JobDetailPage() {
           </>
         )}
         <LoginRegistrationLine job={job} />
+        {/* REV-PAR の m-4: 下調べの後に続けて始める点検を、同じサイトの別の設定が動いていて始めなかったときの理由（黙って飛ばさない）。 */}
+        {job.entryCheckFollowUp?.state === 'SKIPPED' && job.entryCheckFollowUp.reason !== undefined ? (
+          <Notice kind="caution">
+            <div data-testid="job-follow-up-not-started" data-reason={job.entryCheckFollowUp.reason}>
+              <p>{AUDIT_JOB_START_REJECTION_DESCRIPTIONS[job.entryCheckFollowUp.reason].description}</p>
+              <p>{AUDIT_JOB_START_REJECTION_DESCRIPTIONS[job.entryCheckFollowUp.reason].action}</p>
+            </div>
+          </Notice>
+        ) : null}
         {/* OP-3（D12）: まとめて実行が止まったときの理由と次にできること（要点の中。ステップの一覧は詳しい内容）。 */}
         {job.stageChain === null ? null : <StageChainStopNotice chain={job.stageChain} jobId={job.jobId} />}
         {summary.incomplete ? <p data-testid="job-incomplete">{LOCAL_UI_JOB_SUMMARY_TEXT.incomplete(DETAILS_HEADING)}</p> : null}

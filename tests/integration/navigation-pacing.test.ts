@@ -47,7 +47,8 @@ const TOGGLE_PAGE = '/page-auditor-interaction-toggle.html';
 const PACING_INTERVAL_MS = 1_000;
 /**
  * 1 つの候補のページ（`TOGGLE_PAGE`）を、幅の走査の 2 つの幅で監査するときの読み込みの数。Desktop、Interaction の候補、開いた状態からの入れ子の押下
- * （COV-4 の区切り 3。開いた状態の中の同じ候補を押し直す）、幅の走査の 2 つの幅、Mobile（L5 の N5: Mobile は Desktop と同じ候補を押し直さない）。
+ * （COV-4 の区切り 3。開いた状態の中の同じ候補を押し直す）、幅の走査の 2 回（SWR: 大きさを変えて回す読み込みと、一番狭い幅の照らし合わせ）、Mobile（L5 の N5:
+ * Mobile は Desktop と同じ候補を押し直さない）。
  */
 const TOGGLE_PAGE_LOADS = 6;
 /** 幅の走査・performance・accessibility・スクリーンショットの有無（Interaction は有効）。幅は、主要な2つのビューポートの幅と違う。 */
@@ -349,11 +350,11 @@ describe('Navigation pacing of the stress sweep (DEF-209)', () => {
 
     const outcome = await auditWith(server.origin, config, pacer, browser);
 
-    // Desktop、2 つの幅、Mobile の 4 回だけ待ち、どの待ちの間にも Context がない。
+    // Desktop、幅の走査の 2 回（SWR: 大きさを変えて回す読み込みと、一番狭い幅の照らし合わせ）、Mobile の 4 回だけ待ち、どの待ちの間にも Context がない。
     expect(pacer.calls()).toBe(4);
     expect(contextsAtWaitStart).toEqual([0, 0, 0, 0]);
     const [layout] = evidenceOf(outcome, 'layout', 'desktop');
-    expect(layout?.payload.stressSweep?.map(({ width, status }) => [width, status])).toEqual([[320, 'COMPLETE'], [768, 'COMPLETE']]);
+    expect(layout?.payload.stressSweep?.map(({ width, status }) => [width, status])).toEqual([[768, 'COMPLETE'], [320, 'COMPLETE']]);
     expect(outcome.result.viewports.desktop).toMatchObject({ status: 'AUDITED', incompleteReasons: [] });
     // サーバに届いた文書の要求は、4 回の読み込みの分だけ。
     expect(server.getRequestObservations().filter(({ pathname }) => pathname === TOGGLE_PAGE)).toHaveLength(4);

@@ -24,6 +24,8 @@ const containsBox = (outer: InclusionBox, inner: InclusionBox): boolean =>
   && outer.x + outer.width >= inner.x + inner.width - TARGET_IMAGE_INCLUSION_TOLERANCE_PX
   && outer.y + outer.height >= inner.y + inner.height - TARGET_IMAGE_INCLUSION_TOLERANCE_PX;
 
+const hasArea = (box: InclusionBox | null): box is InclusionBox => box !== null && box.width > 0 && box.height > 0;
+
 /** hit-test の点の数と、最前面が対象（か子孫）だった点の数。 */
 export interface InclusionHits {
   readonly hitTestPointCount: number;
@@ -32,10 +34,11 @@ export interface InclusionHits {
 
 /**
  * 測った対象の矩形と、見える部分（viewport と、内容を切り取る祖先の箱で切り取った後）から決める（見える部分がなければ `OUTSIDE`）。REV-EV12 の I-2: hit-test の
- * 事実を渡したときは、点があって最前面に対象が 1 つもない（ほかの部品の下に隠れて写らない）なら `OUTSIDE`。
+ * 事実を渡したときは、点があって最前面に対象が 1 つもない（ほかの部品の下に隠れて写らない）なら `OUTSIDE`。DEF-286: 大きさのない対象（幅か高さが 0。selector の
+ * 深さの上限で、前にある同じ形の隠れた要素に当たったときなど）は、写らないので `OUTSIDE`（指摘は保留 `TARGET_NOT_IN_IMAGE`）。
  */
 export function inclusionOfVisiblePart(rect: InclusionBox | null, visible: InclusionBox | null, hits?: InclusionHits): TargetImageInclusion {
-  if (rect === null || visible === null || (hits !== undefined && hits.hitTestPointCount > 0 && hits.hitPointCount === 0)) {
+  if (!hasArea(rect) || visible === null || (hits !== undefined && hits.hitTestPointCount > 0 && hits.hitPointCount === 0)) {
     return OUTSIDE;
   }
   if (containsBox(visible, rect)) {
@@ -65,6 +68,21 @@ export const isUncoveredMeasurement = (measured: {
   readonly hitPointCount: number;
   readonly coveredPointCount?: number;
 }): boolean => measured.found && measured.visibleRect !== null && measured.hitPointCount > 0 && (measured.coveredPointCount ?? 0) === 0;
+
+/**
+ * TII（DEF-285）: 動かす前の測りで、対象（重なりは 2 つの要素の交わり）が画面の中で全部見えるか（見える部分に全部入り、hit-test の点の最前面に対象がある）。
+ * 見えるなら、祖先も文書も動かさずに、その位置（layout の測りと同じ位置関係）で撮る。大きさのない対象は、点がないので見えるとしない（今どおり動かす）。
+ */
+export const isShownInPlace = (measured: {
+  readonly found: boolean;
+  readonly rect: InclusionBox | null;
+  readonly visibleRect: InclusionBox | null;
+  readonly hitTestPointCount: number;
+  readonly hitPointCount: number;
+}): boolean => measured.found && measured.hitPointCount > 0 && inclusionOfVisiblePart(measured.rect, measured.visibleRect, measured) === INSIDE;
+
+/** TII（DEF-285）: 動かしたことで、動かす前に大きさのあった対象（重なりの交わり）が消えた（幅か高さが 0 になった）か。消えたら、元の位置で撮る。 */
+export const vanishedByMove = (before: InclusionBox | null, after: InclusionBox | null): boolean => hasArea(before) && after !== null && !hasArea(after);
 
 /** 分けて撮った部分ごとの結果をまとめる（全部が `INSIDE` なら `INSIDE`、どれかが入れば `PARTIAL`、ほかは `OUTSIDE`）。 */
 export function combinedInclusion(inclusions: readonly TargetImageInclusion[]): TargetImageInclusion {

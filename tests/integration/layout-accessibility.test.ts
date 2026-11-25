@@ -611,6 +611,23 @@ describe('layout evidence that avoids false positives (RT12 I1, I2, I3)', () => 
     ]);
   });
 
+  // S-06: 文字と外枠の間にスクロールできる祖先があれば、その祖先の箱で判定する（収まれば外枠の文字切れにしない。はみ出せば、その祖先を対象に残す）。
+  it('judges the text in an inner scroll region by the box of the region (S-06)', async () => {
+    await withFixture('layout-rule-cases.html', DEFAULT_FIXTURE_VIEWPORT, async (fixturePage) => {
+      await fixturePage.evaluate(() => {
+        const rows = Array.from({ length: 30 }, (_, index) => `<p>行 ${index + 1}</p>`).join('');
+        // 外枠（高さ 150px で隠す）の中に、見出しと内側のスクロール領域。`inner-fits` は、領域の下の空の箱で外枠の中身がはみ出す（領域は外枠に収まる）。
+        const box = (id: string, inner: string, after = ''): string => `<div id="${id}" style="height:150px;overflow:hidden">`
+          + `<header style="height:40px">見出し</header><div id="${id}-inner" style="${inner};overflow:auto">${rows}</div>${after}</div>`;
+        document.querySelector('main')?.insertAdjacentHTML('afterbegin',
+          box('sticks-out', 'height:100%') + box('inner-fits', 'height:100px', '<div style="height:60px"></div>'));
+      });
+      const evidence = completeLayout(await collectLayoutEvidence(fixturePage, { width: 400, height: 300 }));
+      const selectors = layoutRuleSelectors('TEXT_CLIPPING', evidence).filter((selector) => /^#(sticks-out|inner-fits)/u.test(selector ?? ''));
+      expect(selectors).toEqual(['#sticks-out-inner']);
+    });
+  });
+
   it('checks every text node of a candidate, beyond the former limit of 256 nodes (I2, COV-6)', async () => {
     await withFixture('layout-rule-cases.html', DEFAULT_FIXTURE_VIEWPORT, async (fixturePage) => {
       await fixturePage.evaluate((limit) => {

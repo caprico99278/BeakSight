@@ -253,7 +253,10 @@ afterAll(async () => {
   await stopServer(server);
   if (site !== undefined) {
     expect(site.requests.filter(({ method }) => !READ_METHODS.has(method)), 'non-read requests').toEqual([]);
-    expect(site.requests.filter(({ site: origin }) => origin === 'B'), 'requests outside the allowed origins').toEqual([]);
+    // SD-2（設計書 `2026-11-16-beaksight-action-based-delete-guard-design.md` 2.4）: サーバのリダイレクトはサイトのものとして通す。許可 Origin の外へは、
+    // 開始の URL が 302 で移した先の移動の GET の 1 回だけが届く（移った画面は読まない。`entry-check-run.test.ts` と同じ）。
+    expect(site.requests.filter(({ site: origin }) => origin === 'B').map(({ method, path }) => `${method} ${path}`), 'requests outside the allowed origins')
+      .toEqual([`GET ${ENTRY_CHECK_SITE_PATHS.sso}?client=entry`]);
     await site.close();
   }
   if (spaSite !== undefined) {

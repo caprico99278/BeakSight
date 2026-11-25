@@ -8,7 +8,9 @@ import {
 } from '../core/evidence-types.js';
 import type { FindingFingerprintIdentityField } from '../core/ids.js';
 import { formatRatioFloor } from '../presentation/format.js';
-import { CONTRAST_RATIO_TEXT } from '../presentation/messages.js';
+import { CONTRAST_RATIO_TEXT, DISABLED_STATE_TEXT } from '../presentation/messages.js';
+import { labelClassKeyOf, roundedTargetKeyOf } from './finding-grouping-keys.js';
+import { LABEL_IN_NAME_RULE_ID, labelInNameIsFinding, labelInNameOf, type LabelInNameClass } from './label-in-name.js';
 import type { AuditRule, FindingDraft, PageRuleInput } from './rule.js';
 import { evidenceOfType } from './rule-helpers.js';
 
@@ -100,16 +102,39 @@ const violationDrafts = ({ ruleId, violation, evidenceId }: ViolationDraftSpec):
   }
   // AUD-8（4-3）: 支援技術に無効と伝わるのに axe が数えた要素（対象外の印）は、主の件数に入れない（Finding にしない）。見た目だけ無効の要素は残し、
   // 「無効の状態を支援技術に伝えていない」の事実を文言に足す。
+  // APS-2: 名前の不一致は、指摘にする区分（`labelInNameIsFinding`）の要素だけを Finding にする（axe の違反は証拠に残る）。
   return violation.nodes
     .filter((node: AccessibilityNodeEvidence) => (node.countExclusion ?? null) === null)
+    .filter((node: AccessibilityNodeEvidence) => ruleId !== LABEL_IN_NAME_RULE_ID || labelInNameIsFinding(labelClassOfNode(node)))
     .map((node: AccessibilityNodeEvidence) => {
       const value = draft(node.impact ?? violation.impact, formatTarget(node.targetSelectors), [
         { name: 'target', value: JSON.stringify(node.targetSelectors) },
       ]);
-      const withRatio = { ...value, message: `${value.message}${contrastRatioNoteOf(node)}` };
-      return disabledStateNotExposed(node) ? { ...withRatio, message: `${withRatio.message}${DISABLED_STATE_NOT_EXPOSED_NOTE}` } : withRatio;
+      // DEF-297: 対象の selector を丸めた形の鍵（fingerprint に入れず、候補群の鍵に入れる）。共通の枠の同じ部品の指摘を、ページをまたいで 1 つの群にする。
+      const withRatio = { ...value, message: `${value.message}${contrastRatioNoteOf(node)}`, linkKeys: [roundedTargetKeyOf(node.targetSelectors)] };
+      const disabledNote = disabledStateNoteOf(node);
+      const withDisabled = disabledNote === '' ? withRatio : { ...withRatio, message: `${withRatio.message}${disabledNote}` };
+      return ruleId === LABEL_IN_NAME_RULE_ID ? withLabelInNameClass(withDisabled, node) : withDisabled;
     });
 };
+
+/**
+ * 名前の不一致の要素の区分（表示用モデルと同じ `labelInNameOf`）。APS-2: 名前の文脈がない・読めない要素は、かたまりを読めない区分（`UNDETERMINED`）。
+ */
+const labelClassOfNode = (node: AccessibilityNodeEvidence): LabelInNameClass => {
+  const context = node.nameContext;
+  return context === undefined || context.status !== 'READ'
+    ? 'UNDETERMINED'
+    : labelInNameOf({ name: context.axName, segments: context.labelSegments }).labelClass;
+};
+
+/**
+ * AUD-5（設計書 `2026-11-19-beaksight-audit-result-review-fixes-design.md` 8.3）: 名前の不一致の指摘に、区分の鍵（`labelClass`。区分の違う指摘を同じ群にしない）を
+ * 足す。DEF-297: 区分の鍵は、丸めた対象の鍵の後ろに足す（selector と区分の両方で群にする）。APS-2: 名前の文脈を読めない指摘にも `UNDETERMINED` の鍵を付ける
+ * （群の確信度を下げる印）。
+ */
+const withLabelInNameClass = (draft: FindingDraft, node: AccessibilityNodeEvidence): FindingDraft =>
+  ({ ...draft, linkKeys: [...(draft.linkKeys ?? []), labelClassKeyOf(labelClassOfNode(node))] });
 
 /**
  * EV-1: 色差の要素の、色から計算した丸める前の比と基準の文（比か基準がない要素・ほかの Rule の要素は空）。比は切り捨てて書く（基準に届かない値を、基準の値に
@@ -122,12 +147,21 @@ const contrastRatioNoteOf = (node: AccessibilityNodeEvidence): string => {
   return ratio === undefined || criterion === undefined ? '' : CONTRAST_RATIO_TEXT.message(formatRatioFloor(ratio), criterion);
 };
 
-/** AUD-8（4-3）: 見た目だけ無効な要素の文言に足す事実。 */
-const DISABLED_STATE_NOT_EXPOSED_NOTE =
-  'この要素は見た目は無効（押せない形）ですが、無効の状態を支援技術に伝えていません（disabled・aria-disabled・inert がありません）。';
-
-const disabledStateNotExposed = (node: AccessibilityNodeEvidence): boolean =>
-  node.disabledFacts?.status === 'READ' && node.disabledFacts.disabledStateNotExposed;
+/**
+ * AUD-8（4-3）: 見た目だけ無効な要素の文言に足す事実（`DISABLED_STATE_TEXT`）。AUD-6（S-09）: `pointer-events: none` がなく `cursor: not-allowed` だけの要素は、
+ * 見た目の指定の事実だけを書く（実際に押せないかは確かめていない）。判定と重さは変えない。見た目だけ無効でなければ空。
+ */
+const disabledStateNoteOf = (node: AccessibilityNodeEvidence): string => {
+  // RVP-4: 名前の規則の対象（AX の名前の文脈を読んだ要素）が無効の状態なら、その事実を書く（読めないときは足さない）。
+  if (node.nameContext?.status === 'READ' && node.nameContext.axDisabled) {
+    return DISABLED_STATE_TEXT.nameRuleDisabledNote;
+  }
+  const facts = node.disabledFacts;
+  if (facts?.status !== 'READ' || !facts.disabledStateNotExposed) {
+    return '';
+  }
+  return facts.pointerEvents === 'none' ? DISABLED_STATE_TEXT.notExposedNote : DISABLED_STATE_TEXT.cursorOnlyNote;
+};
 
 /**
  * axe の violation を対応づける Rule を作る。`ruleIdFor` が null を返す violation は、この Rule の対象外。

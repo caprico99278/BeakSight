@@ -1,13 +1,16 @@
 import { evidenceOfType } from '../audit/rule-helpers.js';
 import {
   INCOMPLETE_REASON_CODES,
+  OUTSIDE_AUDIT_SCOPE_NAVIGATION_DETAIL,
   VIEWPORT_PROFILES,
+  isOutsideAuditScopeNavigation,
   type EvidenceRecordFor,
   type EvidenceType,
   type IncompleteReasonCode,
   type PageAuditResult,
   type PageIncompleteReasonCount,
   type PageAuditStatus,
+  type RunPageSamenessCounts,
   type RunSafetySummary,
   type SafetyBlockedActionCounts,
   type ViewportPageCounts,
@@ -16,6 +19,7 @@ import {
 import type { AuditSendPolicyName } from '../core/audit-send-policy.js';
 import { deepFreeze } from '../core/immutable.js';
 import { saturatingAdd } from '../core/saturating-count.js';
+import { isSameContentSkipReason, isSameContentSkippedViewport } from '../core/status.js';
 import { compareCodeUnits } from '../core/text.js';
 import { summarizePageSafety, type SafetyLedgerSnapshot } from '../safety/safety-ledger.js';
 
@@ -51,7 +55,10 @@ export function countPagesByStatus(pages: readonly Pick<CountedPage, 'status'>[]
   return Object.freeze(counts);
 }
 
-/** ビューポートごとの、ビューポートの状態ごとの数（`viewportPageCounts`）。 */
+/**
+ * ビューポートごとの、ビューポートの状態ごとの数（`viewportPageCounts`）。DUP（REV-DUP の M-9）: 表示の中身が同じなので始めなかったビューポートは、どの数にも
+ * 入れない（まだ見ていない `skipped` に数えない）。
+ */
 export function countViewportPages(pages: readonly Pick<CountedPage, 'viewports'>[]): Readonly<Record<ViewportProfile, ViewportPageCounts>> {
   const counts = Object.fromEntries(VIEWPORT_PROFILES.map((profile) => [profile, emptyCounts()])) as Record<
     ViewportProfile,
@@ -59,6 +66,9 @@ export function countViewportPages(pages: readonly Pick<CountedPage, 'viewports'
   >;
   for (const page of pages) {
     for (const profile of VIEWPORT_PROFILES) {
+      if (isSameContentSkippedViewport(page.viewports[profile])) {
+        continue;
+      }
       counts[profile][PAGE_COUNT_KEYS[page.viewports[profile].status]] += 1;
     }
   }
@@ -69,26 +79,46 @@ export function countViewportPages(pages: readonly Pick<CountedPage, 'viewports'
  * T44c（Task 44 の設計書 P1-4）: ページの未完了の理由ごとの、その理由を持つページの数（`run.json` の `pageIncompleteReasonCounts`）。監査したページ（SKIPPED
  * でない）の、ページとビューポートの理由を、ページごとに理由 1 回で数える（SKIPPED のページの理由は Run の理由にある）。理由のコードの一覧
  * （`INCOMPLETE_REASON_CODES`）の順。理由を持つページがなければ空。
+ * PIR: 各項目は、その理由を持つページの URL の全部（ページの順）を持つ。点検の範囲の外へ移った読み込みの失敗（`isOutsideAuditScopeNavigation`）は、同じコードの
+ * ほかの失敗の後に、`detail` を持つ別の項目として数える。
  */
 export function countPagesByIncompleteReason(
-  pages: readonly Pick<CountedPage, 'status' | 'viewports' | 'incompleteReasons'>[],
+  pages: readonly Pick<PageAuditResult, 'pageUrl' | 'status' | 'viewports' | 'incompleteReasons'>[],
 ): readonly PageIncompleteReasonCount[] {
-  const counts = new Map<IncompleteReasonCode, number>();
+  /** 項目の鍵（コードと、範囲の外の印）ごとの、ページの URL。 */
+  const urls = new Map<string, string[]>();
+  const keyOf = (code: IncompleteReasonCode, outside: boolean): string => `${code}${outside ? OUTSIDE_KEY_SUFFIX : ''}`;
   for (const page of pages) {
     if (page.status === 'SKIPPED') continue;
-    const codes = new Set<IncompleteReasonCode>([
-      ...page.incompleteReasons.map(({ code }) => code),
-      ...VIEWPORT_PROFILES.flatMap((profile) => page.viewports[profile].incompleteReasons.map(({ code }) => code)),
-    ]);
-    for (const code of codes) {
-      counts.set(code, (counts.get(code) ?? 0) + 1);
+    // DUP: 表示の中身が同じなので始めなかったビューポートの理由は、途中で止まった理由ではないので数えない。
+    const keys = new Set([
+      ...page.incompleteReasons,
+      ...VIEWPORT_PROFILES.flatMap((profile) => page.viewports[profile].incompleteReasons),
+    ].filter((reason) => !isSameContentSkipReason(reason)).map((reason) => keyOf(reason.code, isOutsideAuditScopeNavigation(reason))));
+    for (const key of keys) {
+      const list = urls.get(key) ?? [];
+      list.push(page.pageUrl);
+      urls.set(key, list);
     }
   }
-  return deepFreeze(INCOMPLETE_REASON_CODES.flatMap((code) => {
-    const count = counts.get(code);
-    return count === undefined ? [] : [{ code, pages: count }];
-  }));
+  return deepFreeze(INCOMPLETE_REASON_CODES.flatMap((code) =>
+    [false, true].flatMap((outside) => {
+      const pageUrls = urls.get(keyOf(code, outside));
+      return pageUrls === undefined
+        ? []
+        : [{ code, ...(outside ? { detail: OUTSIDE_AUDIT_SCOPE_NAVIGATION_DETAIL } : {}), pages: pageUrls.length, pageUrls }];
+    })));
 }
+
+/** DUP: 軽い点検にしたページと、点検を省いたページの数（`run.json` の `pageSamenessCounts`。どちらも 0 なら `null`）。 */
+export function countPagesBySameness(pages: readonly Pick<PageAuditResult, 'sameness'>[]): RunPageSamenessCounts | null {
+  const lightPages = pages.filter(({ sameness }) => sameness?.depth === 'LIGHT').length;
+  const samePages = pages.filter(({ sameness }) => sameness?.depth === 'SAME').length;
+  return lightPages === 0 && samePages === 0 ? null : Object.freeze({ lightPages, samePages });
+}
+
+/** PIR: 範囲の外へ移った読み込みの失敗の項目の鍵の印（理由のコードに使わない文字）。 */
+const OUTSIDE_KEY_SUFFIX = ':outside';
 
 /** 状態が `PARTIAL` のビューポートの数（Run Status の入力 `incompleteCollectorCount`）。 */
 export function countPartialViewports(pages: readonly Pick<CountedPage, 'viewports'>[]): number {

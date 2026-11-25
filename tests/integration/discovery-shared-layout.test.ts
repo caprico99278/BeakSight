@@ -34,7 +34,9 @@ const probesOf = (run: PlainSiteRun, path: string): { readonly frame: string[]; 
   return { frame: lines.slice(0, FRAME_BUTTONS), body: lines.slice(FRAME_BUTTONS) };
 };
 
-const pressedAll = (frame: readonly string[]): boolean => frame.every((line) => line.endsWith('NO_REQUEST null'));
+/** CALDAY: 同じ形の兄弟（番号だけ違うボタン）は、最初の 1 つを押して何も起きなければ、残りを押さない。 */
+const pressedAll = (frame: readonly string[]): boolean => frame[0]?.endsWith('NO_REQUEST null') === true
+  && frame.slice(1).every((line) => line.endsWith('SAME_SHAPE_NO_CHANGE'));
 
 describe('DEF-208-4 and SLK-1: the shared layout buttons (the default test Chromium, PASS_EXCEPT_DELETE)', () => {
   it('A: presses the shared layout buttons once over the run while the layout part is the same, again where it differs, and the body buttons on every page', async () => {
@@ -43,7 +45,7 @@ describe('DEF-208-4 and SLK-1: the shared layout buttons (the default test Chrom
       const { body } = probesOf(run, path);
       // 本文の「保存」は、どの画面でも押す（観察の対象。届けない）。
       expect(body[0]).toMatch(/^保存 (API_CREATE|NOT_EXECUTABLE) /u);
-      expect(body.slice(1)).toEqual(['- NO_REQUEST null', '- NO_REQUEST null']);
+      expect(body.slice(1)).toEqual(['- NO_REQUEST null', '- NOT_OBSERVED SAME_SHAPE_NO_CHANGE']);
     }
     const sameFrames = SAME_FRAME_PAGES.map((path) => probesOf(run, path).frame);
     expect(sameFrames.filter(pressedAll)).toHaveLength(1);

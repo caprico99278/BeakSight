@@ -252,7 +252,8 @@ const sceneOf = (path: string): string | null => {
   if (path === '/many/page') {
     let body = '';
     for (let index = 1; index <= COVERAGE_SAFETY_MANY_BUTTONS; index += 1) {
-      body += `<button type="button" class="b" data-i="${String(index)}">表示${String(index)}を見る</button>`;
+      // CALDAY: 番号だけ違う同じ形の兄弟は代表だけを押すので、ボタンごとに入れ物の深さを変えて、別の形のボタンにする（どれも押す）。
+      body += `${'<div>'.repeat(index)}<button type="button" class="b" data-i="${String(index)}">表示${String(index)}を見る</button>${'</div>'.repeat(index)}`;
     }
     return page('多い', `${body}<script>document.querySelectorAll(".b").forEach((b) => b.addEventListener("click", () => {`
       + ' fetch("/many/ping?i=" + b.dataset.i).catch(() => {}); }));</script>');

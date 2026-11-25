@@ -14,6 +14,7 @@ import { destructiveActionFactsOfNames, type DestructiveActionFacts } from '../.
 import {
   NOTIFICATION_OVERLAY_LIMITS,
   classifyNotificationFrames,
+  hiddenReasonBeforePressOf,
   isNotificationCloseName,
   notificationFrameDigestOf,
   type NotificationButtonRead,
@@ -319,6 +320,29 @@ describe('通知の枠の見分け（3.1 の 2〜4）', () => {
     expect(statusOf(['プラン'], '×', 'プランを閉じる')).toBe('NO_CLOSE_BUTTON');
     expect(statusOf(['Workspace'], '', '', 'Close workspace')).toBe('NO_CLOSE_BUTTON');
     expect(statusOf(['お役立ち情報'], '', 'お役立ち情報を閉じる')).toBe('DISMISSIBLE');
+  });
+
+  it('AUD-2: 名前が中の画像の alt だけのアイコンのボタンも、閉じるボタンにする', () => {
+    const statusOf = (imageAlt: string): string | undefined => classifyNotificationFrames({
+      viewport: VIEWPORT,
+      surfaces: [{ rect: rect(0, 0, 200, 100), surface: PAINTED_SURFACE }],
+      candidates: [candidate({ surface: 0, element: 0 })],
+      buttons: [button({ candidate: 0, chain: [0], element: 1, text: '', imageAlt })],
+      truncated: false,
+    }).frames[0]?.status;
+    expect([statusOf('閉じる'), statusOf('Close'), statusOf('ロゴ')]).toEqual(['DISMISSIBLE', 'DISMISSIBLE', 'NO_CLOSE_BUTTON']);
+  });
+
+  it('AUD-2: モーダルの小窓は、閉じるボタンがなく大きくても、隠す理由にしない（モーダルでない枠は今どおり）', () => {
+    const framesOf = (modal: boolean) => classifyNotificationFrames({
+      viewport: VIEWPORT,
+      surfaces: [{ rect: rect(0, 0, 1000, 500), surface: PAINTED_SURFACE }],
+      candidates: [candidate({ surface: 0, element: 0, dialog: true, modal })],
+      buttons: [],
+      truncated: false,
+    }).frames;
+    expect(framesOf(true).map((frame) => [frame.status, frame.modal, hiddenReasonBeforePressOf(frame)])).toEqual([['NO_CLOSE_BUTTON', true, null]]);
+    expect(framesOf(false).map((frame) => [frame.status, frame.modal, hiddenReasonBeforePressOf(frame)])).toEqual([['NO_CLOSE_BUTTON', false, 'NO_CLOSE_BUTTON']]);
   });
 
   it('面積の割合が閾値ちょうどなら閉じる対象にし、わずかに超えると外す', () => {

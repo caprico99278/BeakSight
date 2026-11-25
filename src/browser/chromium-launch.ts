@@ -242,11 +242,20 @@ export const EXTERNAL_LAUNCH_BLOCKED_URL_PATTERNS = Object.freeze(['*'] as const
  */
 export const EXTERNAL_LAUNCH_ALLOWED_URL_PATTERNS = Object.freeze(['http://*', 'https://*', 'about:*', 'data:*', 'blob:*'] as const);
 
-/** 一時のプロファイルの `Default/Preferences` に書く中身（呼ぶたびに新しい値）。 */
+/**
+ * 一時のプロファイルの `Default/Preferences` に書く中身（呼ぶたびに新しい値）。
+ * PRN: `printing.enabled` を偽にして、印刷を止める。headed では、ページの `window.print()`（本体と iframe）が印刷の画面を開き、そのページへの操作が
+ * 閉じるまで返らなかった（印刷の画面の中身も、上の URL の一覧で止まって空のままだった）。止めると、`print()` はすぐ返り、何も開かない（Chromium 156 で
+ * 確かめた）。headless では印刷がもともと何も開かないので、自己検査には入れない。
+ */
 export function externalLaunchBlockPreferences(): {
   readonly policy: { readonly url_blocklist: string[]; readonly url_allowlist: string[] };
+  readonly printing: { readonly enabled: false };
 } {
-  return { policy: { url_blocklist: [...EXTERNAL_LAUNCH_BLOCKED_URL_PATTERNS], url_allowlist: [...EXTERNAL_LAUNCH_ALLOWED_URL_PATTERNS] } };
+  return {
+    policy: { url_blocklist: [...EXTERNAL_LAUNCH_BLOCKED_URL_PATTERNS], url_allowlist: [...EXTERNAL_LAUNCH_ALLOWED_URL_PATTERNS] },
+    printing: { enabled: false },
+  };
 }
 
 /** 一時のプロファイルのフォルダの名前の先頭（OS の一時のフォルダの下に、`mkdtemp` で作る）。 */

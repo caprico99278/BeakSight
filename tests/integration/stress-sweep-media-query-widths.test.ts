@@ -103,7 +103,8 @@ const sweptWidthsOf = async (path: string): Promise<readonly number[] | null> =>
 
 describe('L14: the stress sweep adds the widths on both sides of a media query boundary', () => {
   it('sweeps both sides of the boundaries of a style element and a linked stylesheet', async () => {
-    expect(await sweptWidthsOf('/responsive')).toEqual([699, 700, 1100, 1101]);
+    // SWR: 広い順に回す。
+    expect(await sweptWidthsOf('/responsive')).toEqual([1101, 1100, 700, 699]);
   }, TEST_TIMEOUT_MS);
 
   it('adds no width to a page without media queries', async () => {

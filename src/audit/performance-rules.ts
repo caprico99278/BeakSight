@@ -1,4 +1,6 @@
 import { formatDecimal, formatMilliseconds } from '../presentation/format.js';
+import { PERFORMANCE_SINGLE_MEASUREMENT_TEXT } from '../presentation/messages.js';
+import { findingClassKeyOf } from './finding-grouping-keys.js';
 import { judgedWebVitalsOf, POOR_WEB_VITAL_THRESHOLDS } from './performance-observation.js';
 import type { AuditRule, FindingDraft, PageRuleInput } from './rule.js';
 import { evidenceOfType } from './rule-helpers.js';
@@ -46,9 +48,11 @@ const poorWebVitalRule = (ruleId: string, metric: WebVitalName, plainMessage: st
         category: 'PERFORMANCE',
         severity: 'WARN',
         message: `${metric} の計測値が ${format(vital.value)} で、poor の境界 ${format(threshold)} を`
-          + '超えています（合成計測の1回の値です）。',
+          + `超えています（合成計測）。${PERFORMANCE_SINGLE_MEASUREMENT_TEXT.note}`,
         evidenceRefs: [record.evidenceId],
         identityFields: [],
+        // AUD-6（S-11）: 1 回だけの測りの印（確信度を 1 段下げる区分の鍵。fingerprint に入れない）。
+        linkKeys: [findingClassKeyOf('SINGLE_MEASUREMENT')],
       });
     }
     return drafts;

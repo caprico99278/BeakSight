@@ -233,6 +233,23 @@ ${heading === '' ? '' : `<h2 style="margin: 0; font-size: 12px;">${heading}</h2>
     }, FRAMES_VIEWPORT);
   });
 
+  // RVP-3: 閉じるボタンを、上に止まる見出しの帯（header）に置いた前面の窓（大きな role="dialog"）を、閉じるボタンのない通知の枠と見ない。
+  it('does not take a front window whose close button sits in its sticky header for a frame without a close button', async () => {
+    await withFixture('notification-frames.html', async (page) => {
+      await page.evaluate(() => {
+        document.body.innerHTML = '<main><h1>一覧</h1><p>本文</p></main><div id="sheet" role="dialog" aria-label="詳しい内容"'
+          + ' style="position: fixed; top: 0; right: 0; width: 70%; height: 100%; overflow: auto; background: #fff;">'
+          + '<header style="position: sticky; top: 0; background: #eee;"><h2>詳しい内容</h2><button type="button" id="sheet-close" aria-label="閉じる">×</button></header>'
+          + '<p style="height: 900px;">内容</p></div>';
+      });
+      const outcome = await readNotificationFrames(page, Date.now() + FRAMES_READ_TIMEOUT_MS);
+      expect(outcome.status).toBe('READ');
+      if (outcome.status !== 'READ') return;
+      const frames = await Promise.all(outcome.frames.map(async (frame) => ({ frame: await idAtPath(page, frame.frameElement.path), status: frame.status })));
+      expect(frames.filter(({ frame }) => frame === 'sheet')).toEqual([]);
+    }, FRAMES_VIEWPORT);
+  });
+
   it('gives the same frame the same digest when it appears again on another load', async () => {
     await withFixture('notification-frames.html', async (page) => {
       const first = await readNotificationFrames(page, Date.now() + FRAMES_READ_TIMEOUT_MS);

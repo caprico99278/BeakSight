@@ -38,7 +38,16 @@ type SessionPath = readonly string[];
 export async function observeCreatedWebSockets(
   session: CDPSession,
   onCreated: (socket: ObservedWebSocket) => void,
+  /** FRET fix round 4: ページ（と子の target）の接続が frame を送るたびに呼ぶ（数えるだけ。中身は渡さない。呼ぶ側の例外は封じ込める）。 */
+  onFrameSent: () => void = () => undefined,
 ): Promise<() => void> {
+  const frameSent = (): void => {
+    try {
+      onFrameSent();
+    } catch {
+      // 記録の側の失敗は、観察を止めない。
+    }
+  };
   /** 子の target に送る命令の番号（応答は待たない。番号は応答と区別するためだけ）。 */
   let commandId = 0;
   const notify = (params: unknown): void => {
@@ -90,6 +99,8 @@ export async function observeCreatedWebSockets(
     }
     if (parsed.method === 'Network.webSocketCreated') {
       notify(parsed.params);
+    } else if (parsed.method === 'Network.webSocketFrameSent') {
+      frameSent();
     } else if (parsed.method === 'Target.attachedToTarget') {
       onAttached(path, parsed.params);
     } else if (parsed.method === 'Target.receivedMessageFromTarget') {
@@ -108,10 +119,12 @@ export async function observeCreatedWebSockets(
     }
   };
   session.on('Network.webSocketCreated', onPageCreated);
+  session.on('Network.webSocketFrameSent', frameSent);
   session.on('Target.attachedToTarget', onPageAttached);
   session.on('Target.receivedMessageFromTarget', onPageMessage);
   const stop = (): void => {
     session.off('Network.webSocketCreated', onPageCreated);
+    session.off('Network.webSocketFrameSent', frameSent);
     session.off('Target.attachedToTarget', onPageAttached);
     session.off('Target.receivedMessageFromTarget', onPageMessage);
   };

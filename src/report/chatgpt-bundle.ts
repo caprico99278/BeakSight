@@ -7,7 +7,7 @@
  *   `manifest.json` の次に、Rule ごとの要約（`findings-by-rule.json`。表示用モデルの `ruleDigests` の写し）を `summary.json` の次に入れる。どちらも、
  *   表示用モデルの値を描くだけで、数え直さない。
  * - ZIP に入れるものと順（REC-4: 第 1 部は入口だけ）: `manifest.json`、`README.md`、`run.json`、`summary.json`、`findings-by-rule.json`、`finding-files.json`、
- *   `finding-groups.json`、`pages.json`、`links.json`、指摘のファイル（`pages/<pageId>/findings.json` をページの順、最後に `run-findings.json`）、
+ *   `finding-groups.json`、`pages.json`、`links.json`、`measurement-tags.json`（BS-1）、`key-actions.json`（BS-2）、指摘のファイル（`pages/<pageId>/findings.json` をページの順、最後に `run-findings.json`）、
  *   各ページの `page.json`（パスの順。設計書 6.1.11）、各ページの `visible-text.txt`（パスの順）、スクリーンショット（パスの順）。
  * - AUD-1（設計書 `2026-11-09-beaksight-audit-precision-triage.md` の AUD-1a・1b）と AUD-1d（ユーザーの判断 2026-11-09「徹底的に端から端まで監査できなければ
  *   価値が無い」。AUD-1b の予算で外す決まりに優先する）: 表示用モデルの参照の一覧（`artifactReferences`）の全部を入れる。
@@ -83,6 +83,7 @@ import {
   AUDIT_SEND_TEXT,
   CHATGPT_BUNDLE_GUIDE_TEXT,
   HTML_REPORT_TEXT,
+  KEY_ACTION_TEXT,
   PAGE_COVERAGE_ITEMS,
   RUN_SUMMARY_TEXT,
   cliCountText,
@@ -137,8 +138,16 @@ export type { BundleArtifactFiles, ReadArtifactFile } from './artifact-reference
  * `initial-only-findings.json`）をページごとの指摘のファイル（`pages/<pageId>/findings.json` と、ページに属さない指摘の `run-findings.json`）とその場所の一覧
  * （`finding-files.json`）に分け、Evidence の索引（`evidence-index.json`）・`pages.json` の指摘の ID の一覧・`finding-groups.json` の `findingIds` を外し
  * （指摘ごとの `groupId` で引く）、README.md に page.json 2.0 の短い形の読み方を足したので、2.0 にした。前の版を読む口は作らない（作り直さない）。
+ * BS-1（設計書 `2026-11-19-beaksight-measurement-tag-inventory-design.md`）: 計測のタグの一覧の `measurement-tags.json`（第 1 部）と、README.md にその読み方を
+ * 足したので、2.1 にした（ファイルを足したときの前例。`links.json` の 1.11）。
+ * BS-2（設計書 `2026-11-20-beaksight-key-action-positions-design.md`）: 主要な行動の候補の位置の `key-actions.json`（第 1 部）、固定の表示の覆いの指摘の
+ * `verification.keyActions` と、README.md にその読み方を足したので、2.2 にした。
+ * RVP-1（設計書 `2026-11-24-beaksight-review-pending-evidence-design.md` 2.2）: `summary.json` の `focusChecks` に、前面の窓の背後で指摘にしなかった数
+ * （`byOutcome` の `FRONT_WINDOW_COVERED`）と、Tab の確かめのない指摘の数（`findingsWithoutSequentialTab`）を足し、README.md の読み方を直したので、2.3 にした。
+ * FRET（設計書 `2026-11-24-beaksight-dialog-focus-return-design.md` 1.4）: `summary.json` の `focusChecks` に、窓を開くボタンの確かめの数（`dialogFocus`。
+ * 「押す物なし」の画面の数を含む）を足し、README.md にその読み方を足したので、2.4 にした。
  */
-export const CHATGPT_BUNDLE_SCHEMA_VERSION = 'chatgpt-bundle/2.0';
+export const CHATGPT_BUNDLE_SCHEMA_VERSION = 'chatgpt-bundle/2.4';
 
 /**
  * ZIP の中で、このファイルが作るファイルの名前（`run.json` は、Run のディレクトリと同じ `RUN_ARTIFACT_FILE_NAMES.run`）。T44i: 読み方の案内（`readme`。
@@ -156,6 +165,10 @@ export const CHATGPT_BUNDLE_FILE_NAMES = Object.freeze({
   pages: 'pages.json',
   // AUD-6b: リンクごとの確かめの状態（表示用モデルの `linkChecks` の写し）。
   links: 'links.json',
+  // BS-1: 計測のタグの一覧（表示用モデルの `summary.measurementTags` の写し。タグがなければ空の一覧）。
+  measurementTags: 'measurement-tags.json',
+  // BS-2: 主要な行動の候補の位置（表示用モデルの `summary.keyActions` の写し。候補がなくても、ページの行と探した範囲を書く）。
+  keyActions: 'key-actions.json',
   // REC-4: ページごとの指摘のファイルの名前（`pages/<pageId>/` の下）と、ページに属さない指摘のファイル。
   pageFindings: 'findings.json',
   runFindings: 'run-findings.json',
@@ -251,8 +264,10 @@ const reasonCodes = (
  */
 const summaryView = (model: ReportViewModel): object => {
   const { lastFinishedAt: _lastFinishedAt, ...executions } = model.summary.executions;
+  // BS-1: 計測のタグの一覧は `measurement-tags.json` に置く（`summary.json` に重ねて書かない）。BS-2: 主要な行動の候補の位置は `key-actions.json` に置く。
+  const { measurementTags: _measurementTags, keyActions: _keyActions, ...summary } = model.summary;
   return {
-    ...model.summary,
+    ...summary,
     executions,
     incompleteReasons: reasonCodes(model.summary.incompleteReasons),
   };
@@ -606,6 +621,18 @@ function guideMarkdown(model: ReportViewModel, partCount: number): string {
     // 設計者の判断 2026-11-11: 同じ口のくり返しをまとめた記録の読み方（値は summary.json・page.json にある）。
     text.repeatedReadsNote,
     '',
+    // BS-1: 計測のタグの一覧の読み方（事実と、確かめていないことの区別）。
+    `## ${text.measurementTagsHeading}`,
+    '',
+    text.measurementTagsNote(markdownCode(names.measurementTags)),
+    '',
+    // BS-2: 主要な行動の候補の位置の読み方（限界の文はいつも付ける）。
+    `## ${text.keyActionsHeading}`,
+    '',
+    KEY_ACTION_TEXT.limitNote,
+    '',
+    text.keyActionsNote(markdownCode(names.keyActions)),
+    '',
     // AUD-9c: 候補群の読み方。
     `## ${text.findingGroupsHeading}`,
     '',
@@ -940,6 +967,10 @@ async function prepareBundleParts(
     { path: CHATGPT_BUNDLE_FILE_NAMES.findingGroups, bytes: artifactJsonBytes(findingGroupsView(viewModel)) },
     { path: CHATGPT_BUNDLE_FILE_NAMES.pages, bytes: artifactJsonBytes(pagesView(viewModel, included)) },
     { path: CHATGPT_BUNDLE_FILE_NAMES.links, bytes: artifactJsonBytes(viewModel.linkChecks) },
+    // BS-1: 計測のタグの一覧（表示用モデルの値の写し。数え直さない）。
+    { path: CHATGPT_BUNDLE_FILE_NAMES.measurementTags, bytes: artifactJsonBytes(viewModel.summary.measurementTags) },
+    // BS-2: 主要な行動の候補の位置（表示用モデルの値の写し。数え直さない）。
+    { path: CHATGPT_BUNDLE_FILE_NAMES.keyActions, bytes: artifactJsonBytes(viewModel.summary.keyActions) },
   ];
 
   // REC-4: 指摘のファイル（ページの順、ページに属さない指摘は最後）。MEM-2: 中身は持たず、目録の 1 件だけを決め、部を作るときに組み立て直す。

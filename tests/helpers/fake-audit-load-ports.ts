@@ -19,6 +19,7 @@ import type {
   AuditInteractionOutcome,
   AuditLoadPorts,
   AuditPassiveOpening,
+  AuditResizedStressLayoutOptions,
   AuditStressLayoutOptions,
   AuditStressSession,
   AuditView,
@@ -27,7 +28,7 @@ import type {
 } from '../../src/orchestration/page-auditor.js';
 import type { PageNavigationResult } from '../../src/orchestration/page-navigation.js';
 import { SafetyLedger } from '../../src/safety/safety-ledger.js';
-import type { StressLayoutEvidence } from '../../src/core/evidence-types.js';
+import type { LayoutEvidence, StressLayoutEvidence } from '../../src/core/evidence-types.js';
 import { createTestConfig, type TestConfigOverrides } from './test-config.js';
 
 /** 偽の page の名前（Passive は `desktop`・`mobile`、幅の走査は `stress-<幅>`、開いた状態は `opened`）。 */
@@ -45,12 +46,16 @@ export interface FakeAuditScript {
   readonly load?: (profile: ViewportProfile) => MainFrameLoadObservation;
   /** 幅の読み込みの観測（省略は 200 の OK）。 */
   readonly stressLoad?: (width: number) => MainFrameLoadObservation;
-  /** page の操作を差し替える（collector の失敗・PARTIAL など）。`emit` で crash を起こせる。 */
-  readonly view?: (name: FakeViewName, emit: { readonly crash: () => void }) => Partial<AuditView>;
+  /** page の操作を差し替える（collector の失敗・PARTIAL など）。`emit` で crash を起こせる。`emit.url` は、その page の今の URL。 */
+  readonly view?: (name: FakeViewName, emit: { readonly crash: () => void; readonly url: () => string }) => Partial<AuditView>;
   /** Passive の Context を閉じた失敗（省略は失敗なし）。 */
   readonly closeFailure?: (profile: ViewportProfile) => Error | null;
   /** 幅の page を開いた後（違反を記録するなど）。 */
   readonly afterStressOpen?: (width: number) => void;
+  /** SWR: 大きさを変えた幅の page の後（押す期間の移動を数えるなど）。 */
+  readonly afterStressResize?: (width: number) => void;
+  /** SWR: 幅の layout（`RESIZED` は大きさを変えて測った幅、`LOADED` は読み込んで測った幅。省略は空の layout）。`null` は、その幅の失敗。 */
+  readonly stressLayout?: (width: number, mode: 'RESIZED' | 'LOADED') => LayoutEvidence | null;
   /** Interaction の候補 1 つの結果（省略は `VERIFIED`）。 */
   readonly interaction?: (input: AuditInteractionInput) => Promise<AuditInteractionOutcome> | AuditInteractionOutcome;
   /** 見つける Interaction の候補の ID（省略は候補なし）。 */
@@ -60,6 +65,22 @@ export interface FakeAuditScript {
 const OK_LOAD: MainFrameLoadObservation = Object.freeze({ navigationOutcome: 'OK', httpStatus: 200, failureDetail: null });
 const NO_DATA_ACTIVITY: DataRequestActivity = Object.freeze({ inFlight: 0, events: 0, endpoints: Object.freeze({ inFlight: [], completed: [] }) });
 const SETTLED: PageSettlingResult = Object.freeze({ status: 'SETTLED', reason: 'DOM_AND_HEIGHT_STABLE', observations: Object.freeze([]) });
+
+/** SWR: 指摘になりうる事実のない幅の layout（照らし合わせが読む一覧だけを持つ見本）。 */
+export const EMPTY_STRESS_LAYOUT = Object.freeze({
+  document: { horizontalOverflowPx: 0 },
+  boxesOutsideViewport: [],
+  zeroSizeInteractive: [],
+  clippedText: [],
+  fixedHeadingOverlaps: [],
+  elementOverlaps: [],
+  fixedElements: [],
+}) as unknown as LayoutEvidence;
+
+/** 幅の結果（`null` の layout は、その幅の失敗）。 */
+const stressResultOf = (width: number, layout: LayoutEvidence | null): StressLayoutEvidence => sample<StressLayoutEvidence>(layout === null
+  ? { width, height: 900, status: 'FAILED', stage: 'COLLECTION', reason: 'EVALUATION_FAILED', message: null, layout: null }
+  : { width, height: 900, status: 'COMPLETE', layout });
 
 /** 形だけの見本の記録（Rule は読まない。Evidence の種類ごとの payload として残るだけ）。 */
 const sample = <T>(value: object): T => Object.freeze(value) as T;
@@ -87,16 +108,19 @@ export interface FakeAuditLoad {
   readonly events: string[];
   /** 偽の page の Ledger（違反を記録して Guard の止めを表す）。 */
   readonly ledgers: Map<FakeViewName, SafetyLedger>;
+  /** FRET: 偽の page の口の呼び出しと読み込みの順（`<名前>:<口>`。読み込みは `<名前>:navigate`）。 */
+  readonly calls: string[];
 }
 
 export function createFakeAuditLoadPorts(script: FakeAuditScript = {}): FakeAuditLoad {
   const events: string[] = [];
+  const calls: string[] = [];
   const ledgers = new Map<FakeViewName, SafetyLedger>();
   const viewOf = (name: FakeViewName, width: number | null, url: () => string): AuditView => {
     const ledger = new SafetyLedger();
     ledgers.set(name, ledger);
     const crashListeners = new Set<() => void>();
-    const overrides = script.view?.(name, { crash: () => crashListeners.forEach((listener) => listener()) }) ?? {};
+    const overrides = script.view?.(name, { crash: () => crashListeners.forEach((listener) => listener()), url }) ?? {};
     const candidates = (script.candidates?.(name) ?? []).map(fakeCandidate);
     const view: AuditView = {
       url,
@@ -120,13 +144,16 @@ export function createFakeAuditLoadPorts(script: FakeAuditScript = {}): FakeAudi
       readLcpBeforeScroll: async () => undefined,
       captureScreenshots: async () => [],
       captureViewportScreenshot: async () => sample({ captureType: 'VIEWPORT' }),
-      collectFocusChecks: async () => sample({ items: [] }),
+      collectFocusChecks: async ({ stressWidth }) => sample({ items: [], ...(stressWidth === null ? {} : { stressWidth }) }),
       revealAndCapture: async () => undefined,
       captureAsIs: async () => null,
       checkScrollableRegions: async () => [],
+      checkSequentialTab: async (evidence) => evidence,
+      checkDialogFocus: async () => ({ status: 'COMPLETE', pressableCount: 0, alreadyCheckedCount: 0, items: [] }),
       discoverLinks: async () => sample({ links: [] }),
       discoverInteractionCandidates: async () => ({ candidates, completeness: 'COMPLETE', domWorkUsed: 0 }),
       dismissNotificationFrames: async () => sample({ readStatus: 'READ', frames: [], pressCount: 0, navigated: false, truncated: false }),
+      readModalCandidateOrdinals: async () => null,
       loadFacts: () => null,
       pressNavigations: () => 0,
       pressNavigationTargets: () => [],
@@ -141,7 +168,14 @@ export function createFakeAuditLoadPorts(script: FakeAuditScript = {}): FakeAudi
       },
       ...overrides,
     };
-    return Object.freeze(view);
+    // FRET: 口の呼び出しの順を残す（値と振る舞いは変えない）。
+    const logged = Object.fromEntries(Object.entries(view).map(([key, value]) => [key, typeof value === 'function'
+      ? (...args: unknown[]): unknown => {
+        calls.push(`${name}:${key}`);
+        return (value as (...given: unknown[]) => unknown)(...args);
+      }
+      : value])) as unknown as AuditView;
+    return Object.freeze(logged);
   };
   const handleOf = <T>(value: T): CollectorHandle<T> => ({ snapshot: async () => value, detach: () => undefined });
   const ports: AuditLoadPorts = {
@@ -177,6 +211,7 @@ export function createFakeAuditLoadPorts(script: FakeAuditScript = {}): FakeAudi
           installPerformance: async () => undefined,
           navigate: async (url) => {
             events.push(`navigate:${profile}`);
+            calls.push(`${profile}:navigate`);
             const observation = script.load?.(profile) ?? OK_LOAD;
             currentUrl = url;
             return navigationOf(url, observation);
@@ -215,11 +250,54 @@ export function createFakeAuditLoadPorts(script: FakeAuditScript = {}): FakeAudi
         try {
           options.afterNavigation?.(script.stressLoad?.(width) ?? OK_LOAD);
           await options.settleBeforeLayout(session.view, options.deadlineAtMs);
-          results.push(sample<StressLayoutEvidence>({ width, height: 900, status: 'COMPLETE', layout: {} }));
-          await options.afterLayout?.(session.view, width, sample({}));
+          const layout = script.stressLayout === undefined ? EMPTY_STRESS_LAYOUT : script.stressLayout(width, 'LOADED');
+          results.push(stressResultOf(width, layout));
+          if (layout !== null) {
+            await options.afterLayout?.(session.view, width, layout);
+          }
         } finally {
           await session.close();
         }
+      }
+      return results;
+    },
+    // SWR: 1 つの page を最初の幅で読み込み、後の幅は大きさだけを変える（`resize:<page>:<幅>` を残す）。
+    collectResizedStressLayout: async (createSession, _url, widths, options: AuditResizedStressLayoutOptions): Promise<readonly StressLayoutEvidence[]> => {
+      if (script.stressLayoutError !== undefined) {
+        throw script.stressLayoutError();
+      }
+      const around = options.aroundWidth ?? ((_width: number, work: () => Promise<StressLayoutEvidence>) => work());
+      const results: StressLayoutEvidence[] = [];
+      let session: AuditStressSession | null = null;
+      try {
+        for (const [index, width] of widths.entries()) {
+          const result = await around(width, async () => {
+            if (index === 0) {
+              await options.beforeNavigation();
+              session = await createSession({ width, height: 900 });
+              options.afterNavigation?.(script.stressLoad?.(width) ?? OK_LOAD);
+            } else {
+              events.push(`resize:stress-${String(widths[0])}:${String(width)}`);
+              script.afterStressResize?.(width);
+            }
+            const view = (session as AuditStressSession | null)?.view;
+            if (view === undefined) {
+              throw new Error('no resized session');
+            }
+            await options.settleBeforeLayout(view, options.deadlineAtMs);
+            const layout = script.stressLayout === undefined ? EMPTY_STRESS_LAYOUT : script.stressLayout(width, 'RESIZED');
+            if (layout !== null) {
+              await options.afterLayout?.(view, width, layout);
+            }
+            return stressResultOf(width, layout);
+          });
+          results.push(result);
+          if (result.status === 'FAILED') {
+            break;
+          }
+        }
+      } finally {
+        await (session as AuditStressSession | null)?.close();
       }
       return results;
     },
@@ -230,7 +308,7 @@ export function createFakeAuditLoadPorts(script: FakeAuditScript = {}): FakeAudi
         : await script.interaction(input);
     },
   };
-  return { ports, events, ledgers };
+  return { ports, events, ledgers, calls };
 }
 
 /** 間隔の待ちを `events` に `pacer` と残す pacer（待たない）。 */

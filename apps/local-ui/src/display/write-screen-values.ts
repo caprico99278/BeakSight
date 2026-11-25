@@ -59,15 +59,57 @@ const SCREEN_WORD_SKIPPED: ReadonlySet<string> = new Set(['new', 'edit']);
 export const writeScreenWordOf = (path: string): string =>
   [...path.split('/')].reverse().find((segment) => segment.length > 0 && !SCREEN_WORD_SKIPPED.has(segment) && !isRecordIdLikePathSegment(segment)) ?? '';
 
+/** WDEDUP: 行の画面（画面の単位）と送信の形（分からない行は null。まとめない）と、チェック済み（承認済み）か。 */
+export interface WriteScreenSendShape {
+  readonly screen: string;
+  readonly sendShape: string | null;
+  readonly checked: boolean;
+}
+
+/**
+ * WDEDUP: 「登録・更新を試せる画面」の一覧で、同じ画面の中の、同じ送信の形の行を 1 行にまとめる（見せ方だけ。記録・承認・書き込みの元は変えない）。代表は、
+ * まとめる行にチェック済みの行があれば、その中で一覧の順で最初の行、なければ一覧の順で最初の行（まとめた行の位置は、一覧の順で最初の行の位置）。`count` は
+ * まとめた行の数（ひとりの行は 1）、`checkedCount` はそのうちチェック済みの行の数。画面をまたいではまとめない（違う画面の同じ送信は、別の確かめになりうる）。
+ */
+export const writeScreenSameSendRowsOf = <T>(
+  items: readonly T[],
+  shapeOf: (item: T) => WriteScreenSendShape,
+): readonly { readonly item: T; readonly count: number; readonly checkedCount: number }[] => {
+  const groups = new Map<string, { item: T; count: number; checkedCount: number }>();
+  const rows: { item: T; count: number; checkedCount: number }[] = [];
+  for (const item of items) {
+    const { screen, sendShape, checked } = shapeOf(item);
+    const key = sendShape === null ? null : JSON.stringify([screen, sendShape]);
+    const group = key === null ? undefined : groups.get(key);
+    if (group !== undefined) {
+      group.count += 1;
+      if (checked) {
+        if (group.checkedCount === 0) {
+          group.item = item;
+        }
+        group.checkedCount += 1;
+      }
+      continue;
+    }
+    const row = { item, count: 1, checkedCount: checked ? 1 : 0 };
+    rows.push(row);
+    if (key !== null) {
+      groups.set(key, row);
+    }
+  }
+  return rows;
+};
+
 /**
  * OP-2 の修正の 2 回目（判断 2）: 試せない行の理由の種類（閉じた一覧。文言はカタログ `LOCAL_UI_WRITE_SCREENS_TEXT.notCheckable`。網羅は `catalog-coverage.ts`）。
  * - `SECRET_FIELD`: 秘密に見える欄がある。`DESTRUCTIVE`: 消す・取り消すなどの操作に当たる。`ANSWER_CHECK`: 答え合わせのしかたを決められない。
  * - `SITE_CHANGED`: 操作さがしの後にサイトの設定が変わった（もう一度点検すると試せる）。`UNSUPPORTED`: そのほか（BeakSight が扱えない入力のしかた）。
  * - OP-K（K2）: `SECRET_KEY`: 画面が自動で入れて送る項目に、秘密に見える名前のものがある。`FIELD_SHAPE`: 入れた値と送る中身の結び付きが分からない（1 つの欄の値を
  *   いくつもの項目に入れて送る、欄の値を別の形に変えて送るなど）。
+ * - WBF（DEF-291 の B1）: `VALUES_NOT_SENT`: 欄に入れた値が、見た送信のどこにもない（保存の前に別の確かめを送る画面など。本当の保存を見ていない）。
  */
 export const WRITE_SCREEN_NOT_CHECKABLE_KINDS = Object.freeze([
-  'SECRET_FIELD', 'DESTRUCTIVE', 'ANSWER_CHECK', 'SITE_CHANGED', 'UNSUPPORTED', 'SECRET_KEY', 'FIELD_SHAPE',
+  'SECRET_FIELD', 'DESTRUCTIVE', 'ANSWER_CHECK', 'SITE_CHANGED', 'UNSUPPORTED', 'SECRET_KEY', 'FIELD_SHAPE', 'VALUES_NOT_SENT',
 ] as const);
 export type WriteScreenNotCheckableKind = (typeof WRITE_SCREEN_NOT_CHECKABLE_KINDS)[number];
 
@@ -134,6 +176,8 @@ const NOT_CHECKABLE_KIND_OF_REASON: Readonly<Record<ScenarioDraftRejectionReason
   // ARR-5 fix round 1: 一覧の行の欄の道の重なりと、本文の同じ鍵の 2 回。
   SCENARIO_API_ARRAY_PATH_CONFLICT: 'UNSUPPORTED',
   SCENARIO_API_BODY_KEY_DUPLICATE: 'UNSUPPORTED',
+  // WBF（DEF-291 の B1）: 入れた値が送られるところを見届けられない登録の型。
+  SCENARIO_API_FIELD_VALUES_NOT_SENT: 'VALUES_NOT_SENT',
 });
 
 /** 試せない理由のコードの、やさしい 1 行の種類。 */

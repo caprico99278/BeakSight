@@ -285,7 +285,8 @@ describe('the control instance lock: the flows of the review T24R (t24r/e1)', ()
     expect(await second.exited).toBe(0);
 
     expect(await jobsOf(first)).toEqual([[PROFILE_ONE, 'RUNNING', null]]);
-    expect(await request(first, `${INSTANCE_CHILD_PROTOCOL.start} ${PROFILE_TWO} ${MIN_PROFILE_REVISION}`)).toBe('RESULT JOB_ALREADY_ACTIVE -');
+    // PAR-b: ジョブはプロファイルごとに同時に 1 つ（同じプロファイルで確かめる）。
+    expect(await request(first, `${INSTANCE_CHILD_PROTOCOL.start} ${PROFILE_ONE} ${MIN_PROFILE_REVISION}`)).toBe('RESULT JOB_ALREADY_ACTIVE -');
     expect(startsReceived()).toBe(1);
     await closeChild(first);
   }, TEST_TIMEOUT_MS);
@@ -299,7 +300,8 @@ describe('the control instance lock: the flows of the review T24R (t24r/e1)', ()
     expect(second.first.startsWith(`${INSTANCE_CHILD_PROTOCOL.locked} `)).toBe(true);
     await second.exited;
 
-    expect(await request(first, `${INSTANCE_CHILD_PROTOCOL.start} ${PROFILE_TWO} ${MIN_PROFILE_REVISION}`)).toBe('RESULT JOB_ALREADY_ACTIVE -');
+    // PAR-b: ジョブはプロファイルごとに同時に 1 つ（同じプロファイルで確かめる）。
+    expect(await request(first, `${INSTANCE_CHILD_PROTOCOL.start} ${PROFILE_ONE} ${MIN_PROFILE_REVISION}`)).toBe('RESULT JOB_ALREADY_ACTIVE -');
     expect(await jobsOf(first)).toEqual([[PROFILE_ONE, 'RUNNING', null]]);
     expect(startsReceived()).toBe(1);
     await closeChild(first);

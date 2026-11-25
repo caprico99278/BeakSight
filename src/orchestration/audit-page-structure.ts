@@ -8,14 +8,18 @@
  *     選択肢（記録にないので `null`）。
  *   - DOM の記録のないページ（読めなかった）は `UNREAD_PAGE_STRUCTURE_KEY`。
  * - 辺: 各ビューポートの Link の Evidence の、巡回で移るリンク（`crawlableLinkUrlsOf`）と、同じ Origin の子の frame の文書（`frames`）。
+ * - DUP（ユーザーの判断 2026-11-18）: 同じ作りの画面を見分ける作りの鍵（`auditPageTemplateKeyOf`。データを抜いた形）と中身の要約（`auditPageContentDigestOf`）も
+ *   ここで作る。Page Auditor が Desktop の layout の後に読む。
  */
 import type { PageAuditResult } from '../core/contracts.js';
-import type { DomEvidence, SemanticRegionKind } from '../core/evidence-types.js';
+import type { CollectedDomEvidence, DomEvidence, FormFieldEvidence, LayoutEvidence, SemanticRegionKind } from '../core/evidence-types.js';
 import { createSha256Fingerprint } from '../core/ids.js';
 import { foldNfkcCase } from '../core/text.js';
 import { crawlableLinkUrlsOf } from '../crawl/internal-navigable-links.js';
 import { normalizeUrl } from '../crawl/normalize-url.js';
+import { dataFreePathOf, dataFreeQueryItemsOf } from '../discovery/fingerprint.js';
 import { STATE_WORDS, stateStructureKeyOf, type StateLandmarkRole } from '../discovery/state-keys.js';
+import type { InteractionCandidate } from '../safety/interaction-policy.js';
 import { UNREAD_PAGE_STRUCTURE_KEY, type CrawlPageEdge, type CrawlPageOutcome } from './crawl-frontier.js';
 
 /** 区分の種類から landmark の role（`other` は landmark でない）。 */
@@ -41,11 +45,15 @@ const desktopDomOf = (result: PageAuditResult): DomEvidence | null => {
   return found;
 };
 
-/** URL の path と query の名前（解析できなければ `null`）。 */
-const pathAndQueryNamesOf = (url: string): { readonly path: string; readonly queryNames: readonly string[] } | null => {
+/**
+ * URL の path と query の名前（解析できなければ `null`）。DUP: `dataFree` なら、データを抜いた path と query の項目（`dataFreePathOf`・`dataFreeQueryItemsOf`）。
+ */
+const pathAndQueryNamesOf = (url: string, dataFree = false): { readonly path: string; readonly queryNames: readonly string[] } | null => {
   try {
     const parsed = new URL(url);
-    return { path: parsed.pathname, queryNames: [...new Set(parsed.searchParams.keys())] };
+    return dataFree
+      ? { path: dataFreePathOf(parsed.pathname), queryNames: dataFreeQueryItemsOf(parsed.searchParams) }
+      : { path: parsed.pathname, queryNames: [...new Set(parsed.searchParams.keys())] };
   } catch {
     return null;
   }
@@ -63,9 +71,11 @@ function structureKeyOfDom(
     readonly openedDialogOrRegion: boolean | null;
     readonly candidateIds: readonly string[] | null;
     readonly visibleFieldsOnly?: boolean;
+    /** DUP: path と query を、データを抜いた形にする（作りの鍵）。 */
+    readonly dataFree?: boolean;
   },
 ): string {
-  const location = pathAndQueryNamesOf(url);
+  const location = pathAndQueryNamesOf(url, facts.dataFree === true);
   const text = foldNfkcCase(dom.visibleText.text);
   const fields = [...dom.forms.flatMap((form) => form.fields), ...dom.unassociatedFields]
     .filter((field) => facts.visibleFieldsOnly !== true || field.visible);
@@ -101,6 +111,85 @@ export function auditPageStructureKeyOf(result: PageAuditResult): string {
  */
 export function openedStateStructureKeyOf(dom: DomEvidence, url: string, pressedCandidateIds: readonly string[]): string {
   return structureKeyOfDom(dom, url, { openedDialogOrRegion: true, candidateIds: pressedCandidateIds, visibleFieldsOnly: true });
+}
+
+/** DUP: 候補の形の入力の形の印（版つき）。 */
+const CANDIDATE_SHAPE_FORMAT = 'beaksight-audit-candidate-shape/1';
+/** DUP: 中身の要約の入力の形の印（版つき）。 */
+const PAGE_CONTENT_DIGEST_FORMAT = 'beaksight-audit-page-content/1';
+
+/** DUP: データを抜いた URL の path と query の項目（`dataFreePathOf`・`dataFreeQueryItemsOf`。解析できなければ `null`）。 */
+const urlShapeOf = (url: string | null): unknown => {
+  if (url === null) {
+    return null;
+  }
+  try {
+    const parsed = new URL(url);
+    return [dataFreePathOf(parsed.pathname), dataFreeQueryItemsOf(parsed.searchParams)];
+  } catch {
+    return null;
+  }
+};
+
+/**
+ * DUP: データを抜いた候補の形（名前・文字・番号・開いた状態・制御する要素の ID は入れない）。行き先は、同じ Origin の http だけ形を入れ、特別な scheme
+ * （`tel:` など）と外のサイトは種類（`hrefKind`）だけにする（REV-DUP の I-2。電話番号や外のサイトの行き先は、データで変わる）。
+ */
+const candidateShapeOf = (candidate: InteractionCandidate): string => JSON.stringify([
+  CANDIDATE_SHAPE_FORMAT,
+  candidate.tagName,
+  candidate.role,
+  candidate.type,
+  candidate.hrefKind,
+  candidate.hrefKind === 'SAME_ORIGIN_HTTP' ? urlShapeOf(candidate.href) : null,
+  candidate.formAssociated,
+  candidate.formMethod,
+  urlShapeOf(candidate.formAction),
+  candidate.download,
+  candidate.destructiveAction,
+  candidate.disabled,
+  candidate.visible,
+]);
+
+/**
+ * DUP（ユーザーの判断 2026-11-18）: 作りの鍵。Desktop の DOM と URL と Interaction の候補から、データを抜いた形で作る（構造の鍵の部品 `stateStructureKeyOf` を
+ * 使う。候補の識別は、名前・文字・番号の違いでは変わらない形 `candidateShapeOf`）。同じ作りでデータだけが違う画面で同じになる。
+ */
+export function auditPageTemplateKeyOf(dom: DomEvidence, url: string, candidates: readonly InteractionCandidate[]): string {
+  return structureKeyOfDom(dom, url, { openedDialogOrRegion: null, candidateIds: candidates.map(candidateShapeOf), dataFree: true });
+}
+
+/**
+ * DUP: 中身の要約。表示の中身（題名・見える文字・見出し・画像・欄と、見えている欄の値の digest・送信のボタン）と、layout のあらまし（文書の大きさ・指摘の
+ * 対象）の digest。リンクの行き先（href）は入れない（戻り先の query だけが違う画面を同じにする）。layout がなければ `null`（比べられない）。欄の値の digest は、
+ * 集めた DOM の Evidence だけが持つ（記録には残さない。`CollectedDomEvidence`）。
+ */
+export function auditPageContentDigestOf(dom: CollectedDomEvidence, layout: LayoutEvidence | null): string | null {
+  if (layout === null) {
+    return null;
+  }
+  const fieldOf = (field: FormFieldEvidence): unknown => [field.type, field.name, field.required, field.visible, field.labels];
+  const { document } = layout;
+  return createSha256Fingerprint(JSON.stringify([
+    PAGE_CONTENT_DIGEST_FORMAT,
+    dom.title,
+    dom.visibleText.text,
+    dom.visibleText.ariaHiddenText,
+    dom.headings.map(({ level, text }) => [level, text]),
+    dom.images.map((image) => [image.resolvedUrl ?? image.src, image.alt, image.naturalWidth, image.naturalHeight]),
+    dom.forms.map((form) => [form.method, form.fields.map(fieldOf), form.submitControls.map(({ type, name, value, text }) => [type, name, value, text])]),
+    dom.unassociatedFields.map(fieldOf),
+    dom.fieldValuesDigest ?? null,
+    [
+      document.documentElementScrollWidth, document.documentElementScrollHeight, document.bodyScrollWidth, document.bodyScrollHeight,
+      document.horizontalOverflowPx,
+    ],
+    layout.boxesOutsideViewport.map(({ selector }) => selector),
+    layout.zeroSizeInteractive.map(({ selector }) => selector),
+    layout.clippedText.map(({ selector, text }) => [selector, text]),
+    layout.fixedHeadingOverlaps,
+    layout.elementOverlaps,
+  ]));
 }
 
 /** COV-4 の区切り 3: 操作の後の URL が、ページの URL と比べて path が違えば SPA の経路、query だけが違えば query の変化（同じなら辺にしない）。 */

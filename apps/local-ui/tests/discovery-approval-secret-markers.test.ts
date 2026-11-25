@@ -10,7 +10,8 @@
  *   `aria-describedby` の指す要素の文字（T27R2 の I3。fixture の `markerShapes` の画面）にも置く。加えて、秘密に見える名前の欄に入れて拒まれた送る値）が、
  *   検索するすべての場所に、UTF-8 でも UTF-16LE でも出ない。READ の送る値は、定義の画面（HTML と `readCheckPageFn` の応答）・管理データ・
  *   `read-evidence.json`・ワーカーが親から受けた `START` にだけ出る。サイトへの要求（ジョブごとの窓）は、GET と HEAD と仮のサイトの beacon のほかは、
- *   ログインの POST の 1 回だけ。読まないパス・危険な語・範囲の外へは 0 件。READ の URL の query は、定義の欄の名前だけ。
+ *   ログインの POST の 1 回だけ。読まないパス・危険な語・範囲の外へは 0 件。READ の URL の query は、定義の欄の名前だけ。DEF-300: 検索の確かめ（RCA）の
+ *   GET のフォームの組も読む（読んだ組の数だけ query のある読み込みが増え、その query の名前は組が変えた欄の名前で、秘密に見える名前はない）。
  * - T28f（Task 28 の設計書 4.7、6 章、8 章）: 一覧でチェックを入れる・外す（承認と撤回。SPEC-4）の間、サイトへの要求は 0 件（書き込みの要求 0）。画面の
  *   Cookie と token は、シナリオの画面の HTML と、シナリオと一覧の Server Function の応答に出ない。撤回で実行の許可が無効になり、予約が返り、次の発行が
  *   拒まれる。T31h-1・OP-2: チェックの保存は、登録の台帳に結ぶ更新（UPDATE）の下書きも作って承認する（UPDATE のシナリオの詳細の画面と応答も検索する）。
@@ -26,7 +27,7 @@
  * TEST-TIME-A: 読み込みの間隔は 0（流れの既定）。間隔を守ることは `tests/integration/navigation-pacing.test.ts` と navigation-pacer の場面で確かめる。
  */
 import { randomUUID } from 'node:crypto';
-import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import { mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { strToU8, zipSync } from 'fflate';
@@ -43,6 +44,7 @@ import {
 import { AUTO_LOGIN_MIN_INTERVAL_MS } from '../../../src/control/job/auto-login-limits.js';
 import type { ControlDatabase } from '../../../src/control/store/control-database.js';
 import { CONTROL_DATA_DIRECTORY_NAME } from '../../../src/control/store/database-path.js';
+import { isSecretUrlQueryParameterName } from '../../../src/core/secret-query-names.js';
 import { DISCOVERY_ARTIFACT_FILE_NAME, READ_EVIDENCE_ARTIFACT_FILE_NAME } from '../../../src/core/artifact-layout.js';
 import { READ_CHECK_EXPECTATION_KIND_CATALOG } from '../../../src/presentation/catalog.js';
 import { LOCAL_UI_READ_CHECK_TEXT } from '../../../src/presentation/messages.js';
@@ -212,6 +214,29 @@ interface SceneRecord {
   readonly updateScenarioId: string;
 }
 const sceneRecords = new Map<string, SceneRecord>();
+/** DEF-300: READ の確かめのジョブ（窓の名前）ごとの、読んだ検索の確かめの GET のフォームの組の、変えた欄の名前（基準の組は null）。 */
+const formSearchChecks = new Map<string, readonly (string | null)[]>();
+
+/** DEF-300: 検索の確かめの組の結果のうち、ここで読む所（成果物 `read-evidence.json` の `searchChecks`）。 */
+interface SearchCheckRow {
+  readonly trigger: string;
+  readonly state: string;
+  readonly detail?: string;
+  readonly how: { readonly kind: string; readonly field?: string };
+}
+
+/** DEF-300: ジョブの `read-evidence.json` の、読んだ（守りが止めていない）GET のフォームの組の、変えた欄の名前。 */
+const formSearchChecksOf = (jobId: string): readonly (string | null)[] => {
+  const root = flow.rootOf();
+  const document = (readdirSync(root, { recursive: true }) as string[])
+    .filter((name) => name.endsWith(READ_EVIDENCE_ARTIFACT_FILE_NAME))
+    .map((name) => JSON.parse(readFileSync(join(root, name), 'utf8')) as { readonly jobId: string; readonly searchChecks: readonly SearchCheckRow[] })
+    .find((evidence) => evidence.jobId === jobId);
+  expect(document, jobId).toBeDefined();
+  return (document?.searchChecks ?? [])
+    .filter(({ trigger, state, detail }) => trigger === 'FORM' && state === 'EXECUTED' && detail !== 'BLOCKED_BY_BEAKSIGHT')
+    .map(({ how }) => how.field ?? null);
+};
 
 const siteOf = (site: DiscoverySite | undefined): DiscoverySite => {
   if (site === undefined) {
@@ -518,13 +543,19 @@ const expectSiteRequestsOf = (window: JobWindow): void => {
       .filter((path) => path !== DISCOVERY_SITE_PATHS.collect), window.label).toEqual([DISCOVERY_SITE_PATHS.api]);
     expect([...new Set(documents.map(pathnameOf))].sort(), window.label).toEqual([...DISCOVERY_SITE_READ_PAGES, ...readCheckPagePaths()].sort());
   } else {
-    // READ の URL（query のある管理画面の読み込み）の query は、定義の欄の名前だけ。
+    // READ の URL（query のある管理画面の読み込み）は、定義の数と、読んだ検索の確かめの GET のフォームの組の数（DEF-300。読まないパスへ送る組は始める前に
+    // 除くので入らない）。query は、定義の欄の名前と、組が変えた欄の名前だけ（秘密に見える名前はない）。
+    const formChecks = formSearchChecks.get(window.label) ?? [];
+    const names = new Set([...window.parameterNames, ...formChecks.flatMap((field) => (field === null ? [] : [field]))]);
     const readUrls = documents.filter(({ path }) => path.includes('?')).map(({ path }) => new URL(path, window.site.origin));
-    expect(readUrls.length, window.label).toBe(definitionCountOf(window));
+    expect(readUrls.length, window.label).toBe(definitionCountOf(window) + formChecks.length);
     for (const url of readUrls) {
-      expect([...url.searchParams.keys()].every((name) => window.parameterNames.includes(name)), `${window.label} ${url.pathname}`).toBe(true);
+      expect([...url.searchParams.keys()].every((name) => names.has(name) && !isSecretUrlQueryParameterName(name)), `${window.label} ${url.pathname}`)
+        .toBe(true);
     }
-    expect(afterLogin.filter(({ adminDocument }) => !adminDocument).map(pathnameOf), window.label).toEqual([]);
+    // 検索の確かめで開いた画面自身の GET（SPA の画面の fetch）と beacon（DEF-257。上で確かめた）のほかに、管理画面の HTML でない要求はない。
+    expect([...new Set(afterLogin.filter(({ adminDocument }) => !adminDocument).map(pathnameOf))]
+      .filter((path) => path !== DISCOVERY_SITE_PATHS.collect && path !== DISCOVERY_SITE_PATHS.api), window.label).toEqual([]);
   }
 };
 
@@ -555,6 +586,7 @@ const runScene = async (
   await login();
   const readCheck = await runJobFrom(`/read-checks/${profileId}`, 'read-check-start', 'READ_CHECK', profileId, site, ['q', 'id']);
   expect(readCheck).toMatchObject({ jobKind: 'READ_CHECK', state: 'FINISHED', runStatus: 'COMPLETE', lastAuthState: 'AUTHENTICATED', autoLogin });
+  formSearchChecks.set(`${profileId} READ_CHECK`, formSearchChecksOf(readCheck.jobId));
   expect(await readCheckResultsOf(profileId, readCheck.jobId)).toEqual(['MATCHED', 'MATCHED']);
   expect(site.successfulLogins).toBe(JOBS_PER_SCENARIO);
 

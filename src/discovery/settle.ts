@@ -22,7 +22,7 @@ import { PRODUCTION_OBSERVATION_WINDOWS, type ObservationWindows } from '../core
 import { watchProgress, type ProgressSignals } from '../core/progress-watch.js';
 import { OPEN_ENDED_STAGE_MS } from '../orchestration/stage-deadline.js';
 import { requestEndpointKeyOf } from '../core/request-endpoint-key.js';
-import type { DataActivity } from '../browser/page-settling.js';
+import { dataQuietnessOf, progressStoppedOf, type DataActivity } from '../browser/page-settling.js';
 
 // RB-2: 次の待ちの値は、観察の窓の一式（`discoverySettle`）の本番の値から導く。
 const SETTLE_WINDOWS = PRODUCTION_OBSERVATION_WINDOWS.discoverySettle;
@@ -46,6 +46,11 @@ export interface DiscoverySettlePolicy {
   readonly networkQuietMs: number;
   readonly pollIntervalMs: number;
   readonly probeIntervalMs: number;
+  /**
+   * DEF-290: まだ届いていない口の要求が残っていても、途中の要求の組が変わらない状態がこの長さ続いたら、読みに行く（ms。DEF-283 の C と同じ判定
+   * `progressStoppedOf`。省略は、その判定が持つ本番の開いた要求の静まり）。
+   */
+  readonly openDataRequestQuietMs?: number | undefined;
 }
 
 /** 本番の指定（設計書 4.2 の名前つきの定数）。 */
@@ -69,13 +74,36 @@ export const discoverySettlePolicyOf = (injected: ObservationWindows | undefined
  */
 export const settlePolicyOfWindows = (windows: ObservationWindows, busy = false): DiscoverySettlePolicy => {
   const { timeoutMs, networkQuietMs, pollIntervalMs, probeIntervalMs, busyTimeoutMs } = windows.discoverySettle;
-  return Object.freeze({ timeoutMs: busy ? busyTimeoutMs : timeoutMs, networkQuietMs, pollIntervalMs, probeIntervalMs });
+  return Object.freeze({
+    timeoutMs: busy ? busyTimeoutMs : timeoutMs, networkQuietMs, pollIntervalMs, probeIntervalMs, openDataRequestQuietMs: windows.pageSettle.openDataRequestQuietMs,
+  });
 };
 
 /** 進行中の要求が 0 になった時刻（`Date.now()`）を返す源。進行中の要求があれば `null`。 */
 export interface QuietSource {
   quietSinceMs(): number | null;
+  /** DEF-290: 今の要求の数と口ごとの事実（あれば、答えない長い要求で待ち続けないために使う。省略は今のまま）。 */
+  dataActivity?(): DataActivity;
+  /** REV-DQF fix round 3: 前の画面までに出た送り先（この画面で新しい送り先でない。省略はなし）。 */
+  knownEndpoints?(): ReadonlySet<string>;
 }
+
+/** REV-DQF fix round 3: Run の中で、前の画面までに出たデータの送り先の覚え（口の印 `requestEndpointKeyOf`。メモリの中だけで、記録しない）。 */
+export interface DataEndpointMemory {
+  readonly known: () => ReadonlySet<string>;
+  readonly remember: (endpoints: Iterable<string>) => void;
+}
+
+/** REV-DQF fix round 3: 空の覚えを作る（発見の流れが Run ごとに 1 つ作る）。 */
+export const createDataEndpointMemory = (): DataEndpointMemory => {
+  const endpoints = new Set<string>();
+  return Object.freeze({
+    known: (): ReadonlySet<string> => endpoints,
+    remember: (seen: Iterable<string>): void => {
+      for (const endpoint of seen) endpoints.add(endpoint);
+    },
+  });
+};
 
 /** page の要求の事象の名前（数え始めと、終わり。Guard が止めた要求も `requestfailed` で終わる）。 */
 const REQUEST_START_EVENT = 'request';
@@ -115,9 +143,20 @@ export class InFlightRequestCounter implements QuietSource {
 
   /** COV-3: 要求の始まりと終わりの通しの数（`dataActivity`。通信が動いたかを見る）。 */
   #events = 0;
+  /** REV-DQF fix round 3: この画面で出た送り先（次の画面に、新しい送り先でないと伝える）と、前の画面までに出た送り先を読む口。 */
+  readonly #seenEndpoints = new Set<string>();
+  readonly #knownEndpoints: (() => ReadonlySet<string>) | undefined;
+
+  /** QUIET-3: 口ごとの、要求が始まった数（`dataActivity` の `endpoints.started`）。 */
+  readonly #startedEndpoints = new Map<string, number>();
 
   readonly #onStart = (request: Request): void => {
-    this.#inFlight.set(request, { endpoint: this.#endpointOf(request), respondedAtMs: null });
+    const unknownBefore = this.#unknownEndpoints;
+    const endpoint = this.#endpointOf(request);
+    this.#startedEndpoints.set(endpoint, (this.#startedEndpoints.get(endpoint) ?? 0) + 1);
+    // 口を読めない要求の印は、この画面の中だけの番号なので、覚えない。
+    if (this.#unknownEndpoints === unknownBefore) this.#seenEndpoints.add(endpoint);
+    this.#inFlight.set(request, { endpoint, respondedAtMs: null });
     this.#events += 1;
   };
 
@@ -195,9 +234,15 @@ export class InFlightRequestCounter implements QuietSource {
   constructor(
     page: Page,
     /** RB-8: テストだけが差し込む時計と本文の猶予（観察の窓の一式の `discoverySettle.responseBodyGraceMs`）。省略は本番。 */
-    options: { readonly clock?: Clock | undefined; readonly responseBodyGraceMs?: number | undefined } = {},
+    options: {
+      readonly clock?: Clock | undefined;
+      readonly responseBodyGraceMs?: number | undefined;
+      /** REV-DQF fix round 3: 前の画面までに出た送り先を読む口（省略はなし）。 */
+      readonly knownEndpoints?: (() => ReadonlySet<string>) | undefined;
+    } = {},
   ) {
     this.#page = page;
+    this.#knownEndpoints = options.knownEndpoints;
     this.#clock = options.clock ?? SYSTEM_CLOCK;
     this.#responseBodyGraceMs = options.responseBodyGraceMs ?? DISCOVERY_RESPONSE_BODY_GRACE_MS;
     this.#lastEndMs = this.#clock.now();
@@ -227,6 +272,7 @@ export class InFlightRequestCounter implements QuietSource {
         inFlight: [...this.#inFlight.values()].map(({ endpoint }) => endpoint),
         completed: [...this.#completedEndpoints],
         failed: [...this.#failedEndpoints],
+        started: Object.fromEntries(this.#startedEndpoints),
       },
     };
   }
@@ -235,6 +281,16 @@ export class InFlightRequestCounter implements QuietSource {
   quietSinceMs(): number | null {
     this.#expireGrace();
     return [...this.#inFlight.values()].some(({ endpoint }) => this.#pending(endpoint)) ? null : this.#lastEndMs;
+  }
+
+  /** REV-DQF fix round 3: 前の画面までに出た送り先（この画面で新しい送り先でない）。 */
+  knownEndpoints(): ReadonlySet<string> {
+    return this.#knownEndpoints?.() ?? new Set<string>();
+  }
+
+  /** REV-DQF fix round 3: この画面で出た送り先（口を読めた要求だけ）。 */
+  seenEndpoints(): readonly string[] {
+    return [...this.#seenEndpoints];
   }
 
   /** 事象の受け口を外す（何度呼んでもよい）。外した後は数えない。 */
@@ -285,7 +341,7 @@ export async function waitForDiscoverySettled(
   source: QuietSource,
   readCandidateSet: CandidateSetReader,
   policy: DiscoverySettlePolicy = DISCOVERY_SETTLE_POLICY,
-  progress?: Pick<ProgressSignals, 'mark' | 'signal'>,
+  progress?: Pick<ProgressSignals, 'mark' | 'signal' | 'remainingMs'>,
   /**
    * L10 の調べの直し: 読む文書が消えたか（凍結の中の文書が、止めた移動で誤りの画面に替わったなど。候補の集合は読めない）。真になったら、待たずに `TIMED_OUT`
    * を返す（呼ぶ側は読めなかったとする）。省略すると見ない。
@@ -305,20 +361,30 @@ export async function waitForDiscoverySettled(
   let lastReadStartedAtMs: number | null = null;
   /** L0: 読んだことのある候補の集合（重複を除いて並べた digest の列）。 */
   const seenSets = new Set<string>();
-  while (clock.now() < deadlineAtMs) {
-    if (progress?.signal.aborted === true || documentGone?.() === true) {
-      return TIMED_OUT;
-    }
+  /** DEF-290: まだ届いていない口の途中の要求の組の印（`dataQuietnessOf` の `mark`）と、それが最後に変わった時刻。 */
+  let pendingMark: string | null = null;
+  let pendingMovedAtMs = clock.now();
+  /**
+   * 静かになった時刻。DEF-290: まだ届いていない口の要求が残っていても、その組が変わらない（新しい要求の始まりも、まだ届いていない要求の終わりもない）まま、
+   * 開いた要求の静まりの長さが過ぎたら（DEF-283 の C と同じ判定 `progressStoppedOf`）、組が最後に変わった時刻から静かだったとみなす（答えない長い要求で、
+   * 読まずに見張りまで待たない）。作りの変化は、続く 2 回の読み取りの集合の比べが見る。要求の数え方の口がなければ、今のまま。
+   */
+  const quietSinceNow = (): number | null => {
     const quietSince = source.quietSinceMs();
-    const now = clock.now();
-    const quietLongEnough = quietSince !== null && now - quietSince >= policy.networkQuietMs;
-    const spacedEnough = lastReadStartedAtMs === null || now - lastReadStartedAtMs >= policy.probeIntervalMs;
-    if (quietSince === null || !quietLongEnough || !spacedEnough) {
-      await clock.sleep(Math.max(0, Math.min(policy.pollIntervalMs, deadlineAtMs - now)));
-      continue;
+    if (quietSince !== null || source.dataActivity === undefined) {
+      pendingMark = null;
+      return quietSince;
     }
-    const startedAtMs = clock.now();
-    lastReadStartedAtMs = startedAtMs;
+    const now = clock.now();
+    const { mark } = dataQuietnessOf(source.dataActivity());
+    if (mark !== pendingMark) {
+      pendingMark = mark;
+      pendingMovedAtMs = now;
+    }
+    return progressStoppedOf(pendingMovedAtMs, now, policy.openDataRequestQuietMs) ? pendingMovedAtMs : null;
+  };
+  /** 候補の集合を 1 回読む（まだ読んだことのない集合なら、中身の進みの印を付ける）。 */
+  const readSet = async (): Promise<readonly string[] | null> => {
     const readDeadline = readDeadlineAtMs();
     const outcome = await awaitBeforeDeadline(readCandidateSet(readDeadline), readDeadline);
     const set = outcome.status === 'FULFILLED' ? outcome.value : null;
@@ -329,13 +395,74 @@ export async function waitForDiscoverySettled(
         progress.mark('BROWSER_RESPONSE');
       }
     }
+    return set;
+  };
+  /**
+   * REV-DQF の Important-B: 見張りが段を終えるまでの残りが、静かな時間の長さ（`networkQuietMs`）を切ったか（見張りの残りの長さを読める口のときだけ）。切ったら、
+   * 待ちを自分で切り上げる（見張りに終えられると、画面の記録ごと失う）。
+   */
+  const watchEnding = (): boolean => progress?.remainingMs !== undefined && progress.remainingMs() <= policy.networkQuietMs;
+  /**
+   * REV-DQF の Important-B: 静まり（DEF-290）で読んだときの、まだ届いていない口の途中の要求の組の印。見張りの中では、その組が答える（変わる）まで、読まずに
+   * 待ち、答えたら読み直す（答えで描かれる候補を読み落とさない）。答えが見張りの中に来なければ、切り上げて `TIMED_OUT`（読み切れなかった理由
+   * `INCOMPLETE_SETTLE_TIMEOUT` を呼ぶ側が付ける）。見張りの外（残りを読めない口）では、DEF-290 のとおり静まりで読んで終える。
+   */
+  let awaitingAnswerOf: string | null = null;
+  /**
+   * REV-DQF fix round 3: まだ届いていない要求に、この画面で新しい送り先（前の画面までに出ていない口）へのものがあるか。判定は DEF-283 の B と同じ 1 か所
+   * （`dataQuietnessOf`。前の画面までに出た口を、一度終わった口と同じに扱って渡す）。要求の数え方の口がなければ、あるとみなす。
+   */
+  const newDestinationPending = (): boolean => {
+    const data = source.dataActivity?.();
+    if (data === undefined || data.endpoints === undefined) return true;
+    const known = source.knownEndpoints?.() ?? new Set<string>();
+    return dataQuietnessOf({ ...data, endpoints: { ...data.endpoints, completed: [...data.endpoints.completed, ...known] } }).pending > 0;
+  };
+  while (clock.now() < deadlineAtMs) {
+    if (progress?.signal.aborted === true || documentGone?.() === true) {
+      return TIMED_OUT;
+    }
+    const quietSince = quietSinceNow();
+    if (awaitingAnswerOf !== null && source.quietSinceMs() === null && pendingMark === awaitingAnswerOf) {
+      if (watchEnding()) {
+        await readSet();
+        return TIMED_OUT;
+      }
+      await clock.sleep(Math.max(0, Math.min(policy.pollIntervalMs, deadlineAtMs - clock.now())));
+      continue;
+    }
+    if (awaitingAnswerOf !== null) {
+      // 残っていた要求が答えた（組が変わった）。読み直す。
+      awaitingAnswerOf = null;
+      previous = null;
+    }
+    const now = clock.now();
+    const quietLongEnough = quietSince !== null && now - quietSince >= policy.networkQuietMs;
+    const spacedEnough = lastReadStartedAtMs === null || now - lastReadStartedAtMs >= policy.probeIntervalMs;
+    if (quietSince === null || !quietLongEnough || !spacedEnough) {
+      if (watchEnding()) {
+        await readSet();
+        return TIMED_OUT;
+      }
+      await clock.sleep(Math.max(0, Math.min(policy.pollIntervalMs, deadlineAtMs - now)));
+      continue;
+    }
+    const startedAtMs = clock.now();
+    lastReadStartedAtMs = startedAtMs;
+    const set = await readSet();
     // 読み取りの間も静かだったか（読み取りの前と後で、静かになった時刻が変わらない）。
-    const quietThroughout = source.quietSinceMs() === quietSince;
+    const quietThroughout = quietSinceNow() === quietSince;
     if (set === null || !quietThroughout) {
       previous = null;
       continue;
     }
     if (previous !== null && quietSince <= previous.startedAtMs && sameSet(previous.set, set) && clock.now() < deadlineAtMs) {
+      // REV-DQF の Important-B: 静まりで読んだ（まだ届いていない要求が残る）ときは、見張りの中なら、その要求が答えるまで待って読み直す。fix round 3: 待つのは、
+      // 残った要求に、この画面で新しい送り先へのものがあるときだけ（ほかの画面でも出た送り先への答えない要求は待たない）。
+      if (source.quietSinceMs() === null && progress?.remainingMs !== undefined && newDestinationPending()) {
+        awaitingAnswerOf = pendingMark;
+        continue;
+      }
       return SETTLED;
     }
     previous = { set, startedAtMs };
@@ -352,6 +479,10 @@ export interface WatchedSettleOptions {
    * 読めず、新しい集合が出ないので、子の見張りは長さいっぱい待っていた（その間に Chromium が page を閉じ、Guard が印のない閉じとして止めた）。
    */
   readonly documentGone?: (() => boolean) | undefined;
+  /**
+   * REV-DQF の Important-B: 外側の 1 画面の見張りの口（残りの長さを読む。子の見張りより先に終わりうるので、待ちを切り上げる時機は、両方の残りの短い方で決める）。
+   */
+  readonly outer?: Pick<ProgressSignals, 'remainingMs'> | undefined;
 }
 
 /**
@@ -369,7 +500,11 @@ export async function waitForDiscoverySettledWatched(
   options: WatchedSettleOptions = {},
 ): Promise<DiscoverySettleOutcome> {
   const watched = await watchProgress(
-    (signals) => waitForDiscoverySettled(source, readCandidateSet, { ...policy, timeoutMs: OPEN_ENDED_STAGE_MS }, signals, options.documentGone),
+    (signals) => {
+      const outerRemaining = options.outer?.remainingMs;
+      const remainingMs = (): number => Math.min(signals.remainingMs?.() ?? Number.POSITIVE_INFINITY, outerRemaining?.() ?? Number.POSITIVE_INFINITY);
+      return waitForDiscoverySettled(source, readCandidateSet, { ...policy, timeoutMs: OPEN_ENDED_STAGE_MS }, { ...signals, remainingMs }, options.documentGone);
+    },
     { quietLimitMs: options.quietLimitMs },
   );
   return watched.status === 'FULFILLED' ? watched.value : TIMED_OUT;

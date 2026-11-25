@@ -209,9 +209,10 @@ describe('audit worker session (T27d): the discovery job', () => {
   });
 
   // DEF-195: 発見の流れの進み具合を、監査と同じ `PROGRESS` で親へ送る（新しい形を作らない）。
+  // DSEED2: 連鎖の操作さがしの、見つけた画面の分け方（点検から引き継いだ・新しく見つけた）もそのまま送る。
   it('relays the progress of the discovery flow as PROGRESS, the same as the audit', async () => {
     const report = {
-      pagesFinished: 2, pagesDiscovered: 6, maxPages: 20, elapsedMs: 20_000, navigationCount: 2, pacingWaitMs: 0,
+      pagesFinished: 2, pagesDiscovered: 6, pagesDiscoveredSplit: { fromAuditStage: 4, newlyFound: 2 }, maxPages: 20, elapsedMs: 20_000, navigationCount: 2, pacingWaitMs: 0,
       requests: { allowedOrigins: { count: 4, peakPerMinute: 4 }, otherOrigins: { count: 0, peakPerMinute: 0 }, servedFromCache: 0, withheldOtherOrigins: 0 },
       recentPerMinute: { allowedOrigins: 4, otherOrigins: 0 },
     };

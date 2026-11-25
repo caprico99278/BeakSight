@@ -42,7 +42,8 @@ import {
 import { isInsideAllowedOrigins } from './classify.js';
 import type { DiscoveryOptionChoiceRecord, DiscoveryReadPageRecord } from './discovery-result.js';
 import { stateStructureKeyOf, type StateStructureField } from './state-keys.js';
-import { pageTemplatePathOf } from './fingerprint.js';
+import { dataFreePathOfUrl, pageTemplatePathOf } from './fingerprint.js';
+import { isRecord } from '../core/guards.js';
 import { compareCodeUnits } from '../core/text.js';
 
 // ---------------------------------------------------------------------------------------------------------------
@@ -115,6 +116,22 @@ export const SUBMISSION_PROBE_NOT_OBSERVED_REASONS = Object.freeze([
   'COVERED_BY_OTHER',
   // SD-1（設計書 `2026-11-16-beaksight-action-based-delete-guard-design.md` 2.3）: 押す前の判定（`isDestructiveAction`）で削除に関する操作だったので、押さなかった。
   'DESTRUCTIVE_ACTION_SKIPPED',
+  // DEF-289（DQ の案 1）: 押す途中で的の要素が文書から消え、読み直して同じ鍵の新しい要素で押し直しても、また消えたので、押さなかった。
+  'TARGET_VANISHED',
+  // DEF-289（DQ の案 5）: 押す輪を終えるまで、押しにかからなかった（後の状態で出たが見えなかった・押す順が来なかった）。
+  'NOT_REACHED',
+  // DEF-295（設計書 `2026-11-19-beaksight-probe-wait-and-target-found-design.md` 2 の 1）: 押す前の準備の確かめ（押さずに確かめる呼び出し）が、確かめの窓の
+  // 中で済まなかった（止まらない。覆われた・見えない・押せないのほか）ので、押さなかった。
+  'TARGET_NOT_STABLE',
+  // DEF-295（2 の 1・4）: 送信ボタン（か入れる radio）が見えない（押す前に見えないので除いた・準備の確かめで見えなかった）ので、押さなかった。
+  'TARGET_NOT_VISIBLE',
+  // DEF-295（2 の 5）: 読み込み直した画面で、押下の並びをたどって状態を作り直せなかったので、押さなかった。
+  'STATE_NOT_REBUILT',
+  // AIW（ユーザーの判断 2026-11-20）: 押す前の判定（`isAiAction`）で名前に AI の語があったので、押さなかった（サイトの AI の生成を起こさない）。
+  'AI_ACTION_SKIPPED',
+  // CALDAY（設計書 `2026-11-25-beaksight-discovery-sibling-press-design.md` 2.1）: 同じ状態の中の、押す組の digest が同じで番号だけが違う兄弟の組で、
+  // 最初の 1 つを押して違いが出なかった（送信なし・状態が移らない）ので、残りを押さなかった。
+  'SAME_SHAPE_NO_CHANGE',
 ] as const);
 export type SubmissionProbeNotObservedReason = (typeof SUBMISSION_PROBE_NOT_OBSERVED_REASONS)[number];
 /** L6/L3-1 の続き（A1）: ほかの表示に覆われていたので押さなかった理由。 */
@@ -196,10 +213,24 @@ export const CONTEXT_CLOSED_BY_GUARD_PROBE_REASON = 'CONTEXT_CLOSED_BY_GUARD' sa
 export const SAME_IDENTITY_PRESSED_PROBE_REASON = 'SAME_IDENTITY_PRESSED' satisfies SubmissionProbeNotObservedReason;
 /** DEF-208-2（C）: 同じ語の組の対象が何も送らなかったので、押さなかった理由。 */
 export const SAME_WORDS_NO_REQUEST_PROBE_REASON = 'SAME_WORDS_NO_REQUEST' satisfies SubmissionProbeNotObservedReason;
+/** CALDAY: 同じ形の兄弟の組の代表を押して違いが出なかったので、押さなかった理由。 */
+export const SAME_SHAPE_NO_CHANGE_PROBE_REASON = 'SAME_SHAPE_NO_CHANGE' satisfies SubmissionProbeNotObservedReason;
 /** DEF-208-2（D）: 送信ボタンが押せないので、押さなかった理由。 */
 export const DISABLED_SUBMITTER_PROBE_REASON = 'DISABLED_SUBMITTER' satisfies SubmissionProbeNotObservedReason;
+/** DEF-289（案 1）: 押す途中で的の要素が消え続けたので押さなかった理由。 */
+export const TARGET_VANISHED_PROBE_REASON = 'TARGET_VANISHED' satisfies SubmissionProbeNotObservedReason;
+/** DEF-289（案 5）: 押す輪を終えるまで押しにかからなかった理由。 */
+export const NOT_REACHED_PROBE_REASON = 'NOT_REACHED' satisfies SubmissionProbeNotObservedReason;
+/** DEF-295: 押す前の準備の確かめが窓の中で済まなかった（止まらないなど）ので押さなかった理由。 */
+export const TARGET_NOT_STABLE_PROBE_REASON = 'TARGET_NOT_STABLE' satisfies SubmissionProbeNotObservedReason;
+/** DEF-295: 送信ボタンか入れる radio が見えないので押さなかった理由。 */
+export const TARGET_NOT_VISIBLE_PROBE_REASON = 'TARGET_NOT_VISIBLE' satisfies SubmissionProbeNotObservedReason;
+/** DEF-295: 読み込み直した画面で状態を作り直せなかったので押さなかった理由。 */
+export const STATE_NOT_REBUILT_PROBE_REASON = 'STATE_NOT_REBUILT' satisfies SubmissionProbeNotObservedReason;
 /** SD-1: 押す前の判定で、削除に関する操作だったので押さなかった理由。 */
 export const DESTRUCTIVE_ACTION_SKIPPED_PROBE_REASON = 'DESTRUCTIVE_ACTION_SKIPPED' satisfies SubmissionProbeNotObservedReason;
+/** AIW: 押す前の判定で、AI の操作だったので押さなかった理由。 */
+export const AI_ACTION_SKIPPED_PROBE_REASON = 'AI_ACTION_SKIPPED' satisfies SubmissionProbeNotObservedReason;
 /** DEF-208-4（A）: 共通の枠のボタンを前の画面で押したので、押さなかった理由。 */
 export const SHARED_LAYOUT_PRESSED_PROBE_REASON = 'SHARED_LAYOUT_PRESSED' satisfies SubmissionProbeNotObservedReason;
 /** COV-2: 同じ構造の鍵の状態で同じ候補を前に押したので、押さなかった理由。 */
@@ -210,7 +241,7 @@ export const SAME_STATE_PRESSED_PROBE_REASON = 'SAME_STATE_PRESSED' satisfies Su
  * `formaction` が http(s) でないスキーム（`mailto:`・`tel:`・独自のスキームなど）を指す（押す前に見分けた）か、押下で外部スキームへ移ろうとした（Guard が
  * 止めて違反を記録した）。押す回数は使わない。
  */
-export const SUBMISSION_PROBE_ONLY_NOT_EXECUTABLE_REASONS = Object.freeze(['EXTERNAL_SCHEME', 'OPENER_SIDE_REQUEST'] as const);
+export const SUBMISSION_PROBE_ONLY_NOT_EXECUTABLE_REASONS = Object.freeze(['EXTERNAL_SCHEME', 'OPENER_SIDE_REQUEST', 'AI_GENERATION_REQUEST'] as const);
 export type SubmissionProbeOnlyNotExecutableReason = (typeof SUBMISSION_PROBE_ONLY_NOT_EXECUTABLE_REASONS)[number];
 /** DEF-144: 外部スキームで押さなかった理由（成果物の数 `externalSchemeProbesOf` が数える理由）。 */
 export const EXTERNAL_SCHEME_PROBE_REASON = 'EXTERNAL_SCHEME' satisfies SubmissionProbeOnlyNotExecutableReason;
@@ -220,6 +251,19 @@ export const EXTERNAL_SCHEME_PROBE_REASON = 'EXTERNAL_SCHEME' satisfies Submissi
  * 何も送らなかった押下と同じく読み直して押す（`src/interaction/submission-probe.ts`）。
  */
 export const OPENER_SIDE_REQUEST_PROBE_REASON = 'OPENER_SIDE_REQUEST' satisfies SubmissionProbeOnlyNotExecutableReason;
+/**
+ * AIW の 4（ユーザーの判断 2026-11-20）: 押下で AI の送信が出た。登録・更新を試せる候補にしない（書き込みの段で AI の生成を呼ばない。型は残す）。
+ */
+export const AI_GENERATION_REQUEST_PROBE_REASON = 'AI_GENERATION_REQUEST' satisfies SubmissionProbeOnlyNotExecutableReason;
+
+/**
+ * AIW の 4: AI の送信が出た押下の記録に、AI の操作の印（`aiAction`）を付け、登録・更新（`API_CREATE`・`API_UPDATE`）なら試せない形（`NOT_EXECUTABLE`・
+ * `AI_GENERATION_REQUEST`）にする（純粋）。
+ */
+export const aiGenerationProbeOf = (record: SubmissionProbeRecord): SubmissionProbeRecord =>
+  (record.result === 'API_CREATE' || record.result === 'API_UPDATE'
+    ? Object.freeze({ ...record, result: 'NOT_EXECUTABLE' as const, reason: AI_GENERATION_REQUEST_PROBE_REASON, aiAction: true as const })
+    : Object.freeze({ ...record, aiAction: true as const }));
 
 /**
  * LU-4（fix round 1）: 押さなかった（押す回数を使っていない）ことを表す理由（閉じた一覧。押す前に見つからない・見えない、押す数の上限、外部スキーム、Guard が
@@ -233,6 +277,8 @@ export const SUBMISSION_PROBE_NOT_PRESSED_REASONS = Object.freeze([
   CONTEXT_CLOSED_BY_GUARD_PROBE_REASON,
   SAME_IDENTITY_PRESSED_PROBE_REASON,
   SAME_WORDS_NO_REQUEST_PROBE_REASON,
+  // CALDAY: 同じ形の兄弟の代表で済んだ。
+  SAME_SHAPE_NO_CHANGE_PROBE_REASON,
   DISABLED_SUBMITTER_PROBE_REASON,
   SHARED_LAYOUT_PRESSED_PROBE_REASON,
   SAME_STATE_PRESSED_PROBE_REASON,
@@ -240,7 +286,21 @@ export const SUBMISSION_PROBE_NOT_PRESSED_REASONS = Object.freeze([
   COVERED_BY_OTHER_PROBE_REASON,
   // SD-1: 削除に関する操作なので押さなかった。
   DESTRUCTIVE_ACTION_SKIPPED_PROBE_REASON,
+  // AIW: AI の操作なので押さなかった。
+  AI_ACTION_SKIPPED_PROBE_REASON,
+  // DEF-289: 押す途中で的が消え続けた・押しにかからなかった。
+  TARGET_VANISHED_PROBE_REASON,
+  NOT_REACHED_PROBE_REASON,
+  // DEF-295: 準備の確かめで止まらない・見えない、状態を作り直せなかった。
+  TARGET_NOT_STABLE_PROBE_REASON,
+  TARGET_NOT_VISIBLE_PROBE_REASON,
+  STATE_NOT_REBUILT_PROBE_REASON,
 ] as const satisfies readonly (SubmissionProbeNotObservedReason | SubmissionProbeOnlyNotExecutableReason)[]);
+
+const NOT_PRESSED_REASON_SET: ReadonlySet<string> = new Set(SUBMISSION_PROBE_NOT_PRESSED_REASONS);
+
+/** CC-135: 押さなかった（押す回数を使っていない）ことを表す理由か（`SUBMISSION_PROBE_NOT_PRESSED_REASONS` の 1 か所で決める）。 */
+export const isSubmissionProbeNotPressedReason = (reason: string): boolean => NOT_PRESSED_REASON_SET.has(reason);
 
 /** 実行できない理由（T37b の分類の理由と、probe だけの理由）。 */
 export const SUBMISSION_PROBE_NOT_EXECUTABLE_REASONS = Object.freeze([
@@ -335,6 +395,11 @@ export interface SubmissionProbeRecord extends SubmissionProbeObservationCounts,
    * 新しい状態とみなさず、押下の鎖をここで閉じた（`NO_NEW_STRUCTURE`）。値は持たない。ほかの記録と、COV-2c の前の成果物は持たない。
    */
   readonly chainEnd?: SubmissionProbeChainEnd;
+  /**
+   * AIW の 4（ユーザーの判断 2026-11-20）: この押下で AI の送信が出たので、AI の操作と覚えた（`aiGenerationProbeOf`）。検索の確かめの組の作り手が、この候補の押下を
+   * 含むきっかけを除く。ほかの記録と、AIW の前の成果物は持たない。
+   */
+  readonly aiAction?: true;
 }
 
 /** COV-2c: 押下の鎖を閉じた理由の閉じた一覧（同じ作りの部品が増えただけ）。 */
@@ -375,7 +440,8 @@ export const submissionProbeStrengthOf = (record: SubmissionProbeRecord): number
 /** COV-1: 押していないことを表す、観察しなかった理由。 */
 const NOT_PRESSED_REASONS: ReadonlySet<SubmissionProbeReason> = new Set<SubmissionProbeReason>([
   'PAGE_CHANGED', 'PRESS_LIMIT_REACHED', 'TARGET_NOT_FOUND', 'SAME_IDENTITY_PRESSED', 'SAME_WORDS_NO_REQUEST', 'DISABLED_SUBMITTER',
-  'SHARED_LAYOUT_PRESSED', 'DISABLED_FILL_LIMIT_REACHED', 'SAME_STATE_PRESSED',
+  'SHARED_LAYOUT_PRESSED', 'DISABLED_FILL_LIMIT_REACHED', 'SAME_STATE_PRESSED', 'TARGET_VANISHED', 'NOT_REACHED',
+  'TARGET_NOT_STABLE', 'TARGET_NOT_VISIBLE', 'STATE_NOT_REBUILT', 'SAME_SHAPE_NO_CHANGE',
 ]);
 
 /** COV-1: 段の記録を付けた写し（1 段目は付けない）。 */
@@ -639,6 +705,8 @@ export const withSubmissionProbes = (
     ...(record.screenName === undefined ? {} : { screenName: record.screenName }),
     // COV-3: 選択肢を選んだ欄の記録も写す。
     ...(record.optionChoices === undefined ? {} : { optionChoices: record.optionChoices }),
+    // RCA-1: 読み取りを起こしたきっかけの記録も写す。
+    ...(record.searchTriggers === undefined ? {} : { searchTriggers: record.searchTriggers }),
   });
 };
 
@@ -795,6 +863,112 @@ export const sharedLayoutStructureKeyOf = (facts: SharedLayoutStructureFacts): s
 ]));
 
 /**
+ * PSKIP・ISKIP・FRET: 場所の data を除いた path（`dataFreePathOfUrl`）の鍵（形の印 `format` つき。求まらなければ `null`）。操作さがしの押した組と入力の確かめ、
+ * 点検の段の窓を開くボタンの確かめが共有する（FRET の設計書の設計変更履歴の 2 行目）。
+ */
+export const dataFreePathKeyOf = (format: string, location: CandidateLocation): string | null => {
+  const dataFreePath = dataFreePathOfUrl(`${location.origin}${location.path}`);
+  return dataFreePath === null ? null : createSha256Fingerprint(JSON.stringify([format, location.origin, dataFreePath]));
+};
+
+/**
+ * SLIM（設計書 `2026-11-25-beaksight-discovery-input-check-slim-design.md` 2.1・2.3）: 同じ形の組の中の役（入力の確かめの欄の組と、CALDAY の押す兄弟の組。
+ * 組が 1 つだけなら `SINGLE`）。押した後の反応の測りの語にも使う。
+ */
+export type SiblingGroupRole = 'REPRESENTATIVE' | 'SIBLING' | 'SINGLE';
+
+/** SLIM: 1 つの欄を確かめるかの決め（確かめるなら組の中の役と兄弟の数。確かめないなら、前に確かめた欄か、代表で済んだ兄弟か）。 */
+export type InputCheckDecision =
+  | { readonly check: true; readonly role: SiblingGroupRole; readonly siblings: number }
+  | { readonly check: false; readonly skipped: 'EARLIER' | 'SIBLING' };
+
+/** SLIM: 1 画面の入力の確かめの、番号だけ違う欄の組の決め（文書の順に `decide` を呼び、確かめた欄の結果を `settle` で返す）。 */
+export interface InputCheckSiblings {
+  /** この欄を確かめるか（`isFirst` は押す輪の数え `isFirstInputCheck`。欄ごとに必ず 1 回呼ぶ。省く兄弟も数えに入れ、後の画面で確かめ直さない）。 */
+  decide(groupKey: string, isFirst: () => boolean): InputCheckDecision;
+  /** 確かめた欄に違いが出なかったか（組の代表のときだけ効く。呼ばなかった代表は、違いが出たものとする）。 */
+  settle(groupKey: string, quiet: boolean): void;
+  /** 確かめた欄・前に確かめたので省いた欄・代表で済んだので省いた兄弟の数。 */
+  counts(): { readonly checked: number; readonly skippedEarlier: number; readonly skippedSibling: number };
+}
+
+/**
+ * SLIM（設計書 2.1）: 番号だけ違う欄の組（`groupKeys` は文書の順の欄ごとの組の鍵）の確かめの決め。組の中で前に確かめていない最初の欄を代表にして確かめ、代表に
+ * 違いが出なかったときだけ、残りを確かめない。違いが出たら、今どおり全部を確かめる。数の上限は置かない。
+ */
+export function inputCheckSiblingsOf(groupKeys: readonly string[]): InputCheckSiblings {
+  const sizes = new Map<string, number>();
+  for (const key of groupKeys) sizes.set(key, (sizes.get(key) ?? 0) + 1);
+  /** 組ごとの代表の結果（`null` は代表を確かめている途中か、結果がない）。 */
+  const representatives = new Map<string, { quiet: boolean | null }>();
+  let checked = 0;
+  let skippedEarlier = 0;
+  let skippedSibling = 0;
+  return {
+    decide(groupKey: string, isFirst: () => boolean): InputCheckDecision {
+      if (!isFirst()) {
+        skippedEarlier += 1;
+        return { check: false, skipped: 'EARLIER' };
+      }
+      const siblings = Math.max(0, (sizes.get(groupKey) ?? 1) - 1);
+      const representative = representatives.get(groupKey);
+      if (representative?.quiet === true) {
+        skippedSibling += 1;
+        return { check: false, skipped: 'SIBLING' };
+      }
+      checked += 1;
+      if (representative === undefined) {
+        representatives.set(groupKey, { quiet: null });
+        return { check: true, role: siblings === 0 ? 'SINGLE' : 'REPRESENTATIVE', siblings };
+      }
+      return { check: true, role: 'SIBLING', siblings };
+    },
+    settle(groupKey: string, quiet: boolean): void {
+      const representative = representatives.get(groupKey);
+      if (representative !== undefined && representative.quiet === null) representative.quiet = quiet;
+    },
+    counts: () => ({ checked, skippedEarlier, skippedSibling }),
+  };
+}
+
+/** SLK-1: 見出しの段の並び（形が違えば `null`。欠けとして鍵に入れる）。 */
+export const headingLevelsOf = (value: unknown): readonly number[] | null =>
+  (Array.isArray(value) && value.every((level) => Number.isInteger(level) && level >= 1 && level <= 6) ? value as readonly number[] : null);
+
+/** COV-1: 読んだ欄の事実を、構造の鍵の欄の形にする（形が違えば `null`。欠けとして鍵に入れる）。 */
+export const stateFieldsOf = (value: unknown): readonly StateStructureField[] | null => {
+  if (!Array.isArray(value)) return null;
+  const fields: StateStructureField[] = [];
+  for (const item of value as readonly unknown[]) {
+    if (!isRecord(item) || typeof item['name'] !== 'string' || typeof item['type'] !== 'string' || typeof item['required'] !== 'boolean'
+      || typeof item['disabled'] !== 'boolean'
+      || !(item['optionValues'] === null || (Array.isArray(item['optionValues']) && item['optionValues'].every((option) => typeof option === 'string')))) {
+      return null;
+    }
+    fields.push({
+      name: item['name'], type: item['type'], required: item['required'], disabled: item['disabled'], optionValues: item['optionValues'] as readonly string[] | null,
+    });
+  }
+  return fields;
+};
+
+/**
+ * SLK-1・ISKIP・FRET: 共通の枠の部分の読み取りの 1 つの枠の事実（`src/interaction/layout-frame-read.ts` の `readLayoutFramesInPage` の `frames` の 1 つ）から、
+ * 枠の部分の構造の鍵を作る。
+ */
+export const layoutFrameStructureKeyOf = (facts: unknown, candidateIdentityDigests: readonly string[] | null, opened: boolean | null): string =>
+  sharedLayoutStructureKeyOf({
+    candidateIdentityDigests,
+    fields: isRecord(facts) ? stateFieldsOf(facts['fields']) : null,
+    openedDialogOrRegion: opened,
+    headingLevels: isRecord(facts) ? headingLevelsOf(facts['headings']) : null,
+    // REV-SD の M-4: 形が違えば欠け（`null`）として鍵に入れる。
+    linkPaths: isRecord(facts) && Array.isArray(facts['linkPaths']) && facts['linkPaths'].every((path) => typeof path === 'string')
+      ? facts['linkPaths'] as readonly string[] : null,
+    hasExpandToggle: isRecord(facts) && typeof facts['expandToggle'] === 'boolean' ? facts['expandToggle'] : null,
+  });
+
+/**
  * COV-1（網羅の設計書 3.2 の 5）・SLK-1（同 6 章の 2026-11-16）: 共通の枠のボタンの押した印（純粋）。（枠の部分の構造の鍵 `sharedLayoutStructureKeyOf`・共通の
  * 枠のボタンの識別の digest）の digest。発見の流れは中身を見ずに文字列として持つ（`SubmissionProbeOptions.sharedLayout`）。枠の部分の作りが前に押した時と
  * 同じなら同じ印（押し直さない）、枠の中の候補・欄などが違えば別の印になる（押す）。
@@ -935,4 +1109,28 @@ export const submissionProbeMarkerOf = (
     }
   }
   throw new RangeError('A submission probe marker overlapped the markers in use');
+};
+
+/**
+ * REV-RCA fix round 2（検索の確かめの設計書 2.2）: 全角の仮名の目印の文字（16 進の 1 桁ごとに 1 文字。16 文字）。濁音・拗音を持たず、語になりにくい並び。
+ * 長さは半角の目印と同じ考え（乱数の桁の数 `MARKER_RANDOM_BYTES` の 2 倍）で、頭に `FULL_WIDTH_MARKER_PREFIX` を付ける。画面の文言ではない値なので、符号の位置で
+ * 書く（日本語の文字列は文言のカタログだけに置く決まり）。
+ */
+const FULL_WIDTH_MARKER_KANA = String.fromCodePoint(
+  0x3042, 0x3044, 0x3046, 0x3048, 0x304a, 0x304b, 0x304d, 0x304f, 0x3051, 0x3053, 0x3055, 0x3057, 0x3059, 0x305b, 0x305d, 0x305f,
+);
+/** 全角の仮名の目印の頭（目印として見分けるための並び「びいくさいと」）。 */
+const FULL_WIDTH_MARKER_PREFIX = String.fromCodePoint(0x3073, 0x3044, 0x304f, 0x3055, 0x3044, 0x3068);
+
+/** 全角の仮名の目印（16 進の乱数を仮名に置き換える）。 */
+const fullWidthMarkerOf = (hex: string): string =>
+  `${FULL_WIDTH_MARKER_PREFIX}${[...hex].map((digit) => FULL_WIDTH_MARKER_KANA[Number.parseInt(digit, HEX_RADIX)] ?? '').join('')}`;
+
+/**
+ * REV-RCA fix round 2: 検索の確かめで文字の欄に入れる値を、値の種類から作る（組ごと・Run ごとに作る唯一の部品）。空は空、半角は操作さがしの目印と同じ部品・同じ形
+ * （`submissionProbeMarkerOf` の文字の欄の目印）、全角は同じ乱数の仮名の並び。値は成果物・画面に残さない（呼ぶ側がメモリの中だけで使う）。
+ */
+export const searchCheckTextOf = (kind: 'EMPTY' | 'HALF_WIDTH' | 'FULL_WIDTH', randomHex: () => string = defaultRandomHex): string => {
+  if (kind === 'EMPTY') return '';
+  return kind === 'HALF_WIDTH' ? submissionProbeMarkerOf('text', [], randomHex) : fullWidthMarkerOf(randomHex());
 };

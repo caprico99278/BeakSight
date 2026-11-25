@@ -13,7 +13,7 @@ import {
   pageArtifactRelativePath,
 } from '../../src/core/artifact-layout.js';
 import { SEVERITIES, type AuditRunResult, type EvidenceId, type EvidenceRecord, type PageAuditResult } from '../../src/core/contracts.js';
-import { createRunId } from '../../src/core/ids.js';
+import { createPageId, createRunId } from '../../src/core/ids.js';
 import { CHATGPT_BUNDLE_PART_SIZE_BYTES } from '../../src/core/limits.js';
 import {
   AUDIT_SEND_POLICY_CATALOG,
@@ -50,7 +50,9 @@ import {
   idOf,
   loadDisplaySample,
   metadata,
+  networkFailure,
   page,
+  record,
   screenshot,
 } from '../helpers/audit-run-fixture.js';
 
@@ -210,6 +212,8 @@ const LEADING_FILE_PATHS = [
   CHATGPT_BUNDLE_FILE_NAMES.findingGroups,
   CHATGPT_BUNDLE_FILE_NAMES.pages,
   CHATGPT_BUNDLE_FILE_NAMES.links,
+  CHATGPT_BUNDLE_FILE_NAMES.measurementTags,
+  CHATGPT_BUNDLE_FILE_NAMES.keyActions,
 ];
 
 /** REC-4: `edgeCaseAuditRun()` の指摘のファイル（ページの順、ページに属さない指摘のファイルは最後）。 */
@@ -295,6 +299,10 @@ describe('createChatGptBundle', () => {
       'pages.json',
       // AUD-6b: リンクごとの確かめの状態。
       'links.json',
+      // BS-1: 計測のタグの一覧（タグがなければ空の一覧）。
+      'measurement-tags.json',
+      // BS-2: 主要な行動の候補の位置。
+      'key-actions.json',
       // REC-4: ページごとの指摘のファイルと、ページに属さない指摘のファイル。
       ...EDGE_FINDING_FILE_PATHS,
       // R16f: 各ページの page.json（パスの順）を、スクリーンショットの前に入れる。
@@ -321,9 +329,12 @@ describe('createChatGptBundle', () => {
     // COV-4 の区切り 3: 操作で開いた状態の数（summary.json の openedStates）と読み方を足したので、1.12 にした。
     // 設計者の判断 2026-11-11: 同じ口のくり返しをまとめた記録の数（summary.json の repeatedReads）と読み方を足したので、1.13 にした。
     // REC-4: 第 1 部を入口だけにし、指摘をページごとのファイルに分け、Evidence の索引を外したので、2.0 にした。
-    expect(CHATGPT_BUNDLE_SCHEMA_VERSION).toBe('chatgpt-bundle/2.0');
+    // BS-1: 計測のタグの一覧（measurement-tags.json）を足したので、2.1 にした。BS-2: 主要な行動の候補の位置（key-actions.json）を足したので、2.2 にした。
+    // RVP-1: summary.json の focusChecks に前面の窓の背後の数と Tab の確かめのない指摘の数を足したので、2.3 にした。
+    // FRET: summary.json の focusChecks に窓を開くボタンの確かめの数（押す物なしの画面の数を含む）を足したので、2.4 にした。
+    expect(CHATGPT_BUNDLE_SCHEMA_VERSION).toBe('chatgpt-bundle/2.4');
     expect(manifest).toEqual({
-      bundleSchemaVersion: 'chatgpt-bundle/2.0',
+      bundleSchemaVersion: 'chatgpt-bundle/2.4',
       runId: result.run.runId,
       runStatus: result.run.runStatus,
       toolVersion: result.run.toolVersion,
@@ -510,9 +521,11 @@ describe('createChatGptBundle', () => {
       reasons.map(({ code, detail }) => ({ code, detail }));
 
     // CCX-19: 実行の記録の最後の実行の終わりの時刻（`lastFinishedAt`）は、`summary.json` に入れない（形を変えない）。
+    // BS-1: 計測のタグの一覧は `measurement-tags.json` にある（`summary.json` に重ねない）。BS-2: 主要な行動の候補の位置は `key-actions.json` にある。
     const { lastFinishedAt: _lastFinishedAt, ...executions } = model.summary.executions;
+    const { measurementTags: _measurementTags, keyActions: _keyActions, ...summary } = model.summary;
     expect(jsonOf(entries, 'summary.json')).toEqual(
-      JSON.parse(JSON.stringify({ ...model.summary, executions, incompleteReasons: withoutDescription(model.summary.incompleteReasons) })),
+      JSON.parse(JSON.stringify({ ...summary, executions, incompleteReasons: withoutDescription(model.summary.incompleteReasons) })),
     );
     // AUD-1a: スクリーンショットは ZIP に入れたものだけ（`missing` は書かない）。AUD-1d: この見本では、全部入る。
     // REC-4: 指摘の ID の一覧（ページと画像の）は持たない（指摘はページごとの指摘のファイルにある）。
@@ -1170,5 +1183,50 @@ describe('createChatGptBundleParts: the first part is the entrance, and the Find
       return [...file.main, ...file.excluded, ...file.initialOnly].map((entry) => entry.finding.findingId);
     });
     expect([...bundledIds].sort()).toEqual(result.findings.map((value) => value.findingId).sort());
+  });
+
+  // BS-1: 計測のタグの一覧は第 1 部に入り、根拠の page.json は、どれかの部にあるか欠けの一覧にある。summary.json には重ねて書かない。
+  it('puts the measurement tags in the first part, with the page.json of each tag in a part or in omittedFiles', async () => {
+    const tagPage = (number: number, tagId: string): PageAuditResult => {
+      const pageId = createPageId(number);
+      const { timing, isMainFrame, isNavigationRequest, method, resourceType } = networkFailure('', 'script', '');
+      const url = `https://www.googletagmanager.com/gtm.js?id=${tagId}`;
+      return page(pageId, `/p${number}.html`, 'AUDITED', [record('network', number, pageId, 'desktop', {
+        requests: [{ requestId: 'r0', url, method, resourceType, headers: { status: 'OBSERVED', values: {} }, timing, redirectFromRequestId: null,
+          redirectToRequestId: null, redirectChainRequestIds: [], truncated: false, isNavigationRequest, isMainFrame }],
+        responses: [], failures: [], omittedRequestCount: 0, omittedResponseCount: 0, omittedFailureCount: 0,
+      })]);
+    };
+    const withRequests = auditRun({ pages: [tagPage(1, 'GTM-TEST001'), tagPage(2, 'GTM-TEST002')] });
+    const store = artifactStore(withRequests, ['pages/PAGE-000002/page.json']);
+    const parts = await createChatGptBundleParts(buildReportViewModel(withRequests), withRequests, store.readArtifactFile, { partSizeBytes: 1 });
+    const [first] = parts.map((part) => unzipSync(part.bytes));
+    const tags = jsonOf(first ?? {}, 'measurement-tags.json') as { readonly tags: readonly { readonly tagId: string; readonly evidence: { readonly path: string } }[] };
+    expect(tags.tags.map(({ tagId, evidence }) => [tagId, evidence.path])).toEqual([
+      ['GTM-TEST001', 'pages/PAGE-000001/page.json'],
+      ['GTM-TEST002', 'pages/PAGE-000002/page.json'],
+    ]);
+    const manifest = jsonOf(first ?? {}, 'manifest.json') as Manifest;
+    expect(manifest.files.find(({ path }) => path === 'pages/PAGE-000001/page.json')).toBeDefined();
+    expect(manifest.omittedFiles.map(({ path }) => path)).toContain('pages/PAGE-000002/page.json');
+  });
+
+  it('puts an empty list of the measurement tags when no tag was observed', async () => {
+    const entries = unzipSync(await bundleOf(auditRun()));
+    expect((jsonOf(entries, 'measurement-tags.json') as { readonly tags: unknown }).tags).toEqual([]);
+  });
+});
+
+// DUP（設計書 `2026-11-18-beaksight-same-structure-pages-design.md` 3 章）: 束にも、まとめの 1 文と画面ごとの 1 文を表示用モデルのまま入れる。
+describe('createChatGptBundle: the pages of the same template (DUP)', () => {
+  it('writes the sentence of the summary in summary.json and the sentence of each page in pages.json', async () => {
+    const second = createPageId(2);
+    const result = auditRun({ pages: [page(PAGE_1, '/customers/1'), page(second, '/customers/2', 'AUDITED', [], [], { sameness: { depth: 'LIGHT', sameAs: PAGE_1 } })] });
+    const model = buildReportViewModel(result);
+    const entries = unzipSync(await bundleOf(result));
+    expect((jsonOf(entries, 'summary.json') as { readonly samenessNote: unknown }).samenessNote).toBe(model.summary.samenessNote);
+    expect((jsonOf(entries, 'pages.json') as readonly { readonly samenessNote: unknown }[]).map(({ samenessNote }) => samenessNote))
+      .toEqual(model.pages.map(({ samenessNote }) => samenessNote));
+    expect(model.pages[1]?.samenessNote).not.toBeNull();
   });
 });

@@ -142,7 +142,8 @@ describe('AUD-8: 確かめの data', () => {
       { id: 'alt-space-value', group: 'none', result: 'FAILED', messageKey: null, data: {} },
     ]);
     // 色差でない Rule の要素は、無効の事実を読まない。AUD-3d の続き: 違反の要素なので、矩形だけを読む（読み取りの形が違うので、矩形は `NOT_READ`）。
-    expect(reads).toEqual([{ targets: [{ target: ['img'], disabled: false, region: true }] }]);
+    // DEF-310（RVP-5）: 名前の規則（`NAME_CONTEXT_AXE_RULE_IDS`。`image-alt` を含む）の違反の要素は、`aria-labelledby` の参照先も読む。
+    expect(reads).toEqual([{ targets: [{ target: ['img'], disabled: false, region: true, labelledBy: true }] }]);
     expect(node.disabledFacts).toBeNull();
     expect(node.region).toEqual({ status: 'UNREADABLE', reason: 'NOT_READ' });
   });
@@ -217,7 +218,11 @@ describe('AUD-8: 無効の事実（4-3）', () => {
     });
     const evidence = await collect(page);
     expect(reads).toEqual([expect.objectContaining({
-      targets: [{ target: ['#visual'], disabled: true, region: true }, { target: [['#host', '#inner']], disabled: true, region: true }],
+      // DEF-310（RVP-5）: 色差の Rule は名前の規則でないので、参照先は読まない。
+      targets: [
+        { target: ['#visual'], disabled: true, region: true, labelledBy: false },
+        { target: [['#host', '#inner']], disabled: true, region: true, labelledBy: false },
+      ],
     })]);
     const [visual, disabled] = evidence.violations[0]?.nodes ?? [];
     expect(visual).toMatchObject({ countExclusion: null, disabledFacts: { status: 'READ', disabledStateNotExposed: true }, region: { status: 'READ', rect: box } });

@@ -7,8 +7,9 @@
 //      （値を含まない）は、ジョブの行に最後の認証の状態として記録する。
 //   2. ターゲット JSON のパスを `isAcceptedTargetConfigPath` で確かめてから（通らなければファイルを読ませない）、呼び出し側の関数で
 //      ターゲット設定を読み直し、`validateSiteProfile` を通す（I08。画面の操作は権限の十分条件ではない）。
-//   3. `withWriteTransaction` の中で、プロファイルが変わっていないことを確かめ直し、終わっていないジョブがないことを確かめて、
-//      `STARTING` の行を作る（同時に 1 つ。表の一意の部分索引も、最後の守りになる）。拒むときは、行を作らず、ワーカーを起動しない。
+//   3. `withWriteTransaction` の中で、プロファイルが変わっていないことを確かめ直し、サイトごとに同時に 1 つの決まり（PAR-b。同じプロファイル、
+//      許可 Origin が重なるほかのプロファイル、知らない終わっていない行、2 本目からの空きメモリ。`#concurrencyRejectionWith`）を確かめて、
+//      `STARTING` の行を作る（表のプロファイルごとの一意の部分索引も、最後の守りになる）。拒むときは、行を作らず、ワーカーを起動しない。
 //   4. ワーカー（`dist/worker/audit-worker.js`。パスは呼び出し側が渡す）を `fork` する（IPC つき、`detached: false`、cwd はリポジトリの root、
 //      標準入出力は捨てる、`execArgv` は空（画面のサーバの起動の引数（inspector など）を引き継がない））。`READY` を待って `START` を送る。
 // IPC: 受けた値は、どれも `validateWorkerToParentMessage` を通してから使う。形が違う値と、順の違うメッセージ（`START` の前の `RUN_STARTED`
@@ -132,13 +133,11 @@ import {
   type ReadEvidenceDocument,
 } from '../../discovery/read-check-evaluation.js';
 import { VERIFIED_ACTION_RESULT, type ActionRunDocument } from '../actions/action-contracts.js';
-import { readAuditedDataLedger, readWriteResult } from '../actions/write-result-facts.js';
-// DEF-235: READ の確かめの段の、型の定義の番号の元。
-import { readAuditStageLinks } from '../../core/audit-stage-links.js';
-import { CREATE_SCENARIO_KIND, UPDATE_SCENARIO_KIND } from '../../core/scenario-kind.js';
+import { readWriteResult } from '../actions/write-result-facts.js';
+import { UPDATE_SCENARIO_KIND } from '../../core/scenario-kind.js';
 import { CHECKED_WRITE_SCREENS_SCOPE, isAuditPageScopeKind, type AuditPageScopeKind } from '../../core/audit-page-scope.js';
 import { isReadCheckPageTemplatePath } from '../../discovery/read-check-contracts.js';
-import { readCheckRecordIdsOf } from '../../discovery/read-check-record-ids.js';
+import { searchCheckPlanOf } from '../../discovery/search-check-plan.js';
 import { actionRunMatchesWriteStart } from '../actions/action-api-summary.js';
 import { approvalSummaryFactsOf } from '../actions/approval-summary-facts.js';
 import { approvalExternalFactsOf } from '../approval-external-facts.js';
@@ -178,11 +177,12 @@ import {
   writableLoginOriginOf,
   type AutomatedLoginSelectors,
 } from '../auth/automated-login-switch.js';
-import { validateAuthSetup } from '../auth/auth-setup-policy.js';
+import { sessionLostPathPrefixOf, validateAuthSetup } from '../auth/auth-setup-policy.js';
+import { readCheckPagePathRejectionsOf } from '../read-check-page-path.js';
 import { authSetupProposalProfileOf, entryCheckAuthSetupDecisionOf, entryCheckSwitchesToNoLogin, proposedAuthSetupOf } from '../auth/auth-setup-proposal.js';
 import { isAutomatedLoginProfileAuth } from '../auth/credential-destination.js';
 import { startUrlPathOf } from '../../config/target-config-draft.js';
-import { isOriginInAllowedOrigins } from '../../crawl/normalize-url.js';
+import { canonicalizeAllowedOrigins, concurrentSiteKeysOf, isOriginInAllowedOrigins } from '../../crawl/normalize-url.js';
 import { AUTOMATED_LOGIN_SUBMISSION_NONE, AUTOMATED_LOGIN_UNKNOWN_RESULT } from '../auth/automated-login-results.js';
 import {
   AUTOMATED_LOGIN_AUTH_STRATEGY,
@@ -256,6 +256,7 @@ import {
   type WorkerStartAutomatedLogin,
   type WorkerStartApiWrite,
   type WorkerStartReadCheck,
+  type WorkerStartSearchCheck,
   type WorkerStartWrite,
   type WorkerToParentMessage,
   type WorkerWriteJobKind,
@@ -309,7 +310,11 @@ import {
   renewControlInstanceLock,
   type ControlInstanceLock,
 } from './instance-lock.js';
+import { hasMemoryForAnotherJob, readMachineMemory, type MachineMemory } from './machine-memory.js';
 import {
+  activeJobsWith,
+  readActiveJobs,
+  type ActiveJobRow,
   createStartingJob,
   hasActiveJobForProfile,
   interruptActiveJobs,
@@ -374,7 +379,9 @@ import {
 const standaloneReadChecksOf = (database: ControlDatabase, profileId: string): readonly ReadCheckView[] => {
   const verificationOnly = new Set(readVerificationOnlyReadCheckIds(database, profileId));
   // L4（COV-7）: 件数で切らない（ジョブは全部の定義を最後まで読む。前は 20 件まで）。
-  return listReadChecks(database, profileId).filter(({ readCheckId }) => !verificationOnly.has(readCheckId));
+  // RCA-6（検索の確かめの設計書 2.2）: `{id}` の型の画面の path の定義（書き込みの照合のための定義）は、段で読まない（DEF-235 の段の読み込みをやめた）。
+  return listReadChecks(database, profileId).filter(({ readCheckId, definition }) => !verificationOnly.has(readCheckId)
+    && (definition.targetPagePath === undefined || !isReadCheckPageTemplatePath(definition.targetPagePath)));
 };
 export type AuditJobContextResolver = (
   targetConfigPath: string,
@@ -458,7 +465,14 @@ export interface AuditJobManagerOptions {
    * 残りの時間だけ待つ。DEF-258: 待つ間に連鎖を止める要求が来たら `signal` を abort する（関数は、そこで待ちを打ち切って返す）。
    */
   readonly reloginWait?: (untilMs: number, signal: AbortSignal) => Promise<void>;
+  /**
+   * PAR-b: 端末の空きと全体のメモリを読む関数（テストは値を差し込む）。既定は、端末の今の値（`machine-memory.ts` の `readMachineMemory`）。
+   */
+  readonly machineMemory?: () => MachineMemory;
 }
+
+/** PAR-c: 開始の画面の押す前の確かめで出す、サイトごとに同時に 1 つの決まりの理由（`startConcurrencyBlockerOf`）。 */
+export type AuditStartConcurrencyBlocker = Extract<AuditJobStartRejectionReason, 'SITE_ALREADY_ACTIVE' | 'MACHINE_MEMORY_LOW'>;
 
 /** DEF-146: 結果の前に終わったワーカーの終わり方（値と秘密は持たない）。 */
 export interface AuditJobWorkerExit {
@@ -514,12 +528,13 @@ const ENTRY_CHECK_READ_END_REASON = 'READ' satisfies EntryCheckEndReason;
 
 /**
  * OP-1: 下調べの後に続けて始める点検の状態（`entryCheckFollowUpOf`。メモリの中だけ）。`WAITING` は下調べの終わりの処理を待つ、`STARTED` は始めた点検の最初の段の
- * ジョブ、`SKIPPED` は始めなかった（下調べが読めなかった、ログインの設定を保存できなかった、開始を拒まれた）。
+ * ジョブ、`SKIPPED` は始めなかった（下調べが読めなかった、ログインの設定を保存できなかった、開始を拒まれた）。REV-PAR の m-4: 同じサイトの別の設定が動いていて
+ * 拒まれたときだけ、その理由（`reason`）を持つ（作業の画面が出す。ほかの理由はサイトの画面が出す）。
  */
 export type EntryCheckFollowUp =
   | { readonly state: 'WAITING' }
   | { readonly state: 'STARTED'; readonly jobId: string }
-  | { readonly state: 'SKIPPED' };
+  | { readonly state: 'SKIPPED'; readonly reason?: Extract<AuditJobStartRejectionReason, 'SITE_ALREADY_ACTIVE'> };
 
 /** READ の確かめの開始の依頼（T27e。画面から受けた値。形もここで確かめる。再開しないので、新しく始めるかの指定はない）。 */
 export interface ReadCheckStartRequest {
@@ -563,6 +578,12 @@ export interface AuditJobShutdownResult {
 }
 
 /** ジョブの管理。 */
+/** DPROG (b): 見積もりの基準（そのワーカーの実行から最初に受けた進みの、終えたページ・画面の数と経過）。 */
+export interface AuditJobProgressBaseline {
+  readonly pagesFinished: number;
+  readonly elapsedMs: number;
+}
+
 export interface AuditJobManager {
   startAuditJob(request: AuditJobStartRequest): Promise<AuditJobStartResult>;
   /** ログインの検証を始める（T26d-2。自動ログインのプロファイルだけ。Run を作らない）。 */
@@ -596,10 +617,21 @@ export interface AuditJobManager {
    * 書き込みのモードでないプロファイル・ないプロファイルは 0）。開始の画面の「何が起きるか」の文に使う。
    */
   checkedWriteScreenCountOf(profileId: string): number;
+  /**
+   * PAR-c: 開始の画面の押す前の確かめ（読むだけ。開始を受けるかは開始の直前の確かめが決める）。そのプロファイル（許可 Origin は `siteOrigins`）を今始めると、
+   * 同じサイトのほかの設定のジョブが動いている（`SITE_ALREADY_ACTIVE`）か、端末の空きメモリが足りない（`MACHINE_MEMORY_LOW`）で拒むか。どちらでもなければ
+   * `null`（同じプロファイルのジョブが動いているときも `null`。画面は今どおり）。
+   */
+  startConcurrencyBlockerOf(profileId: string, siteOrigins: readonly string[]): AuditStartConcurrencyBlocker | null;
   /** OP-1: 下調べのジョブ（`thenStartAudit` で始めたもの）の、続けて始める点検の状態（ないなら `null`）。 */
   entryCheckFollowUpOf(jobId: string): EntryCheckFollowUp | null;
   /** OP-1（D3）: 手でのログインを待つジョブで、BeakSight がログインの終わりを判定できるか（知らせを受けていなければ `null`）。 */
   loginEndDetectionOf(jobId: string): boolean | null;
+  /**
+   * DPROG (b): 動いているジョブの、このワーカーの実行から最初に受けた進み（見積もりの基準。メモリの中だけ）。ジョブの管理が見ていないジョブと、まだ進みを
+   * 受けていないジョブは `null`。
+   */
+  progressBaselineOf(jobId: string): AuditJobProgressBaseline | null;
   /** 資格情報を変えてよいか（T26d-2。そのプロファイルのジョブが終わっていない間は `CREDENTIAL_IN_USE`）。 */
   checkCredentialChange(profileId: string): CredentialChangeCheck;
   stopAuditJob(jobId: string, options?: { readonly force?: boolean }): AuditJobStopResult;
@@ -717,6 +749,8 @@ interface WorkerLaunch {
   readonly authentication: WorkerStartAuthentication | null;
   /** READ の確かめの定義の一覧（T27e。`READ_CHECK` だけ。ほかは `null`）。 */
   readonly readChecks: readonly WorkerStartReadCheck[] | null;
+  /** RCA-6: 検索の確かめの組（`READ_CHECK` だけ。ほかは `null`）。 */
+  readonly searchChecks: readonly WorkerStartSearchCheck[] | null;
   /** FM2d: まとめて実行（その段のジョブだけ。ほかは `null`）。 */
   readonly chain: ChainRun | null;
   /** FM2d: まとめて実行の段の位置（0 から。まとめて実行でなければ 0）。 */
@@ -829,6 +863,32 @@ const credentialCarriedToLoginDestination = (setup: AuthSetup, carriedBy: { read
   return destinations.some(({ origin, path }) => isOriginInAllowedOrigins([origin], carriedBy.origin) && path === carriedBy.path);
 };
 
+/** DEF-300: 検索の確かめの組の行き先を確かめる文脈（ターゲット設定の開始の URL と許可 Origin、ワーカーに渡す認証の指定）。 */
+interface SearchCheckDestinationContext {
+  readonly startUrl: string | null;
+  readonly allowedOrigins: readonly string[];
+  readonly authentication: WorkerStartAuthentication | null;
+}
+
+/**
+ * DEF-300（REV-RCA の判断「読まない URL の組は始める前に除く」）: 検索の確かめの組の行き先の path が、読まないパス・読む範囲の外・ログインの画面・危険な語に
+ * 当たるか。判定は画面の path の READ の確かめの唯一の owner（`readCheckPagePathRejectionsOf`。ワーカーの事前の判定と同じ出どころ）に任せる。開始の URL が
+ * 分からないときは判定しない（ワーカーの事前の判定と Guard が今どおり止める）。
+ */
+const searchCheckExcludedPathOf = ({ startUrl, allowedOrigins, authentication }: SearchCheckDestinationContext) => (path: string): boolean => {
+  if (startUrl === null) return false;
+  const setup = authentication?.setup ?? null;
+  const rejections = readCheckPagePathRejectionsOf(path, {
+    startUrl,
+    allowedOrigins,
+    approvedTestOrigins: authentication?.approvedTestOrigins ?? [],
+    excludedPathPrefixes: setup?.excludedPaths ?? [],
+    auditPathPrefixes: setup?.auditPathPrefixes ?? [],
+    sessionLostPathPrefix: setup === null ? null : sessionLostPathPrefixOf(setup),
+  });
+  return rejections.includes('READ_PAGE_PATH_EXCLUDED') || rejections.includes('READ_PAGE_PATH_DANGEROUS_WORD');
+};
+
 /** この管理が起動したワーカー。 */
 interface TrackedJob extends WorkerLaunch {
   readonly jobId: string;
@@ -898,6 +958,8 @@ interface TrackedJob extends WorkerLaunch {
   lastHeartbeatMs: number;
   lastProgressWriteMs: number;
   pendingProgress: Extract<WorkerToParentMessage, { readonly type: 'PROGRESS' }>['report'] | null;
+  /** DPROG (b): このワーカーの実行から最初に受けた進み（見積もりの基準。メモリの中だけ。まだ受けていなければ `null`）。 */
+  progressBaseline: AuditJobProgressBaseline | null;
   readyTimer: NodeJS.Timeout | undefined;
   killTimer: NodeJS.Timeout | undefined;
   progressTimer: NodeJS.Timeout | undefined;
@@ -1071,6 +1133,13 @@ class JobManager implements AuditJobManager {
    * メモリの中だけ）。次のワーカーの `START` に、前の読み込みの時刻（`previousNavigationAtMs`）として渡す。待つのはワーカーの pacer だけ（ここでは待たない）。
    */
   readonly #siteWorkerEndedAtMs = new Map<string, number>();
+  /** PAR-b: 端末のメモリを読む関数（2 本目からの開始の確かめ）。 */
+  readonly #machineMemory: () => MachineMemory;
+  /**
+   * PAR-b: 行を作った後、ワーカーの今の段に移す前に待っている、この管理のジョブの ID（連鎖の書き込みの段の準備の間だけ。メモリの中だけ）。
+   * 前の画面のサーバの行を中断に直す確かめと、知らない終わっていない行の確かめで、この管理のジョブとして数える。
+   */
+  readonly #preparingJobIds = new Set<string>();
   readonly #forkWorker: AuditWorkerForker;
   readonly #timing: AuditJobTiming;
   readonly #onBackgroundError: (error: unknown) => void;
@@ -1110,6 +1179,7 @@ class JobManager implements AuditJobManager {
         resolvePromise();
       }, { once: true });
     }));
+    this.#machineMemory = options.machineMemory ?? readMachineMemory;
     this.#forkWorker = options.forkWorker ?? ((modulePath, args, forkOptions) => fork(modulePath, [...args], forkOptions));
     this.#timing = Object.freeze({ ...AUDIT_JOB_TIMING, ...options.timing });
     this.#onBackgroundError = options.onBackgroundError ?? ((): void => undefined);
@@ -1197,6 +1267,71 @@ class JobManager implements AuditJobManager {
     return job.lastSeenAt >= freshSince;
   }
 
+  /** PAR-b: この管理のジョブの ID（追っているジョブと、書き込みの段の準備の間のジョブ）。 */
+  #ownedJobIds(): readonly string[] {
+    return [...this.#jobs.keys(), ...this.#preparingJobIds];
+  }
+
+  /** PAR-b: 行を作ったジョブ（`jobId`）の準備（`prepare`）を待つ間だけ、この管理のジョブとして数える（終われば、失敗でも外す）。 */
+  async #whilePreparing<T>(jobId: string, prepare: () => Promise<T>): Promise<T> {
+    this.#preparingJobIds.add(jobId);
+    try {
+      return await prepare();
+    } finally {
+      this.#preparingJobIds.delete(jobId);
+    }
+  }
+
+  /**
+   * PAR-b（設計書 `2026-11-17-beaksight-parallel-site-audits-design.md` 2 章）: 新しいジョブを始めてよいか（`#start` の行を作るトランザクションの `guard` の
+   * 中で呼ぶ。読むだけ。拒む理由、受けるときは `null`）。
+   * 1. そのプロファイルに終わっていないジョブがある → `JOB_ALREADY_ACTIVE`（`createStartingJob` と一意の部分索引も同じ決まり）。
+   * 2. この管理が知らない終わっていない行（前の画面のサーバのワーカーがまだ動いている）がある → 今どおり `JOB_ALREADY_ACTIVE`（そのサイトが分からない）。
+   * 3. この管理の動いているジョブ（追っているジョブ）のうち、ほかのプロファイルのもので、許可 Origin のどれかが重なる（比べるのは同時に始める判定の鍵
+   *    `concurrentSiteKeysOf`。正規の形で、`www.` の有無は同じとみなす。REV-PAR の I-1・m-2）→ `SITE_ALREADY_ACTIVE`。追っているジョブは、行を作った同じ tick（await を挟まない）で `#launchWorker` が足すので、2 つの開始の間に隙間はない。
+   *    連鎖の段の間とログインし直しの待ちの間も、ワーカーのジョブは追ったまま。
+   * 4. 動いているジョブが 1 つ以上あり、端末の空きメモリが足りない（`hasMemoryForAnotherJob`）→ `MACHINE_MEMORY_LOW`（1 本目と、下調べの後に続けて
+   *    始める点検は確かめない）。
+   * 連鎖の次の段とログインし直しは、`#start` を通らないので、3 と 4 を確かめない（同じプロファイルの確かめだけ）。
+   */
+  #concurrencyRejectionWith(
+    connection: Parameters<typeof activeJobsWith>[0],
+    profileId: string,
+    siteOrigins: readonly string[],
+    checkMachineMemory: boolean,
+  ): AuditJobStartRejectionReason | null {
+    return this.#concurrencyRejectionOf(activeJobsWith(connection), profileId, siteOrigins, checkMachineMemory);
+  }
+
+  /**
+   * PAR-b・PAR-c: `#concurrencyRejectionWith` の判定（読んだ終わっていないジョブの行で決める。開始の画面の押す前の確かめと共用）。同じサイトかは、許可 Origin の
+   * 同時に始める判定の鍵（`concurrentSiteKeysOf`。正規の形にし、`www.` の有無を同じとみなす。REV-PAR の I-1・m-2）で比べる。`checkMachineMemory` が偽なら
+   * 空きメモリを確かめない（下調べの後に続けて始める点検。REV-PAR の m-4）。
+   */
+  #concurrencyRejectionOf(
+    activeJobs: readonly ActiveJobRow[],
+    profileId: string,
+    siteOrigins: readonly string[],
+    checkMachineMemory: boolean,
+  ): AuditJobStartRejectionReason | null {
+    if (activeJobs.some((active) => active.profileId === profileId)) {
+      return 'JOB_ALREADY_ACTIVE';
+    }
+    const owned = new Set(this.#ownedJobIds());
+    if (activeJobs.some(({ jobId }) => !owned.has(jobId))) {
+      return 'JOB_ALREADY_ACTIVE';
+    }
+    const running = [...this.#jobs.values()];
+    const siteKeys = concurrentSiteKeysOf(siteOrigins);
+    if (running.some((job) => job.profileId !== profileId && [...concurrentSiteKeysOf(job.siteOrigins)].some((key) => siteKeys.has(key)))) {
+      return 'SITE_ALREADY_ACTIVE';
+    }
+    if (checkMachineMemory && (running.length > 0 || activeJobs.length > 0) && !hasMemoryForAnotherJob(this.#machineMemory())) {
+      return 'MACHINE_MEMORY_LOW';
+    }
+    return null;
+  }
+
   /**
    * ほかの管理の、終わっていないジョブを中断に直す（ワーカーがまだ動いているものは直さない）。ロックを持っていなければ何もしない。直した行の数。
    */
@@ -1205,7 +1340,7 @@ class JobManager implements AuditJobManager {
       this.#database,
       'SERVER_RESTARTED',
       this.#timestamp(),
-      [...this.#jobs.keys()],
+      this.#ownedJobIds(),
       (connection) => this.#holdsInstanceLock(connection),
       (job) => this.#isUnownedWorkerRunning(job),
     );
@@ -1224,6 +1359,11 @@ class JobManager implements AuditJobManager {
   // -------------------------------------------------------------------------------------------------------------
 
   async startAuditJob(request: AuditJobStartRequest): Promise<AuditJobStartResult> {
+    return this.#startAuditJob(request, true);
+  }
+
+  /** 点検だけを始める（`checkMachineMemory` は `#start` へ渡す。REV-PAR の m-4）。 */
+  async #startAuditJob(request: AuditJobStartRequest, checkMachineMemory: boolean): Promise<AuditJobStartResult> {
     if (this.#closing || !isStartRequest(request)) {
       return startRejected('INVALID_REQUEST');
     }
@@ -1231,7 +1371,7 @@ class JobManager implements AuditJobManager {
     if (request.scope !== undefined) {
       return startRejected('INVALID_REQUEST');
     }
-    return this.#start('AUDIT', request.profileId, request.expectedRevision, request.startNew);
+    return this.#start('AUDIT', request.profileId, request.expectedRevision, request.startNew, null, null, checkMachineMemory);
   }
 
   async startLoginCheck(request: LoginCheckStartRequest): Promise<AuditJobStartResult> {
@@ -1251,6 +1391,11 @@ class JobManager implements AuditJobManager {
   }
 
   async startStageChain(request: AuditJobStartRequest): Promise<AuditJobStartResult> {
+    return this.#startStageChain(request, true);
+  }
+
+  /** まとめて実行を始める（`checkMachineMemory` は `#start` へ渡す。REV-PAR の m-4）。 */
+  async #startStageChain(request: AuditJobStartRequest, checkMachineMemory: boolean): Promise<AuditJobStartResult> {
     if (this.#closing || !isStartRequest(request)) {
       return startRejected('INVALID_REQUEST');
     }
@@ -1267,7 +1412,7 @@ class JobManager implements AuditJobManager {
     }
     // 監査の段は、開始の画面の指定（新しく始めるか）のまま。発見から始める連鎖は、いつも新しい Run。WSO: 範囲つきの点検も、いつも新しい Run。
     const startNew = stages[0] === WORKER_AUDIT_JOB_KIND && pageScope === null ? request.startNew : true;
-    return this.#start(stages[0], request.profileId, request.expectedRevision, startNew, stages, pageScope);
+    return this.#start(stages[0], request.profileId, request.expectedRevision, startNew, stages, pageScope, checkMachineMemory);
   }
 
   async startReadCheck(request: ReadCheckStartRequest): Promise<AuditJobStartResult> {
@@ -1302,6 +1447,11 @@ class JobManager implements AuditJobManager {
     return job?.loginEndDetection ?? null;
   }
 
+  progressBaselineOf(jobId: string): AuditJobProgressBaseline | null {
+    const job = typeof jobId === 'string' ? this.#jobs.get(jobId) : undefined;
+    return job?.progressBaseline ?? null;
+  }
+
   /**
    * OP-1（設計書 4.1 の D11、4.1.3 の 3）: 印つきの下調べが終わったら、ログインの設定の案の保存（`#saveEntryCheckProposal`）の後に、続けて点検（まとめて実行）を
    * 始める。始めるのは、下調べが失敗の理由なしで終わって開始のページを読め（OP-1 修正の 2 回目）、人が止めておらず、プロファイルが有効で、ログインの設定を使うモードなら設定があるときだけ。開始の確かめは今の口
@@ -1322,9 +1472,12 @@ class JobManager implements AuditJobManager {
       return;
     }
     const request = { profileId: job.profileId, expectedRevision: current.profile.revision, startNew: true };
-    const started = chainStagesOfMode(current.profile.mode) === null ? await this.startAuditJob(request) : await this.startStageChain(request);
+    // REV-PAR の m-4: 同じ流れの続きなので、空きメモリは確かめない。同じサイトの別の設定が動いていて始められなかったときは、その理由を残す（作業の画面が出す）。
+    const started = chainStagesOfMode(current.profile.mode) === null ? await this.#startAuditJob(request, false) : await this.#startStageChain(request, false);
     if (started.ok) {
       this.#entryCheckFollowUps.set(job.jobId, Object.freeze({ state: 'STARTED', jobId: started.job.jobId }));
+    } else if (started.reason === 'SITE_ALREADY_ACTIVE') {
+      this.#entryCheckFollowUps.set(job.jobId, Object.freeze({ state: 'SKIPPED', reason: started.reason }));
     } else {
       notStarted();
     }
@@ -1405,6 +1558,8 @@ class JobManager implements AuditJobManager {
     chainStages: WorkerChainStageSequence | null = null,
     /** WSO: 点検の範囲（まとめて実行だけ。サイトの全部の画面は null）。 */
     pageScope: AuditPageScopeKind | null = null,
+    /** REV-PAR の m-4: 端末の空きメモリを確かめるか（下調べの後に続けて始める点検だけ偽）。 */
+    checkMachineMemory = true,
   ): Promise<AuditJobStartResult> {
     if (this.#instanceLockLost) {
       return startRejected('CONTROL_INSTANCE_LOCK_LOST');
@@ -1441,14 +1596,8 @@ class JobManager implements AuditJobManager {
         }
       }
     }
-    // T27e: READ の確かめは、取り消していない定義が 1 件以上あるときだけ始める（ターゲット設定を読む前に確かめる）。
-    let readCheckDefinitions: readonly ReadCheckView[] = [];
-    if (jobKind === WORKER_READ_CHECK_JOB_KIND) {
-      readCheckDefinitions = standaloneReadChecksOf(this.#database, profileId);
-      if (readCheckDefinitions.length === 0) {
-        return startRejected('READ_CHECK_DEFINITIONS_MISSING');
-      }
-    }
+    // T27e: READ の確かめの定義（取り消していない、人が作った定義）。RCA-6: 始められるかは、検索の確かめの組と合わせて、出力先を決めた後に確かめる。
+    const readCheckDefinitions: readonly ReadCheckView[] = jobKind === WORKER_READ_CHECK_JOB_KIND ? standaloneReadChecksOf(this.#database, profileId) : [];
     // T25d: 認証つきの監査は、保存した認証の設定が、今のプロファイルの改訂に結びつくとき（`CURRENT`）だけ始める（ターゲット設定を読む前に
     // 確かめる）。設定の中身は、下でターゲット設定を読み直した後に `validateAuthSetup` で検証し直す。
     // T43c: 認証の設定が要るかは、操作ごとの判定（`operationRequiresAuthSetup`）。入口の確かめはログインをしないので、どのモードでも要らない
@@ -1545,8 +1694,18 @@ class JobManager implements AuditJobManager {
     const outputDirectory = resolve(this.#repositoryRoot, context.targetConfig.output.directory);
     // T27e: READ の確かめの定義の一覧（対象の候補の画面は、候補を最後に見た発見の成果物から決める）。
     const readChecks = jobKind === WORKER_READ_CHECK_JOB_KIND
-      ? await this.#readCheckLaunches(profileId, readCheckDefinitions, outputDirectory, context.targetConfig.site.startUrl, { auditJobId: null })
+      ? await this.#readCheckLaunches(profileId, readCheckDefinitions, outputDirectory, context.targetConfig.site.startUrl)
       : null;
+    // RCA-6: 検索の確かめの組（最新の操作さがしの記録から、始める前に作る）。READ の確かめは、人の定義と組が合わせて 1 件以上のときだけ始める。
+    // DEF-300: 行き先が読まない path に当たる組は、始める前に除く（M は除いた後の数）。
+    const searchChecks = jobKind === WORKER_READ_CHECK_JOB_KIND
+      ? await this.#searchChecksOf(profileId, outputDirectory, {
+        startUrl: context.targetConfig.site.startUrl, allowedOrigins: context.targetConfig.site.allowedOrigins, authentication,
+      })
+      : null;
+    if (jobKind === WORKER_READ_CHECK_JOB_KIND && (readChecks?.length ?? 0) + (searchChecks?.length ?? 0) === 0) {
+      return startRejected('READ_CHECK_DEFINITIONS_MISSING');
+    }
     // OP-2: 書き込みのモードのプロファイルだけ、チェックした画面（承認した登録のシナリオ）を書き込みの段の対象にする。
     const writeTargets = chainStages === null ? [] : this.#chainWriteTargets(profileId, stored.profile.mode);
     // WSO: 「チェックした画面だけ」の点検は、チェックした画面と関係する画面を読む画面にする。チェックした画面か読む画面がなければ始めない（書き込みの OK を
@@ -1562,12 +1721,15 @@ class JobManager implements AuditJobManager {
     }
     const automatedLogin = authentication?.automatedLogin ?? null;
 
-    // 3. 同時に 1 つ。ほかの管理の終わっていないジョブは、ワーカーが終わっていれば中断に直し、まだ動いていれば残す（その場合、下で
-    //    `JOB_ALREADY_ACTIVE` になる。T24h-6）。読み直しを待つ間にプロファイルが変わっていないことも、同じトランザクションの中で確かめ直す。
+    // 3. サイトごとに同時に 1 つ（PAR-b。`#concurrencyRejectionWith`）。ほかの管理の終わっていないジョブは、ワーカーが終わっていれば中断に直し、
+    //    まだ動いていれば残す（その場合、下で `JOB_ALREADY_ACTIVE` になる。T24h-6）。この管理の動いているジョブには触れない。読み直しを待つ間に
+    //    プロファイルが変わっていないことも、同じトランザクションの中で確かめ直す。
     this.#interruptUnownedJobs();
     if (this.#instanceLockLost) {
       return startRejected('CONTROL_INSTANCE_LOCK_LOST');
     }
+    // REV-PAR の I-1: サイトの Origin は正規の形で持つ（同じサイトの判定と、DEF-180 の間隔の鍵がそろう）。
+    const siteOrigins = [...canonicalizeAllowedOrigins(context.targetConfig.site.allowedOrigins)];
     const jobId = randomUUID();
     /** トランザクションの中の上限の確かめで拒んだときの判定（次に始められる時刻を返すため。`guard` の中で書く）。 */
     const limitRejection: { decision: Exclude<AutoLoginLimitDecision, { readonly ok: true }> | null } = { decision: null };
@@ -1604,7 +1766,7 @@ class JobManager implements AuditJobManager {
           return decision.reason;
         }
       }
-      return null;
+      return this.#concurrencyRejectionWith(connection, profileId, siteOrigins, checkMachineMemory);
     });
     if (!created.ok) {
       const rejectedByLimit = limitRejection.decision;
@@ -1645,8 +1807,8 @@ class JobManager implements AuditJobManager {
 
     // 4. ワーカーを起動する。
     this.#launchWorker({
-      jobId, jobKind, profileId, outputDirectory, targetConfigPath, startNew, targetConfigSha256: digestBefore, authentication, readChecks,
-      chain, chainStageIndex: 0, siteOrigins: [...context.targetConfig.site.allowedOrigins],
+      jobId, jobKind, profileId, outputDirectory, targetConfigPath, startNew, targetConfigSha256: digestBefore, authentication, readChecks, searchChecks,
+      chain, chainStageIndex: 0, siteOrigins,
     });
     const job = readJob(this.#database, jobId);
     if (job === null) {
@@ -1660,16 +1822,13 @@ class JobManager implements AuditJobManager {
    * （出力先の、そのジョブの Run のディレクトリ）から決める。索引にない、ジョブの行や成果物を読めない、成果物に候補がないときは `null`。
    * T37d（Task 37 の設計書 3.5）: 画面の path の定義の対象の画面は、ターゲット設定の開始の URL（`startUrl`）の Origin と定義の path（ワーカーが同じ
    * 組み立てで確かめ直す）。開始の URL を渡さない・読めないときは `null`（ワーカーは読まない。IPC の契約も拒む）。
-   * DEF-235（設計書 `2026-11-09-beaksight-read-check-record-id-fill-design.md` 3.1）: READ の確かめの段（`recordIdFill` を渡す呼び出し。書き込みの照合の READ は
-   * 渡さない）では、画面の path の型（`{id}`）の定義に、番号の元で見つけた番号を全部付ける（`#recordIdsOf`。見つからなければ付けない。ワーカーが一覧の画面を読む）。
+   * RCA-6（検索の確かめの設計書 2.2）: DEF-235 の番号を埋める所（`recordIds`）は外した（段では `{id}` の型の定義を読まない。`standaloneReadChecksOf`）。
    */
   async #readCheckLaunches(
     profileId: string,
     definitions: readonly ReadCheckView[],
     outputDirectory: string,
     startUrl: string | null,
-    /** DEF-235: 番号を埋める（READ の確かめの段）。`auditJobId` は同じ連鎖の点検の段のジョブ（連鎖でなければ null）。 */
-    recordIdFill: { readonly auditJobId: string | null } | null = null,
   ): Promise<readonly WorkerStartReadCheck[]> {
     let startOrigin: string | null = null;
     try {
@@ -1690,24 +1849,10 @@ class JobManager implements AuditJobManager {
       return documents.get(jobId) ?? null;
     };
     const launches: WorkerStartReadCheck[] = [];
-    // DEF-235: 番号の元のうち、定義によらないもの（読み切れた画面の path・点検の段のリンク）は、型の定義があるときに 1 回だけ読む。
-    let auditLinkUrls: readonly string[] | null = null;
     for (const { readCheckId, revision, definition } of definitions) {
       if (definition.targetPagePath !== undefined) {
         const targetPage: CandidateLocation | null = startOrigin === null ? null : { origin: startOrigin, path: definition.targetPagePath };
-        let recordIds: readonly string[] = [];
-        if (recordIdFill !== null && startOrigin !== null && isReadCheckPageTemplatePath(definition.targetPagePath)) {
-          auditLinkUrls ??= await this.#auditStageLinkUrlsOf(recordIdFill.auditJobId, outputDirectory);
-          recordIds = readCheckRecordIdsOf({
-            template: definition.targetPagePath,
-            // Origin の判定は、許可 Origin の所属の部品（`isOriginInAllowedOrigins`。GATE-ARCH04）で行う（読めない URL は、番号の元の部品が飛ばす）。
-            isStartOrigin: (url) => isOriginInAllowedOrigins([startOrigin ?? ''], new URL(url).origin),
-            readPagePaths: index.latestReadPagePaths,
-            auditLinkUrls,
-            createdRecordIds: this.#createdRecordIdsOf(profileId, readCheckId),
-          });
-        }
-        launches.push(deepFreeze({ readCheckId, readCheckRevision: revision, targetPage, definition, ...(recordIds.length === 0 ? {} : { recordIds }) }));
+        launches.push(deepFreeze({ readCheckId, readCheckRevision: revision, targetPage, definition }));
         continue;
       }
       const entry = index.candidates.find(({ identityDigest }) => identityDigest === definition.targetIdentityDigest);
@@ -1722,34 +1867,19 @@ class JobManager implements AuditJobManager {
   }
 
   /**
-   * DEF-235（元 2）: 同じ連鎖の点検の段のジョブの成果物の、見つけたリンクの URL（見つけた順。読み方は共通の部品 `readAuditStageLinks`）。ジョブがない・Run の
-   * ディレクトリがない・読めなければ空。例外を投げない。
+   * RCA-6（検索の確かめの設計書 2.2）: 検索の確かめの組（`search-check-plan.ts` の `searchCheckPlanOf`）を、プロファイルの最新の操作さがしのジョブの成果物
+   * `discovery.json` から、始める前に作る（組の数が進み具合の分母）。ジョブがない・Run のディレクトリがない・成果物を読めない・合わないときは空。例外を投げない。
    */
-  async #auditStageLinkUrlsOf(auditJobId: string | null, outputDirectory: string): Promise<readonly string[]> {
-    const runDirectory = auditJobId === null ? null : readJob(this.#database, auditJobId)?.runDirectory ?? null;
+  async #searchChecksOf(profileId: string, outputDirectory: string, destination: SearchCheckDestinationContext): Promise<readonly WorkerStartSearchCheck[]> {
+    const { latestJobId } = readDiscoveryIndex(this.#database, profileId);
+    const runDirectory = latestJobId === null ? null : readJob(this.#database, latestJobId)?.runDirectory ?? null;
     if (runDirectory === null) {
       return [];
     }
-    try {
-      return (await readAuditStageLinks(resolve(outputDirectory, runDirectory))).map(({ url }) => url);
-    } catch {
-      return [];
-    }
-  }
-
-  /**
-   * DEF-235（元 3）: この READ の定義に照合で結んだ登録のシナリオ（今の版が CREATE で、照合の READ がこの定義）の書き込みで作った登録の ID のうち、照合で確かめた回
-   * （`VERIFIED`）のもの（台帳の新しい順）。形の確かめは番号の元の部品が行う。
-   */
-  #createdRecordIdsOf(profileId: string, readCheckId: string): readonly string[] {
-    const scenarioIds = new Set(listScenarios(this.#database, profileId)
-      .filter(({ current }) => current.kind === CREATE_SCENARIO_KIND && current.verification.readVerification?.readCheckId === readCheckId)
-      .map(({ scenarioId }) => scenarioId));
-    if (scenarioIds.size === 0) {
-      return [];
-    }
-    return readAuditedDataLedger(this.#database, profileId).flatMap(({ scenarioId, result, recordId }) =>
-      (scenarioIds.has(scenarioId) && result === VERIFIED_ACTION_RESULT && recordId !== null ? [recordId] : []));
+    const value = await this.#readRunArtifact(outputDirectory, runDirectory, DISCOVERY_ARTIFACT_FILE_NAME, 'discovery');
+    return value === null || (value as DiscoveryDocument).jobId !== latestJobId
+      ? []
+      : searchCheckPlanOf(value as DiscoveryDocument, searchCheckExcludedPathOf(destination)).combos;
   }
 
   /**
@@ -1853,6 +1983,7 @@ class JobManager implements AuditJobManager {
       lastHeartbeatMs: performance.now(),
       lastProgressWriteMs: Number.NEGATIVE_INFINITY,
       pendingProgress: null,
+      progressBaseline: null,
       readyTimer: undefined,
       killTimer: undefined,
       progressTimer: undefined,
@@ -1977,6 +2108,7 @@ class JobManager implements AuditJobManager {
           targetConfigSha256: job.targetConfigSha256,
           ...(job.authentication === null ? {} : { authentication: job.authentication }),
           ...(job.readChecks === null ? {} : { readChecks: job.readChecks }),
+          ...(job.searchChecks === null ? {} : { searchChecks: job.searchChecks }),
           // FM-2: Run の Browser を起動するジョブは、プロファイルの表示の設定（既定は表示）を、ジョブの開始のときに読んで渡す。
           ...(WORKER_JOB_KINDS_WITH_JOB_BROWSER.includes(job.jobKind)
             ? { showJobBrowser: readProfileDisplaySettings(this.#database, job.profileId).showJobBrowser }
@@ -2021,6 +2153,8 @@ class JobManager implements AuditJobManager {
         }
         // DEF-200: ログインし直した後にページを読んだかを見るため、監査を終えたページの数を覚える。
         job.pagesFinished = Math.max(job.pagesFinished, message.report.pagesFinished);
+        // DPROG (b): このワーカーの実行の最初の進みを、見積もりの基準に覚える（続きの実行では、前の実行の分を 1 画面の時間に入れない）。
+        job.progressBaseline ??= { pagesFinished: message.report.pagesFinished, elapsedMs: message.report.elapsedMs };
         this.#progress(job, message.report);
         return;
       case 'NOTICE':
@@ -2678,9 +2812,18 @@ class JobManager implements AuditJobManager {
     };
     let decision = decide();
     let readChecks: readonly WorkerStartReadCheck[] | null = null;
+    let searchChecks: readonly WorkerStartSearchCheck[] | null = null;
     if (decision.kind === 'CONTINUE' && nextKind === WORKER_READ_CHECK_JOB_KIND) {
       const definitions = standaloneReadChecksOf(this.#database, chain.profileId);
-      if (chainReadCheckDecisionOf(definitions.length) === 'NOT_NEEDED') {
+      // RCA-6: 検索の確かめの組（同じ連鎖の操作さがしの段の記録から作る。索引は記録した後）。人の定義と合わせて 0 件なら行わない。
+      // DEF-300: 行き先の確かめは、この段のジョブの認証の指定と許可 Origin、連鎖を始めた時の開始の URL で行う（次の段のジョブに渡すのと同じ値）。
+      searchChecks = await this.#searchChecksOf(chain.profileId, job.outputDirectory, {
+        startUrl: chain.startUrl, allowedOrigins: job.siteOrigins, authentication: job.authentication,
+      });
+      if (job.processExited) {
+        return;
+      }
+      if (chainReadCheckDecisionOf(definitions.length + searchChecks.length) === 'NOT_NEEDED') {
         // OP-2: チェックした画面があれば、READ の確かめを行わずに書き込みの段へ進む。
         if (chain.writeTargets.length > 0 && !this.#closing && !this.#instanceLockLost) {
           await this.#advanceToWriteStage(job, chain, ending);
@@ -2692,10 +2835,7 @@ class JobManager implements AuditJobManager {
         this.#awaitExit(job);
         return;
       }
-      // DEF-235: 型の定義の番号は、同じ連鎖の点検の段のリンクも元にする（点検の段がなければ null）。
-      const auditStage = chain.stages.indexOf(WORKER_AUDIT_JOB_KIND);
-      const auditJobId = auditStage < 0 ? null : chain.stageStates[auditStage]?.jobId ?? null;
-      readChecks = await this.#readCheckLaunches(chain.profileId, definitions, job.outputDirectory, chain.startUrl, { auditJobId });
+      readChecks = await this.#readCheckLaunches(chain.profileId, definitions, job.outputDirectory, chain.startUrl);
       if (job.processExited) {
         return;
       }
@@ -2714,7 +2854,7 @@ class JobManager implements AuditJobManager {
       await this.#advanceToWriteStage(job, chain, ending);
       return;
     }
-    this.#advanceToNextStage(job, chain, ending, nextKind, readChecks);
+    this.#advanceToNextStage(job, chain, ending, nextKind, readChecks, searchChecks);
   }
 
   // -------------------------------------------------------------------------------------------------------------
@@ -2961,7 +3101,8 @@ class JobManager implements AuditJobManager {
       }
       const grant = readExecutionGrant(this.#database, grantId);
       const authentication = job.authentication === null ? null : (({ loginRegistration: _registration, ...kept }) => kept)(job.authentication);
-      const prepared = grant === null ? 'WRITE_GRANT_REJECTED' : await this.#prepareWrite({
+      // PAR-b: 準備を待つ間も、作った行はこの管理のジョブ（ほかのサイトの開始の確かめが、知らない行や前の画面のサーバの行として扱わない）。
+      const prepared = grant === null ? 'WRITE_GRANT_REJECTED' : await this.#whilePreparing(nextJobId, async () => await this.#prepareWrite({
         jobId: nextJobId, stored, grant, outputDirectory: job.outputDirectory, startUrl: chain.startUrl ?? '',
         // DEF-198（設計書 5.9 の 3）: 更新は、同じ点検で照合まで済んだ登録（対象の番号の登録）のページが決めた値を渡す（メモリの中だけ）。
         createPageKeyValues: step.kind === 'UPDATE' && targetRecordId !== null && chain.lastWrite?.createRecordId === targetRecordId
@@ -2971,7 +3112,7 @@ class JobManager implements AuditJobManager {
           protocol: WORKER_PROTOCOL_VERSION, type: 'START', jobId: nextJobId, jobKind, targetConfigPath: job.targetConfigPath, startNew: true,
           targetConfigSha256: job.targetConfigSha256, ...(authentication === null ? {} : { authentication }), write,
         }),
-      });
+      }));
       if (typeof prepared === 'string' || job.processExited || stopRequested()) {
         // 送らずに締め、その段の行を `FAILED` にする（ワーカーが終わっていたら、ここで終える）。OP-F（M-1）: 準備の間に止める要求が届いたときも、送らずに締めて
         // 利用者の停止で止める。準備が通らなかった画面は、試せなかったことを連鎖の結果に残す。
@@ -3009,6 +3150,7 @@ class JobManager implements AuditJobManager {
       jobKind,
       startNew: true,
       readChecks: null,
+      searchChecks: null,
       writeSpec: write,
       write: {
         grantId: write.grantId, scenarioId: write.scenarioId, scenarioRevision: write.scenarioRevision,
@@ -3036,6 +3178,7 @@ class JobManager implements AuditJobManager {
       lastHeartbeatMs: performance.now(),
       lastProgressWriteMs: Number.NEGATIVE_INFINITY,
       pendingProgress: null,
+      progressBaseline: null,
       readyTimer: undefined,
       killTimer: undefined,
       progressTimer: undefined,
@@ -3072,6 +3215,7 @@ class JobManager implements AuditJobManager {
     ending: Extract<JobEnding, { readonly kind: 'FINISHED' }>,
     nextKind: WorkerNextStageJobKind,
     readChecks: readonly WorkerStartReadCheck[] | null,
+    searchChecks: readonly WorkerStartSearchCheck[] | null,
   ): void {
     const at = this.#timestamp();
     this.#recordJobRow(job, ending, ending.outcome.exitCode, job.recordedResult?.failedReason ?? null, at);
@@ -3102,6 +3246,7 @@ class JobManager implements AuditJobManager {
       jobKind: nextKind,
       startNew: true,
       readChecks,
+      searchChecks,
       chainStageIndex: job.chainStageIndex + 1,
       // 2 つ目からの段は、ログインの段を持たない（自動ログインの結果も、ログインを終えたの知らせも受けない）。
       automatedLoginReported: true,
@@ -3126,6 +3271,7 @@ class JobManager implements AuditJobManager {
       lastHeartbeatMs: performance.now(),
       lastProgressWriteMs: Number.NEGATIVE_INFINITY,
       pendingProgress: null,
+      progressBaseline: null,
       readyTimer: undefined,
       killTimer: undefined,
       progressTimer: undefined,
@@ -3156,6 +3302,7 @@ class JobManager implements AuditJobManager {
       jobId: nextJobId,
       jobKind: nextKind,
       ...(readChecks === null ? {} : { readChecks }),
+      ...(searchChecks === null ? {} : { searchChecks }),
     });
   }
 
@@ -3178,11 +3325,29 @@ class JobManager implements AuditJobManager {
     }
     const group = reloginStageGroupOf(kind);
     const count = chain.relogins[group];
-    // 3.4 の 3: ログインし直した後に 1 ページも読まずにまた切れたら、くり返さない。
+    // RCA-6（検索の確かめの設計書 2.3）: READ の確かめの段は、前のジョブで確かめた検索の確かめの組を除いた残りだけを、新しいジョブに渡す（二重に読まない）。
+    // REV-RCA の I-4: ログインの画面へ戻された組の鍵（成果物の `sessionLostSearchCheckKey`）も渡し、新しいジョブはその組を最初に 1 回だけやり直す。人の定義で
+    // 戻されたときは鍵がない（どの組も 2 回目の戻しにしない）。
+    const searchProgress = kind === WORKER_READ_CHECK_JOB_KIND
+      ? await this.#searchCheckProgressOf(job, ending)
+      : { executedKeys: new Set<string>(), sessionLostKey: null };
+    const executedSearchKeys = searchProgress.executedKeys;
+    if (job.processExited) {
+      return false;
+    }
+    const remainingSearchChecks = job.searchChecks === null ? null : job.searchChecks.filter(({ key }) => !executedSearchKeys.has(key));
+    const bouncedSearchCheckKey = remainingSearchChecks?.some(({ key }) => key === searchProgress.sessionLostKey) === true ? searchProgress.sessionLostKey : null;
+    if (kind === WORKER_READ_CHECK_JOB_KIND && (job.readChecks?.length ?? 0) + (remainingSearchChecks?.length ?? 0) === 0) {
+      // 残りがなければ、ログインし直さない（確かめることがない）。
+      return false;
+    }
+    // 3.4 の 3: ログインし直した後に 1 ページも読まずにまた切れたら、くり返さない（READ の確かめは、定義か検索の確かめの組を 1 つも確かめずに）。
     const readSinceRelogin = job.relogin === null
       || (kind === WORKER_AUDIT_JOB_KIND
         ? job.pagesFinished > job.relogin.pagesBefore
-        : kind === WORKER_DISCOVERY_JOB_KIND ? (ending.discovery?.pagesRead ?? 0) > job.relogin.pagesBefore : (ending.readCheck?.executed ?? 0) > 0);
+        : kind === WORKER_DISCOVERY_JOB_KIND
+          ? (ending.discovery?.pagesRead ?? 0) > job.relogin.pagesBefore
+          : (ending.readCheck?.executed ?? 0) > 0 || executedSearchKeys.size > 0);
     if (count >= MAX_AUTOMATIC_RELOGINS_PER_STAGE || !readSinceRelogin || job.stopRequested || chain.stopRequested || this.#closing || this.#instanceLockLost) {
       return false;
     }
@@ -3267,6 +3432,8 @@ class JobManager implements AuditJobManager {
       jobId: nextJobId,
       jobKind: kind,
       startNew,
+      // RCA-6: 検索の確かめの組は、残りだけ。
+      searchChecks: remainingSearchChecks,
       // 新しいジョブは、ログインの段の結果を 1 回受ける（自動ログイン）。
       automatedLoginReported: false,
       relogin: { count: count + 1, pagesBefore: kind === WORKER_DISCOVERY_JOB_KIND ? (ending.discovery?.pagesRead ?? 0) : job.pagesFinished },
@@ -3288,6 +3455,7 @@ class JobManager implements AuditJobManager {
       lastHeartbeatMs: performance.now(),
       lastProgressWriteMs: Number.NEGATIVE_INFINITY,
       pendingProgress: null,
+      progressBaseline: null,
       readyTimer: undefined,
       killTimer: undefined,
       progressTimer: undefined,
@@ -3314,8 +3482,32 @@ class JobManager implements AuditJobManager {
       jobKind: kind,
       count: count + 1,
       ...(kind === WORKER_READ_CHECK_JOB_KIND && job.readChecks !== null ? { readChecks: job.readChecks } : {}),
+      ...(kind === WORKER_READ_CHECK_JOB_KIND && next.searchChecks !== null ? { searchChecks: next.searchChecks } : {}),
+      ...(kind === WORKER_READ_CHECK_JOB_KIND && bouncedSearchCheckKey !== null ? { bouncedSearchCheckKey } : {}),
     });
     return true;
+  }
+
+  /**
+   * RCA-6: READ の確かめのジョブの成果物 `read-evidence.json` で、確かめた（`EXECUTED`）検索の確かめの組の鍵と、REV-RCA の I-4: セッションが切れたときに確かめて
+   * いた組の鍵（なければ null）。Run のディレクトリがない・読めない・合わないときは空と null（全部を残りにする）。例外を投げない。
+   */
+  async #searchCheckProgressOf(
+    job: TrackedJob,
+    ending: Extract<JobEnding, { readonly kind: 'FINISHED' }>,
+  ): Promise<{ readonly executedKeys: ReadonlySet<string>; readonly sessionLostKey: string | null }> {
+    const { runDirectory } = ending.outcome;
+    const value = runDirectory === null
+      ? null
+      : await this.#readRunArtifact(job.outputDirectory, runDirectory, READ_EVIDENCE_ARTIFACT_FILE_NAME, 'read-evidence');
+    if (value === null || (value as ReadEvidenceDocument).jobId !== job.jobId) {
+      return { executedKeys: new Set(), sessionLostKey: null };
+    }
+    const document = value as ReadEvidenceDocument;
+    return {
+      executedKeys: new Set(document.searchChecks.flatMap(({ key, state }) => (state === 'EXECUTED' ? [key] : []))),
+      sessionLostKey: document.sessionLostSearchCheckKey ?? null,
+    };
   }
 
   /** FM2d: 連鎖を止めて（理由つき）、ワーカーに `CHAIN_END` を送り、終わりを待つ。 */
@@ -3374,6 +3566,11 @@ class JobManager implements AuditJobManager {
       });
       this.#closeChain(chain, decision.kind === 'STOP' ? decision.reason : null, NOT_STARTED_CHAIN_STAGE_STATE);
     }
+  }
+
+  startConcurrencyBlockerOf(profileId: string, siteOrigins: readonly string[]): AuditStartConcurrencyBlocker | null {
+    const rejection = this.#concurrencyRejectionOf(readActiveJobs(this.#database), profileId, siteOrigins, true);
+    return rejection === 'SITE_ALREADY_ACTIVE' || rejection === 'MACHINE_MEMORY_LOW' ? rejection : null;
   }
 
   checkedWriteScreenCountOf(profileId: string): number {
@@ -3655,8 +3852,11 @@ class JobManager implements AuditJobManager {
     const writable = switchPlan?.ok === true
       ? writableLoginOriginOf({
         database: this.#database,
-        // 動いているジョブは、このジョブだけ（同時に 1 つ）。ログインの段の口から書くときの、ジョブの確かめの 1 つの口。
-        checkCredentialChange: () => ({ ok: true }),
+        // PAR-b: このジョブ（自分）を除いて、同じプロファイルに終わっていないジョブがあれば拒む（ジョブはプロファイルごとに同時に 1 つなので、ふつうは通る）。
+        // ログインの段の口から書くときの、ジョブの確かめの 1 つの口。
+        checkCredentialChange: () => (hasActiveJobForProfile(this.#database, job.profileId, job.jobId)
+          ? Object.freeze({ ok: false, reason: 'CREDENTIAL_IN_USE' })
+          : Object.freeze({ ok: true })),
         platformSupported: () => process.platform === CREDENTIAL_PLATFORM,
       }, job.profileId, { auth: AUTOMATED_LOGIN_AUTH_STRATEGY, loginStartUrl: switchPlan.nextSetup.loginStartUrl })
       : null;
@@ -4094,6 +4294,10 @@ class JobManager implements AuditJobManager {
         && check.targetIdentityDigest === target.targetIdentityDigest
         && check.targetPagePath === target.targetPagePath;
     });
+    // RCA-6: 検索の確かめの組も、開始の組と同じ鍵が同じ順（件数の要約の組の数と誤りの数も、成果物と同じ）。
+    const startedSearch = job.searchChecks ?? [];
+    const sameSearchChecks = document.searchChecks.length === startedSearch.length
+      && document.searchChecks.every((check, index) => check.key === startedSearch[index]?.key);
     if (
       document.jobId !== job.jobId
       || document.runId !== runId
@@ -4101,6 +4305,9 @@ class JobManager implements AuditJobManager {
       || reported === null
       || summary.checks !== reported.checks
       || summary.executed !== reported.executed
+      || summary.searchChecks !== reported.searchChecks
+      || summary.searchCheckErrors !== reported.searchCheckErrors
+      || !sameSearchChecks
       // T37a（Task 37 の設計書 3.1）: 監査の段の数も、成果物と同じ（どちらもないか、同じ数）。
       || !sameJobAuthenticationSummary(summary.authentication, reported.authentication)
       || !sameChecks

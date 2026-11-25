@@ -399,6 +399,82 @@ describe('OP-1: the job manager starts the audit right after the entry check sta
     }, TEST_TIMEOUT_MS);
   }
 
+  // REV-PAR の m-4: 下調べの後に続けて始める点検は、同じ流れの続きなので空きメモリを確かめない。同じサイトの別の設定が動いていて始められなかったときは、
+  // 黙って飛ばさず、その理由を残す（作業の画面が出す）。
+  describe('with a job of another profile running (REV-PAR m-4)', () => {
+    const PUBLIC_ID = 'example-entry-public-parallel';
+    const HOLDER_ID = 'example-entry-holder';
+    const HOLDER_TARGET_PATH = 'local/targets/example-holder.json';
+    const GIB = 1024 ** 3;
+    /** 別のサイト（許可 Origin が重ならない）。 */
+    const OTHER_SITE_CONTEXT: ProfileValidationContext = Object.freeze({ targetConfig: createTestConfig('https://other-site.example.invalid', START_PATH) });
+    const publicDocument = (): EntryCheckDocument => documentFor({
+      facts: { ...(documentFor().facts as NonNullable<EntryCheckDocument['facts']>), loginPage: false },
+      proposal: null,
+    });
+
+    /** 1 つ目の起動だけを、止めるまで動く偽のワーカー（ほかの設定のジョブ）にする管理。`holderContext` はそのジョブのサイト。 */
+    const parallelManager = (name: string, holderContext: ProfileValidationContext, memory: { freeBytes: number }, gate: Promise<void> | null): AuditJobManager => {
+      const worker = entryCheckWorker(name, publicDocument());
+      const holding = writeFakeWorker(join(workDirectory, name), 'hold', fakeWorkerValuesOf({ runId: FAKE_RUN_ID, otherRunId: OTHER_RUN_ID }));
+      let forked = 0;
+      let entryStarted = false;
+      const contextOf = withOutputDirectory((path) => (path === HOLDER_TARGET_PATH ? holderContext : resolveContext(path)), join(OUTPUT_DIRECTORY_NAME, name));
+      const resolver = async (path: string): Promise<ProfileValidationContext | undefined> => {
+        // 下調べの開始の後に読む（続けて始める点検の開始）ときだけ、`gate` まで待つ（その間に、同じサイトの別の設定を始める）。
+        if (path !== HOLDER_TARGET_PATH && entryStarted && gate !== null) {
+          await gate;
+        }
+        entryStarted ||= path !== HOLDER_TARGET_PATH;
+        return contextOf(path);
+      };
+      manager = createFakeWorkerJobManager({
+        database,
+        workDirectory,
+        worker,
+        resolveContext: resolver,
+        forkWorker: (modulePath, args, options) => {
+          forked += 1;
+          return forks.fork(forked === (gate === null ? 1 : 2) ? holding.path : modulePath, args, options);
+        },
+        machineMemory: () => ({ freeBytes: memory.freeBytes, totalBytes: 16 * GIB }),
+      });
+      return manager;
+    };
+
+    beforeEach(() => {
+      writeFileSync(join(workDirectory, HOLDER_TARGET_PATH), TARGET_CONFIG_TEXT, 'utf8');
+      expect(createProfile(database, publicProfile(PUBLIC_ID, MIN_PROFILE_REVISION, TEST_TARGET_PATH), { resolveContext }).ok).toBe(true);
+      expect(createProfile(database, publicProfile(HOLDER_ID, MIN_PROFILE_REVISION, HOLDER_TARGET_PATH), { resolveContext: () => CONTEXT }).ok).toBe(true);
+    });
+
+    it('starts the audit after the entry check without checking the free memory', async () => {
+      const memory = { freeBytes: 16 * GIB };
+      const jobManager = parallelManager('follow-up-memory', OTHER_SITE_CONTEXT, memory, null);
+      const holder = await jobManager.startAuditJob({ profileId: HOLDER_ID, expectedRevision: MIN_PROFILE_REVISION, startNew: true });
+      await waitForJob(currentManager, holder.ok ? holder.job.jobId : '', (job) => job.state === 'RUNNING');
+      const started = await jobManager.startEntryCheck({ profileId: PUBLIC_ID, expectedRevision: MIN_PROFILE_REVISION, thenStartAudit: true });
+      memory.freeBytes = 0;
+
+      expect(await waitForFollowUp(jobManager, started.ok ? started.job.jobId : '')).toMatchObject({ state: 'STARTED' });
+    });
+
+    it('keeps the reason when another profile of the same site started before the audit', async () => {
+      let open: () => void = () => undefined;
+      const gate = new Promise<void>((resolveGate) => {
+        open = resolveGate;
+      });
+      const jobManager = parallelManager('follow-up-same-site', CONTEXT, { freeBytes: 16 * GIB }, gate);
+      const started = await jobManager.startEntryCheck({ profileId: PUBLIC_ID, expectedRevision: MIN_PROFILE_REVISION, thenStartAudit: true });
+      await waitForJob(currentManager, started.ok ? started.job.jobId : '', isJobEnded);
+      const holder = await jobManager.startAuditJob({ profileId: HOLDER_ID, expectedRevision: MIN_PROFILE_REVISION, startNew: true });
+      expect(holder.ok).toBe(true);
+      open();
+
+      expect(await waitForFollowUp(jobManager, started.ok ? started.job.jobId : '')).toEqual({ state: 'SKIPPED', reason: 'SITE_ALREADY_ACTIVE' });
+    });
+  });
+
   it('has no follow up without the mark', async () => {
     const jobManager = await managerWith(entryCheckWorker('follow-up-none', documentFor()), 'follow-up-none');
     const started = await jobManager.startEntryCheck({ profileId: PROFILE_ID, expectedRevision: MIN_PROFILE_REVISION });

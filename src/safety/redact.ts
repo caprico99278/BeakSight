@@ -1,3 +1,4 @@
+import { measurementTagOf } from '../core/measurement-services.js';
 import { REDACTED } from '../core/redaction.js';
 import { asHttpSchemeUrl, redactServiceOriginUrl, redactUrlQueryValues } from '../core/url-redaction.js';
 import { canonicalizeAllowedOrigins, redactUrlCredentials } from '../crawl/normalize-url.js';
@@ -146,15 +147,38 @@ export const RECORDED_REQUEST_URL_LIST_NAMES = Object.freeze([
  * 止めた記録のうち、`events` に項目を持つ記録の名前（その `events` の項目の `url` を伏せる）。監査の段の除外の記録（`BlockedAuditExclusionsRecord`）と、BN-a の
  * 閉じる途中に止めた要求の記録（`BlockedClosingRequestsRecord`）。
  */
-const BLOCKED_EVENT_RECORD_NAMES: ReadonlySet<string> = new Set(['blockedAuditExclusions', 'blockedClosingRequests']);
+// DEF-298: frame の判定の失敗の記録（`frameClassificationFailures`。止めた移動の先の URL）も、同じ形の `events` を持つので加えた。
+const BLOCKED_EVENT_RECORD_NAMES: ReadonlySet<string> = new Set(['blockedAuditExclusions', 'blockedClosingRequests', 'frameClassificationFailures']);
 const BLOCKED_AUDIT_EXCLUSION_EVENTS_NAME = 'events';
 const RECORDED_REQUEST_URL_LISTS: ReadonlySet<string> = new Set(RECORDED_REQUEST_URL_LIST_NAMES);
+/**
+ * DEF-298: 同じ口のくり返しをまとめた記録の一覧（network の Evidence の `repeatedReads`）と、項目の中の代表の要求（`first`・`slowest`）の欄の名前。代表の
+ * `url` は、記録した要求の URL と同じ部品（`redactRecordedField`）で伏せ、伏せる前と後の組を値で照らす表に入れる。
+ */
+const REPEATED_READS_NAME = 'repeatedReads';
+const REPEATED_READ_SAMPLE_FIELDS: readonly string[] = Object.freeze(['first', 'slowest']);
+/**
+ * 設計者の判断（DEF-298 の続き）: performance の Evidence の LCP の値（`webVitals.LCP` と `lcpBeforeScroll`）の欄の名前と、その帰属（`attribution`）の資源の
+ * `url`。署名つきの配信の URL になりうるので、network に同じ URL がなくても、記録した要求の URL と同じ部品で伏せる。
+ */
+const LCP_VALUE_NAMES: ReadonlySet<string> = new Set(['LCP', 'lcpBeforeScroll']);
+const ATTRIBUTION_FIELD = 'attribution';
 
 /**
  * 記録した要求の URL の、query のすべての値・値に見える path の区切り・fragment の値・userinfo を伏せる（名前は残す。同じ値を 2 回通しても変わらない）。
+ * BS-1（設計書 `2026-11-19-beaksight-measurement-tag-inventory-design.md` 6 章）: 狭い例外を 1 つだけ置く。URL が計測サービスの閉じた一覧の行（ホスト・path・
+ * 識別子の欄の名前・識別子の形。owner は `src/core/measurement-services.ts` の `measurementTagOf`）に全部合うときだけ、その識別子の組（同じ名前・同じ値）を
+ * 伏せずに残す。userinfo のある URL には効かせない。ほかの query の値・path・fragment は今どおり伏せる。承認したサービスの Origin の URL は、書き手の
+ * 次の段（`redactUrlSecretsInValue` の `serviceOrigins`。例外を持たない `redactServiceOriginUrl`）で全部伏せる。
  */
 export function redactRecordedRequestUrl(url: string): string {
-  return redactServiceOriginUrl(redactUrlCredentials(url));
+  const withoutCredentials = redactUrlCredentials(url);
+  const tag = withoutCredentials === url ? measurementTagOf(url) : null;
+  const queryName = tag?.queryName ?? null;
+  return redactServiceOriginUrl(
+    withoutCredentials,
+    tag === null || queryName === null ? null : (name, value) => name === queryName && value === tag.tagId,
+  );
 }
 
 /**
@@ -300,6 +324,23 @@ const redactStructurally = (value: unknown, redactions: RecordedUrlRedactions): 
       const walked = redactStructurally(item, redactions) as Record<string, unknown>;
       const events = (item[BLOCKED_AUDIT_EXCLUSION_EVENTS_NAME] as unknown[]).map((entry) => redactRequestUrlItem(entry, redactions, true));
       return [name, { ...walked, [BLOCKED_AUDIT_EXCLUSION_EVENTS_NAME]: events }];
+    }
+    if (name === REPEATED_READS_NAME && Array.isArray(item)) {
+      return [name, item.map((entry: unknown) => {
+        const walked = redactStructurally(entry, redactions);
+        if (!isPlainObject(walked)) {
+          return walked;
+        }
+        const copy: Record<string, unknown> = { ...walked };
+        for (const field of REPEATED_READ_SAMPLE_FIELDS.filter((sample) => isPlainObject(walked[sample]))) {
+          copy[field] = redactNamedFields(walked[field], [URL_FIELD], redactions);
+        }
+        return copy;
+      })];
+    }
+    if (LCP_VALUE_NAMES.has(name) && isPlainObject(item) && isPlainObject(item[ATTRIBUTION_FIELD])) {
+      const walked = redactStructurally(item, redactions) as Record<string, unknown>;
+      return [name, { ...walked, [ATTRIBUTION_FIELD]: redactNamedFields(walked[ATTRIBUTION_FIELD], [URL_FIELD], redactions) }];
     }
     if (name === IMAGE_URL_LIST_NAME && Array.isArray(item)) {
       return [name, item.map((entry: unknown) => redactNamedFields(entry, IMAGE_URL_FIELDS, redactions))];
@@ -549,7 +590,9 @@ export interface RecordedRequestUrlRedactionOptions {
 
 /**
  * 値の木（JSON の値）の写しを作り、記録した要求の URL を伏せる（入力は変えない）。
- * - (a) 項目の名前で伏せる: 記録した要求の URL の一覧（`RECORDED_REQUEST_URL_LIST_NAMES` の名前の配列と、`blockedAuditExclusions.events`）の項目の `url`、
+ * - (a) 項目の名前で伏せる: 記録した要求の URL の一覧（`RECORDED_REQUEST_URL_LIST_NAMES` の名前の配列と、`blockedAuditExclusions`・`blockedClosingRequests`・
+ *   `frameClassificationFailures` の `events`）の項目の `url`、くり返しをまとめた記録（`repeatedReads`）の `first.url`・`slowest.url`（DEF-298）、
+ *   performance の LCP の帰属の `url`（`webVitals.LCP`・`lcpBeforeScroll` の `attribution.url`）、
  *   画像の記録の `src`・`resolvedUrl`、console の記録の `location.url`、ページの誤りの `stack` の中の URL、header の値の `location`・`content-location`・`refresh`。
  * - (b) 値で照らす（T44R の C-1）: (a) で伏せた値と、その path と query の形を、木の中のほかの文字列（Finding の本文、ほかの Evidence の欄など）でも、
  *   同じ規則で伏せた値に替える。T44R2 の I-1・I-2・I-3: 字句（URL の候補の区切りで分けたもの）がまるごと等しいときだけ替える（字句の中の、非 ASCII の

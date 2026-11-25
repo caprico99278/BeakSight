@@ -12,3 +12,18 @@ export function requestEndpointKeyOf(method: string | null, url: string): string
     return JSON.stringify([method, url.split(/[?#]/u)[0] ?? url]);
   }
 }
+
+/**
+ * QUIET-3: 口の鍵（`requestEndpointKeyOf` の形）から、メソッドと Origin と path を読む（鍵の形を知るのはこのファイルだけ）。解析できなかった URL の鍵・
+ * 形の違う文字は null。
+ */
+export function requestEndpointPartsOf(key: string): { readonly method: string; readonly origin: string; readonly pathname: string } | null {
+  try {
+    const parts: unknown = JSON.parse(key);
+    if (!Array.isArray(parts) || parts.length !== 3 || !parts.every((part) => typeof part === 'string')) return null;
+    const [method, origin, pathname] = parts as [string, string, string];
+    return { method, origin, pathname };
+  } catch {
+    return null;
+  }
+}

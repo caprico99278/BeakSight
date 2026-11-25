@@ -30,6 +30,7 @@ import {
   API_WRITE_SECRET_LIKE_KEY_WORDS,
   isSecretUrlQueryParameterName,
 } from '../core/secret-query-names.js';
+import { PLURAL_SUFFIX, separatedWordsOf, sequenceHasBoundedWord } from '../core/bounded-words.js';
 import { REDACTED } from '../core/redaction.js';
 import { compareCodeUnits, foldNfkcCase, stripCombiningMarks } from '../core/text.js';
 import { classifyUrl } from '../crawl/admission-policy.js';
@@ -91,18 +92,11 @@ const DELEGATION_LISTENER_KINDS: ReadonlySet<ListenerKind> = new Set<ListenerKin
 /** percent-encode を外す回数の上限（二重に encode した path に備える。外せない形は、そこで止める）。 */
 const MAX_PERCENT_DECODE_PASSES = 3;
 
-/** 英語の語の複数形として、語の境界の比べで同じとみなす接尾辞。 */
-const PLURAL_SUFFIX = 's';
-
 /** 区切り（文字と数字以外）を除いた形。 */
 const compactText = (folded: string): string => folded.replace(/[^\p{L}\p{N}]+/gu, '');
 
 /** camelCase の境（小文字か数字の後の大文字）に区切りを入れる（畳み込みの前に行う）。 */
 const splitCamelCase = (text: string): string => text.replace(/([\p{Ll}\p{N}])(\p{Lu})/gu, '$1 $2');
-
-/** 区切り（文字と数字以外）で分けた語の一覧（畳み込んだ形）。 */
-const separatedWordsOf = (text: string): readonly string[] =>
-  foldNfkcCase(text).split(/[^\p{L}\p{N}]+/u).filter((word) => word.length > 0);
 
 /** 語の境界で分けた語の一覧（畳み込んだ形）。camelCase の境で分けた語と、分けない語の両方（`addItem` の `add`、`GraphQL` の `graphql`）。 */
 const wordsOf = (text: string): readonly string[] => [...separatedWordsOf(splitCamelCase(text)), ...separatedWordsOf(text)];
@@ -273,11 +267,7 @@ export const textsHaveBoundedWord = (
       return [word, compactText(word)].some((form) => form.length > 0 && searched.some((text) => hasJapaneseWordWithoutSuffix(text, form, nounSuffixes)));
     }
     const parts = fieldNameWordsOf(word);
-    const last = parts.length - 1;
-    return parts.length > 0 && sequences.some((sequence) => sequence.some((_token, start) => parts.every((part, offset) => {
-      const token = sequence[start + offset];
-      return token === part || (offset === last && token === `${part}${PLURAL_SUFFIX}`);
-    }) && !asciiFollowerExclusions.includes(sequence[start + parts.length] ?? '')));
+    return sequences.some((sequence) => sequenceHasBoundedWord(sequence, parts, asciiFollowerExclusions));
   });
 };
 

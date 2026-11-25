@@ -88,6 +88,7 @@ export const BOTH_CHROMIUM_LEAK_CHECK_FILES: readonly string[] = Object.freeze([
   'tests/integration/api-write-submission.test.ts', // 2 回目・再送・中継へ直に送った分が届かない、Authorization と応答の本文が記録に出ない
   'tests/integration/write-stage-after-press-sends.test.ts', // 押した後の削除・書き換えた本文・READ_ONLY のページの送信が届かない
   'tests/integration/write-stage-context.test.ts', // 書き込みの段の許可が外へ漏れない、中継へ直に送った承認の形の POST が届かない
+  'tests/integration/wbf-nameless-field-write.test.ts', // 名前のない欄の位置がずれて別の欄に入った値の送信が届かない
   // ログイン・認証
   'tests/integration/spa-script-login-baseline.test.ts', // 登録のない RPC・token の更新・WebSocket・beacon が届かない
   'tests/integration/authenticated-context-factory.test.ts', // 別の Origin の Cookie が届かない、状態の読み取りで何も送らない
@@ -103,8 +104,11 @@ export const BOTH_CHROMIUM_LEAK_CHECK_FILES: readonly string[] = Object.freeze([
   'tests/integration/spa-audit-run.test.ts', // 読み取りでない要求（token の更新・計測・WebSocket）が届かない、秘密が成果物に出ない
   'tests/integration/audit-scope-move.test.ts', // REV-SD の I-1: 読み込みの後に範囲の外へ移った画面で押さず、押下の POST が外のサーバに届かない
   'tests/integration/spa-audit-revisit.test.ts', // 幅の走査の読み込み直しでサービスに何も届かない、秘密が成果物に出ない
+  'tests/integration/modal-open-state.test.ts', // AUD-2: 押した後に開いた小窓を読んでも、使い捨ての Context から読み込みのほかの要求が届かない
+  'tests/integration/focus-tab-guard.test.ts', // AUD-3: 通常の Tab の確かめの間にページが出す POST が、送信の扱いのまま記録され、読み込みが増えない
   'tests/integration/read-check-run.test.ts', // 読まないパス・危険な語・秘密の名前・送れない欄の READ と、凍結の後の読み込みが届かない
   'tests/integration/read-check-page.test.ts', // 登録していない手続きの呼び出しが届かない
+  'tests/integration/read-check-search-checks.test.ts', // RCA-7: 検索の確かめ（スクリプトの組の押下）で読み取りでない要求が届かない
   'tests/integration/job-audit-stage-review.test.ts', // probe の押下で書いた目印と読み取りでない要求が届かない
   'tests/integration/job-audit-stage-spa.test.ts', // 登録した呼び出しのほかの読み取りでない要求が届かない
   // 制御
@@ -123,6 +127,7 @@ export const BOTH_CHROMIUM_LEAK_CHECK_FILES: readonly string[] = Object.freeze([
   'tests/integration/discovery-token-refresh.test.ts', // 凍結の間、入力の値・危険な語・DELETE を運ぶ更新が届かない
   'tests/integration/discovery-token-refresh-disguise.test.ts', // 見せかけの token の更新が届かず、押下で書いた値が次の画面へ渡らない
   'tests/integration/discovery-run.test.ts', // 読み取りでない要求・読まないパス・ログインの画面・ページ自身の beacon と POST が届かず、秘密が成果物に出ない
+  'tests/integration/discovery-screen-watch.test.ts', // DEF-289: 動くボタンを force で押す・作り直された要素を押し直す・読み込み直して続きを押す間に、読み取りでない要求が届かない
   // SLIM-1（X3）: 部品の export（`probe-scene-site.ts` の `PROBE_SCENE_LAUNCHERS`、`isolated-interaction-cases.ts` の DEF-045 の組）を通して 2 つの Chromium で流していた
   'tests/integration/discovery-probe-scenes.test.ts', // 凍結の間、書き込み・削除・上書き・危険なパス・読まないパス・認証情報を含む URL が届かない
   'tests/integration/isolated-interaction-audit.test.ts', // 凍結の直後に閉じる途中の POST が届かない（DEF-045）
@@ -220,6 +225,7 @@ export const SLOW_CLI_CHROMIUM_LAUNCH_TEST_FILES: readonly string[] = Object.fre
   'tests/integration/discovery-coverage-safety.test.ts',
   'tests/integration/discovery-probe-scenes.test.ts',
   'tests/integration/discovery-run.test.ts',
+  'tests/integration/discovery-screen-watch.test.ts',
   'tests/integration/discovery-submission-probe.test.ts',
   'tests/integration/discovery-token-refresh-disguise.test.ts',
   'tests/integration/discovery-token-refresh.test.ts',
@@ -228,6 +234,7 @@ export const SLOW_CLI_CHROMIUM_LAUNCH_TEST_FILES: readonly string[] = Object.fre
   'tests/integration/element-path-engine-timing-cli.test.ts',
   'tests/integration/entry-check-run.test.ts',
   'tests/integration/external-launch-block.test.ts',
+  'tests/integration/focus-tab-guard.test.ts',
   'tests/integration/frozen-observation-context.test.ts',
   'tests/integration/gate-fixtures.test.ts',
   'tests/integration/guard-api-write-stage.test.ts',
@@ -254,12 +261,14 @@ export const SLOW_CLI_CHROMIUM_LAUNCH_TEST_FILES: readonly string[] = Object.fre
   'tests/integration/login-credential-capture.test.ts',
   'tests/integration/login-form-fields.test.ts',
   'tests/integration/login-observation-hostile.test.ts',
+  'tests/integration/modal-open-state.test.ts',
   'tests/integration/passive-request-guard-browser.test.ts',
   'tests/integration/preflight.test.ts',
   'tests/integration/preloading-disabled.test.ts',
   'tests/integration/public-audit-url-values-all-fields.test.ts',
   'tests/integration/read-check-page.test.ts',
   'tests/integration/read-check-run.test.ts',
+  'tests/integration/read-check-search-checks.test.ts',
   'tests/integration/resource-cache-truncated.test.ts',
   'tests/integration/resource-delivery.test.ts',
   'tests/integration/safety-gates.test.ts',
@@ -269,6 +278,7 @@ export const SLOW_CLI_CHROMIUM_LAUNCH_TEST_FILES: readonly string[] = Object.fre
   'tests/integration/spa-script-login-baseline.test.ts',
   'tests/integration/visible-pacing-wait-worker.test.ts',
   'tests/integration/visible-pacing-wait.test.ts',
+  'tests/integration/wbf-nameless-field-write.test.ts',
   'tests/integration/write-stage-after-press-sends.test.ts',
   'tests/integration/write-stage-context.test.ts',
   // RB-3: ずれの確かめの通り道ごとの代表（2 つの Chromium の組の入口を通す）。

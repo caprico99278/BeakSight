@@ -116,4 +116,14 @@ describe('SPEC-5: what counts as evidence of a press', () => {
     expect(evidence.changedFields).toEqual(['attributes']);
     expect(evidence.changedAttributes).toEqual(['aria-expanded']);
   });
+
+  it('AUD-2: counts a modal dialog that was not shown before the press, and not one that was already shown', () => {
+    const withModals = (beforeKeys: readonly string[], afterKeys: readonly string[]) => collectInteractionChangeEvidence(before, before, {
+      modalDialogs: { before: beforeKeys, after: afterKeys },
+    }).changedFields;
+
+    expect(withModals([], ['0/1/3'])).toEqual(['modalDialogOpened']);
+    expect(withModals(['0/1/3'], ['0/1/3'])).toEqual([]);
+    expect(withModals(['0/1/3'], [])).toEqual([]);
+  });
 });

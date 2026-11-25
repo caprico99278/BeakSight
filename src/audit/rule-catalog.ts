@@ -102,6 +102,20 @@ export const RULE_CATALOG: readonly AuditRule[] = freezeCatalog([
 ]);
 
 /**
+ * S-12（設計書 `doc/design/2026-11-19-beaksight-audit-result-review-fixes-design.md` 4.3）: 点検のための操作の記録（指摘ではない）の Rule の唯一の一覧。
+ * Finding の記録は残し、表示用モデルが、指摘の総数・重さごとの数・確かめ待ちの数から外して別に数える（表示面は数え直さない）。
+ */
+const OPERATION_RECORD_RULE_IDS: ReadonlySet<string> = new Set(['NOTIFICATION_HANDLED_BEFORE_AUDIT']);
+for (const ruleId of OPERATION_RECORD_RULE_IDS) {
+  if (ruleOfFindingRuleId(RULE_CATALOG, ruleId) === undefined) {
+    throw new Error(`operation record rule is not registered: ${ruleId}`);
+  }
+}
+
+/** S-12: Finding の ruleId が、点検のための操作の記録の Rule のものか。 */
+export const isOperationRecordRuleId = (ruleId: string): boolean => OPERATION_RECORD_RULE_IDS.has(ruleId);
+
+/**
  * OP-R2: Finding の ruleId を持つ page rule の、やさしい文（`AuditRule.plainMessage`）。どの page rule のものでもなければ `null`。Rule を評価しない。
  * 報告は、Cross-page rule とあわせて引く `rulePlainMessageOf`（`./cross-page-rules.ts`）を使う。
  */

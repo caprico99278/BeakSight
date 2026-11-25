@@ -5,6 +5,7 @@ import type {
   Severity,
 } from '../core/contracts.js';
 import type {
+  DuplicateIdEvidence,
   FormFieldEvidence,
   NetworkEvidence,
   NetworkRequestEvidence,
@@ -15,7 +16,8 @@ import { isGuardBlockedPageError } from '../core/guard-page-exceptions.js';
 import type { FindingFingerprintIdentityField } from '../core/ids.js';
 import { compareCodeUnits, normalizeWhitespace } from '../core/text.js';
 import { normalizeUrl } from '../crawl/normalize-url.js';
-import { listText } from '../presentation/messages.js';
+import { DUPLICATE_ELEMENT_ID_TEXT, listText } from '../presentation/messages.js';
+import { findingClassKeyOf } from './finding-grouping-keys.js';
 import { classifiedHttpErrorsOf, errorDisplayOfRecords } from './http-error-classes.js';
 import type { AuditRule, FindingDraft, PageRuleInput, RulePlainMessageOwner } from './rule.js';
 import {
@@ -59,6 +61,8 @@ interface Detection {
   readonly message: string;
   readonly evidenceRefs: readonly EvidenceId[];
   readonly identityFields: readonly FindingFingerprintIdentityField[];
+  /** RVP-5: fingerprint に入れない鍵（確信度を下げる区分の鍵など）。省略は、なし。 */
+  readonly linkKeys?: readonly FindingFingerprintIdentityField[];
 }
 
 interface TechnicalRuleSpec extends RulePlainMessageOwner {
@@ -83,6 +87,7 @@ const defineRule = (spec: TechnicalRuleSpec): AuditRule => ({
       message: detection.message,
       evidenceRefs: detection.evidenceRefs,
       identityFields: detection.identityFields,
+      ...(detection.linkKeys === undefined ? {} : { linkKeys: detection.linkKeys }),
     })),
 });
 
@@ -520,16 +525,22 @@ const DUPLICATE_ELEMENT_ID = defineRule({
   severity: 'WARN',
   plainMessage: 'ページの中で、部品につける名前が重なっています。読み上げのソフトやページの動きが、ちがう部品を指してしまうことがあります。',
   detect: (input) => {
-    const groups = new DetectionGroups<number>();
+    const groups = new DetectionGroups<DuplicateIdEvidence>();
     for (const record of evidenceOfType(input, 'dom')) {
       for (const duplicate of record.payload.duplicateIds) {
-        groups.add(duplicate.id, record.evidenceId, duplicate.count);
+        groups.add(duplicate.id, record.evidenceId, duplicate);
       }
     }
-    return groups.toDetections((id, counts) => ({
-      message: `同じ id「${id}」を持つ要素が ${Math.max(...counts)} 個あります。`,
-      identityFields: [{ name: 'elementId', value: id }],
-    }));
+    return groups.toDetections((id, duplicates) => {
+      // RVP-5: その id を参照する要素が、どの記録でも 0 なら、文にその事実を書き、確信度を下げる区分の鍵を付ける（前の版の記録は今どおり）。
+      const unreferenced = duplicates.every(({ referenceCount }) => referenceCount === 0);
+      return {
+        message: `同じ id「${id}」を持つ要素が ${Math.max(...duplicates.map(({ count }) => count))} 個あります。`
+          + (unreferenced ? DUPLICATE_ELEMENT_ID_TEXT.unreferencedNote : ''),
+        identityFields: [{ name: 'elementId', value: id }],
+        ...(unreferenced ? { linkKeys: [findingClassKeyOf('UNREFERENCED_ID')] } : {}),
+      };
+    });
   },
 });
 
@@ -570,7 +581,8 @@ const FORM_WITHOUT_ACTION = defineRule({
   ruleId: 'FORM_WITHOUT_ACTION',
   category: 'FORM',
   severity: 'INFO',
-  plainMessage: '入力の欄のまとまりに、送り先の指定がありません。送るボタンを押しても、思ったとおりに送られないことがあります。',
+  // AUD-6（S-09）: 事実の記録の文（送れるかは確かめていないので、送れないとは書かない）。
+  plainMessage: '入力の欄のまとまりに、送り先の指定がありません（事実の記録です。送るとどうなるかは確かめていません）。',
   detect: (input) => {
     const groups = new DetectionGroups<string>();
     for (const record of evidenceOfType(input, 'dom')) {

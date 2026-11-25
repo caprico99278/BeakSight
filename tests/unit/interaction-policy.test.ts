@@ -106,6 +106,8 @@ describe('classifyInteractionCandidate', () => {
     }, 'DOWNLOAD'],
     // SD-1（設計書 `2026-11-16-beaksight-action-based-delete-guard-design.md` 2.3）: 削除に関する操作は押さない（記録は除外した候補）。
     ['destructive actions', { destructiveAction: true }, 'DESTRUCTIVE_ACTION_SKIPPED'],
+    // AIW: 名前に AI の語があるボタンは押さない（サイトの AI の生成を起こさない）。
+    ['AI actions', { aiAction: true }, 'AI_ACTION_SKIPPED'],
     ['disabled controls', { disabled: true }, 'DISABLED'],
     ['non-visible controls', { visible: false }, 'NOT_VISIBLE'],
   ] as const)('rejects %s', (_label, overrides, reason) => {
@@ -222,6 +224,7 @@ describe('interactionRejectionLedgerRecord (M2)', () => {
     ['FORM_ASSOCIATED', 'EXCLUDED_CANDIDATE'],
     ['NAVIGATION_HREF', 'EXCLUDED_CANDIDATE'],
     ['DESTRUCTIVE_ACTION_SKIPPED', 'EXCLUDED_CANDIDATE'],
+    ['AI_ACTION_SKIPPED', 'EXCLUDED_CANDIDATE'],
     ['DISABLED', 'NONE'],
     ['NOT_VISIBLE', 'NONE'],
     ['MALFORMED_CANDIDATE', 'NONE'],

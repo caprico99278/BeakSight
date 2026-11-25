@@ -72,9 +72,20 @@ const INTERACTION_EVIDENCE_ATTRIBUTES: ReadonlySet<string> = Object.freeze(new S
 /** 中の名前ごとに比べる属性の名前（R6 の M-2。`src/interaction/discover-candidates.ts` も参照する）。 */
 export const CLASS_ATTRIBUTE_NAME = 'class';
 
+/**
+ * AUD-2（設計書 `2026-11-19-beaksight-audit-result-review-fixes-design.md` 5.3）: 押す前になかったモーダルの小窓が、押した後に見えるようになったことを表す、
+ * `changedFields` の値。
+ */
+export const MODAL_DIALOG_OPENED_CHANGED_FIELD = 'modalDialogOpened';
+
 export interface InteractionChangeEvidenceOptions {
   /** 候補の事実の外にある状態の変化。既定は、変化なし。 */
   readonly difference?: InteractionStateDifference;
+  /**
+   * AUD-2（5.3）: 押す前と押した後に見えていたモーダルの小窓の鍵（要素の位置。読み方は `readOpenModalDialogKeys`）。どちらかを読めなかったときは渡さない
+   * （根拠にしない）。
+   */
+  readonly modalDialogs?: { readonly before: readonly string[]; readonly after: readonly string[] };
 }
 
 /**
@@ -139,6 +150,10 @@ export function collectInteractionChangeEvidence(
   );
   if (changedAttributes.length > 0) {
     changedFields.push(TARGET_ATTRIBUTES_CHANGED_FIELD);
+  }
+  const modalDialogs = options.modalDialogs;
+  if (modalDialogs !== undefined && modalDialogs.after.some((key) => !modalDialogs.before.includes(key))) {
+    changedFields.push(MODAL_DIALOG_OPENED_CHANGED_FIELD);
   }
   return evidenceOf(before, after, changedFields, changedAttributes, detailsOpen);
 }

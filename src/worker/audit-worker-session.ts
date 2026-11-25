@@ -142,6 +142,7 @@ import {
   type WorkerStartMessage,
   type WorkerStartApiWrite,
   type WorkerStartReadCheck,
+  type WorkerStartSearchCheck,
   type WorkerStartWrite,
   type WorkerToParentMessage,
   type WorkerChainStageSequence,
@@ -534,6 +535,10 @@ const createDefaultRunCoordinator = (coordinatorDependencies: RunCoordinatorDepe
 const toWorkerProgress = (report: RunProgressReport): RunProgressReport => ({
   pagesFinished: report.pagesFinished,
   pagesDiscovered: report.pagesDiscovered,
+  // DSEED2: 連鎖の操作さがしだけが、見つけた画面の分け方を持つ（ないときは項目を置かない）。
+  ...(report.pagesDiscoveredSplit === undefined
+    ? {}
+    : { pagesDiscoveredSplit: { fromAuditStage: report.pagesDiscoveredSplit.fromAuditStage, newlyFound: report.pagesDiscoveredSplit.newlyFound } }),
   // L14 の後の段: ページの上限は、指定したときだけ持つ（項目を置かない）。
   ...(report.maxPages === undefined ? {} : { maxPages: report.maxPages }),
   elapsedMs: report.elapsedMs,
@@ -653,6 +658,9 @@ export const toReadCheckFinished = (
     readCheck: {
       checks: outcome.summary.checks,
       executed: outcome.summary.executed,
+      // RCA-5: 検索の確かめの組の数と誤りの数。
+      searchChecks: outcome.summary.searchChecks,
+      searchCheckErrors: outcome.summary.searchCheckErrors,
       // T37a: 監査の段の数（成果物にあるときだけ。成果物と同じ値）。
       ...(outcome.summary.authentication === undefined ? {} : { authentication: outcome.summary.authentication }),
       // DEF-144: 違反の中身（成果物にあるときだけ。成果物と同じ値）。
@@ -1327,6 +1335,9 @@ export function startAuditWorker(dependencies: AuditWorkerDependencies): AuditWo
     executeReadCheck: NonNullable<AuditWorkerDependencies['executeReadCheck']>,
     navigationPacer: NavigationPacer | undefined,
     stageCarry: RunStageCarry | undefined = undefined,
+    /** RCA-7: 検索の確かめの組と、REV-RCA の I-4: ログインし直す前に戻された組の鍵。 */
+    searchChecks: readonly WorkerStartSearchCheck[] = [],
+    bouncedSearchCheckKey: string | undefined = undefined,
   ): Promise<number> => {
     const outputDirectory = resolve(config.output.directory);
     const outcome = await executeReadCheck({
@@ -1334,6 +1345,8 @@ export function startAuditWorker(dependencies: AuditWorkerDependencies): AuditWo
       jobId,
       authentication,
       readChecks,
+      ...(searchChecks.length === 0 ? {} : { searchChecks }),
+      ...(bouncedSearchCheckKey === undefined ? {} : { bouncedSearchCheckKey }),
       launchBrowser: dependencies.runDependencies.launchBrowser,
       browserLease,
       clock: dependencies.runDependencies.clock,
@@ -1358,6 +1371,8 @@ export function startAuditWorker(dependencies: AuditWorkerDependencies): AuditWo
       onNotice: (notice) => sendChecked({ protocol: WORKER_PROTOCOL_VERSION, type: 'NOTICE', notice: toWorkerNotice(notice) }),
       // DEF-143: 成果物を組み立てて書く段に入る知らせ（監査と同じ口）。
       onFinalizing: sendRunFinalizing,
+      // RCA-7: 検索の確かめの進み具合（確かめた組 N / 全部の組 M）を、監査と同じ `PROGRESS` で送る（作業の画面に出る）。
+      onProgress: (report) => sendChecked({ protocol: WORKER_PROTOCOL_VERSION, type: 'PROGRESS', report: toWorkerProgress(report) }),
     });
     if (!failureReported) {
       sendChecked({
@@ -1550,7 +1565,10 @@ export function startAuditWorker(dependencies: AuditWorkerDependencies): AuditWo
           return;
         }
         authentication = relogged;
-        current = { kind: next.jobKind, jobId: next.jobId, readChecks: next.readChecks, write: undefined, relogin: next.count };
+        current = {
+          kind: next.jobKind, jobId: next.jobId, readChecks: next.readChecks, searchChecks: next.searchChecks, write: undefined, relogin: next.count,
+          bouncedSearchCheckKey: next.bouncedSearchCheckKey,
+        };
         continue;
       }
       // OP-2: 書き込みの段の指定は、`START` と同じ確かめ（承認したサービスの Origin を含む）を通ったときだけ使う。通らなければ親を信用しない。
@@ -1575,7 +1593,7 @@ export function startAuditWorker(dependencies: AuditWorkerDependencies): AuditWo
       if (carriedNavigation !== undefined) {
         stagePacer = nextStageNavigationPacerOf(carriedNavigation, config.crawl.minNavigationIntervalMs, dependencies.runDependencies.now, wait);
       }
-      current = { kind: next.jobKind, jobId: next.jobId, readChecks: next.readChecks, write: write ?? undefined };
+      current = { kind: next.jobKind, jobId: next.jobId, readChecks: next.readChecks, searchChecks: next.searchChecks, write: write ?? undefined };
       if (next.jobKind === fixedNext) {
         index += 1;
       }
@@ -1596,8 +1614,8 @@ export function startAuditWorker(dependencies: AuditWorkerDependencies): AuditWo
           discover(jobId, config, authentication, executeDiscovery, navigationPacer, stageCarry, chainedAuditRunDirectory, checkpoint, onRan),
       readCheck: executeReadCheck === undefined
         ? null
-        : (jobId, readChecks, config, authentication, navigationPacer, stageCarry) =>
-          readCheck(jobId, readChecks, config, authentication, executeReadCheck, navigationPacer, stageCarry),
+        : (jobId, readChecks, config, authentication, navigationPacer, stageCarry, searchChecks, bouncedSearchCheckKey) =>
+          readCheck(jobId, readChecks, config, authentication, executeReadCheck, navigationPacer, stageCarry, searchChecks, bouncedSearchCheckKey),
       // OP-2: 書き込みの段（今の書き込みの流れ。ログインの状態・pacer・1 分の窓は持ち越し。段ごとに確かめ直しの部品を作り直す）。
       write: executeWriteCreate === undefined
         ? null
@@ -1832,7 +1850,8 @@ export function startAuditWorker(dependencies: AuditWorkerDependencies): AuditWo
           exitWith(FAILURE_EXIT_CODE);
           return;
         }
-        exitWith(await readCheck(start.jobId, start.readChecks, config, authentication, dependencies.executeReadCheck, navigationPacer));
+        exitWith(await readCheck(start.jobId, start.readChecks, config, authentication, dependencies.executeReadCheck, navigationPacer, undefined,
+          start.searchChecks ?? []));
         return;
       }
       exitWith(await audit(auditRunOptionsOf(start), config, authentication, navigationPacer, (start.authentication?.automatedLogin ?? null) !== null));

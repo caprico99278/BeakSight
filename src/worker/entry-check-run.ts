@@ -229,7 +229,7 @@ export async function executeEntryCheckRun(request: EntryCheckRunRequest, observ
   const { config } = request;
   const outputDirectory = resolve(config.output.directory);
   const writer = new ArtifactWriter({ urlSecretRedaction: true });
-  const run = await startWorkerRun(outputDirectory, request.clock);
+  const run = await startWorkerRun(outputDirectory, config.target.id, request.clock);
   if (run.kind !== 'STARTED') {
     return run;
   }

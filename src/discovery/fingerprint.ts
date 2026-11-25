@@ -173,6 +173,43 @@ export const pageTemplatePathOf = (path: string): string | null => {
   return segments.map((segment) => (isRecordIdLikePathSegment(segment) ? PATH_TEMPLATE_ID_SEGMENT : segment)).join(PATH_SEPARATOR);
 };
 
+// ---------------------------------------------------------------------------------------------------------------
+// DUP（設計書 `2026-11-18-beaksight-same-structure-pages-design.md` 2 章、REV-DUP の I-2・I-3）: 同じ作りの画面の作りの鍵の、データを抜いた path と query。
+// `pageTemplatePathOf` のほかの使い手（操作さがし・状態の構造の鍵）の意味は変えない（この 2 つは DUP の作りの鍵だけが使う）。
+// ---------------------------------------------------------------------------------------------------------------
+
+/** DUP: 数字を含む、英数字（と `.`・`_`・`-`）の 3 文字以上の区切り（注文の番号 `ORD-00123`・`A0012`、日付 `2026-11-18`・`2026.11.18` など）。 */
+const NUMBERED_DATA_SEGMENT = /^(?=.*\d)[A-Za-z0-9._-]{3,}$/u;
+
+/** DUP: 値も鍵に入れる query の値（数字・`/`・`:` を含まない、`MAX_WORD_QUERY_VALUE_LENGTH` 文字までの語。例 `screen=A`・`tab=list`）。 */
+const WORD_QUERY_VALUE = /^[^\d/:]+$/u;
+/** DUP: 値も鍵に入れる query の値の長さの上限（文字。それより長い値は、データとして捨てる）。 */
+const MAX_WORD_QUERY_VALUE_LENGTH = 32;
+
+/** DUP: データに見える path の区切りか（番号・UUID（`isRecordIdLikePathSegment`）、日付、数字を含む英数字の番号）。 */
+export const isDataLikePathSegment = (segment: string): boolean => isRecordIdLikePathSegment(segment) || NUMBERED_DATA_SEGMENT.test(segment);
+
+/** DUP: データを抜いた path（データに見える区切りを、すべて `{id}` にする）。 */
+export const dataFreePathOf = (path: string): string =>
+  segmentsOf(path).map((segment) => (isDataLikePathSegment(segment) ? PATH_TEMPLATE_ID_SEGMENT : segment)).join(PATH_SEPARATOR);
+
+/** AUDR2: URL の、データを抜いた path（`dataFreePathOf`。解析できなければ `null`）。題名の重なりと、主要な行動の共通の枠の判定が使う。 */
+export const dataFreePathOfUrl = (url: string): string | null => {
+  try {
+    return dataFreePathOf(new URL(url).pathname);
+  } catch {
+    return null;
+  }
+};
+
+/**
+ * DUP: データを抜いた query の項目（名前の集合。値が語（`WORD_QUERY_VALUE`。`http` で始まるものを除く）なら `名前=値`）。番号・日付・URL や path の形の値
+ * （戻り先の `returnTo` など）は捨てる。並びは UTF-16 のコード単位の順。
+ */
+export const dataFreeQueryItemsOf = (params: URLSearchParams): readonly string[] => [...new Set([...params.entries()].map(([name, value]) =>
+  (value.length <= MAX_WORD_QUERY_VALUE_LENGTH && WORD_QUERY_VALUE.test(value) && !value.toLowerCase().startsWith('http') ? `${name}=${value}` : name)))]
+  .sort(compareCodeUnits);
+
 /** COV-2: 状態の型にした識別の digest の入力の形の印（版つき）。 */
 export const CANDIDATE_STATE_TEMPLATE_IDENTITY_DIGEST_FORMAT = 'beaksight-candidate-state-template-identity/1';
 

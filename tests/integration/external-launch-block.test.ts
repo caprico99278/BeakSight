@@ -9,6 +9,7 @@
 //
 // 厳守事項: Chromium は headless だけで起動する。外部スキームの宛先は、実在しないもの（`fixtures/external-scheme-targets.ts`）だけ。守りのない Context で
 // 移動させるのは、設定ありの CLI の Chromium の、登録のない独自のスキーム（`custom`）だけ（設定なしの Chromium に `mailto:` などを流さない。EL-0 の手違い）。
+// 例外（PRN）: 印刷の画面の場面だけは、設定ありの CLI の Chromium を headed で起動する（headless では印刷がもともと何もしないため）。外部スキームへは移らない。
 import { existsSync } from 'node:fs';
 import type { Browser, LaunchOptions, Page } from 'playwright';
 import { afterAll, beforeAll, describe, expect, it } from 'vitest';
@@ -450,6 +451,45 @@ describe('EL-F: the default Context of the launch component sends nothing', () =
     } finally {
       await browser.close();
       await target.close();
+    }
+  });
+});
+
+/**
+ * PRN: 起動の部品の一時のプロファイルの設定で、印刷を止める（headed でも印刷の画面を開かない）。印刷の画面が開くと、そのページへの操作は閉じるまで返らない。
+ * 押した後の 1 手と読み取りが、この窓の中で返ることを確かめる（直す前は返らなかった）。値は待ちの窓で、場面の時間の上限ではない。
+ */
+const PRINT_RESPONSE_WINDOW_MS = 2_000;
+/** 本体と iframe で `print()` を呼ぶボタン（押した後に、押したボタンの名前を書く）。 */
+const PRINT_PAGE = `<!doctype html><title>print</title><body>
+<button id="page" onclick="window.print(); document.body.dataset.done = 'page';">page</button>
+<button id="frame" onclick="const f = document.createElement('iframe'); document.body.append(f); f.contentWindow.print(); document.body.dataset.done = 'frame';">frame</button>
+</body>`;
+
+/** `call` が窓の中で返った値（返らなければ誤り）。 */
+const withinPrintWindow = <T>(call: Promise<T>): Promise<T> => Promise.race([
+  call,
+  wait(PRINT_RESPONSE_WINDOW_MS).then(() => { throw new Error(`no response within ${String(PRINT_RESPONSE_WINDOW_MS)} ms (a print dialog is open)`); }),
+]);
+
+describe('PRN: the launch component opens no print dialog', () => {
+  it('returns the click and the next page read right after print() in the page and in an iframe (headed)', async () => {
+    const site = await startLoopbackHttpServer((_request, response) => {
+      response.setHeader('content-type', 'text/html; charset=utf-8');
+      response.end(PRINT_PAGE);
+    });
+    const options = chromiumLaunchOptions({ headless: false });
+    const browser = await launchChromiumWith({ ...options, args: [...withTestOnlyNoInternetArgs(options.args ?? [])] });
+    try {
+      const page = await (await browser.newContext()).newPage();
+      await page.goto(`${site.origin}/`);
+      for (const id of ['page', 'frame']) {
+        await withinPrintWindow(page.locator(`#${id}`).click({ noWaitAfter: true, timeout: PRINT_RESPONSE_WINDOW_MS }));
+        await expect(withinPrintWindow(page.evaluate(() => document.body.dataset['done']))).resolves.toBe(id);
+      }
+    } finally {
+      await browser.close();
+      await site.close();
     }
   });
 });

@@ -249,8 +249,8 @@ describe('T38b: the draft of an API scenario', () => {
   });
 
   it('has the reasons of an API draft at the end of the closed list', () => {
-    // ARR-2: 一覧の最後に、一覧の鍵の 4 つを足した（`def-226-array-key-approval.test.ts`）。ARR-3: さらに 1 つ（`arr-3-array-rows.test.ts`）。ARR-5: さらに 2 つ。ARR-5 fix round 1: さらに 2 つ。
-    expect(SCENARIO_DRAFT_REJECTION_REASONS.slice(-26, -9)).toEqual([
+    // ARR-2: 一覧の最後に、一覧の鍵の 4 つを足した（`def-226-array-key-approval.test.ts`）。ARR-3: さらに 1 つ（`arr-3-array-rows.test.ts`）。ARR-5: さらに 2 つ。ARR-5 fix round 1: さらに 2 つ。WBF: さらに 1 つ。
+    expect(SCENARIO_DRAFT_REJECTION_REASONS.slice(-27, -10)).toEqual([
       'SCENARIO_API_CANDIDATE_NOT_API',
       'SCENARIO_API_STATE_KEY',
       'SCENARIO_API_METHOD_OVERRIDE',

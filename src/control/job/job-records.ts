@@ -52,7 +52,7 @@ export type AuditJobKind = WorkerJobKind;
  */
 export { AUDIT_JOB_STATES, FAILED_AUDIT_JOB_STATE, FINISHED_AUDIT_JOB_STATE, STOPPING_AUDIT_JOB_STATE, type AuditJobState };
 
-/** 終わっていないジョブの状態（同時に 1 つだけ。この状態の行は、全体で 1 行まで）。 */
+/** 終わっていないジョブの状態（PAR-b からプロファイルごとに同時に 1 つだけ。この状態の行は、プロファイルごとに 1 行まで）。 */
 export const ACTIVE_AUDIT_JOB_STATES = Object.freeze(['STARTING', 'RUNNING', 'STOPPING'] as const satisfies readonly AuditJobState[]);
 export type ActiveAuditJobState = (typeof ACTIVE_AUDIT_JOB_STATES)[number];
 

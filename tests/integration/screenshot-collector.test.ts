@@ -63,14 +63,15 @@ describe('captureScreenshots', () => {
       const fullPagePng = await readFile(fullPageOutputPath);
       expect(pngDimensions(viewportPng)).toEqual({ width: 320, height: 240 });
       expect(pngDimensions(fullPagePng)).toEqual({ width: 320, height: 700 });
+      // AUD-4: viewport の画像は、状態の印（`stateMark`）も持つ（中身は state-mark の結合のテストで確かめる）。
       expect(evidence).toEqual([
-        {
+        expect.objectContaining({
           pageId,
           viewport: 'desktop',
           relativePath: 'screenshots/PAGE-000010/desktop/viewport.png',
           captureType: 'VIEWPORT',
           scrollPosition: { scrollX: 0, scrollY: 0 },
-        },
+        }),
         {
           pageId,
           viewport: 'desktop',

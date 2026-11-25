@@ -68,6 +68,21 @@ const PAGES: Readonly<Record<string, string>> = Object.freeze({
     + '<span style="display: inline-block; width: 1500px">x</span><a id="t" href="#y">奥のリンク</a></div></body></html>',
   '/hidden-carousel': `${head}<body style="margin: 0"><div id="c" style="width: 600px; overflow: hidden; white-space: nowrap">`
     + '<span style="display: inline-block; width: 1500px">x</span><a id="t" href="#y">奥のリンク</a></div></body></html>',
+  // TII: 高さ 0 の overflow: hidden の箱の、10 段下にある重なり（切り取りの祖先は段数で打ち切らない）。
+  '/deep-clipped-overlap': `${head}<body style="margin: 0"><div style="overflow: hidden; height: 0">${'<div>'.repeat(10)}`
+    + '<button id="b" style="display: block; width: 200px; height: 60px">申し込む</button>'
+    + `<img id="i" alt="" style="display: block; margin-top: -50px; width: 160px; height: 40px; background: #c33">${'</div>'.repeat(10)}</div></body></html>`,
+  // AUD-5（S-02）: 画像の上の位置指定の入れ物に置いた編集のボタン（中にアイコン）と入力欄、画像のない所で重なる 2 つのボタン。
+  '/photo-edit-buttons': `${head}<body style="margin: 0">`
+    + '<div style="position: relative; width: 300px; height: 200px"><img id="photo" alt="" style="display: block; width: 300px; height: 200px; background: #ccc">'
+    + '<div style="position: absolute; top: 8px; right: 8px">'
+    + ['crop', 'swap', 'del'].map((id) => `<button id="${id}" style="display: block; width: 40px; height: 40px; padding: 0">`
+      + '<svg width="24" height="24" style="display: block; margin: 8px"><rect width="24" height="24"></rect></svg></button>').join('')
+    + '</div></div>'
+    + '<div style="position: relative; width: 300px; height: 200px"><img id="photo2" alt="" style="display: block; width: 300px; height: 200px; background: #ccc">'
+    + '<div style="position: absolute; top: 8px; left: 8px"><input id="cap" style="display: block; width: 200px; height: 30px"></div></div>'
+    + '<button id="b1" style="display: block; width: 120px; height: 40px">一</button>'
+    + '<button id="b2" style="display: block; width: 120px; height: 40px; margin-top: -30px">二</button></body></html>',
   // 先頭の小さな見出しと、ずっと下の大きな塊（スクロールで描かれる）。
   '/lcp': `${head}<body style="margin: 0"><h1 id="top" style="font-size: 16px">見出し</h1><div style="height: 4000px"></div>`
     + '<div id="big" style="width: 1200px; height: 700px; background: #369; color: #fff; font-size: 200px">大きな塊</div></body></html>',
@@ -155,6 +170,11 @@ describe('EV-1: the judgements that do not add a load', () => {
     expect(await layoutDraftsOn('/overlap-pe-none', 'ELEMENT_OVERLAP')).toHaveLength(1);
   });
 
+  // TII: 切り取りの祖先の決まりは、layout と、対象まで動かして撮る部品の 1 か所（段数で打ち切らない）。
+  it('does not report an overlap that an overflow box far above the elements cuts off', async () => {
+    expect(await layoutDraftsOn('/deep-clipped-overlap', 'ELEMENT_OVERLAP')).toEqual([]);
+  });
+
   // REV-SD2 の M-2・M-3: smooth のスクロールは落ち着いてから読み、overflow: hidden の並びも、動いた位置を元へ戻す。
   it.each(['/smooth-carousel', '/hidden-carousel'])('reads the link in %s after the scroll settles, and restores the scroll', async (path) => {
     const { evidence, scrollLeft } = await onPage(path, async (page) => {
@@ -187,6 +207,16 @@ describe('EV-1: the judgements that do not add a load', () => {
     // EV-3: 文書の範囲の外と大きさ 0 の表示は数えない。
     const outside = await onPage('/loading-offscreen', (page) => collectDomEvidence(page, createPageId(1)));
     expect(outside.loadingIndicators).toEqual({ ariaBusyCount: 0, progressbarCount: 0, indeterminateProgressCount: 0 });
+  });
+
+  // AUD-5（S-02）: 画像の上に意図して置いた押せる部品は区分を付けて 1 件にまとめ、入力欄・押せる部品どうしの重なりは今どおり。
+  it('marks the buttons placed over a photo as an intended placement, one per button, and keeps the other overlaps as they are', async () => {
+    const drafts = await layoutDraftsOn('/photo-edit-buttons', 'ELEMENT_OVERLAP');
+    const classOf = (draft: FindingDraft): string | null => draft.linkKeys?.find(({ name }) => name === 'findingClass')?.value ?? null;
+    const selectorsOf = (draft: FindingDraft): string[] => draft.identityFields.map(({ value }) => value);
+    const intended = drafts.filter((draft) => classOf(draft) === 'INTENDED_PLACEMENT');
+    expect(intended.map((draft) => selectorsOf(draft).find((value) => value !== '#photo')).sort()).toEqual(['#crop', '#del', '#swap']);
+    expect(drafts.filter((draft) => classOf(draft) === null).map(selectorsOf).sort()).toEqual([['#b1', '#b2'], ['#cap', '#photo2']]);
   });
 
   it('reads the LCP before the scroll', async () => {

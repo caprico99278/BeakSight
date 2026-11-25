@@ -176,7 +176,8 @@ export interface BrowserContextFactoryOptions {
   /**
    * AS-a（設計書 `2026-10-19-beaksight-audit-send-policy-design.md` 2.2）: 監査の段の送信の扱い `PASS_EXCEPT_DELETE` の指定（`GuardAuditSend`。設定から作って渡すのは
    * AS-b）。渡すと、Passive の Context（`createPassiveContext`。役割によらない）の Guard と中継の要求の方針に渡す（今の `auditStage` などと同じ道）。ログインの段・
-   * 書き込みの段の Context と、Isolated Interaction Context（`createInteractionSession`）には渡さない（今のまま読み取りだけ）。形が違えば `TypeError`。
+   * 書き込みの段の Context には渡さない（今のまま読み取りだけ）。RB-4b（設計者の判断 2026-11-15）: Isolated Interaction Context（`createInteractionSession`）は、
+   * 押す前の段だけ、Guard の送信の扱いの口にこの指定を渡して通す（サービスの Origin へ送るか・届け方・中継の方針は渡さず、押した後は今どおり凍結する）。形が違えば `TypeError`。
    * 省略すると、今と同じ（読み取りだけ。`READ_ONLY`）。
    */
   readonly auditSend?: GuardAuditSend | undefined;
@@ -839,8 +840,9 @@ function egressReadAdmissionKeyOf(method: string, url: string): string | null {
 /**
  * T44b（Task 44 の設計書 3.1 の P1-1）: その Context が、スクリプトで送るログインの監査の段で承認したサービスの Origin へ送るか（Guard の口の
  * `readRequestsAllowed` と、中継の口の写し）。最初の読み込み（`PRIMARY`）と、監査の段の送信の扱い `PASS_EXCEPT_DELETE` の Context（幅の走査の `REVISIT` を
- * 含む。`auditSend` を渡すのは Passive の Context だけ）。送る要求は、どの役割でも上限の部品（`service-request-budget`）で数える。`READ_ONLY` の幅の走査と、
- * Isolated Interaction Context（`auditSend` を渡さない）は、今どおり送らない（T35R-fix の C-1）。
+ * 含む。この引数の `auditSend` を渡すのは Passive の Context だけ）。送る要求は、どの役割でも上限の部品（`service-request-budget`）で数える。`READ_ONLY` の幅の走査と、
+ * Isolated Interaction Context は、今どおり送らない（T35R-fix の C-1）。RB-4b: Isolated Interaction Context は、押す前の段の Guard の送信の扱いの口だけに指定を
+ * 受け取るが、この引数には渡さない（承認したサービスの Origin へは送らない）。
  */
 const servesServiceOrigin = (role: ResourceDeliveryRole, auditSend: GuardAuditSend | undefined): boolean =>
   role === 'PRIMARY' || auditSend !== undefined;

@@ -119,7 +119,7 @@ export const SPA_REAL_ENV_SHAPE_OPTIONS: SpaAuthSiteOptions = Object.freeze({
 /**
  * T44c: 実テスト環境の形の SPA の、probe の正解（fixture の作りから決めた数。更新の画面ごと）。COV-1（網羅の設計書 3.3）: 押す数の上限（前は 1 画面 3 回）を
  * 外したので、見えるボタンは全部押す。
- * - 見えないボタン（`SPA_HIDDEN_PRESS_TARGET_WORDS`）は押さない（`TARGET_NOT_FOUND`）。
+ * - 見えないボタン（`SPA_HIDDEN_PRESS_TARGET_WORDS`）は押さない（DEF-295 から `TARGET_NOT_VISIBLE`）。
  * - 押すのは、保存（`API_UPDATE`）と、道具のボタンの全部と、文字のないボタンの全部（`NO_REQUEST`）。上限で押せなかった候補（`PRESS_LIMIT_REACHED`）はない。
  */
 export const SPA_REAL_ENV_EXPECTED_EDIT_SCREEN_PROBES = Object.freeze({

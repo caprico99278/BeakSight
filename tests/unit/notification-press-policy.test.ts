@@ -30,6 +30,31 @@ describe('REV-EV4: the key press period on a scrollable region', () => {
     expect(reasonOf(classifyPassiveRequest(facts('GET', `${ORIGIN}/frame`, { isNavigationRequest: true, isMainFrame: false }), ALLOWED, policy))).toBe('ALLOW');
     expect(reasonOf(classifyPassiveRequest(facts('POST', `${ORIGIN}/api/mark`), ALLOWED, policy))).toBe('ALLOW');
   });
+
+  it('FRET: in the press period of a window button, also stops every non-read request of any frame, and lets the reads go', () => {
+    const policy: PassiveRequestPolicyOptions = { auditSend, scrollKeyPress: 'DIALOG_PRESS' };
+    expect(reasonOf(classifyPassiveRequest(facts('DELETE', `${ORIGIN}/api/items/1`, { isMainFrame: true }), ALLOWED, policy))).toBe(SCROLL_KEY_PRESS_BLOCK_REASON);
+    expect(reasonOf(classifyPassiveRequest(facts('POST', `${ORIGIN}/api/frame-post`, { isNavigationRequest: true }), ALLOWED, policy))).toBe(SCROLL_KEY_PRESS_BLOCK_REASON);
+    expect(reasonOf(classifyPassiveRequest(facts('POST', `${OTHER}/beacon`), ALLOWED, policy))).toBe(SCROLL_KEY_PRESS_BLOCK_REASON);
+    expect(reasonOf(classifyPassiveRequest(facts('GET', `${ORIGIN}/api/list`), ALLOWED, policy))).toBe('ALLOW');
+  });
+
+  it('FRET fix round 3: in the press period, also stops a new WebSocket and the reads of a logout or delete path', () => {
+    const policy: PassiveRequestPolicyOptions = { auditSend: { ...auditSend, webSockets: true }, scrollKeyPress: 'DIALOG_PRESS' };
+    // FRETWS（設計書 `2026-11-25-beaksight-discovery-sibling-press-design.md` 2.2）: 押す期間に止めた接続は、押下の記録の理由（普通の止めと分ける）。
+    expect(reasonOf(classifyPassiveRequest({ kind: 'WEBSOCKET', url: 'ws://127.0.0.1:8100/ws' }, ALLOWED, policy))).toBe(SCROLL_KEY_PRESS_BLOCK_REASON);
+    expect(reasonOf(classifyPassiveRequest(facts('GET', `${ORIGIN}/logout`), ALLOWED, policy))).toBe(SCROLL_KEY_PRESS_BLOCK_REASON);
+    expect(reasonOf(classifyPassiveRequest(facts('GET', `${ORIGIN}/api/items/1/delete`, { isNavigationRequest: true }), ALLOWED, policy)))
+      .toBe(SCROLL_KEY_PRESS_BLOCK_REASON);
+    // fix round 4: 操作の前の判定と同じ語（日本語・ログアウトの語を含む）を、符号化を解いてから当てる。案内の語の続く名詞は通す。
+    const stopped = ['/api/items/1/Delete', '/api/items/1/de%6Cete', '/api/x?op=remove', '/api/%E5%89%8A%E9%99%A4/1', '/account/unsubscribe',
+      '/api/items/1/purge', '/api/items/1/archive', '/session/%E3%83%AD%E3%82%B0%E3%82%A2%E3%82%A6%E3%83%88', '/api/x?q=del%2565te', '/api/items/1/_delete',
+      '/api/LogOut', '/api/x?redirect=%2Flogout', '/api/items/1/trash', '/api/items/1/reset'];
+    expect(stopped.filter((path) => reasonOf(classifyPassiveRequest(facts('GET', `${ORIGIN}${path}`), ALLOWED, policy)) !== SCROLL_KEY_PRESS_BLOCK_REASON)).toEqual([]);
+    expect(reasonOf(classifyPassiveRequest(facts('GET', `${ORIGIN}/api/items/1/deletion/faq`), ALLOWED, policy))).toBe('ALLOW');
+    // 押す期間の外（キーの押下の期間だけ）は、WebSocket を今の判定のまま通す。
+    expect(reasonOf(classifyPassiveRequest({ kind: 'WEBSOCKET', url: 'ws://127.0.0.1:8100/ws' }, ALLOWED, { ...policy, scrollKeyPress: true }))).toBe('ALLOW');
+  });
 });
 
 describe('the close press period of a notification frame', () => {

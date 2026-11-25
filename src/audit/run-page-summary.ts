@@ -14,7 +14,7 @@ import { crossPagePageFactsOf, type CrossPagePageFacts } from './cross-page-rule
  * - `evidence`: Interaction の Evidence だけ（Interaction の結果の数え上げ `countInteractionOutcomes` が読む）。
  * - `crossPage`: Cross-page rule の材料（`crossPagePageFactsOf`）。
  */
-export interface RunPageSummary extends Pick<PageAuditResult, 'pageId' | 'pageUrl' | 'status' | 'incompleteReasons' | 'viewports' | 'findings'> {
+export interface RunPageSummary extends Pick<PageAuditResult, 'pageId' | 'pageUrl' | 'status' | 'incompleteReasons' | 'viewports' | 'findings' | 'sameness'> {
   readonly evidence: readonly EvidenceRecordFor<'interaction'>[];
   /**
    * Cross-page rule の材料。取り出しが例外を投げた（壊れた Evidence）ときは、その例外（`failure`）を持つ。例外は、Run の終わりの Cross-page rule の段で
@@ -45,6 +45,8 @@ export function runPageSummaryOf(page: PageAuditResult): RunPageSummary {
     findings: page.findings,
     evidence: page.evidence.filter(isInteractionRecord),
     crossPage: crossPageOf(page),
+    // DUP: 軽い点検にしたか、点検を省いたページの記録（`run.json` の数に使う）。
+    ...(page.sameness === undefined ? {} : { sameness: page.sameness }),
   };
 }
 

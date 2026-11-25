@@ -64,6 +64,21 @@
               "ordinal": { "type": "integer", "minimum": 0 }
             }
           }
+        },
+        "pageReferences": {
+          "description": "DUP (doc/design/2026-11-18-beaksight-same-structure-pages-design.md): the audited pages by template key and content digest (the first FULL page of a template is the fully audited first page; a LIGHT page is only a page of the same content). Kept after a resume. An earlier checkpoint has none (read as empty).",
+          "type": "array",
+          "items": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["templateKey", "pageId", "depth", "contentDigest"],
+            "properties": {
+              "templateKey": { "type": "string", "pattern": "^sha256:[0-9a-f]{64}$" },
+              "pageId": { "type": "string", "pattern": "^PAGE-[0-9]{6,}$" },
+              "depth": { "enum": ["FULL", "LIGHT"] },
+              "contentDigest": { "type": ["string", "null"], "pattern": "^sha256:[0-9a-f]{64}$" }
+            }
+          }
         }
       }
     },
@@ -310,6 +325,7 @@
         "blockedClosingRequests": { "$ref": "urn:beaksight:schema:page:1.0#/$defs/blockedClosingRequests" },
         "frameClassificationFailures": { "$ref": "urn:beaksight:schema:page:1.0#/$defs/frameClassificationFailures" },
         "readNavigationFailures": { "$ref": "urn:beaksight:schema:page:1.0#/$defs/readNavigationFailures" },
+        "detachedTargetContinues": { "$ref": "urn:beaksight:schema:page:1.0#/$defs/detachedTargetContinues" },
         "invariantViolations": { "$ref": "urn:beaksight:schema:run:1.0#/properties/safety/properties/invariantViolations" },
         "invariantViolationCount": {
           "$ref": "urn:beaksight:schema:run:1.0#/properties/safety/properties/invariantViolationCount"

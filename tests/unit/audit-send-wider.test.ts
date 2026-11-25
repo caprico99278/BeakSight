@@ -193,6 +193,22 @@ describe('AS-c: the Safety Ledger records of the wider passes', () => {
     expect(JSON.stringify(ledger.snapshot())).not.toContain(MARKER);
   });
 
+  it('FRET fix round 4: counts the passed requests in the leave steps of a page where a window button was pressed', () => {
+    const ledger = new SafetyLedger();
+    ledger.recordPassedAuditSendRequest({ method: 'POST', url: `${APP_ORIGIN}/api/save`, otherOrigin: false });
+    expect(ledger.snapshot().passedAuditSendRequests?.afterDialogPressLeave).toBeUndefined();
+    ledger.recordPassedAuditSendRequest({ method: 'DELETE', url: `${APP_ORIGIN}/api/lock`, otherOrigin: false, afterDialogPressLeave: true });
+    expect(ledger.snapshot().passedAuditSendRequests).toMatchObject({ count: 2, afterDialogPressLeave: 1 });
+  });
+
+  it('FRET fix round 5: counts the frames that an earlier connection sent after the press, in the passed WebSocket record', () => {
+    const ledger = new SafetyLedger();
+    ledger.recordPassedAuditSendWebSocket({ url: 'ws://127.0.0.1:9/socket' });
+    expect(ledger.snapshot().passedAuditSendWebSockets?.framesAfterDialogPress).toBeUndefined();
+    ledger.recordWebSocketFrameAfterDialogPress();
+    expect(ledger.snapshot().passedAuditSendWebSockets?.framesAfterDialogPress).toBe(1);
+  });
+
   it('records the shape of the passed WebSocket connections (Origin, path, count) without the query, and puts it in the Evidence', () => {
     const ledger = new SafetyLedger();
     expect(ledger.snapshot().passedAuditSendWebSockets).toBeUndefined();

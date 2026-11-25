@@ -82,6 +82,12 @@ describe('discoverLinks（分けて集める）', () => {
   });
 });
 
+/** DUP: 記録に残る欄（ページの中から受け取る表示の値を除いたもの）。 */
+const recorded = (raw: object): object => {
+  const { shownValue: _shownValue, ...rest } = raw as { readonly shownValue?: unknown };
+  return rest;
+};
+
 /** 偽のページの DOM の事実（全体）。偽のページが、続きの位置の部分を切り出して返す。 */
 const domFacts = (() => {
   const headings: HeadingEvidence[] = Array.from({ length: DOM_COLLECTION_PART_SIZE * 2 + 1 }, (_value, index) => ({ level: 2, text: `H${index}`, truncated: false }));
@@ -90,6 +96,8 @@ const domFacts = (() => {
   }));
   const field = (index: number) => ({
     type: 'text', name: `f${index}`, required: false, visible: true, labels: [], hasAriaLabel: false, hasAriaLabelledby: false, hasTitle: false, truncated: false,
+    // DUP: ページの中から受け取る表示の値（記録には残さない）。
+    shownValue: null,
   });
   const forms: FormDomEvidence[] = Array.from({ length: 3 }, (_value, index) => ({
     method: 'get',
@@ -139,9 +147,9 @@ describe('collectDomEvidence（分けて集める）', () => {
     expect(calls).toHaveLength(4);
     expect(evidence.headings).toEqual(domFacts.headings);
     expect(evidence.images).toEqual(domFacts.images);
-    expect(evidence.forms).toEqual(domFacts.forms);
+    expect(evidence.forms).toEqual(domFacts.forms.map((form) => ({ ...form, fields: form.fields.map(recorded) })));
     expect(evidence.forms[0]?.fields).toHaveLength(250);
-    expect(evidence.unassociatedFields).toEqual(domFacts.unassociatedFields);
+    expect(evidence.unassociatedFields).toEqual(domFacts.unassociatedFields.map(recorded));
     expect(evidence.duplicateIds).toEqual(domFacts.duplicateIds);
     expect(evidence.visibleText.regions).toEqual(domFacts.regions);
     expect(evidence.visibleText.text).toBe(domFacts.text);

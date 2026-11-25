@@ -137,6 +137,25 @@ export const DESTRUCTIVE_ACTION_EXTRA_WORDS = Object.freeze([
 ] as const);
 
 /**
+ * AIW（ユーザーの判断 2026-11-20）: 操作の前の判定（`src/discovery/destructive-action.ts` の `isAiAction`）が、押す要素の名前に当てる AI の語。押すとサイトの
+ * AI の生成を起こしうるので押さない。英語の語は語の境界つき（MAIL・DETAIL の中の ai には当てない）。全角の ＡＩ は比べる前の畳み込み（NFKC）で ai になる。
+ * 「生成」などの広い語は入れない（QR コードの生成・報告の生成を押せなくなる）。キラキラの絵文字（✨）も名前の印にする。
+ */
+export const AI_ACTION_WORDS = Object.freeze(['ai', '人工知能', '✨'] as const);
+
+/** AIW の 2: ボタンの中のアイコン（svg などの class・data 属性・aria-label）のキラキラの印の語（よくある部品の名前）。 */
+export const AI_ICON_WORDS = Object.freeze(['sparkle', 'sparkles', 'magic', 'wand'] as const);
+
+/** AIW の 3: AI の枠（ボタンの入った枠の見出しかラベル）の語（AI の語と、自動で作る語）。 */
+export const AI_REGION_WORDS = Object.freeze([...AI_ACTION_WORDS, '自動作成', '自動生成'] as const);
+
+/** AIW の 3: AI の枠の中で押さないボタンの語（枠の中でも、保存・閉じる・キャンセル・タブの切り替えなどは押す）。 */
+export const AI_REGION_RUN_WORDS = Object.freeze(['生成', '作成', '実行'] as const);
+
+/** AIW の 4: 押下で出た送信の行き先の path の区切りの AI の語（語の境界つき）。 */
+export const AI_REQUEST_PATH_WORDS = Object.freeze(['ai', 'generate', 'generation', 'assist', 'completion', 'completions', 'llm', 'coach'] as const);
+
+/**
  * REV-SD の M-2（設計者の判断 2026-11-16）: リンクの文字に当てる日本語の動きの語（英語は、巡回の URL と同じ狭い一覧）。アーカイブ・ゴミ箱・キャンセルのような
  * 名詞は入れない（読むだけの一覧の画面へのリンクが多いため）。
  */

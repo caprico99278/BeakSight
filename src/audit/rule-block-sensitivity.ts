@@ -151,6 +151,10 @@ export const RULE_BLOCK_SENSITIVITIES: readonly RuleBlockSensitivityEntry[] = Ob
   row({ ruleId: 'COLOR_CONTRAST_VIOLATION' }, DISPLAYED_ELEMENT),
   // AUD-4d: フォーカスで現れるかは、描かれた要素（スタイルとスクリプトの遮断で変わりうる）の事実。
   row({ ruleId: 'FOCUSED_CONTROL_HIDDEN' }, DISPLAYED_ELEMENT),
+  // FRET: 窓を開くボタンと窓は、描かれた要素とページの JS（スタイルとスクリプトの遮断で変わりうる）の事実。
+  row({ ruleId: 'DIALOG_FOCUS_NOT_RETURNED' }, DISPLAYED_ELEMENT),
+  row({ ruleId: 'DIALOG_FOCUS_NOT_MOVED' }, DISPLAYED_ELEMENT),
+  row({ ruleId: 'DIALOG_NOT_CLOSABLE_BY_KEYBOARD' }, DISPLAYED_ELEMENT),
   // axe の Rule のうち、意味の上で欠けの指摘のもの（題・lang・main の目印・最上位の見出し・繰り返しを飛ばす手段の欠け）は、`MISSING_TITLE` などと同じ欠けの
   // 指摘のまとまりにする（設計者の判断。同じ欠けが別の区分に分かれないため）。接頭辞の行より先に引く（`ruleBlockSensitivityOf` は同じ ruleId の行を先に見る）。
   // ruleId は、axe のルールの ID を大文字の snake case にした形（`accessibility-rules.ts` の接頭辞 `A11Y_` の後ろ）。

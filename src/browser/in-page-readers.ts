@@ -38,6 +38,57 @@ export interface StateFieldCriteria {
 }
 
 /**
+ * SKIP-1（設計書 `2026-11-20-beaksight-discovery-skip-and-debug-timing-design.md` 2.1）: 操作さがしの候補になる要素の基準（`input` のうちボタンの形の型と、そのうち
+ * 送信ボタンになる型）。操作さがしの probe（`src/discovery/probe.ts`）と、点検の段の DOM の数え方（`src/evidence/dom-collector.ts`）が、この値を部品
+ * （`discoveryCandidateElementOf`・`discoveryCandidateCountIn`）に渡す。
+ */
+export interface DiscoveryCandidateElementCriteria {
+  readonly buttonInputTypes: readonly string[];
+  readonly submitInputTypes: readonly string[];
+}
+
+/**
+ * RVP-0: 前面の窓（`frontWindows`）とみなす、窓がビューポートの面積に占める割合の下限（唯一の所。呼ぶ側はこの値を渡す）。大きすぎる固定要素の閾値
+ * （`OVERSIZED_FIXED_ELEMENT_MIN_VIEWPORT_RATIO`）と同じく、内容の 3 割以上を覆う窓にする（日付の選択などの小さな小窓を前面の窓にしない）。
+ */
+export const FRONT_WINDOW_MIN_VIEWPORT_RATIO = 0.3;
+
+/** SKIP-1: 操作さがしの候補になる要素の基準の値（唯一の所）。 */
+export const DISCOVERY_CANDIDATE_ELEMENT_CRITERIA: DiscoveryCandidateElementCriteria = Object.freeze({
+  buttonInputTypes: Object.freeze(['submit', 'image', 'button', 'reset']),
+  submitInputTypes: Object.freeze(['submit', 'image']),
+});
+
+/**
+ * FRET（設計書 `2026-11-24-beaksight-dialog-focus-return-design.md` の設計変更履歴の 2026-11-25）: 閉じるボタンの判定（`isCloseButton`）に渡す、押せる要素の
+ * 事実の読み方の基準（form の送信ボタンの見分けの基準と、ネットワークへ送らない form の method）。通知の枠の見分けと、窓を開くボタンの確かめが共有する。
+ * fix round 3（2026-11-26）: 送信ボタンは、属性の selector でなく IDL の `type` と `form` で見分ける（`discoveryCandidateElementOf` の 1 か所。`<button type="x">` は
+ * 送信ボタン）。
+ */
+export interface PressableButtonFactsCriteria {
+  readonly candidateCriteria: DiscoveryCandidateElementCriteria;
+  readonly dialogFormMethod: string;
+}
+
+/** FRET: 閉じるボタンの判定に渡す、押せる要素の事実（通知の枠の `NotificationButtonRead` の同じ名前の項目と同じ意味）。 */
+export interface PressableButtonFacts {
+  readonly text: string;
+  readonly ariaLabel: string;
+  readonly title: string;
+  readonly imageAlt: string;
+  readonly disabled: boolean;
+  readonly formSubmitter: boolean;
+  readonly link: { readonly isAnchor: boolean; readonly href: string | null; readonly download: boolean; readonly target: string; readonly formAction: string | null };
+  readonly destructive: DestructiveActionFacts;
+}
+
+/** SKIP-1: 要素が操作さがしの候補として何にあたるか（form・form の送信ボタン・ボタンの候補）。どれでもなければ `null`。 */
+export type DiscoveryCandidateElement =
+  | { readonly kind: 'FORM' }
+  | { readonly kind: 'SUBMITTER'; readonly form: unknown }
+  | { readonly kind: 'BUTTON' };
+
+/**
  * ページの中で使う、標準の prototype の getter で読む部品。どれも、ページの中で `createStandardReadersInPage` が作る。
  * 型の引数 `T` は呼ぶ側の宣言（ページの中で値の形は確かめない。今までの `as T` と同じ）。
  */
@@ -128,11 +179,34 @@ export interface StandardReaders {
    */
   readonly destructiveActionFactsOf: (element: Element) => DestructiveActionFacts;
   /**
+   * FRET（2026-11-25）: 閉じるボタンの判定（Node の側の `isCloseButton`）に渡す、押せる要素の事実の読み方の 1 か所（見える文字・aria-label・title・中の画像の alt・
+   * 押せないか・form の送信ボタンか・リンクの移りうる先・操作の前の判定の事実）。通知の枠の見分けと、窓を開くボタンの確かめが共有する。`destructiveActionFactsOf` を
+   * 使うので、isolated world の読み取りからだけ呼ぶ。
+   * - `<form method="dialog">` の中のボタンは、ネットワークへ送らないので送信ボタンにしない（`formmethod` が dialog でない・`formaction`・`form` 属性のあるボタンは
+   *   送信ボタンのまま。`formmethod` のあるボタンはブラウザが決めた `formMethod`、ないボタンは form の `method` で決める）。
+   */
+  readonly pressableButtonFactsOf: (element: Element, criteria: PressableButtonFactsCriteria) => PressableButtonFacts;
+  /**
    * EV-1（設計書 `2026-11-16-beaksight-finding-evidence-design.md` 3.1）: 要素のスクロールの祖先（内から外の順）。`overflow-x` か `overflow-y` が `auto`・`scroll`・
    * `overlay` で、その方向の内容が箱より大きい祖先。文書の根・body・`scrollingElement` は含めない（文書のスクロールは別に読む）。固定の枠の覆いの判定（layout の
    * 読み取り）と、フォーカスの確かめの前と後の位置（フォーカスの確かめの読み取り）が共有する。
    */
   readonly scrollAncestorsOf: (element: Element) => Element[];
+  /**
+   * S-06: 要素が、利用者がスクロールできる箱か（`scrollAncestorsOf` が祖先を選ぶのと同じ決まり。文書の根・body・`scrollingElement` は呼ぶ側が除く）。layout の
+   * 読み取りの文字切れの判定（内側のスクロール領域の箱で判定する）が使う。
+   */
+  readonly isScrollableBox: (element: Element) => boolean;
+  /**
+   * TII（DEF-285）: 要素を overflow で切り取りうる祖先と、その計算値（近い順）。切り取りの決まりの 1 か所（layout の読み取りの重なりの候補・横の切り取りと、
+   * 対象まで動かして撮る部品の見える部分が共有する）。段数では打ち切らない（selector の段の上限とは分ける）。
+   * - html・body・`scrollingElement` に着いたら止める（文書のスクロールとして扱う）。
+   * - `position: fixed` の要素は、祖先で切り取られない（transform を持つ祖先の中の場合を除く近似）。`fixed` の祖先は、返した後で止める。
+   * - `position: absolute` の要素（と祖先）は、包含ブロック（position が static でないか、transform を持つ祖先）とその外側だけが切り取る。
+   * - overflow が効かない箱（`display: inline`・`contents`）は返さない。
+   * overflow の値で切り取るかは、呼ぶ側が決める（返すのは切り取りうる祖先だけ）。
+   */
+  readonly clippingAncestorsOf: (element: Element, style: CSSStyleDeclaration) => (readonly [Element, CSSStyleDeclaration])[];
   /**
    * EV-1: 要素の selector（id があれば `#id`、なければ、文書の根の下からの `名前:nth-of-type(n)` の並び。段は `maxDepth` まで）。フォーカスの確かめの読み取りが使う
    * （layout の読み取りは、番号を親ごとに覚える自分の書き方を使う）。
@@ -154,6 +228,38 @@ export interface StandardReaders {
    * （その状態の記録）と、落ち着きの待ち（準備の状態）が共有する。
    */
   readonly loadingIndicatorsIn: (visibilityOptions: CheckVisibilityOptions) => LoadingIndicatorEvidence;
+  /**
+   * AUD-2（設計書 `2026-11-19-beaksight-audit-result-review-fixes-design.md` 5.1・5.3）: モーダルの小窓の判定の 1 か所。見えているモーダルの小窓と、その背景を覆う
+   * 暗転の要素（ないときは null）の一覧（文書の順）。通知の枠の見分け（隠さない枠）・固定の要素の覆いの読み取り（背景が塞がるのは指摘にしない）・押した後に
+   * 開いた小窓の読み取り（開いた状態の根拠）が共有する。
+   * - モーダルの小窓: `aria-modal="true"`、modal で開いた `dialog`（`:modal`）、role が `dialog`・`alertdialog` で暗転の要素を伴うもの。
+   * - 暗転の要素: ビューポートの四隅（内側へ 1px）の最前面の要素が、どの隅でも同じ 1 つの要素で、小窓の中の要素でなく、`position: fixed` でビューポートを
+   *   覆い、透明でない背景の色・背景の画像・背後のぼかしのどれかを描くもの（隅の最前面が中身の要素なら、暗転の要素にしない）。小窓そのものが全面の暗転を
+   *   描くときは、小窓そのものを暗転の要素にする。
+   */
+  readonly openModalDialogs: () => { readonly dialog: Element; readonly backdrop: Element | null }[];
+  /**
+   * RVP-0（設計書 `2026-11-24-beaksight-review-pending-evidence-design.md` 2.1）: 前面の窓の判定の 1 か所。見えているモーダルの小窓（`openModalDialogs`）と、
+   * 見えている `dialog[open]`・role が `dialog`・`alertdialog`・`aria-modal="true"` の要素のうち、ビューポートの面積の `minViewportRatio` 以上を覆うもの（文書の順。
+   * 重なりは除かない）。フォーカスの確かめ・固定要素の覆いの読み取り・通知の枠の見分けが共有する。読めないときは空（前面の窓でないとする）。
+   */
+  readonly frontWindows: (minViewportRatio: number) => Element[];
+  /**
+   * EV-4・AUD-3（REV-AUD3 の 2 回目の M-A）: キーを押す確かめを止める「値を入れる所にフォーカスがある」の判定の 1 か所。`deep` は、影の木の中まで深くたどった
+   * フォーカスの要素。値を入れる要素（`editableSelector`）、編集できる要素、または、深くたどれない影の木（closed）の host にフォーカスがある形（それ自身は
+   * フォーカスできる要素でない。中に何があるか読めないので、値を入れる所とみなす）。
+   */
+  readonly isValueEntryFocus: (deep: Element, editableSelector: string) => boolean;
+  /**
+   * SKIP-1: 操作さがしの候補の選び方の 1 か所。`form` は form、`button` と `input` のボタンの形（`criteria`）は、属する form があって送信の型なら送信ボタン
+   * （`form` はその form）、そうでなければボタンの候補、role の最初の語が `button` の要素はボタンの候補。操作さがしの probe と、点検の段の DOM の数え方が共有する。
+   */
+  readonly discoveryCandidateElementOf: (element: Element, criteria: DiscoveryCandidateElementCriteria) => DiscoveryCandidateElement | null;
+  /**
+   * SKIP-1: 文書と open な shadow root の中の、操作さがしの候補の数（probe と同じ数え方: form は送信ボタンごとに 1 つ（なければ 1 つ）、ボタンの候補は 1 つ）。
+   * shadow root の標準の getter がない（ページの JS が消した）ときは数えられないので `null`。点検の段の DOM の読み取りが使う。
+   */
+  readonly discoveryCandidateCountIn: (criteria: DiscoveryCandidateElementCriteria) => number | null;
 }
 
 /**
@@ -531,27 +637,123 @@ function createStandardReadersInPage(): StandardReaders {
     };
     const confirmElement = closestOf(element, confirmSelector);
     const confirmText = confirmElement === null ? null : bodyTextOf(confirmElement);
+    // AIW の 2: 中のアイコン（svg と中の use・i・class に icon を含む要素）の class・data 属性の名前と値・aria-label。
+    const attributesOf = standardGetter<NamedNodeMap>(Element.prototype, 'attributes');
+    const attrNameOf = standardGetter<string>(Attr.prototype, 'name');
+    const attrValueOf = standardGetter<string>(Attr.prototype, 'value');
+    const attributeCountOf = standardGetter<number>(NamedNodeMap.prototype, 'length');
+    const iconTokens: string[] = [];
+    for (const icon of queryAll(element, 'svg, svg use, i, [class*="icon" i]')) {
+      const attributes = attributesOf(icon);
+      for (let index = 0; index < attributeCountOf(attributes); index += 1) {
+        const attribute = NamedNodeMap.prototype.item.call(attributes, index);
+        if (attribute === null) continue;
+        const name = attrNameOf(attribute);
+        if (name === 'class' || name === 'aria-label') iconTokens.push(attrValueOf(attribute));
+        else if (name.startsWith('data-')) iconTokens.push(name, attrValueOf(attribute));
+      }
+    }
+    // AIW の 3: 入った枠（いちばん近い section・article・fieldset・region・tabpanel・dialog の役割か、見出しを持つ入れ物）の見出しとラベル（fieldset は legend も）。
+    const regionSelector = 'section, article, fieldset, [role="region"], [role="tabpanel"], [role="dialog"], dialog';
+    let regionElement: Element | null = null;
+    for (let node = parentElementOf(element); regionElement === null && node !== null && node !== document.body; node = parentElementOf(node)) {
+      if (Element.prototype.matches.call(node, regionSelector) || Element.prototype.querySelector.call(node, 'h1, h2, h3, h4, h5, h6') !== null) regionElement = node;
+    }
+    const legend = regionElement instanceof HTMLFieldSetElement ? Element.prototype.querySelector.call(regionElement, 'legend') : null;
+    const regionTexts = regionElement === null ? [] : [...frameNamesOf(regionElement), legend === null ? '' : textOf(legend)].map(squeezed).filter((text) => text !== '');
     return {
       names, methods, htmxDelete,
       urls, baseUrl: documentProperty<string>('URL'), chosenTexts: chosenTexts.map(squeezed).filter((text) => text !== ''), inRow,
       frame: frameElement !== null && !inRow ? { names: frameNamesOf(frameElement), text: bodyTextOf(frameElement) } : null, confirmText,
+      iconTokens: iconTokens.map(squeezed).filter((token) => token !== ''), regionTexts,
     };
+  };
+  const pressableButtonFactsOf = (element: Element, criteria: PressableButtonFactsCriteria): PressableButtonFacts => {
+    const attributeOf = (target: Element, name: string): string => {
+      const value: unknown = Element.prototype.getAttribute.call(target, name);
+      return typeof value === 'string' ? value : '';
+    };
+    // URL-LEN: リンクの移りうる先は切り詰めない。
+    const rawAttributeOf = (target: Element, name: string): string | null => {
+      const value: unknown = Element.prototype.getAttribute.call(target, name);
+      return typeof value === 'string' ? value : null;
+    };
+    const matchesOf = (target: Element, selector: string): boolean => {
+      try {
+        return Element.prototype.matches.call(target, selector);
+      } catch {
+        return false;
+      }
+    };
+    // DEF-260: 空白をまとめるだけで、長さでは切らない。
+    const squeezed = (value: string): string => value.replace(/\s+/gu, ' ').trim();
+    const nodeListLengthOf = standardGetter<number>(NodeList.prototype, 'length');
+    const disabled = matchesOf(element, ':disabled') || attributeOf(element, 'aria-disabled').trim().toLowerCase() === 'true';
+    const ownerForm = Element.prototype.closest.call(element, 'form');
+    const buttonMethodIsDialog = !Element.prototype.hasAttribute.call(element, 'formmethod')
+      || (element instanceof HTMLButtonElement && standardGetter<string>(HTMLButtonElement.prototype, 'formMethod')(element) === criteria.dialogFormMethod);
+    const inDialogForm = ownerForm instanceof HTMLFormElement && !Element.prototype.hasAttribute.call(element, 'form')
+      && !Element.prototype.hasAttribute.call(element, 'formaction')
+      && buttonMethodIsDialog
+      && standardGetter<string>(HTMLFormElement.prototype, 'method')(ownerForm) === criteria.dialogFormMethod;
+    const text = element instanceof HTMLElement ? standardGetter<string>(HTMLElement.prototype, 'innerText')(element) : '';
+    // AUD-2: アイコンだけのボタンの名前（中の画像の alt）。
+    const images = Element.prototype.querySelectorAll.call(element, 'img[alt]');
+    const alts: string[] = [];
+    for (let image = 0; image < nodeListLengthOf(images); image += 1) {
+      const item = NodeList.prototype.item.call(images, image);
+      if (item instanceof Element) alts.push(attributeOf(item, 'alt'));
+    }
+    return {
+      text: squeezed(typeof text === 'string' ? text : ''), ariaLabel: squeezed(attributeOf(element, 'aria-label')), title: squeezed(attributeOf(element, 'title')),
+      imageAlt: squeezed(alts.join(' ')), disabled,
+      // fix round 3: 送信ボタンは IDL の `type` と `form` で見分ける（`discoveryCandidateElementOf`。不正な型の button も送信ボタン）。
+      formSubmitter: discoveryCandidateElementOf(element, criteria.candidateCriteria)?.kind === 'SUBMITTER' && !inDialogForm,
+      link: {
+        isAnchor: standardGetter<string>(Element.prototype, 'localName')(element) === 'a',
+        href: rawAttributeOf(element, 'href'),
+        download: Element.prototype.hasAttribute.call(element, 'download'),
+        target: (rawAttributeOf(element, 'target') ?? '').trim().toLowerCase(),
+        formAction: rawAttributeOf(element, 'formaction'),
+      },
+      // SD-1: 操作の前の判定の事実（判定は Node の側の `isDestructiveAction`）。
+      destructive: destructiveActionFactsOf(element),
+    };
+  };
+  const isScrollableBox = (node: Element): boolean => {
+    const scrollable = ['auto', 'scroll', 'overlay'];
+    const style = window.getComputedStyle(node);
+    const vertical = scrollable.includes(style.overflowY)
+      && standardGetter<number>(Element.prototype, 'scrollHeight')(node) > standardGetter<number>(Element.prototype, 'clientHeight')(node);
+    const horizontal = scrollable.includes(style.overflowX)
+      && standardGetter<number>(Element.prototype, 'scrollWidth')(node) > standardGetter<number>(Element.prototype, 'clientWidth')(node);
+    return vertical || horizontal;
   };
   const scrollAncestorsOf = (element: Element): Element[] => {
     const parentOf = standardGetter<Element | null>(Node.prototype, 'parentElement');
     const scrollingElement = documentProperty<Element | null>('scrollingElement');
     const root = documentProperty<Element | null>('documentElement');
     const body = documentProperty<Element | null>('body');
-    const scrollable = ['auto', 'scroll', 'overlay'];
     const ancestors: Element[] = [];
     for (let node = parentOf(element); node !== null; node = parentOf(node)) {
       if (node === root || node === body || node === scrollingElement) continue;
-      const style = window.getComputedStyle(node);
-      const vertical = scrollable.includes(style.overflowY)
-        && standardGetter<number>(Element.prototype, 'scrollHeight')(node) > standardGetter<number>(Element.prototype, 'clientHeight')(node);
-      const horizontal = scrollable.includes(style.overflowX)
-        && standardGetter<number>(Element.prototype, 'scrollWidth')(node) > standardGetter<number>(Element.prototype, 'clientWidth')(node);
-      if (vertical || horizontal) ancestors.push(node);
+      if (isScrollableBox(node)) ancestors.push(node);
+    }
+    return ancestors;
+  };
+  const clippingAncestorsOf = (element: Element, style: CSSStyleDeclaration): (readonly [Element, CSSStyleDeclaration])[] => {
+    const ancestors: (readonly [Element, CSSStyleDeclaration])[] = [];
+    if (style.position === 'fixed') return ancestors;
+    const parentOf = standardGetter<Element | null>(Node.prototype, 'parentElement');
+    const stops = [documentProperty<Element | null>('documentElement'), documentProperty<Element | null>('body'), documentProperty<Element | null>('scrollingElement')];
+    let waitForContainingBlock = style.position === 'absolute';
+    for (let ancestor = parentOf(element); ancestor !== null && !stops.includes(ancestor); ancestor = parentOf(ancestor)) {
+      const ancestorStyle = window.getComputedStyle(ancestor);
+      const establishesContainingBlock = ancestorStyle.position !== 'static' || ancestorStyle.transform !== 'none';
+      if (waitForContainingBlock && !establishesContainingBlock) continue;
+      if (ancestorStyle.display !== 'inline' && ancestorStyle.display !== 'contents') ancestors.push([ancestor, ancestorStyle]);
+      if (ancestorStyle.position === 'fixed') break;
+      waitForContainingBlock = ancestorStyle.position === 'absolute';
     }
     return ancestors;
   };
@@ -624,10 +826,177 @@ function createStandardReadersInPage(): StandardReaders {
       indeterminateProgressCount: visibleCountOf('progress:indeterminate, [role="progressbar" i]:not(progress):not([aria-valuenow])'),
     };
   };
+  const openModalDialogs = (): { dialog: Element; backdrop: Element | null }[] => {
+    const root = documentProperty<Element>('documentElement');
+    const width = standardGetter<number>(Element.prototype, 'clientWidth')(root);
+    const height = standardGetter<number>(Element.prototype, 'clientHeight')(root);
+    const attributeOf = (element: Element, name: string): string => {
+      const value: unknown = Element.prototype.getAttribute.call(element, name);
+      return typeof value === 'string' ? value.trim().toLowerCase() : '';
+    };
+    const matchesOf = (element: Element, selector: string): boolean => {
+      try {
+        return Element.prototype.matches.call(element, selector);
+      } catch {
+        // `:modal` を読めないブラウザでは、modal で開いた dialog として扱わない。
+        return false;
+      }
+    };
+    const covers = (element: Element): boolean => {
+      const style = window.getComputedStyle(element);
+      const box = Element.prototype.getBoundingClientRect.call(element);
+      const transparent = style.backgroundColor === 'transparent' || /,\s*0\)$/u.test(style.backgroundColor);
+      return style.position === 'fixed' && box.left <= 0 && box.top <= 0 && box.right >= width && box.bottom >= height
+        && (!transparent || style.backgroundImage !== 'none' || (style.backdropFilter !== '' && style.backdropFilter !== 'none'));
+    };
+    const backdropOf = (dialog: Element): Element | null => {
+      if (!(width > 2 && height > 2)) return null;
+      // 配列の反復子を使わない（main world で読む呼び手もあるため。このファイルの決まり）。
+      const xs = [1, width - 2, 1, width - 2];
+      const ys = [1, 1, height - 2, height - 2];
+      let found: Element | null = null;
+      for (let corner = 0; corner < xs.length; corner += 1) {
+        const hit = Document.prototype.elementFromPoint.call(document, xs[corner] ?? 0, ys[corner] ?? 0);
+        // 小窓そのものが全面の暗転を描く形（role=dialog の要素が暗転で、中に枠がある）は、小窓そのものを暗転の要素にする。小窓の中の要素は暗転にしない。
+        if (hit === null || (hit !== dialog && Node.prototype.contains.call(dialog, hit)) || (found !== null && hit !== found) || !covers(hit)) return null;
+        found = hit;
+      }
+      return found !== null && !hasContentOutside(found, dialog) ? found : null;
+    };
+    // REV-AUD2 の I-2: 暗転の要素は、小窓の外に見える文字・操作要素を持たない（全面の固定のアプリの殻を暗転とみなさない）。見つけたら、そこで止める。
+    const controlSelector = 'a[href], button, input, select, textarea, [role="button"], [role="link"], [tabindex]';
+    const hasContentOutside = (backdrop: Element, dialog: Element): boolean => {
+      const walker = Document.prototype.createTreeWalker.call(document, backdrop, NodeFilter.SHOW_ELEMENT | NodeFilter.SHOW_TEXT);
+      for (let node: Node | null = walker.currentNode; node !== null; node = TreeWalker.prototype.nextNode.call(walker)) {
+        if (node === dialog) {
+          // 小窓の中は見ない（小窓の次の兄弟か、祖先の次の兄弟へ移る）。
+          let next: Node | null = null;
+          for (let current: Node | null = node; current !== null && current !== backdrop && next === null; current = standardGetter<Node | null>(Node.prototype, 'parentNode')(current)) {
+            next = standardGetter<Node | null>(Node.prototype, 'nextSibling')(current);
+          }
+          if (next === null) return false;
+          walker.currentNode = next;
+          node = next;
+        }
+        if (node instanceof Text) {
+          const parent = standardGetter<Element | null>(Node.prototype, 'parentElement')(node);
+          if (standardGetter<string>(CharacterData.prototype, 'data')(node).trim() !== '' && parent !== null && isVisible(parent)) return true;
+        } else if (node instanceof Element && node !== backdrop && matchesOf(node, controlSelector) && isVisible(node)) {
+          return true;
+        }
+      }
+      return false;
+    };
+    const dialogs: { dialog: Element; backdrop: Element | null }[] = [];
+    const list = Document.prototype.querySelectorAll.call(document, '[aria-modal], dialog[open], [role="dialog"], [role="alertdialog"]');
+    const length = standardGetter<number>(NodeList.prototype, 'length')(list);
+    for (let index = 0; index < length; index += 1) {
+      const dialog = NodeList.prototype.item.call(list, index);
+      if (!(dialog instanceof Element) || !isVisible(dialog)) continue;
+      const backdrop = backdropOf(dialog);
+      const role = attributeOf(dialog, 'role');
+      if (attributeOf(dialog, 'aria-modal') === 'true' || matchesOf(dialog, 'dialog:modal')
+        || ((role === 'dialog' || role === 'alertdialog') && backdrop !== null)) {
+        dialogs.push({ dialog, backdrop });
+      }
+    }
+    return dialogs;
+  };
+  const frontWindows = (minViewportRatio: number): Element[] => {
+    try {
+      const root = documentProperty<Element>('documentElement');
+      const width = standardGetter<number>(Element.prototype, 'clientWidth')(root);
+      const height = standardGetter<number>(Element.prototype, 'clientHeight')(root);
+      const windows: Element[] = [];
+      const modals = openModalDialogs();
+      for (let index = 0; index < modals.length; index += 1) {
+        const modal = modals[index];
+        if (modal !== undefined) windows.push(modal.dialog);
+      }
+      if (!(width > 0 && height > 0)) return windows;
+      const list = Document.prototype.querySelectorAll.call(document, 'dialog[open], [role="dialog" i], [role="alertdialog" i], [aria-modal="true" i]');
+      const length = standardGetter<number>(NodeList.prototype, 'length')(list);
+      for (let index = 0; index < length; index += 1) {
+        const element = NodeList.prototype.item.call(list, index);
+        if (!(element instanceof Element) || windows.indexOf(element) >= 0 || !isVisible(element)) continue;
+        const box = Element.prototype.getBoundingClientRect.call(element);
+        const area = Math.max(0, Math.min(box.right, width) - Math.max(box.left, 0)) * Math.max(0, Math.min(box.bottom, height) - Math.max(box.top, 0));
+        if (area / (width * height) >= minViewportRatio) windows.push(element);
+      }
+      return windows;
+    } catch {
+      return [];
+    }
+  };
+  const isValueEntryFocus =(deep: Element, editableSelector: string): boolean => {
+    if (Element.prototype.matches.call(deep, editableSelector)
+      || (deep instanceof HTMLElement && standardGetter<boolean>(HTMLElement.prototype, 'isContentEditable')(deep))) {
+      return true;
+    }
+    // closed な影の木の host: 開いた影の木がなく、それ自身はフォーカスできる要素でない（tabindex もなく、スクロールの箱でもない）のに、フォーカスがある。
+    return deep instanceof HTMLElement && deep !== documentProperty<HTMLElement | null>('body') && deep !== documentProperty<Element | null>('documentElement')
+      && standardGetter<ShadowRoot | null>(Element.prototype, 'shadowRoot')(deep) === null
+      && standardGetter<number>(HTMLElement.prototype, 'tabIndex')(deep) < 0 && Element.prototype.getAttribute.call(deep, 'tabindex') === null
+      && !Element.prototype.matches.call(deep, ':any-link, button, input, select, textarea, iframe, frame, object, embed, summary, audio, video')
+      // Chromium は、中にフォーカスできる要素のないスクロールの箱も、Tab で止める（tabindex なしでもフォーカスが来る）。
+      && !isScrollableBox(deep);
+  };
+  const discoveryCandidateElementOf = (element: Element, criteria: DiscoveryCandidateElementCriteria): DiscoveryCandidateElement | null => {
+    const name = standardGetter<unknown>(Element.prototype, 'localName')(element);
+    if (name === 'form') {
+      return { kind: 'FORM' };
+    }
+    let owner: unknown = null;
+    let submitter = false;
+    if (name === 'button') {
+      owner = standardGetter<unknown>(HTMLButtonElement.prototype, 'form')(element);
+      submitter = standardGetter<unknown>(HTMLButtonElement.prototype, 'type')(element) === 'submit';
+    } else if (name === 'input') {
+      const type = standardGetter<unknown>(HTMLInputElement.prototype, 'type')(element);
+      if (typeof type !== 'string' || !criteria.buttonInputTypes.includes(type)) {
+        return null;
+      }
+      owner = standardGetter<unknown>(HTMLInputElement.prototype, 'form')(element);
+      submitter = criteria.submitInputTypes.includes(type);
+    } else if ((Element.prototype.getAttribute.call(element, 'role') ?? '').trim().toLowerCase().split(/\s+/u)[0] !== 'button') {
+      // `role=button` の要素（role の最初の語）は送信ボタンにならないので、form の中でも外でもボタンの候補にする。
+      return null;
+    }
+    return owner === null || owner === undefined || !submitter ? { kind: 'BUTTON' } : { kind: 'SUBMITTER', form: owner };
+  };
+  const discoveryCandidateCountIn = (criteria: DiscoveryCandidateElementCriteria): number | null => {
+    let roots: (Document | ShadowRoot)[];
+    try {
+      roots = openRoots();
+    } catch {
+      return null;
+    }
+    const elements = queryAllInRoots(roots, '*');
+    const forms: unknown[] = [];
+    const submitterForms: unknown[] = [];
+    let count = 0;
+    for (let index = 0; index < elements.length; index += 1) {
+      const element = elements[index];
+      const found = element instanceof Element ? discoveryCandidateElementOf(element, criteria) : null;
+      if (found?.kind === 'FORM') forms.push(element);
+      else if (found?.kind === 'SUBMITTER') submitterForms.push(found.form);
+      else if (found?.kind === 'BUTTON') count += 1;
+    }
+    for (let index = 0; index < forms.length; index += 1) {
+      let submitters = 0;
+      for (let other = 0; other < submitterForms.length; other += 1) {
+        if (submitterForms[other] === forms[index]) submitters += 1;
+      }
+      count += submitters === 0 ? 1 : submitters;
+    }
+    return count;
+  };
   return {
     standardGetter, optionalStandardGetter, standardProperty, documentProperty, elementPathOf, elementAtPath, openRoots, optionalOpenRoots, queryAllInRoots,
     hasLinkAncestor, isVisible, isLayoutLandmark, layoutLandmarksOf, visibleStateFieldsIn, visibleHeadingLevelsIn, ownSurfaceFactsOf, destructiveActionFactsOf,
-    scrollAncestorsOf, selectorOf, hitPointsOf, loadingIndicatorsIn,
+    pressableButtonFactsOf,
+    scrollAncestorsOf, isScrollableBox, clippingAncestorsOf, selectorOf, hitPointsOf, loadingIndicatorsIn, openModalDialogs, frontWindows,
+    isValueEntryFocus, discoveryCandidateElementOf, discoveryCandidateCountIn,
   };
 }
 

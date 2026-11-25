@@ -44,7 +44,9 @@ import type { SessionLossEvidence } from '../core/evidence-types.js';
 import { CONTEXT_CLOSE_TIMEOUT_MS } from '../core/limits.js';
 import type { ObservationWindows } from '../core/observation-windows.js';
 import type { NavigationPacer } from '../crawl/navigation-pacer.js';
-import { InFlightRequestCounter } from '../discovery/settle.js';
+import { InFlightRequestCounter, type DataEndpointMemory } from '../discovery/settle.js';
+import type { PageTimePart, PageTimeRecorder } from '../discovery/page-time-breakdown.js';
+import { attachScreenTiming } from '../discovery/screen-watch.js';
 import type { ReadCheckAuditStageObservation } from '../discovery/read-check-evaluation.js';
 import {
   auditStageReadCountsOf,
@@ -97,12 +99,16 @@ export type WorkerRunStart =
     readonly exitCode: number;
   };
 
-/** Run を始める（ファイルの先頭の 1）。Run の外の失敗は reject する。始めなかったとき（reject を含む）は、取ったロックを離す。 */
+/**
+ * Run を始める（ファイルの先頭の 1）。印は出力先 + 対象の ID（設定の `target.id`。PAR-a）。Run の外の失敗は reject する。始めなかったとき
+ * （reject を含む）は、取ったロックを離す。
+ */
 export async function startWorkerRun(
   outputDirectory: string,
+  targetId: string,
   clock: () => Date,
 ): Promise<WorkerRunStart> {
-  const runLock = await acquireRunExclusion(outputDirectory);
+  const runLock = await acquireRunExclusion(outputDirectory, targetId);
   if (runLock.kind === 'HELD') {
     return { kind: 'RUN_ACTIVE', exitCode: RUN_UNAVAILABLE_EXIT_CODE };
   }
@@ -180,6 +186,16 @@ export interface GuardedPageLoadOptions {
    * 省略すると今どおり（凍結せずに読み込む）。
    */
   readonly frozenFromStart?: true | undefined;
+  /**
+   * REV-DQF fix round 3: Run の中で、前の画面までに出たデータの送り先の覚え（発見の流れが Run ごとに 1 つ渡す）。落ち着きの待ちは、まだ届いていない要求がこの画面で
+   * 新しい送り先へのものであるときだけ答えを待つ。省略すると、どの送り先も新しい（覚えない）。
+   */
+  readonly dataEndpointMemory?: DataEndpointMemory | undefined;
+  /**
+   * DTIME: 操作さがしの 1 画面の時間の内訳を測る口（操作さがしだけが渡す）。間隔の待ちと読み込みを測り、読み取りの間は page ごとの口に置く（深い部品が
+   * `timedOnScreen` で待ちを測る）。測るだけで、待ちを変えない。省略すると測らない。
+   */
+  readonly timing?: PageTimeRecorder | undefined;
   /**
    * RB-8 の残り（RB-12 で行った）: 観察の窓の一式（進行中の要求の数え方の、応答の後の本文の猶予 `discoverySettle.responseBodyGraceMs` を読む）。省略すると本番の値。
    * テストだけが渡す（本番の入口は渡さない。`worker-login-hooks` の (n)・(p)）。
@@ -344,7 +360,10 @@ export async function visitGuardedPage<T>(
 ): Promise<GuardedPageVisit<T>> {
   // DEF-236（設計書 `2026-11-09-beaksight-visible-pacing-wait-design.md` 3.2）: 読み込みの間隔は、セッションを作る前に待つ（新しい空の page を見せたまま待たない。
   // 監査と同じ順）。前の画面は、閉じる前に見せたまま待ったので、ふつうは待たない。
-  await pacer.beforeNavigation();
+  // DTIME: 口があれば、間隔の待ちと読み込みを測る（測るだけ）。
+  const { timing } = options;
+  const timed = <R>(part: PageTimePart, work: () => PromiseLike<R>): Promise<R> => (timing === undefined ? Promise.resolve(work()) : timing.measure(part, work));
+  await timed('PACING_WAIT', () => pacer.beforeNavigation());
   // COV-2c の M-1: 最初から凍結した Context（`frozenFromStart`）は、factory の口で開く（失敗したら、factory が Context を閉じて投げる）。
   const opened = options.frozenFromStart === true
     ? await openFrozenFromStart(factory, options.config.viewports.primaryDesktop)
@@ -360,6 +379,8 @@ export async function visitGuardedPage<T>(
     return { kind: 'NOT_OPENED', violation };
   }
   const { context, page, ledger } = opened;
+  // DTIME: 読み取りの間、page ごとの口に時間の内訳の口を置く（閉じる前に外す）。
+  const detachTiming = timing === undefined ? null : attachScreenTiming(page, timing);
   // DEF-144: 最初に違反を見た段（と押した候補）。今の段は、読み込みと読み取り。呼ぶ側が probe の段に入るたびと、読み取りの後に、それまでの違反を今の段に
   // 結びつける。
   const stages = new SafetyViolationStages(ledger);
@@ -391,7 +412,7 @@ export async function visitGuardedPage<T>(
   const allowedOrigins = new Set(options.config.site.allowedOrigins);
   const isOutsideAuditScope = (target: string): boolean => isOutsideRunAuditScope(target, allowedOrigins, options.authentication ?? null);
   // REV-SD の I-1: 読み込みから probe の段に入るまで、main frame の移動を見張る（probe の段の後の移動は、BeakSight の押下の結果として probe の部品が扱う）。
-  const scope = watchAuditScope(page, isOutsideAuditScope);
+  const scope = watchAuditScope(page, isOutsideAuditScope, url);
   let probeEntered = false;
   /** 範囲の外へ移っていれば、読み取りを止める（その画面は `FAILED`）。 */
   const stopIfOutsideAuditScope = (): void => {
@@ -401,7 +422,10 @@ export async function visitGuardedPage<T>(
   };
   try {
     // 進行中の要求の数え方は、読み込みの前に作る（それより前に始まった要求は数えられない）。
-    const counter = new InFlightRequestCounter(page, { responseBodyGraceMs: options.observationWindows?.discoverySettle.responseBodyGraceMs });
+    // REV-DQF fix round 3: ほかの画面で出た送り先（`dataEndpointMemory`）は、この画面で新しい送り先でない（答えを待たない）。
+    const counter = new InFlightRequestCounter(page, {
+      responseBodyGraceMs: options.observationWindows?.discoverySettle.responseBodyGraceMs, knownEndpoints: options.dataEndpointMemory?.known,
+    });
     try {
       const load = (): ReturnType<typeof navigatePage> => navigatePage(page, url, {
         timeoutMs: options.config.crawl.navigationTimeoutMs,
@@ -411,7 +435,7 @@ export async function visitGuardedPage<T>(
         isOutsideAuditScope,
       });
       // COV-2c の M-1: 最初から凍結した Context では、凍結を解かずに読み込む（`loadFrozenDocument`）。
-      const navigation = options.frozenFromStart === true ? await factory.loadFrozenDocument(page, url, load) : await load();
+      const navigation = await timed('LOAD', () => (options.frozenFromStart === true ? factory.loadFrozenDocument(page, url, load) : load()));
       // 経路の記録は、読み込みの直後の写しを証拠に使う（鍵の消失の証拠も、この写し）。後の時機で path の切れを見つけたら、その時点の写しにする。
       routeRecord = route?.snapshot() ?? null;
       const lostUrl = lostUrlAt(SESSION_LOSS_CHECK_POINTS.navigation);
@@ -448,6 +472,8 @@ export async function visitGuardedPage<T>(
         visit = lostAtEnd === null ? { kind: 'VISITED', value } : { kind: 'SESSION_LOST', url: lostAtEnd };
       }
     } finally {
+      // REV-DQF fix round 3: この画面で出た送り先を覚える（後の画面では、新しい送り先でない）。
+      options.dataEndpointMemory?.remember(counter.seenEndpoints());
       counter.dispose();
     }
   } catch (error) {
@@ -461,8 +487,9 @@ export async function visitGuardedPage<T>(
   // DEF-236（設計書 3.2）: 読み取りを終えた後、閉じる前に、この画面を見せたまま次の読み込みの間隔を待つ（監査と同じ部品）。セッションの切れ・違反の後と、呼ぶ側が
   // 次の読み込みがないと伝えた時（`pacingWaitBeforeClose` が偽）は、待たずに閉じる。
   const pacingWait = visit.kind !== 'SESSION_LOST' && !hasViolation(ledger) && options.pacingWaitBeforeClose !== false
-    ? await waitWithPageShown({ page, ledger, pacer })
+    ? await timed('PACING_WAIT', () => waitWithPageShown({ page, ledger, pacer }))
     : null;
+  detachTiming?.();
   await closePassiveContextBeforeDeadline(factory, context, { timeoutMs: CONTEXT_CLOSE_TIMEOUT_MS });
   // DF-3: Context を閉じた後にも、もう一度確かめる（閉じる間に Guard が止めた main frame の移動を含める。時機はページの終わり）。
   if (visit.kind !== 'SESSION_LOST') {

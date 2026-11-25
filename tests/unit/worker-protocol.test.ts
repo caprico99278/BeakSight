@@ -348,7 +348,7 @@ describe('worker protocol: value lists, limits and the schema', () => {
     expect(pointerValue(SCHEMA, '/$id')).toBe('urn:beaksight:schema:control:worker-message:1');
     expect(definitionOf('protocol')).toEqual({ const: WORKER_PROTOCOL_VERSION });
     // T30e: 書き込みのジョブの指定と、確かめ直しの往復と、送信の報告を足したので、版を上げた。
-    expect(WORKER_PROTOCOL_VERSION).toBe('beaksight-worker-message/9'); // WSO: チェックした画面だけの段の並びと読む画面で版 9。DEF-200: ログインし直す段の指定（`RELOGIN_STAGE`）と、自動ログインの段の通した一覧（DEF-194）で版 8。 OP-2: 書き込みの段で版 4。DEF-180: 前の読み込みの時刻で版 5。OP-H: チェックした画面の数で版 6。OP-L: 保存できなかった理由で版 7
+    expect(WORKER_PROTOCOL_VERSION).toBe('beaksight-worker-message/10'); // RCA-5・6: 検索の確かめの組で版 10。WSO: チェックした画面だけの段の並びと読む画面で版 9。DEF-200: ログインし直す段の指定（`RELOGIN_STAGE`）と、自動ログインの段の通した一覧（DEF-194）で版 8。 OP-2: 書き込みの段で版 4。DEF-180: 前の読み込みの時刻で版 5。OP-H: チェックした画面の数で版 6。OP-L: 保存できなかった理由で版 7
     expect(pointerValue(SCHEMA, '/$defs/start/properties/jobId/pattern')).toBe(WORKER_JOB_ID_PATTERN.source);
     expect(pointerValue(SCHEMA, '/$defs/start/properties/targetConfigSha256/pattern')).toBe(TARGET_CONFIG_SHA256_PATTERN.source);
     // 要約は、内容の SHA-256 の 16 進（Node の crypto と同じ値）。

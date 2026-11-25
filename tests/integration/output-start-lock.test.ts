@@ -113,7 +113,7 @@ describe.each(DEFAULT_CHROMIUM_LAUNCHERS)('DEF-057: two overlapping starts on th
     expect({ runDirectories: runDirectories.length, robotsRequests }).toEqual({ runDirectories: 1, robotsRequests: ROBOTS_REQUESTS_PER_RUN });
     expect(outcomes.map(({ kind }) => kind).sort()).toEqual(['RAN', 'RUN_ACTIVE']);
     expect(outcomes.find(({ kind }) => kind === 'RUN_ACTIVE')).toEqual({ kind: 'RUN_ACTIVE', exitCode: RUN_UNAVAILABLE_EXIT_CODE });
-    const after = await acquireRunExclusion(outputDirectory);
+    const after = await acquireRunExclusion(outputDirectory, config.target.id);
     expect(after.kind).toBe('ACQUIRED');
     if (after.kind === 'ACQUIRED') {
       await after.release();

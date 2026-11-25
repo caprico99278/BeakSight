@@ -63,12 +63,18 @@ import { EXIT_CODES } from '../cli/exit-codes.js';
 import type { AuditConfig } from '../config/types.js';
 import { isUsableRecordId } from '../control/actions/action-outcome.js';
 import { readCheckPagePathRejectionsOf, type ReadCheckPageContext } from '../control/read-check-page-path.js';
-import type { WorkerStartReadCheck } from '../control/worker-protocol.js';
+import type { WorkerStartReadCheck, WorkerStartSearchCheck } from '../control/worker-protocol.js';
+import { createLoadMeter } from '../crawl/load-meter.js';
+import { ROW_COUNT_AT_LEAST_EXPECTATION_KIND } from '../core/read-check-expectation-kinds.js';
 import { auditSendPolicyOf } from '../core/audit-send-policy.js';
-import type { JobSafetyViolation, RunId, RunStatus, SessionLostDetail } from '../core/contracts.js';
+import type { JobSafetyViolation, RunId, RunProgressReport, RunStatus, SessionLostDetail } from '../core/contracts.js';
 import type { SessionLossEvidence } from '../core/evidence-types.js';
 import { wait } from '../core/deadline.js';
 import { isHttpErrorOrNonStandardStatus } from '../core/http-status.js';
+import { runSearchTrigger, type SearchTriggerOutcome } from '../interaction/submission-probe.js';
+import { searchReadRecordOf, searchReadsNeedRecheck } from '../discovery/search-read-contracts.js';
+import { searchCheckTextOf } from '../discovery/submission-probe-contracts.js';
+import { observationWindowsOrProduction, type ObservationWindows } from '../core/observation-windows.js';
 import { formatCompactUtcTimestamp } from '../core/utc-timestamp.js';
 import { createNavigationPacer, type NavigationPacer } from '../crawl/navigation-pacer.js';
 import type { CandidateLocation } from '../discovery/candidate-contracts.js';
@@ -83,18 +89,22 @@ import {
 import {
   READ_CHECK_DETAIL_RESULTS,
   READ_EVIDENCE_ARTIFACT_SCHEMA_VERSION,
+  SEARCH_CHECK_DETAIL_RESULTS,
   buildReadCheckUrl,
   confirmReadTargetOnPage,
   evaluateReadExpectations,
-  pageOpenedEvidenceOf,
   readCheckAuditStageDetailOf,
-  readCheckRecordsEvidenceOf,
   readCheckEvidenceTargetOf,
   readCheckResultOf,
   readEvidenceRunStatusOf,
   readEvidenceSummaryOf,
   readStructureSummaryOf,
   withReadCheckAuditStageDetail,
+  formSearchCheckEvidenceOf,
+  searchCheckEvidenceBaseOf,
+  searchCheckVerdictOf,
+  type SearchCheckEvidence,
+  type SearchCheckObservation,
   type ReadCandidateConfirmation,
   type ReadCheckDetail,
   type ReadCheckEndReason,
@@ -112,10 +122,6 @@ import {
   type ReadStructureOutcome,
 } from '../discovery/read-executor.js';
 import { TEXT_CONTAINS_EXPECTATION_KIND } from '../core/read-check-expectation-kinds.js';
-import { createPageId } from '../core/ids.js';
-import { discoverLinks } from '../crawl/discover-links.js';
-import { internalNavigableUrlsOf } from '../crawl/internal-navigable-links.js';
-import { isPageOpenedReadCheckDefinition, readCheckListPagePathOf, recordIdsOfLinkUrls } from '../discovery/read-check-record-ids.js';
 import type { ReadCheckExpectation } from '../discovery/read-check-contracts.js';
 import type { DiscoverySettlePolicy } from '../discovery/settle.js';
 import {
@@ -153,6 +159,8 @@ import { endWorkerRun, startWorkerRun, visitGuardedPage, type GuardedPageVisit, 
 export type ReadCheckPageVisitOptions = GuardedPageVisitOptions & {
   readonly settlePolicy?: DiscoverySettlePolicy | undefined;
   readonly progressQuietLimitMs?: number | undefined;
+  /** RCA-7: スクリプトの組の押下の後の最短の観察（ms。観察の窓の一式から決める。書き込みのジョブの照合の READ は渡さない）。 */
+  readonly submissionProbeQuietWaitMs?: number | undefined;
 };
 
 /** 日時の名前（誤りの文に使う）。 */
@@ -166,8 +174,17 @@ export interface ReadCheckRunRequest {
   readonly jobId: string;
   /** ログインの段の後の、認証つきの Run の指定。 */
   readonly authentication: RunAuthentication;
-  /** `START` の定義の一覧（契約で、1 件以上。L4: 件数の上限なし。秘密に見える名前なし）。 */
+  /** `START` の定義の一覧（RCA-6: 空でもよい。L4: 件数の上限なし。秘密に見える名前なし）。 */
   readonly readChecks: readonly WorkerStartReadCheck[];
+  /** RCA-7: 検索の確かめの組（`START`・`NEXT_STAGE`・`RELOGIN_STAGE` の `searchChecks`。省略は 0 件）。 */
+  readonly searchChecks?: readonly WorkerStartSearchCheck[] | undefined;
+  /**
+   * REV-RCA の I-4: ログインし直す前のジョブで、ログインの画面へ戻された組の鍵（親が `RELOGIN_STAGE` で渡す。人の定義で戻されたときは省略）。その組を最初に確かめ、
+   * その組でまた戻されたときだけ、2 回目の戻しとして誤りにする。
+   */
+  readonly bouncedSearchCheckKey?: string | undefined;
+  /** RCA-7: 観察の窓の一式（スクリプトの組の押下の後の最短の観察に使う。ワーカーの流れは渡さない。テストが短くする。省略は本番の値）。 */
+  readonly observationWindows?: ObservationWindows | undefined;
   readonly launchBrowser: BrowserLauncher;
   /** RB-5: ワーカーの Browser の lease（あれば `launchBrowser` を呼ばずに借りる。`runPreflight` の `browserLease`）。 */
   readonly browserLease?: BrowserLease | undefined;
@@ -212,12 +229,12 @@ export interface ReadCheckRunRequest {
 /**
  * RB-11（INV-REBUILD の plan 2 章の 12）: 開いた READ の確かめの段の口。どの操作も 1 画面を新しい Context で Guard 付きで開いて読み（`visitGuardedPage`）、例外を
  * 投げない。読み込みの間隔は、口を開くときに渡した pacer が守る。
- * - `readListPageLinks`: 一覧の画面のリンク（DEF-235）。`readTargetCandidates`: 対象の画面の候補（凍結して 1 回）。
+ * - `readTargetCandidates`: 対象の画面の候補（凍結して 1 回）。
  * - `visitAndRead`: 候補の定義の READ（READ の URL を開いて構造を読み、期待と照らす）。`visitAndReadPage`: 画面の path の定義。
- *   `visitAndReadRecordPage`: 番号を埋めた画面の path の定義（照合の READ と同じ確かめ直し）。
+ *   `visitAndReadRecordPage`: 番号を埋めた画面の path の定義（書き込みの照合の READ。確かめ直しつき）。
+ * REV-RCA の M-4: DEF-235 の一覧の画面のリンクの読み取り（`readListPageLinks`）は、段で型の定義を読まなくなったので消した。
  */
 export interface ReadCheckSession extends StageSession {
-  readonly readListPageLinks: (url: string, options: ReadCheckPageVisitOptions) => Promise<GuardedPageVisit<ListPageLinks>>;
   readonly readTargetCandidates: (pageUrl: string, options: ReadCheckPageVisitOptions) => Promise<GuardedPageVisit<TargetCandidates>>;
   readonly visitAndRead: (
     readCheck: WorkerStartReadCheck,
@@ -232,6 +249,11 @@ export interface ReadCheckSession extends StageSession {
     options: ReadCheckPageVisitOptions,
     rowSelection?: ReadCheckRowSelection,
   ) => Promise<CheckedReadCheck<ReadCheckExecutedEvidence>>;
+  /** RCA-7: スクリプトの組 1 つを動かす（`runScriptSearch`。省略した口ではスクリプトの組を動かせない）。 */
+  readonly runScriptSearch?: (
+    combo: Extract<WorkerStartSearchCheck, { readonly kind: 'SCRIPT' }>,
+    options: ReadCheckPageVisitOptions,
+  ) => Promise<GuardedPageVisit<ScriptSearchVisit>>;
 }
 
 /** RB-11: 照合の READ（`verifyReadCheck`）が使う、READ の確かめの段の口の操作（書き込みの段の口も同じ操作を持つ）。 */
@@ -259,6 +281,8 @@ export interface ReadCheckRunObserver {
    * 後に 1 回。`RUN_FINALIZING`。監査の「Run の終わり」の段と同じ口）。
    */
   readonly onFinalizing?: (() => void) | undefined;
+  /** RCA-7: 検索の確かめの進み具合（確かめた組 N / 全部の組 M。組があるときだけ。`PROGRESS`）。 */
+  readonly onProgress?: ((report: RunProgressReport) => void) | undefined;
 }
 
 /** READ の確かめの流れの結果（Run のディレクトリは絶対パス）。 */
@@ -290,6 +314,8 @@ interface CheckResult {
   readonly endReasonDetail?: SessionLostDetail | null;
   /** DEF-138: セッションの切れで止まったときの証拠（なければ省略か `null`）。 */
   readonly sessionLoss?: SessionLossEvidence | null;
+  /** REV-RCA の I-4: セッションが切れたときに動かしていたスクリプトの組の位置（`START` の順。スクリプトの組で切れたときだけ）。 */
+  readonly sessionLostScriptIndex?: number;
 }
 
 /** 止まるべき事象（セッションの切れと違反）つきの、1 つの定義の結果。T37a: セッションの切れの詳しい理由（鍵の消失なら `session-key`）も返す。 */
@@ -547,63 +573,6 @@ async function executePageReadCheck(
   return readAndEvaluate(factory, pacer, readCheck, url, options);
 }
 
-/** DEF-235: 一覧の画面のリンクを読むときの、リンクの Evidence の元の画面の ID（記録しない。リンクの読み取りの部品が求める）。 */
-const LIST_PAGE_LINK_SOURCE_ID = createPageId(1);
-
-/** DEF-235: 一覧の画面の読み込みの結果（型に当たる番号を探す前のリンクの URL。DEF-136: サイトの不調だったか）。 */
-export interface ListPageLinks {
-  readonly urls: readonly string[];
-  readonly siteUnavailable: boolean;
-}
-
-/**
- * DEF-235（設計書 3.2・3.3）: 一覧の画面の読む URL（開始の URL の Origin と一覧の画面の path。画面の path の確かめ `readCheckPagePathRejectionsOf` と事前の判定
- * `isReadUrlAllowed` を通したものだけ。通らなければ null で、読まない）。
- */
-const listPageReadUrlOf = (listPath: string, options: ReadCheckPageVisitOptions): string | null => {
-  const startOrigin = startOriginOf(options.config);
-  const url = startOrigin === null ? null : readCheckPageUrlOf(startOrigin, listPath);
-  if (url === null) {
-    return null;
-  }
-  return readCheckPagePathRejectionsOf(listPath, readCheckPageContextOf(options.config, options.authentication)).length > 0
-    || !isReadUrlAllowed(url, options.config, options.authentication) ? null : url;
-};
-
-/**
- * DEF-235（設計書 3.2）: 一覧の画面を新しい Context で 1 回だけ読み（間隔・Guard・監査の段の上限は、ほかの読み込みと同じ部品）、発見の入口で凍結して落ち着かせた
- * 後に、リンクを読む（`discoverLinks`。受け入れが `INTERNAL_NAVIGABLE` で正規化できたものの URL。文書の順）。読み込みの失敗・エラーの状態の画面からは拾わない。
- */
-const readListPageLinks = (
-  factory: BrowserContextFactory,
-  pacer: NavigationPacer,
-  url: string,
-  options: ReadCheckPageVisitOptions,
-): Promise<GuardedPageVisit<ListPageLinks>> => {
-  const classificationPolicy = { allowedOrigins: new Set(options.authentication.approvedTestOrigins) };
-  return visitGuardedPage(factory, pacer, url, options, async ({ page, counter, navigation }): Promise<ListPageLinks> => {
-    const siteUnavailable = pageLoadVerdictOf(navigation).kind === 'SITE_UNAVAILABLE';
-    if (navigation.navigationOutcome !== 'OK' || isHttpErrorOrNonStandardStatus(navigation.httpStatus)) {
-      return { urls: [], siteUnavailable };
-    }
-    // 凍結（発見の入口）と落ち着きの待ちの後に、リンクを読む（押さない・入れない）。
-    await readCandidatePage(page, { classificationPolicy, requestCounter: counter, settlePolicy: options.settlePolicy });
-    try {
-      const found = await discoverLinks(page, LIST_PAGE_LINK_SOURCE_ID, {
-        allowedOrigins: new Set(options.config.site.allowedOrigins), allowedQueryParameters: options.allowedQueryParameters,
-      });
-      // 巡回の候補の取り出しの owner（`internalNavigableUrlsOf`）で、受け入れが `INTERNAL_NAVIGABLE` で正規化できたリンクだけを選ぶ。
-      return { urls: internalNavigableUrlsOf(found.links), siteUnavailable: false };
-    } catch {
-      return { urls: [], siteUnavailable: false };
-    }
-  });
-};
-
-/** DEF-136: 一覧の画面の読み込みが、サイトの不調だったか（違反のある読み込みは、違反の扱いを先にする）。 */
-const listVisitUnavailable = (visit: GuardedPageVisit<ListPageLinks>): boolean =>
-  visit.kind === 'VISITED' && visit.value.siteUnavailable && !visit.violation;
-
 /** 画面の path の確かめの文脈（設定と認証の指定から。保存の時と同じ owner `readCheckPagePathRejectionsOf` に渡す）。 */
 const readCheckPageContextOf = (config: AuditConfig, authentication: RunAuthentication): ReadCheckPageContext => ({
   startUrl: config.site.startUrl,
@@ -821,6 +790,61 @@ const readTargetCandidates = (
   }));
 };
 
+/** RCA-7: スクリプトの組を動かした画面の結果（DEF-136: サイトの不調だったか）。 */
+export interface ScriptSearchVisit {
+  readonly outcome: SearchTriggerOutcome;
+  readonly siteUnavailable: boolean;
+}
+
+/**
+ * RCA-7（検索の確かめの設計書 2.2、RCA-7 の Blocker の判断）: スクリプトの組 1 つ。組の画面を、押す口の Context（`submissionProbeRun`）で新しく開き、発見の入口
+ * （落ち着きの待ち → 凍結 → 候補の読み取り）で凍結し、記録した押下の並びをたどり直して、最後のきっかけを決まった値で動かす（押す部品 `runSearchTrigger`。送信は
+ * 凍結の Guard が届けない）。読み込みが失敗・エラーの状態・押す口がないなら、動かさない（`NOT_REBUILT`）。
+ */
+const runScriptSearch = (
+  factory: BrowserContextFactory,
+  pacer: NavigationPacer,
+  combo: Extract<WorkerStartSearchCheck, { readonly kind: 'SCRIPT' }>,
+  options: ReadCheckPageVisitOptions,
+): Promise<GuardedPageVisit<ScriptSearchVisit>> => {
+  const classificationPolicy = { allowedOrigins: new Set(options.authentication.approvedTestOrigins) };
+  return visitGuardedPage(factory, pacer, pageUrlOf(combo.page), options, async ({ page, counter, navigation, enterSubmissionProbe }): Promise<ScriptSearchVisit> => {
+    const siteUnavailable = pageLoadVerdictOf(navigation).kind === 'SITE_UNAVAILABLE';
+    if (navigation.navigationOutcome !== 'OK' || isHttpErrorOrNonStandardStatus(navigation.httpStatus)) {
+      return { outcome: { kind: 'NOT_REBUILT' }, siteUnavailable };
+    }
+    await readCandidatePage(page, { classificationPolicy, requestCounter: counter, settlePolicy: options.settlePolicy });
+    const observation = factory.submissionObservationOf(page.context());
+    if (observation === null) {
+      return { outcome: { kind: 'NOT_REBUILT' }, siteUnavailable };
+    }
+    // 押す前に、次の Context へ渡す状態を読んでおく（押下でページが書き換えた状態を受け継がない。操作さがしと同じ）。
+    await factory.pinAuthenticatedStateBeforeProbe(page.context());
+    enterSubmissionProbe(null);
+    const { trigger } = combo;
+    const outcome = await runSearchTrigger(page, observation, combo.page, {
+      priorPresses: trigger.priorPresses,
+      trigger: trigger.kind === 'PRESS'
+        ? { kind: 'PRESS', identityDigest: trigger.identityDigest, ordinal: trigger.ordinal }
+        : { kind: 'TYPED', field: trigger.field },
+      // REV-RCA fix round 2: 決まった値は、組ごとに作る目印（空・半角・全角）。
+      text: searchCheckTextOf(combo.text),
+    }, {
+      quietWaitMs: options.submissionProbeQuietWaitMs ?? observationWindowsOrProduction(undefined).afterPress.probeQuietWaitMs,
+      dataActivity: () => counter.dataActivity(),
+    });
+    return { outcome, siteUnavailable };
+  });
+};
+
+/**
+ * DEF-136: スクリプトの組の読み込みが、サイトの不調だったか。REV-RCA の M-1（検索の確かめの設計書 2.2）: 画面は読めても、きっかけが出した読み取りが 429・502・503・
+ * 504・応答なしなら不調とする（1 回だけ確かめ直す）。
+ */
+const scriptVisitUnavailable = (visit: GuardedPageVisit<ScriptSearchVisit>): boolean =>
+  visit.kind === 'VISITED' && !visit.violation && (visit.value.siteUnavailable
+    || (visit.value.outcome.kind === 'RAN' && searchReadsNeedRecheck(visit.value.outcome.reads.map(({ status }) => status))));
+
 /** 対象の画面の候補の読み取り（読めなければ候補は null。DEF-136: サイトの不調だったか）。 */
 export interface TargetCandidates {
   readonly candidates: ReadCandidatePage | null;
@@ -902,15 +926,54 @@ export async function verifyReadCheck(
  * RB-11: 本物の READ の確かめの段の操作（factory の上の読み込みの部品）。READ の確かめの段の口と書き込みの段の口（照合の READ）が、この 1 か所を使う。
  */
 export const readCheckOperationsOf = (factory: BrowserContextFactory, pacer: NavigationPacer): Omit<ReadCheckSession, keyof StageSession> => ({
-  readListPageLinks: (url, options) => readListPageLinks(factory, pacer, url, options),
   readTargetCandidates: (pageUrl, options) => readTargetCandidates(factory, pacer, pageUrl, options),
   visitAndRead: (readCheck, confirmation, options, rowSelection) => executeReadCheck(factory, pacer, readCheck, confirmation, options, rowSelection),
   visitAndReadPage: (readCheck, options) => executePageReadCheck(factory, pacer, readCheck, options),
   visitAndReadRecordPage: (readCheck, recordId, options, rowSelection) => verifyRecordPageReadCheck(factory, pacer, readCheck, recordId, options, rowSelection),
+  runScriptSearch: (combo, options) => runScriptSearch(factory, pacer, combo, options),
 });
 
 /** RB-11: 本物の READ の確かめの段の口（今までの `runPreflight` と factory の上の読み込みの部品）。 */
 const PLAYWRIGHT_READ_CHECK_PORTS: ReadCheckPorts = playwrightStagePortsOf<ReadCheckSession>(readCheckOperationsOf);
+
+/** RCA-7: GET のフォームの組の、内部の定義（ID は人の定義と重ならない形 `#search-<順>`。期待は照らさない仮の 1 件。結果は状態の番号だけで判定する）。 */
+const formSearchReadCheckOf = (combo: Extract<WorkerStartSearchCheck, { readonly kind: 'FORM' }>, index: number): WorkerStartReadCheck => Object.freeze({
+  readCheckId: `#search-${String(index)}`,
+  readCheckRevision: 1,
+  targetPage: combo.page,
+  definition: Object.freeze({
+    targetIdentityDigest: combo.targetIdentityDigest,
+    // REV-RCA fix round 2: 文字の欄を変える組は、その欄に、組ごとに作る目印（半角か全角）を入れる（値は成果物に残さない）。
+    parameters: combo.change.kind === 'TEXT'
+      ? Object.freeze({ ...combo.parameters, [combo.change.field]: searchCheckTextOf(combo.change.text) })
+      : combo.parameters,
+    expectations: Object.freeze([Object.freeze({ kind: ROW_COUNT_AT_LEAST_EXPECTATION_KIND, count: 0 })]),
+  }),
+});
+
+/**
+ * RCA-7（検索の確かめの設計書 2.3）・REV-RCA の M-6: 定義（人の定義と、GET のフォームの組の内部の定義）の結果を記録するたびに、進み具合（確かめた数 N / 全部 M）を
+ * 送る結果の表。確かめた（`EXECUTED`）結果だけを数える（止まったときに残りを確かめなかった印で埋めても、数を一気に跳ばさない）。点検・操作さがしの数は使わない。
+ */
+class ProgressChecks extends Map<string, ReadCheckEvidence> {
+  readonly #onRecorded: (finished: number) => void;
+  #finished = 0;
+
+  constructor(onRecorded: (finished: number) => void) {
+    super();
+    this.#onRecorded = onRecorded;
+  }
+
+  override set(key: string, value: ReadCheckEvidence): this {
+    const added = !this.has(key);
+    super.set(key, value);
+    if (added && value.state === 'EXECUTED') {
+      this.#finished += 1;
+      this.#onRecorded(this.#finished);
+    }
+    return this;
+  }
+}
 
 /** 確かめる（ファイルの先頭の 2〜4）。 */
 async function check(
@@ -919,9 +982,31 @@ async function check(
   observer: ReadCheckRunObserver,
   jobAuditStage: JobAuditStage,
   onSafetyViolation: (violation: JobSafetyViolation) => void,
+  /** RCA-7: 検索の確かめの GET のフォームの組の内部の定義の ID（REV-RCA の M-1: 検索だけ開けないときに、フォームの画面を 1 回読む）。 */
+  searchReadIds: ReadonlySet<string> = new Set(),
+  /** REV-RCA の M-6: 進み具合の分母 M（人の定義と、始める前に除いた組を除く組の数。0 なら進み具合を送らない）。 */
+  progressTotal = 0,
+  /** RCA-7: スクリプトの組（`START` の順の位置つき。REV-RCA の I-4: 戻された組が先頭）と、その結果を書く表。 */
+  scriptCombos: readonly { readonly index: number; readonly combo: Extract<WorkerStartSearchCheck, { readonly kind: 'SCRIPT' }> }[] = [],
+  scriptEvidence: Map<number, SearchCheckEvidence> = new Map(),
+  /** REV-RCA の I-4: ログインし直す前のジョブで戻された組の鍵（なければ null）。その組でまた戻されたときだけ、2 回目の戻し。 */
+  bouncedSearchCheckKey: string | null = null,
+  /** REV-RCA の M-1: 確かめ直しの後も検索だけ開けなかった、GET のフォームの組の内部の定義の ID（ここに書く）。 */
+  notOpenedSearchReads: Set<string> = new Set(),
 ): Promise<CheckResult> {
   const { config, authentication, stopSignal, now } = request;
-  const checks = new Map<string, ReadCheckEvidence>();
+  const loadMeter = progressTotal > 0 && observer.onProgress !== undefined
+    ? createLoadMeter({ allowedOrigins: config.site.allowedOrigins, now })
+    : undefined;
+  /** 進み具合を送る（送れなくても確かめを止めない）。`startedAtMs` は、下でログインの後に決める。 */
+  let reportProgress: (finished: number) => void = () => undefined;
+  /** 確かめた数（定義と GET のフォームの組と、スクリプトの組）。 */
+  let readFinished = 0;
+  let scriptFinished = 0;
+  const checks: Map<string, ReadCheckEvidence> = new ProgressChecks((finished) => {
+    readFinished = finished;
+    reportProgress(readFinished + scriptFinished);
+  });
   const markRest = (reason: Exclude<ReadCheckEndReason, 'COMPLETED'>): void => {
     for (const readCheck of request.readChecks) {
       if (!checks.has(readCheck.readCheckId)) {
@@ -953,7 +1038,14 @@ async function check(
     createSafetyLedger: () => new SafetyLedger(),
     outputDirectory,
     // AS-b: 監査の段の送信の扱いが `PASS_EXCEPT_DELETE` のときだけ、口を渡す（承認したサービスの Origin はプロファイルのもの）。
-    contextFactoryOptions: { ...factoryOptions, ...auditSendOptionsOf(config, request.authentication.approvedTestOrigins), navigationPacer: pacer },
+    contextFactoryOptions: {
+      ...factoryOptions, ...auditSendOptionsOf(config, request.authentication.approvedTestOrigins), navigationPacer: pacer,
+      // RCA-7: 検索の確かめの進み具合の、サイトに送った要求の実績（操作さがしと同じ部品）。
+      ...(loadMeter === undefined ? {} : { loadMeter }),
+      // RCA-7 の Blocker の判断: スクリプトの組があるときだけ、操作さがしと同じ押す口にする（凍結・守り 2〜8・押す時点の確かめ・削除の判定は操作さがしと同じ）。
+      // 組がなければ、今の押さない口（`freezeOnlyForReading`）のまま。
+      ...(scriptCombos.length === 0 ? {} : { submissionProbeRun: true as const }),
+    },
   }, pacer);
   if (session === null) {
     // FM2d: factory がないので、状態は持ち越さない。
@@ -976,8 +1068,35 @@ async function check(
       // DEF-233（設計書 2.3）: 承認したサービスの Origin の 401 で描けなかった画面は、セッションの切れにする（READ の確かめのジョブだけ。書き込みのジョブの照合の
       // READ は渡さない）。
       serviceUnauthorizedSessionLoss: true,
+      // RCA-7: スクリプトの組の押下の後の最短の観察（テストだけが渡す）。
+      submissionProbeQuietWaitMs: observationWindowsOrProduction(request.observationWindows).afterPress.probeQuietWaitMs,
     };
     const startedAtMs = now();
+    // RCA-7（検索の確かめの設計書 2.3）: 進み具合は、確かめた組 N / 全部の組 M（ログインの後・最初の組の前に 0 / M、組を終えるたびに N / M）。経過は、この実行の
+    // 始めから。送れなくても確かめを止めない。
+    reportProgress = (finished: number): void => {
+      if (observer.onProgress === undefined || loadMeter === undefined) {
+        return;
+      }
+      try {
+        const paced = pacer.snapshot();
+        const returned: unknown = observer.onProgress(Object.freeze({
+          pagesFinished: finished,
+          pagesDiscovered: progressTotal,
+          elapsedMs: Math.max(0, now() - startedAtMs),
+          navigationCount: paced.navigationCount,
+          pacingWaitMs: paced.totalWaitMs,
+          requests: loadMeter.snapshot(),
+          recentPerMinute: loadMeter.recentPerMinute(),
+        }));
+        if (returned instanceof Promise) {
+          returned.catch(() => undefined);
+        }
+      } catch {
+        // 表示の失敗で、確かめを止めない。
+      }
+    };
+    reportProgress(0);
     // DEF-136: サイトの不調の確かめ直し（読み取りの監査の最初の待ちだけ待って 1 回。通ったら読み込みの間隔を 2 倍。知らせの URL は伏せ字を通す）。
     const siteRecheck = createJobSiteRecheck({
       delayMs: request.siteUnavailableRecheckDelayMs ?? JOB_SITE_UNAVAILABLE_RECHECK_DELAY_MS,
@@ -1006,8 +1125,6 @@ async function check(
      * 読み込みの間隔を待たずに閉じる（`pacingWaitBeforeClose`）。ほかの読み込みは、見せたまま待つ（既定）。
      */
     const optionsForLoad = (lastLoad: boolean): ReadCheckPageVisitOptions => (lastLoad ? { ...options, pacingWaitBeforeClose: false } : options);
-    /** DEF-235: 一覧の画面ごとの、読んだリンクの URL（同じ一覧の画面は、定義が複数あっても 1 回だけ読む）。 */
-    const listPageLinks = new Map<string, readonly string[]>();
     /** 止まるべき事象（違反・セッションの切れ）があれば、残りを確かめずに終える結果（なければ null）。 */
     const endedBy = (checked: { readonly violation: boolean; readonly sessionLostUrl: string | null; readonly sessionLostDetail: SessionLostDetail | null;
       readonly sessionLoss?: SessionLossEvidence | null; }): CheckResult | null => {
@@ -1023,93 +1140,81 @@ async function check(
       }
       return null;
     };
+    // RCA-6（検索の確かめの設計書 2.2）: DEF-235 の型の定義を段で番号を埋めて読む所は外した（親が型の定義を送らない。届いた型の定義は、今の画面の path の
+    // 読み方で URL を組み立てられず、読まずに止まる）。
     /**
-     * DEF-235（設計書 3.2）: 親が番号を渡さなかった型の定義の番号を、一覧の画面のリンクから探す（型に当たる番号を全部。一覧の画面が読めない・確かめ直しに通らない
-     * ときは空）。止まるべき事象があれば、その終わり方。
+     * RCA-7（検索の確かめの設計書 2.2）: スクリプトの組 1 つ。組の画面を新しく開いて凍結し、記録した押下をたどり直して、決まった値で動かす。止まるなら、その結果
+     * （なければ null）。REV-RCA の M-1: きっかけの読み取りが不調（429・502〜504・応答なし）なら 1 回だけ確かめ直し、まだ不調でも画面が開けていれば、検索だけ
+     * 開けない誤り（`NOT_OPENED`）。画面も開けなければ止める。REV-RCA の I-4: 戻された組でまた戻されたときだけ、2 回目の戻し（誤り）。
      */
-    const listedRecordIdsOf = async (template: string): Promise<{ readonly recordIds: readonly string[] } | { readonly ended: CheckResult }> => {
-      const listPath = readCheckListPagePathOf(template);
-      const startOrigin = startOriginOf(config);
-      const url = listPath === null ? null : listPageReadUrlOf(listPath, options);
-      if (url === null || startOrigin === null) {
-        return { recordIds: [] };
+    const runScriptCombo = async (index: number, combo: Extract<WorkerStartSearchCheck, { readonly kind: 'SCRIPT' }>): Promise<CheckResult | null> => {
+      const stopped = stopReason();
+      if (stopped !== null) {
+        return { endReason: stopped, checks };
       }
-      let urls = listPageLinks.get(url);
-      if (urls === undefined) {
-        const rechecked = await siteRecheck.visit(url, () => session.readListPageLinks(url, options), listVisitUnavailable);
-        const siteStop = siteStopOf(rechecked.kind);
-        if (siteStop !== null) {
-          markRest(siteStop);
-          return { ended: { endReason: siteStop, checks } };
-        }
-        const visit = rechecked.value;
-        const ended = endedBy({
-          violation: visit.violation,
-          sessionLostUrl: visit.kind === 'SESSION_LOST' ? visit.url : null,
-          sessionLostDetail: visit.kind === 'SESSION_LOST' ? visit.detail : null,
-          sessionLoss: visit.kind === 'SESSION_LOST' ? visit.sessionLoss : null,
-        });
-        if (ended !== null) {
-          return { ended };
-        }
-        urls = visit.kind === 'VISITED' ? visit.value.urls : [];
-        listPageLinks.set(url, urls);
-      }
-      return { recordIds: recordIdsOfLinkUrls(template, (link) => hasAllowedOrigin(link, new Set([startOrigin])), urls) };
-    };
-    /**
-     * DEF-235（設計書 3.1〜3.4。FIX-235 の読み替え）: 画面の path の型の定義を、番号を埋めて読む。番号は、親が渡した番号（元 1〜3 の全部）、なければ一覧の画面の
-     * リンクの番号の全部。どれもなければ `RECORD_ID_NOT_AVAILABLE`。番号ごとに、照合の READ と同じ確かめ直し（`verifyRecordPageReadCheck`）で 1 回ずつ読み、
-     * 結果を番号ごとに持つ（`readCheckRecordsEvidenceOf`）。自動の下書きが作った型の定義は「画面が開けた」で照らす（`pageOpenedEvidenceOf`）。番号の間でも、
-     * 止める要求・時間の上限・承認したサービスへの要求の上限を確かめる（読み込みの間隔は今の pacer のまま）。止まるべき事象があれば、その終わり方。
-     */
-    const checkTemplate = async (readCheck: WorkerStartReadCheck, template: string, lastGroup: boolean): Promise<CheckResult | null> => {
-      let recordIds: readonly string[] = readCheck.recordIds ?? [];
-      if (recordIds.length === 0) {
-        const listed = await listedRecordIdsOf(template);
-        if ('ended' in listed) {
-          return listed.ended;
-        }
-        recordIds = listed.recordIds;
-      }
-      if (recordIds.length === 0) {
-        checks.set(readCheck.readCheckId, decidedEvidence(readCheck, 'RECORD_ID_NOT_AVAILABLE'));
+      const pageUrl = pageUrlOf(combo.page);
+      const base = searchCheckEvidenceBaseOf(combo);
+      const recordScript = (evidence: SearchCheckEvidence): void => {
+        scriptEvidence.set(index, evidence);
+        scriptFinished += 1;
+        reportProgress(readFinished + scriptFinished);
+      };
+      const verdictOf = (observation: Partial<SearchCheckObservation>): SearchCheckEvidence => Object.freeze({
+        ...base,
+        state: 'EXECUTED' as const,
+        ...searchCheckVerdictOf({
+          kind: 'SCRIPT', documentStatus: null, reads: [], unsentHiddenFields: false, emptyValue: combo.text === 'EMPTY', blockedByBeakSight: false, loginBouncedAgain: false,
+          searchNotOpened: false, stateNotRebuilt: false, auditStageDetail: null, ...observation,
+        }),
+        httpStatus: null,
+        reads: Object.freeze([...(observation.reads ?? [])]),
+      });
+      if (session.runScriptSearch === undefined) {
+        recordScript(verdictOf({ stateNotRebuilt: true }));
         return null;
       }
-      const pageOpened = isPageOpenedReadCheckDefinition(readCheck.definition);
-      const results: ReadCheckExecutedEvidence[] = [];
-      const save = (): void => {
-        if (results.length > 0) {
-          checks.set(readCheck.readCheckId, readCheckRecordsEvidenceOf(results));
-        }
-      };
-      const noticeUrl = readCheck.targetPage === null ? '' : pageUrlOf(readCheck.targetPage);
-      for (const [index, recordId] of recordIds.entries()) {
-        const stoppedBetween = index === 0 ? null : stopReason();
-        if (stoppedBetween !== null) {
-          save();
-          markRest(stoppedBetween);
-          return { endReason: stoppedBetween, checks };
-        }
-        const recordOptions = optionsForLoad(lastGroup && index === recordIds.length - 1);
-        const rechecked = await siteRecheck.visit(noticeUrl, () => session.visitAndReadRecordPage(readCheck, recordId, recordOptions), checkedUnavailable);
-        const siteStop = siteStopOf(rechecked.kind);
-        if (siteStop !== null) {
-          save();
-          markRest(siteStop);
-          return { endReason: siteStop, checks };
-        }
-        const executed = rechecked.value;
-        results.push(pageOpened ? pageOpenedEvidenceOf(executed.evidence) : executed.evidence);
-        if (executed.violation || executed.sessionLostUrl !== null) {
-          // 違反・セッションの切れで止まった定義は、読んだ分の結果を持つ（先に記録する。`markRest` は、結果のない定義だけを確かめなかったにする）。
-          save();
-          return endedBy(executed);
-        }
+      const runScript = session.runScriptSearch;
+      const rechecked = await siteRecheck.visit(pageUrl, () => runScript(combo, options), scriptVisitUnavailable);
+      const visit = rechecked.value;
+      if (rechecked.kind === 'SITE_UNAVAILABLE' && visit.kind === 'VISITED' && !visit.violation && !visit.value.siteUnavailable) {
+        recordScript(verdictOf({ searchNotOpened: true }));
+        return null;
       }
-      save();
+      const siteStop = siteStopOf(rechecked.kind);
+      if (siteStop !== null) {
+        return { endReason: siteStop, checks };
+      }
+      if (visit.violation) {
+        return { endReason: 'SAFETY_VIOLATION', checks };
+      }
+      if (visit.kind === 'SESSION_LOST') {
+        // 戻された組でまた切れたら、2 回目の戻し（誤り）。ほかは確かめなかった（ログインし直した後に、この組を最初にやり直す）。
+        if (combo.key === bouncedSearchCheckKey) {
+          recordScript(verdictOf({ loginBouncedAgain: true }));
+        }
+        observer.onSessionLost(redactUrlSecrets(visit.url), visit.sessionLoss);
+        return { endReason: 'AUTH_SESSION_LOST', checks, endReasonDetail: visit.detail, sessionLoss: visit.sessionLoss, sessionLostScriptIndex: index };
+      }
+      if (visit.kind !== 'VISITED') {
+        recordScript(verdictOf({ stateNotRebuilt: true }));
+        return null;
+      }
+      const { outcome } = visit.value;
+      const auditStageDetail = visit.auditStageObservation === null ? null : readCheckAuditStageDetailOf(visit.auditStageObservation);
+      recordScript(outcome.kind === 'RAN'
+        ? verdictOf({ reads: outcome.reads.map((fact) => searchReadRecordOf(fact, { pagePath: combo.page.path, markers: [] })), auditStageDetail })
+        : verdictOf(outcome.kind === 'BLOCKED' ? { blockedByBeakSight: true } : { stateNotRebuilt: true }));
       return null;
     };
+    // REV-RCA の I-4: 戻された組がスクリプトの組なら、人の定義とフォームの組より先に動かす（フォームの組なら、呼ぶ側が定義の先頭に置いた）。
+    const bouncedScript = scriptCombos.find(({ combo }) => combo.key === bouncedSearchCheckKey);
+    if (bouncedScript !== undefined) {
+      const ended = await runScriptCombo(bouncedScript.index, bouncedScript.combo);
+      if (ended !== null) {
+        markRest(ended.endReason === 'COMPLETED' ? 'STOPPED' : ended.endReason);
+        return ended;
+      }
+    }
     const groups = groupByPage(request.readChecks);
     for (const [groupIndex, group] of groups.entries()) {
       const lastGroup = groupIndex === groups.length - 1;
@@ -1117,14 +1222,6 @@ async function check(
       if (stopped !== null) {
         markRest(stopped);
         return { endReason: stopped, checks };
-      }
-      const template = group.kind === 'PAGE' ? group.readCheck.definition.targetPagePath ?? '' : '';
-      if (group.kind === 'PAGE' && isReadCheckPageTemplatePath(template)) {
-        const ended = await checkTemplate(group.readCheck, template, lastGroup);
-        if (ended !== null) {
-          return ended;
-        }
-        continue;
       }
       if (group.kind === 'PAGE') {
         // T37d: 画面の path の定義は、1 定義あたり読み込み 1 回（候補の画面の読み込みはしない）。DEF-136: 不調なら 1 回だけ確かめ直す。
@@ -1196,6 +1293,20 @@ async function check(
         const readOptions = optionsForLoad(lastGroup && index === group.readChecks.length - 1);
         const rechecked = await siteRecheck.visit(pageUrl, () => session.visitAndRead(readCheck, confirmation, readOptions), checkedUnavailable);
         const siteStop = siteStopOf(rechecked.kind);
+        if (siteStop === 'SITE_UNAVAILABLE' && searchReadIds.has(readCheck.readCheckId)) {
+          // REV-RCA の M-1（検索の確かめの設計書 2.2）: GET のフォームの組の検索が、確かめ直しの後も不調なら、フォームの画面を 1 回読む。画面は開けて検索だけ開けなければ
+          // 誤り（`NOT_OPENED`）にして続ける。画面も開けなければ、今どおり止める。
+          const formPage = await session.readTargetCandidates(pageUrl, options);
+          if (formPage.violation) {
+            markRest('SAFETY_VIOLATION');
+            return { endReason: 'SAFETY_VIOLATION', checks };
+          }
+          if (formPage.kind === 'VISITED' && !candidateVisitUnavailable(formPage) && formPage.value.candidates !== null) {
+            notOpenedSearchReads.add(readCheck.readCheckId);
+            checks.set(readCheck.readCheckId, rechecked.value.evidence);
+            continue;
+          }
+        }
         if (siteStop !== null) {
           markRest(siteStop);
           return { endReason: siteStop, checks };
@@ -1214,6 +1325,14 @@ async function check(
         }
       }
     }
+    // RCA-7（検索の確かめの設計書 2.2）: スクリプトの組（押下・入力）。GET のフォームの組の後に（REV-RCA の I-4: 戻された組は最初に）、組ごとに動かす。
+    for (const { index, combo } of scriptCombos) {
+      if (scriptEvidence.has(index)) continue;
+      const ended = await runScriptCombo(index, combo);
+      if (ended !== null) {
+        return ended;
+      }
+    }
     return { endReason: 'COMPLETED', checks };
   } finally {
     await session.close();
@@ -1229,7 +1348,7 @@ async function check(
 export async function executeReadCheckRun(request: ReadCheckRunRequest, observer: ReadCheckRunObserver): Promise<ReadCheckRunOutcome> {
   const outputDirectory = resolve(request.config.output.directory);
   const writer = new ArtifactWriter({ urlSecretRedaction: true });
-  const run = await startWorkerRun(outputDirectory, request.clock);
+  const run = await startWorkerRun(outputDirectory, request.config.target.id, request.clock);
   if (run.kind !== 'STARTED') {
     return run;
   }
@@ -1242,16 +1361,75 @@ export async function executeReadCheckRun(request: ReadCheckRunRequest, observer
     const jobAuditStage = jobContextFactoryOptions(request.authentication, request.now, 'REGISTERED', request.stageCarry?.serviceRequestWindowMs ?? []);
     // DEF-144: 止まるきっかけの違反の中身（最初の 1 件）。
     const violations: { first: JobSafetyViolation | null } = { first: null };
-    const checked = await check(request, outputDirectory, observer, jobAuditStage, (violation) => {
-      violations.first ??= violation;
-    });
+    // RCA-7（検索の確かめの設計書 2.2）: GET のフォームの組は、定義の READ と同じ手順（候補の確かめ・URL の組み立て・要求の判定・読み込み・DEF-136 の確かめ直し）で
+    // 読む（新しい送り方を作らない）。組ごとに内部の定義を作り、人の定義の後に並べる（組の数が進み具合の分母）。
+    const searchChecks = request.searchChecks ?? [];
+    // REV-RCA の M-6: 読んでよい URL でない画面の組は、始める前に除く（守りが止めた組として残し、進み具合の分母 M に入れない）。
+    const allowed = searchChecks.map((combo) => isReadUrlAllowed(pageUrlOf(combo.page), request.config, request.authentication));
+    const formReads = searchChecks.map((combo, index) => (combo.kind === 'FORM' && allowed[index] === true ? formSearchReadCheckOf(combo, index) : null));
+    // REV-RCA の I-4: ログインし直す前に戻された組を、最初に確かめる（フォームの組は定義の先頭へ、スクリプトの組は `check` が最初に動かす）。
+    const bouncedKey = request.bouncedSearchCheckKey ?? null;
+    const bouncedIndex = bouncedKey === null ? -1 : searchChecks.findIndex(({ key }) => key === bouncedKey);
+    const bouncedFormRead = formReads[bouncedIndex] ?? null;
+    // RCA-7: スクリプトの組（押下・入力）は、GET のフォームの組の後に、組ごとに画面を開いて動かす。
+    const scriptCombos = searchChecks.flatMap((combo, index) => (combo.kind === 'SCRIPT' && allowed[index] === true ? [{ index, combo }] : []));
+    const scriptEvidence = new Map<number, SearchCheckEvidence>();
+    const notOpenedSearchReads = new Set<string>();
+    const otherFormReads = formReads.flatMap((read) => (read === null || read === bouncedFormRead ? [] : [read]));
+    const checked = await check(
+      { ...request, readChecks: [...(bouncedFormRead === null ? [] : [bouncedFormRead]), ...request.readChecks, ...otherFormReads] },
+      outputDirectory,
+      observer,
+      jobAuditStage,
+      (violation) => {
+        violations.first ??= violation;
+      },
+      new Set(formReads.flatMap((read) => (read === null ? [] : [read.readCheckId]))),
+      request.readChecks.length + allowed.filter((entry) => entry).length,
+      scriptCombos,
+      scriptEvidence,
+      bouncedKey,
+      notOpenedSearchReads,
+    );
     // DEF-143: ここから成果物を組み立てて書く段。入る前に 1 回だけ知らせる。
     observer.onFinalizing?.();
     const checks =request.readChecks.flatMap(({ readCheckId }) => {
       const evidence = checked.checks.get(readCheckId);
       return evidence === undefined ? [] : [evidence];
     });
-    const base = { endReason: checked.endReason, checks };
+    // RCA-7: 組の結果（`START` の順）。REV-RCA の I-4: 戻された組でまたログインが切れたら、2 回目の戻し（誤り）。
+    const searchEvidence = searchChecks.map((combo, index): SearchCheckEvidence => {
+      if (allowed[index] !== true) {
+        return Object.freeze({
+          ...searchCheckEvidenceBaseOf(combo), state: 'EXECUTED', result: SEARCH_CHECK_DETAIL_RESULTS.BLOCKED_BY_BEAKSIGHT, detail: 'BLOCKED_BY_BEAKSIGHT',
+          httpStatus: null, reads: [],
+        });
+      }
+      const read = formReads[index];
+      const evidence = read === null || read === undefined ? undefined : checked.checks.get(read.readCheckId);
+      if (combo.kind === 'FORM' && read !== null && read !== undefined && evidence !== undefined) {
+        return formSearchCheckEvidenceOf(combo, evidence, combo.key === bouncedKey, notOpenedSearchReads.has(read.readCheckId));
+      }
+      const script = scriptEvidence.get(index);
+      if (script !== undefined) {
+        return script;
+      }
+      // 止まった後に残った組は、確かめなかった（理由はジョブの終わり方）。最後まで行ったのに結果のない組（内部の定義が結果を持たない）は、動かせなかった。
+      return checked.endReason === 'COMPLETED'
+        ? Object.freeze({ ...searchCheckEvidenceBaseOf(combo), state: 'EXECUTED', result: 'UNDETERMINED', detail: 'STATE_NOT_REBUILT', httpStatus: null, reads: [] })
+        : Object.freeze({ ...searchCheckEvidenceBaseOf(combo), state: 'NOT_EXECUTED', reason: checked.endReason });
+    });
+    const base = { endReason: checked.endReason, checks, searchChecks: searchEvidence };
+    // REV-RCA の I-4: セッションが切れたときに確かめていた組の鍵（フォームの組は、その内部の定義が切れの結果を持つ。スクリプトの組は、その位置）。
+    const sessionLostSearchCheckKey = checked.endReason !== 'AUTH_SESSION_LOST'
+      ? undefined
+      : checked.sessionLostScriptIndex !== undefined
+        ? searchChecks[checked.sessionLostScriptIndex]?.key
+        : searchChecks.find((_combo, index) => {
+          const read = formReads[index];
+          const evidence = read === null || read === undefined ? undefined : checked.checks.get(read.readCheckId);
+          return evidence?.state === 'EXECUTED' && evidence.detail === 'SESSION_LOST';
+        })?.key;
     const { state } = jobAuditStage;
     const document: ReadEvidenceDocument = {
       schemaVersion: READ_EVIDENCE_ARTIFACT_SCHEMA_VERSION,
@@ -1261,6 +1439,7 @@ export async function executeReadCheckRun(request: ReadCheckRunRequest, observer
       finishedAt: formatCompactUtcTimestamp(request.clock(), READ_CHECK_TIME_SUBJECT),
       runStatus: readEvidenceRunStatusOf(base),
       ...base,
+      ...(sessionLostSearchCheckKey === undefined ? {} : { sessionLostSearchCheckKey }),
       ...(checked.endReasonDetail === undefined || checked.endReasonDetail === null ? {} : { endReasonDetail: checked.endReasonDetail }),
       ...(state === null ? {} : { authentication: runAuthenticationSummaryOf(state) }),
       // DEF-138: セッションの切れで止まったときの証拠（組み立てられたときだけ）。

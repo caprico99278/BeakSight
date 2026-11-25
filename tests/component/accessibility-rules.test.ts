@@ -12,6 +12,7 @@ import type {
   NormalizedHttpUrlEvidence,
 } from '../../src/core/evidence-types.js';
 import { createEvidenceId, createPageId } from '../../src/core/ids.js';
+import { DISABLED_STATE_TEXT } from '../../src/presentation/messages.js';
 
 const PAGE_ID = createPageId(5);
 const PAGE_URL = 'http://127.0.0.1:4173/accessibility-rules/page' as NormalizedHttpUrlEvidence;
@@ -155,7 +156,9 @@ describe('COLOR_CONTRAST_VIOLATION', () => {
     const drafts = contrastRule().evaluate(input([record]));
     expect(drafts).toHaveLength(1);
     expect(identity(drafts[0], 'target')).toBe('["#visual-only"]');
-    expect(drafts[0]?.message).toContain('無効の状態を支援技術に伝えていません');
+    // AUD-6（S-09）: `cursor: not-allowed` だけの要素は、見た目の指定の事実の記録で、無効とは書かない。
+    expect(drafts[0]?.message).toContain('確かめていません');
+    expect(drafts[0]?.message).not.toContain('無効');
   });
 
   it('EV-1: 色から計算した丸める前の比と基準を文に出し、境目に近い値も基準に届いたと丸めない', () => {
@@ -263,6 +266,15 @@ describe('A11Y_ の Rule', () => {
     const record = accessibilityRecord([axeRule('image-alt', 'critical', [node(['img'])])], { viewport: 'mobile' });
     expect(axeViolationRule().evaluate(input([record]))).toEqual([]);
   });
+
+  it('RVP-4: 名前の規則の対象が無効の状態なら、無効の状態で見つけた文を足す（重さは変えない）', () => {
+    const named = (selector: string, axDisabled: boolean): AccessibilityNodeEvidence => ({
+      ...node([selector], 'critical'),
+      nameContext: { status: 'READ', axName: null, axRole: 'button', axDisabled, nameSource: null, labelSegments: [] },
+    });
+    const drafts = axeViolationRule().evaluate(input([accessibilityRecord([axeRule('button-name', 'critical', [named('#off', true), named('#on', false)])])]));
+    expect(drafts.map((draft) => [draft.severity, draft.message.includes(DISABLED_STATE_TEXT.nameRuleDisabledNote)])).toEqual([['ERROR', true], ['ERROR', false]]);
+  });
 });
 
 describe('ACCESSIBILITY_RULES と Rule Engine', () => {
@@ -293,7 +305,8 @@ describe('AUD-9a: axe の Finding の groupingKeys', () => {
     const result = new RuleEngine({ targetId: 'a11y-grouping', firstFindingSequence: 1, catalog: [axeViolationRule()] })
       .evaluate(input([record]));
     expect(result.failures).toEqual([]);
-    expect(result.findings.map((finding) => JSON.stringify(finding.groupingKeys)).sort()).toEqual([
+    // DEF-297: 後ろに丸めた対象の鍵（`roundedTarget`）も付くので、target の鍵だけを見る。
+    expect(result.findings.map((finding) => JSON.stringify(finding.groupingKeys?.filter(({ name }) => name === 'target'))).sort()).toEqual([
       JSON.stringify([{ name: 'target', value: JSON.stringify(['#hero > img']) }]),
       JSON.stringify([{ name: 'target', value: JSON.stringify([['iframe', '#inner']]) }]),
     ].sort());

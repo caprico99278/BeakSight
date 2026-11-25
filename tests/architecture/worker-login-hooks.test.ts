@@ -66,6 +66,8 @@ const OBSERVATION_WINDOWS_USERS: readonly string[] = [
   'src/orchestration/page-auditor.ts',
   'src/browser/context-factory.ts',
   'src/worker/discovery-run.ts',
+  // RCA-7（検索の確かめの設計書 2.2）: 見るだけの確かめの流れの受け口（スクリプトの組の押下の後の最短の観察）。
+  'src/worker/read-check-run.ts',
   // RB-8 の残り（RB-12 で行った）: 1 画面の読み込みの受け口（`GuardedPageLoadOptions.observationWindows`。進行中の要求の数え方の本文の猶予）。
   'src/worker/worker-run-session.ts',
   'src/worker/write-create-run.ts',
@@ -116,12 +118,21 @@ const CLICK_OPERATION = /^\.\s*click\s*\($/u;
 /**
  * (q) キーを押すことだけの例外（EV-4。設計書 `2026-11-16-beaksight-finding-evidence-design.md` 3.4）: 横にスクロールする領域の実操作（Tab で届くか・矢印の
  * キーで動くか）。値を入れる要素は起点にせず、そこへフォーカスが来たら止める。押してよいキーは `KEY_PRESS_ALLOWED_KEYS` だけ（文字・Enter・Space は許さない）。
+ * FRET: 窓を開くボタンの確かめだけは、別の閉じた一覧 `DIALOG_KEY_ALLOWED_KEYS`（Enter・Esc）も押す（同じ 1 か所。文字・Space は許さない）。
  * 押す所は `.keyboard.press(key)` の 1 か所で、その引数は、ファイルの中のキーの一覧 `SCROLLABLE_REGION_KEYS` の型（一覧の外は押さずに投げる）。
  */
 const KEY_PRESS_ONLY_EXCEPTION_PATH = 'src/evidence/reveal-and-capture.ts';
 const KEY_PRESS_OPERATION = /^(?:\.\s*press\s*\(|keyboard)$/u;
 const KEY_PRESS_ALLOWED_KEYS: readonly string[] = ['Tab', 'Shift+Tab', 'ArrowRight', 'ArrowLeft', 'ArrowDown', 'ArrowUp'];
 const KEY_PRESS_KEY_LIST = /\bSCROLLABLE_REGION_KEYS\s*=\s*Object\.freeze\(\[([^\]]*)\]/u;
+/**
+ * FRET（設計書 `2026-11-24-beaksight-dialog-focus-return-design.md` 1.2）: 窓を開くボタンの確かめの、別の閉じた一覧のキー（押す物と閉じるボタンを押す Enter と、窓を
+ * 閉じる Esc。押す所は同じ 1 か所）。押す物は、送信の要素・リンク・危ない語の名前・値を入れる要素を除いた、窓を開くボタンだけ。
+ */
+const DIALOG_KEY_ALLOWED_KEYS: readonly string[] = ['Enter', 'Escape'];
+const DIALOG_KEY_LIST = /\bDIALOG_CHECK_KEYS\s*=\s*Object\.freeze\(\[([^\]]*)\]/u;
+/** FRET: `pressDialogCheckKey` を使ってよい、ただ 1 つのファイル。 */
+const DIALOG_KEY_PRESS_USER_PATH = 'src/interaction/dialog-focus-check.ts';
 const KEY_PRESS_CALL = /\.\s*press\s*\(([^)]*)\)/gu;
 /** (x) 入力の部品を参照してよいファイル（自動ログインの段）。 */
 const AUTOMATED_LOGIN_PATH = 'src/worker/automated-login.ts';
@@ -248,8 +259,13 @@ describe('Worker login hooks (T25d) and the single form input owner (T26d-1)', (
     const listed = [...(KEY_PRESS_KEY_LIST.exec(keyOwner)?.[1] ?? '').matchAll(/'([^']*)'/gu)].map((match) => match[1]);
     expect(listed).toEqual(KEY_PRESS_ALLOWED_KEYS);
     expect([...keyOwner.matchAll(KEY_PRESS_CALL)].map((match) => (match[1] ?? '').trim())).toEqual(['key']);
+    expect([...(DIALOG_KEY_LIST.exec(keyOwner)?.[1] ?? '').matchAll(/'([^']*)'/gu)].map((match) => match[1])).toEqual(DIALOG_KEY_ALLOWED_KEYS);
     expect(keyOwner).toMatch(/type ScrollableRegionKey = \(typeof SCROLLABLE_REGION_KEYS\)\[number\];/u);
-    expect(keyOwner).toMatch(/const pressRegionKey = \(page: KeyboardRevealPage, key: ScrollableRegionKey\)/u);
+    expect(keyOwner).toMatch(/type DialogCheckKey = \(typeof DIALOG_CHECK_KEYS\)\[number\];/u);
+    expect(keyOwner).toMatch(/const pressRegionKey = \(page: KeyboardRevealPage, key: ScrollableRegionKey \| DialogCheckKey\)/u);
+    // FRET: Enter と Esc を押す口を使うのは、窓を開くボタンの確かめの部品だけ（押す物の判定と押す期間の止めを通る所）。
+    expect(SOURCE_FILES.filter(({ path, bare }) => path !== KEY_PRESS_ONLY_EXCEPTION_PATH && /\bpressDialogCheckKey\b/u.test(bare)).map(({ path }) => path))
+      .toEqual([DIALOG_KEY_PRESS_USER_PATH]);
     // click の例外のファイルが、実際に click を使う（例外の一覧が古くなっていない）。
     for (const clickPath of CLICK_ONLY_EXCEPTION_PATHS) {
       const clickOwner = SOURCE_FILES.find(({ path }) => path === clickPath);

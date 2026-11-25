@@ -87,7 +87,7 @@ const withWrite = (overrides: Record<string, unknown>): Record<string, unknown> 
 
 describe('T30e: the write job messages and lists', () => {
   it('raises the protocol version and adds the message types at the end of each direction', () => {
-    expect(WORKER_PROTOCOL_VERSION).toBe('beaksight-worker-message/9'); // WSO: チェックした画面だけの段の並びと読む画面で版 9。DEF-200: ログインし直す段の指定（`RELOGIN_STAGE`）と、自動ログインの段の通した一覧（DEF-194）で版 8。 OP-2: 書き込みの段で版 4。DEF-180: 前の読み込みの時刻で版 5。OP-H: チェックした画面の数で版 6。OP-L: 保存できなかった理由で版 7
+    expect(WORKER_PROTOCOL_VERSION).toBe('beaksight-worker-message/10'); // RCA-5・6: 検索の確かめの組で版 10。WSO: チェックした画面だけの段の並びと読む画面で版 9。DEF-200: ログインし直す段の指定（`RELOGIN_STAGE`）と、自動ログインの段の通した一覧（DEF-194）で版 8。 OP-2: 書き込みの段で版 4。DEF-180: 前の読み込みの時刻で版 5。OP-H: チェックした画面の数で版 6。OP-L: 保存できなかった理由で版 7
     // ML-a: 「ログインを終えた」（`LOGIN_CONFIRMED`）を、親 → 子の最後に足した。FM2d: まとめて実行の `NEXT_STAGE`・`CHAIN_END` を、その後に足した。
     // OP-1: ログインの直後の登録の往復（`CREDENTIAL_SAVE_ALLOWED`・`LOGIN_REGISTERED`・`LOGIN_REGISTRATION_SKIPPED`、子 → 親の `CREDENTIAL_SAVED`）を、それぞれの最後に足した。
     expect(PARENT_TO_WORKER_MESSAGE_TYPES).toEqual([

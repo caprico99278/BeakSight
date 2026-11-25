@@ -2,7 +2,8 @@
 // を本物の `fork` で起動する（本物のワーカーと Chromium での確かめは `control-audit-jobs-worker.test.ts`）。
 // - 開始の直前の検証し直し（I08）: 依頼の形、プロファイルがない、取り消した、改訂の不一致、実行できないモード、受けないパス（ファイルを読まない）、
 //   ターゲット設定を読めない、`validateSiteProfile` を通らない。どれも行を作らず、ワーカーを起動しない（起動の回数で確かめる）。
-// - 同時に 1 つ: 同じ process の中で 2 つの開始をほぼ同時に送ると、片方だけが成功する。
+// - サイトごとに同時に 1 つ（PAR-b）: 同じプロファイルの 2 つの開始をほぼ同時に送ると、片方だけが成功する。別のサイトは同時に始まり、許可 Origin が
+//   重なるほかのプロファイルと、空きメモリが足りない 2 本目は拒む。
 // - IPC: `START` の値、`RUN_STARTED` → `RUNNING`、`PROGRESS`（最短の間隔で間引いた最後の値）と `NOTICE`、`FINISHED`、`FAILED`。
 // - 信頼の境界: 形の違うメッセージ、順の違うメッセージ → `FAILED`（`PROTOCOL_VIOLATION`）とワーカーの停止。`READY` が来ない、`HEARTBEAT` が止まる。
 // - 停止: `STOP` → `STOPPING` → 結果、強制 → 終了コード 5、強制の後も終わらない → kill（`STOP_TIMEOUT`）。
@@ -23,6 +24,7 @@ import {
   type AuditJobContextResolver,
   type AuditJobManager,
   type AuditJobManagerOptions,
+  type AuditJobStartRequest,
   type AuditJobTiming,
   type AuditWorkerForker,
 } from '../../src/control/job/audit-job-manager.js';
@@ -46,11 +48,16 @@ import {
   waitForJob,
 } from '../helpers/job-test-support.js';
 import {
+  DRIFTED_CONTEXT,
+  PROFILE_CONTEXT,
   PUBLIC_TARGET_PATH,
+  SECOND_PUBLIC_TARGET_PATH,
+  TEST_ORIGIN,
   publicProfile,
   resolveTestContext,
   testAuthProfile,
 } from './control-profile-fixtures.js';
+import { createTestConfig } from '../helpers/test-config.js';
 
 const FAKE_RUN_ID = 'RUN-20261009000000';
 /** このジョブの Run ではない、別の Run の ID（T24h-1 の M1）。 */
@@ -90,6 +97,8 @@ const managerWith = (
     readonly onUnexpectedWorkerExit?: AuditJobManagerOptions['onUnexpectedWorkerExit'];
     /** RB-2: ジョブの管理の時計。 */
     readonly now?: AuditJobManagerOptions['now'];
+    /** PAR-b: 端末のメモリの読み取り（省略は、テストの補助の足りる値）。 */
+    readonly machineMemory?: AuditJobManagerOptions['machineMemory'];
   } = {},
 ): AuditJobManager => {
   manager = createFakeWorkerJobManager({
@@ -101,6 +110,7 @@ const managerWith = (
     ...(options.timing === undefined ? {} : { timing: options.timing }),
     ...(options.onUnexpectedWorkerExit === undefined ? {} : { onUnexpectedWorkerExit: options.onUnexpectedWorkerExit }),
     ...(options.now === undefined ? {} : { now: options.now }),
+    ...(options.machineMemory === undefined ? {} : { machineMemory: options.machineMemory }),
   });
   return manager;
 };
@@ -307,6 +317,68 @@ describe('audit jobs: one job at a time', () => {
       workerPath: join(workDirectory, 'fake-worker-hold.mjs'),
       resolveContext: resolveTestContext,
     })).toThrow(/only one audit job manager/u);
+  });
+});
+
+// PAR-b（設計書 `2026-11-17-beaksight-parallel-site-audits-design.md` 2 章・4 章）: ジョブはサイトごとに同時に 1 つ。別のサイトのジョブは同時に始まり、
+// 同じプロファイルと、許可 Origin が重なるほかのプロファイルは拒む。2 本目からは、端末の空きメモリが足りなければ拒む（1 本目は確かめない）。
+describe('audit jobs: one job per site at a time (PAR-b)', () => {
+  const OTHER_SITE_PROFILE_ID = 'example-job-other-site';
+  const SAME_SITE_PROFILE_ID = 'example-job-same-site';
+  /** 2 つ目のターゲット設定は、別のサイト（`DRIFTED_CONTEXT`。許可 Origin が重ならない）。ほかは今のサイト。 */
+  const siteResolver = (path: string): ReturnType<typeof resolveTestContext> => (path === SECOND_PUBLIC_TARGET_PATH ? DRIFTED_CONTEXT : resolveTestContext(path));
+  const startOf = (profileId: string): AuditJobStartRequest => ({ ...START_REQUEST, profileId });
+  const GIB = 1024 ** 3;
+  const LOW_MEMORY = { freeBytes: 0, totalBytes: 16 * GIB };
+  const ENOUGH_MEMORY = { freeBytes: 16 * GIB, totalBytes: 16 * GIB };
+
+  beforeEach(() => {
+    writeFileSync(join(workDirectory, SECOND_PUBLIC_TARGET_PATH), TARGET_CONFIG_TEXT, 'utf8');
+    expect(createProfile(database, publicProfile(OTHER_SITE_PROFILE_ID, MIN_PROFILE_REVISION, SECOND_PUBLIC_TARGET_PATH), { resolveContext: siteResolver }).ok).toBe(true);
+    expect(createProfile(database, publicProfile(SAME_SITE_PROFILE_ID, MIN_PROFILE_REVISION), { resolveContext: siteResolver }).ok).toBe(true);
+  });
+
+  it('starts the jobs of two sites, refuses the same profile and another profile of the same site, and leaves the running job as it is', async () => {
+    const jobManager = managerWith(fakeWorker('hold'), { resolver: siteResolver });
+    const first = await startedJob(jobManager);
+    await waitForJob(jobManager, first.jobId, (job) => job.state === 'RUNNING');
+
+    const other = await jobManager.startAuditJob(startOf(OTHER_SITE_PROFILE_ID));
+    expect(other.ok).toBe(true);
+    expect(await jobManager.startAuditJob(START_REQUEST)).toMatchObject({ ok: false, reason: 'JOB_ALREADY_ACTIVE' });
+    expect(await jobManager.startAuditJob(startOf(SAME_SITE_PROFILE_ID))).toMatchObject({ ok: false, reason: 'SITE_ALREADY_ACTIVE' });
+    expect(forks.count()).toBe(2);
+    // PAR-c: 開始の画面の押す前の確かめも、同じ判定（同じプロファイルは今どおり画面で止めない）。
+    expect(jobManager.startConcurrencyBlockerOf(SAME_SITE_PROFILE_ID, PROFILE_CONTEXT.targetConfig.site.allowedOrigins)).toBe('SITE_ALREADY_ACTIVE');
+    expect(jobManager.startConcurrencyBlockerOf(PROFILE_ID, PROFILE_CONTEXT.targetConfig.site.allowedOrigins)).toBeNull();
+    await waitForJob(jobManager, other.ok ? other.job.jobId : '', (job) => job.state === 'RUNNING');
+    // ほかの開始の前の、はぐれた記録の締め（前の画面のサーバのジョブを中断に直す）は、動いているジョブに触れない。
+    expect(jobManager.getAuditJob(first.jobId)).toMatchObject({ state: 'RUNNING', finishedAt: null });
+  });
+
+  // REV-PAR の I-1・m-2: 動いている側の許可 Origin が正規の形でない（末尾の `/`）・`www.` の有無だけが違うときも、同じサイトとして拒む。
+  it.each([
+    ['a trailing slash (I-1)', { ...PROFILE_CONTEXT.targetConfig, site: { ...PROFILE_CONTEXT.targetConfig.site, allowedOrigins: [`${TEST_ORIGIN}/`] } }],
+    ['www (m-2)', createTestConfig(TEST_ORIGIN.replace('https://', 'https://www.'))],
+  ])('refuses another profile of the same site whose running job has the allowed origin with %s', async (_name, targetConfig) => {
+    const jobManager = managerWith(fakeWorker('hold'), { resolver: (path) => (path === SECOND_PUBLIC_TARGET_PATH ? { targetConfig } : resolveTestContext(path)) });
+    const running = await jobManager.startAuditJob(startOf(OTHER_SITE_PROFILE_ID));
+    await waitForJob(jobManager, running.ok ? running.job.jobId : '', (job) => job.state === 'RUNNING');
+
+    expect(await jobManager.startAuditJob(START_REQUEST)).toMatchObject({ ok: false, reason: 'SITE_ALREADY_ACTIVE' });
+    expect(forks.count()).toBe(1);
+  });
+
+  it('refuses a second job while the free memory of the machine is low, but not the first one', async () => {
+    let memory = LOW_MEMORY;
+    const jobManager = managerWith(fakeWorker('hold'), { resolver: siteResolver, machineMemory: () => memory });
+    await startedJob(jobManager);
+
+    expect(await jobManager.startAuditJob(startOf(OTHER_SITE_PROFILE_ID))).toMatchObject({ ok: false, reason: 'MACHINE_MEMORY_LOW' });
+    expect(jobManager.startConcurrencyBlockerOf(OTHER_SITE_PROFILE_ID, DRIFTED_CONTEXT.targetConfig.site.allowedOrigins)).toBe('MACHINE_MEMORY_LOW');
+    expect(forks.count()).toBe(1);
+    memory = ENOUGH_MEMORY;
+    expect((await jobManager.startAuditJob(startOf(OTHER_SITE_PROFILE_ID))).ok).toBe(true);
   });
 });
 

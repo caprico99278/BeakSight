@@ -5,7 +5,9 @@ import { mkdir, mkdtemp, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
-import { auditStageLinksOfEvidence, readAuditStageLinks } from '../../src/core/audit-stage-links.js';
+import {
+  auditStageLinksOfEvidence, auditStagePageWithoutDiscoveryCandidates, readAuditStageLinks, readAuditStagePages,
+} from '../../src/core/audit-stage-links.js';
 
 const ORIGIN = 'https://app.example.com';
 const linkOf = (path: string, kind = 'INTERNAL_NAVIGABLE'): Record<string, unknown> => ({
@@ -39,6 +41,30 @@ describe('OP-R: the links found by the audit stage (readAuditStageLinks)', () =>
 
   it('returns nothing for a directory without pages', async () => {
     expect(await readAuditStageLinks(join(directory, 'missing'))).toEqual([]);
+  });
+
+  it('DSEED: reads the URLs of the pages the audit stage read in its order, leaving out the pages outside the audit scope', async () => {
+    const outside = { code: 'NAVIGATION_FAILED', detail: 'BLOCKED_EXTERNAL_REDIRECT' };
+    const viewports = (reasons: readonly unknown[] = []) => ({ desktop: { incompleteReasons: reasons }, mobile: { incompleteReasons: [] } });
+    await writePage('PAGE-000003', JSON.stringify({ pageUrl: `${ORIGIN}/away`, status: 'FAILED', incompleteReasons: [], viewports: viewports([outside]) }));
+    await writePage('PAGE-000002', JSON.stringify({ pageUrl: `${ORIGIN}/broken`, status: 'FAILED', incompleteReasons: [{ code: 'NAVIGATION_FAILED', detail: null }], viewports: viewports() }));
+    await writePage('PAGE-000001', JSON.stringify({ pageUrl: `${ORIGIN}/`, status: 'AUDITED', incompleteReasons: [], viewports: viewports() }));
+    await writePage('PAGE-000004', '{ not json');
+    expect((await readAuditStagePages(directory)).map(({ url }) => url)).toEqual([`${ORIGIN}/`, `${ORIGIN}/broken`]);
+    expect(await readAuditStagePages(join(directory, 'missing'))).toEqual([]);
+  });
+
+  it('SKIP-1: a page is without pressable elements only when the DOM of both viewports counts none (a SAME page uses the Desktop count)', () => {
+    const dom = (viewport: string, count?: number): Record<string, unknown> =>
+      ({ type: 'dom', viewport, payload: count === undefined ? {} : { discoveryCandidateCount: count } });
+    const pageOf = (evidence: readonly unknown[], extra: Record<string, unknown> = {}): Record<string, unknown> => ({ pageUrl: `${ORIGIN}/`, evidence, ...extra });
+    expect(auditStagePageWithoutDiscoveryCandidates(pageOf([dom('desktop', 0), dom('mobile', 0)]))).toBe(true);
+    expect(auditStagePageWithoutDiscoveryCandidates(pageOf([dom('desktop', 0), dom('mobile', 1)]))).toBe(false);
+    expect(auditStagePageWithoutDiscoveryCandidates(pageOf([dom('desktop', 0), dom('mobile')]))).toBe(false);
+    expect(auditStagePageWithoutDiscoveryCandidates(pageOf([dom('desktop', 0)]))).toBe(false);
+    expect(auditStagePageWithoutDiscoveryCandidates(pageOf([dom('desktop', 0)], { sameness: { depth: 'SAME', sameAs: 'PAGE-000001' } }))).toBe(true);
+    expect(auditStagePageWithoutDiscoveryCandidates(pageOf([dom('desktop', 2)], { sameness: { depth: 'SAME', sameAs: 'PAGE-000001' } }))).toBe(false);
+    expect(auditStagePageWithoutDiscoveryCandidates(pageOf([]))).toBe(false);
   });
 
   it('reads no link from a record of another shape', () => {

@@ -305,7 +305,16 @@ const loginStageBlockedByReason = {
 };
 const loginStageCounts = { tokenRequestsAllowed: 0, sideRequestsAllowed: [], serviceOriginReads: 0, blockedByReason: loginStageBlockedByReason };
 // T27e: START の定義の一覧から read-evidence.json を組み立てて書き、FINISHED の件数の要約を返す（read-check と chain の READ の段が共用する）。
-const writeReadEvidence = (jobId, readChecks, runId) => {
+// RCA-6: 検索の確かめの組は、受けた順に全部、誤りなしで確かめたとして書く（本物のワーカーと同じく、組の鍵が同じ順）。
+const searchEvidenceOf = (combo) => ({
+  key: combo.key,
+  trigger: combo.kind === 'FORM' ? 'FORM' : combo.trigger.kind,
+  pagePath: combo.page.path,
+  how: combo.kind === 'FORM' ? combo.change : { kind: 'TEXT', text: combo.text },
+  state: 'EXECUTED', result: 'NO_ERROR', detail: 'OPENED', httpStatus: combo.kind === 'FORM' ? 200 : null, reads: [],
+});
+// RCA-6: ログインが切れた回（executedSearch に数）は、先頭のその数の組だけを確かめ、残りは確かめなかった（AUTH_SESSION_LOST）として書く。
+const writeReadEvidence = (jobId, readChecks, runId, searchChecks = [], executedSearch = undefined) => {
   const readCheck = VALUES.readCheck;
   const evaluated = new Set(['MATCHED', 'NOT_MATCHED', 'UNDETERMINED']);
   const details = { READ_BLOCKED_BY_POLICY: 'REQUEST_POLICY', READ_CANDIDATE_DRIFTED: 'CANDIDATE_NOT_FOUND', READ_CANDIDATE_NOT_READ: 'CANDIDATE_NOT_READ' };
@@ -330,7 +339,7 @@ const writeReadEvidence = (jobId, readChecks, runId) => {
   });
   const kind = readCheck.document ?? 'valid';
   const document = {
-    schemaVersion: 'read-evidence-schema/1.2',
+    schemaVersion: 'read-evidence-schema/1.3',
     jobId: kind === 'other-job' ? jobId + '-other' : jobId,
     runId,
     startedAt: '20261011000000',
@@ -338,6 +347,10 @@ const writeReadEvidence = (jobId, readChecks, runId) => {
     runStatus: 'COMPLETE',
     endReason: 'COMPLETED',
     checks,
+    searchChecks: (searchChecks ?? []).map((combo, index) => (executedSearch === undefined || index < executedSearch
+      ? searchEvidenceOf(combo)
+      : { ...searchEvidenceOf(combo), state: 'NOT_EXECUTED', result: undefined, detail: undefined, httpStatus: undefined, reads: undefined,
+        reason: 'AUTH_SESSION_LOST' })),
     ...(readCheck.authentication === undefined ? {} : { authentication: readCheck.authentication }),
   };
   if (kind !== 'missing') {
@@ -345,8 +358,9 @@ const writeReadEvidence = (jobId, readChecks, runId) => {
     writeFileSync(join(readCheck.outputDirectory, runId, FILES.readEvidence),kind === 'broken' ? '{"schemaVersion":' : JSON.stringify(document), 'utf8');
   }
   return readCheck.summary === undefined
-    ? { checks: checks.length, executed: checks.length, ...(readCheck.authentication === undefined ? {} : { authentication: readCheck.authentication }) }
-    : readCheck.summary;
+    ? { checks: checks.length, executed: checks.length, searchChecks: (searchChecks ?? []).length, searchCheckErrors: 0, ...(readCheck.authentication === undefined ? {} : { authentication: readCheck.authentication }) }
+    // RCA-6: 直に渡した要約にも、組の数と誤りの数（書いた成果物と同じ値）を補う（渡した値が先）。
+    : { searchChecks: (searchChecks ?? []).length, searchCheckErrors: 0, ...readCheck.summary };
 };
 // FM2d: まとめて実行（chain）。段ごとに RUN_STARTED と FINISHED（理由のコードつき）を送り、途中の段の後は NEXT_STAGE・CHAIN_END を待つ。
 const chainState = { stages: [], index: 0, exitCode: 0, holding: null, firstStage: null, attempts: {}, pages: 0, reloginRunIndex: 0, automated: false, discoveryRuns: 0,
@@ -358,7 +372,7 @@ const discoveryOf = () => {
   chainState.discoveryRuns += 1;
   return attempt === undefined ? { documentText: discovery.documentText, summary: discovery.summary } : attempt;
 };
-const chainFinish = (kind, jobId, readChecks, runId, runStatus, codes) => {
+const chainFinish = (kind, jobId, readChecks, runId, runStatus, codes, searchChecks = []) => {
   const exitCode = runStatus === 'COMPLETE' ? VALUES.exitCodes.complete : VALUES.exitCodes.partial;
   chainState.exitCode = exitCode;
   let extra = {};
@@ -370,7 +384,7 @@ const chainFinish = (kind, jobId, readChecks, runId, runStatus, codes) => {
       written.documentText.split('__JOB_ID__').join(jobId).split('__RUN_ID__').join(runId), 'utf8');
     extra = { discovery: written.summary };
   } else if (kind === 'READ_CHECK') {
-    extra = { readCheck: writeReadEvidence(jobId, readChecks, runId) };
+    extra = { readCheck: writeReadEvidence(jobId, readChecks, runId, searchChecks) };
   }
   const message = { protocol: P, type: 'FINISHED', outcome: { kind: 'RAN', exitCode, runId, runDirectory: runId, runStatus }, ...extra, incompleteReasonCodes: codes };
   // OP-2: 書き込みの段の印のある連鎖は、最後の読み取りの段の後も親の指定を待つ。
@@ -380,7 +394,7 @@ const chainFinish = (kind, jobId, readChecks, runId, runStatus, codes) => {
     send(message);
   }
 };
-const chainRun = (kind, jobId, readChecks) => {
+const chainRun = (kind, jobId, readChecks, searchChecks = []) => {
   const chain = VALUES.chain;
   const index = chainState.index;
   const attempt = chainState.attempts[index] ?? 0;
@@ -399,7 +413,7 @@ const chainRun = (kind, jobId, readChecks) => {
     chainState.exitCode = VALUES.exitCodes.partial;
     const lostDiscovery = kind === 'DISCOVERY' ? discoveryOf() : null;
     const extra = kind === 'READ_CHECK'
-      ? { readCheck: { ...writeReadEvidence(jobId, readChecks, runId), ...(stalled ? { executed: 0 } : {}) } }
+      ? { readCheck: { ...writeReadEvidence(jobId, readChecks, runId, searchChecks, stalled ? 0 : 1), ...(stalled ? { executed: 0 } : {}) } }
       : lostDiscovery !== null ? { discovery: lostDiscovery.summary } : {};
     if (lostDiscovery !== null) {
       mkdirSync(join(VALUES.discovery.outputDirectory, runId), { recursive: true });
@@ -411,10 +425,11 @@ const chainRun = (kind, jobId, readChecks) => {
     return;
   }
   if (chain.holdStage === index) {
-    chainState.holding = { kind, jobId, readChecks, runId };
+    chainState.holding = { kind, jobId, readChecks, runId, searchChecks };
     return;
   }
-  setTimeout(() => chainFinish(kind, jobId, readChecks, runId, chain.runStatuses?.[index] ?? 'COMPLETE', chain.reasonCodes?.[index] ?? []), chain.finishDelayMs ?? 0);
+  setTimeout(() => chainFinish(kind, jobId, readChecks, runId, chain.runStatuses?.[index] ?? 'COMPLETE', chain.reasonCodes?.[index] ?? [], searchChecks),
+    chain.finishDelayMs ?? 0);
 };
 process.on('message', (message) => {
   appendFileSync(LOG, JSON.stringify(message) + '\n');
@@ -556,7 +571,7 @@ process.on('message', (message) => {
       const readCheck = VALUES.readCheck;
       send(authState('AUTHENTICATED'));
       send(runStarted);
-      const summary = writeReadEvidence(message.jobId, message.readChecks, VALUES.runId);
+      const summary = writeReadEvidence(message.jobId, message.readChecks, VALUES.runId, message.searchChecks);
       const done = finished('COMPLETE', VALUES.exitCodes.complete);
       setTimeout(() => exitAfter(summary === null ? done : { ...done, readCheck: summary }, VALUES.exitCodes.complete), readCheck.delayMs ?? 0);
       return;
@@ -742,14 +757,14 @@ process.on('message', (message) => {
   }
   if (message && MODE === 'chain' && message.type === 'NEXT_STAGE') {
     chainState.index += 1;
-    chainRun(message.jobKind, message.jobId, message.readChecks);
+    chainRun(message.jobKind, message.jobId, message.readChecks, message.searchChecks);
     return;
   }
   if (message && MODE === 'chain' && message.type === 'RELOGIN_STAGE') {
     // DEF-200: ログインし直した（自動ログインの成功の結果つき）後に、同じ段をやり直す。
     send({ protocol: P, type: 'AUTH_STATE', state: 'AUTHENTICATED', sessionLostUrl: null,
       automatedLogin: { result: 'SUCCEEDED', submitted: 'YES', retryAfterUntil: null, formInvalidReason: null } });
-    chainRun(message.jobKind, message.jobId, message.readChecks);
+    chainRun(message.jobKind, message.jobId, message.readChecks, message.searchChecks);
     return;
   }
   if (message && MODE === 'chain' && message.type === 'CHAIN_END') {
@@ -771,7 +786,7 @@ process.on('message', (message) => {
     if (holding !== null) {
       chainState.holding = null;
       chainState.stages = chainState.stages.slice(0, chainState.index + 1);
-      chainFinish(holding.kind, holding.jobId, holding.readChecks, holding.runId, 'PARTIAL', ['RUN_INTERRUPTED']);
+      chainFinish(holding.kind, holding.jobId, holding.readChecks, holding.runId, 'PARTIAL', ['RUN_INTERRUPTED'], holding.searchChecks);
     }
     return;
   }

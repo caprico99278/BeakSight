@@ -146,13 +146,15 @@ const pageAuditLoadKey = (pageId: PageId, viewport: ViewportProfile | null): str
 /** 幅の走査の読み込みの鍵（ページ・幅）。 */
 const stressLoadKey = (pageId: PageId, width: number): string => JSON.stringify(['STRESS_WIDTH', pageId, width]);
 
-/** safety の Evidence の読み込みの鍵（Interaction の読み込みは `null`）。 */
-const loadKeyOfSafety = (record: EvidenceRecordFor<'safety'>): string | null => {
+/** safety の Evidence の読み込みの鍵（Interaction の読み込みは空）。SWR: 大きさを変えて回した幅の走査の Context は、走査した幅ごとの鍵。 */
+const loadKeysOfSafety = (record: EvidenceRecordFor<'safety'>): readonly string[] => {
   const { load } = record.payload;
   if (record.payload.scope !== 'PASSIVE' || load.kind === 'INTERACTION') {
-    return null;
+    return [];
   }
-  return load.kind === 'STRESS_WIDTH' ? stressLoadKey(record.pageId, load.width) : pageAuditLoadKey(record.pageId, record.viewport);
+  return load.kind === 'STRESS_WIDTH'
+    ? (load.widths ?? [load.width]).map((width) => stressLoadKey(record.pageId, width))
+    : [pageAuditLoadKey(record.pageId, record.viewport)];
 };
 
 /** 1 つの記録の、止めた要求（種類は記録の出どころの対応で読んだもの。`null` は見えない種類）。 */
@@ -322,8 +324,7 @@ export function createBeakSightBlockIndexBuilder(
           evidence.set(record.evidenceId, indexedEvidenceOf(record, page.pageId));
         }
         if (record.type === 'safety') {
-          const key = loadKeyOfSafety(record);
-          if (key !== null) {
+          for (const key of loadKeysOfSafety(record)) {
             add(key, blocksOfSafety(record));
           }
         } else if (record.type === 'network') {

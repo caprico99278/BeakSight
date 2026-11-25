@@ -48,7 +48,7 @@ const TRANSITIONAL_PRODUCTION_READERS: FileExceptions = {
   'src/discovery/submission-probe-contracts.ts': { count: 3, reason: 'probe の押した後の最短の観察の別名（差し込みは済み。RB-13）' },
   'src/interaction/isolated-auditor.ts': { count: 3, reason: 'Interaction の落ち着き（RB-10）' },
   'src/interaction/notification-overlay.ts': { count: 6, reason: '操作さがしの知らせの枠の上限の別名と、発見の落ち着きの既定（RB-8。閉じる輪の待ちは RB-9 で差し込みへ）' },
-  'src/interaction/submission-probe.ts': { count: 8, reason: '押した後の落ち着きと最短の観察の既定（RB-13）' },
+  'src/interaction/submission-probe.ts': { count: 9, reason: '押した後の落ち着きと最短の観察の既定（RB-13）と、消えた要素を見放す確かめの窓（QUIET-1。落ち着きの静まりの窓と同じ値）' },
   'src/orchestration/page-auditor.ts': { count: 6, reason: '段の見張りの間隔・スクロールの量・見張りの上限（RB-10）' },
   'src/orchestration/visible-pacing-wait.ts': { count: 4, reason: '見せたまま待つ間の印の間隔（RB-10）' },
   'src/safety/passive-request-guard.ts': { count: 2, reason: 'Guard の閉じるときの作業の待ちの上限（factory の注入で替わる。RB-14）' },

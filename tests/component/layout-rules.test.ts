@@ -887,6 +887,30 @@ describe('FIXED_ELEMENT_OCCLUSION', () => {
     expect(drafts).toHaveLength(1);
     expect(identity(drafts[0], 'overlaySelector')).toBe('#cookie-banner');
   });
+
+  it('RVP-2: 覆いの対象が画像の外に出るときは「隠しています」と言い切らず、計った数だけを書く', () => {
+    const opaque = {
+      selector: '#panel', relation: 'OVERLAY', position: 'fixed', zIndex: '10', pointerEvents: 'auto', effectiveOpacity: 1, visibility: 'visible',
+      backgroundColor: 'rgb(255, 255, 255)', hasBackgroundImage: false, paintsOwnSurface: true,
+    } as const;
+    const covered = (panel: RectangleEvidence): EvidenceRecord => layoutRecord(complete(baseLayout({
+      document: notScrollableDocument(),
+      elementOverlaps: [{
+        ...overlap(element('#panel', 'other', panel, { position: 'fixed', zIndex: '10' }), element('#list', 'paragraph', rect(0, 600, 800, 600))),
+        hitTest: {
+          target: 'COVERED',
+          points: [{ x: 400, y: 750, topRelation: 'OVERLAY', layers: [opaque], targetFound: true, targetSelector: '#list' }],
+          overlay: opaque,
+          modal: { dialogModal: false, ariaModal: false },
+        },
+      }],
+    })));
+    const [outside] = evaluate('FIXED_ELEMENT_OCCLUSION', [covered(rect(0, 0, VIEWPORT_WIDTH, 2000))]);
+    expect(outside?.message).toContain('#list');
+    expect(outside?.message).not.toContain('隠して');
+    const [inside] = evaluate('FIXED_ELEMENT_OCCLUSION', [covered(rect(0, 600, VIEWPORT_WIDTH, 300))]);
+    expect(inside?.message).toContain('隠して');
+  });
 });
 
 describe('AUD-3a: スクロールすれば固定要素の外へ出せる内容', () => {
@@ -1350,7 +1374,29 @@ describe('DEF-210: 通知の枠の規則', () => {
     ]);
     expect(drafts.every((draft) => draft.severity === 'WARN' && draft.category === 'LAYOUT')).toBe(true);
     expect(drafts[0]?.message).toContain('押しましたが、枠が残りました');
+    // S-03a: 「隠しました」は実際に隠した枠だけ。
+    expect(drafts.map((draft) => draft.message.includes('隠しました'))).toEqual([true, true, false]);
     expect(drafts.map((draft) => draft.message).join('')).not.toMatch(/sha256|http/u);
+  });
+
+  it('RVP-3: 幅の走査でだけ隠した枠は、文にその幅を書き、その幅の隠す前の画像を参照する', () => {
+    const shot = (sequence: number, stressWidth?: number): EvidenceRecord => ({
+      evidenceId: createEvidenceId('screenshot', sequence), type: 'screenshot', pageId: PAGE_ID, viewport: 'desktop', observedAt: '2026-09-24T00:00:00.000Z',
+      payload: {
+        pageId: PAGE_ID, viewport: 'desktop', relativePath: `before-hide-${String(sequence)}.png`, captureType: 'VIEWPORT', scrollPosition: { scrollX: 0, scrollY: 0 },
+        beforeNotificationHide: true, ...(stressWidth === undefined ? {} : { stressWidth }),
+      },
+    });
+    const record = withNotificationOverlay(layoutRecord(complete(baseLayout())), [notificationFrame('b', { status: 'NO_CLOSE_BUTTON', hiddenReason: 'NO_CLOSE_BUTTON' })], {
+      stressNotificationOverlays: [{
+        width: 320,
+        overlay: { readStatus: 'READ', frames: [notificationFrame('b', { status: 'NO_CLOSE_BUTTON', hidden: true, hiddenReason: 'NO_CLOSE_BUTTON' })],
+          pressCount: 0, navigated: false, truncated: false },
+      }],
+    });
+    const [draft] = evaluate('NOTIFICATION_NOT_DISMISSIBLE', [record, shot(7), shot(8, 320)]);
+    expect(draft?.message).toContain(NOTIFICATION_OVERLAY_TEXT.hiddenAt([NOTIFICATION_OVERLAY_TEXT.stressWidthPlace('320 px')]));
+    expect(draft?.evidenceRefs).toEqual([record.evidenceId, createEvidenceId('screenshot', 8)]);
   });
 
   it('NOTIFICATION_HANDLED_BEFORE_AUDIT は、閉じたか隠した枠があるビューポートに 1 件の INFO で、文は messages.ts の文', () => {

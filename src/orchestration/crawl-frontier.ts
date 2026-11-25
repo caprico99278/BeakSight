@@ -1,5 +1,7 @@
 import {
   CRAWL_URL_STATES,
+  PAGE_REFERENCE_DEPTHS,
+  type PageReferenceDepth,
   isIncompleteReasonCode,
   isIncompleteReasonDetail,
   type CrawlUrlState,
@@ -52,7 +54,29 @@ export interface CrawlFrontierSnapshot {
   readonly openedStructureKeys?: readonly string[];
   /** COV-4 の区切り 3（入れ子の開いた状態）: 開いた状態の中で押した組（受け付けた順）。前の版の保存にはない（空として読む）。 */
   readonly openedPresses?: readonly OpenedPressKey[];
+  /** DUP: 同じ作りの 1 回目と、点検を終えた画面の中身の表（受け付けた順）。前の版の保存にはない（空として読む）。 */
+  readonly pageReferences?: readonly PageReferenceRecord[];
 }
+
+/**
+ * DUP（設計書 `2026-11-18-beaksight-same-structure-pages-design.md` 2 章）: 点検を終えた画面の、作りの鍵と中身の要約。`FULL` はしっかり点検した画面（作りの鍵の
+ * 最初の `FULL` が 1 回目）、`LIGHT` は軽い点検の画面（中身が同じ画面を省く相手にだけなる）。
+ */
+export interface PageReferenceRecord {
+  readonly templateKey: string;
+  readonly pageId: PageId;
+  readonly depth: PageReferenceDepth;
+  readonly contentDigest: string | null;
+}
+
+const isPageReferenceRecord = (value: unknown): value is PageReferenceRecord => {
+  if (typeof value !== 'object' || value === null) {
+    return false;
+  }
+  const { templateKey, pageId, depth, contentDigest } = value as Record<string, unknown>;
+  return typeof templateKey === 'string' && isSha256Fingerprint(templateKey) && typeof pageId === 'string' && isPageId(pageId)
+    && (PAGE_REFERENCE_DEPTHS as readonly unknown[]).includes(depth) && (contentDigest === null || (typeof contentDigest === 'string' && isSha256Fingerprint(contentDigest)));
+};
 
 /** COV-4 の区切り 3: 開いた状態の中で押す組（その状態の構造の鍵、候補の ID、同じ ID の中の順番）。 */
 export interface OpenedPressKey {
@@ -110,6 +134,8 @@ export interface StoredCrawlFrontierSnapshot {
   readonly openedStructureKeys?: unknown;
   /** COV-4 の区切り 3: 開いた状態の中で押した組（JSON から読んだ値。形の違う値は `RangeError`）。前の版の保存にはない。 */
   readonly openedPresses?: unknown;
+  /** DUP: 同じ作りの 1 回目と、点検を終えた画面の中身の表（JSON から読んだ値。形の違う値は `RangeError`）。前の版の保存にはない。 */
+  readonly pageReferences?: unknown;
 }
 
 /** `CrawlFrontier.restore` の設定。`maxDepth` と `allowedQueryParameters` は、Run の設定から取る。 */
@@ -235,6 +261,8 @@ export class CrawlFrontier {
   readonly #openedStructureKeys = new Set<string>();
   /** COV-4 の区切り 3: 開いた状態の中で押した組（受け付けた順）。 */
   readonly #openedPresses = new Map<string, OpenedPressKey>();
+  /** DUP: 同じ作りの 1 回目と、点検を終えた画面の中身の表（ページの ID ごとに 1 件。受け付けた順）。 */
+  readonly #pageReferences = new Map<PageId, PageReferenceRecord>();
   /** L14: 深さの上限。`undefined` は上限なし（利用者が指定したときだけ効く）。 */
   readonly #maxDepth: number | undefined;
   readonly #allocator: IdAllocator;
@@ -289,6 +317,14 @@ export class CrawlFrontier {
     for (const press of presses as readonly OpenedPressKey[]) {
       frontier.#openedPresses.set(openedPressKeyText(press), Object.freeze({ ...press }));
     }
+    // DUP: 同じ作りの 1 回目と、点検を終えた画面の中身の表。前の版の保存（欄がない）は、空として読む。
+    const references: unknown = snapshot.pageReferences ?? [];
+    if (!Array.isArray(references) || !references.every(isPageReferenceRecord)) {
+      throw new RangeError('crawl frontier snapshot has page references that are not page reference records');
+    }
+    for (const reference of references as readonly PageReferenceRecord[]) {
+      frontier.acceptPageReference(reference);
+    }
     if (snapshot.coverage !== undefined) {
       // COV-4: 今の版の保存。待ち行列は書き出しから作り直す（取り出して読み終えていない状態は、`next` がもう一度渡す。記録が終えていれば飛ばす）。
       frontier.#queue = CoverageQueue.restore(snapshot.coverage);
@@ -328,7 +364,39 @@ export class CrawlFrontier {
       coverage: this.#queue.snapshot(),
       openedStructureKeys: [...this.#openedStructureKeys],
       openedPresses: [...this.#openedPresses.values()].map((press) => ({ ...press })),
+      pageReferences: [...this.#pageReferences.values()].map((reference) => ({ ...reference })),
     });
+  }
+
+  /**
+   * DUP: 点検を終えた画面を、同じ作りの表に受け付ける（同じページの ID は、後のもの（読み直し）で、受け付けた順のまま置き換える）。表は `snapshot` に残り、
+   * 再開でも引き継ぐ。形の違う値は `RangeError`。
+   */
+  acceptPageReference(reference: PageReferenceRecord): void {
+    if (!isPageReferenceRecord(reference)) {
+      throw new RangeError('page reference must have a fingerprint template key, a page ID, a depth and a content digest or null');
+    }
+    this.#pageReferences.set(reference.pageId, Object.freeze({ ...reference }));
+  }
+
+  /** DUP: 作りの鍵の 1 回目（最初に受け付けた `FULL` の画面。なければ `null`）。 */
+  pageReferenceOf(templateKey: string): PageId | null {
+    for (const reference of this.#pageReferences.values()) {
+      if (reference.templateKey === templateKey && reference.depth === 'FULL') {
+        return reference.pageId;
+      }
+    }
+    return null;
+  }
+
+  /** DUP: 同じ作りで、表示の中身の要約が同じ、点検を終えた画面（最初に受け付けたもの。なければ `null`）。 */
+  samePageOf(templateKey: string, contentDigest: string): PageId | null {
+    for (const reference of this.#pageReferences.values()) {
+      if (reference.templateKey === templateKey && reference.contentDigest === contentDigest) {
+        return reference.pageId;
+      }
+    }
+    return null;
   }
 
   /**

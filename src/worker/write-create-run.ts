@@ -3397,7 +3397,7 @@ export function writeRunDocumentsOf(input: {
 export async function executeWriteCreateRun(request: WriteCreateRunRequest, observer: WriteCreateRunObserver): Promise<WriteCreateRunOutcome> {
   const outputDirectory = resolve(request.config.output.directory);
   const writer = new ArtifactWriter({ urlSecretRedaction: true });
-  const run = await startWorkerRun(outputDirectory, request.clock);
+  const run = await startWorkerRun(outputDirectory, request.config.target.id, request.clock);
   if (run.kind !== 'STARTED') {
     request.reportSubmission({ submission: 'NOT_SENT', blockReason: PRECHECK_FAILED });
     return run;

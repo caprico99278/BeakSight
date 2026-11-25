@@ -17,6 +17,7 @@ import { foldNfkcCase } from '../core/text.js';
 import { canonicalizeAllowedOrigins, hasUrlCredentials } from '../crawl/normalize-url.js';
 import { DEFAULT_EXCLUDED_URL_WORDS } from '../core/default-excluded-url-words.js';
 import { isSecretUrlQueryParameterName } from '../core/secret-query-names.js';
+import { urlHasDestructiveWord } from '../discovery/destructive-action.js';
 
 /**
  * 要求の種類の閉じた一覧（T34b。Task 34 の設計書 3.3）。CDP の `Network.ResourceType` と、Playwright の `Request.resourceType()` の値を、
@@ -203,7 +204,8 @@ export type PassiveRequestDecision =
     readonly category: 'NAVIGATION';
     readonly reason: 'EXTERNAL_MAIN_FRAME_NAVIGATION';
   }
-  | { readonly action: 'BLOCK'; readonly category: 'WEBSOCKET'; readonly reason: 'PASSIVE_WEBSOCKET' }
+  // FRETWS: 窓を開くボタンの押す期間に止めた接続は、押下の理由（`SCROLL_KEY_PRESS_RESTRICTED`）。
+  | { readonly action: 'BLOCK'; readonly category: 'WEBSOCKET'; readonly reason: 'PASSIVE_WEBSOCKET' | 'SCROLL_KEY_PRESS_RESTRICTED' }
   | {
     readonly action: 'BLOCK';
     readonly category: 'AUDIT_EXCLUSION';
@@ -573,9 +575,10 @@ interface PassiveRequestPolicyCommon {
   readonly notificationPress?: NotificationPressMode | undefined;
   /**
    * REV-EV4（設計書 `2026-11-16-beaksight-finding-evidence-design.md` 3.4）: 横にスクロールする領域のキーの押下の期間の印（Guard が、押す期間の間だけ渡す）。
-   * 判定は `scrollKeyPressDecisionOf`。省略は押す期間でない。
+   * 判定は `scrollKeyPressDecisionOf`。省略は押す期間でない。FRET（設計書 `2026-11-24-beaksight-dialog-focus-return-design.md` の設計変更履歴の 2026-11-25）:
+   * `DIALOG_PRESS` は、窓を開くボタンの押す期間（Enter を押してから、窓を閉じて落ち着くまで）。
    */
-  readonly scrollKeyPress?: true | undefined;
+  readonly scrollKeyPress?: true | 'DIALOG_PRESS' | undefined;
 }
 
 /**
@@ -658,9 +661,24 @@ export const SCROLL_KEY_PRESS_BLOCK_REASON = 'SCROLL_KEY_PRESS_RESTRICTED' satis
 /**
  * REV-EV4（設計書 3.4）: 横にスクロールする領域のキーの押下の期間の判定。その期間の main frame の文書の移動（フォームの送信を含む）は、BeakSight の操作が
  * 起こしたものとして止める（違反にしない）。ほか（期間でない・main frame の移動でない）は `null`（呼び出し側が今の判定を行う）。
+ * FRET（2026-11-25）: 窓を開くボタンの押す期間（`DIALOG_PRESS`）は、BeakSight の押下が原因の送信とみなし、読み取りでない要求も、main frame と子の frame の
+ * どちらでも止める（操作さがしの凍結と同じ考え方。押す期間の外の送信の扱いは変えない）。
  */
 export function scrollKeyPressDecisionOf(facts: PassiveRequestFacts, policy: PassiveRequestPolicyOptions): PassiveRequestDecision | null {
-  return policy.scrollKeyPress === true && facts.kind === 'HTTP' && facts.isNavigationRequest && facts.isMainFrame
+  if (policy.scrollKeyPress === undefined) {
+    return null;
+  }
+  const dialogPress = policy.scrollKeyPress === 'DIALOG_PRESS';
+  if (facts.kind !== 'HTTP') {
+    // FRET fix round 3（設計書の設計変更履歴の 2026-11-26）: 押す期間と押した後の止めの続きに新しく開く WebSocket の接続を止める（その接続の frame も届かない。
+    // 前から開いていた接続は、判定に来ないので今どおり通る）。FRETWS（設計書 `2026-11-25-beaksight-discovery-sibling-press-design.md` 2.2）: 記録の理由は
+    // HTTP と同じ押下の理由（普通の止め `PASSIVE_WEBSOCKET` と分ける）。
+    return dialogPress ? { action: 'BLOCK', category: 'WEBSOCKET', reason: SCROLL_KEY_PRESS_BLOCK_REASON } : null;
+  }
+  const mainFrameMove = facts.isNavigationRequest && facts.isMainFrame;
+  // FRET fix round 3・4（設計書の設計変更履歴の 2026-11-26）: 押す期間と止めの続きは、読み取りの method でも、SD-1 の操作の前の判定と同じ語（日本語・ログアウトの
+  // 語を含む。1 か所 `urlHasDestructiveWord`。path と query の符号化を外してから当てる）の URL を止める。巡回の語の判定は変えない。
+  return mainFrameMove || (dialogPress && (!isReadMethod(facts.method) || urlHasDestructiveWord(facts.url)))
     ? { action: 'BLOCK', category: 'REQUEST', reason: SCROLL_KEY_PRESS_BLOCK_REASON }
     : null;
 }

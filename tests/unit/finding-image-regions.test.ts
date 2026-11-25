@@ -380,6 +380,28 @@ describe('AUD-3d: the image and the regions of each finding in the report model'
     expect(buildReportViewModel(auditRun({ pages: [result] })).findings[0]?.imageRegion?.holdReason ?? null).toBe(expected);
   });
 
+  // AUD-6（S-08）: 落ち着きの待ちを終えられなかった状態の内容の指摘は、準備の状態が分からない理由で保留にする。確かめ直しで同じ指摘が出たなら、今どおり。
+  it.each([
+    ['the settling did not complete', 'NOT_COMPLETED', undefined, 'PAGE_READINESS_UNKNOWN'],
+    ['the settling completed', 'SETTLED', undefined, null],
+    ['the settling did not complete, the same finding at the recheck', 'NOT_COMPLETED', 'PERSISTENT', null],
+  ] as const)('S-08: gives a content finding the hold reason of an unknown readiness: %s', (_label, status, mark, expected) => {
+    const domRecord = withCapture(dom(90, PAGE_1, 'desktop', '本文'), capture('desktop', 'dom'));
+    const content = finding(99, 'WARN', 'ACCESSIBILITY', PAGE_1, [idOf(domRecord)], { ruleId: 'A11Y_PAGE_HAS_HEADING_ONE' });
+    const recheck = mark === undefined ? {} : { recheck: {
+      status: 'RECHECKED', reason: null, stateId: `${PAGE_1}:desktop:1`, startedAt: FIXTURE_OBSERVED_AT, finishedAt: FIXTURE_OBSERVED_AT,
+      settling: null, axeRuleIds: [], headings: [], pageReady: true,
+      findings: [{ fingerprint: content.fingerprint, ruleId: content.ruleId, state: mark }],
+    } as const };
+    const settling = {
+      status, reason: status === 'SETTLED' ? 'DOM_AND_HEIGHT_STABLE' : null, elapsedMs: 0, observationCount: 1, lastScrollHeight: null, watchEnd: null,
+    } as const;
+    const audited = page(PAGE_1, '/', 'AUDITED', [metadata(1, PAGE_1), domRecord], [content]);
+    const desktop = { ...audited.viewports.desktop, stateId: `${PAGE_1}:desktop:1` as const, settling, ...recheck };
+    const result = { ...audited, viewports: { ...audited.viewports, desktop } };
+    expect(buildReportViewModel(auditRun({ pages: [result] })).findings[0]?.imageRegion?.holdReason ?? null).toBe(expected);
+  });
+
   it('shows the image and the place in plain words in the HTML body, without the role codes', () => {
     const html = renderHtmlReport(buildReportViewModel(run()));
     expect(html).toContain(findingImageRegionLinkText);

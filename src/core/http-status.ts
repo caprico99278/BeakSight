@@ -35,6 +35,21 @@ export const OBSERVABLE_HTTP_STATUS_RANGE: HttpStatusRange = Object.freeze({ min
 /** 回数の制限（429 Too Many Requests）の HTTP ステータス（T30f。書き込みの結果の判定と、自動ログインの結果の判定が使う）。 */
 export const TOO_MANY_REQUESTS_HTTP_STATUS = 429;
 
+/**
+ * サイトの不調とみなす HTTP の status の閉じた一覧（DEF-136 の設計書 2章）。500 は、そのページだけの不具合のことが多いので含めない。RCA-1: 読み込みの不調の
+ * 判定（`src/orchestration/site-availability.ts`。同じ名前で公開し直す）と、検索の読み取りの判定（`src/discovery/search-read-contracts.ts`）が使うので、ここに置く。
+ */
+export const SITE_UNAVAILABLE_HTTP_STATUSES = Object.freeze([
+  /** 429 Too Many Requests: サイトが、要求が多すぎると答えた（これ以上の読み込みを控えるべき合図）。 */
+  TOO_MANY_REQUESTS_HTTP_STATUS,
+  /** 502 Bad Gateway: 中継のサーバが、その先のサーバから正しい応答を受け取れなかった。 */
+  502,
+  /** 503 Service Unavailable: メンテナンスや過負荷で、サーバが一時的に応答できない。 */
+  503,
+  /** 504 Gateway Timeout: 中継のサーバが、その先のサーバの応答を待ちきれなかった。 */
+  504,
+] as const);
+
 /** HTTP のステータスが範囲にあるか。観測できなかったステータス（`null`）は、どの範囲にも入らない。 */
 export const isHttpStatusInRange = (status: number | null, range: HttpStatusRange): boolean =>
   status !== null && status >= range.min && status <= range.max;

@@ -15,6 +15,7 @@ import {
   type BlockedPopupEvent,
   type BlockedRequestEvent,
   type BlockedWebSocketEvent,
+  type DetachedTargetContinuesRecord,
   type ExcludedInteractionCandidateEvent,
   type ExternalSchemeNavigationEvent,
   type FrameClassificationFailureEvent,
@@ -222,6 +223,8 @@ export class SafetyLedger {
   #frameClassificationFailureCount = 0;
   readonly #readNavigationFailures: ReadNavigationFailureEvent[] = [];
   #readNavigationFailureCount = 0;
+  /** CDPX: 許した要求を続ける命令が、OOPIF の target が先に外れたために送れなかった数（違反でない）。 */
+  #detachedTargetContinueCount = 0;
   readonly #invariantViolations: InvariantViolationEvent[] = [];
   #invariantViolationCount = 0;
   /** AS-a: 監査の段の送信の扱いで通した読み取りでない要求（総数、method ごとの数、method・Origin・path ごとの行、一覧に入れなかった数）。 */
@@ -231,6 +234,8 @@ export class SafetyLedger {
   #passedAuditSendUnlisted = 0;
   /** AS-c: 通した要求のうち、ほかの Origin へのものの数。 */
   #passedAuditSendOtherOrigins = 0;
+  /** FRET fix round 4: 通した要求のうち、窓を開くボタンの確かめが押した page の、閉じる前の離れる手順の間に通した数。 */
+  #passedAuditSendAfterDialogPressLeave = 0;
   /** AS-c: 監査の段の送信の扱いで通した WebSocket の接続（総数、Origin・path ごとの行、一覧に入れなかった数）。 */
   #passedWebSocketCount = 0;
   readonly #passedWebSocketRows = new Map<string, {
@@ -244,6 +249,16 @@ export class SafetyLedger {
   /** AS-c fix round 1（C-1・C-2）: そのうち Guard の route を通らずに開いた接続の数と、危険な語に当たる接続の数。 */
   #passedWebSocketOutsideGuard = 0;
   #passedWebSocketDangerous = 0;
+  /** FRET fix round 5: 押した page の、押す期間の後の止めの続きの間に、前から開いていた接続が送った frame の数。 */
+  #passedWebSocketFramesAfterDialogPress = 0;
+
+  /**
+   * FRET fix round 5（設計者の判断 (A)）: 窓を開くボタンの確かめが押した page で、押す期間の後から page を閉じるまでに、前から開いていた WebSocket の接続が送った
+   * frame を 1 つ数える（止めない。中身は持たない）。通した接続の記録（`passedAuditSendWebSockets`）の項目に出る。
+   */
+  recordWebSocketFrameAfterDialogPress(): void {
+    this.#passedWebSocketFramesAfterDialogPress = saturatingIncrement(this.#passedWebSocketFramesAfterDialogPress);
+  }
 
   recordBlockedRequest(event: BlockedRequestEvent): void {
     const method = this.#recordedMethod(event.method);
@@ -261,8 +276,17 @@ export class SafetyLedger {
    * method ごとの数と同じ部品（`#countByMethod`）で数える。同じ method・Origin・path は重ねて
    * 回数を足す。Origin を作れない URL は `unlisted` に数える（LZ-3a: 一覧の行の数の上限（前は 256）はない）。総数は一覧に入れなかった分も数える。
    */
-  recordPassedAuditSendRequest(event: { readonly method: string; readonly url: string; readonly otherOrigin?: boolean }): void {
+  recordPassedAuditSendRequest(event: {
+    readonly method: string;
+    readonly url: string;
+    readonly otherOrigin?: boolean;
+    /** FRET fix round 4: 窓を開くボタンの確かめが押した page の、閉じる前の離れる手順の間に通したか（Guard が見分けて渡す）。 */
+    readonly afterDialogPressLeave?: boolean;
+  }): void {
     this.#passedAuditSendCount = saturatingIncrement(this.#passedAuditSendCount);
+    if (event.afterDialogPressLeave === true) {
+      this.#passedAuditSendAfterDialogPressLeave = saturatingIncrement(this.#passedAuditSendAfterDialogPressLeave);
+    }
     // AS-c: ほかの Origin（許可 Origin と承認したサービスの Origin のほか）へ通した数（Guard が見分けて渡す）。
     if (event.otherOrigin === true) {
       this.#passedAuditSendOtherOrigins = saturatingIncrement(this.#passedAuditSendOtherOrigins);
@@ -478,6 +502,11 @@ export class SafetyLedger {
     });
   }
 
+  /** CDPX: Guard が許した要求を続ける命令が、OOPIF の target が先に外れたために送れなかったことを数える（違反にしない。要求の値は持たない）。 */
+  recordDetachedTargetContinue(): void {
+    this.#detachedTargetContinueCount = saturatingIncrement(this.#detachedTargetContinueCount);
+  }
+
   /**
    * 不変条件の違反を記録する。DEF-144: 違反が 1 つの要求に結びつくとき（`request`）は、その method と、URL から取り出した Origin と path を残す（通した要求の
    * 記録と同じ部品 `#originAndPathOf`。query・fragment・本文・値は持たない。Origin を作れない URL は Origin を `null`、path を空にする）。
@@ -519,6 +548,7 @@ export class SafetyLedger {
             requests: immutableEvents([...this.#passedAuditSendRows.values()]),
             unlisted: this.#passedAuditSendUnlisted,
             otherOrigins: this.#passedAuditSendOtherOrigins,
+            ...(this.#passedAuditSendAfterDialogPressLeave === 0 ? {} : { afterDialogPressLeave: this.#passedAuditSendAfterDialogPressLeave }),
           }),
         };
     // AS-c: 通した WebSocket の接続の記録も、1 本でも通したときだけ snapshot に入れる。
@@ -533,6 +563,7 @@ export class SafetyLedger {
             // AS-c fix round 1（C-1・C-2）: Guard の route を通らずに開いた数と、危険な語に当たる数。
             outsideGuard: this.#passedWebSocketOutsideGuard,
             dangerous: this.#passedWebSocketDangerous,
+            ...(this.#passedWebSocketFramesAfterDialogPress === 0 ? {} : { framesAfterDialogPress: this.#passedWebSocketFramesAfterDialogPress }),
           }),
         };
     // BN-a: 閉じる途中に止めた要求の記録も、1 件でも止めたときだけ snapshot に入れる（止めなかった記録の形は変えない）。
@@ -564,6 +595,9 @@ export class SafetyLedger {
             events: immutableEvents(this.#readNavigationFailures),
           }),
         };
+    // CDPX: target が外れて送れなかった続ける命令の数も、1 件でもあったときだけ入れる。
+    const detachedTargetContinues: { readonly detachedTargetContinues?: DetachedTargetContinuesRecord } =
+      this.#detachedTargetContinueCount === 0 ? {} : { detachedTargetContinues: Object.freeze({ count: this.#detachedTargetContinueCount }) };
     return Object.freeze({
       blockedRequestsByMethod: Object.freeze(Object.assign(
         Object.create(null) as Record<string, number>,
@@ -597,6 +631,7 @@ export class SafetyLedger {
       ...blockedClosingRequests,
       ...frameClassificationFailures,
       ...readNavigationFailures,
+      ...detachedTargetContinues,
     });
   }
 

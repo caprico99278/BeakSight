@@ -45,6 +45,16 @@
     },
     "pages": { "type": "array", "items": { "$ref": "#/$defs/page" } },
     "omittedUnreadPages": { "type": "integer", "minimum": 0, "maximum": 9007199254740991 },
+    "pagesDiscoveredSplit": {
+      "description": "Optional (DSEED2): only for a discovery chained after the audit stage (the version stays 1.1). The found pages split into the pages taken over from the audit stage and the pages the discovery newly found (the same counts as the last progress).",
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["fromAuditStage", "newlyFound"],
+      "properties": {
+        "fromAuditStage": { "type": "integer", "minimum": 0, "maximum": 9007199254740991 },
+        "newlyFound": { "type": "integer", "minimum": 0, "maximum": 9007199254740991 }
+      }
+    },
     "frozenStartFallbacks": {
       "description": "Optional (COV-2c M-1): how many times an ancestor of a state read only inside the freeze could not be read in a Context frozen from the start, and was loaded outside the freeze instead. Present only when 1 or more.",
       "type": "integer", "minimum": 1, "maximum": 9007199254740991
@@ -97,6 +107,7 @@
   },
   "$defs": {
     "compactUtcTimestamp": { "type": "string", "pattern": "^[0-9]{14}$" },
+    "count": { "type": "integer", "minimum": 0, "maximum": 9007199254740991 },
     "url": { "type": "string", "minLength": 1 },
     "page": {
       "oneOf": [
@@ -153,6 +164,30 @@
             "reloadedForProbe": {
               "description": "Optional (DEF-144): the page was loaded again once to press the rest of the candidates. Absent otherwise.",
               "const": true
+            },
+            "timeBreakdown": {
+              "description": "Optional (DTIME): where the time of this page went (milliseconds and counts only; no URL and no value). The parts, stageEndMs and otherMs add up to totalMs (a nested wait is counted once, in the outer part). The current writer writes it only when the debug timing is on (DBG-1; the developer settings file local/debug-settings.json with debugTiming true); absent otherwise and in the artifacts of the earlier writers (the version stays 1.1).",
+              "type": "object",
+              "additionalProperties": false,
+              "required": [
+                "totalMs", "pacingWaitMs", "loadMs", "loads", "reloads", "settleMs", "afterPressWindowMs", "presses",
+                "pressReadinessMs", "pressReadinessTimeouts", "inputChecksMs", "stageEndMs", "otherMs"
+              ],
+              "properties": {
+                "totalMs": { "$ref": "#/$defs/count" },
+                "pacingWaitMs": { "$ref": "#/$defs/count" },
+                "loadMs": { "$ref": "#/$defs/count" },
+                "loads": { "$ref": "#/$defs/count" },
+                "reloads": { "$ref": "#/$defs/count" },
+                "settleMs": { "$ref": "#/$defs/count" },
+                "afterPressWindowMs": { "$ref": "#/$defs/count" },
+                "presses": { "$ref": "#/$defs/count" },
+                "pressReadinessMs": { "$ref": "#/$defs/count" },
+                "pressReadinessTimeouts": { "$ref": "#/$defs/count" },
+                "inputChecksMs": { "$ref": "#/$defs/count" },
+                "stageEndMs": { "$ref": "#/$defs/count" },
+                "otherMs": { "$ref": "#/$defs/count" }
+              }
             }
           }
         },
@@ -178,7 +213,8 @@
                 "SAFETY_VIOLATION",
                 "PREFLIGHT_FAILED",
                 "SAME_TEMPLATE_PAGE_READ",
-                "REBUILD_FAILED"
+                "REBUILD_FAILED",
+                "NO_PRESSABLE_ELEMENTS"
               ]
             }
           }
@@ -212,6 +248,94 @@
           "description": "Optional (COV-3; coverage by state design 3.2, 3.3): the fields (a select or a radio group of one name) whose options the submission probe chose one by one, in the order chosen (the stages read again add theirs). No option value and no option label: an option is its index and the SHA-256 digest of its value and label. Absent when there are none and in the documents of the earlier writers (the version stays 1.1).",
           "type": "array",
           "items": { "$ref": "#/$defs/optionChoice" }
+        },
+        "searchTriggers": {
+          "description": "Optional (RCA-1; search check design 2.1): the presses, option choices and inputs into a field with no form that caused a data read (a GET or HEAD fetch or xhr the frozen Guard passed), in the order caused, with the shape and the status of each read. The contract is src/discovery/search-read-contracts.ts. Never a URL, a value or a body. Absent when there are none and in the documents of the earlier writers (the version stays 1.1).",
+          "type": "array",
+          "items": { "$ref": "#/$defs/searchTrigger" }
+        }
+      }
+    },
+    "searchTrigger": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["trigger", "reads"],
+      "properties": {
+        "trigger": {
+          "type": "object",
+          "required": ["kind", "stage", "priorPresses"],
+          "properties": {
+            "kind": { "enum": ["PRESS", "OPTION", "TYPED"] },
+            "stage": { "type": "integer", "minimum": 1, "maximum": 9007199254740991 },
+            "priorPresses": {
+              "type": "array",
+              "items": { "$ref": "urn:beaksight:schema:control:candidate:1#/$defs/submissionProbe/properties/stage/properties/priorPresses/items" }
+            }
+          },
+          "oneOf": [
+            {
+              "additionalProperties": false,
+              "required": ["identityDigest", "ordinal", "inputFields"],
+              "properties": {
+                "kind": { "const": "PRESS" },
+                "stage": true,
+                "priorPresses": true,
+                "identityDigest": { "$ref": "urn:beaksight:schema:control:candidate:1#/$defs/digest" },
+                "ordinal": { "type": "integer", "minimum": 0, "maximum": 9007199254740991 },
+                "inputFields": {
+                  "type": "array",
+                  "items": { "$ref": "urn:beaksight:schema:control:candidate:1#/$defs/submissionProbe/properties/inputFields/items" }
+                }
+              }
+            },
+            {
+              "additionalProperties": false,
+              "required": ["field", "optionIndex"],
+              "properties": {
+                "kind": { "const": "OPTION" },
+                "stage": true,
+                "priorPresses": true,
+                "field": { "$ref": "#/$defs/optionChoice/properties/field" },
+                "optionIndex": { "type": "integer", "minimum": 0, "maximum": 9007199254740991 }
+              }
+            },
+            {
+              "additionalProperties": false,
+              "required": ["field"],
+              "properties": {
+                "kind": { "const": "TYPED" },
+                "stage": true,
+                "priorPresses": true,
+                "field": {
+                  "type": "object",
+                  "additionalProperties": false,
+                  "required": ["name", "selector", "type"],
+                  "properties": {
+                    "name": { "anyOf": [{ "type": "string", "minLength": 1 }, { "type": "null" }] },
+                    "selector": { "anyOf": [{ "type": "string", "minLength": 1 }, { "type": "null" }] },
+                    "type": { "$ref": "urn:beaksight:schema:control:candidate:1#/$defs/field/properties/type" }
+                  }
+                }
+              }
+            }
+          ]
+        },
+        "reads": {
+          "type": "array",
+          "minItems": 1,
+          "items": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["method", "resourceType", "pathShape", "queryNames", "markerQueryNames", "status"],
+            "properties": {
+              "method": { "enum": ["GET", "HEAD"] },
+              "resourceType": { "enum": ["fetch", "xhr"] },
+              "pathShape": { "type": "string" },
+              "queryNames": { "type": "array", "items": { "type": "string" } },
+              "markerQueryNames": { "type": "array", "items": { "type": "string" } },
+              "status": { "anyOf": [{ "type": "integer", "minimum": 100, "maximum": 999 }, { "type": "null" }] }
+            }
+          }
         }
       }
     },

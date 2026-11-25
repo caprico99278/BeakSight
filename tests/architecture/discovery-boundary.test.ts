@@ -74,8 +74,6 @@ const PURE_DISCOVERY_FILES: readonly string[] = [
   'src/discovery/discovery-result.ts',
   // T27e（設計書 4.5）: READ の確かめの候補の確かめ・URL の組み立て・照合・成果物 `read-evidence.json` の形（純粋。ワーカーとジョブの管理から使う）。
   'src/discovery/read-check-evaluation.ts',
-  // DEF-235（設計書 `2026-11-09-beaksight-read-check-record-id-fill-design.md`）: 番号の入る画面の型の番号の元の選び方と、一致の決まり（純粋。ワーカーとジョブの管理から使う）。
-  'src/discovery/read-check-record-ids.ts',
   // T37b（Task 37 の設計書 3.3、3.4）: 送らずに観察した型の分類と、型の digest（純粋。ページを操作しない）。
   'src/discovery/api-shape-classification.ts',
   // T37c（Task 37 の設計書 3.2、3.4）: 送らずに観察する probe の契約（対象の選び方、目印、結果の形。純粋。押す部品は `src/interaction/submission-probe.ts`）。
@@ -89,6 +87,15 @@ const PURE_DISCOVERY_FILES: readonly string[] = [
   'src/discovery/coverage-queue.ts',
   // SD-1（設計書 `2026-11-16-beaksight-action-based-delete-guard-design.md` 2.2）: 削除に関する操作の、操作の前の判定（純粋。ページを操作しない・読まない）。
   'src/discovery/destructive-action.ts',
+  // RCA-1・RCA-4（検索の確かめの設計書 `2026-11-18-beaksight-search-check-design.md` 2.1・2.2）: 操作さがしが起こした読み取りの記録の契約と、検索の確かめの組の
+  // 作り手と、欄に入れる値の一覧（純粋。ページを操作しない・読まない）。
+  'src/discovery/search-read-contracts.ts',
+  'src/discovery/search-check-plan.ts',
+  'src/discovery/search-check-text-values.ts',
+  // RCA-8（同 2.4）: 検索の確かめの結果の見せ方の材料（純粋）。
+  'src/discovery/search-check-results.ts',
+  // DTIME: 操作さがしの 1 画面の時間の内訳（測る口と記録の形。純粋。時計は呼ぶ側が差し込む）。
+  'src/discovery/page-time-breakdown.ts',
 ];
 
 /** (v): 発見のブラウザの部品（T27b）。純粋な部品の一覧には含めない。 */

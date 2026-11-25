@@ -209,7 +209,7 @@ describe.each(BOTH_CHROMIUM_LAUNCHERS)('T27d: the discovery job flow (%s)', (nam
       onRunStarted: (event) => {
         started.push(event);
         activeCheck = (async () => {
-          const exclusion = await acquireRunExclusion(dirname(event.runDirectory));
+          const exclusion = await acquireRunExclusion(dirname(event.runDirectory), config.target.id);
           await releaseIfAcquired(exclusion);
           return exclusion.kind === 'HELD';
         })();
@@ -279,7 +279,7 @@ describe.each(BOTH_CHROMIUM_LAUNCHERS)('T27d: the discovery job flow (%s)', (nam
 
     // 出力先の監査中の印（SPEC-2）: 実行の間は動いている Run として見え、終わったら離す。
     expect(result.visibleAsActive).toBe(true);
-    const after = await acquireRunExclusion(outputDirectory);
+    const after = await acquireRunExclusion(outputDirectory, configFor().target.id);
     expect(after.kind).toBe('ACQUIRED');
     await releaseIfAcquired(after);
     expect(readdirSync(result.outcome.runDirectory).filter((name) => name !== 'checkpoint')).toEqual([DISCOVERY_ARTIFACT_FILE_NAME]);

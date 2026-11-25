@@ -149,6 +149,8 @@ describe('scenario contracts and defaults (T28a)', () => {
       // ARR-5 fix round 1（SREV-ARR2 の M1・M2）: 一覧の位置の道の重なりと、本文の同じ鍵の 2 回。
       'SCENARIO_API_ARRAY_PATH_CONFLICT',
       'SCENARIO_API_BODY_KEY_DUPLICATE',
+      // WBF（DEF-291 の B1）。
+      'SCENARIO_API_FIELD_VALUES_NOT_SENT',
     ]);
     expect(Object.isFrozen(SCENARIO_DRAFT_REJECTION_REASONS)).toBe(true);
   });

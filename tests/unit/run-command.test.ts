@@ -556,7 +556,9 @@ describe('R5a: after the Run, the CLI follows the checkpoint conclusion of the R
       expect(lines.filter((line) => line.includes(cause.message))).toHaveLength(1);
       // 出力を作らない（結果の要約も示さない）。
       expect(fake.outcome?.stdout).not.toContain(CLI_TEXT.run.resultHeading);
-      expect(existsSync(join(workDirectory, name))).toBe(false);
+      // REV-PAR の m-1: 出力先は別の対象と共有するので、印の後始末では消さない（空の出力先は残る）。書かないのは Run のディレクトリと成果物。
+      const outputDirectory = join(workDirectory, name);
+      expect(existsSync(outputDirectory) ? await readdir(outputDirectory, { recursive: true }) : []).toEqual([]);
       expect(fake.finish).not.toHaveBeenCalled();
       expect(fake.abandon).not.toHaveBeenCalled();
     },

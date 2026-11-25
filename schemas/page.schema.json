@@ -35,6 +35,21 @@
     "incompleteReasons": {
       "type": "array",
       "items": { "$ref": "urn:beaksight:schema:run:1.0#/$defs/incompleteReason" }
+    },
+    "sameness": {
+      "description": "Optional (DUP; doc/design/2026-11-18-beaksight-same-structure-pages-design.md): a later page of the same template audited lightly (LIGHT; sameAs is the fully audited first page of the template) or not audited because its shown content was the same as an audited page (SAME; sameAs is that page). Absent on a fully audited page and in the documents of the earlier writers (the version stays).",
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["depth", "sameAs"],
+      "properties": {
+        "depth": { "enum": ["LIGHT", "SAME"] },
+        "sameAs": { "type": "string", "pattern": "^PAGE-[0-9]{6,}$" }
+      }
+    },
+    "templateKey": {
+      "description": "Optional (AUD-5; doc/design/2026-11-19-beaksight-audit-result-review-fixes-design.md 8.2): the template key of the page made on Desktop (the DUP key without the data), read by the cross-page rule of the same titles. Absent when it could not be made and in the documents of the earlier writers (the version stays).",
+      "type": "string",
+      "pattern": "^sha256:[0-9a-f]{64}$"
     }
   },
   "$defs": {
@@ -153,7 +168,12 @@
           "properties": {
             "dismissedCount": { "type": "integer", "minimum": 0 },
             "hiddenCount": { "type": "integer", "minimum": 0 },
-            "digests": { "type": "array", "items": { "type": "string" } }
+            "digests": { "type": "array", "items": { "type": "string" } },
+            "stressHiddenCount": {
+              "description": "Optional (S-03a; doc/design/2026-11-19-beaksight-audit-result-review-fixes-design.md): the number of the notification frames (by digest) hidden in the stress sweep, apart from hiddenCount of the main load. Present only when the stress sweep saw notification frames. Absent in the documents of the earlier writers (the version stays).",
+              "type": "integer",
+              "minimum": 0
+            }
           }
         }
       }
@@ -353,6 +373,12 @@
         "viewportHeight": { "type": "number", "minimum": 0 },
         "scrollPosition": { "$ref": "#/$defs/scrollPosition" },
         "stressWidth": { "type": "integer", "minimum": 1 },
+        "sequentialTabOutcome": {
+          "enum": [
+            "CHECKED", "NO_CANDIDATES", "WATCH_ENDED", "KEY_GUARD_UNAVAILABLE", "NO_START", "FRAME", "VALUE_ENTRY", "NEW_ELEMENT", "UNSETTLED", "DEADLINE",
+            "READ_FAILED"
+          ]
+        },
         "scrollableRegions": {
           "type": "array",
           "items": {
@@ -376,6 +402,45 @@
             }
           }
         },
+        "dialogFocus": {
+          "description": "Optional (FRET): the check of where the focus goes after a window opened by a button is closed (the primary load only). pressableCount 0 means no button to press.",
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["status", "pressableCount", "alreadyCheckedCount", "items"],
+          "properties": {
+            "status": { "enum": ["COMPLETE", "NAVIGATED", "NOT_CLOSABLE", "KEY_GUARD_UNAVAILABLE", "PARTIAL"] },
+            "pressableCount": { "type": "integer", "minimum": 0 },
+            "alreadyCheckedCount": { "type": "integer", "minimum": 0 },
+            "lateNonReadRequestCount": { "type": "integer", "minimum": 1 },
+            "lateWebSocketFrameSentCount": { "type": "integer", "minimum": 1 },
+            "items": {
+              "type": "array",
+              "items": {
+                "type": "object",
+                "additionalProperties": false,
+                "required": [
+                  "selector", "name", "keyDigest", "outcome", "focusMovedIntoWindow", "closedBy", "focusAfterClose", "focusAfterCloseSelector",
+                  "beforeScreenshotEvidenceId", "afterScreenshotEvidenceId"
+                ],
+                "properties": {
+                  "selector": { "type": "string" },
+                  "name": { "type": "string" },
+                  "keyDigest": { "type": "string", "minLength": 1 },
+                  "outcome": { "enum": ["NOT_FOCUSED", "NO_WINDOW", "NAVIGATED", "CHECKED"] },
+                  "focusMovedIntoWindow": { "type": ["boolean", "null"] },
+                  "closedBy": { "enum": ["ESCAPE", "CLOSE_BUTTON", "NOT_CLOSABLE", null] },
+                  "focusAfterClose": { "enum": ["TRIGGER", "OTHER", "BODY", "TRIGGER_GONE", null] },
+                  "focusAfterCloseSelector": { "type": ["string", "null"] },
+                  "nonReadRequestCount": { "type": "integer", "minimum": 1 },
+                  "guardBlockedCount": { "type": "integer", "minimum": 1 },
+                  "webSocketFrameSentCount": { "type": "integer", "minimum": 1 },
+                  "beforeScreenshotEvidenceId": { "type": ["string", "null"], "pattern": "^EV-SHOT-[0-9]{6,}$" },
+                  "afterScreenshotEvidenceId": { "type": ["string", "null"], "pattern": "^EV-SHOT-[0-9]{6,}$" }
+                }
+              }
+            }
+          }
+        },
         "items": {
           "type": "array",
           "items": {
@@ -391,7 +456,41 @@
               "visibleAfterFocus": { "type": "boolean" },
               "hitAfterFocus": { "type": "boolean" },
               "screenshotEvidenceId": { "type": ["string", "null"], "pattern": "^EV-SHOT-[0-9]{6,}$" },
-              "operation": { "enum": ["DIRECT_FOCUS"] },
+              "operation": { "enum": ["DIRECT_FOCUS", "SEQUENTIAL_TAB"] },
+              "sequentialTab": {
+                "type": "object",
+                "additionalProperties": false,
+                "required": [
+                  "operation", "reached", "afterRect", "visibleAfterFocus", "hitAfterFocus", "hitTestPointCount", "hitPointCount", "coveredBySelector"
+                ],
+                "properties": {
+                  "operation": { "const": "SEQUENTIAL_TAB" },
+                  "reached": { "type": "boolean" },
+                  "afterRect": { "oneOf": [{ "type": "null" }, { "$ref": "#/$defs/rectangle" }] },
+                  "visibleAfterFocus": { "type": "boolean" },
+                  "hitAfterFocus": { "type": "boolean" },
+                  "hitTestPointCount": { "type": "integer", "minimum": 0 },
+                  "hitPointCount": { "type": "integer", "minimum": 0 },
+                  "coveredBySelector": { "type": ["string", "null"] },
+                  "behindFrontWindow": { "const": true }
+                }
+              },
+              "kind": { "enum": ["GUARD", "CONTROL", "UNKNOWN"] },
+              "unsettled": { "const": true },
+              "frontWindowCovered": { "const": true },
+              "kindBasis": {
+                "type": "object",
+                "additionalProperties": false,
+                "required": ["tiny", "named", "hasRole", "controlType", "trapEdge"],
+                "properties": {
+                  "tiny": { "type": "boolean" },
+                  "named": { "type": "boolean" },
+                  "hasRole": { "type": "boolean" },
+                  "controlType": { "type": "boolean" },
+                  "trapEdge": { "type": "boolean" },
+                  "dialogSiblingEdge": { "type": "boolean" }
+                }
+              },
               "hitTestPointCount": { "type": "integer", "minimum": 0 },
               "hitPointCount": { "type": "integer", "minimum": 0 },
               "scroll": {
@@ -1054,7 +1153,8 @@
             "properties": {
               "id": { "type": "string" },
               "count": { "type": "integer", "minimum": 2 },
-              "truncated": { "type": "boolean" }
+              "truncated": { "type": "boolean" },
+              "referenceCount": { "type": "integer", "minimum": 0 }
             }
           }
         },
@@ -1099,6 +1199,11 @@
             "progressbarCount": { "type": "integer", "minimum": 0 },
             "indeterminateProgressCount": { "type": "integer", "minimum": 0 }
           }
+        },
+        "discoveryCandidateCount": {
+          "description": "Optional (SKIP-1; doc/design/2026-11-20-beaksight-discovery-skip-and-debug-timing-design.md 2.1): the number of candidates the discovery would press on this page, counted by the selection shared with the discovery probe, at every audit depth. Absent when it could not be counted and in the documents of the earlier writers (unknown; the discovery reads the page; the version stays).",
+          "type": "integer",
+          "minimum": 0
         }
       }
     },
@@ -1206,6 +1311,25 @@
         "bothHitPointCount": { "type": "integer", "minimum": 0 }
       }
     },
+    "overlapSidePlacement": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["positionedInSharedContainer", "controlAncestorSelector"],
+      "properties": {
+        "positionedInSharedContainer": { "type": "boolean" },
+        "controlAncestorSelector": { "type": ["string", "null"] }
+      }
+    },
+    "overlapPlacement": {
+      "description": "Optional (AUD-5; doc/design/2026-11-19-beaksight-audit-result-review-fixes-design.md 8.1): how each element of a pair of non-fixed elements is placed. Absent in the documents of the earlier writers (the version stays).",
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["first", "second"],
+      "properties": {
+        "first": { "$ref": "#/$defs/overlapSidePlacement" },
+        "second": { "$ref": "#/$defs/overlapSidePlacement" }
+      }
+    },
     "overlapHitLayer": {
       "type": "object",
       "additionalProperties": false,
@@ -1263,7 +1387,19 @@
           "required": ["dialogModal", "ariaModal"],
           "properties": {
             "dialogModal": { "type": "boolean" },
-            "ariaModal": { "type": "boolean" }
+            "ariaModal": { "type": "boolean" },
+            "openModal": {
+              "const": true,
+              "description": "AUD-2: the overlay is a shown modal dialog, inside one, or its dimming backdrop. Optional so that the schema version stays the same."
+            },
+            "coveredInside": {
+              "const": true,
+              "description": "AUD-2: the covered element is inside the same modal dialog (the inside of the dialog is blocked, so it is not counted as a modal). Optional so that the schema version stays the same."
+            },
+            "frontWindow": {
+              "const": true,
+              "description": "RVP-2: the overlay is an open front window (a large dialog) or inside one. Optional so that the schema version stays the same."
+            }
           }
         }
       }
@@ -1435,6 +1571,19 @@
               "widthClipped": { "type": "boolean" },
               "heightClipped": { "type": "boolean" },
               "partiallyClippedText": { "type": "boolean" },
+              "cutScrollRegions": {
+                "description": "Optional (S-06; doc/design/2026-11-19-beaksight-audit-result-review-fixes-design.md): the outermost scrollable ancestors between the text and this box whose boxes stick out of this box (the edge of an inner scroll region is cut by this box). The text in a scrollable ancestor is judged by the box of the ancestor, not by partiallyClippedText. Present only when there is such a region. Absent in the documents of the earlier writers (the version stays).",
+                "type": "array",
+                "items": {
+                  "type": "object",
+                  "additionalProperties": false,
+                  "required": ["selector", "rect"],
+                  "properties": {
+                    "selector": { "type": "string" },
+                    "rect": { "$ref": "#/$defs/rectangle" }
+                  }
+                }
+              },
               "truncated": { "type": "boolean" },
               "clippingStyle": {
                 "type": "object",
@@ -1518,7 +1667,8 @@
               "truncated": { "type": "boolean" },
               "hitTest": { "$ref": "#/$defs/overlapHitTest" },
               "coveredScrollContainer": { "$ref": "#/$defs/scrollContainer" },
-              "lineOverlap": { "$ref": "#/$defs/lineOverlap" }
+              "lineOverlap": { "$ref": "#/$defs/lineOverlap" },
+              "placement": { "$ref": "#/$defs/overlapPlacement" }
             }
           }
         },
@@ -1590,7 +1740,80 @@
             "renderedDescendantScanLimitReachedCount": { "type": "integer", "minimum": 0 }
           }
         },
-        "collectedInParts": { "type": "integer", "minimum": 1 }
+        "collectedInParts": { "type": "integer", "minimum": 1 },
+        "stateMark": { "$ref": "#/$defs/evidenceStateMark" },
+        "keyActionElements": {
+          "description": "BS-2: the facts of the positions of the key action candidates (the target is the scheme and the host only; phone numbers and mail addresses in the text are redacted). Optional so that the schema version stays the same.",
+          "type": "array",
+          "items": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["selector", "tagName", "role", "text", "ariaLabel", "title", "hrefScheme", "hrefHost", "rect", "visible", "fixedContainerSelector"],
+            "properties": {
+              "selector": { "type": "string" },
+              "tagName": { "type": "string" },
+              "role": { "type": ["string", "null"] },
+              "text": { "type": "string" },
+              "ariaLabel": { "type": ["string", "null"] },
+              "title": { "type": ["string", "null"] },
+              "hrefScheme": { "type": ["string", "null"] },
+              "hrefHost": { "type": ["string", "null"] },
+              "rect": { "$ref": "#/$defs/rectangle" },
+              "visible": { "type": "boolean" },
+              "fixedContainerSelector": { "type": ["string", "null"] }
+            }
+          }
+        }
+      }
+    },
+    "evidenceStateMark": {
+      "description": "AUD-4: the state mark read when the layout was read and when the image of the state was taken (scrolls, scroll boxes, a digest of the DOM structure without values). Optional so that the schema version stays the same.",
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["documentScroll", "scrollBoxes", "structureDigest"],
+      "properties": {
+        "documentScroll": { "$ref": "#/$defs/scrollPosition" },
+        "scrollBoxes": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["selector", "scrollLeft", "scrollTop", "clientRect"],
+            "properties": {
+              "selector": { "type": "string" },
+              "scrollLeft": { "type": "number" },
+              "scrollTop": { "type": "number" },
+              "clientRect": { "$ref": "#/$defs/rectangle" }
+            }
+          }
+        },
+        "structureDigest": { "type": "string", "pattern": "^[0-9]+:[0-9a-f]{16}$" },
+        "hiddenNotificationFrameCount": { "type": "integer", "minimum": 0 },
+        "targetScrollBoxes": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["selector", "boxes"],
+            "properties": {
+              "selector": { "type": "string" },
+              "boxes": { "type": "array", "minItems": 1, "items": { "type": "integer", "minimum": 0 } }
+            }
+          }
+        },
+        "targetRects": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["selector", "matchCount", "rect"],
+            "properties": {
+              "selector": { "type": "string" },
+              "matchCount": { "type": "integer", "minimum": 0 },
+              "rect": { "anyOf": [{ "type": "null" }, { "$ref": "#/$defs/rectangle" }] }
+            }
+          }
+        }
       }
     },
     "sameAsRef": {
@@ -1676,7 +1899,8 @@
                   "truncated": { "type": "boolean" },
                   "hitTest": { "$ref": "#/$defs/overlapHitTest" },
                   "coveredScrollContainer": { "$ref": "#/$defs/scrollContainer" },
-                  "lineOverlap": { "$ref": "#/$defs/lineOverlap" }
+                  "lineOverlap": { "$ref": "#/$defs/lineOverlap" },
+                  "placement": { "$ref": "#/$defs/overlapPlacement" }
                 }
               }
             ]
@@ -1684,7 +1908,9 @@
         },
         "overlapElements": { "type": "array", "minItems": 1, "items": { "$ref": "#/$defs/layoutElement" } },
         "truncation": { "$ref": "#/$defs/layoutEvidence/properties/truncation" },
-        "collectedInParts": { "$ref": "#/$defs/layoutEvidence/properties/collectedInParts" }
+        "collectedInParts": { "$ref": "#/$defs/layoutEvidence/properties/collectedInParts" },
+        "stateMark": { "$ref": "#/$defs/evidenceStateMark" },
+        "keyActionElements": { "$ref": "#/$defs/layoutEvidence/properties/keyActionElements" }
       }
     },
     "accessibilityRuleRecord": {
@@ -1816,7 +2042,22 @@
               "dismissed": { "type": "boolean" },
               "hidden": { "type": "boolean" },
               "hiddenReason": { "enum": ["NOT_DISMISSED", "CLOSE_BUTTON_DISABLED", "NO_CLOSE_BUTTON", null] },
-              "firstSeen": { "type": "boolean" }
+              "firstSeen": { "type": "boolean" },
+              "keptOpen": {
+                "const": true,
+                "description": "AUD-2: a modal dialog (aria-modal, a modal dialog element, or role=dialog with a dimming backdrop, its inside or its backdrop) audited open without hiding it. Optional so that the schema version stays the same (records before AUD-2 do not have it)."
+              },
+              "hiddenAt": {
+                "type": "object",
+                "additionalProperties": false,
+                "required": ["viewportWidth", "scrollX", "scrollY"],
+                "description": "AUD-2: the viewport width and the document scroll position when the frame was actually hidden. Optional so that the schema version stays the same (records before AUD-2 do not have it).",
+                "properties": {
+                  "viewportWidth": { "type": "number", "minimum": 0 },
+                  "scrollX": { "type": "number" },
+                  "scrollY": { "type": "number" }
+                }
+              }
             }
           }
         },
@@ -2687,6 +2928,7 @@
               "failureSummary": { "type": ["string", "null"] },
               "htmlSnippet": { "type": "string" },
               "truncated": { "type": "boolean" },
+              "truncationKind": { "enum": ["SOURCE_TRUNCATED"] },
               "checks": { "type": "array", "items": { "$ref": "#/$defs/accessibilityCheck" } },
               "truncations": { "type": "array", "items": { "$ref": "#/$defs/accessibilityValueTruncation" } },
               "disabledFacts": {
@@ -2694,6 +2936,16 @@
               },
               "countExclusion": { "enum": ["DISABLED_FOR_ASSISTIVE_TECH", null] },
               "computedContrastRatio": { "type": "number", "minimum": 1 },
+              "labelledBy": {
+                "type": "object",
+                "additionalProperties": false,
+                "required": ["idCount", "foundCount", "visibility"],
+                "properties": {
+                  "idCount": { "type": "integer", "minimum": 0 },
+                  "foundCount": { "type": "integer", "minimum": 0 },
+                  "visibility": { "enum": ["VISIBLE", "HIDDEN", "MISSING"] }
+                }
+              },
               "region": {
                 "oneOf": [
                   {
@@ -2768,6 +3020,20 @@
           "type": "object",
           "additionalProperties": {
             "oneOf": [{ "type": "string" }, { "type": "number" }, { "type": "boolean" }, { "type": "null" }]
+          }
+        },
+        "relatedNodes": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["targetSelectors"],
+            "properties": {
+              "targetSelectors": {
+                "type": "array",
+                "items": { "oneOf": [{ "type": "string" }, { "type": "array", "items": { "type": "string" } }] }
+              }
+            }
           }
         }
       }
@@ -2904,6 +3170,7 @@
         "disabled": { "type": "boolean" },
         "visible": { "type": "boolean" },
         "destructiveAction": { "type": "boolean" },
+        "aiAction": { "type": "boolean" },
         "boundingBox": {
           "type": "object",
           "additionalProperties": false,
@@ -2958,6 +3225,7 @@
         "NOT_VISIBLE",
         "MALFORMED_CANDIDATE",
         "DESTRUCTIVE_ACTION_SKIPPED",
+        "AI_ACTION_SKIPPED",
         "SAFETY_FREEZE_BLOCKED",
         "OWNER_CLOSE_SAFETY_FAILURE",
         "SESSION_OPEN_DEADLINE",
@@ -3003,6 +3271,7 @@
         "DEADLINE_DURING_EXACT_NODE_ADMISSION",
         "TARGET_NOT_SCROLL_PREPARED",
         "DEADLINE_BEFORE_EXACT_NODE_CLICK",
+        "TARGET_COVERED_BY_OTHER",
         "CLICK_TIMED_OUT",
         "DEADLINE_BEFORE_POST_CONDITION_OBSERVATION",
         "DEADLINE_DURING_POST_CONDITION_OBSERVATION",
@@ -3041,7 +3310,8 @@
                   "DISABLED",
                   "NOT_VISIBLE",
                   "MALFORMED_CANDIDATE",
-                  "DESTRUCTIVE_ACTION_SKIPPED"
+                  "DESTRUCTIVE_ACTION_SKIPPED",
+                  "AI_ACTION_SKIPPED"
                 ] } } }
         },
         {
@@ -3094,6 +3364,7 @@
                   "DEADLINE_DURING_EXACT_NODE_ADMISSION",
                   "TARGET_NOT_SCROLL_PREPARED",
                   "DEADLINE_BEFORE_EXACT_NODE_CLICK",
+                  "TARGET_COVERED_BY_OTHER",
                   "CLICK_TIMED_OUT",
                   "DEADLINE_BEFORE_POST_CONDITION_OBSERVATION",
                   "DEADLINE_DURING_POST_CONDITION_OBSERVATION",
@@ -3196,7 +3467,12 @@
         "captureType": { "enum": ["VIEWPORT", "FULL_PAGE"] },
         "scrollPosition": { "$ref": "#/$defs/scrollPosition" },
         "stressWidth": { "type": "integer", "minimum": 1 },
-        "reveal": { "$ref": "#/$defs/revealCapture" }
+        "reveal": { "$ref": "#/$defs/revealCapture" },
+        "beforeNotificationHide": {
+          "const": true,
+          "description": "AUD-2: the image taken just before hiding a notification frame (kept only when a frame was hidden; not used as the image of the state). Optional so that the schema version stays the same."
+        },
+        "stateMark": { "$ref": "#/$defs/evidenceStateMark" }
       }
     },
     "revealCapture": {
@@ -3516,7 +3792,7 @@
       "required": ["url", "reason", "phase"],
       "properties": {
         "url": { "type": "string" },
-        "reason": { "enum": ["PASSIVE_WEBSOCKET", "WORKER_CONNECT_POLICY", "AUDIT_SEND_OVER_LIMIT", "WEBSOCKET_SEND_QUEUE_FULL"] },
+        "reason": { "enum": ["PASSIVE_WEBSOCKET", "WORKER_CONNECT_POLICY", "AUDIT_SEND_OVER_LIMIT", "WEBSOCKET_SEND_QUEUE_FULL", "SCROLL_KEY_PRESS_RESTRICTED"] },
         "phase": { "$ref": "#/$defs/blockedEventPhase" }
       }
     },
@@ -3565,6 +3841,15 @@
         }
       }
     },
+    "detachedTargetContinues": {
+      "description": "CDPX: the number of the continue commands for requests the Guard allowed that could not be sent because the cross-site iframe (OOPIF) target had already detached (not violations; when the target detaches, Chromium releases the paused request as if it were continued). Only when at least one was recorded. Not a SAFETY finding.",
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["count"],
+      "properties": {
+        "count": { "type": "integer", "minimum": 1 }
+      }
+    },
     "readNavigationFailures": {
       "description": "SAFE-2 item 4 (DEF-145): the failures of the delivery of the main frame navigations that are reads (GET and HEAD) the Guard allowed (formerly the violation HTTP_MAIN_FRAME_DELIVERY_FAILED; a non-read failure is still a violation). Whether the read reached the server is unknown, and a read is safe either way. url has the origin and the path only (no query, fragment or value). Only when at least one was recorded. count also counts the events beyond the event limit. Not a SAFETY finding.",
       "type": "object",
@@ -3589,7 +3874,7 @@
       }
     },
     "safetyEvidenceLoad": {
-      "description": "BN-a (BeakSight block noise design 3.1, item 4): the load of the Ledger of the safety evidence. PAGE_AUDIT: the page audit load (desktop and mobile). STRESS_WIDTH: one width of the width scan (CSS px). INTERACTION: one Interaction candidate (its index in the discovery order, from 0). Required.",
+      "description": "BN-a (BeakSight block noise design 3.1, item 4): the load of the Ledger of the safety evidence. PAGE_AUDIT: the page audit load (desktop and mobile). STRESS_WIDTH: one width of the width scan (CSS px); a Context loaded once and resized through the widths also has widths (the resized widths whose results were kept, in order; empty when none was kept). INTERACTION: one Interaction candidate (its index in the discovery order, from 0). Required.",
       "oneOf": [
         {
           "type": "object",
@@ -3601,7 +3886,11 @@
           "type": "object",
           "additionalProperties": false,
           "required": ["kind", "width"],
-          "properties": { "kind": { "const": "STRESS_WIDTH" }, "width": { "type": "integer", "minimum": 1 } }
+          "properties": {
+            "kind": { "const": "STRESS_WIDTH" },
+            "width": { "type": "integer", "minimum": 1 },
+            "widths": { "type": "array", "items": { "type": "integer", "minimum": 1 } }
+          }
         },
         {
           "type": "object",
@@ -3638,7 +3927,8 @@
             "DISABLED",
             "NOT_VISIBLE",
             "MALFORMED_CANDIDATE",
-            "DESTRUCTIVE_ACTION_SKIPPED"
+            "DESTRUCTIVE_ACTION_SKIPPED",
+            "AI_ACTION_SKIPPED"
           ]
         }
       }
@@ -3754,6 +4044,11 @@
           "description": "AS-c: the number of the passed requests to another Origin (neither an allowed Origin nor an approved service Origin). Required (LG-4: the records without it are no longer read).",
           "type": "integer",
           "minimum": 0
+        },
+        "afterDialogPressLeave": {
+          "description": "Optional (FRET fix round 4): of them, the number passed in the leave steps before closing a page where the window button check pressed a button (not told apart from the site's own cleanup).",
+          "type": "integer",
+          "minimum": 1
         }
       }
     },
@@ -3795,6 +4090,11 @@
           "description": "AS-c fix round 1: the number of the connections whose URL hits a dangerous term. Required (LG-4).",
           "type": "integer",
           "minimum": 0
+        },
+        "framesAfterDialogPress": {
+          "description": "Optional (FRET fix round 5): the number of the frames that the connections opened before the press sent on a page where the window button check pressed a button, after the press period until the page was closed (not stopped; not always caused by the press).",
+          "type": "integer",
+          "minimum": 1
         }
       }
     },
@@ -3863,7 +4163,8 @@
         "passedAuditSendWebSockets": { "$ref": "#/$defs/passedAuditSendWebSockets" },
         "blockedClosingRequests": { "$ref": "#/$defs/blockedClosingRequests" },
         "frameClassificationFailures": { "$ref": "#/$defs/frameClassificationFailures" },
-        "readNavigationFailures": { "$ref": "#/$defs/readNavigationFailures" }
+        "readNavigationFailures": { "$ref": "#/$defs/readNavigationFailures" },
+        "detachedTargetContinues": { "$ref": "#/$defs/detachedTargetContinues" }
       }
     }
   }

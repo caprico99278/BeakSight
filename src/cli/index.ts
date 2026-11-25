@@ -11,6 +11,7 @@
  *   止める印（`AbortController`）を付け、その印を `runCli` に渡して、Run Coordinator に届ける。2回目は、文言を書き終えてから、終了コード 5 で
  *   すぐに終える（Chromium の終了は、扱われない失敗と同じく、Playwright がプロセスの終了時に行う処理に任せる）。
  */
+import { debugSettingsPathOf, debugTimingSwitchOf } from '../core/debug-timing.js';
 import { createInterruptHandler, registerInterruptHandlers } from './interrupt.js';
 import { reportUnhandledFailure, runCli } from './main.js';
 import { ignoreOutputErrors, streamOutput } from './output-stream.js';
@@ -36,5 +37,8 @@ process.on('unhandledRejection', handleUnhandledFailure);
 const interruption = new AbortController();
 registerInterruptHandlers(process, createInterruptHandler({ controller: interruption, stderr, exit: (code) => process.exit(code) }));
 
-const exitCode = await runCli(process.argv.slice(2), { stdout, stderr }, { stopSignal: interruption.signal });
+// DBG-1: 測りの記録の入切は、リポジトリの根（作業のフォルダ。設定ファイルと同じ決め方）の `local/` の設定ファイルを、Run の始めに 1 回読む（既定は切）。
+const exitCode = await runCli(process.argv.slice(2), { stdout, stderr }, {
+  stopSignal: interruption.signal, debugTimingSwitch: () => debugTimingSwitchOf(debugSettingsPathOf(process.cwd())),
+});
 process.exit(await (unhandledFailure ?? exitCode));

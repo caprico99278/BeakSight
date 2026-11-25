@@ -4,7 +4,14 @@
 //   `documentGoneOf` と同じ考え方。Playwright の 1 手には期限を付けない）。
 import type { Page } from 'playwright';
 import { describe, expect, it } from 'vitest';
-import { auditDocumentLeftCause, stressWidthIncompleteReasonOf, stressWidthSessionCloser } from '../../src/orchestration/stress-width-end.js';
+import type { FocusCheckEvidence, LayoutEvidence } from '../../src/core/evidence-types.js';
+import {
+  auditDocumentLeftCause,
+  sameStressLayoutFacts,
+  stressLayoutFactKeys,
+  stressWidthIncompleteReasonOf,
+  stressWidthSessionCloser,
+} from '../../src/orchestration/stress-width-end.js';
 import { SafetyLedger } from '../../src/safety/safety-ledger.js';
 
 const pageAt = (url: string, closed = false): Page => ({ isClosed: () => closed, url: () => url, mainFrame: () => ({ url: () => url }) }) as unknown as Page;
@@ -43,5 +50,42 @@ describe('the end of a stress width', () => {
     expect(auditDocumentLeftCause(pageAt('https://example.test/'), [clean], true)).toBeNull();
     // 読み込む前の page（`about:blank`）は、文書が消えたとみなさない。
     expect(auditDocumentLeftCause(pageAt('about:blank'), [clean], false)).toBeNull();
+  });
+});
+
+// SWR（設計者の判断 2026-11-17 の 1）: 大きさを変えて測った幅と、読み込み直して測った幅の照らし合わせは、指摘になりうる事実の鍵の集合で比べる（位置の違いは見ない）。
+describe('the layout facts of a stress width to compare a resized page with a loaded page', () => {
+  const element = (selector: string, x = 0): unknown => ({ selector, rect: { x } });
+  const layoutWith = (facts: Partial<Record<string, unknown>>): LayoutEvidence => ({
+    document: { horizontalOverflowPx: 0 },
+    boxesOutsideViewport: [],
+    clippedText: [],
+    fixedHeadingOverlaps: [],
+    elementOverlaps: [],
+    fixedElements: [],
+    ...facts,
+  }) as unknown as LayoutEvidence;
+  const focusWith = (items: readonly { readonly selector: string; readonly visibleAfterFocus: boolean; readonly hitAfterFocus: boolean }[]): FocusCheckEvidence =>
+    ({ items }) as unknown as FocusCheckEvidence;
+
+  it('names the overflow, the elements outside, the overlaps, the fixed frames, the clipped text and the hidden focus', () => {
+    const facts = stressLayoutFactKeys(layoutWith({
+      document: { horizontalOverflowPx: 12 },
+      boxesOutsideViewport: [element('#wide')],
+      elementOverlaps: [{ first: element('#a'), second: element('#b') }],
+      fixedHeadingOverlaps: [{ overlaySelector: '#bar', headingSelector: 'h2' }],
+      fixedElements: [{ selector: '#banner', viewportIntersectionArea: 100, visibility: { visible: true } }],
+      clippedText: [element('#clip')],
+    }), focusWith([{ selector: '#hidden', visibleAfterFocus: false, hitAfterFocus: false }, { selector: '#shown', visibleAfterFocus: true, hitAfterFocus: true }]));
+    expect([...facts].sort()).toEqual([
+      'CLIPPED_TEXT #clip', 'DOCUMENT_OVERFLOW', 'ELEMENT_OVERLAP #a #b', 'FIXED_ELEMENT #banner', 'FIXED_HEADING_OVERLAP #bar h2',
+      'FOCUS_HIDDEN #hidden', 'OUTSIDE_VIEWPORT #wide',
+    ]);
+  });
+
+  it('is the same for the same facts at other positions, and differs when a fact appears', () => {
+    const at = (x: number): LayoutEvidence => layoutWith({ boxesOutsideViewport: [element('#wide', x)] });
+    expect(sameStressLayoutFacts({ layout: at(0), focus: null }, { layout: at(30), focus: null })).toBe(true);
+    expect(sameStressLayoutFacts({ layout: at(0), focus: null }, { layout: layoutWith({ document: { horizontalOverflowPx: 5 } }), focus: null })).toBe(false);
   });
 });

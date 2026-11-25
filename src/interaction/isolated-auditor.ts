@@ -59,8 +59,11 @@ import {
   inspectInteractionCandidateHandle,
   resolveInteractionCandidateHandle,
   type InteractionAttributeRecord,
+  type InteractionCandidateReference,
   type InteractionHandleResolution,
 } from './discover-candidates.js';
+import { readOpenModalDialogKeys } from './notification-overlay.js';
+import { reachTargetOf, submitterHitOf, type SubmitterHit } from './submission-probe.js';
 
 export type InteractionAuditSession = InteractionGuardedSession;
 
@@ -144,7 +147,7 @@ const OUTSIDE_AUDIT_SCOPE_DETAIL = 'OUTSIDE_AUDIT_SCOPE';
 
 /** REV-SD の I-1: 隔離した page の main frame が、点検の範囲の外へ移ったか（判定は `auditScopeLeftUrl` の 1 か所）。 */
 const movedOutsideAuditScope = (session: InteractionAuditSession, input: InteractionAuditInput): boolean =>
-  input.isOutsideAuditScope !== undefined && auditScopeLeftUrl(session.page.url(), input.isOutsideAuditScope) !== null;
+  input.isOutsideAuditScope !== undefined && auditScopeLeftUrl(session.page.url(), input.isOutsideAuditScope, input.targetUrl) !== null;
 
 /** COV-4 の区切り 3: 押し直す押下の 1 つ（候補の ID と、同じ ID の中の順番）。 */
 export interface InteractionPressStep {
@@ -226,6 +229,8 @@ export const INTERACTION_NOT_VERIFIABLE_REASONS = Object.freeze({
   TARGET_NOT_SCROLL_PREPARED: 'CHECK_NOT_COMPLETED',
   /** 凍結の後、click を始める前に、期限が切れた（探し直し・handle の解決・押す前の観測のどこでも）。 */
   DEADLINE_BEFORE_EXACT_NODE_CLICK: 'CHECK_NOT_COMPLETED',
+  /** DEF-294: 押す前の hit-test で、対象がほかの表示（暗転・全面の層など）に覆われていた。押さない（サイトの表示の結果として扱う）。 */
+  TARGET_COVERED_BY_OTHER: 'OBSERVED_NO_CHANGE',
   /**
    * click が期限切れになった。詳細は、整えた click のエラーの文言（残らなければ null）。click のほかの失敗は、
    * EXECUTION_FAILED の `CLICK_FAILED` で、コードで見分けられる。
@@ -254,6 +259,7 @@ export const INTERACTION_NOT_VERIFIABLE_REASONS = Object.freeze({
 
 /** 下準備の hover の後、凍結の前に待つ描画の回数。 */
 const SCROLL_PREPARATION_SETTLE_FRAMES = 2;
+
 const UNINSPECTABLE_INTERACTION_ERROR_MESSAGE = 'Interaction error could not be safely normalized';
 /** owner の close の拒否のエラーの文言から、不要な部分を除いた結果が空になった場合の、Ledger の違反の文言。 */
 const OWNER_CLOSE_FAILURE_FALLBACK_MESSAGE = 'Interaction owner close failed';
@@ -557,8 +563,12 @@ type CloseSettlement =
 type BoundedCloseSettlement = CloseSettlement | { readonly status: 'TIMED_OUT' };
 
 function containedCloseSettlement(session: InteractionAuditSession): Promise<CloseSettlement> {
-  return Promise.resolve()
-    .then(() => session.close())
+  return settlementOf(Promise.resolve().then(() => session.close()));
+}
+
+/** 閉じる処理の約束の結果（例外を投げない）。DEF-294: 見張りが始めた閉じる処理の結果も、同じ形で見る。 */
+function settlementOf(close: Promise<void>): Promise<CloseSettlement> {
+  return close
     .then(
       (): CloseSettlement => Object.freeze({ status: 'FULFILLED' }),
       (error: unknown): CloseSettlement => Object.freeze({ status: 'REJECTED', error }),
@@ -779,7 +789,7 @@ async function prepareTarget(
   effectiveDeadlineAtMs: number,
 ): Promise<TargetPreparation> {
   const stop = (
-    code: 'SCROLL_PREPARATION_DEADLINE' | 'SCROLL_PREPARATION_FAILED',
+    code: 'SCROLL_PREPARATION_DEADLINE' | 'SCROLL_PREPARATION_FAILED' | 'TARGET_COVERED_BY_OTHER',
     reasonDetail: string | null = null,
   ): TargetPreparation => Object.freeze({
     status: 'STOPPED' as const,
@@ -845,10 +855,22 @@ async function prepareTarget(
       if (scrollWork.status === 'PENDING_AT_DEADLINE') {
         return stop('SCROLL_PREPARATION_DEADLINE');
       }
+      // DEF-294（REV-AUD2）: hover の前に、対象がほかの表示に覆われていないかを確かめる（`reachTargetOf`）。覆われた対象は、hover も押下も待ち続けるので、
+      // 下準備をやめて理由を残す。中心だけが覆われていれば、届く四隅の点に hover する。読めなければ今までどおり。
+      const hit = await reachTargetIn(session, reference, effectiveDeadlineAtMs);
+      if (hit === 'DEADLINE') {
+        return stop('SCROLL_PREPARATION_DEADLINE');
+      }
+      if (hit?.kind === 'COVERED') {
+        return stop('TARGET_COVERED_BY_OTHER');
+      }
+      const hoverPosition = hit?.kind === 'REACHABLE' ? hit.position : undefined;
       // 対象に hover し、hover の後の状態を押す前の状態にする（設計書 2026-09-23 4.4.1）。CSS の `:hover` や JavaScript の hover の処理による
       // 変化を、押す前と後の差に出さないためである。
       const hoverWork = await awaitBrowserWork(
-        () => reference.handle.hover({ timeout: Math.max(1, effectiveDeadlineAtMs - Date.now()) }),
+        () => reference.handle.hover({
+          timeout: Math.max(1, effectiveDeadlineAtMs - Date.now()), ...(hoverPosition === undefined ? {} : { position: hoverPosition }),
+        }),
         effectiveDeadlineAtMs,
       );
       if (hoverWork.status === 'PENDING_AT_DEADLINE') {
@@ -923,6 +945,26 @@ async function loadInteractionTarget(
  * 安全の判定（`classifyInteractionCandidate`）で拒む要素は押さず、押した後はページの落ち着き（`waitForPageSettled` と口ごとの静まり）を待つ。見つからない・
  * 拒む・押せない・期限を過ぎたら偽（押し直しが再現しない）。凍結の中なので、押下が出す送信は Guard が止める（止めた事実は Ledger に残り、呼び出し側が見る）。
  */
+/**
+ * DEF-294・REV-AUD2 の M-a: 押す（hover する）前に、対象がほかの表示に覆われていないかを確かめる（DEF-295: 操作さがしと共通の部品 `reachTargetOf`）。hit-test と
+ * 置き直しは、この点検の期限つき（`awaitBrowserWork`）で行い、置き直しは保持した handle のスクロール。読めなければ null（今までどおり押す）、期限切れは
+ * `DEADLINE`。下準備と、入れ子の押し直しが共有する。
+ */
+const reachTargetIn = (
+  session: InteractionAuditSession,
+  reference: Pick<InteractionCandidateReference, 'backendNodeId' | 'handle'>,
+  deadlineAtMs: number,
+): Promise<SubmitterHit | null | 'DEADLINE'> => reachTargetOf({
+  hit: async () => {
+    const hitWork = await awaitBrowserWork(() => submitterHitOf(session.page, reference.backendNodeId), deadlineAtMs);
+    return hitWork.status === 'SETTLED' ? hitWork.value : null;
+  },
+  scrollTo: async (block) => (await awaitBrowserWork(
+    () => reference.handle.evaluate((element, alignment) => { element.scrollIntoView({ block: alignment, inline: 'nearest' }); }, block),
+    deadlineAtMs,
+  )).status !== 'PENDING_AT_DEADLINE',
+});
+
 async function replayPressTrail(
   session: InteractionAuditSession,
   trail: readonly InteractionPressStep[],
@@ -942,10 +984,17 @@ async function replayPressTrail(
     if (resolution.status !== 'FOUND') {
       return false;
     }
+    // REV-AUD2 の M-a: 押し直す前にも、覆いを確かめる（覆われていれば押さずに、再現できなかったことにする。中心だけが覆われていれば、届く隅を押す）。
+    const hit = await reachTargetIn(session, resolution.reference, deadlineAtMs);
+    if (hit === 'DEADLINE' || hit?.kind === 'COVERED') {
+      await resolution.reference.handle.dispose().catch(() => undefined);
+      return false;
+    }
+    const position = hit?.kind === 'REACHABLE' ? hit.position : undefined;
     // 落ち着きの待ちのためだけなので、要求ごとの記録を持たない口にする（設計者の判断 2026-11-11）。
     const network = DataActivityCollector.attach(session.page);
     try {
-      await resolution.reference.handle.click({ timeout: Math.max(1, deadlineAtMs - Date.now()) });
+      await resolution.reference.handle.click({ timeout: Math.max(1, deadlineAtMs - Date.now()), ...(position === undefined ? {} : { position }) });
       await waitForPageSettled(session.page, {
         deadlineAtMs,
         ...PAGE_SETTLING_PACING,
@@ -1097,6 +1146,18 @@ async function executeInteraction(
       return notVerifiable('INITIAL_LOAD_AFTER_LOAD', emptyEvidence(resolvedCandidate), OUTSIDE_AUDIT_SCOPE_DETAIL);
     }
 
+    // AUD-2（設計書 `2026-11-19-beaksight-audit-result-review-fixes-design.md` 5.3）: 押す前に見えていたモーダルの小窓（読むだけ。要求を足さない）。読めなければ、
+    // 小窓が開いたことを根拠にしない。
+    const modalsBeforeWork = await awaitBrowserWork(() => readOpenModalDialogKeys(session.page, effectiveDeadlineAtMs), effectiveDeadlineAtMs);
+    const modalsBefore = modalsBeforeWork.status === 'SETTLED' ? modalsBeforeWork.value : null;
+    // DEF-294（REV-AUD2）: 押す前に、対象がほかの表示に覆われていないかを確かめる（押す前の hit-test の部品。操作さがしの `COVERED_BY_OTHER` と同じ考え）。
+    // 覆われていれば押さずに理由を残す（押せるようになるのを待ち続けない）。中心だけが覆われていれば、届く四隅の点を押す。読めなければ今までどおり押す。
+    const hitWork = await awaitBrowserWork(() => submitterHitOf(session.page, targetReference.backendNodeId), effectiveDeadlineAtMs);
+    const hit = hitWork.status === 'SETTLED' ? hitWork.value : null;
+    if (hit?.kind === 'COVERED') {
+      return notVerifiable('TARGET_COVERED_BY_OTHER', emptyEvidence(resolvedCandidate));
+    }
+    const clickPosition = hit?.kind === 'REACHABLE' ? hit.position : undefined;
     const clickBudgetMs = remaining();
     if (clickBudgetMs === 0) {
       return deadlineBeforeClick(emptyEvidence(resolvedCandidate));
@@ -1109,7 +1170,7 @@ async function executeInteraction(
     const network = DataActivityCollector.attach(session.page);
     try {
       try {
-        await targetReference.handle.click({ timeout: clickBudgetMs });
+        await targetReference.handle.click({ timeout: clickBudgetMs, ...(clickPosition === undefined ? {} : { position: clickPosition }) });
       } catch (error) {
         clickFailure = Object.freeze({ error });
       }
@@ -1141,10 +1202,16 @@ async function executeInteraction(
       if (retainedSnapshotWork.status === 'SETTLED') {
         const retainedSnapshot = retainedSnapshotWork.value;
         if (retainedSnapshot.status === 'CONNECTED') {
+          // AUD-2（5.3）: 押した後に見えるモーダルの小窓（押す前になかった小窓が見えるようになった事実も根拠にする。読むだけ）。
+          const modalsAfterWork = modalsBefore === null
+            ? null
+            : await awaitBrowserWork(() => readOpenModalDialogKeys(session.page, effectiveDeadlineAtMs), effectiveDeadlineAtMs);
+          const modalsAfter = modalsAfterWork?.status === 'SETTLED' ? modalsAfterWork.value : null;
           // 対象の位置と大きさの変化は、根拠にしない（`collectInteractionChangeEvidence` は `boundingBox` を数えない）。属性は、ARIA の状態と
           // `open` と class の名前だけを根拠にする（SPEC-5。前はタブだけに当てた決まりを、全部の候補に当てる）。
           observed = collectInteractionChangeEvidence(resolvedCandidate, retainedSnapshot.candidate, {
             difference: targetStateDifference(observationBeforeClick, retainedSnapshot),
+            ...(modalsBefore === null || modalsAfter === null ? {} : { modalDialogs: { before: modalsBefore, after: modalsAfter } }),
           });
         } else {
           const liveCandidatesWork = await awaitBrowserWork(
@@ -1238,8 +1305,12 @@ export async function auditInteraction(input: InteractionAuditInput): Promise<In
   // L5: 進みの見張りの口があれば、隔離した page の変化に印を付け、見張りが終えたら session を閉じて待ちを終わらせる（閉じる処理の失敗は、後片付けが記録する）。
   const { progress } = input;
   const detachProgress = progress === undefined ? (): void => undefined : attachPageProgressSignals(session.page, progress);
+  // DEF-294: 見張りが始めた閉じる処理は 1 回だけで、後片付けの最初の試みは、閉じ直さずにその結果を見る（同じ owner の閉じる処理を 2 回走らせない。
+  // 前は、閉じ終えた owner を後片付けが閉じ直し、`already closed` の失敗を違反として記録していた）。
+  let watchEndClose: Promise<void> | null = null;
   const closeOnWatchEnd = (): void => {
-    void session.close().catch(() => undefined);
+    watchEndClose ??= session.close();
+    void watchEndClose.catch(() => undefined);
   };
   if (progress !== undefined) {
     if (progress.signal.aborted) {
@@ -1357,7 +1428,11 @@ export async function auditInteraction(input: InteractionAuditInput): Promise<In
     lastCloseError = undefined;
     attemptsStarted += 1;
     const attemptDeadlineAtMs = attempt === 0 ? firstAttemptDeadlineAtMs : cleanupDeadlineAtMs;
-    const closeSettlement = await observeCloseUntil(containedCloseSettlement(session), attemptDeadlineAtMs);
+    const startedClose = attempt === 0 ? watchEndClose : null;
+    const closeSettlement = await observeCloseUntil(
+      startedClose === null ? containedCloseSettlement(session) : settlementOf(startedClose),
+      attemptDeadlineAtMs,
+    );
     if (closeSettlement.status === 'REJECTED') {
       lastCloseRejected = true;
       lastCloseError = closeSettlement.error;

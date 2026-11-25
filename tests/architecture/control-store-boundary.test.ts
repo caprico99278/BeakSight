@@ -418,6 +418,8 @@ const SQL_WRITE_FILES: readonly string[] = [
   'src/control/store/control-schema-v21.ts',
   // DN-1: 版 22 の文（表示の設定に画面に出す名前の列を足す。凍結の文）。
   'src/control/store/control-schema-v22.ts',
+  // PAR-b: 版 23 の文（終わっていないジョブの一意の部分索引をプロファイルごとにする。凍結の文）。
+  'src/control/store/control-schema-v23.ts',
 ];
 /** T24e: 監査のジョブの管理のフォルダ（どのファイルも、書き込みは `withWriteTransaction` の中だけ）と、行の読み書きのファイル。 */
 const JOB_DIRECTORY = 'src/control/job/';
@@ -431,7 +433,7 @@ const SQL_WRITER_PATHS: readonly string[] = [...SQL_WRITE_FILES, ...JOB_FILES];
  * 文のファイルの `CONTROL_SCHEMA_V17`）も、版の一覧と同じデータとして扱う。文の配列（`CONTROL_SCHEMA_V17_STATEMENTS`）は公開しないので、一覧に入れない
  * （外で流す漏れを見る）。
  */
-const MIGRATION_LIST_NAMES: readonly string[] = ['CONTROL_MIGRATIONS', 'CONTROL_SCHEMA_BASE', 'CONTROL_SCHEMA_V17', 'CONTROL_SCHEMA_V18', 'CONTROL_SCHEMA_V19', 'CONTROL_SCHEMA_V20', 'CONTROL_SCHEMA_V21', 'CONTROL_SCHEMA_V22'];
+const MIGRATION_LIST_NAMES: readonly string[] = ['CONTROL_MIGRATIONS', 'CONTROL_SCHEMA_BASE', 'CONTROL_SCHEMA_V17', 'CONTROL_SCHEMA_V18', 'CONTROL_SCHEMA_V19', 'CONTROL_SCHEMA_V20', 'CONTROL_SCHEMA_V21', 'CONTROL_SCHEMA_V22', 'CONTROL_SCHEMA_V23'];
 
 /**
  * T43d fix round 1（Task 43 の設計書 7 章。設計者の判断 2026-10-17）: (g) の閉じた例外（ファイル → 公開の名前と理由）。プロファイルと認証の設定を

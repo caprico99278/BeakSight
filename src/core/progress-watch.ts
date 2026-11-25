@@ -6,7 +6,7 @@
 //     （周期的な変化は進みと見なさない）。
 //   - ページの自発の変化: ページの通信（要求・応答）と、画面の変化（DOM の変化）。印は `src/browser/page-progress-signals.ts` が付ける。
 // - 最後の中身の進みから、反応なしの長さ（`PROGRESS_WATCH_QUIET_LIMIT_MS`）が過ぎたら、段を終える。その間に印が 1 つもなければ「応答しなかった」
-//   （`STAGE_UNRESPONSIVE`）、ページの自発の変化だけがあれば「静まらない」（`STAGE_NEVER_QUIET`）。進みが続く間は、何分でも待つ。
+//   （`STAGE_UNRESPONSIVE`）、ページの自発の変化が窓の後半にも続いていれば「静まらない」（`STAGE_NEVER_QUIET`。QUIET-2）。進みが続く間は、何分でも待つ。
 // - Run の時間の上限（利用者の `maxRuntimeMs`。`runDeadlineAtMs`）は、指定したときだけ、段の途中でも効かせる（`RUN_TIME_LIMIT`）。
 // - 終えた段の処理は待たない（見放す）。段には `signal`（終えたら abort）を渡すので、段は繰り返しを止められる。段がそれまでに集めた記録は、段が
 //   呼び出し側の入れ物に入れておけば残る。見放した処理の、遅れて返る値や reject は封じ込める（`awaitBeforeDeadline` と同じ）。
@@ -48,6 +48,11 @@ export interface ProgressSignals {
   mark(kind: ProgressSignalKind): void;
   /** ブラウザの呼び出しを待ち、返ったら（成功でも失敗でも）ブラウザからの応答の印を付ける。値と reject はそのまま返す。 */
   track<T>(call: PromiseLike<T>): Promise<T>;
+  /**
+   * REV-DQF の Important-B: 見張りが段を終えるまでの残りの長さ（ms。最後の中身の進みから、反応なしの長さまで）。段が、自分で待ちを切り上げてから終えられる
+   * ように読む（見張りに終えられると、それまでの読み取りの記録が残らない）。省略できる（見張りでない口）。
+   */
+  remainingMs?(): number;
 }
 
 export interface ProgressWatchOptions {
@@ -99,6 +104,7 @@ export async function watchProgress<T>(
     signal: controller.signal,
     mark,
     track: <U>(call: PromiseLike<U>): Promise<U> => Promise.resolve(call).finally(() => mark('BROWSER_RESPONSE')),
+    remainingMs: (): number => Math.min(lastContentAtMs + quietLimitMs, runDeadlineAtMs ?? Number.POSITIVE_INFINITY) - now(),
   });
 
   let timer: ReturnType<typeof setTimeout> | undefined;
@@ -113,8 +119,9 @@ export async function watchProgress<T>(
         return;
       }
       if (at - lastContentAtMs >= quietLimitMs) {
-        // 中身の進みがない。ページの自発の変化も同じ長さなければ「応答しなかった」、あれば「静まらない」。
-        const end: ProgressWatchEnd = at - lastAnyAtMs >= quietLimitMs ? 'STAGE_UNRESPONSIVE' : 'STAGE_NEVER_QUIET';
+        // 中身の進みがない。QUIET-2（設計書 `2026-11-24-beaksight-discovery-stuck-step-design.md` 2.2）: ページの自発の変化が窓の後半にも続いていれば
+        // 「静まらない」、窓の後半になければ「応答しなかった」（最後の中身の進みの直後に 1 回だけ付いた印では、静まらないとしない）。
+        const end: ProgressWatchEnd = at - lastAnyAtMs >= quietLimitMs / 2 ? 'STAGE_UNRESPONSIVE' : 'STAGE_NEVER_QUIET';
         endedWith = end;
         resolve(Object.freeze({ status: 'ENDED', end }));
         return;

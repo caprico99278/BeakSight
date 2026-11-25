@@ -8,7 +8,7 @@
 import { describe, expect, it } from 'vitest';
 import type { IncompleteReasonCode } from '../../src/core/contracts.js';
 import type { NormalizedHttpUrlEvidence } from '../../src/core/evidence-types.js';
-import { createSha256Fingerprint } from '../../src/core/ids.js';
+import { createPageId, createSha256Fingerprint } from '../../src/core/ids.js';
 import { normalizeUrl } from '../../src/crawl/normalize-url.js';
 import { CrawlFrontier, type CrawlPageEdge, type StoredCrawlFrontierSnapshot } from '../../src/orchestration/crawl-frontier.js';
 import { IdAllocator } from '../../src/orchestration/id-allocator.js';
@@ -133,5 +133,29 @@ describe('COV-4: the crawl frontier on the coverage queue', () => {
     expect(auditNext(restored, STRUCTURE_A, [])).toBe(url('/e'));
     expect(restored.next()).toBeUndefined();
     expect(restored.entries().find(({ url: value }) => value === url('/e'))?.pageId).toBe(page(6));
+  });
+});
+
+// DUP（設計書 `2026-11-18-beaksight-same-structure-pages-design.md` 2 章）: 同じ作りの 1 回目と、点検を終えた画面の中身の表は、巡回の保存に残り、再開でも引き継ぐ。
+describe('DUP: the table of the first pages of each template', () => {
+  const TEMPLATE = createSha256Fingerprint('template');
+  const CONTENT = createSha256Fingerprint('content');
+  const OTHER = createSha256Fingerprint('other-content');
+  const page = createPageId;
+
+  it('takes the first fully audited page of a template, finds an audited page of the same content, and keeps them after a resume', () => {
+    const frontier = new CrawlFrontier(undefined, new IdAllocator());
+    expect(frontier.pageReferenceOf(TEMPLATE)).toBeNull();
+    frontier.acceptPageReference({ templateKey: TEMPLATE, pageId: page(1), depth: 'FULL', contentDigest: CONTENT });
+    frontier.acceptPageReference({ templateKey: TEMPLATE, pageId: page(2), depth: 'FULL', contentDigest: null });
+    frontier.acceptPageReference({ templateKey: TEMPLATE, pageId: page(3), depth: 'LIGHT', contentDigest: OTHER });
+    const options = { maxDepth: undefined, allocator: new IdAllocator(), allowedQueryParameters: new Set<string>(), requeueSkipReasonCodes: NO_REQUEUE };
+    const restored = CrawlFrontier.restore(JSON.parse(JSON.stringify(frontier.snapshot())) as StoredCrawlFrontierSnapshot, options);
+    for (const table of [frontier, restored]) {
+      expect(table.pageReferenceOf(TEMPLATE)).toBe(page(1));
+      expect(table.samePageOf(TEMPLATE, CONTENT)).toBe(page(1));
+      expect(table.samePageOf(TEMPLATE, OTHER)).toBe(page(3));
+      expect(table.samePageOf(TEMPLATE, createSha256Fingerprint('unknown'))).toBeNull();
+    }
   });
 });

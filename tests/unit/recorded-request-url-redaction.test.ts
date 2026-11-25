@@ -11,6 +11,7 @@ import {
   redactRecordedRequestUrl,
   redactRecordedRequestUrlsByTable,
   redactRecordedRequestUrlsInValue,
+  redactUrlSecretsInValue,
 } from '../../src/safety/redact.js';
 import { startCpuStopwatch } from '../architecture/source-scan.js';
 
@@ -484,5 +485,59 @@ describe('MEM-1: the table of the whole Run, then each part, gives the same resu
     const twoPasses = { ...redactRecordedRequestUrlsByTable(rest, table), pages: value.pages.map((part) => redactRecordedRequestUrlsByTable(part, table)) };
     expect(JSON.stringify(twoPasses)).toBe(JSON.stringify(redactRecordedRequestUrlsInValue(value, options)));
     expect(JSON.stringify(twoPasses).includes('SECRET')).toBe(options.matchValues === false);
+  });
+});
+
+// DEF-298: frame の判定の失敗の記録の `events` も、止めた記録の項目として伏せる（くり返しの記録の `first`・`slowest` は、書き手を通す場面
+// `artifact-writer-url-secrets.test.ts`）。
+describe('DEF-298: the nested URLs of the stopped navigation records', () => {
+  it('redacts the url of the events of the frame classification failures', () => {
+    const value = { frameClassificationFailures: { count: 1, events: [{ url: RAW, phase: 'PASSIVE' }] } };
+    expect(redactRecordedRequestUrlsInValue(value).frameClassificationFailures.events[0]?.url).toBe(REDACTED_URL);
+  });
+
+  // 設計者の判断（DEF-298 の続き）: LCP の資源の URL は署名つきの URL になりうる。network に同じ URL がなくても伏せる。
+  it('redacts the resource url of the LCP attribution, also when no network record has the same URL', () => {
+    const lcp = { status: 'OBSERVED', value: 1, id: null, navigationType: null, attribution: { target: 'img', url: RAW } };
+    const written = redactRecordedRequestUrlsInValue({ evidence: [{ type: 'performance', payload: { webVitals: { LCP: lcp }, lcpBeforeScroll: lcp } }] });
+    expect(written.evidence[0]?.payload.webVitals.LCP.attribution.url).toBe(REDACTED_URL);
+    expect(written.evidence[0]?.payload.lcpBeforeScroll.attribution.url).toBe(REDACTED_URL);
+  });
+});
+
+// BS-1（設計書 `2026-11-19-beaksight-measurement-tag-inventory-design.md` 6 章）: 計測サービスの閉じた一覧の行に全部合う識別子だけを残す狭い例外。
+// 識別子は作り物の値。
+describe('BS-1: the measurement tag identifier is the only query value kept', () => {
+  const TAG_MANAGER = 'https://www.googletagmanager.com/gtm.js';
+
+  it('keeps only the identifier of a row of the list and redacts the other query values of the same URL', () => {
+    expect(redactRecordedRequestUrl(`${TAG_MANAGER}?id=GTM-TEST001&cx=c&gtm=mark-a`)).toBe(`${TAG_MANAGER}?id=GTM-TEST001&cx=${REDACTED}&gtm=${REDACTED}`);
+    expect(redactRecordedRequestUrl('https://region1.google-analytics.com/g/collect?v=2&tid=G-TEST0001&cid=mark-b'))
+      .toBe(`https://region1.google-analytics.com/g/collect?v=${REDACTED}&tid=G-TEST0001&cid=${REDACTED}`);
+  });
+
+  it.each([
+    ['another host', 'https://example.com/gtm.js?id=GTM-TEST001'],
+    ['another path', 'https://www.googletagmanager.com/other.js?id=GTM-TEST001'],
+    ['another name', `${TAG_MANAGER}?ref=GTM-TEST001`],
+    ['a token-like value', `${TAG_MANAGER}?id=${HEX_VALUE}`],
+    ['an email address', `${TAG_MANAGER}?id=user%40example.com`],
+    ['a space', `${TAG_MANAGER}?id=GTM-TE%20ST`],
+    ['a symbol', `${TAG_MANAGER}?id=GTM-TEST;001`],
+    ['a value over the length limit', `${TAG_MANAGER}?id=GTM-${'A'.repeat(40)}`],
+    ['a lower case value', `${TAG_MANAGER}?id=gtm-test001`],
+    ['a second value of the same name', `${TAG_MANAGER}?id=GTM-TEST001&id=mark-c`],
+    ['userinfo', 'https://user:pass@www.googletagmanager.com/gtm.js?id=GTM-TEST001'],
+    ['a port', 'https://www.googletagmanager.com:8443/gtm.js?id=GTM-TEST001'],
+  ])('redacts the value on %s', (_name, url) => {
+    const redacted = redactRecordedRequestUrl(url);
+    expect(redacted).not.toMatch(/GTM-TEST001|mark-c|example\.com\?|user%40|TE%20ST|AAAA|gtm-test001/u);
+    expect(redacted).toContain(REDACTED);
+  });
+
+  it('redacts the identifier on the origin of an approved service, as the writer does after this stage', () => {
+    const value = { requests: [{ url: `${TAG_MANAGER}?id=GTM-TEST001` }] };
+    const written = redactUrlSecretsInValue(redactRecordedRequestUrlsInValue(value), { serviceOrigins: ['https://www.googletagmanager.com'] });
+    expect(written.requests[0]?.url).toBe(`${TAG_MANAGER}?id=${REDACTED}`);
   });
 });

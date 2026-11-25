@@ -23,6 +23,7 @@
 import type { EntryCheckAuthSetupState } from '../../../../src/control/auth/auth-setup-proposal.js';
 import type { AuditMode, AuthStrategy } from '../../../../src/control/contracts.js';
 import { ACTIVE_PROFILE_STATUS, type ProfileStatus } from '../../../../src/control/store/profile-records.js';
+import { FINISHED_CHAIN_STATE, RUNNING_CHAIN_STATE, type ChainState } from '../../../../src/core/stage-chain-states.js';
 import { formatInteger } from '../../../../src/presentation/format.js';
 import { LOCAL_UI_JOB_SUMMARY_TEXT } from '../../../../src/presentation/messages.js';
 import type { JobSummaryFinishedResult } from '../server/audit-job-functions';
@@ -199,6 +200,30 @@ const readyStageOf = (facts: ProfileStageFacts): Omit<ProfileStage, 'laterOffers
 };
 
 /** サイトの画面の段とボタン（決め方はファイルの先頭。サイトの画面とサイトの一覧が使う）。 */
+/** DEF-197・DEF-301: サイトの点検が動いているかの事実（いちばん新しいジョブと、最新の点検のジョブのまとめて実行の連鎖）。 */
+export interface SiteAuditRunningFacts {
+  readonly lastJob: { readonly jobId: string; readonly active: boolean } | null;
+  readonly lastAuditChain: {
+    readonly state: ChainState;
+    readonly stages: readonly { readonly jobId: string | null }[];
+    readonly writeStageJobIds: readonly string[];
+  } | null;
+}
+
+/**
+ * DEF-197: サイトの点検が動いているか（決める所はここ 1 か所。サイトの画面とサイトの一覧の段が使う）。最新の点検の連鎖が動いている（段と段の間を含む）か、
+ * いちばん新しいジョブ（種類を問わない）が動いている状態か。DEF-301: 終えた（FINISHED）連鎖の段のジョブは、ワーカーが閉じるまで動いている行のまま残るが、
+ * 連鎖が終われば作業の画面はサイトの画面へ移す（`advance`）ので、動いているとしない（移った先で「結果を見る」が出ないまま残らない）。止まった連鎖と連鎖の外の
+ * ジョブは、今どおり行が動いている間は動いている。
+ */
+export const siteAuditRunningOf = ({ lastJob, lastAuditChain }: SiteAuditRunningFacts): boolean => {
+  if (lastAuditChain?.state === RUNNING_CHAIN_STATE) return true;
+  if (lastJob === null || !lastJob.active) return false;
+  const finishedChainJob = lastAuditChain?.state === FINISHED_CHAIN_STATE
+    && (lastAuditChain.stages.some(({ jobId }) => jobId === lastJob.jobId) || lastAuditChain.writeStageJobIds.includes(lastJob.jobId));
+  return !finishedChainJob;
+};
+
 export const profileStageOf = (facts: ProfileStageFacts): ProfileStage => {
   if (facts.status !== ACTIVE_PROFILE_STATUS) {
     return { stage: 'SITE_RETIRED', primary: null, secondary: null, laterOffers: [] };

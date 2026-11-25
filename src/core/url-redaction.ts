@@ -34,18 +34,20 @@ const WEB_SOCKET_SCHEME_AS_HTTP: readonly (readonly [string, string])[] = Object
   Object.freeze(['ws://', 'http://'] as const),
 ]);
 
-/** query の 1 組（`name=value`）。名前が `shouldRedactValue` に当たり、値が空でなければ、値を `REDACTED` にする。名前は書かれたまま残す。 */
-const redactQueryPair = (pair: string, shouldRedactValue: (name: string) => boolean): string => {
+/**
+ * query の 1 組（`name=value`）。`shouldRedactValue` が名前と書かれたままの値で真を返し、値が空でなければ、値を `REDACTED` にする。名前は書かれたまま残す。
+ */
+const redactQueryPair = (pair: string, shouldRedactValue: (name: string, value: string) => boolean): string => {
   const separator = pair.indexOf(NAME_VALUE_SEPARATOR);
   if (separator < 0 || separator === pair.length - 1) {
     return pair;
   }
   const name = pair.slice(0, separator);
-  return shouldRedactValue(name) ? `${name}${NAME_VALUE_SEPARATOR}${REDACTED}` : pair;
+  return shouldRedactValue(name, pair.slice(separator + NAME_VALUE_SEPARATOR.length)) ? `${name}${NAME_VALUE_SEPARATOR}${REDACTED}` : pair;
 };
 
-/** URL（絶対でも相対でもよい）の query の、名前が `shouldRedactValue` に当たる組の値を伏せる（ファイルの先頭の説明）。 */
-export function redactUrlQueryValues(url: string, shouldRedactValue: (name: string) => boolean): string {
+/** URL（絶対でも相対でもよい）の query の、`shouldRedactValue`（名前と書かれたままの値）に当たる組の値を伏せる（ファイルの先頭の説明）。 */
+export function redactUrlQueryValues(url: string, shouldRedactValue: (name: string, value: string) => boolean): string {
   const queryStart = url.indexOf(QUERY_START);
   const fragmentStart = url.indexOf(FRAGMENT_START);
   if (queryStart < 0 || (fragmentStart >= 0 && fragmentStart < queryStart)) {
@@ -97,9 +99,10 @@ export function asHttpSchemeUrl(url: string): string {
 /**
  * 承認したサービスの Origin の URL（絶対形。`<scheme>://<authority><path>?<query>#<fragment>`）の、path の値に見える区切りと、query のすべての値と、
  * fragment の値を伏せる（名前は残す）。authority の後の path の部分は、最初の `?`・`#`（なければ終わり）まで。絶対形でない値は、query と fragment の
- * 値だけを伏せる。
+ * 値だけを伏せる。BS-1（設計書 `2026-11-19-beaksight-measurement-tag-inventory-design.md` 6 章）: `keptQueryValue` を渡すと、それが真を返す query の組
+ * （名前と書かれたままの値）だけを伏せずに残す（記録した要求の URL の、計測サービスの識別子の狭い例外。渡すのは `src/safety/redact.ts` だけ）。
  */
-export function redactServiceOriginUrl(url: string): string {
+export function redactServiceOriginUrl(url: string, keptQueryValue: ((name: string, value: string) => boolean) | null = null): string {
   const authorityStart = url.indexOf(AUTHORITY_START);
   const pathStart = authorityStart < 0 ? -1 : url.indexOf(PATH_START, authorityStart + AUTHORITY_START.length);
   const queryOrFragment = [url.indexOf(QUERY_START), url.indexOf(FRAGMENT_START)].filter((index) => index >= 0);
@@ -107,5 +110,6 @@ export function redactServiceOriginUrl(url: string): string {
   const withPath = pathStart < 0 || pathStart > pathEnd
     ? url
     : `${url.slice(0, pathStart)}${redactValueLikePathSegments(url.slice(pathStart, pathEnd))}${url.slice(pathEnd)}`;
-  return redactFragmentValues(redactUrlQueryValues(withPath, EVERY_QUERY_NAME));
+  const shouldRedact = keptQueryValue === null ? EVERY_QUERY_NAME : (name: string, value: string): boolean => !keptQueryValue(name, value);
+  return redactFragmentValues(redactUrlQueryValues(withPath, shouldRedact));
 }

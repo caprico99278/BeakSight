@@ -88,7 +88,7 @@ const run = () => auditRun({
 describe('AUD-6b: the check state of each link', () => {
   it('splits the links into navigated, static candidates and unverified, with the facts of each', () => {
     const { linkChecks } = buildReportViewModel(run());
-    expect(linkChecks.counts).toEqual({ total: 5, navigated: 2, navigatedBroken: 1, staticCandidate: 2, unverified: 1 });
+    expect(linkChecks.counts).toEqual({ total: 5, navigated: 2, navigatedBroken: 1, staticCandidate: 2, unverified: 1, outsideReadScope: 0 });
     const byHref = new Map(linkChecks.links.map((entry) => [entry.href, entry]));
     expect(byHref.get('/second.html')).toEqual({
       sourcePageId: PAGE_1,
@@ -115,6 +115,16 @@ describe('AUD-6b: the check state of each link', () => {
     });
     expect(byHref.get('https://example.invalid/')).toMatchObject({ status: 'STATIC_CANDIDATE', admission: 'EXTERNAL_RECORD_ONLY', unverified: null });
     expect(byHref.get('tel:0120000000')).toMatchObject({ status: 'STATIC_CANDIDATE', resolvedUrl: null, admission: 'SPECIAL_SCHEME_RECORD_ONLY' });
+  });
+
+  // DEF-296: 巡回の候補から外した行き先（読む範囲の外・読まないパス・危険な語）は、別の理由にし、確かめていないリンクの数に入れない。
+  it('gives the links to a target outside the read scope their own reason, out of the unverified count', () => {
+    const { linkChecks } = buildReportViewModel(run(), { isOutsideReadScope: (url) => url === fixtureUrl('/not-read.html') });
+    expect(linkChecks.links.find((entry) => entry.href === '/not-read.html')).toMatchObject({
+      status: 'UNVERIFIED',
+      unverified: { reason: 'OUTSIDE_READ_SCOPE', nextStep: LINK_CHECK_NEXT_STEP_TEXT.OUTSIDE_READ_SCOPE },
+    });
+    expect(linkChecks.counts).toMatchObject({ total: 5, unverified: 0, outsideReadScope: 1 });
   });
 
   it('writes links.json to the bundle as the copy of the report model, with the reading note', async () => {

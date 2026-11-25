@@ -122,7 +122,6 @@ const fakePorts = (answers: FakeAnswers): { readonly ports: WritePorts; readonly
     candidateMismatch: value === null ? { reason: 'IDENTITY_NOT_FOUND' as const, pageCandidateCount: 0, sameIdentityCount: 0, fieldPosition: null } : null,
   });
   const session: WriteSession = {
-    readListPageLinks: unexpected,
     readTargetCandidates: async (_url, options) => {
       calls.push({ kind: 'CANDIDATES', lastLoad: lastLoad(options) });
       return {

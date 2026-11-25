@@ -106,6 +106,7 @@ function candidateIsWellFormed(candidate: InteractionCandidate): boolean {
     && typeof candidate.disabled === 'boolean'
     && typeof candidate.visible === 'boolean'
     && typeof candidate.destructiveAction === 'boolean'
+    && (candidate.aiAction === undefined || typeof candidate.aiAction === 'boolean')
     && finiteRectangle(candidate.boundingBox, candidate.visible)
     && (candidate.href === null) === (candidate.hrefKind === 'NONE')
     && validControlledState(candidate.ariaControls, candidate.controlledVisible, candidate.controlledHidden);
@@ -147,6 +148,7 @@ const INTERACTION_REJECTION_LEDGER_RECORDS: Readonly<Record<InteractionRejection
     FORM_ASSOCIATED: 'EXCLUDED_CANDIDATE',
     NAVIGATION_HREF: 'EXCLUDED_CANDIDATE',
     DESTRUCTIVE_ACTION_SKIPPED: 'EXCLUDED_CANDIDATE',
+    AI_ACTION_SKIPPED: 'EXCLUDED_CANDIDATE',
     EXTERNAL_ACTION: 'BLOCKED_EXTERNAL_ACTION',
     DOWNLOAD: 'BLOCKED_EXTERNAL_ACTION',
     DISABLED: 'NONE',
@@ -196,6 +198,10 @@ export function classifyInteractionCandidate(candidate: InteractionCandidate): I
     // SD-1（設計書 `2026-11-16-beaksight-action-based-delete-guard-design.md` 2.3）: 削除に関する操作は押さない（判定は候補を作るときの `isDestructiveAction`）。
     if (candidate.destructiveAction) {
       return reject('DESTRUCTIVE_ACTION_SKIPPED');
+    }
+    // AIW（ユーザーの判断 2026-11-20）: AI の操作は押さない（判定は候補を作るときの `isAiAction`）。
+    if (candidate.aiAction === true) {
+      return reject('AI_ACTION_SKIPPED');
     }
     if (candidate.disabled) {
       return reject('DISABLED');

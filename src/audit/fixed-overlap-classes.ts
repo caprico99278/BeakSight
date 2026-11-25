@@ -11,7 +11,7 @@
  *   - 1 つの指摘（覆う要素ごと）の区分は、いちばん強い区分。強さは `FIXED_OVERLAP_CLASSES` の順。
  *   - 前の版の Evidence（hit-test の事実がない）は、今までの判定のまま Finding にし、区分は `null`。
  */
-import type { EvidencePayloadByType } from '../core/contracts.js';
+import type { EvidencePayloadByType, EvidenceRecord } from '../core/contracts.js';
 import {
   FIXED_ELEMENT_POSITIONS,
   type FixedElementEvidence,
@@ -26,7 +26,7 @@ import {
   type VisibilityEvidence,
 } from '../core/evidence-types.js';
 import { colorAlphaOf, isPassThroughContainer, POINTER_EVENTS_NONE } from '../core/own-surface.js';
-import { isUncoveredMeasurement } from '../core/target-image-inclusion.js';
+import { inclusionInImage, isUncoveredMeasurement } from '../core/target-image-inclusion.js';
 
 // ---------------------------------------------------------------------------------------------------------------
 // 判定の定数（Task 12・13 の設計書 5.1。layout の Rule のファイルから移した）
@@ -167,7 +167,14 @@ export function fixedOverlapClassOf({ modal, scrollRevealable, render, pointerCa
   return pointerCaptured ? 'POINTER_ONLY' : 'GEOMETRY_ONLY';
 }
 
-const isModal = (hitTest: OverlapHitTestEvidence): boolean => hitTest.modal.dialogModal || hitTest.modal.ariaModal;
+/**
+ * 覆う側がモーダルか（背景が塞がるのは普通のモーダルなので、指摘にしない）。AUD-2（設計書 `2026-11-19-beaksight-audit-result-review-fixes-design.md` 5.1）: 暗転の
+ * 要素（`openModal`）もモーダルの側にし、覆われる要素が同じ小窓の中にある形（`coveredInside`）は、小窓の中が塞がるのでモーダルとして数えない。RVP-2: 開いた前面の窓
+ * （`frontWindow`）が下を覆うのも、作りどおりなのでモーダルの側にする。
+ */
+export const isModalOverlap = (hitTest: OverlapHitTestEvidence): boolean =>
+  (hitTest.modal.dialogModal || hitTest.modal.ariaModal || hitTest.modal.openModal === true || hitTest.modal.frontWindow === true)
+  && hitTest.modal.coveredInside !== true;
 
 // ---------------------------------------------------------------------------------------------------------------
 // 形の小さな部品（layout の Rule と共有する）
@@ -436,13 +443,16 @@ export const classifiedOcclusionPairsOf = (
   const pairs: ClassifiedOcclusionPair[] = [];
   for (const facts of occlusionFactsOf(layout)) {
     const { hitTest } = facts;
+    // AUD-2（設計書 `2026-11-19-beaksight-audit-result-review-fixes-design.md` 5.1）: モーダルの小窓の中の要素は、固定の小窓の子孫でも、同じ小窓の中の覆いを
+    // 判定する（小窓の中の操作要素が塞がれる形だけを指摘にする）。
+    const insideSameModal = hitTest?.modal.coveredInside === true;
     if (
       !isPainted(facts.overlayVisibility)
       || (hitTest === undefined && passThroughContainers.has(facts.overlaySelector))
       || !isPaintedContent(facts.coveredVisibility)
-      || facts.coveredInFixedLayer
+      || (facts.coveredInFixedLayer && !insideSameModal)
       || isFixedPosition(facts.coveredPosition)
-      || fixedLayerSelectors.has(facts.coveredSelector)
+      || (fixedLayerSelectors.has(facts.coveredSelector) && !insideSameModal)
       || (hitTest === undefined && !overlayPaintsAbove(facts))
     ) {
       continue;
@@ -456,7 +466,7 @@ export const classifiedOcclusionPairsOf = (
       pairs.push({ facts, ratio, overlapClass: scrollRevealable ? 'SCROLL_REVEALABLE' : null, render: null });
       continue;
     }
-    if (passThroughContainers.has(facts.overlaySelector) && !isModal(hitTest)) {
+    if (passThroughContainers.has(facts.overlaySelector) && !isModalOverlap(hitTest)) {
       pairs.push({ facts, ratio, overlapClass: 'GEOMETRY_ONLY', render: 'NONE' });
       continue;
     }
@@ -464,7 +474,7 @@ export const classifiedOcclusionPairsOf = (
     pairs.push({
       facts,
       ratio,
-      overlapClass: fixedOverlapClassOf({ modal: isModal(hitTest), scrollRevealable, render: judged.render, pointerCaptured: judged.capturedPointCount > 0 }),
+      overlapClass: fixedOverlapClassOf({ modal: isModalOverlap(hitTest), scrollRevealable, render: judged.render, pointerCaptured: judged.capturedPointCount > 0 }),
       render: judged.render,
     });
   }
@@ -505,14 +515,14 @@ export const classifiedOversizedFixedElementsOf = (layout: LayoutEvidence): read
     if (hitTest === undefined) {
       return [{ element, ratio, overlapClass: null, render: null }];
     }
-    if (isPassThroughContainer(element) && !isModal(hitTest)) {
+    if (isPassThroughContainer(element) && !isModalOverlap(hitTest)) {
       return [{ element, ratio, overlapClass: 'GEOMETRY_ONLY', render: 'NONE' }];
     }
     const judged = hitTestJudgementOf(hitTest, { overlayAbove: true });
     return [{
       element,
       ratio,
-      overlapClass: fixedOverlapClassOf({ modal: isModal(hitTest), scrollRevealable: false, render: judged.render, pointerCaptured: judged.capturedPointCount > 0 }),
+      overlapClass: fixedOverlapClassOf({ modal: isModalOverlap(hitTest), scrollRevealable: false, render: judged.render, pointerCaptured: judged.capturedPointCount > 0 }),
       render: judged.render,
     }];
   });
@@ -568,6 +578,20 @@ export interface OcclusionRevealView {
   readonly pressBlocked: boolean;
 }
 
+/**
+ * RVP-2（設計書 `2026-11-24-beaksight-review-pending-evidence-design.md` 2.3）: 覆いの指摘の対象（覆う要素と覆われる要素の交わり）が、先頭の位置の画像
+ * （ビューポート）に全部入るか。入らなければ、画像の参照は保留（`TARGET_NOT_IN_IMAGE`）になるので、Rule の文は「隠しています」と言い切らない。入ったかの決め方は、
+ * 画像の参照と同じ部品（`inclusionInImage`）。
+ */
+export function occlusionTargetsInViewport(pairs: readonly ClassifiedOcclusionPair[], width: number, height: number): boolean {
+  const parts = pairs.map(({ facts: { overlayRect, coveredRect } }) => {
+    const x = Math.max(overlayRect.left, coveredRect.left);
+    const y = Math.max(overlayRect.top, coveredRect.top);
+    return { x, y, width: Math.max(0, Math.min(overlayRect.right, coveredRect.right) - x), height: Math.max(0, Math.min(overlayRect.bottom, coveredRect.bottom) - y) };
+  });
+  return inclusionInImage(parts, width, height) === 'INSIDE';
+}
+
 /** 覆いの指摘の組と、同じ状態・同じ幅の測り直しの記録から、区分と「押せません」と言えるかを決める（判定の 1 か所）。 */
 export function occlusionRevealOf(pairs: readonly ClassifiedOcclusionPair[], reveals: readonly RevealedTargetEvidence[]): OcclusionRevealView {
   let outcome: FixedOcclusionRevealOutcome | null = null;
@@ -600,7 +624,29 @@ export function occlusionRevealOf(pairs: readonly ClassifiedOcclusionPair[], rev
 export interface FixedOverlapFindingView {
   readonly overlapClass: FixedOverlapClass;
   readonly renderDetermined: boolean;
+  /**
+   * S-06: 覆いの指摘の、動かして測り直した区分（`occlusionRevealOf` の `outcome`。Rule の文と同じ決め方）。測り直しの記録があるときだけ。`SCROLL_AVOIDABLE`・
+   * `INITIAL_ONLY` は、表示用モデルが確信度を下げる（重さは変えない）。
+   */
+  readonly revealOutcome?: FixedOcclusionRevealOutcome;
 }
+
+/** S-06: 動かせば避けられる・初めの位置だけの覆いか（確信度を下げる区分）。 */
+export const isAvoidableOcclusion = (view: FixedOverlapFindingView | undefined): boolean =>
+  view?.revealOutcome === 'SCROLL_AVOIDABLE' || view?.revealOutcome === 'INITIAL_ONLY';
+
+/**
+ * EV-2: 同じ状態・同じ幅で、対象まで動かして撮った画像の測り直しの記録（その画像の Evidence の `reveal`）。状態のない前の版の Evidence は空。覆いの Rule と
+ * 表示用モデル（`fixedOverlapOfFinding`）が使う 1 か所。
+ */
+export const revealedTargetsInState = (
+  evidence: readonly EvidenceRecord[],
+  stateId: string | undefined,
+  stressWidth: number | null,
+): readonly RevealedTargetEvidence[] => (stateId === undefined ? [] : evidence.flatMap((record) => (
+  record.type === 'screenshot' && record.capture?.stateId === stateId && (record.payload.stressWidth ?? null) === stressWidth
+    ? record.payload.reveal?.targets ?? []
+    : [])));
 
 /** 覆う要素の、Finding にする組の区分（前の版の Evidence の組だけなら `null`）。 */
 export const occlusionFindingViewOf = (pairs: readonly ClassifiedOcclusionPair[]): FixedOverlapFindingView | null => {
@@ -626,11 +672,13 @@ const keyValueOf = (keys: readonly { readonly name: string; readonly value: stri
 /**
  * 指摘の区分（覆いの Rule と大きすぎる固定要素の Rule だけ。ほかの Rule・前の版の Evidence・目印のない指摘は `null`）。指摘が参照する layout の Evidence の payload と、
  * 指摘の目印（覆う要素の selector・幅）から、Rule と同じ決め方で引く。幅の目印があれば、その幅の結果。覆いの Rule で主の layout に組がなければ、通知の枠を閉じる前の
- * layout（DEF-210）で引く。
+ * layout（DEF-210）で引く。S-06: 覆いの Rule は、同じ状態のその幅の測り直しの記録（`revealsAt`）から、動かして測り直した区分も付ける（閉じる前の layout には
+ * 付けない。Rule の文と同じ）。
  */
 export function fixedOverlapOfFinding(
   finding: { readonly ruleId: string; readonly keys: readonly { readonly name: string; readonly value: string }[] },
   payload: EvidencePayloadByType['layout'],
+  revealsAt: (stressWidth: number | null) => readonly RevealedTargetEvidence[] = () => [],
 ): FixedOverlapFindingView | null {
   const widthText = keyValueOf(finding.keys, 'stressWidth');
   const layout = widthText === undefined
@@ -648,7 +696,9 @@ export function fixedOverlapOfFinding(
       pairs.filter((pair) => pair.facts.overlaySelector === overlaySelector && isFindingFixedOverlapClass(pair.overlapClass));
     const after = of(classifiedOcclusionPairsOf(layout));
     if (after.length > 0 || widthText !== undefined) {
-      return occlusionFindingViewOf(after);
+      const view = occlusionFindingViewOf(after);
+      const { outcome } = occlusionRevealOf(after, revealsAt(widthText === undefined ? null : Number(widthText)));
+      return view === null || outcome === null ? view : { ...view, revealOutcome: outcome };
     }
     const before = payload.beforeNotificationDismissal?.layout ?? null;
     return before === null ? null : occlusionFindingViewOf(of(classifiedOcclusionPairsOf(before, 'BEFORE_NOTIFICATION_DISMISSAL')));

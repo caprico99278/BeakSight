@@ -8,7 +8,8 @@ import type {
   OverlapHitLayerEvidence,
   OverlapHitTestEvidence,
 } from '../../src/core/evidence-types.js';
-import { RUN_ARTIFACT_FILE_NAMES, pageArtifactRelativePath } from '../../src/core/artifact-layout.js';
+import { RUN_ARTIFACT_FILE_NAMES, pageArtifactRelativePath, screenshotRelativePath } from '../../src/core/artifact-layout.js';
+import type { EvidenceCapture, EvidenceRecord } from '../../src/core/contracts.js';
 import { CHATGPT_BUNDLE_GUIDE_TEXT } from '../../src/presentation/messages.js';
 import { createChatGptBundle } from '../../src/report/chatgpt-bundle.js';
 import { renderHtmlReport } from '../../src/report/html-report.js';
@@ -79,6 +80,40 @@ describe('AUD-3c: the classes of the fixed overlaps in the report model and the 
     const group = model.findingGroups.find((candidate) => candidate.ruleId === 'OVERSIZED_FIXED_ELEMENT');
     // RENDERED（HIGH）から、描画を決められないので 1 段下げる。
     expect(group?.confidence).toBe('MEDIUM');
+  });
+
+  // S-06: 動かせば隠れた内容が見える覆いは、確信度を 1 段下げる（重さは変えない）。
+  it('lowers the confidence of a cover avoidable by scrolling', () => {
+    const header = rect(0, 0, WIDTH, 100);
+    const title = rect(0, 20, 300, 60);
+    const occlusion: LayoutEvidence = { ...layout(), fixedElements: [], fixedHeadingOverlaps: [{
+      overlaySelector: '#site-header', headingSelector: '#page-title', overlayRect: header, headingRect: title, intersection: { ...title, area: 300 * 60 },
+      overlayVisibility: visible, headingVisibility: visible, overlayPosition: 'fixed', overlayZIndex: '10', overlayOverflowX: 'visible',
+      overlayOverflowY: 'visible', headingPosition: 'static', headingZIndex: 'auto', headingOverflowX: 'visible', headingOverflowY: 'visible', truncated: false,
+      hitTest: hitTest('#site-header', layer('#site-header', { backgroundColor: 'rgb(255, 255, 255)' }), true),
+    }] };
+    const captured = <T extends EvidenceRecord>(value: T): T => ({ ...value, capture: {
+      stateId: `${PAGE_1}:desktop:1`, phase: value.type === 'layout' ? 'layout' : 'screenshot', startedAt: '2026-11-19T00:00:00.000Z',
+      finishedAt: '2026-11-19T00:00:01.000Z', url: null, scrollPosition: null,
+    } as EvidenceCapture });
+    const layoutRecord = captured(record('layout', 40, PAGE_1, 'desktop', { primary: { status: 'COMPLETE', layout: occlusion }, stressSweep: null }));
+    const revealShot = captured(record('screenshot', 41, PAGE_1, 'desktop', {
+      pageId: PAGE_1, viewport: 'desktop', relativePath: screenshotRelativePath(PAGE_1, 'desktop', 'VIEWPORT', null, null, false, null, null, 1),
+      captureType: 'VIEWPORT', scrollPosition: { scrollX: 0, scrollY: 0 },
+      reveal: { viewportWidth: WIDTH, viewportHeight: HEIGHT, targets: [{
+        purpose: 'FIXED_ELEMENT_OCCLUSION', selectors: ['#page-title'], overlaySelector: '#site-header', position: 'TARGET', found: true,
+        scroll: { document: { before: { scrollX: 0, scrollY: 0 }, after: { scrollX: 0, scrollY: 0 } }, ancestors: [] },
+        rect: title, elementRects: [title], lineRectCounts: [1], visibleRect: title, hitTestPointCount: 5, hitPointCount: 5, coveredPointCount: 0,
+        overlayPresent: true, inclusion: 'INSIDE',
+      }] },
+    } as never));
+    const occlusionFinding = finding(72, 'WARN', 'LAYOUT', PAGE_1, [idOf(layoutRecord)], {
+      ruleId: 'FIXED_ELEMENT_OCCLUSION', groupingKeys: [{ name: 'overlaySelector', value: '#site-header' }],
+    });
+    const confidenceOf = (evidence: readonly EvidenceRecord[]) => buildReportViewModel(auditRun({
+      pages: [page(PAGE_1, '/', 'AUDITED', [metadata(1, PAGE_1), ...evidence], [occlusionFinding])],
+    })).findingGroups.find((group) => group.ruleId === 'FIXED_ELEMENT_OCCLUSION')?.confidence;
+    expect([confidenceOf([layoutRecord]), confidenceOf([layoutRecord, revealShot])]).toEqual(['HIGH', 'MEDIUM']);
   });
 
   it('counts the overlaps that are not findings', () => {

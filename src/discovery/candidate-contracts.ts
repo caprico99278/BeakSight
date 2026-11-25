@@ -163,6 +163,12 @@ export const isUnsendableFieldType = (type: CandidateFieldType): boolean =>
 export const SELECT_FIELD_TYPES = Object.freeze(['select-one', 'select-multiple'] as const satisfies readonly CandidateFieldType[]);
 
 /**
+ * REV-RCA の M-5（検索の確かめの設計書 2.1・2.2）: 検索の確かめで決まった値（空・「a」・「あ」）を入れ、打つだけの検索を探す文字の欄の型（閉じた一覧の唯一の置き場）。
+ * 組の作り手（`search-check-plan.ts`）と押下の部品（`submission-probe.ts`）が使う。
+ */
+export const SEARCH_TEXT_FIELD_TYPES = Object.freeze(['text', 'search', 'textarea'] as const satisfies readonly CandidateFieldType[]);
+
+/**
  * 既定の値が分からない欄の型（閉じた一覧。T30f fix round 1・2。DEF-098）: 送る欄に選ばなくても、ブラウザがページの決めた既定の値で送る欄（select と、
  * 空にならない range・color）。書き込みの入力の部品は、送る欄に選ばなければ送らない（`SPEC_INVALID`）。シナリオの下書きの確かめ
  * （`src/control/approval/scenario-policy.ts`）は、CREATE で送る欄に選ばなければ受けない（`SCENARIO_CREATE_DEFAULT_VALUE_FIELD_NOT_SENT`）。
@@ -315,6 +321,11 @@ export interface CandidateField {
   readonly omittedOptionCount: number;
   /** 値があるか（値そのものは持たない）。 */
   readonly hasValue: boolean;
+  /**
+   * REV-RCA の I-3（検索の確かめの設計書 2.5。任意の項目。版は変えず、識別の digest に入れない）: 値か表示の文字が削除の語に当たる選択肢の位置（`options` の位置。
+   * 当たる選択肢がなければ項目を持たない）。表示の文字は持たない。検索の確かめの組の作り手が、その選択肢を組から除く。
+   */
+  readonly destructiveOptionIndexes?: readonly number[];
 }
 
 /** JS の結び付き（listener の種類。重複なし）。form の外のボタンの `form` は空。 */

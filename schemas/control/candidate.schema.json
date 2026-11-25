@@ -298,7 +298,14 @@
           ]
         },
         "omittedOptionCount": { "type": "integer", "minimum": 0, "maximum": 9007199254740991 },
-        "hasValue": { "type": "boolean" }
+        "hasValue": { "type": "boolean" },
+        "destructiveOptionIndexes": {
+          "description": "REV-RCA I-3: the positions in options of the choices whose value or shown text has a delete word (optional; the shown text is not kept).",
+          "type": "array",
+          "minItems": 1,
+          "uniqueItems": true,
+          "items": { "type": "integer", "minimum": 0, "maximum": 9007199254740991 }
+        }
       }
     },
     "listenerKinds": {
@@ -379,6 +386,7 @@
                 "UNRECOGNIZED",
                 "EXTERNAL_SCHEME",
                 "OPENER_SIDE_REQUEST",
+                "AI_GENERATION_REQUEST",
                 "PAGE_CHANGED",
                 "PRESS_LIMIT_REACHED",
                 "TARGET_NOT_FOUND",
@@ -393,7 +401,14 @@
                 "STAGE_UNRESPONSIVE",
                 "STAGE_NEVER_QUIET",
                 "COVERED_BY_OTHER",
-                "DESTRUCTIVE_ACTION_SKIPPED"
+                "DESTRUCTIVE_ACTION_SKIPPED",
+                "TARGET_VANISHED",
+                "NOT_REACHED",
+                "TARGET_NOT_STABLE",
+                "TARGET_NOT_VISIBLE",
+                "STATE_NOT_REBUILT",
+                "AI_ACTION_SKIPPED",
+                "SAME_SHAPE_NO_CHANGE"
               ]
             },
             { "type": "null" }
@@ -457,6 +472,10 @@
         "chainEnd": {
           "description": "Optional (COV-2c; coverage by state design, SREV-COV I-1): the press only added parts of a make already seen on the screen (no new structure signature), so the probe did not take the screen after the press as a new state and closed the chain of presses there (NO_NEW_STRUCTURE). Never a value. Absent otherwise and in the probes written before COV-2c.",
           "enum": ["NO_NEW_STRUCTURE"]
+        },
+        "aiAction": {
+          "description": "Optional (AIW 4): the press made an AI request (a destination path with an AI word, or a streaming answer), so the probe keeps the candidate as an AI action: it is not pressed again, it is not a create or update candidate, and the search check leaves out the triggers that press it. Absent otherwise and in the probes written before AIW.",
+          "const": true
         }
       },
       "allOf": [
@@ -484,7 +503,8 @@
                   "CREATE_PATH_HAS_ID",
                   "UNRECOGNIZED",
                   "EXTERNAL_SCHEME",
-                  "OPENER_SIDE_REQUEST"
+                  "OPENER_SIDE_REQUEST",
+                  "AI_GENERATION_REQUEST"
                 ]
               }
             }
@@ -495,7 +515,7 @@
           "then": {
             "type": "object",
             "properties": {
-              "reason": { "enum": ["PAGE_CHANGED", "PRESS_LIMIT_REACHED", "TARGET_NOT_FOUND", "PRESS_FAILED", "CONTEXT_CLOSED_BY_GUARD", "SAME_IDENTITY_PRESSED", "SAME_WORDS_NO_REQUEST", "DISABLED_SUBMITTER", "SHARED_LAYOUT_PRESSED", "DISABLED_FILL_LIMIT_REACHED", "SAME_STATE_PRESSED", "STAGE_UNRESPONSIVE", "STAGE_NEVER_QUIET", "COVERED_BY_OTHER", "DESTRUCTIVE_ACTION_SKIPPED"] },
+              "reason": { "enum": ["PAGE_CHANGED", "PRESS_LIMIT_REACHED", "TARGET_NOT_FOUND", "PRESS_FAILED", "CONTEXT_CLOSED_BY_GUARD", "SAME_IDENTITY_PRESSED", "SAME_WORDS_NO_REQUEST", "DISABLED_SUBMITTER", "SHARED_LAYOUT_PRESSED", "DISABLED_FILL_LIMIT_REACHED", "SAME_STATE_PRESSED", "STAGE_UNRESPONSIVE", "STAGE_NEVER_QUIET", "COVERED_BY_OTHER", "DESTRUCTIVE_ACTION_SKIPPED", "TARGET_VANISHED", "NOT_REACHED", "TARGET_NOT_STABLE", "TARGET_NOT_VISIBLE", "STATE_NOT_REBUILT", "AI_ACTION_SKIPPED", "SAME_SHAPE_NO_CHANGE"] },
               "shape": { "type": "null" }
             }
           }

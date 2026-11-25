@@ -28,6 +28,7 @@ const documentOf = (): ReadEvidenceDocument => ({
   finishedAt: '20261011010100',
   runStatus: 'COMPLETE',
   endReason: 'COMPLETED',
+  searchChecks: [],
   checks: [{
     readCheckId: 'read-1',
     readCheckRevision: 1,

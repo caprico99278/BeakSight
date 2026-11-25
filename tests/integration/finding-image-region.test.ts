@@ -39,7 +39,7 @@ const RED: readonly [number, number, number] = [255, 0, 0];
 const PAGE = '<!doctype html><html lang="ja"><head><meta charset="utf-8"><link rel="icon" href="data:,"><title>red header</title>'
   + '<style>html, body { margin: 0; background: #fff; } main { padding: 8px; }</style></head><body>'
   + '<header id="cover" style="position: fixed; top: 0; left: 0; width: 100%; height: 300px; background: rgb(255, 0, 0); z-index: 10"><p>ヘッダです。</p></header>'
-  + '<main><h1 id="title">見出し</h1><p>本文です。</p></main></body></html>';
+  + '<main><h1 id="title">見出し</h1><p>本文です。</p><p id="wide" style="width: 1000px">幅の走査の幅でだけ、はみ出す段落です。</p></main></body></html>';
 
 let browser: Browser;
 let server: LoopbackHttpServer | undefined;
@@ -143,10 +143,34 @@ const HIDE_BANNER_PAGE = `${EV2_HEAD}<body style="margin: 0">`
   + '<div id="bn" style="position: fixed; top: 0; left: 0; right: 0; height: 120px; background: rgb(255, 0, 0); z-index: 10">お知らせ</div>'
   + '<main><a id="toplink" href="#x" style="display: block; margin-top: 20px; width: 300px; height: 40px">はじめのリンク</a><div style="height: 3000px"></div></main>'
   + '<script>addEventListener(\'scroll\', () => { document.getElementById(\'bn\').style.display = scrollY > 200 ? \'none\' : \'block\'; });</script></body></html>';
+// TII（DEF-285）: 横にスクロールする道具の並びの、ボタン（中に span と svg）と選択の欄の重なり。祖先の overflow が効かない 4 つの形（inline・既定が inline の
+// custom element・display: contents・包含ブロックが外にある absolute の入れ物）と、選択の欄が sticky の並び（画面の中で見えている形と、画面の下の端に
+// かかる形。並びを動かすと重なりが消える）。
+const toolPairOf = (prefix: string, selectStyle = ''): string => `<button id="${prefix}-a" style="flex: none; width: 110px; height: 36px">`
+  + `<span>道具</span><svg width="16" height="16"><rect width="16" height="16"></rect></svg></button>`
+  + `<select id="${prefix}-b" style="flex: none; width: 120px; height: 36px; margin-left: -40px;${selectStyle}"><option>選ぶ</option></select>`;
+const toolBarOf = (inner: string, style = ''): string => `<div style="display: flex; gap: 8px; width: 600px; padding: 8px; overflow-x: auto;${style}">${inner}`
+  + `${'<button style="flex: none; width: 110px; height: 36px">他</button>'.repeat(12)}</div>`;
+const stickyBarOf = (prefix: string, style: string): string => toolBarOf(
+  `<select id="${prefix}-b" style="flex: none; width: 120px; height: 36px; position: sticky; left: 0; z-index: 1"><option>選ぶ</option></select>`
+    + `${'<button style="flex: none; width: 110px; height: 36px">他</button>'.repeat(6)}<button id="${prefix}-a" style="flex: none; width: 110px; height: 36px">`
+    + '<span>道具</span><svg width="16" height="16"><rect width="16" height="16"></rect></svg></button>',
+  style,
+).replace('<div ', `<div id="${prefix}-bar" `);
+const TOOLBAR_PAGE = `${EV2_HEAD}<body style="margin: 0">`
+  + `<span style="overflow: hidden">${toolBarOf(toolPairOf('in'))}</span>`
+  + `<x-bar style="overflow-x: hidden">${toolBarOf(toolPairOf('ce'))}</x-bar>`
+  + `<div style="display: contents; overflow: hidden">${toolBarOf(toolPairOf('dc'))}</div>`
+  + stickyBarOf('sv', '')
+  + `<div style="overflow: hidden; height: 0"><div style="position: absolute; left: 0; top: 400px">${toolBarOf(toolPairOf('ab'))}</div></div>`
+  + stickyBarOf('fb', ' position: absolute; left: 0; top: 772px')
+  + '<div style="height: 3000px"></div><script>for (const id of ["sv", "fb"]) { const bar = document.getElementById(`${id}-bar`);'
+  + ' for (let i = 0; i < 3; i += 1) bar.scrollLeft += document.getElementById(`${id}-a`).getBoundingClientRect().left'
+  + ' - (document.getElementById(`${id}-b`).getBoundingClientRect().right - 60); }</script></body></html>';
 const EV2_PAGES: Readonly<Record<string, string>> = Object.freeze({
   '/deep': DEEP_PAGE, '/footer-end': FOOTER_PAGE, '/banner-initial': BANNER_PAGE, '/hide-banner': HIDE_BANNER_PAGE,
   '/covered-and-clipped': COVERED_AND_CLIPPED_PAGE, '/footer-two': FOOTER_TWO_PAGE, '/scroll-region': SCROLL_REGION_PAGE,
-  '/scroll-keys': SCROLL_KEY_PAGE,
+  '/scroll-keys': SCROLL_KEY_PAGE, '/toolbar': TOOLBAR_PAGE,
 });
 /** サーバが受けた要求の path（REV-EV4: キーで移る先へ届いていないかを見る）。 */
 const receivedPaths: string[] = [];
@@ -247,6 +271,16 @@ describe('AUD-3d: the image and the region of a finding at a width of the stress
     expect(image.rgbAt(x + width / 2, y + height / 2)).toEqual(RED);
     expect(image.rgbAt(x + width - 2, y + height - 2)).toEqual(RED);
     expect(image.rgbAt(x + width / 2, y + height + 4)).not.toEqual(RED);
+
+    // AUD-4: 落ち着いた画面では、動かして撮る規則でない指摘（その幅のはみ出し）の layout と画像の両方に状態の印があり、比べたうえで保留にしない。
+    const wide = outcome.result.findings.find((candidate) => candidate.ruleId === 'ELEMENT_OUTSIDE_VIEWPORT'
+      && candidate.groupingKeys?.some(({ name, value }) => name === 'stressWidth' && value === String(STRESS_WIDTH)));
+    const regionOf = findingImageRegionIndexOf({ pages: [outcome.result] } as unknown as AuditRunResult);
+    const wideRegion = wide === undefined ? null : regionOf(wide);
+    expect(wideRegion).toMatchObject({ screenshotEvidenceId: widthShot.evidenceId, holdReason: null });
+    const widthLayout = layout?.type === 'layout' ? layout.payload.stressSweep?.find((entry) => entry.width === STRESS_WIDTH)?.layout : undefined;
+    expect([widthLayout?.stateMark?.hiddenNotificationFrameCount, widthShot.payload.stateMark?.hiddenNotificationFrameCount]).toEqual([0, 0]);
+    expect(outcome.result.findings.filter((candidate) => regionOf(candidate)?.holdReason === 'EVIDENCE_MISMATCH')).toEqual([]);
   }, TEST_TIMEOUT_MS);
 });
 
@@ -381,6 +415,15 @@ describe('EV-2 (REV-EV12): the parts that decide what the image shows', () => {
       captured.flatMap(({ targets }) => targets).find((target) => target.selectors[0] === selector)?.inclusion;
     expect([inclusionOf('#ft-a'), inclusionOf('#cl-a')]).toEqual(['OUTSIDE', 'PARTIAL']);
   }, TEST_TIMEOUT_MS);
+
+  it('TII: counts an overlap on a tool bar as inside the image, taking it where it is when moving the bar would pull the two apart', async () => {
+    const ids = ['in', 'ce', 'dc', 'ab', 'sv', 'fb'];
+    const captured = await revealOn('/toolbar', ids.map((id) => ({ purpose: 'ELEMENT_OVERLAP', selectors: [`#${id}-a`, `#${id}-b`] })));
+    const measuredOf = (id: string) => captured.flatMap(({ targets }) => targets).find((target) => target.selectors[0] === `#${id}-a`);
+    // 画面の下の端にかかる重なりは、元の位置（layout と同じ位置関係）で一部だけ入る（保留のまま）。
+    expect(ids.map((id) => measuredOf(id)?.inclusion)).toEqual(['INSIDE', 'INSIDE', 'INSIDE', 'INSIDE', 'INSIDE', 'PARTIAL']);
+    expect(['sv', 'fb'].map((id) => (measuredOf(id)?.rect?.width ?? 0) > 0)).toEqual([true, true]);
+  });
 
   it('measures the covers of one band once at the end, and takes the covered targets of the same band in one image', async () => {
     const captured = await revealOn('/footer-two', [

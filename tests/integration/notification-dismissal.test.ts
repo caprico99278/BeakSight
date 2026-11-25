@@ -13,6 +13,7 @@ import { join } from 'node:path';
 import type { Browser } from 'playwright';
 import { afterAll, beforeAll, beforeEach, describe, expect, it } from 'vitest';
 import { BrowserContextFactory } from '../../src/browser/context-factory.js';
+import { BEFORE_HIDE_SCREENSHOT_DIRECTORY } from '../../src/core/artifact-layout.js';
 import type { EvidenceRecordFor, PageAuditOutcome } from '../../src/core/contracts.js';
 import { wait } from '../../src/core/deadline.js';
 import type { NotificationOverlayEvidence } from '../../src/core/evidence-types.js';
@@ -23,7 +24,7 @@ import { PageAuditor } from '../../src/orchestration/page-auditor.js';
 import { SafetyLedger } from '../../src/safety/safety-ledger.js';
 import { BROWSER_DEFAULT_FAVICON_PATH } from '../../src/safety/request-policy.js';
 import { executeAuditRun } from '../../src/cli/audit-run.js';
-import { NOTIFICATION_OVERLAY_TEXT } from '../../src/presentation/messages.js';
+import { EVIDENCE_SUFFICIENCY_TEXT, NOTIFICATION_OVERLAY_TEXT } from '../../src/presentation/messages.js';
 import { launchTestDefaultChromium, useHeadlessChromium } from '../helpers/chromium.js';
 import { fastRunConfig, findTextOccurrences, readRunArtifactFiles } from '../helpers/run-harness.js';
 import { startLoopbackHttpServer, type LoopbackHttpServer } from '../helpers/loopback-server.js';
@@ -102,6 +103,27 @@ const modalHtml = (behavior: 'remove' | 'stay'): string => `
 document.getElementById('modal-close').addEventListener('click', () => { ${behavior === 'remove' ? "document.getElementById('modal').remove();" : ''} });
 </script>`;
 
+/**
+ * AUD-2: 閉じる語のない操作用のモーダルの小窓（`aria-modal`。暗転の要素は小窓の外の別の要素）。背景のボタンは暗転に塞がれ、小窓の中のボタンは小窓の中の固定の
+ * 要素に覆われる。
+ */
+const MODAL_OPEN_HTML = `
+<button type="button" id="bg-button" style="position: absolute; left: 24px; top: 160px; width: 160px; height: 40px;">背景のボタン</button>
+<div id="backdrop" style="position: fixed; inset: 0; z-index: 40; background: rgba(0, 0, 0, 0.5);"></div>
+<div id="dialog" role="dialog" aria-modal="true" aria-labelledby="dialog-title"
+  style="position: fixed; left: 20vw; top: 20vh; width: 60vw; height: 60vh; z-index: 50; background: rgb(255, 255, 255);">
+  <h2 id="dialog-title">予定の詳しい内容</h2>
+  <p>一般の案内の文です。</p>
+  <button type="button" id="dialog-action" style="position: absolute; left: 16px; bottom: 16px; width: 120px; height: 40px;">次へ</button>
+  <div id="cover" style="position: fixed; left: calc(20vw + 8px); bottom: calc(20vh + 8px); width: 160px; height: 56px; z-index: 60; background: rgb(0, 128, 0);"></div>
+</div>`;
+
+/** AUD-2: 名前が中の画像の alt だけの閉じるボタンの、隅の小さな通知の枠。 */
+const ICON_CLOSE_HTML = `<div id="icon-layer" style="position: fixed; inset: 0; z-index: 40; pointer-events: none;">
+<section id="icon-notice" role="region" style="position: fixed; top: 16px; right: 16px; width: 200px; height: 80px; pointer-events: auto; background: #fee;">
+<p>一般のお知らせの文です。</p><button type="button" id="icon-close"><img alt="閉じる" width="12" height="12" src="data:image/gif;base64,R0lGODlhAQABAAAAACw="></button></section></div>
+<script>document.getElementById('icon-close').addEventListener('click', () => { document.getElementById('icon-layer').remove(); });</script>`;
+
 const pageHtml = (title: string, extra: string): string => `<!doctype html><html lang="ja"><head><meta charset="utf-8"><link rel="icon" href="data:,">
 <title>${title}</title><style>body { margin: 0; font-family: sans-serif; } main { padding: 24px; }</style></head><body>
 <main><h1>${title}</h1>
@@ -147,6 +169,8 @@ const PAGES: Readonly<Record<string, string>> = Object.freeze({
   '/moved': pageHtml('移った先', ''),
   '/modal': pageHtml('全面のモーダル', modalHtml('remove')),
   '/modal-stuck': pageHtml('残る全面のモーダル', modalHtml('stay')),
+  '/modal-open': pageHtml('操作用の小窓', MODAL_OPEN_HTML),
+  '/icon-close': pageHtml('画像の閉じるボタン', ICON_CLOSE_HTML),
 });
 
 beforeAll(async () => {
@@ -331,6 +355,9 @@ function listPngFiles(directory: string): string[] {
   });
 }
 
+/** AUD-2: 通知の枠を隠す前に撮った画像のファイルか（置き場は配置の owner の 1 か所）。 */
+const isBeforeHideFile = (file: string): boolean => file.split(/[\\/]/u).includes(BEFORE_HIDE_SCREENSHOT_DIRECTORY);
+
 /** PNG の、指定の色の画素の数（画素の読み方は、テストの補助 `tests/helpers/png-pixels.ts` の 1 か所）。 */
 const countColorPixels = (file: string, color: typeof NOTICE_COLOR): number => countRgbPixels(file, [color.red, color.green, color.blue]);
 
@@ -361,12 +388,14 @@ describe('NO-2: the new Rules show in the report without changing the report cod
       expect(outcome.kind).toBe('RAN');
       if (outcome.kind !== 'RAN') return;
       const files = await readRunArtifactFiles(outcome.runDirectory);
-      const found = findTextOccurrences(files, ['NOTIFICATION_NOT_DISMISSIBLE', NOTIFICATION_OVERLAY_TEXT.hidden, '通知の枠の閉じるボタンを押しましたが、枠が残りました。']);
-      // 表示面（HTML のレポート）に、Rule の ID と文が出る（表示面のコードは変えていない）。
+      const found = findTextOccurrences(files, [
+        'NOTIFICATION_NOT_DISMISSIBLE', NOTIFICATION_OVERLAY_TEXT.hidden, '通知の枠の閉じるボタンを押しましたが、枠が残りました。', EVIDENCE_SUFFICIENCY_TEXT.operationRecordLabel,
+      ]);
+      // 表示面（HTML のレポート）に、Rule の ID と文が出る。S-12: 閉じた（隠した）知らせは操作の記録として、指摘に並べず数だけを出す。
       expect(found.filter((line) => line.startsWith('report.html: '))).toEqual([
         'report.html: NOTIFICATION_NOT_DISMISSIBLE',
-        `report.html: ${NOTIFICATION_OVERLAY_TEXT.hidden}`,
         'report.html: 通知の枠の閉じるボタンを押しましたが、枠が残りました。',
+        `report.html: ${EVIDENCE_SUFFICIENCY_TEXT.operationRecordLabel}`,
       ]);
     } finally {
       await rm(outputDirectory, { recursive: true, force: true });
@@ -419,6 +448,8 @@ describe('NO-2: closing notification frames before the audit', () => {
             { status: 'DISMISSIBLE', pressed: true, dismissed: false, hidden: true, hiddenReason: 'NOT_DISMISSED' },
             { status: 'NO_CLOSE_BUTTON', pressed: false, dismissed: false, hidden: true, hiddenReason: 'NO_CLOSE_BUTTON' },
           ]));
+        // AUD-2（5.2）: 隠した枠は、そのときの幅とスクロールを残す。
+        expect(overlay?.frames.every((frame) => frame.hiddenAt !== undefined && frame.hiddenAt.viewportWidth > 0)).toBe(true);
       }
       expect(findingsOf(outcome, 'NOTIFICATION_NOT_DISMISSIBLE')).toEqual(['desktop', 'desktop', 'mobile', 'mobile']);
       expect(findingsOf(outcome, 'NOTIFICATION_HANDLED_BEFORE_AUDIT')).toEqual(['desktop', 'mobile']);
@@ -427,13 +458,19 @@ describe('NO-2: closing notification frames before the audit', () => {
         const selectors = record.payload.primary.layout?.fixedElements.map((element) => element.selector) ?? [];
         expect(selectors.filter((selector) => selector === '#notice' || selector === '#big-panel')).toEqual([]);
       }
-      expect(screenshots.map((file) => countColorPixels(file, NOTICE_COLOR))).toEqual(screenshots.map(() => 0));
+      // AUD-2（5.2）: 隠す前の画面の画像を、主の読み込みと幅ごとに 1 枚ずつ撮り（枠が写る）、ほかの写しには枠が写らない。
+      const beforeHide = screenshots.filter(isBeforeHideFile);
+      expect(beforeHide).toHaveLength(3);
+      expect(beforeHide.every((file) => countColorPixels(file, NOTICE_COLOR) > 0)).toBe(true);
+      const states = screenshots.filter((file) => !isBeforeHideFile(file));
+      expect(states.map((file) => countColorPixels(file, NOTICE_COLOR))).toEqual(states.map(() => 0));
+      expect(outcome.result.evidence.filter((record) => record.type === 'screenshot' && record.payload.beforeNotificationHide === true)).toHaveLength(3);
     } finally {
       await session.close();
     }
   }, TEST_TIMEOUT_MS);
 
-  it('fix round 1: presses the close button of a full modal too, and reports and hides a full modal that stays after the press', async () => {
+  it('fix round 1: presses the close button of a full modal too, and AUD-2: reports a full modal that stays after the press but keeps it open', async () => {
     const session = await openAuditSession();
     try {
       const closed = await session.audit('/modal');
@@ -447,15 +484,51 @@ describe('NO-2: closing notification frames before the audit', () => {
 
       const stuck = await session.audit('/modal-stuck');
       for (const overlay of overlaysOf(stuck.outcome)) {
-        expect(overlay?.frames.map(({ status, pressed, dismissed, hidden, hiddenReason }) => ({ status, pressed, dismissed, hidden, hiddenReason })))
-          .toEqual([{ status: 'TOO_LARGE', pressed: true, dismissed: false, hidden: true, hiddenReason: 'NOT_DISMISSED' }]);
+        expect(overlay?.frames.map(({ status, pressed, dismissed, hidden, hiddenReason, keptOpen }) => ({ status, pressed, dismissed, hidden, hiddenReason, keptOpen })))
+          .toEqual([{ status: 'TOO_LARGE', pressed: true, dismissed: false, hidden: false, hiddenReason: 'NOT_DISMISSED', keptOpen: true }]);
       }
       expect(findingsOf(stuck.outcome, 'NOTIFICATION_NOT_DISMISSIBLE')).toEqual(['desktop', 'mobile']);
-      expect(stuck.screenshots.map((file) => countColorPixels(file, NOTICE_COLOR))).toEqual(stuck.screenshots.map(() => 0));
+      // AUD-2: 隠さないので「隠しました」の文はなく、隠す前の画像も撮らない。
+      expect(stuck.outcome.result.findings.filter((finding) => finding.message.includes('隠しました'))).toEqual([]);
+      expect(stuck.screenshots.filter(isBeforeHideFile)).toEqual([]);
     } finally {
       await session.close();
     }
   }, TEST_TIMEOUT_MS);
+
+  it('AUD-2: audits a modal dialog without a close word open, does not report its blocked background, and reports a cover inside the dialog', async () => {
+    const session = await openAuditSession();
+    try {
+      const { outcome, screenshots } = await session.audit('/modal-open');
+      for (const overlay of overlaysOf(outcome)) {
+        expect(overlay?.frames.length).toBeGreaterThan(0);
+        expect(overlay?.frames.map(({ hidden, hiddenReason, keptOpen }) => ({ hidden, hiddenReason, keptOpen })))
+          .toEqual(overlay?.frames.map(() => ({ hidden: false, hiddenReason: null, keptOpen: true })));
+      }
+      expect(findingsOf(outcome, 'NOTIFICATION_NOT_DISMISSIBLE')).toEqual([]);
+      expect(screenshots.filter(isBeforeHideFile)).toEqual([]);
+      // 背景が暗転と小窓に塞がれるのは指摘にならず、小窓の中のボタンを覆う要素は指摘になる。
+      const occlusions = outcome.result.findings.filter((finding) => finding.ruleId === 'FIXED_ELEMENT_OCCLUSION' || finding.ruleId === 'OVERSIZED_FIXED_ELEMENT');
+      expect(occlusions.filter((finding) => /固定要素 #(?:backdrop|dialog)（/u.test(finding.message))).toEqual([]);
+      expect(occlusions.filter((finding) => finding.ruleId === 'FIXED_ELEMENT_OCCLUSION' && finding.message.includes('#cover'))
+        .map((finding) => finding.viewport)).toEqual(expect.arrayContaining(['desktop', 'mobile']));
+    } finally {
+      await session.close();
+    }
+  });
+
+  it('AUD-2: takes a button whose name is only the alt of its image as the close button', async () => {
+    const session = await openAuditSession();
+    try {
+      const { outcome } = await session.audit('/icon-close');
+      for (const overlay of overlaysOf(outcome)) {
+        expect(overlay?.frames.map(({ status, pressed, dismissed }) => ({ status, pressed, dismissed })))
+          .toEqual([{ status: 'DISMISSIBLE', pressed: true, dismissed: true }]);
+      }
+    } finally {
+      await session.close();
+    }
+  });
 
   it('RB-14a (X11): lets the move of a close press reach the site, and does not measure the moved page (PARTIAL with the reason)', async () => {
     const session = await openAuditSession();

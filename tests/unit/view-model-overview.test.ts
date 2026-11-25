@@ -6,7 +6,7 @@
 import { describe, expect, it } from 'vitest';
 import type { AuditRunResult, Finding } from '../../src/core/contracts.js';
 import { createFindingId } from '../../src/core/ids.js';
-import { describeIncompleteReason, nextStepOfIncompleteReason } from '../../src/presentation/messages.js';
+import { describeIncompleteReason, describeIncompleteReasonOf, nextStepOfIncompleteReasonOf } from '../../src/presentation/messages.js';
 import { REPORT_OVERVIEW_TOP_PROBLEM_COUNT, buildReportViewModel } from '../../src/report/view-model.js';
 import { PAGE_1, PAGE_2, PAGE_3, auditRun, dom, finding, idOf, page, runSummary } from '../helpers/audit-run-fixture.js';
 
@@ -89,19 +89,23 @@ describe('buildReportViewModel: the overview of the report (PL-R)', () => {
       pageIncompleteReasonCounts: [
         { code: 'INNER_SCROLL_CONTAINER_NOT_TRAVERSED', pages: 2 },
         { code: 'DEADLINE_EXCEEDED', pages: 1 },
+        // PIR: 点検の範囲の外へ移ったページは、別の文。
+        { code: 'NAVIGATION_FAILED', detail: 'BLOCKED_EXTERNAL_REDIRECT', pages: 1, pageUrls: ['http://127.0.0.1:4173/away.html'] },
       ],
     }));
-    const reasonOf = (code: Parameters<typeof describeIncompleteReason>[0]) => ({
+    const reasonOf = (code: Parameters<typeof describeIncompleteReason>[0], detail: string | null = null) => ({
       code,
-      detail: null,
-      description: describeIncompleteReason(code),
-      nextStep: nextStepOfIncompleteReason(code),
+      detail,
+      description: describeIncompleteReasonOf({ code, detail }),
+      nextStep: nextStepOfIncompleteReasonOf({ code, detail }),
     });
     expect(model.overview.runReasons).toEqual([reasonOf('MAX_PAGES_REACHED'), reasonOf('REQUIRED_WORK_NOT_VERIFIED')]);
     expect(model.overview.pageReasons).toEqual([
       { reason: reasonOf('INNER_SCROLL_CONTAINER_NOT_TRAVERSED'), pages: 2 },
       { reason: reasonOf('DEADLINE_EXCEEDED'), pages: 1 },
+      { reason: reasonOf('NAVIGATION_FAILED', 'BLOCKED_EXTERNAL_REDIRECT'), pages: 1 },
     ]);
+    expect(model.overview.pageReasons[2]?.reason.description).not.toBe(describeIncompleteReason('NAVIGATION_FAILED'));
   });
 
   it('has no page reasons for a Run without the page reason counts (an earlier writer)', () => {

@@ -8,8 +8,10 @@
  * - CLI と設定のエラーの文言は、Task 17 でここに加える。
  * - このファイルが import してよいのは、`src/core/**` と `src/config/types.ts` だけ（UI追補設計書 4.1）。
  */
+import type { AuditSendPolicyName } from '../core/audit-send-policy.js';
 import type { BeakSightBlockRelationReason } from '../core/beaksight-block-relation.js';
-import type { FindingCategory, IncompleteReasonCode, JobSafetyViolationStage } from '../core/contracts.js';
+import type { FindingCategory, IncompleteReasonCode, JobSafetyViolationStage, PageSamenessDepth } from '../core/contracts.js';
+import { isOutsideAuditScopeNavigation } from '../core/contracts.js';
 import {
   INTERACTION_LEGACY_NOT_VERIFIABLE_REASON_CODES,
   type BLOCKED_REQUEST_REASONS,
@@ -103,6 +105,15 @@ export const NOTIFICATION_OVERLAY_TEXT = deepFreeze({
   hidden: '通知の枠を隠して点検しました。',
   /** 閉じた枠と隠した枠の両方があった。 */
   dismissedAndHidden: '通知の枠を閉じて（隠して）点検しました。',
+  /**
+   * RVP-3（設計書 `2026-11-24-beaksight-review-pending-evidence-design.md` 2.4）: 閉じられない枠の指摘の文に足す、隠した所（主の読み込み・幅の走査の幅）の文。
+   * 所は、読み込んだ順（主の読み込みが先、幅の順）。
+   */
+  hiddenAt: (places: readonly string[]): string => `点検のために、${places.join('と、')}で、その枠を隠しました。`,
+  /** RVP-3: 主の読み込みの所の名前。 */
+  primaryPlace: '最初に開いた画面',
+  /** RVP-3: 幅の走査の幅の所の名前（幅は書いた形の値）。 */
+  stressWidthPlace: (widthText: string): string => `幅 ${widthText} の確認`,
 } as const);
 
 /**
@@ -117,6 +128,42 @@ export const FOCUSED_CONTROL_HIDDEN_TEXT = deepFreeze({
     NOT_VISIBLE: '見えるようになりません',
     NOT_HITTABLE: 'ほかの要素の下にあり、押せません',
   },
+  /** AUD-3（設計書 `2026-11-19-beaksight-audit-result-review-fixes-design.md` 6.2 の 2）: 項目の種別が循環の守り（`GUARD`）の指摘の文に足す文。 */
+  guardNote: 'キーボードの移動を小窓の中で回すために置く、見えない守りの部品の可能性があります。',
+  /** AUD-3（6.2 の 5）: 画面の先頭から Tab のキーで移ると、届いて見える項目の指摘の文に足す文。 */
+  tabShownNote: '画面の先頭から Tab のキーで移ったときは、画面に出てきます。',
+  /** AUD-3（6.2 の 5）: 画面の先頭から Tab のキーで移っても届かない項目の指摘の文に足す文。 */
+  tabUnreachedNote: '画面の先頭から Tab のキーで移っても、この部品には届きません。',
+  /**
+   * RVP-1（設計書 `2026-11-24-beaksight-review-pending-evidence-design.md` 2.2）: 通常の Tab の確かめのない項目の、ほかの要素の下にあった指摘の文（「押せません」と
+   * 言い切らず、直の focus の事実だけ）。
+   */
+  directNotHittableMessage: (selector: string): string => `画面の外に置いた要素 ${selector} に、直にフォーカスを当てたとき、ほかの要素の下にありました。`,
+  /** RVP-1: 通常の Tab の確かめのない項目の指摘の文に足す文。 */
+  tabUncheckedNote: '画面の先頭から Tab のキーで移ったときは、確かめていません。',
+  /** RVP-1: 前面の窓を開いたまま、Tab で背後の要素へ移った項目の指摘の文に足す文。 */
+  frontWindowTabNote: '前面の窓を開いたまま、Tab で背後の要素へ移ります。',
+} as const);
+
+/**
+ * FRET（設計書 `2026-11-24-beaksight-dialog-focus-return-design.md` 1.4）: 窓を開くボタンを押して窓を閉じた後のフォーカスの戻り先の 3 つの Rule の文。`plain` は
+ * 報告の本文のやさしい文、`*Message` は Rule の文（記録の段とバンドル）。
+ */
+export const DIALOG_FOCUS_TEXT = deepFreeze({
+  notReturnedPlain: '開いた窓を閉じた後、キーボードの位置が、窓を開いたボタンに戻らない所があります。キーボードだけで使う人が、どこにいるか分からなくなります。',
+  notMovedPlain: '窓を開いても、キーボードの位置が窓の中へ移らない所があります。キーボードだけで使う人が、窓を使えないことがあります。',
+  notClosablePlain: 'キーボードでは閉じられない窓があります。キーボードだけで使う人が、窓から出られないことがあります。',
+  /** 閉じた後のフォーカスが、ボタンに戻らなかった（`destination` は行き先の文）。 */
+  notReturnedMessage: (selector: string, destination: string): string =>
+    `ボタン ${selector} で開いた窓を Esc などで閉じた後、フォーカスがボタンに戻らず、${destination}。`,
+  /** 行き先が、ほかの要素。 */
+  otherDestination: (selector: string): string => `${selector} へ移ります`,
+  /** 行き先が、ページの全体（body）。 */
+  bodyDestination: 'ページの全体（body）に落ちます',
+  notMovedMessage: (selector: string): string => `ボタン ${selector} で窓を開いても、フォーカスが窓の中へ移りません。`,
+  notClosableMessage: (selector: string): string => `ボタン ${selector} で開いた窓は、Esc でも、窓の中の閉じるボタンでも閉じられません。`,
+  /** Esc では閉じず、窓の中の閉じるボタンで閉じた窓の指摘の文に足す文。 */
+  closeButtonOnlyNote: 'この窓は Esc では閉じず、窓の中の閉じるボタンで閉じました。',
 } as const);
 
 /**
@@ -140,6 +187,41 @@ export const FIXED_OVERLAP_TEXT = deepFreeze({
   SCROLL_REVEALABLE: 'ページを動かせば、隠れた内容を見ることができます。',
 } as const);
 
+/** AUD-5（設計書 `2026-11-19-beaksight-audit-result-review-fixes-design.md` 8.1）: 画像の上に意図して置いた押せる部品の候補の、重なりの指摘の文に足す文。 */
+export const ELEMENT_OVERLAP_TEXT = deepFreeze({
+  intendedPlacementNote: '画像の上に、編集などのボタンを重ねて置いた、意図した配置の候補です。',
+} as const);
+
+/** AUD-5（8.2）: 同じ作りの画面どうしで題名が同じ指摘の文に足す文。 */
+export const DUPLICATE_PAGE_TITLE_TEXT = deepFreeze({
+  sameTemplateNote: '同じ作りの画面で、中のデータだけが違うページの可能性があります。',
+} as const);
+
+/**
+ * AUD-8（4-3）: 見た目だけ無効な色差の要素の、指摘の文に足す事実。AUD-6（設計書 `2026-11-19-beaksight-audit-result-review-fixes-design.md` 9.2。S-09）:
+ * `cursor: not-allowed` だけの要素は、見た目の指定の事実の記録にする（実際に押せないかは確かめていない）。
+ */
+export const DISABLED_STATE_TEXT = deepFreeze({
+  notExposedNote: 'この要素は見た目は無効（押せない形）ですが、無効の状態を支援技術に伝えていません（disabled・aria-disabled・inert がありません）。',
+  cursorOnlyNote: 'この要素には、押せない形を示す見た目の指定があります（実際に押せないかは確かめていません）。',
+  /**
+   * RVP-4（設計書 `2026-11-24-beaksight-review-pending-evidence-design.md` 2.5）: 名前の規則の対象が無効（`disabled`・`aria-disabled="true"`。AX の無効の状態）の
+   * ときに足す文（有効の状態は作らない）。
+   */
+  nameRuleDisabledNote: '無効の状態で見つけました（有効の状態は確かめていません）。',
+} as const);
+
+/** RVP-5（設計書 `2026-11-24-beaksight-review-pending-evidence-design.md` 2.6）: 同じ id の指摘（`DUPLICATE_ELEMENT_ID`）の文に足す文。 */
+export const DUPLICATE_ELEMENT_ID_TEXT = deepFreeze({
+  /** その id を参照する要素が、ページの中に 1 つもないときに足す。 */
+  unreferencedNote: 'この id を参照する要素（ラベル・説明・ページの中のリンクなど）は、ページの中にありません。',
+} as const);
+
+/** AUD-6（9.4。S-11）: 性能の指摘の文に足す、1 回の測りの文（測り直しはしない）。 */
+export const PERFORMANCE_SINGLE_MEASUREMENT_TEXT = deepFreeze({
+  note: '1 回の測りです（測り直していないので、たまたまの遅れのこともあります）。',
+} as const);
+
 /** EV-2: 押下を捕まえる区分でも「押せません」と言えない覆い（見出しなど読む対象・測り直しで確かめられない組）の文。 */
 export const FIXED_OVERLAP_READ_TARGET_TEXT = deepFreeze({
   RENDER_AND_POINTER: '部品が下の内容を隠しています。',
@@ -158,6 +240,8 @@ export const FINDING_HOLD_REASON_TEXT = deepFreeze({
   TARGET_NOT_IN_IMAGE: '画像に問題の場所が写っていないため、確かめを待っています。',
   PAGE_NOT_READY: '画面の準備が終わっていなかったため、確かめを待っています。',
   NOT_OPERATED: '問題の場所まで動かして撮れなかったため、確かめを待っています。',
+  EVIDENCE_MISMATCH: '記録と画像の状態がずれたため、確かめ直しを待っています。',
+  PAGE_READINESS_UNKNOWN: '画面の準備ができたかが分からなかったため、確かめを待っています。',
 } as const);
 
 /** EV-5: 証拠の足り方の数の、利用者向けの短い言葉（HTML の件数の小節と CLI の結果の行。コードは出さない）。 */
@@ -167,10 +251,16 @@ export const EVIDENCE_SUFFICIENCY_TEXT = deepFreeze({
     TARGET_NOT_IN_IMAGE: '画像に写っていない',
     PAGE_NOT_READY: '画面の準備が終わっていない',
     NOT_OPERATED: '撮れなかった',
+    EVIDENCE_MISMATCH: '記録と画像がずれた',
+    PAGE_READINESS_UNKNOWN: '画面の準備ができたかが分からない',
   },
   imageLabel: '問題の場所が写った画像',
   uncollectedLabel: 'まだ見ていない画面',
   uncollectedViewports: 'デスクトップとモバイルの表示で数えると',
+  /** S-12: 読み込めなかった画面（まだ見ていない画面とは分ける。0 なら出さない）。 */
+  failedLabel: '読み込めなかった画面',
+  /** S-12: 点検のための操作の記録（問題の数に入れない。0 なら出さない）。 */
+  operationRecordLabel: '通知を閉じるなどの操作の記録',
 } as const);
 
 /** EV-5: 表示用モデルの証拠の足り方の数（`EvidenceSufficiencyView` と同じ形）。 */
@@ -181,15 +271,17 @@ export interface EvidenceSufficiencyCounts {
   readonly targetInImageCount: number;
   readonly uncollectedPageCount: number;
   readonly uncollectedViewportCount: number;
+  readonly failedPageCount: number;
 }
 
 /**
  * EV-5: 証拠の足り方の 2 行（確かめを待つ問題と、場所が写った画像の数。まだ見ていない画面の数）。HTML と CLI が同じ言葉で出す。`count` は件数の書式。理由は 0 件のものを
- * 出さない。
+ * 出さない。S-12: 読み込めなかった画面の数と、点検のための操作の記録の数（表示用モデルの `operationRecordCount`）の行を、0 でないときだけ足す。
  */
 export const evidenceSufficiencyEntries = (
   counts: EvidenceSufficiencyCounts,
   count: (value: number) => string,
+  operationRecordCount: number,
 ): readonly { readonly label: string; readonly value: string }[] => {
   const text = EVIDENCE_SUFFICIENCY_TEXT;
   const reasons = (Object.keys(text.reasons) as (keyof typeof text.reasons)[])
@@ -199,6 +291,8 @@ export const evidenceSufficiencyEntries = (
   return [
     { label: text.heldLabel, value: countWithDetailsText(count(counts.heldFindingCount), [...reasons, image]) },
     { label: text.uncollectedLabel, value: `${count(counts.uncollectedPageCount)}（${text.uncollectedViewports} ${count(counts.uncollectedViewportCount)}）` },
+    ...(counts.failedPageCount > 0 ? [{ label: text.failedLabel, value: count(counts.failedPageCount) }] : []),
+    ...(operationRecordCount > 0 ? [{ label: text.operationRecordLabel, value: count(operationRecordCount) }] : []),
   ];
 };
 
@@ -295,6 +389,8 @@ export const INCOMPLETE_REASON_DESCRIPTIONS = deepFreeze({
   // L0（設計書 `2026-11-09-beaksight-remove-limits-design.md` 5 の 1）: 進みの見張りが段を終えた（画面の文は 1 文）。
   STAGE_UNRESPONSIVE: '画面がしばらく全く反応しなくなったため、その作業をそこまでの記録で終えました。',
   STAGE_NEVER_QUIET: '画面の動きが止まらず作業が進まなくなったため、その作業をそこまでの記録で終えました。',
+  // DUP: 表示の中身が点検した画面と同じなので、スマートフォンの幅を点検しなかった。
+  SAME_CONTENT_AS_EARLIER_PAGE: '点検した画面と同じ内容なので、この幅の点検を省きました。',
 } as const satisfies Record<IncompleteReasonCode, string>);
 
 /**
@@ -316,7 +412,7 @@ export const BLOCKED_REQUEST_REASON_DESCRIPTIONS = deepFreeze({
   // DEF-210: 通知の枠の閉じるボタンを押す間の決まり。
   NOTIFICATION_DISMISSAL_RESTRICTED: '通知の枠を閉じるボタンを押した間に、画面が別の画面へ移ろうとしたか、送ってはいけない送信をしようとしたため、止めました。',
   // REV-EV4: 横にスクロールする欄でキーを試す間の決まり。
-  SCROLL_KEY_PRESS_RESTRICTED: '横にスクロールする欄でキーを試した間に、画面が別の画面へ移ろうとしたため、止めました。',
+  SCROLL_KEY_PRESS_RESTRICTED: '点検のためにキーを押した間に、画面が別の画面へ移ろうとしたか、窓を開くボタンを押した間に送信が出たため、止めました。',
 } as const satisfies Record<BlockedRequestReason, string>);
 
 /**
@@ -424,10 +520,46 @@ export const INCOMPLETE_REASON_NEXT_STEPS = deepFreeze({
   // L0: 進みの見張りが段を終えた。
   STAGE_UNRESPONSIVE: retryThenManualOf('画面のプログラムが止まっていることがあります。'),
   STAGE_NEVER_QUIET: `動き続ける画面（時計や動きのある表示など）で起きます。要るときは、${MANUAL_PAGE_CHECK_TEXT}。`,
+  SAME_CONTENT_AS_EARLIER_PAGE: 'することはありません。同じ内容の画面の点検の結果を見てください。',
 } as const satisfies Record<IncompleteReasonCode, string>);
+
+/**
+ * DUP（設計書 `2026-11-18-beaksight-same-structure-pages-design.md` 3 章）: 報告のまとめの 1 文（軽い点検にした画面の数と、点検を省いた画面の数）。どちらも 0 なら
+ * `null`（文を出さない）。数の書き方は、呼ぶ側の書き方（`count`）。
+ */
+export const samenessSummaryText = (lightPages: number, samePages: number, count: (value: number) => string): string | null => {
+  const sentences = [
+    ...(lightPages > 0 ? [`同じ作りの画面が多かったので、2 つ目からは画面の崩れなど主な点だけを確かめました（${count(lightPages)} 画面）。`] : []),
+    ...(samePages > 0 ? [`中身がまったく同じ画面 ${count(samePages)} 個は、点検を省きました。`] : []),
+  ];
+  return sentences.length === 0 ? null : sentences.join('');
+};
+
+/** DUP: 画面ごとの 1 文（`LIGHT` は同じ作りのしっかり点検した画面、`SAME` は同じ内容の点検した画面。`pageUrl` はその画面の URL）。 */
+export const samenessPageText = (depth: PageSamenessDepth, pageUrl: string): string => (depth === 'LIGHT'
+  ? `「${pageUrl}」の画面と同じ作りなので、軽い点検にしました。`
+  : `「${pageUrl}」の画面と同じ内容なので、点検を省きました。`);
 
 /** T44c: 未完了の理由のコードの、次にできること（T44h の判断 (1) から、すべての理由にある）。 */
 export const nextStepOfIncompleteReason = (code: IncompleteReasonCode): string => INCOMPLETE_REASON_NEXT_STEPS[code];
+
+/**
+ * PIR: 点検の範囲の外へ移ったので点検しなかった読み込みの失敗（`isOutsideAuditScopeNavigation`。コードは `NAVIGATION_FAILED` で、detail が鍵）の、理由の説明と
+ * 次にできること。範囲の外は、点検してよいサイトの外のほか、読まないページや危険な語のアドレスも含む。
+ */
+export const OUTSIDE_AUDIT_SCOPE_NAVIGATION_TEXT = deepFreeze({
+  description: '点検の範囲の外へ移るページなので、点検しませんでした。',
+  nextStep:
+    '移る先は、点検してよいサイトの外か、読まないページなどです。移る先も点検したいときは、そのページをブラウザで開いて移る先を確かめ、点検してよいサイトのアドレスに入っているかを見直してください。',
+} as const);
+
+/** PIR: 未完了の理由（コードと detail）の説明。点検の範囲の外へ移った読み込みの失敗は別の文、ほかはコードの文（`describeIncompleteReason`）。 */
+export const describeIncompleteReasonOf = (reason: { readonly code: IncompleteReasonCode; readonly detail?: string | null }): string =>
+  isOutsideAuditScopeNavigation(reason) ? OUTSIDE_AUDIT_SCOPE_NAVIGATION_TEXT.description : describeIncompleteReason(reason.code);
+
+/** PIR: 未完了の理由（コードと detail）の次にできること。点検の範囲の外へ移った読み込みの失敗は別の文、ほかはコードの文。 */
+export const nextStepOfIncompleteReasonOf = (reason: { readonly code: IncompleteReasonCode; readonly detail?: string | null }): string =>
+  isOutsideAuditScopeNavigation(reason) ? OUTSIDE_AUDIT_SCOPE_NAVIGATION_TEXT.nextStep : nextStepOfIncompleteReason(reason.code);
 
 /**
  * Interaction の理由のコードごとの、日本語の説明（Task 19 の前の整理の設計書 5.1.2 の「表示」。C18o）。
@@ -443,6 +575,9 @@ const LEGACY_INTERACTION_REASON_DESCRIPTION = '前の版の確かめ方で記録
  * 理由の説明と、発見の probe の理由の表示（`src/presentation/catalog.ts`）が同じ文を使う。
  */
 export const DESTRUCTIVE_ACTION_SKIPPED_TEXT = '消す・取り消すなどのボタンなので、押しませんでした';
+
+/** AIW（ユーザーの判断 2026-11-20）: AI のボタンなので押さなかった理由（`AI_ACTION_SKIPPED`）の文。Interaction の理由の説明と、発見の probe の理由の表示が同じ文を使う。 */
+export const AI_ACTION_SKIPPED_TEXT = 'AI を動かすボタンなので、押しませんでした';
 
 export const INTERACTION_REASON_DESCRIPTIONS = deepFreeze({
   ...(Object.fromEntries(
@@ -463,6 +598,8 @@ export const INTERACTION_REASON_DESCRIPTIONS = deepFreeze({
   MALFORMED_CANDIDATE: '候補の記録が不正で、安全かを判断できないので、操作しませんでした。',
   // SD-1（設計書 `2026-11-16-beaksight-action-based-delete-guard-design.md` 2.3 の文）。
   DESTRUCTIVE_ACTION_SKIPPED: `${DESTRUCTIVE_ACTION_SKIPPED_TEXT}。`,
+  // AIW: 名前に AI の語があるボタン。
+  AI_ACTION_SKIPPED: `${AI_ACTION_SKIPPED_TEXT}。`,
   // BLOCKED_BY_SAFETY
   // `SAFETY_FREEZE_BLOCKED`: 凍結の後の、通信・移動・ポップアップ・ダウンロード・WebSocket の遮断と、外部スキームへの移動の試み
   // （`isolated-auditor.ts` の `hasFreezeEvent`）。ページのスクリプトによる外部スキームへの移動は止められないので、そのことを隠さない
@@ -490,6 +627,7 @@ export const INTERACTION_REASON_DESCRIPTIONS = deepFreeze({
   TARGET_CHANGED_DURING_EXACT_NODE_RESOLUTION: 'クリックする要素を1つに定める途中で、対象の要素が変わりました。',
   TARGET_NOT_SCROLL_PREPARED: '安全のために通信を止める前に、対象の要素を画面の中に入れられませんでした。',
   DEADLINE_BEFORE_EXACT_NODE_CLICK: '安全のために通信を止めた後、クリックを始める前に、確認の期限を過ぎました。',
+  TARGET_COVERED_BY_OTHER: 'ほかの表示に覆われていて押せないので、押しませんでした。',
   CLICK_TIMED_OUT: 'クリックが、期限までに終わりませんでした。',
   // NOT_VERIFIABLE: クリックの後の観測（SPEC-5: 落ち着きを待ってから 1 回だけ観測する）
   DEADLINE_DURING_POST_CONDITION_OBSERVATION: 'クリックの後の状態を観測し終える前に、確認の期限を過ぎました。',
@@ -1048,8 +1186,11 @@ export const CLI_TEXT = deepFreeze({
 // 呼び出し側（`src/cli/output.ts`）が渡す。
 // ---------------------------------------------------------------------------------------------------------------
 
-/** 同じ出力先で、別の Run が実行中（出力先のロックを、動いている別の起動が持つ。SPEC-2）なので、再開も新しい Run もせずに終える（終了コード 4）。 */
-export const runActiveInOutputDirectoryText = '同じ出力先で、別の Run が実行中です。その Run が終わってから実行してください。';
+/**
+ * 同じ出力先で、同じ対象の別の Run が実行中（出力先 + 対象の ID のロックを、動いている別の起動が持つ。SPEC-2、PAR-a）なので、再開も新しい Run もせずに
+ * 終える（終了コード 4）。
+ */
+export const runActiveInOutputDirectoryText = '同じ出力先で、同じ対象の別の Run が実行中です。その Run が終わってから実行してください。';
 
 /** 途中の Run の再開のための保存（`state.json` と `state.prev.json`）を読めないので、再開の対象にしない。 */
 export const unreadableCheckpointText = (runId: string): string =>
@@ -1438,7 +1579,7 @@ export const TARGET_CRAWL_LIMITS_CHANGE_FAILURE_DESCRIPTIONS = deepFreeze({
 /** T44d（Task 44 の設計書 P2-1）: プロファイルの画面の「監査の負荷」（ページの上限・時間の上限・読み込みの間隔）の文言。 */
 export const LOCAL_UI_CRAWL_LIMITS_TEXT = deepFreeze({
   heading: '点検の負荷',
-  body: 'このサイトの設定のファイルにある、ページの上限・時間の上限・ページの読み込みの間隔です。変えると、設定のファイルを更新します（サイトの変更の回数は進みません）。',
+  body: 'このサイトの設定のファイルにある、ページの上限・時間の上限・ページの読み込みの間隔です。変えると、設定のファイルを更新します（サイトの変更の回数は進みません）。ページの読み込みの間隔は、点検・操作さがし・見るだけの確かめ・書き込みの試しのすべてに使います。時間の上限は、点検・操作さがし・見るだけの確かめに使います。ページの上限は、点検と操作さがしに使います。',
   targetConfigPath: '設定のファイル',
   notEditable: 'この設定のファイルは、画面からは変えられません（画面から書くのは、local/targets/ の中の、名前と同じ .json だけです）。変えるときは、設定のファイルを直してください。',
   unreadable: '設定のファイルを読めないか、内容が設定の決まりに合わないため、画面からは変えられません。設定のファイルを確かめてください。',
@@ -1584,7 +1725,7 @@ export const LOCAL_UI_START_FAILURE_TEXT = deepFreeze({
   previewNotSupportedAction: '画面は npm run ui で起動してください（開発のときは npm run ui:dev）。',
   /** ほかの画面のサーバが動いている（DEF-061。T24h-4）。`portText` は「、port N」か空。 */
   alreadyRunning: (processId: number, portText: string): string =>
-    `画面のサーバは、すでに動いています（プロセスの ID ${processId}${portText}）。画面のサーバは、同時に 1 つだけ動かせます（点検を同時に 1 つだけにするため）。`,
+    `画面のサーバは、すでに動いています（プロセスの ID ${processId}${portText}）。画面のサーバは、同時に 1 つだけ動かせます。`,
   alreadyRunningPort: (port: number): string => `、port ${port}`,
   alreadyRunningAction: '動いている画面のサーバを使うか、それを止めてから起動してください（npm run ui と npm run ui:dev、--port の違いも、同じ扱いです）。',
 } as const);
@@ -1870,9 +2011,20 @@ export const AUDIT_JOB_START_REJECTION_DESCRIPTIONS = deepFreeze({
     description: '今の設定のファイルでは、サイトの設定に誤りがあります。',
     action: '表示された誤りを、「サイトの設定」の画面で直してから、もう一度始めてください。',
   },
+  // PAR-b（設計書 `2026-11-17-beaksight-parallel-site-audits-design.md` 2・3 章）: 作業はサイトごとに同時に 1 つ。別のサイトの作業は同時に動かせる。
+  // REV-PAR の m-3: 管理が知らない前の作業（前の画面のサーバのもの）でも拒むので、中立の文にした。
   JOB_ALREADY_ACTIVE: {
-    description: 'ほかの作業が動いています。作業は、同時に 1 つだけ動かせます（サイトへの負担を増やさないため）。',
-    action: '「作業の履歴」で、動いている作業が終わるのを待つか、止めてから、もう一度始めてください。',
+    description: 'このサイトか、前に動かした作業が、まだ終わっていません。',
+    action: '終わってから始めてください。',
+  },
+  // PAR-c（設計書 3 章）: 開始の画面の押す前の確かめと、押した後の拒否で、同じ 1 文（説明と手順の 2 つで 1 文になる）を出す。
+  SITE_ALREADY_ACTIVE: {
+    description: 'このサイトは、いま別の設定で点検しています。',
+    action: '終わってから始めてください。',
+  },
+  MACHINE_MEMORY_LOW: {
+    description: 'パソコンの空きが足りません。',
+    action: '動いている点検が終わってから始めてください。',
   },
   // T24h-4（DEF-061）: この画面のサーバが、画面のサーバを 1 つだけにするロックを失った（ほかの画面のサーバが取り直した）。
   CONTROL_INSTANCE_LOCK_LOST: {
@@ -2323,6 +2475,8 @@ export const DISCOVERY_UNREAD_REASON_LABELS = deepFreeze({
   SAME_TEMPLATE_PAGE_READ: '同じ作りの画面をもう読んだ',
   // COV-2c fix round 5: 続きから始めた後、前の画面を作り直せなかった。
   REBUILD_FAILED: '続きから始めたとき、前の画面を作り直せなかった',
+  // SKIP-1: 点検で、押すところがないと分かった画面は読まない。
+  NO_PRESSABLE_ELEMENTS: '押すところのない画面（点検で確かめ済み）',
 } as const satisfies Record<string, string>);
 
 /** 発見で画面を読み切れなかった理由（`INCOMPLETE_REASONS`。候補の契約の値）の説明。 */
@@ -2366,8 +2520,6 @@ export const READ_CHECK_DETAIL_DESCRIPTIONS = deepFreeze({
   HTTP_ERROR_STATUS: '読んだページで、サイトがエラーを返しました。',
   RESULT_PAGE_UNREADABLE: '読んだページは読み込めましたが、結果の画面の形を読めませんでした。',
   SESSION_LOST: '読んだページの読み込みで、ログインが切れていました（ブラウザに残るログインの印が消えた場合を含みます）。',
-  // DEF-235: 番号の入る画面で、見る登録の番号がどこにもなかった（断らない。利用者に手を求めない）。
-  RECORD_ID_NOT_AVAILABLE: '見る登録がまだないため、見ていません。',
   // L4（L0 の進みの見張り）: 読み取りを終えた（ほかの定義へ進む）。
   STAGE_UNRESPONSIVE: '画面がしばらく全く反応しなくなったため、見るのをやめました。',
   STAGE_NEVER_QUIET: '画面の動きが止まらず読み取りが進まなくなったため、見るのをやめました。',
@@ -2802,6 +2954,10 @@ export const SCENARIO_DRAFT_REJECTION_DESCRIPTIONS = deepFreeze({
     description: '送る中身に、同じ名前の項目が 2 回あります。どちらの値が使われるか分からないため、扱えません。保存していません。',
     action: 'この候補では、画面を通さずに送る書き込みの手順を作れません。',
   },
+  SCENARIO_API_FIELD_VALUES_NOT_SENT: {
+    description: '欄に入れた値が、保存のときに送る中身に見つかりませんでした（保存の前に別の確かめを送る画面など）。保存していません。',
+    action: 'この候補では、画面を通さずに送る書き込みの手順を作れません。',
+  },
   SCENARIO_API_ARRAY_MULTIPLE_FIELDS: {
     description: 'この項目の値は並びで、その中に 2 つ以上の欄の文字が入っています。ページが決める値として扱えず、今は欄ごとに照らせないため、扱えません。保存していません。',
     action: 'この項目を、ページが決める項目から外してください。外せない場合は、この候補では書き込みの手順を作れません。',
@@ -3013,7 +3169,7 @@ export const LOCAL_UI_JOB_NEXT_STEPS = deepFreeze({
     RUN_DIRECTORY_UNAVAILABLE:
       '結果を書き出すフォルダ（設定のファイルで決めた出力先）に書き込めるかを確かめてから、もう一度始めてください。空きの容量、書き込みの権限、ほかのプログラムが開いていないかを見てください。',
     RESUME_UNAVAILABLE:
-      '同じ出力先で、ほかの点検（コマンドで始めたものを含む）が動いていないかを確かめてから、もう一度始めてください。続けて起きるときは、「新しく始める」を選んで「点検を始める」を押してください。',
+      '同じサイトの、ほかの点検（コマンドで始めたものを含む）が動いていないかを確かめてから、もう一度始めてください。続けて起きるときは、「新しく始める」を選んで「点検を始める」を押してください。',
   },
   /**
    * Run の全体に付く理由（`IncompleteReasonCode` のうち、Run の理由に入るもの。閉じた一覧は `catalog-coverage.ts`）。ページごとの理由は HTML レポートに出す。
@@ -3254,6 +3410,24 @@ export const LOCAL_UI_AUDIT_TEXT = deepFreeze({
     none: 'なし',
     progressHeading: '進み具合',
     pagesProgressLabel: '点検を終えたページの割合（ページの上限に対して）',
+    /**
+     * DPROG: 操作さがし（と見るだけの確かめ）の段の進み具合の欄（点検の連鎖が動いている間の点検の画面と、その段の作業の画面）。`stage` は段の呼び名
+     * （`auditJobKindDisplay`）。数は画面の語で、確かめた画面・見つけた画面・経過だけ。
+     */
+    stageProgressHeading: (stage: string): string => `進み具合（${stage}）`,
+    screensFinished: '確かめた画面',
+    screensDiscovered: '見つけた画面',
+    /**
+     * DSEED2: まとめて実行の連鎖の操作さがしの、見つけた画面の数の分け方（進み具合の欄と見積もりの 1 行で共用。数はワーカーが数えたまま。`totalText` は
+     * 見つけた画面の数）。
+     */
+    screensDiscoveredSplit: (totalText: string, fromAuditText: string, newText: string): string =>
+      `${totalText}（点検から引き継いだ ${fromAuditText}・新しく見つけた ${newText}）`,
+    screensProgressLabel:'確かめた画面の割合（見つけた画面に対して）',
+    /** RCA-8（検索の確かめの設計書 2.3）: 見るだけの確かめの段の進み具合の欄の語（数は検索の確かめの組。全部の数は始める前に決まり、増えない）。 */
+    searchesFinished: '確かめた検索',
+    searchesTotal: '全部の検索',
+    searchesProgressLabel: '確かめた検索の割合（全部の検索に対して）',
     noticeHeading: '知らせ',
     /** T44d（Task 44 の設計書 P2-3）: ジョブの画面の大きい止めるボタン（`target` は止める対象の呼び名。`AUDIT_JOB_STOP_TARGET_NAMES`）。 */
     stop: (target: string): string => `${target}を止める`,
@@ -3274,6 +3448,9 @@ export const LOCAL_UI_AUDIT_TEXT = deepFreeze({
     /** AUD-1d: まとめファイルを分けたときの、リンクの文言（引数は書式にかけた全部の数と、この番号）。 */
     downloadBundlePart: (partCount: string, partNumber: string): string =>
       `ChatGPT に渡すまとめファイル（ZIP。全 ${partCount} 個のうち ${partNumber} 個目）をダウンロードする`,
+    /** DLALL: 「できたファイル」の一覧の全部を、一覧の順に 1 つずつダウンロードするボタンと、押した後の 1 行（引数は書式にかけた数）。 */
+    downloadAll: 'まとめてダウンロードする',
+    downloadAllStarted: (countText: string): string => `${countText} 個のファイルのダウンロードを始めました`,
   },
   /**
    * DEF-146: 題と確定のボタンは、止める対象の呼び名（ジョブの種類ごと。`AUDIT_JOB_STOP_TARGET_NAMES`）を入れる。取り消しは「止めずに戻る」（前の「やめる」は、
@@ -3298,6 +3475,47 @@ export const LOCAL_UI_AUDIT_TEXT = deepFreeze({
  * 主のボタン）と、作業の一覧の 3 つの列。結果の種類と主のボタンの種類は、画面のサーバ（`apps/local-ui/src/server/audit-job-functions.ts` の `jobSummaryOf`）が
  * 決める。書き漏れと余分は `apps/local-ui/src/display/catalog-coverage.ts` で確かめる。`target` は作業の呼び名（`AUDIT_JOB_STOP_TARGET_NAMES`）。
  */
+/**
+ * RCA-8（検索の確かめの設計書 2.4）: 検索の確かめの結果の文言（作業の画面の要点と、プロファイルの詳細の要点の 1 行。材料は `src/discovery/search-check-results.ts`）。
+ * 欄の名前・URL・値は出さない。数は `formatInteger` で整えた文字。
+ */
+export const SEARCH_CHECK_RESULT_TEXT = deepFreeze({
+  /**
+   * ためした数と、問題があった数の 1 行（誤りがなければ、問題がなかったこと）。REV-RCA の M-2: 操作さがしの誤りは混ぜない（`exploration`）。「画面が開けません
+   * でした」は、起きたことの `NOT_OPENED` だけに使う。
+   */
+  summary: (triedText: string, errorCount: number, errorText: string): string => (errorCount === 0
+    ? `検索を ${triedText} 通りためしました。問題はありませんでした。`
+    : `検索を ${triedText} 通りためしました。${errorText} 通りで問題がありました。`),
+  /** REV-RCA の M-2: 操作さがしの中で、サイトの誤りが返った操作の数の 1 行（検索の数とは別）。 */
+  exploration: (errorText: string): string => `操作さがしの中で、${errorText} か所の操作にサイトが誤りを返しました。`,
+  heading: '問題があった検索',
+  explorationHeading: '操作さがしでサイトが誤りを返した操作',
+  unnamedScreen: '名前のない画面',
+  /** 見るだけの確かめの組の試し方。 */
+  how: {
+    BASELINE: '何も入れずに検索したとき',
+    TEXT_EMPTY: '何も入れずに検索したとき',
+    TEXT_HALF_WIDTH: '半角の文字を入れて検索したとき',
+    TEXT_FULL_WIDTH: '全角の文字を入れて検索したとき',
+    OPTION: (numberText: string): string => `選択肢の ${numberText} 番目を選んで検索したとき`,
+    CHECK: 'チェックを入れて検索したとき',
+  },
+  /** 操作さがしのきっかけ。 */
+  discovery: {
+    PRESS: '操作さがしでボタンを押したとき',
+    OPTION: '操作さがしで選択肢を選んだとき',
+    TYPED: '操作さがしで文字を入れたとき',
+  },
+  happened: {
+    SERVER_ERROR: 'サイトが誤りを返しました。',
+    NOT_OPENED: '画面が開けませんでした。',
+    LOGIN_BOUNCE: 'ログインの画面に戻されました。',
+  },
+  /** 一覧の 1 行（画面の名前、どう試したか、起きたこと）。 */
+  item: (screen: string, how: string, happened: string): string => `${screen}：${how}、${happened}`,
+});
+
 export const LOCAL_UI_JOB_SUMMARY_TEXT = deepFreeze({
   /** 動いている間の結果の 1 行（止めている間は、種類ごとの `AUDIT_JOB_STOP_REQUESTED_TEXTS`）。 */
   active: {
@@ -3354,6 +3572,12 @@ export const LOCAL_UI_JOB_SUMMARY_TEXT = deepFreeze({
    */
   progressEstimate: (pagesText: string, pagesTotalText: string, minutesText: string): string =>
     `読んだページ ${pagesText} / ${pagesTotalText}。あと 約 ${minutesText} 分`,
+  /** DPROG: 操作さがしの見積もりの 1 行（画面の語。見つけた画面は確かめるたびに増えうるので、延びることを言う。分は切り上げ）。 */
+  stageProgressEstimate: (screensText: string, screensTotalText: string, minutesText: string): string =>
+    `確かめた画面 ${screensText} / 見つけた画面 ${screensTotalText}。あと 約 ${minutesText} 分（新しい画面が見つかると延びます）`,
+  /** RCA-8（検索の確かめの設計書 2.3）: 見るだけの確かめの見積もりの 1 行（全部の数は増えないので、延びるとは言わない。分は切り上げ）。 */
+  searchProgressEstimate: (searchesText: string, searchesTotalText: string, minutesText: string): string =>
+    `確かめた検索 ${searchesText} / 全部 ${searchesTotalText}。あと 約 ${minutesText} 分`,
   /** 動いている間の、画面が新しくなることと、閉じても続くこと（読み直しの間隔は書かない）。 */
   autoRefresh: (target: string): string => `この画面は自動で新しくなります。閉じても${target}は続きます。`,
   /** 確かめきれなかった所があるとき（`details` はたたんだ区画の見出し。`LOCAL_UI_TEXT.advancedSettings.summary`）。 */
@@ -4950,13 +5174,15 @@ export const LOCAL_UI_EXTERNAL_SCHEME_PROBE_TEXT = deepFreeze({
 
 /**
  * T44c（Task 44 の設計書 P1-4。設計者の判断）: 監査のジョブの、ページの未完了の理由ごとのページ数（`run.json` の `pageIncompleteReasonCounts`）の表示。理由の
- * 説明は `INCOMPLETE_REASON_DESCRIPTIONS`、次にできることは `INCOMPLETE_REASON_NEXT_STEPS`。
+ * 説明は `describeIncompleteReasonOf`、次にできることは `nextStepOfIncompleteReasonOf`（PIR: 点検の範囲の外へ移った読み込みの失敗は別の文）。
  */
 export const LOCAL_UI_PAGE_INCOMPLETE_REASON_TEXT = deepFreeze({
   heading: '確かめきれなかったページの理由',
   body: '点検したページのうち、一部を確かめきれなかったページの数を、理由ごとに示します。くわしくはレポートのページの欄を見てください。',
   tableCaption: '理由ごとのページ数',
   columns: { reason: '理由', pages: 'ページ数', nextStep: '次にできること' },
+  /** PIR: ページの数の欄の、そのページのアドレスの全部を開いて見るたたみの見出し（アドレスを持たない前の書き手の Run には出さない）。 */
+  pageUrls: 'ページのアドレス',
 } as const);
 
 /** DEF-144: 違反が起きた段（`JobSafetyViolationStage`）の表示。 */
@@ -5097,6 +5323,58 @@ export const LOCAL_UI_AUTH_SETUP_PROPOSAL_TEXT = deepFreeze({
 } as const);
 
 // ---------------------------------------------------------------------------------------------------------------
+// BS-1: 計測タグの一覧（設計書 `2026-11-19-beaksight-measurement-tag-inventory-design.md` 2.3・2.4）
+// ---------------------------------------------------------------------------------------------------------------
+
+/**
+ * 計測タグの一覧の文言の唯一の置き場所（HTML の節・CLI の 1 行・バンドルの README）。読み込みを観測した事実だけを書き、送信が届いたか・数えられたかを
+ * 確かめたとは書かない。種類と分け方の名前は表示カタログ（`MEASUREMENT_SERVICE_CATALOG`・`MEASUREMENT_SERVICE_GROUP_CATALOG`）。
+ */
+export const MEASUREMENT_TAG_TEXT = deepFreeze({
+  heading: '計測のタグ（読み込みを観測したもの）',
+  /** いつも付ける文。 */
+  factNote: '読み込みを観測した事実です。設置した人・設定の中身・成果の計上（重なり・漏れ）は確かめていません。',
+  columns: ['種類', '識別子', 'ページの数', 'デスクトップ', 'モバイル'],
+  observed: '観測した',
+  notObserved: '観測していない',
+  /** 構成の要約（引数は「分け方の名前 数」を並べた文）。 */
+  groupSummary: (items: string): string => `種類ごとの数: ${items}`,
+  /** 点検が最後まで届かなかったこと（引数は書式にかけた数）。 */
+  incompleteNote: (failedPages: string, uncollectedPages: string, runReasons: string): string =>
+    `読み込めなかったページ ${failedPages}、まだ見ていないページ ${uncollectedPages}、点検が最後まで終わらなかった理由 ${runReasons} があります。それらのページの読み込みは、この一覧に入っていません。`,
+  /** 監査の送信の扱いごとの限界。 */
+  auditSendNote: {
+    READ_ONLY: 'この点検では、ページが出す書き込みの送信を BeakSight が止めました。計測の送信が送り先に届いたかは分かりません。',
+    PASS_EXCEPT_DELETE: 'この点検では、ページが出す送信を、削除のほかは止めずに通しました。送り先で受け付けられたか・数えられたかは分かりません。',
+  } satisfies Record<AuditSendPolicyName, string>,
+  /** 計測サービスへの、BeakSight が止めた要求の数（引数は書式にかけた数）。 */
+  blockedNote: (count: string): string => `計測のサービスへの要求のうち、BeakSight が止めたもの: ${count}`,
+  cliLabel: '計測のタグ',
+  /** CLI の値（引数は書式にかけた行の数）。 */
+  cliValue: (count: string): string => `${count} 種類（読み込みを観測。詳しくはレポート）`,
+} as const);
+
+// ---------------------------------------------------------------------------------------------------------------
+// BS-2: 主要な行動の候補の位置（設計書 `2026-11-20-beaksight-key-action-positions-design.md` 2.4）
+// ---------------------------------------------------------------------------------------------------------------
+
+/**
+ * 主要な行動の候補の位置の文言の唯一の置き場所（HTML の節・バンドルの README）。見つけた候補の位置の事実だけを書き、どれが大事か・見つけやすいか・押せるかを
+ * 確かめたとは書かない。種類の名前は表示カタログ（`KEY_ACTION_KIND_CATALOG`）。
+ */
+export const KEY_ACTION_TEXT = deepFreeze({
+  heading: '主要な行動の候補の位置',
+  /** いつも付ける限界の文。 */
+  limitNote: '見つけた候補の位置の事実です。どれが大事か、利用者が見つけやすいか、実際に押せるかは確かめていません。見つからなかった候補が『ない』とは限りません。',
+  // AUDR2: 本文と、ページに共通の部分（メニューなど。データを除いた path の違う 2 つ以上のページに同じ要素として出る候補）に分けた数も出す。
+  columns: ['種類', '候補のあるページの数', '本文に候補のあるページの数', 'ページに共通の部分（メニューなど）に候補のあるページの数'],
+  /** 固定の表示の中に候補があるページの数（引数は書式にかけた数）。 */
+  fixedNote: (count: string): string => `画面に止まって動かない表示の中に候補があるページ: ${count}`,
+  /** 最初の画面に見える候補がないページの数（引数は「ビューポートの名前 数」を並べた文）。 */
+  firstViewNote: (items: string): string => `最初の画面に見える候補がないページ: ${items}`,
+} as const);
+
+// ---------------------------------------------------------------------------------------------------------------
 // ChatGPT 用バンドルの読み方の案内（`README.md`。T44i）
 // ---------------------------------------------------------------------------------------------------------------
 
@@ -5226,15 +5504,22 @@ export const CHATGPT_BUNDLE_GUIDE_TEXT = deepFreeze({
   findingGroupsHeading: '同じ作りの所の候補群',
   /** AUD-9c: 候補群の読み方（引数は `finding-groups.json` の名前）。 */
   findingGroupsNote: (name: string): string =>
-    `${name} は、同じ Rule で、同じ要素の目印（selector など。\`groupingKeys\`）を持つ指摘を、1 つの群にまとめたものです。ページやビューポートが違っても、同じ作りの所なら同じ群になります。指摘は、指摘ごとの \`groupId\` で群に結び付きます。群ごとに、影響したページ（\`pageIds\`・\`pageCount\`）、発生の数（\`occurrenceCount\`）、ビューポート、検証の状態の数（\`verification\`）、画像などのファイルを撮影・保存できなかった指摘の数（\`missingEvidenceFindingCount\`）、確信度（\`confidence\`: \`HIGH\`・\`MEDIUM\`・\`LOW\`）があります。要素の作りの印（タグの名前と class の並び。\`structure\`）が分かる指摘は、selector の番号（\`:nth-of-type(2)\` など）を \`n\` にまとめ、作りの印が同じものだけを同じ群にしました。作りの印が分からない指摘は、番号をまとめていないので、番号だけ違う所は別の群です（\`structure\` は \`null\`）。目印のない指摘は、1 件だけの群です。群は重さの順に並び、数や確信度では並べ替えていません。確信度は、指摘の確からしさの目安で、重さ（優先度）ではありません。\`findings-by-rule.json\` の Rule ごとの \`groupCount\`・\`groupIds\` は、その Rule の指摘が入る群です。`,
+    `${name} は、同じ Rule で、同じ要素の目印（selector など。\`groupingKeys\`）を持つ指摘を、1 つの群にまとめたものです。ページやビューポートが違っても、同じ作りの所なら同じ群になります。指摘は、指摘ごとの \`groupId\` で群に結び付きます。群ごとに、影響したページ（\`pageIds\`・\`pageCount\`）、発生の数（\`occurrenceCount\`）、ビューポート、検証の状態の数（\`verification\`）、画像などのファイルを撮影・保存できなかった指摘の数（\`missingEvidenceFindingCount\`）、確信度（\`confidence\`: \`HIGH\`・\`MEDIUM\`・\`LOW\`）があります。要素の作りの印（タグの名前と class の並び。\`structure\`）が分かる指摘は、selector の番号（\`:nth-of-type(2)\` など）を \`n\` にまとめ、作りの印が同じものだけを同じ群にしました。作りの印が分からない指摘は、番号をまとめていないので、番号だけ違う所は別の群です（\`structure\` は \`null\`）。目印のない指摘は、1 件だけの群です。\`groupingKeys\` の \`findingClass\` は確信度を 1 段下げた指摘の区分（\`INTENDED_PLACEMENT\`: 画像の上に意図して置いた部品の候補、\`SAME_TEMPLATE\`: 同じ作りの画面の別のデータ。そのときの \`sameTemplate\` は、作りの鍵と題名の digest）で、区分の違う指摘は同じ群にしません。\`sameTitle\` は、違う画面どうしで題名が同じ指摘の、題名の digest です（同じ題名の指摘を 1 つの群にまとめます）。群は重さの順に並び、数や確信度では並べ替えていません。確信度は、指摘の確からしさの目安で、重さ（優先度）ではありません。\`findings-by-rule.json\` の Rule ごとの \`groupCount\`・\`groupIds\` は、その Rule の指摘が入る群です。`,
   /** AUD-6c: Web Vitals の観測の範囲の読み方。 */
   webVitalsCoverageNote:
     '`summary.json` の `webVitalsCoverage` は、性能の指標（LCP・FCP・CLS・TTFB・INP）ごとに、観測できた数（`observed`）、観測できなかった数（`notObserved`）、ブラウザが対応していない数（`unsupported`）、集められなかった数（`notCollected`）です。数える単位は、ページとビューポートごとの性能の記録です。未観測は、良いという意味ではありません。とくに INP は、操作への応答の指標なので、見て回るだけの点検では、ほとんど観測できません。性能の指摘がないことは、観測できた指標が境界を超えなかったことだけを意味します。',
   /** AUD-8: 色差の「測定できない」の読み方。 */
   labelInNameNote:
-    '名前の不一致（`A11Y_LABEL_CONTENT_NAME_MISMATCH`）の指摘の `verification.labelInName` は、ブラウザのアクセシビリティの木で求めた名前（`axName`）と、その命名元（`nameSource`）、画面に見える文字のかたまり（`labelSegments`）です。`labelClass` が区分です: `MAIN_LABEL_MISSING`（見える文字が名前にない）、`SUPPLEMENT_ONLY_MISSING`（数のバッジなど、補足の文字だけが名前にない。`supplements`）、`UNDETERMINED`（主な文字を見分けられない）、`LABEL_IN_NAME`（見える文字は名前に含まれる）。`MAIN_LABEL_MISSING` のほかは、候補群の確信度を 1 段下げています。page.json の axe の要素の `nameContext` に、もとの事実があります。',
+    '名前の不一致（`A11Y_LABEL_CONTENT_NAME_MISMATCH`）の指摘の `verification.labelInName` は、ブラウザのアクセシビリティの木で求めた名前（`axName`）と、その命名元（`nameSource`）、画面に見える文字のかたまり（`labelSegments`）です。`labelClass` が区分です: `MAIN_LABEL_MISSING`（見える文字の先頭のかたまりが、全角と半角・空白・区切りの記号・数字の並びの書き方をそろえても名前にない）、`UNDETERMINED`（名前か見える文字がなく、比べられない）。見える文字の全部が名前に含まれるもの・書き方の違いだけのもの・先頭は名前にあり後の補足の文字だけがないものは、指摘にしていません（axe の違反は page.json に残ります）。古い Run には、`SUPPLEMENT_ONLY_MISSING`・`LABEL_IN_NAME`・`NORMALIZED_MATCH` の指摘もあります。区分は候補群の鍵（`groupingKeys` の `labelClass`）にも入れ、区分の違う指摘を同じ群にしません。`MAIN_LABEL_MISSING` のほかは、候補群の確信度を 1 段下げています。page.json の axe の要素の `nameContext` に、もとの事実があります。',
   focusChecksNote:
-    '`summary.json` の `focusChecks` は、画面の外に置いた、押せる部品（スキップリンクなど）に、ほかの記録を集め終えた後でキーボードの移動（フォーカス）を当てて確かめた数です。`APPEARS` は画面に正しく出てきたもの（指摘にしていません）、`OUTSIDE_VIEWPORT`・`NOT_VISIBLE`・`NOT_HITTABLE` はフォーカスしても画面の外・見えない・押せないもの（`FOCUSED_CONTROL_HIDDEN` の指摘。フォーカスを当てたままの画像を参照します）、`NOT_FOCUSED` はフォーカスが当たらなかったものです。page.json の `focus` の記録に、要素ごとの矩形と事実があります。',
+    '`summary.json` の `focusChecks` は、画面の外に置いた、押せる部品（スキップリンクなど）に、ほかの記録を集め終えた後でキーボードの移動（フォーカス）を当てて確かめた数です。`APPEARS` は画面に正しく出てきたもの（指摘にしていません）、`OUTSIDE_VIEWPORT`・`NOT_VISIBLE`・`NOT_HITTABLE` はフォーカスしても画面の外・見えない・ほかの要素の下にあったもの（`FOCUSED_CONTROL_HIDDEN` の指摘。フォーカスを当てたままの画像を参照します）、`NOT_FOCUSED` はフォーカスが当たらなかったもの、`FRONT_WINDOW_COVERED` は開いた前面の窓（大きな小窓）の背後にあって、Tab でも背後へ移らなかったので指摘にしなかったものです（Tab で背後へ移ったものは `NOT_HITTABLE` の指摘です）。`findingsWithoutSequentialTab` は、指摘にしたもののうち、画面の先頭から Tab のキーで移る確かめがないもの（直にフォーカスを当てた事実だけの指摘。確信度を 1 段下げています）の数です。page.json の `focus` の記録に、要素ごとの矩形と事実（前面の窓の背後は `frontWindowCovered`）があります。'
+    + '`focusChecks.dialogFocus` は、窓を開くボタンを Enter で押し、Esc（閉じなければ窓の中の閉じるボタン）で閉じて、閉じた後のフォーカスの戻り先を確かめた数です'
+    + '（`screens` は確かめた画面、`screensWithoutPressables` は押す物のなかった画面、`pressed` は押した物、`alreadyChecked` は同じ物を前の画面で確かめたので押さなかった物）。'
+    + '要素ごとの事実は page.json の `focus` の記録の `dialogFocus` にあります（`DIALOG_FOCUS_NOT_RETURNED`・`DIALOG_FOCUS_NOT_MOVED`・`DIALOG_NOT_CLOSABLE_BY_KEYBOARD` の指摘）。'
+    + '`dialogFocus` の `nonReadRequestCount`・`lateNonReadRequestCount` は、ボタンを押してから画面を閉じるまでに BeakSight が止めた送信の数で、押下が原因とは限りません（その間にサイトが自動で出した送信も数えます）。'
+    + '`lateWebSocketFrameSentCount` は、押した後、確かめの終わりまでに、押す前から開いていた WebSocket の接続が送った数です（止めていません）。'
+    + 'その後に送った分も含めた画面を閉じるまでの数は、safety の記録の `passedAuditSendWebSockets.framesAfterDialogPress` にあります。'
+    + 'safety の記録の `passedAuditSendRequests.afterDialogPressLeave` は、押した画面の閉じる時に通した送信の数で、サイト自身の後始末を含みます。',
   specialSchemeLinksNote:
     '`summary.json` の `specialSchemeLinks` は、電話（scheme が `tel`）やメール（scheme が `mailto`）など、ふつうの Web ページではないものを開くリンクの数と、リンクごとの事実（ページ・scheme・href・リンクの文字）です。これらは、ふつうの Web リンクとして開いて確かめていません。不具合としては数えていません。',
   imageRegionNote:
@@ -5242,11 +5527,17 @@ export const CHATGPT_BUNDLE_GUIDE_TEXT = deepFreeze({
     + '部品の重なり・画面に止まって動かない部品の覆い・フォーカスの指摘では、BeakSight が画面を対象の所まで動かして撮り直しています。'
     + '`targetInImage` は、画像に対象が写ったかです（`INSIDE`: 全部写った、`PARTIAL`: 一部だけ、`OUTSIDE`: 写っていない。ほかの部品の下に隠れた対象も写っていないとします）。'
     + '`holdReason` があれば、その指摘は確かめを待っています（`TARGET_NOT_IN_IMAGE`: 画像に対象が写っていない、`PAGE_NOT_READY`: 画面の準備が終わっていなかった、'
-    + '`NOT_OPERATED`: 対象の所まで動かして撮れなかった）。フォーカスしても画面に出ない指摘は、写らないこと自体が問題なので、確かめを待つことにはしません。'
+    + '`NOT_OPERATED`: 対象の所まで動かして撮れなかった、`EVIDENCE_MISMATCH`: 記録を読んだときと画像を撮ったときで、画面の作りや内側のスクロールの位置が'
+    + 'ずれた、`PAGE_READINESS_UNKNOWN`: 画面が落ち着くのを待ちきれず、準備ができたかが分からなかった）。フォーカスしても画面に出ない指摘は、写らないこと自体が問題なので、確かめを待つことにはしません。'
     + '`revealScreenshotEvidenceIds` は、その指摘の対象の所まで動かして撮った画像の記録の番号です。'
     + '`summary.json` の `evidenceSufficiency` は、確かめを待つ指摘の数（`heldFindingCount`）と理由ごとの数（`heldByReason`）、画像に対象が写ったかを決めた指摘の数'
     + '（`targetImageJudgedCount`）とそのうち全部写った数（`targetInImageCount`）、まだ見ていないページ（`uncollectedPageCount`）とビューポート'
-    + '（`uncollectedViewportCount`。見ていないページの分も数える）の数です。確かめ直しで消えた指摘の数は `recheck` にあります。',
+    + '（`uncollectedViewportCount`。見ていないページの分も数える）、読み込めなかったページ（`failedPageCount`）の数です。確かめ直しで消えた指摘の数は `recheck` にあります。'
+    + '通知の枠を閉じたなどの点検のための操作の記録は、指摘の数に入れず、`summary.json` の `operationRecordCount` に数だけを置いています。'
+    + '同じ作りの画面の 2 つ目以降は、画面の崩れなど主な点（Desktop と Mobile の layout・画像、Desktop の axe）だけを確かめる軽い点検にし、'
+    + '表示の中身も点検した画面と同じ画面は点検を省いています（Rule には安全・通信・console の記録だけを渡しています）。'
+    + '`summary.json` の `samenessNote` がその数の 1 文、`pages.json` の各ページの `samenessNote` が、どの画面と同じかの 1 文です'
+    + '（点検を省いた画面の Mobile は `SAME_CONTENT_AS_EARLIER_PAGE` の理由で始めておらず、まだ見ていない数には入れていません）。',
   fixedOverlapNote:
     '画面に止まって動かない部品（固定要素）の重なりは、重なりの中の 5 点（中心と、内側に寄せた四隅）で、いちばん手前の要素を調べて区分しています。`FIXED_ELEMENT_OCCLUSION`・`OVERSIZED_FIXED_ELEMENT` の指摘の `verification.overlap.overlapClass` が区分です: `RENDER_AND_POINTER`（内容を隠し、押すこともできない）、`POINTER_ONLY`（透明だが、押しても下に届かない）、`RENDER_ONLY`（隠すが、押すことはできる）。`renderDetermined` が `false` の指摘は、半透明や文字だけの部品などで、隠れているとまでは言い切れないもので、候補群の確信度を 1 段下げています。`summary.json` の `fixedOverlapsNotCounted` は、指摘にしなかった重なりの数です（`GEOMETRY_ONLY`: 枠が重なるだけで、内容は見えて押せる。`MODAL`: 開いたモーダル。`SCROLL_REVEALABLE`: ページを動かせば見える）。点ごとの事実（いちばん手前の要素・`pointer-events`・不透明度・背景）は、page.json の layout の `hitTest` にあります。区分のない指摘は、点の事実を記録する前の版の記録です。',
   contrastUnmeasuredNote:
@@ -5256,13 +5547,23 @@ export const CHATGPT_BUNDLE_GUIDE_TEXT = deepFreeze({
     '`HTTP_4XX`・`RESOURCE_4XX`・`RESOURCE_5XX` の指摘の `verification.httpError.errorClass` は、応答の区分です: `SITE_FAILURE`（画面に誤りが出た、または回復しなかった）、`COLLECTION_CAUSED`（BeakSight の側の事情の見込み。`beaksightBlockRelation` が `CAUSED`・`POSSIBLE`）、`UNDETERMINED`（手がかりがぶつかって決められない。候補群の確信度を 1 段下げています）。`responses` に応答ごとの事実があります: 要求に資格（Cookie・Authorization）があったか（`credentials`。値は残していません）、同じ読み込みで後に同じ口（メソッド・Origin・path）が 2xx を返したか（`recovered`）、やり直しの結果（`retryStatuses`）、画面の誤りの表示（`errorDisplay`: role=alert・aria-live=assertive・見出し・aria-invalid の欄の近くに、誤りの語があったか）、承認したサービスの応答か（`approvedService`）、本文の要旨（`bodySummary`。許した鍵だけ・200 文字まで。秘密に見える値は残さず `secretLike` の印だけ）。`summary.json` の `httpErrorsNotCounted` は、正常の分岐（`EXPECTED_BRANCH`: 回復して、画面に誤りがない 4xx）として指摘にしなかった応答の数と事実です。',
   /** AUD-6b: リンクの確かめの読み方。 */
   linkChecksNote:
-    '`links.json` は、ページのリンクごとの確かめの状態です。`status` が `NAVIGATED`（行き先のページを読んで確かめた。`navigation` に、ビューポートごとの状態の番号・最後の URL・リダイレクトの鎖）、`STATIC_CANDIDATE`（外部のリンク・電話やメールのリンク・書き方が正しくない href。開いて確かめていない）、`UNVERIFIED`（サイトの中のリンクで、行き先を読んでいない。`unverified` に理由と、次に要る手順）のどれかです。`access` は、行き先が開けたか（`OPEN`）、BeakSight が止めたか（`BLOCKED`）、権限がないという応答か（`NO_PERMISSION`）です。`counts` の `unverified` は、リンク切れ（`navigatedBroken`）や確かめたリンクとは別の数です。今ある記録だけで作り、新しく移って確かめてはいません。',
+    '`links.json` は、ページのリンクごとの確かめの状態です。`status` が `NAVIGATED`（行き先のページを読んで確かめた。`navigation` に、ビューポートごとの状態の番号・最後の URL・リダイレクトの鎖）、`STATIC_CANDIDATE`（外部のリンク・電話やメールのリンク・書き方が正しくない href。開いて確かめていない）、`UNVERIFIED`（サイトの中のリンクで、行き先を読んでいない。`unverified` に理由と、次に要る手順）のどれかです。理由が `OUTSIDE_READ_SCOPE` のリンクは、行き先が点検の範囲の外なので、意図して読んでいません。`access` は、行き先が開けたか（`OPEN`）、BeakSight が止めたか（`BLOCKED`）、権限がないという応答か（`NO_PERMISSION`）です。`counts` の `unverified` は、リンク切れ（`navigatedBroken`）や確かめたリンクとは別の数で、点検の範囲の外のリンク（`outsideReadScope`）を含みません。今ある記録だけで作り、新しく移って確かめてはいません。',
   /** COV-4 の区切り 3: 操作で開いた状態の監査の読み方。 */
   openedStatesNote:
     '見るだけの点検で、押して開いた状態（タブ・折りたたみ・窓など）も、読み込み直さずに点検しました。開いた状態の記録と指摘は、段（`capture.phase`）が `opened-state`、状態の ID（`capture.stateId`）の終わりが `:state-<番号>` で、画像は `…/<viewport>/state-<番号>/viewport.png` です。同じ作りの開いた状態は、点検全体で 1 回だけ点検しました。`summary.json` の `openedStates` は、点検した数（`audited`）、同じ作りを前に点検したので点検しなかった数（`sameStructureSeen`）、途中までの数（`partial`）と、開く前の画面と同じ指摘だったので除いた数（`duplicateFindingsDropped`）です。',
   /** 設計者の判断 2026-11-11: 同じ口のくり返しをまとめた記録の読み方。 */
   repeatedReadsNote:
     '同じ宛先（method・Origin・path）へ、成功した読み取りがくり返されたときは、`page.json` の network の記録に 1 件ずつ並べず、`repeatedReads` にまとめました。最初の 1 件は、今までどおり 1 件の記録として残り（`firstRequestId`）、まとめた記録には、件数（`count`）、最初と最後の時刻、転送量の合計、最初の 1 件といちばん遅かった 1 件の URL と時間の内訳、query の値の違いの数があります。HTTP の誤り（4xx・5xx）・読み込みの失敗・止めた要求は、まとめずに 1 件ずつ残しています。`summary.json` の `repeatedReads` は、まとめた記録の数（`groupCount`）、その中の要求の数（`requestCount`）と、1 件ずつ並べなかった要求の数（`unlistedRequestCount`）です。',
+  /** BS-1: 計測タグの一覧の節。 */
+  measurementTagsHeading: '計測のタグの一覧',
+  /** BS-1: 計測タグの一覧の読み方（引数は `measurement-tags.json` の名前）。事実と、確かめていないことを分ける。 */
+  measurementTagsNote: (name: string): string =>
+    `${name} は、BeakSight が記録した要求の中に、決まった計測のサービス（タグの管理の入れ物・分析・広告）の読み込みを観測した事実の一覧です。行は種類（\`service\`）と識別子（\`tagId\`）の組ごとで、サイト全体で同じ構成が繰り返されても 1 行です。行ごとに、観測したページ（\`pageIds\`・\`pageCount\`）、ビューポートごとの観測の有無（\`viewports\`）、要求の数（\`requestCount\`。同じ宛先のくり返しをまとめた記録の分を含む）と種類（\`requestKinds\`）、結果の数（\`results\`: 応答の状態の番号の範囲、\`REQUEST_FAILED\` 失敗、\`BLOCKED\` BeakSight が止めた、\`NO_RESPONSE\` 応答を観測していない）、根拠の参照（\`evidence\` の \`path\` と \`pointer\`）があります。\`countsByGroup\` は分け方ごとの行の数です。\`limits\` は限界の事実です: Run の状態と、読み込めなかったページ・まだ見ていないページ・理由の数、監査の送信の扱い（\`auditSendPolicy\`）、計測のサービスへの BeakSight が止めた要求の数（\`blockedRequestCount\`）。一覧にないサービスと、ページの中の記述（埋め込みの設定）からの検出は数えていません。分かっているのは読み込みを観測したことだけで、設置した人・設定の中身・送り先で受け付けられたか・成果の計上（重なり・漏れ）は確かめていません。候補にするときは、これらを断定しないでください。要求の URL の値は伏せてありますが、この一覧の識別子だけは残しています（ページに公開で書かれる値です）。`,
+  /** BS-2: 主要な行動の候補の位置の節。 */
+  keyActionsHeading: '主要な行動の候補の位置',
+  /** BS-2: 主要な行動の候補の位置の読み方（引数は `key-actions.json` の名前）。事実と、確かめていないことを分ける。 */
+  keyActionsNote: (name: string): string =>
+    `${name} は、押せる要素（リンク・ボタン）のうち、決まった行き先の型（電話 \`tel\`・メール \`mailto\`）、メッセージのサービスのホスト、汎用の語（予約・問い合わせ・購入など）に当たったもの（主要な行動の候補）の位置の事実です。\`pages\` はページとビューポートごとの行で、候補ごとに種類（\`kind\`: \`PHONE\`・\`EMAIL\`・\`MESSAGE\`・\`BOOKING\`・\`CONTACT\`・\`PURCHASE\`・\`OTHER\`）、名前（\`name\`。電話番号とメールアドレスに見える文字は伏せてあります）、文書の中の位置（\`top\`・\`height\`。px）、最初の画面に入るか（\`inFirstView\`）、画面に止まって動かない表示の中か（\`fixed\`）、見えるか（\`visible\`）、ページの高さ（\`pageHeight\`）に対する位置の割合（\`positionRatio\`。固定の表示は \`null\`）、ページに共通の部分（メニューなど。データを除いた path の違う 2 つ以上のページに、同じ要素として出る候補）か（\`sharedFrame\`）があります。文書がスクロールせず内側の入れ物がスクロールする画面は、ページの高さがその入れ物の高さ（\`pageHeightBasis\` が \`INNER_SCROLL_CONTAINER\`）で、入れ物の中の候補（\`inScrollContainer\`）だけ、入れ物の中の位置と割合です。高さが分からない行（\`pageHeightBasis\` が \`UNKNOWN\`）は、割合を出していません。\`summary\` は、種類ごとの候補を持つページの数（\`pagesWithKind\`。本文の候補 \`pagesWithKindInBody\` と、共通の部分の候補 \`pagesWithKindInSharedFrame\` に分けた数も）、固定の表示の候補のあるページの数、最初の画面に候補がないページの数、ページの高さの分布です。\`scope\` は、探した範囲（要素の種類・行き先の型・ホスト・語の一覧）です。\`actions\` が空の行は、この範囲で見つからなかったという意味で、候補が「ない」とは限りません（画像の中の文字・名前のないアイコン・ほかの言い回しは拾えません）。固定の表示の覆いの指摘の \`verification.keyActions\` は、覆う側（\`overlayKinds\`）と覆われる側（\`coveredKinds\`）の候補の種類と、押せないかを確かめた証拠の有無（\`pressCheck\`。\`NOT_CHECKED\` は、画面の上で重なっているだけで、操作の支障は確かめていない）です。どれが大事かは、利用者の目的で決めてください。`,
   /** AUD-6c: 性能の値の観測の範囲の読み方。 */
   performanceObservationsNote:
     '`summary.json` の `performanceObservations` は、性能の記録ごとの観測の範囲です。`stage` は測った段、`observedForMs` はページの読み込みの始まりから測った時までの時間（ms）、`operations` は測る前に BeakSight がページにした操作（縦に動かした `scrolled`、通知の枠の閉じるボタンを押した `notificationFramePressed`）です。`inp` が `NOT_OBSERVED` のときは、操作がなかったので INP を観測していません（良いという意味ではありません）。`slowMetrics` は、境界を超えた指標（LCP・FCP・TTFB）です。遅い記録の `breakdown` は時間の内訳で、`waitUntilFirstDataRequestMs` は最初のデータの要求（fetch・XHR）が始まるまでの待ち、`firstDataRequest.communicationMs` はその要求の通信の時間（Resource Timing）です。',
@@ -5278,7 +5579,9 @@ export const FINDING_UNVERIFIED_NEXT_STEP_TEXT = deepFreeze({
 export const LINK_CHECK_NEXT_STEP_TEXT = deepFreeze({
   TARGET_NOT_AUDITED: '行き先のページを、まだ読んでいません。行き先を読む点検で確かめられます。',
   TARGET_NOT_NAVIGATED: '行き先のページを開けませんでした。行き先を読み直す点検で確かめられます。',
-} as const satisfies Record<'TARGET_NOT_AUDITED' | 'TARGET_NOT_NAVIGATED', string>);
+  // DEF-296: 巡回の候補から外した行き先（読む範囲の外・読まないパス・危険な語）。
+  OUTSIDE_READ_SCOPE: '点検の範囲の外のページなので、読んでいません。',
+} as const satisfies Record<'TARGET_NOT_AUDITED' | 'TARGET_NOT_NAVIGATED' | 'OUTSIDE_READ_SCOPE', string>);
 
 /** FM2d: まとめて実行の、各段のジョブの画面で次にできることを確かめる案内（止めた理由の多くに共通）。 */
 const STAGE_CHAIN_SEE_STAGE_TEXT = '止まったステップの作業の様子を開き、その画面の「次にできること」を確かめてください。';
@@ -5416,6 +5719,12 @@ export const LOCAL_UI_WRITE_SCREENS_TEXT = deepFreeze({
    */
   unnamedScreen: (positionText: string): string => `登録の画面（${positionText}）`,
   /**
+   * WDEDUP: 同じ画面の中で、同じ送り方になる操作をまとめた行の 1 行（`countText` は、まとめた操作の数の `formatInteger` の結果。2 以上のときだけ出す）。
+   * `checkedCountText` は、まとめた操作のうちチェック済みの数（2 以上のときだけ渡す。ほかは null）。
+   */
+  sameSendCount: (countText: string, checkedCountText: string | null): string =>
+    `この画面では、同じ送り方になる操作が ${countText} 件あるので、1 行にまとめています。${checkedCountText === null ? '' : `うち ${checkedCountText} 件をチェック済みです。`}`,
+  /**
    * OP-2 の修正の 1 回目（判断 1）: メールや電話への知らせを送ることがある画面の行の 1 行（副作用の確認の 4 つの約束のうち、通知の約束をやさしい形にした文）。
    * チェックを入れることが、この確認を兼ねる。
    */
@@ -5439,6 +5748,8 @@ export const LOCAL_UI_WRITE_SCREENS_TEXT = deepFreeze({
     // OP-K（K2）: 本物のテスト環境で「扱えない」になった理由に合わせた 1 行。
     SECRET_KEY: '画面が自動で送る項目に、秘密に見える名前のものがあるため、試せません。',
     FIELD_SHAPE: '入れた値と、送る中身の結び付きが分からないため、試せません。',
+    // WBF（DEF-291 の B1）: 保存の前に別の確かめを送る画面など、入れた値を送るところまで見届けられない。
+    VALUES_NOT_SENT: '保存のときに入れた値が送られるところを見届けられないため、試せません。',
   },
   /**
    * OP-2 の修正の 2 回目（設計書 4.1.2 の R1）: 更新の 1 行。更新の画面は作ったデータがあるときにしか見つからないので、まだ見つからないときは次の点検で試す。

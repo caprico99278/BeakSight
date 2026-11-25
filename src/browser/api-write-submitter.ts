@@ -81,6 +81,8 @@ import {
 } from './form-submission-common.js';
 import { composeInPage, type StandardReaders } from './in-page-readers.js';
 import { attachPageProgressSignals } from './page-progress-signals.js';
+import { waitForPageSettled } from './page-settling.js';
+import { openEndedStageDeadline } from '../orchestration/stage-deadline.js';
 import { watchProgress } from '../core/progress-watch.js';
 
 /**
@@ -950,6 +952,47 @@ export async function fillApiWriteInput(
     // T40R-fix-A: 開くのは窓の観察の段（値を入れる間。承認の形の要求も通さずに止めて数える）。送信の段は、押す直前に `submitApiWriteInput` が開く。
     await monitor.openSubmissionWindow(page);
     windowMonitors.set(input, monitor);
+    const filled = await fillWithRefill(page, input, state, timeoutMs, watch);
+    // WBF（DEF-291 の C）: 入れた値をページが遅れて受け取る作り（入力の後に間を置いて値を持つ欄など）のため、入れ終えた後に、ページが落ち着くまで待つ（落ち着きの
+    // 待ちの唯一の部品 `waitForPageSettled`。長さは観察の窓の一式。押す前の値の読み直しは今どおり `submitApiWriteInput` が行う。送る回数は変えない）。
+    if (filled.ok) {
+      await settleAfterFill(page, watch);
+    }
+    return filled;
+  } catch {
+    return { ok: false, reason: 'INPUT_FAILED' };
+  }
+}
+
+/** WBF（DEF-291 の C）: 入れた後の落ち着きの待ち（期限は置かず、反応がなければ L0 の進みの見張りが終える）。例外を投げない。 */
+async function settleAfterFill(page: Page, watch: ApiWriteWatchOptions): Promise<void> {
+  const windows = observationWindowsOrProduction(watch.observationWindows).pageSettle;
+  await watchProgress(async (signals) => {
+    const detach = attachPageProgressSignals(page, signals);
+    try {
+      await waitForPageSettled(page, {
+        deadlineAtMs: openEndedStageDeadline(Date.now()),
+        pollIntervalMs: windows.pollIntervalMs,
+        stableWindowMs: windows.stableWindowMs,
+        openDataRequestQuietMs: windows.openDataRequestQuietMs,
+        progress: signals,
+      });
+    } finally {
+      detach();
+    }
+  }, { quietLimitMs: watch.quietLimitMs }).catch(() => undefined);
+}
+
+/** 確かめた欄に値を入れ、作り直し・値の戻りがあれば入れ直す（`fillApiWriteInput` の中身）。 */
+async function fillWithRefill(
+  page: Page,
+  input: InspectedApiWriteInput,
+  state: InspectedState,
+  timeoutMs: number,
+  watch: ApiWriteWatchOptions,
+): Promise<ApiWriteInputStep> {
+  // 入れ直しの手順の中身は、WBF の前の `fillApiWriteInput` のまま（字下げを保つため、ブロックで包む）。
+  {
     let result = await fillOnce(page, state, timeoutMs);
     if (refillStepOf(result, { pageGone: false }) === 'DONE') {
       return result;
@@ -984,8 +1027,6 @@ export async function fillApiWriteInput(
       }
     }, { quietLimitMs: watch.quietLimitMs });
     return watched.status === 'FULFILLED' ? watched.value : result;
-  } catch {
-    return { ok: false, reason: 'INPUT_FAILED' };
   }
 }
 

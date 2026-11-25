@@ -315,7 +315,7 @@
     },
     "incompleteReasons": { "type": "array", "items": { "$ref": "#/$defs/incompleteReason" } },
     "pageIncompleteReasonCounts": {
-      "description": "Optional (T44c; Task 44 design P1-4): for each incomplete reason of the audited pages (not SKIPPED; the page and viewport reasons, once per page), the number of the pages with it, in the order of the reason codes. Absent when no page has a reason, and in the documents of the earlier writers (the version stays 1.0).",
+      "description": "Optional (T44c; Task 44 design P1-4): for each incomplete reason of the audited pages (not SKIPPED; the page and viewport reasons, once per page), the number of the pages with it, in the order of the reason codes. Absent when no page has a reason, and in the documents of the earlier writers (the version stays 1.0). PIR: the optional detail BLOCKED_EXTERNAL_REDIRECT (only with NAVIGATION_FAILED) counts the pages that left the audit scope apart from the other navigation failures, and the optional pageUrls lists all the URLs of the pages (absent in the documents of the earlier writers; the version stays 1.0).",
       "type": "array",
       "minItems": 1,
       "items": {
@@ -324,8 +324,22 @@
         "required": ["code", "pages"],
         "properties": {
           "code": { "$ref": "#/$defs/incompleteReason/properties/code" },
-          "pages": { "type": "integer", "minimum": 1, "maximum": 9007199254740991 }
-        }
+          "detail": { "const": "BLOCKED_EXTERNAL_REDIRECT" },
+          "pages": { "type": "integer", "minimum": 1, "maximum": 9007199254740991 },
+          "pageUrls": { "type": "array", "minItems": 1, "items": { "type": "string", "minLength": 1 } }
+        },
+        "if": { "properties": { "detail": { "const": "BLOCKED_EXTERNAL_REDIRECT" } }, "required": ["detail"] },
+        "then": { "properties": { "code": { "const": "NAVIGATION_FAILED" } } }
+      }
+    },
+    "pageSamenessCounts": {
+      "description": "Optional (DUP; doc/design/2026-11-18-beaksight-same-structure-pages-design.md): the numbers of the pages audited lightly as later pages of the same template, and of the pages not audited because their shown content was the same as an audited page. Absent when both are 0, and in the documents of the earlier writers (the version stays 1.0).",
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["lightPages", "samePages"],
+      "properties": {
+        "lightPages": { "type": "integer", "minimum": 0, "maximum": 9007199254740991 },
+        "samePages": { "type": "integer", "minimum": 0, "maximum": 9007199254740991 }
       }
     },
     "load": {
@@ -459,7 +473,8 @@
             "AUTH_SESSION_LOST",
             "SERVICE_REQUEST_LIMIT_REACHED",
             "STAGE_UNRESPONSIVE",
-            "STAGE_NEVER_QUIET"
+            "STAGE_NEVER_QUIET",
+            "SAME_CONTENT_AS_EARLIER_PAGE"
           ]
         },
         "detail": { "type": ["string", "null"] }

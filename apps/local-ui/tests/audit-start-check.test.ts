@@ -134,6 +134,12 @@ describe('T25e: the start screen check (the same order as the job manager)', () 
       { code: 'AUTH_SETUP_PATH_INVALID', field: 'excludedPaths', line: 2 },
     ]);
   });
+
+  // PAR-c（設計書 `2026-11-17-beaksight-parallel-site-audits-design.md` 3 章）: サイトごとに同時に 1 つの決まりの理由は、ジョブの管理と同じく、ほかの確かめの後に当てる。
+  it.each(['SITE_ALREADY_ACTIVE', 'MACHINE_MEMORY_LOW'] as const)('shows %s after the other checks', (concurrencyBlocker) => {
+    expect(check({ concurrencyBlocker })).toMatchObject({ blocker: concurrencyBlocker });
+    expect(check({ concurrencyBlocker, context: undefined })).toMatchObject({ blocker: 'TARGET_CONFIG_UNAVAILABLE' });
+  });
 });
 
 // T25e round 1（Blocker 1 の案 A）: ジョブの管理の開始の拒否が `AUTH_SETUP_INVALID` の誤りを持つとき、画面に返す開始の結果の

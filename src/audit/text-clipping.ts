@@ -3,7 +3,12 @@
  * （`./layout-rules.ts`）と、対象まで動かして撮る対象の選び方（`./overlap-pairs.ts` の `revealTargetsOfLayout`。Page Auditor は Rule のファイルを import できない。
  * GATE-ARCH07）が使う。
  */
-import { VISUALLY_HIDDEN_MAX_DIMENSION_PX, type ClippedTextEvidence, type VisibilityEvidence } from '../core/evidence-types.js';
+import {
+  VISUALLY_HIDDEN_MAX_DIMENSION_PX,
+  type ClippedTextEvidence,
+  type CutScrollRegionEvidence,
+  type VisibilityEvidence,
+} from '../core/evidence-types.js';
 import { isPaintedContent } from './fixed-overlap-classes.js';
 
 /**
@@ -80,4 +85,14 @@ export const textClippingDirectionsOf = (clipped: ClippedTextEvidence): TextClip
   const horizontal = CLIPPING_OVERFLOWS.includes(clipped.overflowX) && clipped.scrollWidth - clipped.clientWidth > MAX_IGNORED_CLIPPED_OVERFLOW_PX;
   const vertical = CLIPPING_OVERFLOWS.includes(clipped.overflowY) && clipped.scrollHeight - clipped.clientHeight > MAX_IGNORED_CLIPPED_OVERFLOW_PX;
   return (horizontal || vertical) && !isIntendedClipping(clipped, horizontal, vertical) ? { horizontal, vertical } : null;
+};
+
+/**
+ * S-06（設計書 `doc/design/2026-11-19-beaksight-audit-result-review-fixes-design.md` 4.4）: 端が外枠で切れる、内側のスクロール領域で、指摘にするもの。外枠は、
+ * 見切れと同じ決まり（`textClippingDirectionsOf`。見る方向・隠す手法・意図した省略）で決める（領域の中の文字は外枠の行の判定に使っていないので、行の判定の
+ * 結果は問わない）。記録のない前の版の Evidence は空。
+ */
+export const cutScrollRegionsOf = (clipped: ClippedTextEvidence): readonly CutScrollRegionEvidence[] => {
+  const regions = clipped.cutScrollRegions ?? [];
+  return regions.length > 0 && textClippingDirectionsOf({ ...clipped, partiallyClippedText: true }) !== null ? regions : [];
 };

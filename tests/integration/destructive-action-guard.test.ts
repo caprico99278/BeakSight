@@ -119,11 +119,17 @@ const PROBE_PAGE = html(`
 <form id="f-radio"><label><input type="radio" name="op" value="erase">消す</label><label><input type="radio" name="op" value="keep">残す</label><button type="submit" id="p-radio">適用</button></form>
 <form id="f-hx" hx-delete="/api/items/3"><label>題 <input name="t1"></label><button type="submit" id="p-hx">実行</button></form>
 <div id="d-nf"><select id="op-nf"><option value="">選んでください</option><option value="delete">削除</option></select><button type="button" id="p-nf">実行</button></div>
-<script>${['save', 'bulk', 'method', 'confirm', 'sel', 'radio', 'hx'].map((name) => `document.getElementById('f-${name}').addEventListener('submit',function(e){e.preventDefault();`
+<form id="f-ai"><label>本文 <input name="b1"></label><button type="submit" id="p-ai">AIで本文を編集</button></form>
+<form id="f-spark"><label>本文 <input name="b2"></label><button type="submit" id="p-spark"><svg class="lucide lucide-sparkles" width="8" height="8"></svg>下書き</button></form>
+<section><h3>記事の下書きを自動作成する</h3><form id="f-gen"><label>題 <input name="b3"></label><button type="submit" id="p-gen">下書きを生成</button></form></section>
+<form id="f-qr"><label>URL <input name="b4"></label><button type="submit" id="p-qr">QR コードを生成</button></form>
+<script>${['save', 'bulk', 'method', 'confirm', 'sel', 'radio', 'hx', 'ai', 'spark', 'gen', 'qr'].map((name) => `document.getElementById('f-${name}').addEventListener('submit',function(e){e.preventDefault();`
   + `fetch('/api/press-p-${name}',{method:'POST',body:'x'}).catch(function(){});});`).join('')}
 document.getElementById('p-nf').addEventListener('click',function(){fetch('/api/press-p-nf',{method:'POST',body:'x'}).catch(function(){});});</script>`);
 /** 押す押下（REV-SD の I-4 (a): 削除の語の選択肢を避けて、安全な選択肢を選んで押す）。 */
-const PROBE_PRESSED = ['p-radio', 'p-save', 'p-sel'];
+const PROBE_PRESSED = ['p-qr', 'p-radio', 'p-save', 'p-sel'];
+/** AIW: 押さない AI の操作（名前の AI の語・キラキラのアイコン・AI の枠の中の生成）。枠の外の「QR コードを生成」は押す。 */
+const PROBE_AI_SKIPPED = ['p-ai', 'p-gen', 'p-spark'];
 /**
  * 押す前の判定で止める押下（`p-method` は分類で対象から外れる）。REV-SD の I-4: 選択肢が削除の語だけの form（`p-bulk`）と form の外の欄（`p-nf`）、
  * form の `hx-delete`（`p-hx`）。
@@ -283,6 +289,7 @@ describe.each(BOTH_CHROMIUM_LAUNCHERS)('SD-1: destructive actions are judged bef
     // その前の分類（`DESTRUCTIVE`）で対象にならない。
     const reasons = probed.candidates.flatMap((candidate) => (candidate.submissionProbe?.result === 'NOT_OBSERVED' ? [candidate.submissionProbe.reason] : []));
     expect(reasons.filter((reason) => reason === 'DESTRUCTIVE_ACTION_SKIPPED')).toHaveLength(PROBE_JUDGED_AT_PRESS.length);
+    expect(reasons.filter((reason) => reason === 'AI_ACTION_SKIPPED')).toHaveLength(PROBE_AI_SKIPPED.length);
     // サーバ: 読み取りでない要求は 0。
     expect(nonReads()).toEqual([]);
   });
