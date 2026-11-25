@@ -18,7 +18,7 @@ import {
 import { createChatGptBundleParts } from '../../src/report/chatgpt-bundle.js';
 import { renderHtmlReport } from '../../src/report/html-report.js';
 import { buildReportViewModel } from '../../src/report/view-model.js';
-import { PAGE_1, PAGE_2, auditRun, finding, idOf, metadata, page, record, viewportResult } from '../helpers/audit-run-fixture.js';
+import { PAGE_1, PAGE_2, PAGE_3, auditRun, dom, finding, idOf, metadata, page, record, viewportResult } from '../helpers/audit-run-fixture.js';
 
 const WIDTH = 400;
 const HEIGHT = 300;
@@ -70,31 +70,47 @@ const heldPage = (): PageAuditResult => {
   return { ...audited, viewports: { ...audited.viewports, mobile } };
 };
 
-const run = () => auditRun({ pages: [heldPage(), page(PAGE_2, '/later', 'SKIPPED')] });
+// S-12: 読み込めなかったページ（点検のための操作の記録が 1 件ある）。
+const failedPage = (): PageAuditResult => page(PAGE_3, '/failed', 'FAILED', [], [
+  finding(98, 'INFO', 'LAYOUT', PAGE_3, [], { ruleId: 'NOTIFICATION_HANDLED_BEFORE_AUDIT' }),
+]);
+
+const run = () => auditRun({ pages: [heldPage(), page(PAGE_2, '/later', 'SKIPPED'), failedPage()] });
 
 describe('EV-5: the counts of the evidence in the report model', () => {
   it('counts the findings on hold by reason, the findings whose target is in the image, and the pages and viewports not collected', () => {
     expect(buildReportViewModel(run()).summary.evidenceSufficiency).toEqual({
       heldFindingCount: 2,
-      heldByReason: { TARGET_NOT_IN_IMAGE: 1, PAGE_NOT_READY: 0, NOT_OPERATED: 1 },
+      heldByReason: { TARGET_NOT_IN_IMAGE: 1, PAGE_NOT_READY: 0, NOT_OPERATED: 1, EVIDENCE_MISMATCH: 0, PAGE_READINESS_UNKNOWN: 0 },
       targetImageJudgedCount: 2,
       targetInImageCount: 1,
       uncollectedPageCount: 1,
       uncollectedViewportCount: 3,
+      failedPageCount: 1,
     });
+  });
+
+  // S-12: 点検のための操作の記録は、指摘の数に入れず、別に数える。
+  it('counts the records of the operations for the audit apart from the findings', () => {
+    const { summary, overview } = buildReportViewModel(run());
+    expect(summary.operationRecordCount).toBe(1);
+    expect([summary.findingCounts.total, summary.findingCounts.bySeverity.INFO, overview.problemCount]).toEqual([3, 0, 3]);
   });
 
   it('shows the counts in a few plain lines of the HTML report and the CLI, and copies them to the bundle', async () => {
     const result = run();
     const model = buildReportViewModel(result);
     const html = renderHtmlReport(model);
-    for (const text of [EVIDENCE_SUFFICIENCY_TEXT.heldLabel, EVIDENCE_SUFFICIENCY_TEXT.imageLabel, EVIDENCE_SUFFICIENCY_TEXT.uncollectedLabel]) {
+    const labels = [EVIDENCE_SUFFICIENCY_TEXT.heldLabel, EVIDENCE_SUFFICIENCY_TEXT.uncollectedLabel, EVIDENCE_SUFFICIENCY_TEXT.failedLabel, EVIDENCE_SUFFICIENCY_TEXT.operationRecordLabel];
+    for (const text of [...labels, EVIDENCE_SUFFICIENCY_TEXT.imageLabel]) {
       expect(html).toContain(text);
     }
-    expect(html).not.toContain('TARGET_NOT_IN_IMAGE');
+    expect(html).not.toMatch(/TARGET_NOT_IN_IMAGE|NOTIFICATION_HANDLED_BEFORE_AUDIT/u);
     const cli = runSummaryLines(model.summary, 'out').join('\n');
-    expect(cli).toContain(EVIDENCE_SUFFICIENCY_TEXT.heldLabel);
-    expect(cli).toContain(EVIDENCE_SUFFICIENCY_TEXT.uncollectedLabel);
+    for (const text of labels) {
+      expect(cli).toContain(text);
+    }
+    expect(cli).not.toContain('NOTIFICATION_HANDLED_BEFORE_AUDIT');
     const files = new Map<string, Uint8Array>([[RUN_ARTIFACT_FILE_NAMES.run, new TextEncoder().encode(JSON.stringify(result.run))]]);
     const parts = await createChatGptBundleParts(model, result, async (path) => files.get(path) ?? null);
     const summary = JSON.parse(new TextDecoder().decode(unzipSync(parts[0]?.bytes ?? new Uint8Array())['summary.json'])) as { evidenceSufficiency: unknown };
@@ -106,6 +122,35 @@ describe('EV-5: the pages to read first when a run stopped by the time limit is 
   it('finds a page cut by the time limit and counts the findings waiting for an image of their target (not the ones waiting for the page)', () => {
     expect(pageRevisitFactOf(heldPage())).toEqual({ cutByRunTimeLimit: true, heldFindingCount: 2, collectedViewportCount: 1 });
     expect(pageRevisitFactOf(page(PAGE_2, '/done', 'AUDITED'))).toEqual({ cutByRunTimeLimit: false, heldFindingCount: 0, collectedViewportCount: 2 });
+  });
+
+  it('AUD-4: counts a finding whose layout and image do not match (EVIDENCE_MISMATCH) as waiting, and reads its page again', () => {
+    const mark = { documentScroll: { scrollX: 0, scrollY: 0 }, scrollBoxes: [], structureDigest: '1:00000000000000aa' };
+    const zeroBox = { selector: '#z', tagName: 'a', role: null, rect: rect(10, 10, 0, 20), visibility: { visible: true, display: 'block', visibility: 'visible',
+      opacity: 1, hiddenAttribute: false, ariaHidden: false, clientRectCount: 1 }, position: 'static', zIndex: 'auto', overflowX: 'visible', overflowY: 'visible',
+    hasRenderedDescendant: false, truncated: false };
+    const layoutRecord = withCapture(record('layout', 71, PAGE_1, 'desktop', {
+      primary: { status: 'COMPLETE', layout: { ...emptyLayout(), zeroSizeInteractive: [zeroBox], stateMark: mark } }, stressSweep: null,
+    }), capture('layout'));
+    // 撮る直前に読み直した対象が見つからない（消えた）。
+    const shot = withCapture(record('screenshot', 72, PAGE_1, 'desktop', {
+      pageId: PAGE_1, viewport: 'desktop', relativePath: screenshotRelativePath(PAGE_1, 'desktop', 'VIEWPORT', null), captureType: 'VIEWPORT',
+      scrollPosition: { scrollX: 0, scrollY: 0 }, stateMark: { ...mark, targetRects: [{ selector: '#z', matchCount: 0, rect: null }] },
+    }), capture('screenshot'));
+    const zero = finding(99, 'WARN', 'LAYOUT', PAGE_1, [idOf(layoutRecord)], { ruleId: 'ZERO_SIZE_INTERACTIVE_ELEMENT', groupingKeys: [{ name: 'selector', value: '#z' }] });
+    const mismatched = page(PAGE_1, '/', 'AUDITED', [layoutRecord, shot], [zero]);
+    expect(pageRevisitFactOf(mismatched).heldFindingCount).toBe(1);
+    expect(buildReportViewModel(auditRun({ pages: [mismatched] })).summary.evidenceSufficiency.heldByReason.EVIDENCE_MISMATCH).toBe(1);
+  });
+
+  it('AUD-6: counts a content finding of a state whose settling did not complete (PAGE_READINESS_UNKNOWN) as waiting, and reads its page again', () => {
+    const domRecord = withCapture(dom(73, PAGE_1, 'desktop', '本文'), capture('dom'));
+    const heading = finding(99, 'WARN', 'ACCESSIBILITY', PAGE_1, [idOf(domRecord)], { ruleId: 'A11Y_PAGE_HAS_HEADING_ONE' });
+    const audited = page(PAGE_1, '/', 'AUDITED', [domRecord], [heading]);
+    const settling = { status: 'NOT_COMPLETED', reason: null, elapsedMs: 0, observationCount: 0, lastScrollHeight: null, watchEnd: null } as const;
+    const unknown = { ...audited, viewports: { ...audited.viewports, desktop: { ...audited.viewports.desktop, stateId: capture('dom').stateId, settling } } };
+    expect(pageRevisitFactOf(unknown).heldFindingCount).toBe(1);
+    expect(buildReportViewModel(auditRun({ pages: [unknown] })).summary.evidenceSufficiency.heldByReason.PAGE_READINESS_UNKNOWN).toBe(1);
   });
 
   /** 読み直しの事実（一部だけ終わったか・確かめを待つ指摘の数・見たビューポートの数）。 */

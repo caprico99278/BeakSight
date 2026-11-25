@@ -27,8 +27,12 @@ import { earlierAttemptEvidenceIds } from './artifact-writer.js';
 export const LINK_CHECK_STATUSES = Object.freeze(['NAVIGATED', 'STATIC_CANDIDATE', 'UNVERIFIED'] as const);
 export type LinkCheckStatus = (typeof LINK_CHECK_STATUSES)[number];
 
-/** 未検証の理由の閉じた一覧（行き先のページを読んでいない・行き先のページの記録はあるが、どのビューポートでも移動していない）。 */
-export const LINK_UNVERIFIED_REASONS = Object.freeze(['TARGET_NOT_AUDITED', 'TARGET_NOT_NAVIGATED'] as const);
+/**
+ * 未検証の理由の閉じた一覧（行き先のページを読んでいない・行き先のページの記録はあるが、どのビューポートでも移動していない・DEF-296: 行き先が巡回の候補の
+ * 除外（読む範囲の外・読まないパス・危険な語。判定は呼び出し側が渡す `isExcludedCrawlCandidate` の 1 か所）に当たり、意図して読んでいない）。
+ * `OUTSIDE_READ_SCOPE` は、確かめていないリンクの数（`counts.unverified`）に入れず、`counts.outsideReadScope` に数える。
+ */
+export const LINK_UNVERIFIED_REASONS = Object.freeze(['TARGET_NOT_AUDITED', 'TARGET_NOT_NAVIGATED', 'OUTSIDE_READ_SCOPE'] as const);
 export type LinkUnverifiedReason = (typeof LINK_UNVERIFIED_REASONS)[number];
 
 /** 行き先の遮断・権限の状態の閉じた一覧（開けた・BeakSight が止めた・権限がないという応答）。 */
@@ -96,7 +100,10 @@ export interface LinkChecksView {
     /** 移って確認したリンクのうち、行き先が誤りの応答か、移動に失敗したもの。 */
     readonly navigatedBroken: number;
     readonly staticCandidate: number;
+    /** 未検証のうち、読む範囲の中のもの（理由が `OUTSIDE_READ_SCOPE` のものは入れない）。 */
     readonly unverified: number;
+    /** DEF-296: 未検証のうち、行き先が読む範囲の外のもの（理由が `OUTSIDE_READ_SCOPE`）。 */
+    readonly outsideReadScope: number;
   };
   readonly links: readonly LinkCheckView[];
 }
@@ -181,8 +188,11 @@ interface LinkDraft {
 export function createLinkChecksCollector(run: Pick<RunSummary, 'retries' | 'crawlLimits'>): {
   /** ページを足す（URL の発見の順に）。 */
   readonly addPage: (page: PageAuditResult) => void;
-  /** リンクごとの確かめの状態（作るのは、ここだけ。最終の試行の link の Evidence の、ページの順・リンクの順）。 */
-  readonly result: () => LinkChecksView;
+  /**
+   * リンクごとの確かめの状態（作るのは、ここだけ。最終の試行の link の Evidence の、ページの順・リンクの順）。DEF-296: `isOutsideReadScope` は、巡回の候補の
+   * 除外の判定（省略は、除外なし）。
+   */
+  readonly result: (isOutsideReadScope?: (url: string) => boolean) => LinkChecksView;
 } {
   const targets = new Map<string, LinkTargetFacts>();
   const seen = new Set<string>();
@@ -215,7 +225,7 @@ export function createLinkChecksCollector(run: Pick<RunSummary, 'retries' | 'cra
         }
       }
     },
-    result: () => linkChecksOf(run, drafts, targets),
+    result: (isOutsideReadScope = () => false) => linkChecksOf(run, drafts, targets, isOutsideReadScope),
   };
 }
 
@@ -224,6 +234,7 @@ function linkChecksOf(
   run: Pick<RunSummary, 'crawlLimits'>,
   drafts: readonly LinkDraft[],
   targets: ReadonlyMap<string, LinkTargetFacts>,
+  isOutsideReadScope: (url: string) => boolean,
 ): LinkChecksView {
   const crawlLimitsReached = (Object.keys(CRAWL_LIMIT_NAMES) as (keyof CrawlLimitState)[])
     .filter((name) => run.crawlLimits[name])
@@ -242,7 +253,9 @@ function linkChecksOf(
       links.push({ ...base, status: 'NAVIGATED', unverified: null, navigation, access: accessOf(navigation) });
       continue;
     }
-    const reason: LinkUnverifiedReason = target === undefined ? 'TARGET_NOT_AUDITED' : 'TARGET_NOT_NAVIGATED';
+    const reason: LinkUnverifiedReason = target !== undefined
+      ? 'TARGET_NOT_NAVIGATED'
+      : isOutsideReadScope(targetUrl) ? 'OUTSIDE_READ_SCOPE' : 'TARGET_NOT_AUDITED';
     links.push({
       ...base,
       status: 'UNVERIFIED',
@@ -257,13 +270,15 @@ function linkChecksOf(
     });
   }
   const countOf = (status: LinkCheckStatus): number => links.filter((link) => link.status === status).length;
+  const outsideReadScope = links.filter((link) => link.unverified?.reason === 'OUTSIDE_READ_SCOPE').length;
   return {
     counts: {
       total: links.length,
       navigated: countOf('NAVIGATED'),
       navigatedBroken,
       staticCandidate: countOf('STATIC_CANDIDATE'),
-      unverified: countOf('UNVERIFIED'),
+      unverified: countOf('UNVERIFIED') - outsideReadScope,
+      outsideReadScope,
     },
     links,
   };

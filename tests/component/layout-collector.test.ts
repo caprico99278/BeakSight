@@ -25,6 +25,9 @@ import { TIMER_CLOCK_GRANULARITY_MS } from '../helpers/timer-clock.js';
 /** テストの幅の走査に渡す、1 幅あたりの期限（ms。幅の走査の期限は、呼び出し側の Page Auditor が決める）。 */
 const STRESS_TEST_WIDTH_TIMEOUT_MS = 10_000;
 
+/** AUD-4: 偽の page が受けた読み取りが、layout の部分の読み取り（続きの位置 `cursor` を渡す）か。状態の印の読み取りは、偽の page では読めない（印なし）。 */
+const isLayoutPartRead = (argument: unknown): boolean => typeof argument === 'object' && argument !== null && 'cursor' in argument;
+
 function rawLayout(width: number, height: number) {
   return {
     scrollPosition: { scrollX: 0, scrollY: 0 },
@@ -48,6 +51,8 @@ function rawLayout(width: number, height: number) {
     fixedHeadingOverlaps: [],
     elementOverlaps: [],
     fixedElements: [],
+    // BS-2: 押せる要素（主要な行動の候補を選ぶ前）。
+    keyActionElements: [] as unknown[],
     // COV-6: 一覧ごとの次に読む位置（どれも null なら、1 回で読み終える）。
     next: {
       boxesOutsideViewport: null as number | null,
@@ -56,6 +61,7 @@ function rawLayout(width: number, height: number) {
       fixedHeadingOverlaps: null as number | null,
       elementOverlaps: null as number | null,
       fixedElements: null as number | null,
+      keyActionElements: null as number | null,
     },
     truncation: {
       overlapComparisonLimitReached: false,
@@ -145,6 +151,13 @@ function neverSettles(): Promise<never> {
   return new Promise<never>(() => undefined);
 }
 
+/**
+ * DEF-310: 幅の読み込みの前の Guard への知らせ（`announceOwnMainFrameNavigation`）は、FRET fix round 1 から page の Context の Guard の状態も読む。本物の page は
+ * いつも Context を持つので、偽の page にも Context（Guard のない空の物）を持たせる。
+ */
+const FAKE_CONTEXT = Object.freeze({});
+const fakeContext = (): object => FAKE_CONTEXT;
+
 /** 間隔を確かめないテストの、幅の走査の引数。期限は、呼び出し時点から、幅の数 × `defaultTimeoutMs` 後。 */
 function unpacedStressOptions(widths: readonly number[]): StressLayoutOptions {
   return {
@@ -161,6 +174,7 @@ function sessionFactory(events: string[]): PassiveStressSessionFactory {
     const id = serial;
     events.push(`create:${id}:${viewport.width}x${viewport.height}`);
     const page = {
+      context: fakeContext,
       goto: async (url: string) => { events.push(`goto:${id}:${url}`); },
       evaluate: async () => rawLayout(viewport.width, viewport.height),
     } as unknown as Page;
@@ -225,8 +239,10 @@ describe('responsive layout stress lifecycle', () => {
       serial += 1;
       const id = serial;
       const page = {
+        context: fakeContext,
         goto: async () => { events.push(`goto:${id}`); },
-        evaluate: async () => {
+        evaluate: async (_read: unknown, argument: unknown) => {
+          if (!isLayoutPartRead(argument)) throw new Error('not a layout read');
           events.push(`measure:${id}`);
           return rawLayout(viewport.width, viewport.height);
         },
@@ -300,6 +316,7 @@ describe('responsive layout stress lifecycle', () => {
       const id = serial;
       return {
         page: {
+          context: fakeContext,
           goto: async () => undefined,
           evaluate: async () => {
             if (id === 2) {
@@ -341,6 +358,7 @@ describe('responsive layout stress lifecycle', () => {
       const id = serial;
       return {
         page: {
+          context: fakeContext,
           goto: async () => {
             if (id === 1) {
               throw new Error('navigation failed');
@@ -369,6 +387,7 @@ describe('responsive layout stress lifecycle', () => {
   it('records a closed page as the reason of a failed width (V8)', async () => {
     const factory: PassiveStressSessionFactory = async () => ({
       page: {
+        context: fakeContext,
         goto: async () => undefined,
         evaluate: async () => { throw new Error('Target page, context or browser has been closed'); },
         isClosed: () => true,
@@ -421,6 +440,7 @@ describe('responsive layout stress lifecycle', () => {
     let closes = 0;
     const factory: PassiveStressSessionFactory = async () => ({
       page: {
+        context: fakeContext,
         goto: neverSettles,
         evaluate: async () => { throw new Error('must not collect'); },
         isClosed: () => false,
@@ -446,6 +466,7 @@ describe('responsive layout stress lifecycle', () => {
   it('passes a partial layout of a width through with its reason (V8)', async () => {
     const factory: PassiveStressSessionFactory = async (viewport) => ({
       page: {
+        context: fakeContext,
         goto: async () => undefined,
         evaluate: async () => ({ ...rawLayout(viewport.width, viewport.height), incompleteReason: 'DEADLINE_EXCEEDED' }),
         isClosed: () => false,
@@ -463,7 +484,7 @@ describe('responsive layout stress lifecycle', () => {
     const workError = new Error('navigation failed');
     const closeError = new Error('owner close failed');
     const factory: PassiveStressSessionFactory = async () => ({
-      page: { goto: async () => { throw workError; } } as unknown as Page,
+      page: { context: fakeContext, goto: async () => { throw workError; } } as unknown as Page,
       close: async () => { throw closeError; },
     });
 
@@ -538,8 +559,10 @@ describe('responsive layout stress navigation pacing (load control design 4.1, 4
     const scanDeadlines: number[] = [];
     const factory: PassiveStressSessionFactory = async (viewport) => ({
       page: {
+        context: fakeContext,
         goto: async () => undefined,
         evaluate: async (_collect: unknown, argument: { readonly scanDeadlineAtMs: number }) => {
+          if (!isLayoutPartRead(argument)) throw new Error('not a layout read');
           scanDeadlines.push(argument.scanDeadlineAtMs);
           return rawLayout(viewport.width, viewport.height);
         },
@@ -636,6 +659,7 @@ function eventEmittingSessionFactory(
     const emitter = new EventEmitter();
     const listeners = (): string => `request=${emitter.listenerCount('request')},response=${emitter.listenerCount('response')}`;
     const page = Object.assign(emitter, {
+      context: fakeContext,
       mainFrame: () => mainFrame,
       isClosed: () => false,
       evaluate: async () => rawLayout(viewport.width, viewport.height),
@@ -755,7 +779,7 @@ describe('responsive layout stress main frame load observation (site unavailabil
 
   it('works as before without afterNavigation, without listening to the events of the page nor observing its requests', async () => {
     // 受け口を省略した呼び出し（既存の呼び出し）の振る舞いは変えない。事象の受け口も付けず、ページ本体の要求の観察（CDP の session）も
-    // 始めない（D3。事象の受け口も Context も持たない偽の page でも動く）。
+    // 始めない（D3。事象の受け口を持たず、CDP の session を開けない偽の page でも動く）。
     const events: string[] = [];
     const factory = sessionFactory(events);
     const listening: PassiveStressSessionFactory = async (viewport) => {
@@ -766,9 +790,12 @@ describe('responsive layout stress main frame load observation (site unavailabil
           on: () => {
             throw new Error('must not listen to the page events');
           },
-          context: () => {
-            throw new Error('must not open a CDP session');
-          },
+          // DEF-310: Guard への知らせは Context を引く（Guard の状態の表を見るだけ）。CDP の session を開いたら誤り。
+          context: () => ({
+            newCDPSession: () => {
+              throw new Error('must not open a CDP session');
+            },
+          }),
         }),
       };
     };
@@ -887,6 +914,7 @@ describe('layout overlap and truncation evidence (V5, V9)', () => {
     const cursors: Record<string, number | null>[] = [];
     const page = {
       evaluate: async (_collect: unknown, argument: { readonly cursor: Record<string, number | null>; readonly partSize: number }) => {
+        if (!isLayoutPartRead(argument)) throw new Error('not a layout read');
         cursors.push(argument.cursor);
         const start = argument.cursor.zeroSizeInteractive;
         const base = rawLayout(320, STRESS_VIEWPORT_HEIGHT);
@@ -1105,6 +1133,24 @@ describe('layout evidence that avoids false positives (RT12 I1, I2, I3)', () => 
     })));
 
     expect(layout.boxesOutsideViewport.map((box) => box.kind)).toEqual(['table', 'media']);
+  });
+
+  // BS-2: 押せる要素のうち主要な行動の候補だけを残し、行き先は scheme とホストだけ、文字の電話番号は伏せる（値は作り物）。
+  it('keeps only the key action candidates, with the scheme and the host of the target and without the phone number', async () => {
+    const pressable = (selector: string, text: string, href: string | null) => ({
+      selector, tagName: 'a', role: null, text, ariaLabel: null, title: null, href, rect: rect(0, 700, 100, 40), visible: true, fixedContainerSelector: '#bar',
+    });
+    const layout = completeLayout(await collect(layoutWith({
+      keyActionElements: [
+        pressable('#tel', '電話 0120-000-000', 'tel:0120000000'),
+        pressable('#about', '会社の案内', 'http://127.0.0.1/about'),
+        pressable('#chat', 'メッセージ', 'https://line.me/R/ti/p/example'),
+      ],
+    })));
+    expect(layout.keyActionElements?.map(({ selector, text, hrefScheme, hrefHost }) => [selector, text, hrefScheme, hrefHost])).toEqual([
+      ['#tel', '電話 [REDACTED]', 'tel', null],
+      ['#chat', 'メッセージ', 'https', 'line.me'],
+    ]);
   });
 
   it('shares the visually hidden size with the rules as the limit of an unrendered descendant (RT12r N5)', () => {

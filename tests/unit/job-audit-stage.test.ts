@@ -108,6 +108,7 @@ const readEvidenceOf = (overrides: Partial<ReadEvidenceDocument> = {}): ReadEvid
   finishedAt: '20261017010100',
   runStatus: 'PARTIAL',
   endReason: LIMIT_REASON,
+  searchChecks: [],
   // T37d: 版 1.2 の書き手は、対象の種類を必ず書く。
   checks: [{
     readCheckId: 'read-1', readCheckRevision: 1, targetKind: 'CANDIDATE', targetIdentityDigest: `sha256:${'a'.repeat(64)}`, state: 'NOT_EXECUTED',
@@ -138,8 +139,8 @@ describe('T37a: the closed lists of the end reasons and the page reasons', () =>
 
   it('raises the versions of discovery.json and read-evidence.json', () => {
     expect(DISCOVERY_ARTIFACT_SCHEMA_VERSION).toBe('discovery-schema/1.1');
-    // T37d（Task 37 の設計書 3.5）: read-evidence.json は、対象の種類と画面の path を足して 1.2 に上げた。
-    expect(READ_EVIDENCE_ARTIFACT_SCHEMA_VERSION).toBe('read-evidence-schema/1.2');
+    // T37d（Task 37 の設計書 3.5）: read-evidence.json は、対象の種類と画面の path を足して 1.2 に上げた。RCA-5: 検索の確かめの組を足して 1.3。
+    expect(READ_EVIDENCE_ARTIFACT_SCHEMA_VERSION).toBe('read-evidence-schema/1.3');
   });
 });
 
@@ -154,7 +155,7 @@ describe('LG-4: the readers accept only the current versions of discovery.json a
     }
     const evidence = readEvidenceOf();
     expect((await validateArtifact('read-evidence', evidence)).ok).toBe(true);
-    for (const version of ['read-evidence-schema/1.0', 'read-evidence-schema/1.1', 'read-evidence-schema/1.3']) {
+    for (const version of ['read-evidence-schema/1.0', 'read-evidence-schema/1.1', 'read-evidence-schema/1.2', 'read-evidence-schema/1.4']) {
       expect((await validateArtifact('read-evidence', { ...evidence, schemaVersion: version })).ok, version).toBe(false);
     }
   });
@@ -227,8 +228,9 @@ describe('T37a: the artifacts carry the counts of the audit stage and the detail
     const page: DiscoveryPageEntry = { url: `${SAMPLE_ORIGIN}/admin`, state: 'READ', record: recordOf('/admin'), blockedRequests: 0 };
     expect(discoverySummaryOf(discoveryDocumentOf([page], { authentication: SUMMARY }))).toEqual({ pagesRead: 1, pagesNotRead: 0, candidates: 1, authentication: SUMMARY });
     expect(discoverySummaryOf(discoveryDocumentOf([page]))).toEqual({ pagesRead: 1, pagesNotRead: 0, candidates: 1 });
-    expect(readEvidenceSummaryOf(readEvidenceOf({ authentication: SUMMARY }))).toEqual({ checks: 1, executed: 0, authentication: SUMMARY });
-    expect(readEvidenceSummaryOf(readEvidenceOf())).toEqual({ checks: 1, executed: 0 });
+    expect(readEvidenceSummaryOf(readEvidenceOf({ authentication: SUMMARY })))
+      .toEqual({ checks: 1, executed: 0, searchChecks: 0, searchCheckErrors: 0, authentication: SUMMARY });
+    expect(readEvidenceSummaryOf(readEvidenceOf())).toEqual({ checks: 1, executed: 0, searchChecks: 0, searchCheckErrors: 0 });
   });
 
   it('tells the same counts of the audit stage (both absent, or the same numbers)', () => {
@@ -250,10 +252,11 @@ describe('T37a: FINISHED carries the counts of the audit stage in the summary of
 
   it('accepts the counts in the discovery and the READ check summaries, and rejects a wrong shape', () => {
     expect(finishedErrors({ discovery: { pagesRead: 1, pagesNotRead: 1, candidates: 0, authentication: SUMMARY } })).toEqual([]);
-    expect(finishedErrors({ readCheck: { checks: 1, executed: 0, authentication: SUMMARY } })).toEqual([]);
+    expect(finishedErrors({ readCheck: { checks: 1, executed: 0, searchChecks: 0, searchCheckErrors: 0, authentication: SUMMARY } })).toEqual([]);
     expect(finishedErrors({ discovery: { pagesRead: 1, pagesNotRead: 1, candidates: 0, authentication: { ...SUMMARY, url: APP_ORIGIN } } }).length)
       .toBeGreaterThan(0);
-    expect(finishedErrors({ readCheck: { checks: 1, executed: 0, authentication: { ...SUMMARY, otherNonReadBlocked: -1 } } }).length).toBeGreaterThan(0);
+    expect(finishedErrors({ readCheck: { checks: 1, executed: 0, searchChecks: 0, searchCheckErrors: 0, authentication: { ...SUMMARY, otherNonReadBlocked: -1 } } }).length)
+      .toBeGreaterThan(0);
   });
 });
 

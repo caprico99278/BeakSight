@@ -82,6 +82,7 @@ describe('EL-12: the launch component blocks external applications in a temporar
   it('writes the closed allow list of the design (http, https and the internal schemes that the Guard treats as not external)', () => {
     expect(externalLaunchBlockPreferences()).toEqual({
       policy: { url_blocklist: ['*'], url_allowlist: ['http://*', 'https://*', 'about:*', 'data:*', 'blob:*'] },
+      printing: { enabled: false },
     });
     expect(EXTERNAL_LAUNCH_ALLOWED_URL_PATTERNS.map((pattern) => pattern.replace(/(?:\/\/)?\*$/u, ''))).toEqual([...NON_EXTERNAL_NAVIGATION_SCHEMES]);
     expect(CHROMIUM_LAUNCH_REFUSAL_REASONS).toEqual(['EXTERNAL_LAUNCH_BLOCK_UNAVAILABLE']);

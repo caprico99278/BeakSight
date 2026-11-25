@@ -64,7 +64,7 @@ const workerOk = (value: unknown): boolean => validateWorkerToParentMessage(valu
 
 describe('OP-1: the IPC contract of the registration right after the login (version 3)', () => {
   it('has the version 3, the new message types and the named wait limit', () => {
-    expect(WORKER_PROTOCOL_VERSION).toBe('beaksight-worker-message/9'); // WSO: チェックした画面だけの段の並びと読む画面で版 9。DEF-200: ログインし直す段の指定（`RELOGIN_STAGE`）と、自動ログインの段の通した一覧（DEF-194）で版 8。 OP-2: 書き込みの段で版 4。DEF-180: 前の読み込みの時刻で版 5。OP-H: チェックした画面の数で版 6。OP-L: 保存できなかった理由で版 7
+    expect(WORKER_PROTOCOL_VERSION).toBe('beaksight-worker-message/10'); // RCA-5・6: 検索の確かめの組で版 10。WSO: チェックした画面だけの段の並びと読む画面で版 9。DEF-200: ログインし直す段の指定（`RELOGIN_STAGE`）と、自動ログインの段の通した一覧（DEF-194）で版 8。 OP-2: 書き込みの段で版 4。DEF-180: 前の読み込みの時刻で版 5。OP-H: チェックした画面の数で版 6。OP-L: 保存できなかった理由で版 7
     expect(PARENT_TO_WORKER_MESSAGE_TYPES).toEqual(expect.arrayContaining(['CREDENTIAL_SAVE_ALLOWED', 'LOGIN_REGISTERED', 'LOGIN_REGISTRATION_SKIPPED']));
     expect(WORKER_TO_PARENT_MESSAGE_TYPES).toContain('CREDENTIAL_SAVED');
     expect(WORKER_LOGIN_REGISTRATION_TIMEOUT_MS).toBeGreaterThan(0);

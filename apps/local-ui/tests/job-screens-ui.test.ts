@@ -111,6 +111,8 @@ import {
   READ_CHECK_DEFINITION_REJECTION_DESCRIPTIONS,
   READ_CHECK_DETAIL_DESCRIPTIONS,
   READ_CHECK_TARGET_KIND_LABELS,
+  describeIncompleteReasonOf,
+  nextStepOfIncompleteReasonOf,
   serviceRequestPacingWaitText,
   siteUnavailableRecheckText,
 } from '../../../src/presentation/messages.js';
@@ -327,15 +329,16 @@ describe('job-screen-ui: PL-2 the job screen', () => {
   });
 
   describe('PL-2: the job screen while the job runs (13 章の 10・11)', () => {
-    it('shows the result line, the estimate and the note of the automatic refresh, with no primary button and the stop as a secondary', async () => {
+    it('shows the result line and the note of the automatic refresh, with no primary button and the stop as a secondary', async () => {
       startAuditJob('job-pl2-running');
       withDatabase((database) => expect(recordProgress(database, 'job-pl2-running', PROGRESS)).toBe(true));
       const page = await openPage('/jobs/job-pl2-running');
       await waitForResult(page, 'RUNNING');
       const summary = page.getByTestId('job-summary-panel');
       expect(await summary.getByTestId('job-result').textContent()).toBe(summaryText.active.RUNNING('点検'));
-      // 13 章の 11（DEF-192）: 分母は見つけたページ 5（上限 20 まで）。残り 2 ページ × 1 ページの実際の時間 10 秒 = 20 秒 → あと 約 1 分。
-      expect(await summary.getByTestId('job-progress-estimate').textContent()).toBe(summaryText.progressEstimate('3', '5', '1'));
+      // DPROG (b): 見積もりの基準（ワーカーの実行から最初に受けた進み）はジョブの管理のメモリにあり、行だけを書いた作業にはないので、見積もりを出さない
+      // （求め方は `job-summary.test.ts`）。
+      expect(await summary.getByTestId('job-progress-estimate').count()).toBe(0);
       expect(await summary.getByTestId('job-auto-refresh').textContent()).toBe(summaryText.autoRefresh('点検'));
       // 技術の文（読み直しの間隔。前の「この画面は、2秒ごとに自動で新しくなります」。PL-TD で文言を消した）を出さない。
       expect(await page.getByRole('main').textContent()).not.toMatch(/\d+秒ごと/u);
@@ -351,14 +354,31 @@ describe('job-screen-ui: PL-2 the job screen', () => {
       await screenshot(page, 'pl2-01-running');
     }, SCENARIO_TIMEOUT_MS);
 
-    it('DEF-195: shows the same progress line for the discovery job', async () => {
+    it('DEF-195・DPROG: shows the progress of the discovery job in the words of the stage, without the numbers of the audit', async () => {
       startAuditJob('job-def195-discovery', 'DISCOVERY');
       withDatabase((database) => expect(recordProgress(database, 'job-def195-discovery', PROGRESS)).toBe(true));
       const page = await openPage('/jobs/job-def195-discovery');
       await waitForResult(page, 'RUNNING');
-      const summary = page.getByTestId('job-summary-panel');
-      expect(await summary.getByTestId('job-progress-estimate').textContent()).toBe(summaryText.progressEstimate('3', '5', '1'));
-      expect(await page.getByTestId('job-pages-finished').textContent()).toBe(formatCount(3));
+      const progress = page.getByTestId('job-stage-progress');
+      // 進み具合の欄は、たたんだ詳しい内容の中（閉じた details の中は読み上げの木から外れるので、隠れた見出しも数える）。
+      expect(await progress.getByRole('heading', { includeHidden: true }).textContent()).toBe(LOCAL_UI_AUDIT_TEXT.job.stageProgressHeading('操作さがし'));
+      expect(await progress.getByTestId('job-screens-finished').textContent()).toBe(formatCount(3));
+      // DSEED2: 連鎖でない操作さがしは、見つけた画面を分けない（今のまま）。
+      expect(await progress.getByTestId('job-screens-discovered').textContent()).toBe(formatCount(5));
+      expect(await page.getByTestId('job-pages-finished').count()).toBe(0);
+
+      // DSEED2: 連鎖の操作さがし（ワーカーが分け方を送る）は、点検から引き継いだ画面と新しく見つけた画面に分けて出す。同じプロファイルで動く作業は 1 つだけ
+      // なので、前の作業の行を終えてから書く（後片付けの `afterEach` と同じ終わり方）。
+      withDatabase((database) => {
+        recordEnded(database, 'job-def195-discovery', { state: 'INTERRUPTED', reason: 'WORKER_EXITED', exitCode: null, at: now() });
+      });
+      startAuditJob('job-dseed2-discovery', 'DISCOVERY');
+      const split = { fromAuditStage: 4, newlyFound: 1 };
+      withDatabase((database) => expect(recordProgress(database, 'job-dseed2-discovery', { ...PROGRESS, pagesDiscoveredSplit: split })).toBe(true));
+      const chained = await openPage('/jobs/job-dseed2-discovery');
+      await waitForResult(chained, 'RUNNING');
+      expect(await chained.getByTestId('job-stage-progress').getByTestId('job-screens-discovered').textContent())
+        .toBe(LOCAL_UI_AUDIT_TEXT.job.screensDiscoveredSplit(formatCount(5), formatCount(4), formatCount(1)));
     }, SCENARIO_TIMEOUT_MS);
 
     it('waits for the manual login in one panel: the result line, the primary "login finished" and the secondary stop', async () => {
@@ -626,7 +646,10 @@ describe('job-audit-stage-ui: T37a and DEF-144 on the job detail', () => {
         schemaVersion: DISCOVERY_ARTIFACT_SCHEMA_VERSION, ...base, endReason: 'SERVICE_REQUEST_LIMIT_REACHED', maxPages: MAX_PAGES,
         pages: [{ url: `${TEST_ORIGIN}${ADMIN_PATH}`, state: 'NOT_READ', reason: 'SERVICE_REQUEST_LIMIT_REACHED' }], omittedUnreadPages: 0, ...extra,
       }]
-      : ['read-evidence.json', { schemaVersion: READ_EVIDENCE_ARTIFACT_SCHEMA_VERSION, ...base, endReason: 'SERVICE_REQUEST_LIMIT_REACHED', checks: [], ...extra }];
+      // RCA-5: read-evidence 1.3 は検索の確かめの組 `searchChecks` を必ず持つ（ないと画面のサーバがスキーマで読まない）。
+      : ['read-evidence.json', {
+        schemaVersion: READ_EVIDENCE_ARTIFACT_SCHEMA_VERSION, ...base, endReason: 'SERVICE_REQUEST_LIMIT_REACHED', checks: [], searchChecks: [], ...extra,
+      }];
     const runDirectory = join(rootOf().root, OUTPUT_DIRECTORY, runId);
     mkdirSync(runDirectory, { recursive: true });
     writeFileSync(join(runDirectory, fileName), JSON.stringify(document), 'utf8');
@@ -853,9 +876,12 @@ describe('job-page-incomplete-reasons-ui: T44c the page incomplete reasons of an
   const STARTED_AT = '20261021020001';
   const FINISHED_AT = '20261021020100';
   const INNER_SCROLL = 'INNER_SCROLL_CONTAINER_NOT_TRAVERSED';
+  // PIR: 点検の範囲の外へ移ったページは別の行。アドレスを持たない項目（前の書き手）には、アドレスの欄を出さない。
+  const OUTSIDE = { code: 'NAVIGATION_FAILED', detail: 'BLOCKED_EXTERNAL_REDIRECT' } as const;
   const COUNTS: readonly PageIncompleteReasonCount[] = Object.freeze([
-    { code: 'COLLECTOR_INCOMPLETE', pages: 2 },
+    { code: 'COLLECTOR_INCOMPLETE', pages: 2, pageUrls: ['http://127.0.0.1:9/a.html', 'http://127.0.0.1:9/b.html'] },
     { code: INNER_SCROLL, pages: 9 },
+    { ...OUTSIDE, pages: 1, pageUrls: ['http://127.0.0.1:9/away.html'] },
   ]);
 
   const text = LOCAL_UI_PAGE_INCOMPLETE_REASON_TEXT;
@@ -915,13 +941,25 @@ describe('job-page-incomplete-reasons-ui: T44c the page incomplete reasons of an
     await panel.waitFor({ timeout: UI_TIMEOUT_MS });
     expect(await panel.getByRole('heading', { name: text.heading }).count()).toBe(1);
     const rows = await panel.getByTestId('job-page-incomplete-reason-list').evaluate((table) =>
-      [...table.querySelectorAll('tbody tr')].map((row) => [row.getAttribute('data-code') ?? '', ...[...row.querySelectorAll('td')].map((cell) => cell.textContent ?? '')]));
+      [...table.querySelectorAll('tbody tr')].map((row) => {
+        const [reason, pages, nextStep] = [...row.querySelectorAll(':scope > td')];
+        return [
+          row.getAttribute('data-code') ?? '',
+          reason?.textContent ?? '',
+          pages?.firstChild?.textContent ?? '',
+          [...(pages?.querySelectorAll('li') ?? [])].map((item) => item.textContent ?? ''),
+          nextStep?.textContent ?? '',
+        ];
+      }));
     // PL-W（設計書 `2026-10-26-beaksight-plain-ui-design.md` 3 章の 2・4）: 理由のコードは画面に出さない（行の data-code にだけ残る）。
+    // PIR: 各行に、そのページのアドレスの全部（たたんだ欄の中の文字）。範囲の外へ移ったページは別の文。
     expect(rows).toEqual([
-      ['COLLECTOR_INCOMPLETE', INCOMPLETE_REASON_DESCRIPTIONS.COLLECTOR_INCOMPLETE, formatCount(2), INCOMPLETE_REASON_NEXT_STEPS.COLLECTOR_INCOMPLETE],
-      [INNER_SCROLL, INCOMPLETE_REASON_DESCRIPTIONS[INNER_SCROLL], formatCount(9), INCOMPLETE_REASON_NEXT_STEPS[INNER_SCROLL]],
+      ['COLLECTOR_INCOMPLETE', INCOMPLETE_REASON_DESCRIPTIONS.COLLECTOR_INCOMPLETE, formatCount(2), COUNTS[0]?.pageUrls, INCOMPLETE_REASON_NEXT_STEPS.COLLECTOR_INCOMPLETE],
+      [INNER_SCROLL, INCOMPLETE_REASON_DESCRIPTIONS[INNER_SCROLL], formatCount(9), [], INCOMPLETE_REASON_NEXT_STEPS[INNER_SCROLL]],
+      ['NAVIGATION_FAILED', describeIncompleteReasonOf(OUTSIDE), formatCount(1), COUNTS[2]?.pageUrls, nextStepOfIncompleteReasonOf(OUTSIDE)],
     ]);
-    // 画面のサーバが返す値も、数と理由のコードだけ。
+    expect(await panel.getByTestId('job-page-incomplete-reason-urls').count()).toBe(2);
+    // 画面のサーバが返す値は、数・理由のコード・範囲の外の印・ページのアドレス。
     const detail = await valueOf<{ pageIncompleteReasons: unknown }>('getAuditJobFn', 'GET', { jobId: 'job-t44c-reasons' });
     expect(detail.pageIncompleteReasons).toEqual(COUNTS);
   }, SCENARIO_TIMEOUT_MS);
@@ -1242,7 +1280,7 @@ describe('read-check-page-ui: T37d the READ check definitions of a page path on 
     const runId = 'RUN-20261017020002';
     writeFinishedJob(jobId, 'READ_CHECK', runId, 'read-evidence.json', {
       schemaVersion: READ_EVIDENCE_ARTIFACT_SCHEMA_VERSION, jobId, runId, startedAt: STARTED_AT, finishedAt: FINISHED_AT, runStatus: 'PARTIAL',
-      endReason: 'COMPLETED',
+      endReason: 'COMPLETED', searchChecks: [],
       checks: [{
         readCheckId: definition.readCheckId, readCheckRevision: definition.revision, targetKind: 'PAGE', targetPagePath: DETAIL_PATH, state: 'EXECUTED',
         result: 'UNDETERMINED', detail: 'SERVICE_READ_REFUSED', url: `${TEST_ORIGIN}${DETAIL_PATH}`, httpStatus: 200, blockedRequests: 0,
@@ -1280,7 +1318,7 @@ describe('read-check-page-ui: T37d the READ check definitions of a page path on 
     const removedId = 'read-def136-removed';
     writeFinishedJob(readJobId, 'READ_CHECK', readRunId, 'read-evidence.json', {
       schemaVersion: READ_EVIDENCE_ARTIFACT_SCHEMA_VERSION, jobId: readJobId, runId: readRunId, startedAt: STARTED_AT, finishedAt: FINISHED_AT,
-      runStatus: 'PARTIAL', endReason: 'SITE_UNAVAILABLE',
+      runStatus: 'PARTIAL', endReason: 'SITE_UNAVAILABLE', searchChecks: [],
       checks: [{
         readCheckId: definition.readCheckId, readCheckRevision: definition.revision, targetKind: 'PAGE', targetPagePath: DETAIL_PATH, state: 'EXECUTED',
         result: 'UNDETERMINED', detail: 'SERVICE_READ_REFUSED', url: `${TEST_ORIGIN}${DETAIL_PATH}`, httpStatus: 200, blockedRequests: 0,
@@ -1351,7 +1389,7 @@ describe('read-check-page-ui: T37d the READ check definitions of a page path on 
     const runId = 'RUN-20261017020005';
     writeFinishedJob(jobId, 'READ_CHECK', runId, 'read-evidence.json', {
       schemaVersion: READ_EVIDENCE_ARTIFACT_SCHEMA_VERSION, jobId, runId, startedAt: STARTED_AT, finishedAt: FINISHED_AT,
-      runStatus: 'PARTIAL', endReason: 'MAX_RUNTIME_REACHED',
+      runStatus: 'PARTIAL', endReason: 'MAX_RUNTIME_REACHED', searchChecks: [],
       checks: [{
         readCheckId: definition.readCheckId, readCheckRevision: definition.revision, targetKind: 'PAGE', targetPagePath: DETAIL_PATH, state: 'NOT_EXECUTED',
         reason: 'MAX_RUNTIME_REACHED',

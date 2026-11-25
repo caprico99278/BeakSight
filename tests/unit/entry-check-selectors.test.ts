@@ -10,6 +10,7 @@ import {
   cssStringOf,
   entryFieldSelectorOf,
   entrySelectorCandidatesOf,
+  structuralSelectorOf,
   uniqueEntrySelectorOf,
   type EntrySelectorCheck,
 } from '../../src/discovery/entry-check-selectors.js';
@@ -104,6 +105,32 @@ describe('T43c: the selector candidates of one element', () => {
     expect(entrySelectorCandidatesOf({ tag: 'input', id: 'field-123456789', name: 'deadbeef', type: '' })).toEqual([
       '#field-123456789', 'input[name="deadbeef"]',
     ]);
+  });
+
+  // WBF（DEF-291 の A）: 描画の順で替わりうる id（React の useId の形）は、候補にしない。
+  it('never builds a candidate from an id given by the render order', () => {
+    for (const id of [':r1:', ':R1aq:', '«r2»', '_r_3_', '_R_1d_']) {
+      expect(entrySelectorCandidatesOf({ tag: 'input', id, name: '', type: 'text' }), id).toEqual(['input[type="text"]']);
+    }
+  });
+
+  // REV-WBF の Minor-2: React の形でない id（区切りに `:`・`_r_` を含むだけのもの）は、今どおり使う。
+  it('keeps the ids that only contain the separators of the render order form', () => {
+    for (const id of ['mainForm:region:username', 'form:repeat:0:name', 'user_r_name_', 'addr_R_1_x']) {
+      expect(entrySelectorCandidatesOf({ tag: 'input', id, name: '', type: 'text' })[0], id).toBe(`#${cssIdentifierOf(id)}`);
+    }
+  });
+});
+
+describe('WBF (DEF-291 A): the structural selector of an element path', () => {
+  it('builds the child positions from the root, with the tag of the element', () => {
+    expect(structuralSelectorOf([0, 1, 2, 0], 'input')).toBe(':root > :nth-child(2) > :nth-child(3) > input:nth-child(1)');
+  });
+
+  it('gives no selector without a path from the root element', () => {
+    expect(structuralSelectorOf([], 'input')).toBeNull();
+    expect(structuralSelectorOf([1, 0], 'input')).toBeNull();
+    expect(structuralSelectorOf([0, 0], '')).toBeNull();
   });
 });
 

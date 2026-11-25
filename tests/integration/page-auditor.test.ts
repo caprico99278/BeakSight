@@ -33,7 +33,7 @@ import { validateArtifact } from '../../src/core/schema-validator.js';
 import type { NavigationPacer } from '../../src/crawl/navigation-pacer.js';
 import { normalizeUrl } from '../../src/crawl/normalize-url.js';
 import { collectAccessibilityEvidence } from '../../src/evidence/accessibility-collector.js';
-import { collectStressLayout } from '../../src/evidence/layout-collector.js';
+import { collectResizedStressLayout, collectStressLayout, type StressLayoutOptions } from '../../src/evidence/layout-collector.js';
 import { isOutsideRunAuditScope } from '../../src/orchestration/authenticated-run.js';
 import { IdAllocator } from '../../src/orchestration/id-allocator.js';
 import { PageAuditor, type PageAuditAttempt, type PageAuditorDependencies } from '../../src/orchestration/page-auditor.js';
@@ -344,7 +344,8 @@ describe('PageAuditor on a page with a broken image and console errors (Task 14 
     const desktopLayout = firstPassLayoutOf(outcome, 'desktop');
     const mobileLayout = firstPassLayoutOf(outcome, 'mobile');
     const primaryWidths = [config.viewports.primaryDesktop.width, config.viewports.primaryMobile.width];
-    const expectedWidths = config.viewports.stressWidths.filter((width) => !primaryWidths.includes(width));
+    // SWR: 広い順に回す。
+    const expectedWidths = config.viewports.stressWidths.filter((width) => !primaryWidths.includes(width)).sort((left, right) => right - left);
 
     expect(expectedWidths.length).toBeGreaterThan(0);
     expect(expectedWidths.length).toBeLessThan(config.viewports.stressWidths.length);
@@ -353,13 +354,19 @@ describe('PageAuditor on a page with a broken image and console errors (Task 14 
     expect(mobileLayout?.payload.stressSweep).toBeNull();
   });
 
-  it('records one PASSIVE safety Evidence per Ledger (the Passive Context and each stress sweep session)', () => {
+  // SWR の 3: 幅の走査は、大きさを変えて回す Context（Ledger 1 つに走査した幅の一覧）と、一番狭い幅を読み込み直した Context の 2 つ。
+  it('records one PASSIVE safety Evidence per Ledger (the Passive Context, the resized stress sweep session and the narrowest width session)', () => {
     const { outcome } = run;
-    const sweptWidthCount = firstPassLayoutOf(outcome, 'desktop')?.payload.stressSweep?.length ?? 0;
+    const sweptWidths = firstPassLayoutOf(outcome, 'desktop')?.payload.stressSweep?.map(({ width }) => width) ?? [];
     const desktopSafety = evidenceOf(outcome, 'safety', 'desktop');
     const mobileSafety = evidenceOf(outcome, 'safety', 'mobile');
 
-    expect(desktopSafety).toHaveLength(1 + sweptWidthCount);
+    expect(desktopSafety).toHaveLength(1 + 2);
+    expect(desktopSafety.map((record) => record.payload.load)).toEqual([
+      { kind: 'PAGE_AUDIT' },
+      { kind: 'STRESS_WIDTH', width: sweptWidths[0], widths: sweptWidths.slice(0, -1) },
+      { kind: 'STRESS_WIDTH', width: sweptWidths.at(-1) },
+    ]);
     expect(mobileSafety).toHaveLength(1);
     expect([...desktopSafety, ...mobileSafety].every((record) => record.payload.scope === 'PASSIVE')).toBe(true);
     // 違反がなく、違反にしない止めた記録（SAFE-2 の 4）もない（確かめたい欄だけを見る）。
@@ -1027,28 +1034,31 @@ describe('PageAuditor Guard installation failure that closes the Context (R14r I
 // `waitForPageSettled`）を待ってから形を測る。待ちの上限は、その幅の期限から形を測る予備（`STRESS_LAYOUT_MEASURE_RESERVE_MS`）を引いた時刻と、今から
 // `crawl.resourceSettlingTimeoutMs` 後の早い方（落ち着かない画面でも、形を測る時間を残す）。ふだんの実行で、この配線を守る。
 describe('PageAuditor: the stress sweep waits for the page to settle before measuring each width (P1-5, T44R2 I-6・M-5)', () => {
-  it('calls the real settling wait once for each width, after the load and before measuring', async () => {
+  // SWR: 大きさを変えた幅も、読み込み直した一番狭い幅も、測る前に同じ落ち着きの待ちを待つ。
+  it('calls the real settling wait once for each width, after the load or the resize and before measuring', async () => {
     const server = await startServer();
     const settled: { readonly width: number; readonly waitedMs: number }[] = [];
+    const recordingSettle = <T extends StressLayoutOptions>(options: T): T => ({
+      ...options,
+      settleBeforeLayout: async (page: Page, deadlineAtMs: number) => {
+        const started = Date.now();
+        await options.settleBeforeLayout(page, deadlineAtMs);
+        settled.push({ width: page.viewportSize()?.width ?? 0, waitedMs: Date.now() - started });
+      },
+    });
     const { outcome } = await auditFixture(server, '/index.html', {
       overrides: {
         viewports: { stressWidths: [320, 768] },
         audit: { interactions: false, performance: false, screenshots: false, accessibility: false },
       },
       collectors: {
-        collectStressLayout: async (createSession, url, widths, options) => collectStressLayout(createSession, url, widths, {
-          ...options,
-          settleBeforeLayout: async (page, deadlineAtMs) => {
-            const started = Date.now();
-            await options.settleBeforeLayout(page, deadlineAtMs);
-            settled.push({ width: page.viewportSize()?.width ?? 0, waitedMs: Date.now() - started });
-          },
-        }),
+        collectStressLayout: async (createSession, url, widths, options) => collectStressLayout(createSession, url, widths, recordingSettle(options)),
+        collectResizedStressLayout: async (createSession, url, widths, options) => collectResizedStressLayout(createSession, url, widths, recordingSettle(options)),
       },
     });
     const sweep = firstPassLayoutOf(outcome, 'desktop')?.payload.stressSweep ?? [];
-    expect(sweep.map(({ width, status }) => `${String(width)} ${status}`)).toEqual(['320 COMPLETE', '768 COMPLETE']);
-    expect(settled.map(({ width }) => width)).toEqual([320, 768]);
+    expect(sweep.map(({ width, status }) => `${String(width)} ${status}`)).toEqual(['768 COMPLETE', '320 COMPLETE']);
+    expect(settled.map(({ width }) => width)).toEqual([768, 320, 320]);
     // 本物の落ち着きの待ち: 高さが変わらない時間（差し込んだ一式の `pageSettle.stableWindowMs`）を待つ。
     for (const { waitedMs } of settled) {
       expect(waitedMs).toBeGreaterThanOrEqual(TEST_SHORT_AUDIT_OBSERVATION_WINDOWS.pageSettle.stableWindowMs - TIMER_TOLERANCE_MS);
@@ -1238,5 +1248,39 @@ describe('PageAuditor requires the navigation pacer (load control design 4.1)', 
     expect(() => new PageAuditor(withoutPacer)).toThrow(TypeError);
     expect(() => new PageAuditor({ ...withoutPacer, navigationPacer: {} as unknown as NavigationPacer })).toThrow(TypeError);
     expect(() => new PageAuditor({ ...withoutPacer, navigationPacer: createTestNavigationPacer(config) })).not.toThrow();
+  });
+});
+
+// SWR（設計者の判断 2026-11-17。案 B）: 幅の走査は、1 回だけ読み込んで広い順に大きさだけを変え、一番狭い幅を読み込み直して照らし合わせる（ふだん 2 回）。
+// 読み込みの時だけ幅を読む画面は、照らし合わせで違いが出るので、残りの幅を幅ごとに読み込み直す（幅の数 + 1 回）。
+describe('PageAuditor: the stress sweep resizes one loaded page and checks the narrowest width with a load (SWR)', () => {
+  it('loads the sweep twice for a CSS layout, and goes back to loading each width for a page that reads its width only when it loads', async () => {
+    const server = await startServer();
+    const overrides: TestConfigOverrides = {
+      viewports: { stressWidths: [320, 768, 1024] },
+      audit: { interactions: false, performance: false, screenshots: false, accessibility: false },
+    };
+    const documentLoadsOf = (pathname: string): number => server.getRequestObservations().filter((observation) => observation.pathname === pathname).length;
+    const sweepOf = (outcome: PageAuditOutcome): readonly string[] => (firstPassLayoutOf(outcome, 'desktop')?.payload.stressSweep ?? [])
+      .map(({ width, status, layout }) => `${String(width)} ${status} ${String(layout?.document.horizontalOverflowPx ?? null)}`);
+
+    server.resetRequestObservations();
+    const css = await auditFixture(server, '/stress-resize-css.html', { overrides });
+    // Desktop、幅の走査の 2 回、Mobile。
+    expect(documentLoadsOf('/stress-resize-css.html')).toBe(2 + 2);
+    expect(sweepOf(css.outcome)).toEqual(['1024 COMPLETE 0', '768 COMPLETE 0', '320 COMPLETE 0']);
+    expect(evidenceOf(css.outcome, 'safety', 'desktop').map((record) => record.payload.load).filter((load) => load.kind === 'STRESS_WIDTH'))
+      .toEqual([{ kind: 'STRESS_WIDTH', width: 1024, widths: [1024, 768] }, { kind: 'STRESS_WIDTH', width: 320 }]);
+    await expect(validateArtifact('page', JSON.parse(JSON.stringify(css.outcome.result)) as unknown)).resolves.toEqual({ ok: true });
+
+    server.resetRequestObservations();
+    const jsLoad = await auditFixture(server, '/stress-resize-js-load.html', { overrides });
+    // Desktop、大きさを変えて回す 1 回、照らし合わせの 1 回、残りの 2 つの幅の読み込み直し、Mobile。大きさを変えたときだけの横のはみ出しは残らない。
+    expect(documentLoadsOf('/stress-resize-js-load.html')).toBe(2 + 1 + 1 + 2);
+    expect(sweepOf(jsLoad.outcome)).toEqual(['1024 COMPLETE 0', '768 COMPLETE 0', '320 COMPLETE 0']);
+    // REV-SWR の M-1: 大きさを変えた Context の Ledger は、結果を残した幅を持たない（読み込み直した幅の Ledger は、今どおり幅ごと）。
+    expect(evidenceOf(jsLoad.outcome, 'safety', 'desktop').map((record) => record.payload.load).filter((load) => load.kind === 'STRESS_WIDTH'))
+      .toEqual([{ kind: 'STRESS_WIDTH', width: 1024, widths: [] }, { kind: 'STRESS_WIDTH', width: 320 }, { kind: 'STRESS_WIDTH', width: 1024 }, { kind: 'STRESS_WIDTH', width: 768 }]);
+    await expect(validateArtifact('page', JSON.parse(JSON.stringify(jsLoad.outcome.result)) as unknown)).resolves.toEqual({ ok: true });
   });
 });

@@ -4,10 +4,17 @@
  * `ELEMENT_OVERLAP`・`CONTENT_COLLISION` の Rule（`./layout-rules.ts`）と、Page Auditor（撮る対象を選ぶ）が使う。Page Auditor は Rule のファイルを import
  * できない（GATE-ARCH07）ので、判定をここに置く（`./fixed-overlap-classes.ts` と同じ形）。
  */
-import type { ElementOverlapEvidence, LayoutElementEvidence, LayoutElementKind, LayoutEvidence, RevealTargetSpec } from '../core/evidence-types.js';
+import type {
+  ElementOverlapEvidence,
+  LayoutElementEvidence,
+  LayoutElementKind,
+  LayoutEvidence,
+  OverlapSidePlacementEvidence,
+  RevealTargetSpec,
+} from '../core/evidence-types.js';
 import { compareCodeUnits } from '../core/text.js';
 import { classifiedOcclusionPairsOf, isFindingFixedOverlapClass, isPaintedContent } from './fixed-overlap-classes.js';
-import { textClippingDirectionsOf } from './text-clipping.js';
+import { cutScrollRegionsOf, textClippingDirectionsOf } from './text-clipping.js';
 
 /**
  * `ELEMENT_OVERLAP`・`CONTENT_COLLISION`: 重なりの面積が、小さい方の要素の面積に占める割合が、これを超えたら Finding にする。
@@ -57,10 +64,62 @@ export interface OverlapFindingPair {
   readonly secondSelector: string;
   readonly overlapArea: number;
   readonly ratio: number;
+  /** AUD-5（S-02）: 画像の上に意図して置いた押せる部品の候補か（確信度を下げ、文で分ける）。 */
+  readonly intendedPlacement: boolean;
 }
 
-/** その Rule が指摘にする重なりの組（判定の 1 か所。Rule と、対象まで動かして撮る対象の選び方が使う）。 */
-export const overlapFindingPairsOf = (layout: LayoutEvidence, ruleId: OverlapRuleId): readonly OverlapFindingPair[] =>
+/** AUD-5: 押せる部品の種類。 */
+const CONTROL_ELEMENT_KINDS: readonly LayoutElementKind[] = Object.freeze(['button', 'link']);
+
+/** AUD-5: 押せる部品か（自分がボタンかリンク、または押せる祖先の中）。 */
+const isPressable = (element: LayoutElementEvidence, side: OverlapSidePlacementEvidence | undefined): boolean =>
+  CONTROL_ELEMENT_KINDS.includes(element.kind) || (side?.controlAncestorSelector ?? null) !== null;
+
+/**
+ * AUD-5（設計書 `2026-11-19-beaksight-audit-result-review-fixes-design.md` 8.1 の 2）: 片方が押せない画像で、位置指定の入れ物の外にあり、もう片方が、
+ * 共通の入れ物の下の位置指定の入れ物の中の押せる部品か。入力欄・押せる部品どうし・位置指定の入れ物の中の画像は当てはまらない（今どおり）。
+ */
+const isIntendedPlacement = (overlap: ElementOverlapEvidence): boolean => {
+  const { placement } = overlap;
+  if (placement === undefined) {
+    return false;
+  }
+  const sides = [[overlap.first, placement.first], [overlap.second, placement.second]] as const;
+  return sides.some(([image, imageSide], index) => {
+    const [control, controlSide] = sides[1 - index] ?? sides[0];
+    return image.kind === 'image' && !isPressable(image, imageSide) && !imageSide.positionedInSharedContainer
+      && isPressable(control, controlSide) && controlSide.positionedInSharedContainer;
+  });
+};
+
+/**
+ * AUD-5（8.1 の 3）: 押せる部品の中の子（アイコンなど）は、押せる祖先の selector に寄せる（押せる部品と画像の組と同じ 1 件にする）。両方が同じ押せる祖先の中なら
+ * 寄せない（部品の中どうしの重なりを消さない）。
+ */
+const reportedSelectorsOf = (overlap: ElementOverlapEvidence): readonly [string, string] => {
+  const first = overlap.placement?.first.controlAncestorSelector ?? null;
+  const second = overlap.placement?.second.controlAncestorSelector ?? null;
+  return first !== null && first === second
+    ? [overlap.first.selector, overlap.second.selector]
+    : [first ?? overlap.first.selector, second ?? overlap.second.selector];
+};
+
+/** その Rule が指摘にする重なりの組（判定の 1 か所。Rule と、対象まで動かして撮る対象の選び方が使う）。AUD-5: 押せる祖先に寄せて同じになった組は 1 件にする。 */
+export const overlapFindingPairsOf = (layout: LayoutEvidence, ruleId: OverlapRuleId): readonly OverlapFindingPair[] => {
+  const pairs = new Map<string, OverlapFindingPair>();
+  for (const pair of judgedOverlapPairsOf(layout, ruleId)) {
+    const key = JSON.stringify([pair.firstSelector, pair.secondSelector]);
+    const known = pairs.get(key);
+    // 同じ組が 2 つ以上あれば、面積の比の大きい方の値を残し、どれかが意図した配置の候補でなければ、候補にしない（疑わしければ下げない）。
+    pairs.set(key, known === undefined ? pair : {
+      ...(pair.ratio > known.ratio ? pair : known),
+      intendedPlacement: known.intendedPlacement && pair.intendedPlacement,
+    });
+  }
+  return [...pairs.values()];
+};
+
+const judgedOverlapPairsOf = (layout: LayoutEvidence, ruleId: OverlapRuleId): readonly OverlapFindingPair[] =>
   layout.elementOverlaps.flatMap((overlap) => {
     if (
       overlapRuleFor(overlap) !== ruleId
@@ -79,8 +138,8 @@ export const overlapFindingPairsOf = (layout: LayoutEvidence, ruleId: OverlapRul
     if (!Number.isFinite(ratio) || ratio <= OVERLAP_MIN_AREA_RATIO) {
       return [];
     }
-    const [firstSelector = '', secondSelector = ''] = [overlap.first.selector, overlap.second.selector].sort(compareCodeUnits);
-    return [{ firstSelector, secondSelector, overlapArea, ratio }];
+    const [firstSelector = '', secondSelector = ''] = [...reportedSelectorsOf(overlap)].sort(compareCodeUnits);
+    return [{ firstSelector, secondSelector, overlapArea, ratio, intendedPlacement: ruleId === 'ELEMENT_OVERLAP' && isIntendedPlacement(overlap) }];
   });
 
 /**
@@ -94,8 +153,13 @@ export const revealTargetsOfLayout = (layout: LayoutEvidence, primary: boolean):
     selectors: [firstSelector, secondSelector],
   }))),
   ...(primary ? layout.clippedText : [])
-    .filter((clipped) => textClippingDirectionsOf(clipped) !== null)
-    .map(({ selector }) => ({ purpose: 'TEXT_CLIPPING' as const, selectors: [selector] })),
+    .flatMap((clipped) => [
+      ...(textClippingDirectionsOf(clipped) === null ? [] : [clipped.selector]),
+      // S-06: 端が外枠で切れる内側のスクロール領域（Rule と同じ `cutScrollRegionsOf`）。
+      ...cutScrollRegionsOf(clipped).map(({ selector }) => selector),
+    ])
+    .filter((selector, index, selectors) => selectors.indexOf(selector) === index)
+    .map((selector) => ({ purpose: 'TEXT_CLIPPING' as const, selectors: [selector] })),
   ...classifiedOcclusionPairsOf(layout)
     .filter((pair) => isFindingFixedOverlapClass(pair.overlapClass))
     .map(({ facts }) => ({ purpose: 'FIXED_ELEMENT_OCCLUSION' as const, selectors: [facts.coveredSelector], overlaySelector: facts.overlaySelector })),

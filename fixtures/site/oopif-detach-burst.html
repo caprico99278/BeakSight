@@ -1,0 +1,21 @@
+<!doctype html>
+<html lang="en">
+  <head><meta charset="utf-8"><title>Fixture OOPIF Detach Burst</title></head>
+  <body>
+    <h1>Fixture OOPIF Detach Burst</h1>
+    <script>
+      // CDPX: 読み込んだら、要求をまとめて出し、同じ処理の中で親に知らせる（親はすぐこの iframe を消す）。
+      // - `kind=read`: GET（Guard が許す要求）。`kind=nonread`: POST（Guard が止める要求。`/__mutation` はサーバが数える）。
+      const params = new URLSearchParams(location.search);
+      const kind = params.get('kind');
+      const round = params.get('round');
+      addEventListener('load', () => {
+        for (let index = 0; index < 12; index += 1) {
+          const init = kind === 'nonread' ? { method: 'POST', body: 'x' } : {};
+          fetch(kind === 'nonread' ? '/__mutation' : `/navigation-target.html?round=${round}&index=${index}`, init).catch(() => {});
+        }
+        parent.postMessage('burst', '*');
+      });
+    </script>
+  </body>
+</html>

@@ -1022,6 +1022,8 @@ export interface AutoDraftScreenView {
    * もの（チェックの保存の `draftUpdateForCreate` が既にある更新を選ぶ順と同じ）。
    */
   readonly existingUpdateScenarioIds: readonly string[];
+  /** WDEDUP: 送信の形（API の形の登録は probe の型の digest、フォームの形は null）。一覧の見せ方のまとめだけに使う。 */
+  readonly sendShapeDigest: string | null;
 }
 
 export const scenarioAutoDraftScreensOf = createServerOnlyFn(async (profileId: string): Promise<readonly AutoDraftScreenView[] | null> => {
@@ -1070,6 +1072,7 @@ export const scenarioAutoDraftScreensOf = createServerOnlyFn(async (profileId: s
       updateFound: updatePossible || updateFound,
       updateOpenerUnnamedOnly,
       existingUpdateScenarioIds,
+      sendShapeDigest: 'shapeDigest' in item.row ? item.row.shapeDigest : null,
     };
   };
   return [

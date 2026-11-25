@@ -60,6 +60,10 @@ function WriteScreenRow({ profileId, row, unnamedPosition, onSaved }: Readonly<{
         />
         <span>{name}</span>
       </label>
+      {/* WDEDUP: 同じ画面の同じ送信の形をまとめた行は、まとめた数を 1 行で添える（見せ方だけ）。 */}
+      {row.sameSendCount > 1 ? (
+        <p className="field-hint" data-testid="write-screen-same-send" data-count={row.sameSendCount}>{text.sameSendCount(formatInteger(row.sameSendCount), row.sameSendCheckedCount > 1 ? formatInteger(row.sameSendCheckedCount) : null)}</p>
+      ) : null}
       {busy ? <p className="field-hint">{text.saving}</p> : null}
       {row.state === 'CHECKED' || row.state === 'CHECKABLE' ? null : (
         <p className="field-hint" data-testid="write-screen-state">{text.states[row.state]}</p>

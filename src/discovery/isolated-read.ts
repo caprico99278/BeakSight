@@ -456,8 +456,17 @@ const ARM_PRESS_GUARD_DECLARATION = `function (token, types, overrideAttributes,
   const armedKey = keyOf(armedFacts);
   const armed = JSON.stringify(armedFacts);
   const registry = globalThis.__beaksightPressGuards || (globalThis.__beaksightPressGuards = new Map());
-  const entry = { tripped: false, types, receiver: null };
+  const entry = { tripped: false, reached: false, abandoned: false, types, receiver: null };
   entry.receiver = (event) => {
+    if (entry.abandoned) {
+      const late = event.target;
+      if (late instanceof Node && (late === element || Node.prototype.contains.call(element, late))) {
+        Event.prototype.stopImmediatePropagation.call(event);
+        Event.prototype.preventDefault.call(event);
+      }
+      return;
+    }
+    entry.reached = true;
     let ok = !entry.tripped;
     if (ok && event.type === 'submit') {
       ok = expectedFormGiven !== true || (expectedForm !== null && event.target === expectedForm);
@@ -484,6 +493,20 @@ const ARM_PRESS_GUARD_DECLARATION = `function (token, types, overrideAttributes,
 const PRESS_GUARD_TRIPPED_DECLARATION = `function (token) {
   const entry = globalThis.__beaksightPressGuards && globalThis.__beaksightPressGuards.get(token);
   return entry ? entry.tripped === true : true;
+}`;
+/** DEF-289: 受け手に事象が 1 つでも届いたかを読む宣言（印がなければ届いた側に倒す）。 */
+const PRESS_GUARD_REACHED_DECLARATION = `function (token) {
+  const entry = globalThis.__beaksightPressGuards && globalThis.__beaksightPressGuards.get(token);
+  return entry ? entry.reached === true : true;
+}`;
+/**
+ * REV-DQF の Important-1: 見放した押す 1 手の受け手を、見放した印の形にする宣言。この後は、押す要素への事象を止め（見放した 1 手が後から押しても、ページの
+ * 受け手に届かない）、ほかの要素への事象には何もしない（押し直しの事象を止めない）。
+ */
+const ABANDON_PRESS_GUARD_DECLARATION = `function (token) {
+  const entry = globalThis.__beaksightPressGuards && globalThis.__beaksightPressGuards.get(token);
+  if (entry) entry.abandoned = true;
+  return true;
 }`;
 /** 受け手を外す宣言。 */
 const DISARM_PRESS_GUARD_DECLARATION = `function (token) {
@@ -513,6 +536,16 @@ export interface PressTimeGuardOptions {
    * （操作さがし。届けない）は、つながり（isConnected）と form owner の一致だけ（文言・属性は比べない。的は、どちらでも確かめる）。
    */
   readonly comparedFacts?: PressTimeComparedFacts;
+  /**
+   * DEF-289: 押す 1 手（`press`）の誤りのうち、呼ぶ側が 1 手を見放したもの（的の要素が消えたなど）か。真の誤りで、受け手に事象が 1 つも届いていなければ
+   * `NOT_DELIVERED` を返す（押していない）。省略すると、どの誤りも今どおり呼ぶ側へ投げる。
+   */
+  readonly undeliveredOn?: ((error: unknown) => boolean) | undefined;
+  /**
+   * REV-DQF の Minor-1・Important-A: 真なら、押す 1 手が返っても受け手に事象が 1 つも届いていなければ `NOT_DELIVERED`（呼ぶ側が、観察の窓の要求の有無で押したかを
+   * 決める）。`click` だけでなく、どの事象でも届いたとみなす（mousedown で送る画面・window の capture で click を止める画面を、押していないにしない）。省略は今のまま。
+   */
+  readonly requireReached?: boolean | undefined;
 }
 
 /** FIX-237 fix round 2: 押す時点の受け手が比べる事実の選び方（`PressTimeGuardOptions.comparedFacts`）。 */
@@ -524,6 +557,13 @@ export interface PressTimeGuard {
   readonly armedFacts: PressTimeFacts;
   /** 受け手が事象を止めたか（読めなければ止めた側に倒す）。押した後に呼ぶ。 */
   readonly tripped: () => Promise<boolean>;
+  /** DEF-289: 受け手に事象が 1 つでも届いたか（ページが送った事象も数える。読めなければ届いた側に倒す）。 */
+  readonly reached: () => Promise<boolean>;
+  /**
+   * REV-DQF の Important-1: 押す 1 手を見放した。受け手を外さずに残し（Context を閉じるまで）、この後に押す要素へ届く事象を止める（見放した 1 手が後から押しても
+   * ページの受け手に届かない）。ほかの要素への事象（押し直し）には何もしない。
+   */
+  readonly abandon: () => Promise<void>;
 }
 
 /**
@@ -542,6 +582,8 @@ export async function withPressTimeGuard<T>(
   let executionContextId: number | undefined;
   let token: string | null = null;
   let useFailure: { readonly error: unknown } | undefined;
+  /** REV-DQF の Important-1: 見放した 1 手の受け手を残す（外さない）。 */
+  let keepArmed = false;
   const outcome = await readWithDiscoveryCdpSession<SignaledElementsOutcome<T>>(page, deadlineAtMs, Object.freeze({ status: 'FAILED' }), async (session) => {
     executionContextId = await isolatedContextOf(session, deadlineAtMs);
     const contextId = executionContextId;
@@ -582,10 +624,11 @@ export async function withPressTimeGuard<T>(
       throw new DiscoveryCdpReadFailure();
     }
     const facts: PressTimeFacts = armedFacts;
-    const tripped = async (): Promise<boolean> => {
+    /** 受け手の印を読む（読めなければ真。止めた・届いた側に倒す）。 */
+    const flagOf = async (declaration: string): Promise<boolean> => {
       try {
         const read = await send(session, 'Runtime.callFunctionOn', {
-          functionDeclaration: PRESS_GUARD_TRIPPED_DECLARATION,
+          functionDeclaration: declaration,
           executionContextId: contextId,
           arguments: [{ value: signal }],
           returnByValue: true,
@@ -597,14 +640,23 @@ export async function withPressTimeGuard<T>(
         return true;
       }
     };
+    const tripped = (): Promise<boolean> => flagOf(PRESS_GUARD_TRIPPED_DECLARATION);
+    const reached = (): Promise<boolean> => flagOf(PRESS_GUARD_REACHED_DECLARATION);
+    // REV-DQF の Important-1: 見放した 1 手の受け手は、外さずに見放した印の形にする（Context を閉じるまで残る）。
+    const abandon = async (): Promise<void> => {
+      keepArmed = true;
+      await flagOf(ABANDON_PRESS_GUARD_DECLARATION);
+    };
     try {
-      return Object.freeze({ status: 'DONE', value: await use(Object.freeze({ armedFacts: Object.freeze(facts), tripped })) } as SignaledElementsOutcome<T>);
+      return Object.freeze({
+        status: 'DONE', value: await use(Object.freeze({ armedFacts: Object.freeze(facts), tripped, reached, abandon })),
+      } as SignaledElementsOutcome<T>);
     } catch (error) {
       useFailure = { error };
       throw error;
     }
   }, async (session, releaseDeadlineAtMs) => {
-    if (executionContextId === undefined || token === null) {
+    if (executionContextId === undefined || token === null || keepArmed) {
       return;
     }
     await send(session, 'Runtime.callFunctionOn', {
@@ -627,7 +679,12 @@ export type PressTimeOutcome =
   /** 受け手を付けた時点の事実が、確かめた候補と違った（押していない）。 */
   | 'NOT_VERIFIED'
   /** 受け手を付けられなかった（押していない）。 */
-  | 'UNAVAILABLE';
+  | 'UNAVAILABLE'
+  /**
+   * DEF-289: 押す 1 手を見放し（`PressTimeGuardOptions.undeliveredOn`）、受け手に事象が 1 つも届かなかった（押していない。受け手は見放した印の形で残る）。
+   * REV-DQF の Minor-1: `requireReached` で、押す 1 手が返っても事象が 1 つも届かなかった。
+   */
+  | 'NOT_DELIVERED';
 
 /**
  * LU-SFIX3-A: 押す時点の確かめを通して押す、ただ 1 つの手順（一覧の行の開き手・API の送り手・フォームの送り手が使う）。受け手を付け（`withPressTimeGuard`）、
@@ -646,7 +703,18 @@ export async function pressWithPressTimeGuard(
     if (!guard.armedFacts.formOwnerMatches || !(await verify(guard.armedFacts))) {
       return 'NOT_VERIFIED';
     }
-    await press();
+    try {
+      await press();
+    } catch (error) {
+      // DEF-289: 呼ぶ側が「押す 1 手を見放した」と言う誤り（`undeliveredOn`）で、受け手に事象が 1 つも届いていなければ、押していない（`NOT_DELIVERED`）。
+      // 届いていれば、押した側に倒して、止めたかを今どおり読む（見放した時機と押した時機が重なっても、押し直さない）。ほかの誤りは、今どおり呼ぶ側へ投げる。
+      // REV-DQF の Important-1: 見放した 1 手は取り消せないので、届いたかを読む前に、受け手を見放した印の形にして残す（後から押しても届かない）。
+      if (options.undeliveredOn?.(error) !== true) throw error;
+      await guard.abandon();
+      if (!(await guard.reached())) return 'NOT_DELIVERED';
+    }
+    // REV-DQF の Minor-1・Important-A: 押す 1 手が返っても、受け手に事象が 1 つも届いていなければ、届かなかったと返す（押したかは呼ぶ側が観察で決める）。
+    if (options.requireReached === true && !(await guard.reached())) return 'NOT_DELIVERED';
     return (await guard.tripped()) ? 'STOPPED' : 'PRESSED';
   }, options);
   if (outcome.status === 'DONE') {

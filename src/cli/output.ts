@@ -23,7 +23,7 @@ import {
   severitiesInGroup,
   sortByDisplayOrder,
 } from '../presentation/catalog.js';
-import { formatCount, formatDuration, formatElapsedTime, formatRequestsWithPeak, formatTimes } from '../presentation/format.js';
+import { formatCount, formatDuration, formatElapsedTime, formatInteger, formatRequestsWithPeak, formatTimes } from '../presentation/format.js';
 import type { RunVersionDifference, RunVersionField } from '../orchestration/run-checkpoint.js';
 import type { RunNotice, RunResumeUnavailableReason } from '../orchestration/run-coordinator.js';
 import {
@@ -32,6 +32,7 @@ import {
   CLI_COMMAND_DESCRIPTIONS,
   CLI_OPTION_DESCRIPTIONS,
   CLI_TEXT,
+  MEASUREMENT_TAG_TEXT,
   PAGE_COVERAGE_ITEMS,
   RUN_SUMMARY_TEXT,
   authSessionLostNoticeText,
@@ -264,6 +265,7 @@ export function runProgressLines(report: RunProgressReport): readonly string[] {
  * - サイトの不調で止めた場合は、止めたことと再開のしかたの1行（サイトが応答しないときに Run を止める設計書 3.4）。この起動の終わり方の
  *   行の次、未完了の理由の行の前に置く。出すかどうかと詳細は、表示用モデルの `siteUnavailableStop` のまま（ここで判断し直さない）
  * - 未完了の理由がある場合は、その件数
+ * - BS-1: 計測のタグを観測した場合は、その行の数の 1 行（表示用モデルの `measurementTags` のまま）
  */
 export function runSummaryLines(summary: RunSummaryView, runDirectory: string, bundlePartCount = 1): readonly string[] {
   const coverage = RUN_SUMMARY_TEXT.coverage;
@@ -294,7 +296,7 @@ export function runSummaryLines(summary: RunSummaryView, runDirectory: string, b
       listText(PAGE_COVERAGE_ITEMS.map((item) => cliCountText(coverage[item], formatCount(summary.coverage[item])))),
     ),
     // EV-5: 証拠の足り方（表示用モデルの数のまま。2 行）。網羅の行の次、指摘の件数の行の前に置く。
-    ...evidenceSufficiencyEntries(summary.evidenceSufficiency, formatCount).map(({ label, value }) => cliFieldText(label, value)),
+    ...evidenceSufficiencyEntries(summary.evidenceSufficiency, formatCount, summary.operationRecordCount).map(({ label, value }) => cliFieldText(label, value)),
     ...groupLines,
     // BN-d: BeakSight の遮断と結び付く指摘（バンドルの本体から外したサイト品質の指摘）の件数。出すかと件数は、表示用モデルの値のまま。
     ...(blockRelation.linkedFindingCount > 0
@@ -337,6 +339,10 @@ export function runSummaryLines(summary: RunSummaryView, runDirectory: string, b
       : []),
     ...(summary.incompleteReasons.length > 0
       ? [cliFieldText(RUN_SUMMARY_TEXT.reasonsHeading, formatCount(summary.incompleteReasons.length))]
+      : []),
+    // BS-1: 計測のタグの行の数（表示用モデルの一覧のまま。0 なら出さない）。
+    ...(summary.measurementTags.tags.length > 0
+      ? [cliFieldText(MEASUREMENT_TAG_TEXT.cliLabel, MEASUREMENT_TAG_TEXT.cliValue(formatInteger(summary.measurementTags.tags.length)))]
       : []),
   ];
 }

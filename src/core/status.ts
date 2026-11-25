@@ -127,6 +127,21 @@ export const derivePageAuditStatus = (viewportStatuses: readonly ViewportAuditSt
 /** EV-5: 監査しなかった（まだ見ていない）ページ・ビューポートの状態か（表示用モデルの、まだ見ていない数）。 */
 export const isUncollectedAuditStatus = (status: ViewportAuditStatus): boolean => status === 'SKIPPED';
 
+/** S-12: 読み込めなかった（失敗した）ページ・ビューポートの状態か（表示用モデルの、読み込めなかった数。まだ見ていない数とは分ける）。 */
+export const isFailedAuditStatus = (status: ViewportAuditStatus): boolean => status === 'FAILED';
+
+/**
+ * DUP: 表示の中身が点検した画面と同じなので始めなかったビューポートの理由か（途中で止まった理由ではない。ページの状態・未完了の理由の数・まだ見ていない数の
+ * 判定の唯一の所）。
+ */
+export const isSameContentSkipReason = (reason: { readonly code: string }): boolean => reason.code === 'SAME_CONTENT_AS_EARLIER_PAGE';
+
+/** DUP: 表示の中身が同じなので始めなかったビューポートか（`SKIPPED` で、理由が `isSameContentSkipReason`）。 */
+export const isSameContentSkippedViewport = (viewport: {
+  readonly status: ViewportAuditStatus;
+  readonly incompleteReasons: readonly { readonly code: string }[];
+}): boolean => viewport.status === 'SKIPPED' && viewport.incompleteReasons.some(isSameContentSkipReason);
+
 /**
  * collector が PARTIAL を返したか、例外を投げた場合の未完了の理由（Task 14〜17 の設計書 4.5.5）。
  * コードは `COLLECTOR_INCOMPLETE`、`detail` は `<段階>:<理由>`。`<理由>` は、collector の PARTIAL の理由か、

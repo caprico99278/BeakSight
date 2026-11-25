@@ -123,8 +123,18 @@ const isSecretLikeAttributeValue = (value: string): boolean =>
   isSecretLikeAttributePart(value) || value.split(ATTRIBUTE_PART_SEPARATORS).some(isSecretLikeAttributePart);
 
 /**
+ * WBF（DEF-291 の A）: 描画の順で替わりうる id（React の useId の形 `:r1:`・`«r1»`・`_r_1_`）。描画の順が変われば、同じ id が別の欄に付きうるので、候補の
+ * CSS に使わない（構造の CSS に回す）。REV-WBF の Minor-2: id の全体がその形で、区切りの間が短い英数字（React の 32 進の番号）のときだけ当てる
+ * （`mainForm:region:username` のような、区切りを含むだけのほかの id は今どおり使う）。
+ */
+const RENDER_ORDER_ID = /^(?::[rR][0-9a-z]{1,8}:|«[rR][0-9a-z]{1,8}»|_[rR]_[0-9a-z]{1,8}_)$/u;
+
+/** WBF: id（escape を解いた値）が、描画の順で替わりうる形か（唯一の判定。DEF-297: 候補群の selector の丸めも使う）。 */
+export const isRenderOrderId = (id: string): boolean => RENDER_ORDER_ID.test(id);
+
+/**
  * 1 つの要素の事実から、候補の CSS の並び（`#id` → `tag[name="…"]` → `tag[type="…"]`。重ねない）。名前がなければ空。FM2R の Minor 14: 秘密に見える
- * `id`・`name` は使わない（ほかの形の候補が残れば、それで数える。なければ案なし）。
+ * `id`・`name` は使わない（ほかの形の候補が残れば、それで数える。なければ案なし）。WBF: 描画の順の id（`RENDER_ORDER_ID`）も使わない。
  */
 export const entrySelectorCandidatesOf = ({ tag, id, name, type }: EntryElementFacts): readonly string[] => {
   if (tag.length === 0) {
@@ -132,12 +142,27 @@ export const entrySelectorCandidatesOf = ({ tag, id, name, type }: EntryElementF
   }
   const element = cssIdentifierOf(tag);
   const candidates = [
-    ...(id.length === 0 || isSecretLikeAttributeValue(id) ? [] : [`#${cssIdentifierOf(id)}`]),
+    ...(id.length === 0 || isSecretLikeAttributeValue(id) || isRenderOrderId(id) ? [] : [`#${cssIdentifierOf(id)}`]),
     ...(name.length === 0 || isSecretLikeAttributeValue(name) ? [] : [`${element}[name=${cssStringOf(name)}]`]),
     ...(type.length === 0 ? [] : [`${element}[type=${cssStringOf(type)}]`]),
   ];
   // T43R-fix の M-4: Playwright の `css=` が解釈できない形は案にしない。
   return [...new Set(candidates)].filter(isPlaywrightCssShape);
+};
+
+/**
+ * WBF（DEF-291 の A）: 要素の位置（文書の根からの、要素の子の中の番号の並び。`StandardReaders.elementPathOf` の数え方。根の要素は 0）から作る構造の CSS
+ * （`:root > :nth-child(…) > … > tag:nth-child(…)`。標準の CSS だけ。サイトの語を含まない）。名前のない欄の、最後の候補（一意かは、ほかの候補と同じく
+ * 文書で数えて確かめる）。位置が根の要素から始まらない・要素の名前がなければ null。
+ */
+export const structuralSelectorOf = (path: readonly number[], tag: string): string | null => {
+  const [root, ...steps] = path;
+  const last = steps.at(-1);
+  if (root !== 0 || last === undefined || tag.length === 0) {
+    return null;
+  }
+  const inner = steps.slice(0, -1).map((step) => `:nth-child(${String(step + 1)})`);
+  return [':root', ...inner, `${cssIdentifierOf(tag)}:nth-child(${String(last + 1)})`].join(' > ');
 };
 
 /** 数えた結果のうち、ちょうど 1 つに当たり、それが読んだ要素である最初の CSS（なければ `null`）。 */

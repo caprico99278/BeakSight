@@ -41,6 +41,11 @@ export interface FindingDraft {
    * 名前 `viewport` は予約名で、使うと検査の失敗になる。
    */
   readonly identityFields: readonly FindingFingerprintIdentityField[];
+  /**
+   * REV-AUD3 の I-2: 指摘と Evidence の項目を結ぶだけの鍵（名前は `LINK_KEY_FIELD_NAMES`）。Finding の `groupingKeys` の後ろに残すが、fingerprint と候補群の
+   * 鍵には入れない。省略は、なし。AUD-5: 区分の鍵（名前は `GROUP_CLASS_KEY_FIELD_NAMES`）もここで渡す（fingerprint に入れず、候補群の鍵には入れる）。
+   */
+  readonly linkKeys?: readonly FindingFingerprintIdentityField[];
 }
 
 /**

@@ -57,7 +57,10 @@ afterAll(async () => {
 
 /** 作業のディレクトリの下の、`name` の出力先に書く、実行時間を抑えた Run の設定（`/crawl/` の5ページ）。 */
 const configFor = (name: string): AuditConfig =>
-  fastRunConfig(server.origin, START_PATH, { target: { id: 'audit-run' }, output: { directory: join(workDirectory, name) } });
+  fastRunConfig(server.origin, START_PATH, { target: { id: AUDIT_RUN_TARGET_ID }, output: { directory: join(workDirectory, name) } });
+
+/** `configFor` の対象の ID（監査中の印は出力先 + 対象の ID。PAR-a）。 */
+const AUDIT_RUN_TARGET_ID = 'audit-run';
 
 /** 本物の headless Chromium で Run を行う依存。`stopAfterPages` を渡すと、そのページ数を終えたときに止める印を付ける。 */
 function realDependencies(stopAfterPages?: number): AuditRunDependencies {
@@ -91,7 +94,7 @@ interface ObservedRun {
 
 /** 出力先の監査中の印が、ほかの起動に持たれているか（取れたら、すぐ離す）。 */
 async function isExclusionHeld(outputDirectory: string): Promise<boolean> {
-  const exclusion = await acquireRunExclusion(outputDirectory);
+  const exclusion = await acquireRunExclusion(outputDirectory, AUDIT_RUN_TARGET_ID);
   if (exclusion.kind === 'ACQUIRED') {
     await exclusion.release();
   }
@@ -107,7 +110,7 @@ function observingObserver(): { readonly observer: AuditRunObserver; readonly ob
       onRunStarted: (started) => {
         observed.hooks.push('onRunStarted');
         observed.started.push(started);
-        // SPEC-2: 監査中の印は、出力先（Run のディレクトリの親）の排他。
+        // SPEC-2・PAR-a: 監査中の印は、出力先（Run のディレクトリの親）+ 対象の ID の排他。
         observed.lockHeldWhenStarted.push(isExclusionHeld(dirname(started.runDirectory)));
       },
       onProgress: (report) => {

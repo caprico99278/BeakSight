@@ -1,8 +1,10 @@
 import type { Page } from 'playwright';
 import type { PageId } from '../core/contracts.js';
 import { SUBMIT_CONTROL_TYPES } from '../core/evidence-types.js';
+import { createSha256Fingerprint } from '../core/ids.js';
 import type {
   DomDocumentFieldTruncationEvidence,
+  CollectedDomEvidence,
   DomEvidence,
   DuplicateIdEvidence,
   FormDomEvidence,
@@ -18,7 +20,9 @@ import type {
 } from '../core/evidence-types.js';
 import { readInParts } from '../core/read-in-parts.js';
 import { VISIBILITY_CHECK_OPTIONS } from '../core/visibility.js';
-import { composeInPage, type StandardReaders } from '../browser/in-page-readers.js';
+import {
+  composeInPage, DISCOVERY_CANDIDATE_ELEMENT_CRITERIA, type DiscoveryCandidateElementCriteria, type StandardReaders,
+} from '../browser/in-page-readers.js';
 import { collectErrorDisplay } from './error-display-collector.js';
 
 /*
@@ -61,11 +65,19 @@ interface RawTextPart {
   readonly total: number;
 }
 
+/**
+ * DUP: ページの中から受け取る欄。表示の値（`shownValue`。見えない欄とパスワードの欄は `null`）は、Node の側で digest にまとめて捨てる（記録に値を残さない）。
+ */
+type RawFormField = FormFieldEvidence & { readonly shownValue: string | null };
+type RawFormDom = Omit<FormDomEvidence, 'fields'> & { readonly fields: readonly RawFormField[] };
+
 /** ページの中の 1 回の読み取りの結果。文書の項目とスクロール位置は、どの回も同じものを返す（まとめるときは最初の回のものを使う）。 */
 interface RawDomPart {
   readonly scrollPosition: ScrollPosition;
   /** EV-1: 見えている読み込み中の表示の数（文書の項目。どの回も同じものを返す）。 */
   readonly loadingIndicators: LoadingIndicatorEvidence;
+  /** SKIP-1: 操作さがしの候補の数（文書の項目。どの回も同じものを返す。数えられなければ null）。 */
+  readonly discoveryCandidateCount?: number | null;
   readonly title: string | null;
   readonly metaDescription: string | null;
   readonly canonicalUrl: string | null;
@@ -74,8 +86,8 @@ interface RawDomPart {
   readonly source: VisibleTextSource;
   readonly headings: RawListPart<HeadingEvidence>;
   readonly images: RawListPart<ImageDomEvidence>;
-  readonly forms: RawListPart<FormDomEvidence>;
-  readonly unassociatedFields: RawListPart<FormFieldEvidence>;
+  readonly forms: RawListPart<RawFormDom>;
+  readonly unassociatedFields: RawListPart<RawFormField>;
   readonly duplicateIds: RawListPart<DuplicateIdEvidence>;
   readonly regions: RawListPart<SemanticRegionEvidence>;
   readonly text: RawTextPart;
@@ -108,14 +120,33 @@ function assertCount(value: number, name: string): void {
   }
 }
 
-function validateField(field: FormFieldEvidence, name: string): void {
+function validateField(field: RawFormField, name: string): void {
   if (typeof field.visible !== 'boolean') {
     throw new Error(`Invalid browser DOM flag: ${name}.visible`);
   }
+  if (field.shownValue !== null && typeof field.shownValue !== 'string') {
+    throw new Error(`Invalid browser DOM value: ${name}.shownValue`);
+  }
 }
 
-function freezeField(field: FormFieldEvidence): FormFieldEvidence {
-  return Object.freeze({ ...field, labels: Object.freeze([...field.labels]) });
+/** 記録する欄（表示の値は除く）。 */
+function freezeField(field: RawFormField): FormFieldEvidence {
+  const { shownValue: _shownValue, ...recorded } = field;
+  return Object.freeze({ ...recorded, labels: Object.freeze([...field.labels]) });
+}
+
+/** DUP: 記録する DOM の Evidence（欄の表示の値の digest を外したもの）。 */
+export const recordedDomEvidenceOf = (dom: CollectedDomEvidence): DomEvidence => {
+  const { fieldValuesDigest: _fieldValuesDigest, ...recorded } = dom;
+  return Object.freeze(recorded);
+};
+
+/** DUP: 欄の表示の値の digest の入力の形の印（版つき）。 */
+const FIELD_VALUES_DIGEST_FORMAT = 'beaksight-dom-field-values/1';
+
+/** DUP: 欄の表示の値の digest（文書の順。値そのものは返さない）。 */
+function fieldValuesDigestOf(fields: readonly RawFormField[]): string {
+  return createSha256Fingerprint(JSON.stringify([FIELD_VALUES_DIGEST_FORMAT, fields.map(({ shownValue }) => shownValue)]));
 }
 
 /**
@@ -128,6 +159,10 @@ function validateRawDomPart(raw: RawDomPart): void {
   }
   for (const [name, value] of Object.entries(raw.loadingIndicators)) {
     assertCount(value, `loadingIndicators.${name}`);
+  }
+  // SKIP-1: 数がない（null・欠け）のは「分からない」として扱う（記録しない）。
+  if (raw.discoveryCandidateCount !== null && raw.discoveryCandidateCount !== undefined) {
+    assertCount(raw.discoveryCandidateCount, 'discoveryCandidateCount');
   }
   for (const name of LIST_PART_NAMES) {
     assertBoundedList(raw[name].items, DOM_COLLECTION_PART_SIZE, name);
@@ -148,6 +183,9 @@ function validateRawDomPart(raw: RawDomPart): void {
   raw.duplicateIds.items.forEach((duplicate, index) => {
     if (!Number.isSafeInteger(duplicate.count) || duplicate.count < 2) {
       throw new Error(`Invalid browser DOM duplicate id count: ${index}`);
+    }
+    if (duplicate.referenceCount !== undefined && (!Number.isSafeInteger(duplicate.referenceCount) || duplicate.referenceCount < 0)) {
+      throw new Error(`Invalid browser DOM duplicate id reference count: ${index}`);
     }
   });
   for (const [field, truncated] of Object.entries(raw.documentFields)) {
@@ -173,7 +211,7 @@ function nextDomPartCursor(cursor: DomPartCursor, raw: RawDomPart): DomPartCurso
 }
 
 /** 部分ごとの読み取りを、1 つの DOM の Evidence にまとめる（文書の項目とスクロール位置は最初の部分のもの）。 */
-function assembleDomEvidence(parts: readonly RawDomPart[], pageId: PageId): DomEvidence {
+function assembleDomEvidence(parts: readonly RawDomPart[], pageId: PageId): CollectedDomEvidence {
   const [first] = parts;
   if (first === undefined) {
     throw new Error('Missing browser DOM part');
@@ -183,12 +221,17 @@ function assembleDomEvidence(parts: readonly RawDomPart[], pageId: PageId): DomE
   const headings = listOf('headings', (heading: HeadingEvidence) => Object.freeze({ ...heading }));
   const regions = listOf('regions', (region: SemanticRegionEvidence) => Object.freeze({ ...region }));
   const images = listOf('images', (image: ImageDomEvidence) => Object.freeze({ ...image }));
-  const forms = listOf('forms', (form: FormDomEvidence) => Object.freeze({
+  const forms = listOf('forms', (form: RawFormDom): FormDomEvidence => Object.freeze({
     ...form,
     fields: Object.freeze(form.fields.map(freezeField)),
     submitControls: Object.freeze(form.submitControls.map((control) => Object.freeze({ ...control }))),
   }));
   const unassociatedFields = listOf('unassociatedFields', freezeField);
+  // DUP: 表示の値は、form の欄、form に属さない欄の順に digest にまとめる（記録の欄には残さない）。
+  const rawFields = [
+    ...parts.flatMap((part) => part.forms.items.flatMap((form) => form.fields)),
+    ...parts.flatMap((part) => part.unassociatedFields.items),
+  ];
   const duplicateIds = listOf('duplicateIds', (duplicate: DuplicateIdEvidence) => Object.freeze({ ...duplicate }));
   const textOf = (name: (typeof TEXT_PART_NAMES)[number]): string => parts.map((part) => part[name].slice).join('');
 
@@ -232,6 +275,8 @@ function assembleDomEvidence(parts: readonly RawDomPart[], pageId: PageId): DomE
       progressbarCount: first.loadingIndicators.progressbarCount,
       indeterminateProgressCount: first.loadingIndicators.indeterminateProgressCount,
     }),
+    ...(typeof first.discoveryCandidateCount === 'number' ? { discoveryCandidateCount: first.discoveryCandidateCount } : {}),
+    fieldValuesDigest: fieldValuesDigestOf(rawFields),
   });
 }
 
@@ -239,6 +284,8 @@ function assembleDomEvidence(parts: readonly RawDomPart[], pageId: PageId): DomE
 interface DomEvaluationArgument {
   readonly visibilityOptions: typeof VISIBILITY_CHECK_OPTIONS;
   readonly submitControlTypes: typeof SUBMIT_CONTROL_TYPES;
+  /** SKIP-1: 操作さがしの候補になる要素の基準（`DISCOVERY_CANDIDATE_ELEMENT_CRITERIA`）。 */
+  readonly candidateElements: DiscoveryCandidateElementCriteria;
   readonly cursor: DomPartCursor;
   readonly partSize: number;
   readonly textPartLength: number;
@@ -251,7 +298,7 @@ interface DomEvaluationArgument {
  */
 function collectDomEvidenceReader(
   R: StandardReaders,
-  { visibilityOptions, submitControlTypes, cursor, partSize, textPartLength }: DomEvaluationArgument,
+  { visibilityOptions, submitControlTypes, candidateElements, cursor, partSize, textPartLength }: DomEvaluationArgument,
 ): RawDomPart {
   // DOM clobbering（DEF-069）: form の中の名前つきの入力の欄は、form の同じ名前のプロパティとメソッドを隠す（`<input name="method">` で
   // `form.method` が入力の欄になる）。form になりうる要素（文書をたどる途中のすべての要素と、form そのもの）の標準のプロパティとメソッドは、
@@ -577,15 +624,30 @@ function collectDomEvidenceReader(
     || element instanceof HTMLSelectElement
     || element instanceof HTMLTextAreaElement
   );
-  const fieldEvidence = (field: FieldElement): FormFieldEvidence => {
+  // DUP: 表示の値（見えない欄とパスワードの欄は `null`。チェックの欄はチェックの有無、select は選んだ選択肢の文字）。Node の側で digest にして捨てる。
+  const shownValueOf = (field: FieldElement, visible: boolean): string | null => {
+    if (!visible || (field instanceof HTMLInputElement && field.type === 'password')) {
+      return null;
+    }
+    if (field instanceof HTMLInputElement && (field.type === 'checkbox' || field.type === 'radio')) {
+      return field.checked ? 'checked' : 'unchecked';
+    }
+    if (field instanceof HTMLSelectElement) {
+      return JSON.stringify([...field.selectedOptions].map((option) => option.text));
+    }
+    return field.value;
+  };
+  const fieldEvidence = (field: FieldElement): RawFormField => {
     const labels = [...(field.labels ?? [])]
       .map(visibleTextOf)
       .filter((label) => label.length > 0);
+    const visible = isVisible(field);
     return {
+      shownValue: shownValueOf(field, visible),
       type: field instanceof HTMLTextAreaElement ? 'textarea' : field.type,
       name: normalizeWhitespace(field.getAttribute('name')),
       required: field.required,
-      visible: isVisible(field),
+      visible,
       labels,
       hasAriaLabel: hasNonBlankAttribute(field, 'aria-label'),
       hasAriaLabelledby: hasNonBlankAttribute(field, 'aria-labelledby'),
@@ -594,7 +656,7 @@ function collectDomEvidenceReader(
     };
   };
   const formElements = [...formsOf(document)];
-  const forms = formElements.slice(cursor.forms, cursor.forms + partSize).map((form): FormDomEvidence => {
+  const forms = formElements.slice(cursor.forms, cursor.forms + partSize).map((form): RawFormDom => {
     const fields = [...formElementsOf(form)].filter(isField).map(fieldEvidence);
     const submitControls = submitControlCandidates
       .filter((control) => control.form === form)
@@ -648,14 +710,41 @@ function collectDomEvidenceReader(
     }
   }
   const duplicatedIds = [...idCounts].filter(([, count]) => count > 1);
-  const duplicateIds = duplicatedIds.map(([id, count]): DuplicateIdEvidence => ({ id, count, truncated: false }));
+  // RVP-5（設計書 `2026-11-24-beaksight-review-pending-evidence-design.md` 2.6）: 重複している id を参照する要素の数（`label[for]`・id の並びの aria の属性・
+  // `list`・`form`・`headers`・ページの中のリンク `#id`）。1 つの要素が同じ id を 2 つの属性で参照しても 1 と数える。
+  const references = new Map<string, number>(duplicatedIds.map(([id]) => [id, 0]));
+  const referenceAttributes = ['for', 'aria-labelledby', 'aria-describedby', 'aria-controls', 'aria-owns', 'aria-activedescendant', 'aria-details',
+    'aria-errormessage', 'aria-flowto', 'list', 'form', 'headers'];
+  if (references.size > 0) {
+    // ページの中のリンクは、行き先の値を読まず、`#` で始まる href の要素だけを見る（リンクの取り出しは `src/crawl/discover-links.ts` の 1 か所。GATE-ARCH03）。
+    for (const element of queryDocumentAll(`${referenceAttributes.map((name) => `[${name}]`).join(', ')}, [href^="#"]`)) {
+      const referenced = new Set<string>();
+      for (const name of referenceAttributes) {
+        for (const id of (getAttributeOf(element, name) ?? '').split(/\s+/u)) {
+          if (references.has(id)) referenced.add(id);
+        }
+      }
+      const href = getAttributeOf(element, 'href');
+      if (href !== null && href.startsWith('#') && references.has(href.slice(1))) referenced.add(href.slice(1));
+      for (const id of referenced) references.set(id, (references.get(id) ?? 0) + 1);
+    }
+  }
+  const duplicateIds = duplicatedIds.map(([id, count]): DuplicateIdEvidence => ({ id, count, truncated: false, referenceCount: references.get(id) ?? 0 }));
 
   // EV-1・EV-3: 見えている読み込み中の表示の数（読み方は部品の 1 か所。落ち着きの待ちと同じ）。
   const loadingIndicators: LoadingIndicatorEvidence = R.loadingIndicatorsIn(visibilityOptions);
+  // SKIP-1: 操作さがしの候補の数（選び方は probe と共通の部品。数えられなければ null）。
+  let discoveryCandidateCount: number | null;
+  try {
+    discoveryCandidateCount = R.discoveryCandidateCountIn(candidateElements);
+  } catch {
+    discoveryCandidateCount = null;
+  }
 
   return {
     scrollPosition,
     loadingIndicators,
+    discoveryCandidateCount,
     title,
     metaDescription: description,
     canonicalUrl,
@@ -684,12 +773,13 @@ const collectDomEvidenceInPage = composeInPage(collectDomEvidenceReader);
  * COV-6: 件数と本文の長さで打ち切らない。ページの中の読み取りを、一覧ごとに `DOM_COLLECTION_PART_SIZE` 件、テキストごとに `DOM_TEXT_PART_LENGTH` 字に
  * 分け、続きの位置から読み直して（`readInParts`）全部を 1 つの記録にまとめる。分けた回数を `collectedInParts` に残す。
  */
-export async function collectDomEvidence(page: Page, pageId: PageId): Promise<DomEvidence> {
+export async function collectDomEvidence(page: Page, pageId: PageId): Promise<CollectedDomEvidence> {
   const parts = await readInParts(FIRST_DOM_PART_CURSOR, async (cursor: DomPartCursor) => {
     // ブラウザ内では import できないため、送信のコントロールの `type` の一覧（`SUBMIT_CONTROL_TYPES`）は引数で渡す。
     const part = await page.evaluate(collectDomEvidenceInPage, {
       visibilityOptions: VISIBILITY_CHECK_OPTIONS,
       submitControlTypes: SUBMIT_CONTROL_TYPES,
+      candidateElements: DISCOVERY_CANDIDATE_ELEMENT_CRITERIA,
       cursor,
       partSize: DOM_COLLECTION_PART_SIZE,
       textPartLength: DOM_TEXT_PART_LENGTH,

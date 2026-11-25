@@ -8,6 +8,7 @@
  * - 発表の前の確かめ（`missingArtifactReferencePaths`）は、参照先を `ReadArtifactFile` で 1 回ずつ読み、ないものを返す（AUD-1c）。
  */
 import {
+  BEFORE_HIDE_SCREENSHOT_DIRECTORY,
   FOCUS_CHECK_SCREENSHOT_DIRECTORY_PREFIX,
   PAGES_ARTIFACT_DIRECTORY,
   PAGE_ARTIFACT_FILE_NAMES,
@@ -157,6 +158,7 @@ export function isPageArtifactReferencePath(value: unknown): value is string {
   const stageOk = afterStress.length === 0
     ? stages.length === 1
     : afterStress.length === 1 && (afterStress[0] === RECHECK_SCREENSHOT_DIRECTORY
+      || afterStress[0] === BEFORE_HIDE_SCREENSHOT_DIRECTORY
       || isNumberedDirectoryName(afterStress[0] ?? '', FOCUS_CHECK_SCREENSHOT_DIRECTORY_PREFIX)
       || isNumberedDirectoryName(afterStress[0] ?? '', REVEAL_SCREENSHOT_DIRECTORY_PREFIX));
   return fileName === SCREENSHOT_FILE_NAMES.VIEWPORT && stageOk;

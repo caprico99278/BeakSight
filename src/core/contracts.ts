@@ -238,6 +238,12 @@ export const INCOMPLETE_REASON_CODES = Object.freeze([
    * 続いたため、その段を「静まらない」として終えた。それまでに集めた記録は残し、次へ進む。`detail` は段の名前。
    */
   'STAGE_NEVER_QUIET',
+  /**
+   * DUP（設計書 `2026-11-18-beaksight-same-structure-pages-design.md` 2 章）: 同じ作りで、表示の中身も点検した画面と同じだったので、そのビューポートを始めなかった
+   * （Mobile の `SKIPPED` の理由。`detail` は同じ中身の画面のページの ID）。途中で止まった理由ではない（ページの状態を `PARTIAL` にせず、未完了の理由の数と
+   * まだ見ていない数に入れず、時間切れの再開の読み直しの候補にもしない。判定は `isSameContentSkipReason`、`src/core/status.ts`）。
+   */
+  'SAME_CONTENT_AS_EARLIER_PAGE',
 ] as const);
 export type IncompleteReasonCode = (typeof INCOMPLETE_REASON_CODES)[number];
 
@@ -520,6 +526,11 @@ export interface ViewportNotificationHandlingRecord {
   readonly dismissedCount: number;
   readonly hiddenCount: number;
   readonly digests: readonly string[];
+  /**
+   * S-03a: 幅の走査（stress）で隠した枠の数（digest で数える。`hiddenCount` は主の読み込みだけ）。幅の走査で通知の枠を見たときだけ。前の版の記録にはない
+   * （任意の項目。版は今のまま）。
+   */
+  readonly stressHiddenCount?: number;
 }
 
 export type EvidenceRecord = {
@@ -619,6 +630,37 @@ export interface PageAuditResult {
   readonly evidence: readonly EvidenceRecord[];
   readonly findings: readonly Finding[];
   readonly incompleteReasons: readonly IncompleteReason[];
+  /**
+   * DUP（設計書 `2026-11-18-beaksight-same-structure-pages-design.md` 2 章）: 同じ作りの 2 つ目以降として、軽い点検（`LIGHT`）にしたか、点検を省いた（`SAME`）
+   * ページの記録（任意の項目）。しっかり点検したページと、前の書き手の page.json は持たない。
+   */
+  readonly sameness?: PageSamenessRecord;
+  /**
+   * AUD-5（設計書 `2026-11-19-beaksight-audit-result-review-fixes-design.md` 8.2）: Desktop で作った作りの鍵（DUP の `auditPageTemplateKeyOf`。データを抜いた
+   * 形の digest。任意の項目）。題名の重なりを、同じ画面の別のデータと分けるために Cross-page rule が読む。作れなかったページと、前の書き手の page.json は持たない。
+   */
+  readonly templateKey?: string;
+}
+
+/** DUP: しっかり点検しなかったページの深さの閉じた一覧（`LIGHT` は軽い点検、`SAME` は点検を省いた）。 */
+export const PAGE_SAMENESS_DEPTHS = Object.freeze(['LIGHT', 'SAME'] as const);
+export type PageSamenessDepth = (typeof PAGE_SAMENESS_DEPTHS)[number];
+
+/** DUP: 同じ作りの表（巡回の保存の `pageReferences`）に入れる、点検を終えたページの深さの閉じた一覧（しっかり点検した・軽い点検）。 */
+export const PAGE_REFERENCE_DEPTHS = Object.freeze(['FULL', 'LIGHT'] as const);
+export type PageReferenceDepth = (typeof PAGE_REFERENCE_DEPTHS)[number];
+
+/** DUP: 軽い点検にしたか、点検を省いたページの記録。 */
+export interface PageSamenessRecord {
+  readonly depth: PageSamenessDepth;
+  /** `LIGHT` は同じ作りのしっかり点検したページ、`SAME` は表示の中身が同じ点検したページのページの ID。 */
+  readonly sameAs: PageId;
+}
+
+/** DUP: 軽い点検にしたページと、点検を省いたページの数（`RunSummary.pageSamenessCounts`）。 */
+export interface RunPageSamenessCounts {
+  readonly lightPages: number;
+  readonly samePages: number;
 }
 
 /**
@@ -922,6 +964,15 @@ export interface RunLoadRecentPerMinute {
 }
 
 /**
+ * DSEED2: 連鎖の操作さがしの見つけた画面の分け方。`fromAuditStage` は直前の点検の段で読んだ画面から最初に入れた画面の数、`newlyFound` は操作さがしが新しく
+ * 見つけた画面の数（和は見つけた画面の数）。進み具合（`RunProgressReport`）と成果物（`discovery.json`）が同じ形で持つ。
+ */
+export interface DiscoveredPagesSplit {
+  readonly fromAuditStage: number;
+  readonly newlyFound: number;
+}
+
+/**
  * 実行中の進み具合の事実（サイトへの負荷の制御の設計書 4.8）。Run Coordinator が、ページの監査が1つ終わるたびに（`markFinished` と
  * Link からの発見の後に）組み立て、注入された受け手（`RunCoordinatorDependencies.onProgress`）に渡す。JSON にできる、凍結した値。
  * 表示の側は、この値を書式にかけるだけで、数え直したり計算したりしない。run.json には書かない（最後の記録は `RunSummary.load`）。
@@ -934,6 +985,11 @@ export interface RunProgressReport {
   readonly pagesFinished: number;
   /** 発見したページの数（開始の URL を含む。`CrawlFrontier.discoveredCount`）。 */
   readonly pagesDiscovered: number;
+  /**
+   * DSEED2（設計書 `2026-11-19-beaksight-discovery-seed-from-audit-design.md`）: まとめて実行の連鎖の操作さがしだけが持つ、見つけた画面（`pagesDiscovered`）の
+   * 分け方（ワーカーが数えた唯一の元。画面は数え直さない）。連鎖でない操作さがし・点検・見るだけの確かめは持たない（項目がない）。
+   */
+  readonly pagesDiscoveredSplit?: DiscoveredPagesSplit;
   /** 設定の `crawl.maxPages`。L14 の後の段: 利用者が指定したときだけ持つ（ないときは上限なし。表示は「指定なし」）。 */
   readonly maxPages?: number;
   /** この実行の開始からの経過時間（ms。注入した `now` で測る。0 以上）。 */
@@ -1026,6 +1082,10 @@ export interface RunSummary {
    * ビューポートの理由。理由のコードの一覧の順。1 ページは理由ごとに 1 回）。理由を持つページがなければ持たない。前の書き手の `run.json` にもない。
    */
   readonly pageIncompleteReasonCounts?: readonly PageIncompleteReasonCount[];
+  /**
+   * DUP: 同じ作りの 2 つ目以降として、軽い点検にしたページと、点検を省いたページの数（任意の項目。どちらかが 1 以上のときだけ持つ。前の書き手の `run.json` にもない）。
+   */
+  readonly pageSamenessCounts?: RunPageSamenessCounts;
   /** サイトへの負荷の記録（サイトへの負荷の制御の設計書 4.5）。PREFLIGHT の失敗などで早く終わった Run にも入れる。 */
   readonly load: RunLoad;
   /**
@@ -1041,11 +1101,24 @@ export interface RunSummary {
   readonly pageScope?: RunPageScopeRecord;
 }
 
-/** T44c: ページの未完了の理由ごとのページの数（`RunSummary.pageIncompleteReasonCounts` の 1 件）。 */
+/**
+ * T44c: ページの未完了の理由ごとのページの数（`RunSummary.pageIncompleteReasonCounts` の 1 件）。
+ * PIR: 点検の範囲の外へ移った読み込みの失敗（`isOutsideAuditScopeNavigation`）は、`detail` を持つ別の項目として数える。`pageUrls` はその理由を持つページの
+ * URL の全部（URL の発見の順。件数は `pages` と同じ）。どちらも任意で、前の書き手の `run.json` にはない。
+ */
 export interface PageIncompleteReasonCount {
   readonly code: IncompleteReasonCode;
+  readonly detail?: typeof OUTSIDE_AUDIT_SCOPE_NAVIGATION_DETAIL;
   readonly pages: number;
+  readonly pageUrls?: readonly string[];
 }
+
+/** PIR: 点検の範囲の外へ移ったので点検しなかった読み込みの失敗の、`NAVIGATION_FAILED` の `detail`（SD-2。`navigationFailureDetail` が作る）。 */
+export const OUTSIDE_AUDIT_SCOPE_NAVIGATION_DETAIL = 'BLOCKED_EXTERNAL_REDIRECT' satisfies NavigationOutcomeKind;
+
+/** PIR: 理由が、点検の範囲の外へ移ったので点検しなかった読み込みの失敗か（表示と数え上げで理由を分ける判定の唯一の所）。 */
+export const isOutsideAuditScopeNavigation = (reason: { readonly code: IncompleteReasonCode; readonly detail?: string | null }): boolean =>
+  reason.code === 'NAVIGATION_FAILED' && reason.detail === OUTSIDE_AUDIT_SCOPE_NAVIGATION_DETAIL;
 
 /**
  * `run.json` の `authentication`（DEF-138）: 監査の段の数（スクリプトで送るログインの Run）に、セッションの切れの証拠（任意）を足したものか、証拠だけ

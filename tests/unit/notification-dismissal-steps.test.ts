@@ -18,7 +18,11 @@ interface FakeFrame {
   readonly status: NotificationFrameStatus;
   readonly surfaceAreaRatio?: number | null;
   readonly onPress?: 'remove' | 'stay' | 'fail' | 'move';
+  readonly modal?: boolean;
 }
+
+/** 偽の口が、隠したときに返す画面の幅とスクロールの位置。 */
+const HIDDEN_AT = Object.freeze({ viewportWidth: 800, scrollX: 0, scrollY: 120 });
 
 const BUTTON_ID_OFFSET = 1_000;
 
@@ -29,6 +33,8 @@ const fakePortOf = (frames: readonly FakeFrame[], options: { readonly canBeginPr
   const log: string[] = [];
   const readAtMs: number[] = [];
   const clock = createFakeClock(10_000);
+  /** 偽の画面の幅とスクロールの位置（隠す前の画像を撮ると先頭へ移る）。 */
+  const position: { viewportWidth: number; scrollX: number; scrollY: number } = { ...HIDDEN_AT };
   const frameOf = (index: number): NotificationFrameWithElements => {
     const frame = frames[index] as FakeFrame;
     const pressable = frame.status === 'DISMISSIBLE' || frame.status === 'TOO_LARGE';
@@ -37,6 +43,7 @@ const fakePortOf = (frames: readonly FakeFrame[], options: { readonly canBeginPr
       status: frame.status,
       closeButton: pressable ? index : null,
       surfaceAreaRatio: frame.surfaceAreaRatio ?? 0.1,
+      modal: frame.modal ?? false,
       digest: frame.digest,
       frameElement: { backendNodeId: index, path: [0, index] },
       closeButtonElement: pressable ? { backendNodeId: BUTTON_ID_OFFSET + index, path: [0, index, 0] } : null,
@@ -74,15 +81,16 @@ const fakePortOf = (frames: readonly FakeFrame[], options: { readonly canBeginPr
     isGone: async (backendNodeId) => !present.has(backendNodeId - BUTTON_ID_OFFSET),
     hideFrame: async (backendNodeId) => {
       log.push(`hide ${(frames[backendNodeId] as FakeFrame).digest}`);
-      return true;
+      return { ...position };
     },
+    readViewportPosition: async () => ({ ...position }),
   };
   const dismiss = async (overrides: Partial<NotificationDismissalOptions> = {}) => {
     const result = dismissNotificationFramesWith(port, { deadlineAtMs: clock.now() + 60_000, pressMode: 'AUDIT', ...overrides }, clock);
     await clock.advance(120_000);
     return result;
   };
-  return { dismiss, log, readAtMs };
+  return { dismiss, log, readAtMs, position };
 };
 
 const factsOf = (overlay: Awaited<ReturnType<ReturnType<typeof fakePortOf>['dismiss']>>) =>
@@ -136,6 +144,32 @@ describe('RB-9: the loop that closes the notification frames', () => {
     ]);
     // 押す期間は 1 回だけ始め、押すのも隠すのも、その後。
     expect(log).toEqual(['begin', 'press modal', 'press stuck', 'hide stuck', 'hide panel', 'hide disabled']);
+  });
+
+  it('AUD-2: keeps a modal dialog open instead of hiding it, and records the hidden frame with the width and the scroll after one capture before the hide', async () => {
+    const { dismiss, log, position } = fakePortOf([
+      { digest: 'modal', status: 'NO_CLOSE_BUTTON', surfaceAreaRatio: 0.9, modal: true },
+      { digest: 'stuck-modal', status: 'TOO_LARGE', surfaceAreaRatio: 0.8, onPress: 'stay', modal: true },
+      { digest: 'panel', status: 'NO_CLOSE_BUTTON', surfaceAreaRatio: 0.7 },
+    ]);
+
+    // REV-AUD2 の M-2: 撮影の部品が先頭へ移しても、記録するのは移す前の位置。
+    const overlay = await dismiss({ beforeFirstHide: async () => { log.push('capture'); position.scrollY = 0; } });
+
+    expect(overlay.frames.map(({ digest, hidden, hiddenReason, keptOpen, hiddenAt }) => ({ digest, hidden, hiddenReason, keptOpen, hiddenAt }))).toEqual([
+      { digest: 'modal', hidden: false, hiddenReason: null, keptOpen: true, hiddenAt: undefined },
+      { digest: 'stuck-modal', hidden: false, hiddenReason: 'NOT_DISMISSED', keptOpen: true, hiddenAt: undefined },
+      { digest: 'panel', hidden: true, hiddenReason: 'NO_CLOSE_BUTTON', keptOpen: undefined, hiddenAt: HIDDEN_AT },
+    ]);
+    expect(log).toEqual(['begin', 'press stuck-modal', 'capture', 'hide panel']);
+  });
+
+  it('AUD-2: does not capture before the hide when nothing is hidden', async () => {
+    const { dismiss, log } = fakePortOf([{ digest: 'modal', status: 'NO_CLOSE_BUTTON', surfaceAreaRatio: 0.9, modal: true }]);
+
+    await dismiss({ beforeFirstHide: async () => { log.push('capture'); } });
+
+    expect(log).toEqual([]);
   });
 
   it('fix round 6: does not press a frame again after its press failed, and hides it as a frame that cannot be closed', async () => {

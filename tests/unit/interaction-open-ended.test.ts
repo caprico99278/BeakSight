@@ -7,11 +7,41 @@ import {
   INTERACTION_NOT_VERIFIABLE_REASON_CODES,
   INTERACTION_REASON_CODES,
 } from '../../src/core/evidence-types.js';
+import type { Page } from 'playwright';
 import {
   INTERACTION_NOT_VERIFIABLE_REASONS as INTERACTION_NOT_VERIFIABLE_KIND_BY_REASON,
+  auditInteraction,
   interactionFreezeEventRecorded,
   interactionStageEndReasonOf,
+  type InteractionAuditSession,
 } from '../../src/interaction/isolated-auditor.js';
+import type { InteractionCandidate } from '../../src/safety/interaction-policy.js';
+
+/** 押す候補（形だけ。押す前に見張りが終える）。 */
+const CANDIDATE: InteractionCandidate = Object.freeze({
+  candidateId: 'interaction-candidate:sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa',
+  ordinal: 0,
+  tagName: 'button',
+  role: null,
+  accessibleName: '詳しく',
+  textFingerprint: 'sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb',
+  ariaExpanded: 'false',
+  ariaControls: null,
+  ariaSelected: null,
+  controlledVisible: null,
+  controlledHidden: null,
+  formAssociated: false,
+  formMethod: null,
+  formAction: null,
+  href: null,
+  hrefKind: 'NONE',
+  download: false,
+  type: 'button',
+  disabled: false,
+  visible: true,
+  destructiveAction: false,
+  boundingBox: Object.freeze({ x: 10, y: 20, width: 100, height: 30, top: 20, right: 110, bottom: 50, left: 10 }),
+});
 import { SafetyLedger } from '../../src/safety/safety-ledger.js';
 import { INTERACTION_CLEANUP_TIMEOUT_MS, interactionTimeoutsOf } from '../../src/orchestration/page-auditor.js';
 import { INTERACTION_REASON_DESCRIPTIONS } from '../../src/presentation/messages.js';
@@ -36,6 +66,40 @@ describe('L5: the interaction ends by the progress watch', () => {
     expect(interactionStageEndReasonOf(ended('STAGE_NEVER_QUIET'))).toBe('STAGE_NEVER_QUIET');
     expect(interactionStageEndReasonOf(new AbortController().signal)).toBeNull();
     expect(interactionStageEndReasonOf(undefined)).toBeNull();
+  });
+
+  it('DEF-294: does not close the owner session again after the watch end has closed it', async () => {
+    let closed = false;
+    let closeCalls = 0;
+    // ページの操作はどれも失敗する偽の page（見張りが終えた後なので、操作は失敗する）。
+    const page = { on: () => undefined, off: () => undefined, isClosed: () => closed } as unknown as Page;
+    const session: InteractionAuditSession = {
+      page,
+      ledger: new SafetyLedger(),
+      isClosed: () => closed,
+      activateInteractionFreeze: async () => undefined,
+      close: async () => {
+        closeCalls += 1;
+        if (closed) throw new Error('Interaction owner session was already closed');
+        closed = true;
+      },
+    };
+    const controller = new AbortController();
+    controller.abort('STAGE_UNRESPONSIVE');
+    const result = await auditInteraction({
+      sessionFactory: async () => session,
+      targetUrl: 'http://127.0.0.1:1/',
+      candidate: CANDIDATE,
+      viewport: { width: 800, height: 600 },
+      navigationTimeoutMs: 10_000,
+      timeoutMs: 10_000,
+      cleanupTimeoutMs: 10_000,
+      deadlineAtMs: Date.now() + 60_000,
+      progress: { signal: controller.signal, mark: () => undefined, track: async (call) => call },
+    });
+
+    expect([result.status, result.reason, closeCalls]).toEqual(['NOT_VERIFIABLE', 'STAGE_UNRESPONSIVE', 1]);
+    expect(result.safety.invariantViolations).toEqual([]);
   });
 
   it('cuts the cleanup timeout off the interaction timeout unless the user gave one', () => {

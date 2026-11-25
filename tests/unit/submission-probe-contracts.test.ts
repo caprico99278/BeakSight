@@ -41,6 +41,7 @@ import {
   submissionProbeOpenerOf,
   submissionProbePressOrderOf,
   SUBMISSION_PROBE_CONFIRM_WORDS,
+  inputCheckSiblingsOf,
   withSubmissionProbes,
   type SubmissionProbeTargetPolicy,
 } from '../../src/discovery/submission-probe-contracts.js';
@@ -86,11 +87,20 @@ describe('T37c: the closed lists and the named constants of the submission probe
         // L6/L3-1 の続き（A1）: 覆われていたので押さなかった。
         'COVERED_BY_OTHER',
         // SD-1: 削除に関する操作なので押さなかった。
-        'DESTRUCTIVE_ACTION_SKIPPED']);
+        'DESTRUCTIVE_ACTION_SKIPPED',
+        // DEF-289: 押す途中で的が消え続けた・押す輪を終えるまで押しにかからなかった。
+        'TARGET_VANISHED', 'NOT_REACHED',
+        // DEF-295: 押す前の準備の確かめで止まらない・見えない、状態を作り直せなかった。
+        'TARGET_NOT_STABLE', 'TARGET_NOT_VISIBLE', 'STATE_NOT_REBUILT',
+        // AIW: AI の操作なので押さなかった。
+        'AI_ACTION_SKIPPED',
+        // CALDAY: 同じ形の兄弟の代表で済んだ。
+        'SAME_SHAPE_NO_CHANGE']);
     // COV-2: ほかの画面の同じ構造の鍵の状態で、同じ候補を押した（押していない理由）。
     expect(SUBMISSION_PROBE_NOT_PRESSED_REASONS).toContain('SAME_STATE_PRESSED');
     // DEF-144: 実行できない理由に、probe だけの `EXTERNAL_SCHEME` を足す。DEF-186: 開き手の側の要求 `OPENER_SIDE_REQUEST` も足す。
-    expect(SUBMISSION_PROBE_NOT_EXECUTABLE_REASONS).toEqual([...API_SHAPE_NOT_EXECUTABLE_REASONS, 'EXTERNAL_SCHEME', 'OPENER_SIDE_REQUEST']);
+    // AIW の 4: 押下で AI の送信が出た `AI_GENERATION_REQUEST` も足す。
+    expect(SUBMISSION_PROBE_NOT_EXECUTABLE_REASONS).toEqual([...API_SHAPE_NOT_EXECUTABLE_REASONS, 'EXTERNAL_SCHEME', 'OPENER_SIDE_REQUEST', 'AI_GENERATION_REQUEST']);
     expect(SUBMISSION_PROBE_REASONS).toEqual([...SUBMISSION_PROBE_NOT_EXECUTABLE_REASONS, ...SUBMISSION_PROBE_NOT_OBSERVED_REASONS]);
     expect(SUBMISSION_PROBE_QUIET_WAIT_MS).toBe(2_000);
   });
@@ -500,7 +510,8 @@ describe('LU-4: the same identity is pressed once, and the opener of a row edito
     expect(SAME_IDENTITY_PRESSED_PROBE_REASON).toBe('SAME_IDENTITY_PRESSED');
     expect(SUBMISSION_PROBE_NOT_PRESSED_REASONS)
       .toEqual(['TARGET_NOT_FOUND', 'PRESS_LIMIT_REACHED', 'EXTERNAL_SCHEME', 'CONTEXT_CLOSED_BY_GUARD', 'SAME_IDENTITY_PRESSED',
-        'SAME_WORDS_NO_REQUEST', 'DISABLED_SUBMITTER', 'SHARED_LAYOUT_PRESSED', 'SAME_STATE_PRESSED', 'COVERED_BY_OTHER', 'DESTRUCTIVE_ACTION_SKIPPED']);
+        'SAME_WORDS_NO_REQUEST', 'SAME_SHAPE_NO_CHANGE', 'DISABLED_SUBMITTER', 'SHARED_LAYOUT_PRESSED', 'SAME_STATE_PRESSED', 'COVERED_BY_OTHER', 'DESTRUCTIVE_ACTION_SKIPPED', 'AI_ACTION_SKIPPED',
+        'TARGET_VANISHED', 'NOT_REACHED', 'TARGET_NOT_STABLE', 'TARGET_NOT_VISIBLE', 'STATE_NOT_REBUILT']);
     for (const reason of SUBMISSION_PROBE_NOT_PRESSED_REASONS) {
       expect((SUBMISSION_PROBE_REASONS as readonly string[]).includes(reason), reason).toBe(true);
     }
@@ -559,5 +570,38 @@ describe('DEF-208-4: the identity of a shared layout button', () => {
 
   it('is null for a button outside the layout landmarks (a body button)', () => {
     expect(sharedLayoutIdentityDigestOf({ ...facts, landmarks: [] })).toBeNull();
+  });
+});
+
+// SLIM（設計書 `doc/design/2026-11-25-beaksight-discovery-input-check-slim-design.md` 2.1）: 番号だけ違う欄の組は、文書の順で最初の 1 つ（代表）を確かめ、
+// 代表に違いが出なかったときだけ残りを確かめない。前に確かめた欄は押す輪の数え（`isFirst`）で省き、省いた兄弟も数えに入れる（後の画面で確かめ直さない）。
+describe('SLIM: the input checks of a group of same-shaped fields', () => {
+  const walk = (keys: readonly string[], quiet: (key: string) => boolean, earlier: ReadonlySet<number> = new Set()) => {
+    const siblings = inputCheckSiblingsOf(keys);
+    const asked: number[] = [];
+    const checked = keys.flatMap((key, at) => {
+      const decision = siblings.decide(key, () => {
+        asked.push(at);
+        return !earlier.has(at);
+      });
+      if (!decision.check) return [];
+      siblings.settle(key, quiet(key));
+      return [`${String(at)}:${decision.role}:${String(decision.siblings)}`];
+    });
+    return { checked, asked, counts: siblings.counts() };
+  };
+
+  it('checks only the representative of a quiet group, every member of a group that showed a difference, and a single field alone', () => {
+    expect(walk(['a', 'b', 'a', 'b', 'c'], (key) => key === 'a')).toEqual({
+      checked: ['0:REPRESENTATIVE:1', '1:REPRESENTATIVE:1', '3:SIBLING:1', '4:SINGLE:0'],
+      asked: [0, 1, 2, 3, 4],
+      counts: { checked: 4, skippedEarlier: 0, skippedSibling: 1 },
+    });
+  });
+
+  it('lets the first field not checked earlier stand for the group', () => {
+    expect(walk(['a', 'a', 'a'], () => true, new Set([0]))).toEqual({
+      checked: ['1:REPRESENTATIVE:2'], asked: [0, 1, 2], counts: { checked: 1, skippedEarlier: 1, skippedSibling: 1 },
+    });
   });
 });

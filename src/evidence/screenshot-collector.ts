@@ -3,7 +3,8 @@ import type { Page } from 'playwright';
 import { readDocumentScrollPosition, scrollDocumentToOrigin } from '../browser/controlled-scroll.js';
 import { isPortableRelativeArtifactPath } from '../core/artifact-layout.js';
 import { VIEWPORT_PROFILES, type PageId, type ViewportProfile } from '../core/contracts.js';
-import type { RevealCaptureEvidence, ScreenshotEvidence } from '../core/evidence-types.js';
+import type { EvidenceStateMark, RevealCaptureEvidence, ScreenshotEvidence } from '../core/evidence-types.js';
+import { readStateMark } from './state-mark.js';
 import { watchCollection, type CollectorWatchEnd, type CollectorWatchOptions } from '../browser/collector-watch.js';
 
 export interface ScreenshotCapturePath {
@@ -44,6 +45,8 @@ export interface ScreenshotCaptureOptions {
    * 省略（`BOTH`）は今までどおり両方（viewport → 全体の順）。Page Auditor は、viewport の画像を DOM・layout の直後に、全体の画像を後で撮るために分けて呼ぶ。
    */
   readonly parts?: ScreenshotCaptureParts | undefined;
+  /** AUD-4: 直前の layout の対象の selector（`stateMarkTargetSelectorsOf`）。渡すと、viewport の画像の状態の印に、対象の矩形を読み直して記録する。 */
+  readonly markTargets?: readonly string[] | undefined;
 }
 
 /** AUD-2c: 撮る画像の指定の閉じた一覧。 */
@@ -107,6 +110,7 @@ export async function captureScreenshots(
   const outcome = await watchCollection(page, async (signals) => {
     if (parts !== 'FULL_PAGE') {
       const viewportScrollPosition = await signals.track(scrollDocumentToOrigin(page));
+      const stateMark = await signals.track(stateMarkOrNull(page, options.markTargets));
       await signals.track(page.screenshot({ path: viewportOutputPath, type: 'png', fullPage: false, timeout: NO_SCREENSHOT_TIMEOUT_MS }));
       captured.push(Object.freeze({
         pageId,
@@ -114,6 +118,7 @@ export async function captureScreenshots(
         relativePath: viewportRelativePath,
         captureType: 'VIEWPORT' as const,
         scrollPosition: viewportScrollPosition,
+        ...(stateMark === null ? {} : { stateMark }),
       }));
     }
     if (parts === 'VIEWPORT') {
@@ -155,10 +160,14 @@ export async function captureViewportScreenshot(
     readonly stressWidth: number | null;
     /** EV-2: 対象まで動かした後の画像なら、測り直しの記録（先頭へ戻さずに、今の位置のまま撮る）。 */
     readonly reveal?: RevealCaptureEvidence | undefined;
+    /** AUD-4: 状態の画像なら、直前の layout の対象の selector（状態の印に、対象の矩形を読み直して記録する）。 */
+    readonly markTargets?: readonly string[] | undefined;
   },
 ): Promise<ScreenshotEvidence> {
   const relativePath = portableRelativeArtifactPath(path.relativeArtifactPath);
   const scrollPosition = target.reveal === undefined ? await scrollDocumentToOrigin(page) : await readDocumentScrollPosition(page);
+  // AUD-4: 状態の画像（先頭へ戻して撮る画像）だけ、撮る直前に状態の印を読む。
+  const stateMark = target.reveal === undefined ? await stateMarkOrNull(page, target.markTargets) : null;
   await page.screenshot({ path: path.outputPath, type: 'png', fullPage: false, timeout: NO_SCREENSHOT_TIMEOUT_MS });
   return Object.freeze({
     pageId: target.pageId,
@@ -168,5 +177,18 @@ export async function captureViewportScreenshot(
     scrollPosition,
     ...(target.stressWidth === null ? {} : { stressWidth: target.stressWidth }),
     ...(target.reveal === undefined ? {} : { reveal: target.reveal }),
+    ...(stateMark === null ? {} : { stateMark }),
   });
+}
+
+/**
+ * AUD-4（設計書 `2026-11-19-beaksight-audit-result-review-fixes-design.md` 7.2 の 1）: 状態の画像の状態の印（読めなければ `null`。撮影は続ける）。対象を渡したら、
+ * 対象の矩形を読み直す。
+ */
+async function stateMarkOrNull(page: Page, markTargets: readonly string[] | undefined): Promise<EvidenceStateMark | null> {
+  try {
+    return await readStateMark(page, markTargets === undefined ? null : { selectors: markTargets, read: 'RECTS' });
+  } catch {
+    return null;
+  }
 }

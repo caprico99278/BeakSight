@@ -61,7 +61,7 @@ import { discoverLinks } from '../../src/crawl/discover-links.js';
 import { collectAccessibilityEvidence } from '../../src/evidence/accessibility-collector.js';
 import { collectFocusChecks } from '../../src/evidence/focus-check-collector.js';
 import { ConsoleCollector } from '../../src/evidence/console-collector.js';
-import { collectDomEvidence } from '../../src/evidence/dom-collector.js';
+import { collectDomEvidence, recordedDomEvidenceOf } from '../../src/evidence/dom-collector.js';
 import { collectLayoutEvidence, collectStressLayout } from '../../src/evidence/layout-collector.js';
 import { NetworkCollector } from '../../src/evidence/network-collector.js';
 import { PerformanceCollector } from '../../src/evidence/performance-collector.js';
@@ -2367,7 +2367,8 @@ describe('C8: real collector output from local fixtures', () => {
         evidenceRecord('network', sequenceBase + 1, networkEvidence),
         evidenceRecord('console', sequenceBase + 2, consoleEvidence),
         evidenceRecord('link', sequenceBase + 3, linkEvidence),
-        evidenceRecord('dom', sequenceBase + 4, dom),
+        // DUP（REV-DUP の M-4）: 記録するのは、欄の表示の値の digest を外した形（Page Auditor と同じ）。
+        evidenceRecord('dom', sequenceBase + 4, recordedDomEvidenceOf(dom)),
         evidenceRecord('layout', sequenceBase + 5, { primary, stressSweep }),
         evidenceRecord('accessibility', sequenceBase + 7, accessibility),
         evidenceRecord('performance', sequenceBase + 8, performance),

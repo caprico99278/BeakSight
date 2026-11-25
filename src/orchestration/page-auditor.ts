@@ -10,7 +10,7 @@ import { pageFailureReason } from '../browser/page-failure.js';
 import { waitForPageSettled, type PageSettlingResult } from '../browser/page-settling.js';
 import type { AuditConfig, Viewport } from '../config/types.js';
 import { viewportSizeFor } from '../config/viewport-size.js';
-import { artifactFilePath, screenshotRelativePath } from '../core/artifact-layout.js';
+import { artifactFilePath, beforeHideScreenshotRelativePath, screenshotRelativePath } from '../core/artifact-layout.js';
 import {
   VIEWPORT_PROFILES,
   evidenceStateIdOf,
@@ -43,16 +43,22 @@ import { createFindingId } from '../core/ids.js';
 import { stateReadyOf } from '../core/page-readiness.js';
 import { recheckStatesOf } from '../core/recheck.js';
 import { awaitBeforeDeadline, resolveTimeoutMs } from '../core/deadline.js';
-import type { StressLayoutOptions } from '../evidence/layout-collector.js';
+import type { PassiveStressSessionFactory, ResizedStressLayoutOptions, StressLayoutOptions } from '../evidence/layout-collector.js';
 import type { InteractionAuditInput } from '../interaction/isolated-auditor.js';
+import { checkDialogFocus, type DialogFocusCheckOptions } from '../interaction/dialog-focus-check.js';
 import type { SessionLossEvidenceInput } from './authenticated-run.js';
 import {
   interactionCandidateStepOf,
   nextLoadMayStart,
+  pageAuditDepthOf,
+  pageAuditStagesOf,
+  RUN_TIME_LIMIT_SKIP_REASON,
   stressWidthAbortOf,
   viewportSkipReasonOf,
   waitsWithPageShown,
   DOWNLOAD_RESPONSE_REASON,
+  type PageAuditDepthDecision,
+  type PageSamenessPort,
 } from './page-audit-plan.js';
 import { safeErrorMessage } from '../core/errors.js';
 import {
@@ -77,17 +83,23 @@ import {
   type ScrollEvidence,
   type SessionLossEvidence,
   type LayoutCollectionResult,
+  type EvidenceStateMark,
   type LayoutEvidence,
+  type NotificationFrameEvidence,
   type NotificationOverlayEvidence,
   type RevealTargetSpec,
   type OpenedStateEvidence,
   type OpenedStateStatus,
   type StressNotificationOverlayEvidence,
   type StressLayoutEvidence,
+  type FocusCheckEvidence,
+  type DialogFocusEvidence,
+  type RevealCaptureEvidence,
 } from '../core/evidence-types.js';
 import { isPositiveSafeInteger, isRecord } from '../core/guards.js';
 import { deepFreeze } from '../core/immutable.js';
 import { observationWindowsOrProduction, type ObservationWindows } from '../core/observation-windows.js';
+import { DEBUG_TIMING_OFF, type DebugTimingLog, type DebugTimingScope } from '../core/debug-timing.js';
 import {
   CONTROLLED_SCROLL_PACING,
   INTERACTION_CLEANUP_ALLOWANCE_MS,
@@ -97,6 +109,7 @@ import {
 import {
   collectorIncompleteReason,
   derivePageAuditStatus,
+  isSameContentSkippedViewport,
   ruleEvaluationFailureReason,
   unhandledFailureReason,
 } from '../core/status.js';
@@ -105,9 +118,15 @@ import type { NavigationPacer } from '../crawl/navigation-pacer.js';
 import { collectAccessibilityEvidence } from '../evidence/accessibility-collector.js';
 import type { CollectorHandle } from '../evidence/collector-handle.js';
 import { ConsoleCollector } from '../evidence/console-collector.js';
-import { collectDomEvidence } from '../evidence/dom-collector.js';
-import { collectLayoutEvidence, collectStressLayout } from '../evidence/layout-collector.js';
-import { collectFocusChecks, type FocusCheckOptions } from '../evidence/focus-check-collector.js';
+import { collectDomEvidence, recordedDomEvidenceOf } from '../evidence/dom-collector.js';
+import { collectLayoutEvidence, collectResizedStressLayout, collectStressLayout } from '../evidence/layout-collector.js';
+import { stateMarkTargetSelectorsOf } from '../evidence/state-mark.js';
+import {
+  checkSequentialTab,
+  collectFocusChecks,
+  type FocusCheckOptions,
+  type SequentialTabOptions,
+} from '../evidence/focus-check-collector.js';
 import { breakpointSideWidthsOf, readMediaQueryConditionTexts } from '../evidence/media-query-widths.js';
 import { DataActivityCollector, NetworkCollector, type DataRequestActivity, type NetworkCollectorHandle } from '../evidence/network-collector.js';
 import { PerformanceCollector } from '../evidence/performance-collector.js';
@@ -125,8 +144,8 @@ import {
   ScreenshotWatchEndedError,
   type ScreenshotCapturePaths,
 } from '../evidence/screenshot-collector.js';
-import { dismissNotificationFrames, type NotificationDismissalProgress } from '../interaction/notification-overlay.js';
-import { discoverInteractionCandidates } from '../interaction/discover-candidates.js';
+import { dismissNotificationFrames, readModalCandidateOrdinals, type NotificationDismissalProgress } from '../interaction/notification-overlay.js';
+import { discoverInteractionCandidates, INTERACTION_CANDIDATE_SELECTOR } from '../interaction/discover-candidates.js';
 import {
   auditInteraction,
   InteractionOwnerCleanupError,
@@ -136,7 +155,7 @@ import {
 } from '../interaction/isolated-auditor.js';
 import type { InteractionCandidate } from '../safety/interaction-policy.js';
 import { mobileOnlyInteractionCandidates } from './interaction-viewport-difference.js';
-import { openedStateStructureKeyOf } from './audit-page-structure.js';
+import { auditPageContentDigestOf, auditPageTemplateKeyOf, openedStateStructureKeyOf } from './audit-page-structure.js';
 import { findingsNotInBase } from './opened-state.js';
 import {
   notificationPressNavigationsOf,
@@ -193,7 +212,13 @@ import {
 import { skippedPageResult } from './skipped-page.js';
 import { waitWithPageShown, withoutPacingWaitEvents, type PacingWaitOptions, type PacingWaitWindow } from './visible-pacing-wait.js';
 import { OPEN_ENDED_STAGE_MS, openEndedStageDeadline } from './stage-deadline.js';
-import { auditDocumentLeftCause, stressWidthIncompleteReasonOf, stressWidthSessionCloser, type AuditDocumentLeftCause } from './stress-width-end.js';
+import {
+  auditDocumentLeftCause,
+  sameStressLayoutFacts,
+  stressWidthIncompleteReasonOf,
+  stressWidthSessionCloser,
+  type AuditDocumentLeftCause,
+} from './stress-width-end.js';
 import type { OpenedPressKey } from './crawl-frontier.js';
 import { createStressSessionFactory, type StressSessionOptions } from './stress-session.js';
 
@@ -206,6 +231,8 @@ export interface PageAuditCollectors {
   readonly collectDomEvidence: typeof collectDomEvidence;
   readonly collectLayoutEvidence: typeof collectLayoutEvidence;
   readonly collectStressLayout: typeof collectStressLayout;
+  /** SWR: 1 回だけ読み込み、幅ごとに大きさだけを変えて回す幅の走査。 */
+  readonly collectResizedStressLayout: typeof collectResizedStressLayout;
   readonly collectAccessibilityEvidence: typeof collectAccessibilityEvidence;
   readonly performance: Pick<PerformanceCollector, 'installBeforeNavigation' | 'collect' | 'readLcpBeforeScroll'>;
   readonly captureScreenshots: typeof captureScreenshots;
@@ -258,9 +285,15 @@ export interface AuditView {
   readonly captureAsIs: PageBound<typeof captureAsIs<EvidenceId>>;
   /** EV-4: 横にスクロールする領域の、キーボードの実操作（`checkScrollableRegions`）。 */
   readonly checkScrollableRegions: PageBound<typeof checkScrollableRegions>;
+  /** AUD-3: 通常の Tab の確かめ（`checkSequentialTab`。キーを押す期間は、この page の Guard の口）。 */
+  readonly checkSequentialTab: PageBound<typeof checkSequentialTab>;
+  /** FRET: 窓を開くボタンの確かめ（`checkDialogFocus`。キーを押す期間は、この page の Guard の口）。 */
+  readonly checkDialogFocus: (options: Omit<DialogFocusCheckOptions, 'keyPressGuard'>) => Promise<DialogFocusEvidence>;
   readonly discoverLinks: PageBound<typeof discoverLinks>;
   readonly discoverInteractionCandidates: PageBound<typeof discoverInteractionCandidates>;
   readonly dismissNotificationFrames: PageBound<typeof dismissNotificationFrames>;
+  /** REV-AUD2 の I-1: 開いた状態がモーダルのとき、小窓の中の操作の候補の番号（モーダルでなければ null。`readModalCandidateOrdinals`）。 */
+  readonly readModalCandidateOrdinals: (deadlineAtMs: number) => Promise<readonly number[] | null>;
   /** DEF-129・DEF-225: Guard が数えた文書の読み込みの事実（`pageLoadFactsOf`）。 */
   readonly loadFacts: () => ReturnType<typeof pageLoadFactsOf>;
   /** fix round 3: 押す期間に Guard が見た移動とポップアップの数（`notificationPressNavigationsOf`。RB-14a: 移動は止めずに数える）。 */
@@ -270,7 +303,7 @@ export interface AuditView {
   /** C・DEF-250 の c: page を使うのをやめる原因（その page の Ledger の記録で見る）。 */
   readonly documentLeftCause: (navigated: boolean) => AuditDocumentLeftCause | null;
   /** REV-SD の I-1: main frame の移動を見張り、点検の範囲の外へ移ったかを答える（`watchAuditScope`。判定がなければ見張らない）。読み込みの前に付ける。 */
-  readonly watchAuditScope: (isOutside: AuditScopeJudge | undefined) => AuditScopeWatch;
+  readonly watchAuditScope: (isOutside: AuditScopeJudge | undefined, requestedUrl: string) => AuditScopeWatch;
   /** その page の Context の Ledger（Guard が閉じた Context では投げうる）。 */
   readonly ledger: () => SafetyLedger;
   /** DEF-138: factory が残した、その Context の状態の名前（読めなければ `null`）。 */
@@ -313,6 +346,11 @@ export interface AuditStressLayoutOptions extends Omit<StressLayoutOptions, 'set
   readonly afterLayout?: ((view: AuditView, width: number, layout: LayoutEvidence) => Promise<void>) | undefined;
 }
 
+/** SWR: 大きさを変えて回す幅の走査の受け口（`collectResizedStressLayout` の `aroundWidth` を足したもの）。 */
+export interface AuditResizedStressLayoutOptions extends AuditStressLayoutOptions {
+  readonly aroundWidth?: ResizedStressLayoutOptions['aroundWidth'];
+}
+
 /** RB-10: Interaction の候補 1 つの入力（session の作り方は口が持つ）。 */
 export interface AuditInteractionInput extends Omit<InteractionAuditInput, 'sessionFactory' | 'releaseLateSessionFailure' | 'afterVerified' | 'verifyTrail'> {
   readonly afterVerified?: ((view: AuditView) => Promise<void>) | undefined;
@@ -339,6 +377,13 @@ export interface AuditLoadPorts {
     url: string,
     widths: readonly number[],
     options: AuditStressLayoutOptions,
+  ) => Promise<readonly StressLayoutEvidence[]>;
+  /** SWR: 1 つのセッションで 1 回だけ読み込み、幅ごとに大きさだけを変えて回す（`collectResizedStressLayout`）。 */
+  readonly collectResizedStressLayout: (
+    createSession: AuditStressSessions['createSession'],
+    url: string,
+    widths: readonly number[],
+    options: AuditResizedStressLayoutOptions,
   ) => Promise<readonly StressLayoutEvidence[]>;
   readonly auditInteraction: (
     input: AuditInteractionInput,
@@ -382,14 +427,22 @@ export function playwrightAuditLoadPortsOf(factory: BrowserContextFactory, colle
       // REV-EV4 の C-1（a）: キーを押す期間の main frame の移動とポップアップは、この page の Guard が止める。
       checkScrollableRegions: (targets: readonly ScrollableRegionTarget[], options: ScrollableRegionCheckOptions) =>
         checkScrollableRegions(page, targets, { ...options, keyPressGuard: scrollKeyPressGuardOf(page) }),
+      // AUD-3: 通常の Tab の確かめのキーの押下の期間も、同じ Guard の口で、ページが始めた画面の移動とポップアップを止める。
+      checkSequentialTab: (evidence: FocusCheckEvidence, options: SequentialTabOptions) =>
+        checkSequentialTab(page, evidence, { ...options, keyPressGuard: scrollKeyPressGuardOf(page) }),
+      // FRET: 窓を開くボタンの確かめのキーの押下の期間も、同じ Guard の口で、ページが始めた画面の移動とポップアップを止める。押す期間（2026-11-25）は、
+      // 同じ口の `pressPeriod` で、読み取りでない要求も止める。
+      checkDialogFocus: (options: Omit<DialogFocusCheckOptions, 'keyPressGuard'>) =>
+        checkDialogFocus(page, { ...options, keyPressGuard: scrollKeyPressGuardOf(page) }),
       discoverLinks: bind(collectors.discoverLinks),
       discoverInteractionCandidates: bind(collectors.discoverInteractionCandidates),
       dismissNotificationFrames: bind(collectors.dismissNotificationFrames),
+      readModalCandidateOrdinals: (deadlineAtMs: number) => readModalCandidateOrdinals(page, INTERACTION_CANDIDATE_SELECTOR, deadlineAtMs),
       loadFacts: () => pageLoadFactsOf(page),
       pressNavigations: () => notificationPressNavigationsOf(page),
       pressNavigationTargets: () => notificationPressNavigationTargetsOf(page),
       documentLeftCause: (navigated: boolean) => auditDocumentLeftCause(page, documentLedgers().map((ledger) => ledger.snapshot()), navigated),
-      watchAuditScope: (isOutside: AuditScopeJudge | undefined) => watchAuditScope(page, isOutside),
+      watchAuditScope: (isOutside: AuditScopeJudge | undefined, requestedUrl: string) => watchAuditScope(page, isOutside, requestedUrl),
       ledger: () => factory.getSafetyLedger(page.context()),
       // 状態の名前を持たない factory（テストの差し替えなど）は、名前の違いを読めない（`null`）。
       authenticatedStateNames: () => (typeof factory.authenticatedStateNamesOf === 'function' ? factory.authenticatedStateNamesOf(page.context()) : null),
@@ -405,6 +458,36 @@ export function playwrightAuditLoadPortsOf(factory: BrowserContextFactory, colle
       throw new TypeError('the page view was not opened by the Playwright audit load ports');
     }
     return page;
+  };
+  // 幅の走査の collector の入力（口の session を page に、口の page の受け口を page の受け口に結ぶ。2 つの幅の走査の共通）。
+  const stressCollectorInputOf = (
+    createSession: AuditStressSessions['createSession'],
+    options: AuditStressLayoutOptions,
+  ): { readonly pageFactory: PassiveStressSessionFactory; readonly options: StressLayoutOptions } => {
+    const views = new Map<Page, AuditView>();
+    const viewOfPage = (page: Page): AuditView => {
+      const view = views.get(page);
+      if (view === undefined) {
+        throw new TypeError('the stress page was not opened by the audit load ports');
+      }
+      return view;
+    };
+    const { afterLayout } = options;
+    return {
+      pageFactory: async (viewport) => {
+        const session = await createSession(viewport);
+        const page = pageOf(session.view);
+        views.set(page, session.view);
+        return { page, close: () => session.close() };
+      },
+      options: {
+        deadlineAtMs: options.deadlineAtMs,
+        beforeNavigation: options.beforeNavigation,
+        afterNavigation: options.afterNavigation,
+        settleBeforeLayout: (page, deadlineAtMs) => options.settleBeforeLayout(viewOfPage(page), deadlineAtMs),
+        afterLayout: afterLayout === undefined ? undefined : (page, width, layout) => afterLayout(viewOfPage(page), width, layout),
+      },
+    };
   };
   return Object.freeze<AuditLoadPorts>({
     openPassive: async (viewport: Viewport, deadlineAtMs: number, deadlines: ResolvedPassiveSessionDeadlines): Promise<AuditPassiveOpening> => {
@@ -444,25 +527,12 @@ export function playwrightAuditLoadPortsOf(factory: BrowserContextFactory, colle
       });
     },
     collectStressLayout: (createSession, url, widths, options) => {
-      const views = new Map<Page, AuditView>();
-      const viewOfPage = (page: Page): AuditView => {
-        const view = views.get(page);
-        if (view === undefined) {
-          throw new TypeError('the stress page was not opened by the audit load ports');
-        }
-        return view;
-      };
-      const { afterLayout } = options;
-      return collectors.collectStressLayout(async (viewport) => {
-        const session = await createSession(viewport);
-        const page = pageOf(session.view);
-        views.set(page, session.view);
-        return { page, close: () => session.close() };
-      }, url, widths, {
-        ...options,
-        settleBeforeLayout: (page, deadlineAtMs) => options.settleBeforeLayout(viewOfPage(page), deadlineAtMs),
-        afterLayout: afterLayout === undefined ? undefined : (page, width, layout) => afterLayout(viewOfPage(page), width, layout),
-      });
+      const bound = stressCollectorInputOf(createSession, options);
+      return collectors.collectStressLayout(bound.pageFactory, url, widths, bound.options);
+    },
+    collectResizedStressLayout: (createSession, url, widths, options) => {
+      const bound = stressCollectorInputOf(createSession, options);
+      return collectors.collectResizedStressLayout(bound.pageFactory, url, widths, { ...bound.options, aroundWidth: options.aroundWidth });
     },
     auditInteraction: async (input, deadlines, cleanupDeadlineAtMs): Promise<AuditInteractionOutcome> => {
       const { afterVerified, verifyTrail, ...rest } = input;
@@ -589,6 +659,11 @@ export interface PageAuditorDependencies {
    */
   readonly acceptOpenedPress?: ((press: OpenedPressKey) => boolean) | undefined;
   /**
+   * DUP（ユーザーの判断 2026-11-18）: 同じ作りの画面の口（`PageSamenessPort`）。渡すと、Desktop の layout の後にページの点検の深さを決め、深さの段の表
+   * （`pageAuditStagesOf`）に従う。省略すると、どのページもしっかり点検する（チェックした画面だけの点検の Run は渡さない）。
+   */
+  readonly pageSameness?: PageSamenessPort | undefined;
+  /**
    * L0（設計書 `2026-11-09-beaksight-remove-limits-design.md` 5 の 1 の 4）: Run の時間の上限の時刻（`now` と同じ基準。利用者の `maxRuntimeMs` を、Run Coordinator
    * がこの実行の開始から数えたもの）。ページの途中でも効かせるため、ページの期限と Interaction の段の期限を、この時刻より後にしない（差し込み口。
    * 上限を過ぎた段は、今の期限切れと同じく `<段階>:DEADLINE_EXCEEDED` で終わり、残りのページは Run Coordinator が `MAX_RUNTIME_REACHED` にする）。
@@ -601,6 +676,11 @@ export interface PageAuditorDependencies {
   readonly progressWatchQuietLimitMs?: number | undefined;
   /** RB-2: 観察の窓の一式（落ち着きとスクロールの待ち）。省略すると本番の値。テストだけが渡す（Run Coordinator の `observationWindows`）。 */
   readonly observationWindows?: ObservationWindows | undefined;
+  /**
+   * DBG-1（設計書 `2026-11-20-beaksight-discovery-skip-and-debug-timing-design.md` 2.2）: 測りの記録（Run Coordinator が入のときだけ渡す）。1 画面の段・読み込み・
+   * ビューポート・幅の走査の幅ごと・読み込みの間隔の待ちを測る。省略すると切（何もしない）。
+   */
+  readonly debugTiming?: DebugTimingLog | undefined;
 }
 
 /**
@@ -819,7 +899,8 @@ class ViewportSiteUnavailability {
 interface ViewportSafetySources {
   readonly passiveLedgers: SafetyLedger[];
   readonly interactionSnapshots: { readonly snapshot: SafetyLedgerSnapshot; readonly candidateIndex: number }[];
-  readonly stressLedgers: { readonly ledger: SafetyLedger; readonly width: number }[];
+  /** SWR: 大きさを変えて回した Context は、走査した幅の一覧（`widths`。走査の順に足す）も持つ。 */
+  readonly stressLedgers: { readonly ledger: SafetyLedger; readonly width: number; readonly widths?: readonly number[] }[];
   /**
    * DEF-236: 前の画面を見せたまま読み込みの間隔を待った Ledger の、待ちの範囲（Passive と幅の走査の Context）。その範囲の事象は、safety の Evidence には残すが、
    * Rule の入力から除く（`withoutPacingWaitEvents`）。
@@ -847,6 +928,9 @@ type StageAttempt<T> = { readonly ok: true; readonly value: T; readonly watchEnd
  * 注入する `now` は、`Date.now()` と同じ基準の時刻でなければならない（`PageAuditorDependencies.now`。期限の判定に
  * `awaitBeforeDeadline` などが `Date.now()` を使うため）。
  */
+/** DUP: しっかり点検する深さ（ページを始めるたびに戻す値）。 */
+const FULL_DEPTH: PageAuditDepthDecision = Object.freeze({ depth: 'FULL', sameAs: null });
+
 export class PageAuditor {
   /** RB-10: 監査の読み込みの口。 */
   readonly #ports: AuditLoadPorts;
@@ -871,16 +955,29 @@ export class PageAuditor {
   #desktopInteractionCandidates: readonly InteractionCandidate[] | null = null;
   /** EV-5: 今のページの試行の読み直しの番号（`PageAuditAttempt.revisit`。読み直しでなければ `null`）。画像のパスを作る所が渡す。 */
   #screenshotRevisit: number | null = null;
+  /** DUP: 同じ作りの画面の口（`PageAuditorDependencies.pageSameness`）。 */
+  readonly #pageSameness: PageSamenessPort | undefined;
+  /** DUP: 今のページの点検の深さ（ページを始めるたびに `FULL` に戻し、Desktop の layout の後に決める）。 */
+  #pageDecision: PageAuditDepthDecision = FULL_DEPTH;
+  /** AUD-5: 今のページの Desktop の作りの鍵（作れなければ `null`。ページの結果の `templateKey` に残す）。 */
+  #pageTemplateKey: string | null = null;
   /** COV-4 の区切り 3: 開いた状態の構造の鍵を受け付ける口（`PageAuditorDependencies.acceptOpenedStructure`）。 */
   readonly #acceptOpenedStructure: (structureKey: string) => boolean;
   /** COV-4 の区切り 3（入れ子の開いた状態）: 開いた状態の中で押す組を受け付ける口（`PageAuditorDependencies.acceptOpenedPress`）。 */
   readonly #acceptOpenedPress: (press: OpenedPressKey) => boolean;
+  /**
+   * FRET（設計書 `2026-11-24-beaksight-dialog-focus-return-design.md` 1.1）: 窓を開くボタンの確かめで押した物の鍵の digest（Run で 1 回。Run Coordinator は Run で
+   * 1 つの Page Auditor を作るので、Run の単位の覚え。checkpoint には残さない）。
+   */
+  readonly #dialogFocusPressed = new Set<string>();
   /** L0: Run の時間の上限の時刻（上限なしは `undefined`。LZ-1 で番兵の `Infinity` をやめた）。 */
   readonly #runDeadlineAtMs: number | undefined;
   /** L1: 進みの見張りの反応なしの長さ（ms）。 */
   readonly #quietLimitMs: number;
   /** RB-2: 観察の窓の一式（落ち着きとスクロール）。 */
   readonly #windows: ObservationWindows;
+  /** DBG-1: 測りの記録（切なら何もしない口）。 */
+  readonly #debugTiming: DebugTimingLog;
   /**
    * DEF-210（設計書 3.3）: この Run で見た通知の枠の digest（ビューポートの種類ごと。幅の走査は別の集合）。Run の続き（checkpoint）では引き継がない
    * （再開の後の最初のページで、同じ枠の覆いの指摘をもう 1 回出しうる。限界）。
@@ -955,6 +1052,12 @@ export class PageAuditor {
       ownOpenedPresses.add(text);
       return true;
     });
+    const { pageSameness } = dependencies;
+    if (pageSameness !== undefined && (!isRecord(pageSameness) || typeof pageSameness.referenceOf !== 'function'
+      || typeof pageSameness.sameContentAs !== 'function' || typeof pageSameness.decided !== 'function')) {
+      throw new TypeError('PageAuditor pageSameness must have referenceOf, sameContentAs and decided functions when given');
+    }
+    this.#pageSameness = pageSameness;
     const { runDeadlineAtMs } = dependencies;
     if (runDeadlineAtMs !== undefined && (typeof runDeadlineAtMs !== 'number' || Number.isNaN(runDeadlineAtMs))) {
       throw new TypeError('PageAuditor runDeadlineAtMs must be a number when given');
@@ -962,6 +1065,7 @@ export class PageAuditor {
     this.#runDeadlineAtMs = runDeadlineAtMs;
     this.#quietLimitMs = resolveTimeoutMs(dependencies.progressWatchQuietLimitMs, PROGRESS_WATCH_QUIET_LIMIT_MS);
     this.#windows = observationWindowsOrProduction(dependencies.observationWindows);
+    this.#debugTiming = dependencies.debugTiming ?? DEBUG_TIMING_OFF;
     this.#deadlines = resolvePassiveSessionDeadlines(dependencies.deadlines);
     this.#config = config;
     this.#allocator = allocator;
@@ -983,6 +1087,7 @@ export class PageAuditor {
       collectDomEvidence,
       collectLayoutEvidence,
       collectStressLayout,
+      collectResizedStressLayout,
       collectAccessibilityEvidence,
       performance: new PerformanceCollector(),
       captureScreenshots,
@@ -1023,6 +1128,9 @@ export class PageAuditor {
     const outcomes: ViewportAuditOutcome[] = [];
     // L5 の N5: 前のページの Desktop の候補を、このページの Mobile に持ち込まない。
     this.#desktopInteractionCandidates = null;
+    // DUP: 深さは、このページの Desktop の layout の後に決める（決めるまでは、しっかり点検する）。
+    this.#pageDecision = FULL_DEPTH;
+    this.#pageTemplateKey = null;
     // 再試行の前の試行なら、その試行の番号（スクリーンショットを `retry-<番号>` に置く）。Desktop の監査を終えた後に決める（DEF-007）。
     let screenshotRetryAttempt: number | null = null;
     // 最初に検知したサイトの不調の詳細（設計書 3.1）。検知しなければ `null`。
@@ -1042,8 +1150,15 @@ export class PageAuditor {
         downloadResponse: outcomes.some((previous) => previous.result.incompleteReasons.some((reason) => reason.code === DOWNLOAD_RESPONSE_REASON.code)),
         runTimeLimitPassed: () => this.#runTimeLimitPassed(),
       });
-      if (skipReason !== null) {
+      // DUP（設計者の判断 2026-11-18）: 表示の中身が点検した画面と同じページは、Mobile を始めない（段の表の `viewport`。理由は同じ中身の画面のページの ID。
+      // 途中で止まった理由ではない）。REV-DUP の M-2: 時間切れより先に当てる（省くビューポートを、時間切れの読み直しの候補にしない）。
+      const skippedBySameness = !pageAuditStagesOf(this.#pageDecision.depth, profile).viewport;
+      if (skipReason !== null && !(skippedBySameness && skipReason.code === RUN_TIME_LIMIT_SKIP_REASON.code)) {
         outcomes.push(skippedViewportOutcome(url, pageId, profile, skipReason));
+        continue;
+      }
+      if (skippedBySameness) {
+        outcomes.push(skippedViewportOutcome(url, pageId, profile, Object.freeze({ code: 'SAME_CONTENT_AS_EARLIER_PAGE', detail: this.#pageDecision.sameAs })));
         continue;
       }
       // DEF-236: このビューポートの後に読み込みが続くか（閉じる前に、前の画面を見せたまま待つかを決める）。Desktop の後は、幅の走査か Mobile。Mobile の後は、
@@ -1055,7 +1170,9 @@ export class PageAuditor {
         || retryFollows
         || attempt?.nextPageFollows?.([...earlierEvidence, ...viewportEvidence]) === true;
       // AUD-2a: 状態 ID の試行の番号（Run Coordinator の試行。渡さなければ 1）。
-      const outcome = await this.#auditViewport(url, pageId, profile, screenshotRetryAttempt, laterLoadFollows, attempt?.attempt ?? 1);
+      // DBG-1: ビューポートごと（Desktop・Mobile）の時間を測る（切なら何もしない）。
+      const outcome = await this.#debugTiming.measure('AUDIT_VIEWPORT', () => ({ pageId, stateId: evidenceStateIdOf(pageId, profile, attempt?.attempt ?? 1) }),
+        () => this.#auditViewport(url, pageId, profile, screenshotRetryAttempt, laterLoadFollows, attempt?.attempt ?? 1));
       outcomes.push(outcome);
       if (outcome.authSessionLostStage !== null) {
         // セッションの切れを検知したので、次のビューポートを始めない。再試行の判断（`precedesRetry`）も呼ばない。
@@ -1072,15 +1189,21 @@ export class PageAuditor {
     const viewports = Object.fromEntries(
       VIEWPORT_PROFILES.map((profile, index) => [profile, (outcomes[index] as ViewportAuditOutcome).result]),
     ) as Record<ViewportProfile, ViewportAuditResult>;
+    // DUP: 表示の中身が同じなので始めなかったビューポートは、ページの状態と未完了の理由に入れない（ページを PARTIAL にしない）。
+    const auditedOutcomes = outcomes.filter((outcome) => !isSameContentSkippedViewport(outcome.result));
+    const { depth, sameAs } = this.#pageDecision;
     const result: PageAuditResult = {
       schemaVersion: PAGE_SCHEMA_VERSION,
       pageId,
       pageUrl: url,
-      status: derivePageAuditStatus(outcomes.map((outcome) => outcome.result.status)),
+      status: derivePageAuditStatus(auditedOutcomes.map((outcome) => outcome.result.status)),
       viewports,
       evidence: outcomes.flatMap((outcome) => outcome.evidence),
       findings: outcomes.flatMap((outcome) => outcome.findings),
-      incompleteReasons: pageIncompleteReasons(outcomes.map((outcome) => outcome.result)),
+      incompleteReasons: pageIncompleteReasons(auditedOutcomes.map((outcome) => outcome.result)),
+      ...(depth === 'FULL' || sameAs === null ? {} : { sameness: Object.freeze({ depth, sameAs }) }),
+      // AUD-5（S-07）: 題名の重なりを同じ画面の別のデータと分けるために、作りの鍵を残す（作れたときだけ）。
+      ...(this.#pageTemplateKey === null ? {} : { templateKey: this.#pageTemplateKey }),
     };
     // 違反の集計は、Context を閉じた後の snapshot で行う（閉じる処理の中で記録された違反も含めるため）。
     const safety = summarizePageSafety(outcomes.flatMap(({ safety: sources }) => [
@@ -1097,6 +1220,11 @@ export class PageAuditor {
     });
   }
 
+  /** DBG-1: 読み込みの間隔の待ち（段の間の待ち。測りの記録が入のときだけ測る）。 */
+  #pacedNavigation(scope: DebugTimingScope): Promise<number> {
+    return this.#debugTiming.measure('PACING_WAIT', () => scope, () => this.#pacer.beforeNavigation());
+  }
+
   /** 1つのビューポートの監査（設計書 4.5.2 の 1〜8）。 */
   async #auditViewport(
     url: NormalizedHttpUrlEvidence,
@@ -1111,7 +1239,7 @@ export class PageAuditor {
     // AUD-2a: この読み込みの状態 ID。
     const stateId = evidenceStateIdOf(pageId, profile, attemptNumber);
     // ページの読み込みの間隔を守る（サイトへの負荷の制御の設計書 4.1）。再試行も、このビューポートの監査を通るので、同じく待つ。
-    await this.#pacer.beforeNavigation();
+    await this.#pacedNavigation({ pageId, stateId });
     // AUD-2a: ビューポートを始めた時刻（間隔の待ちの後。読み込みから集めた Evidence の時刻の範囲の始まり）。
     const viewportStartedAt = this.#clock().toISOString();
     // L1（設計書 `2026-11-09-beaksight-remove-limits-design.md` 6 の L1）: ページの期限（`overallPageTimeoutMs`）と、collector に渡す期限・その余裕は撤廃した。
@@ -1213,7 +1341,7 @@ export class PageAuditor {
         const passive = load;
         const activePage = passive.view;
         // REV-SD の I-1: 読み込みの後にページが自分で範囲の外へ移ったら、それ以降の操作をしない（判定は `audit-scope-watch.ts` の 1 か所）。
-        const scope = activePage.watchAuditScope(this.#isOutsideAuditScope);
+        const scope = activePage.watchAuditScope(this.#isOutsideAuditScope, url);
         scopeWatch = scope;
         const watchPassive: PageWatch = (work, contentKinds) => this.#watchOnPage(activePage, work, contentKinds);
         const runner = new StageRunner(activePage, reasons, watchPassive);
@@ -1231,13 +1359,14 @@ export class PageAuditor {
         ): Promise<StageAttempt<T>> => {
           const startedAt = this.#clock().toISOString();
           let location: CaptureLocation | null = null;
-          const result = await runner.attempt(stage, async (signals) => {
+          // DBG-1: 段ごと（落ち着き・axe・撮影・開いた状態の確かめなど）の時間を測る（切なら何もしない）。
+          const result = await this.#debugTiming.measure('AUDIT_STAGE', () => ({ pageId, stateId, part: stage }), () => runner.attempt(stage, async (signals) => {
             const value = await work(signals);
             if (watched && signals?.signal.aborted !== true) {
               location = await activePage.captureLocation();
             }
             return value;
-          }, watched, failureReason, keepOnWatchEnd);
+          }, watched, failureReason, keepOnWatchEnd));
           // 段の中（閉包）で代入するので、型の絞り込みを外して読む。
           const finished = location as CaptureLocation | null;
           lastCapture = Object.freeze({
@@ -1272,7 +1401,8 @@ export class PageAuditor {
         // 見張りが読み込みを終えた理由（終えなければ `null`）。
         let navigationEnd: ProgressWatchEnd | null = null;
         let loading: Promise<PageNavigationResult> | undefined;
-        const watchedNavigation = await runner.during('navigation', () => watchPassive((signals) => {
+        // DBG-1: 読み込みの時間を測る（切なら何もしない）。
+        const watchedNavigation = await this.#debugTiming.measure('AUDIT_STAGE', () => ({ pageId, stateId, part: 'navigation' }), () => runner.during('navigation', () => watchPassive((signals) => {
           loading = passive.navigate(url, {
             timeoutMs: OPEN_ENDED_STAGE_MS,
             ledger: activePage.ledger(),
@@ -1282,7 +1412,7 @@ export class PageAuditor {
             ...(this.#isOutsideAuditScope === undefined ? {} : { isOutsideAuditScope: this.#isOutsideAuditScope }),
           });
           return loading;
-        }, PROGRESS_SIGNAL_KINDS));
+        }, PROGRESS_SIGNAL_KINDS)));
         if (watchedNavigation.status === 'REJECTED') {
           throw watchedNavigation.reason;
         }
@@ -1346,6 +1476,7 @@ export class PageAuditor {
           // 読み込み直さず、そのまま点検を続ける（移ったことは Evidence に残る）。
           await attempt('settling', (signals) => this.#handleNotificationFrames(
             activePage, profile, viewportSize, notification, signalsOf(signals), () => scope.outsideUrl() === null,
+            { pageId, retryAttempt: screenshotRetryAttempt, record: (shot) => record('screenshot', shot) },
           ));
           // AUD-2a: 通知の枠の扱い（閉じた数・隠した数・見た枠の digest）を、ビューポートの記録に残す。
           notificationHandling = notificationHandlingRecordOf(notification.overlay);
@@ -1490,16 +1621,34 @@ export class PageAuditor {
     }
     const pendingSweep = deferredStressSweep.value;
     if (pendingSweep !== null && closedView !== undefined) {
+      // AUD-3d・SWR: 幅の画像とフォーカスの確かめの Evidence を除き、画像のファイルを消す（結果を残さない幅と、大きさを変えて集めて捨てた幅の共通）。
+      const dropStressWidthEvidence = async (widths: ReadonlySet<number>): Promise<void> => {
+        for (let index = evidence.length - 1; index >= 0; index -= 1) {
+          const created = evidence[index];
+          if (created?.type === 'screenshot' && created.payload.stressWidth !== undefined && widths.has(created.payload.stressWidth)) {
+            evidence.splice(index, 1);
+            await rm(artifactFilePath(this.#screenshotRootDirectory, created.payload.relativePath), { force: true }).catch(() => undefined);
+          } else if (created?.type === 'focus' && created.payload.stressWidth !== undefined && widths.has(created.payload.stressWidth)) {
+            // AUD-4d: その幅のフォーカスの確かめも残さない（その幅の画像は、上で消す）。
+            evidence.splice(index, 1);
+          }
+        }
+      };
       // AUD-3d・4d: 幅の走査の各幅の、viewport の画像（画像を撮る設定のときだけ）とフォーカスの確かめを残す口（状態 ID は Desktop の読み込みのもの）。
       const stressScreenshots: StressScreenshotSink = {
         pageId,
         retryAttempt: screenshotRetryAttempt,
         screenshots: config.audit.screenshots,
         record: (type, payload, capture) => record(type, payload, capture),
+        discardWidths: dropStressWidthEvidence,
+        hiddenFrameCountOf: (width) => hiddenFrameCountOf(notification.stress.find((entry) => entry.width === width)?.overlay),
       };
-      const sweepState = { reasons, safety, siteUnavailability, authSessionLoss, sessionLossLoads, notification, stressScreenshots };
+      // fix round 3・SWR の 4: 押す期間に移動かポップアップを止めた幅（幅ごとに、その幅の間に増えた数で決める）。
+      const pressBlockedWidths = new Set<number>();
+      const sweepState = { reasons, safety, siteUnavailability, authSessionLoss, sessionLossLoads, notification, stressScreenshots, pressBlockedWidths };
       // DEF-250 の c: 点検の途中で page を使うのをやめたビューポートは、幅の走査も始めない（そのビューポートを終えた）。
-      const stressSweep = stages?.crashed === true || stages?.documentLeft === true
+      // DUP: 幅の走査をしない深さのページも、始めない（`DeferredStressSweep.sweep`）。
+      const stressSweep = stages?.crashed === true || stages?.documentLeft === true || !pendingSweep.sweep
         ? null
         : await this.#sweepStressWidths(url, pendingSweep, new StageRunner(closedView, reasons, (work, kinds) => this.#watchOnPage(closedView, work, kinds)), sweepState);
       for (const load of sessionLossLoads) {
@@ -1507,27 +1656,12 @@ export class PageAuditor {
       }
       this.#detectSessionLoss(viewportEndCheckPointOf(profile), sessionLossLoads, authSessionLoss, reasons);
       // fix round 3（設計書 3.2.2 の 1・4）: 幅の走査の各幅も、その幅の押す期間に移動かポップアップを止めたら、その幅の結果を残さない（理由を残す）。
-      const blockedWidths = new Set(sessionLossLoads
-        .filter((load) => load.stage === STRESS_LAYOUT_STAGE && load.view.pressNavigations() > 0)
-        .flatMap((load) => {
-          const width = load.view.viewportWidth();
-          return width === null ? [] : [width];
-        }));
-      if (blockedWidths.size > 0 && !reasons.some((reason) => reason.code === NOTIFICATION_DISMISSAL_NAVIGATION_BLOCKED_REASON.code)) {
+      if (pressBlockedWidths.size > 0 && !reasons.some((reason) => reason.code === NOTIFICATION_DISMISSAL_NAVIGATION_BLOCKED_REASON.code)) {
         reasons.push(NOTIFICATION_DISMISSAL_NAVIGATION_BLOCKED_REASON);
       }
-      const keptSweep = stressSweep === null ? null : stressSweep.filter((result) => !blockedWidths.has(result.width));
+      const keptSweep = stressSweep === null ? null : stressSweep.filter((result) => !pressBlockedWidths.has(result.width));
       // AUD-3d: 結果を残さない幅は、その幅の画像も残さない（Evidence を除き、ファイルを消す。誤りの画面の画像を残さない）。
-      for (let index = evidence.length - 1; index >= 0; index -= 1) {
-        const created = evidence[index];
-        if (created?.type === 'screenshot' && created.payload.stressWidth !== undefined && blockedWidths.has(created.payload.stressWidth)) {
-          evidence.splice(index, 1);
-          await rm(artifactFilePath(this.#screenshotRootDirectory, created.payload.relativePath), { force: true }).catch(() => undefined);
-        } else if (created?.type === 'focus' && created.payload.stressWidth !== undefined && blockedWidths.has(created.payload.stressWidth)) {
-          // AUD-4d: その幅のフォーカスの確かめも残さない（その幅の画像は、上で消す）。
-          evidence.splice(index, 1);
-        }
-      }
+      await dropStressWidthEvidence(pressBlockedWidths);
       // AUD-2a: 幅の走査の後に包んでも、主の形を測った時刻と状態（`primaryCapture`）を残す。
       record('layout', layoutPayloadOf(pendingSweep.primary, keptSweep, notification), pendingSweep.primaryCapture);
     }
@@ -1560,8 +1694,11 @@ export class PageAuditor {
     for (const { snapshot, candidateIndex } of safety.interactionSnapshots) {
       record('safety', safetyEventsEvidenceFromSnapshot(snapshot, 'INTERACTION', { kind: 'INTERACTION', candidateIndex }), viewportCaptureOf('safety', null));
     }
-    for (const { ledger, width } of safety.stressLedgers) {
-      recordSafety(ledger, safetyEventsEvidenceFromSnapshot(ledger.snapshot(), 'PASSIVE', { kind: 'STRESS_WIDTH', width }));
+    for (const { ledger, width, widths } of safety.stressLedgers) {
+      // REV-SWR の M-1: 大きさを変えた Context は、結果を残した幅がなくても `widths`（空）を持つ（どの幅の指摘にも結び付けない）。
+      recordSafety(ledger, safetyEventsEvidenceFromSnapshot(ledger.snapshot(), 'PASSIVE', widths === undefined
+        ? { kind: 'STRESS_WIDTH', width }
+        : { kind: 'STRESS_WIDTH', width, widths: Object.freeze([...widths]) }));
     }
 
     // 8. page rule を評価する。Safety の Evidence は、ここまでに Rule の入力にそろっている（設計書 4.3）。Rule は Evidence だけを読む（page と Context を
@@ -1570,12 +1707,16 @@ export class PageAuditor {
     const recheckedEvidenceIds = new Set<EvidenceId>(pendingRecheck.value?.evidenceIds ?? []);
     // COV-4 の区切り 3: 開いた状態の記録は、1 回目の評価の入力に入れない（開いた状態ごとに、その記録だけで評価する）。
     const openedEvidenceIds = new Set<EvidenceId>(openedStates.flatMap(({ evidenceIds, recheck }) => [...evidenceIds, ...(recheck?.evidenceIds ?? [])]));
+    // DUP（設計者の判断 2026-11-18、REV-DUP の M-3・M-6）: Rule に渡す記録の種類は、深さの段の表（`ruleEvidenceTypes`。点検を省くページは安全・通信・console
+    // だけ。layout などの事実は判定にだけ使い、同じ中身の画面の指摘と重なる表示の指摘を作らない）。
+    const ruleEvidenceTypes = pageAuditStagesOf(this.#pageDecision.depth, profile).ruleEvidenceTypes;
     const baseFindings = this.#evaluateRules(
       url,
       pageId,
       profile,
       evidence
         .filter((created) => !recheckedEvidenceIds.has(created.evidenceId) && !openedEvidenceIds.has(created.evidenceId))
+        .filter((created) => ruleEvidenceTypes === null || ruleEvidenceTypes.includes(created.type))
         .map((created) => ruleInputs.get(created) ?? created),
       reasons,
     );
@@ -1652,7 +1793,7 @@ export class PageAuditor {
         // AUD-2a: この読み込みの状態 ID と、安定の判定の結果・通知の枠の扱い（段を始めたときだけ）。
         stateId,
         ...(settlingRecord === null ? {} : { settling: settlingRecord }),
-        ...(notificationHandling === null ? {} : { notificationHandling }),
+        ...(notificationHandling === null ? {} : { notificationHandling: withStressHiddenCount(notificationHandling, notification.stress) }),
         ...(recheck === null ? {} : { recheck }),
       },
       evidence,
@@ -1777,9 +1918,9 @@ export class PageAuditor {
    * L1: 予算（`NOTIFICATION_HANDLING_BUDGET_MS`）とページの期限は撤廃し、段の見張り（`signals`）で待つ。見張りが段を終えたら（abort）、その時点の途中の結果
    * （押した数と押した枠）を打ち切りの印つきで、すぐに残す（段を見放しても、それまでの記録を残す。fix round 2。設計書 3.2.1 の 6）。
    */
-  /** REV-SD の I-1: `view` の main frame の今の URL が、点検の範囲の中か（判定は `auditScopeLeftUrl`。範囲の判定がなければ中）。 */
-  #inAuditScope(view: Pick<AuditView, 'url'>): boolean {
-    return this.#isOutsideAuditScope === undefined || auditScopeLeftUrl(view.url(), this.#isOutsideAuditScope) === null;
+  /** REV-SD の I-1: `view`（`requestedUrl` を読み込んだ）の main frame の今の URL が、点検の範囲の中か（判定は `auditScopeLeftUrl`。範囲の判定がなければ中）。 */
+  #inAuditScope(view: Pick<AuditView, 'url'>, requestedUrl: string): boolean {
+    return this.#isOutsideAuditScope === undefined || auditScopeLeftUrl(view.url(), this.#isOutsideAuditScope, requestedUrl) === null;
   }
 
   async #handleNotificationFrames(
@@ -1789,6 +1930,7 @@ export class PageAuditor {
     notification: ViewportNotification,
     signals: ProgressSignals,
     inAuditScope: () => boolean,
+    shots: { readonly pageId: PageId; readonly retryAttempt: number | null; readonly record: (shot: ScreenshotEvidence) => void },
   ): Promise<void> {
     const progress: NotificationDismissalProgress = { current: null };
     const keep = (overlay: NotificationOverlayEvidence): void => {
@@ -1797,6 +1939,8 @@ export class PageAuditor {
       }
     };
     const keepPartial = (): void => keep(notificationOverlayAfterTimeout(progress));
+    // AUD-2（5.2）: 隠す前の画面の画像（隠したときだけ残す）。
+    const beforeHide = this.#beforeHideScreenshot({ view, pageId: shots.pageId, profile, retryAttempt: shots.retryAttempt, stressWidth: null });
     signals.signal.addEventListener('abort', keepPartial, { once: true });
     try {
       keep(await view.dismissNotificationFrames({
@@ -1809,10 +1953,53 @@ export class PageAuditor {
         beforeFirstDismissal: async () => {
           notification.beforeDismissal = await view.collectLayoutEvidence(viewportSize);
         },
+        beforeFirstHide: beforeHide.capture,
       }));
     } finally {
       signals.signal.removeEventListener('abort', keepPartial);
+      await beforeHide.commit(notification.overlay?.frames ?? [], shots.record);
     }
+  }
+
+  /**
+   * AUD-2（設計書 `2026-11-19-beaksight-audit-result-review-fixes-design.md` 5.2）: 通知の枠を隠す前の画面の画像。`capture` は最初に隠す直前に呼ばれ（読み込みは
+   * しない。撮影は今の部品）、`commit` は閉じる処理の後に呼ぶ（実際に隠した枠があるときだけ Evidence に残し、なければファイルを消す）。画像を撮る設定でないときは
+   * 撮らない。撮れなくても、隠す処理と点検は続ける。
+   */
+  #beforeHideScreenshot(target: {
+    readonly view: Pick<AuditView, 'captureViewportScreenshot'>;
+    readonly pageId: PageId;
+    readonly profile: ViewportProfile;
+    readonly retryAttempt: number | null;
+    readonly stressWidth: number | null;
+  }): {
+    readonly capture: () => Promise<void>;
+    readonly commit: (frames: readonly NotificationFrameEvidence[], record: (shot: ScreenshotEvidence) => void) => Promise<void>;
+  } {
+    const relativeArtifactPath = beforeHideScreenshotRelativePath(target.pageId, target.profile, target.retryAttempt, target.stressWidth, this.#screenshotRevisit);
+    const outputPath = artifactFilePath(this.#screenshotRootDirectory, relativeArtifactPath);
+    let shot: ScreenshotEvidence | null = null;
+    return {
+      capture: async () => {
+        if (!this.#config.audit.screenshots || shot !== null) return;
+        try {
+          const captured = await target.view.captureViewportScreenshot(
+            { outputPath, relativeArtifactPath }, { pageId: target.pageId, viewport: target.profile, stressWidth: target.stressWidth },
+          );
+          shot = Object.freeze({ ...captured, beforeNotificationHide: true as const });
+        } catch {
+          await rm(outputPath, { force: true }).catch(() => undefined);
+        }
+      },
+      commit: async (frames, record) => {
+        if (shot === null) return;
+        if (frames.some((frame) => frame.hidden)) {
+          record(shot);
+        } else {
+          await rm(outputPath, { force: true }).catch(() => undefined);
+        }
+      },
+    };
   }
 
   /**
@@ -1888,7 +2075,7 @@ export class PageAuditor {
       // AUD-3d の続き（証拠の欠けを埋める）: 集め直した layout の直後に、確かめ直しの段の viewport の画像を撮る（確かめ直しの指摘が参照する。後から出た問題が
       // 写る）。画像を撮る設定のときだけ。撮れなくても確かめ直しの結果は変えない。
       if (this.#config.audit.screenshots) {
-        await this.#recheckScreenshot(state);
+        await this.#recheckScreenshot(state, rechecked.value.layout);
       }
     }
     const headingKey = ({ level, text }: { readonly level: number; readonly text: string }): string => `${String(level)}:${text}`;
@@ -1983,10 +2170,13 @@ export class PageAuditor {
    *   ファイルを残さない。
    * - L1b: 見張りが撮影の途中で段を終えたら、撮り終えた分を、待たずに（ファイルを消さずに）返す。撮り終えなかった画像のファイル（書きかけ）は消す。
    */
-  #screenshotCapture(state: CollectionState): { readonly capture: (part: 'VIEWPORT' | 'FULL_PAGE') => Promise<void> } {
+  #screenshotCapture(state: CollectionState): {
+    readonly capture: (part: 'VIEWPORT' | 'FULL_PAGE', markTargets?: readonly string[]) => Promise<void>;
+  } {
     const { pageId, profile, view, record, attempt } = state;
     const paths = screenshotCapturePaths(this.#screenshotRootDirectory, pageId, profile, state.screenshotRetryAttempt, this.#screenshotRevisit);
-    const capture = async (part: 'VIEWPORT' | 'FULL_PAGE'): Promise<void> => {
+    // AUD-4: `markTargets` は、直前の主の layout の対象（viewport の画像の状態の印に、対象の矩形を読み直して記録する）。
+    const capture = async (part: 'VIEWPORT' | 'FULL_PAGE', markTargets?: readonly string[]): Promise<void> => {
       const outputPath = part === 'VIEWPORT' ? paths.viewportCapture.outputPath : paths.fullPageCapture.outputPath;
       const removeFile = async (): Promise<void> => {
         await rm(outputPath, { force: true }).catch(() => undefined);
@@ -1994,7 +2184,7 @@ export class PageAuditor {
       let abandoned = false;
       const screenshots = await attempt('screenshot', async (signals) => {
         try {
-          const captured = await view.captureScreenshots(paths, { watch: { progress: signalsOf(signals) }, parts: part });
+          const captured = await view.captureScreenshots(paths, { watch: { progress: signalsOf(signals) }, parts: part, markTargets });
           if (abandoned) {
             await removeFile();
           }
@@ -2013,7 +2203,7 @@ export class PageAuditor {
         return;
       }
       for (const screenshot of screenshots.value) {
-        record('screenshot', screenshot);
+        record('screenshot', withHiddenFrameCount(screenshot, hiddenFrameCountOf(state.notification.overlay)));
       }
       if (screenshots.watchEnded !== undefined && !screenshots.value.some((screenshot) => screenshot.captureType === part)) {
         await removeFile();
@@ -2027,7 +2217,12 @@ export class PageAuditor {
    * - 撮った画像の Evidence は、段 `stress-layout`・Desktop の読み込みの状態 ID で残す（その幅の layout の `capture` と同じ状態）。
    * - 撮れなかった幅は、書きかけのファイルを消し、Evidence を残さない（幅の layout の結果は変えない。例外を投げない）。撮る数に上限は置かない。
    */
-  #stressWidthScreenshot(stateId: EvidenceStateId, sink: StressScreenshotSink): (stressView: AuditView, width: number, layout: LayoutEvidence) => Promise<void> {
+  #stressWidthScreenshot(
+    stateId: EvidenceStateId,
+    sink: StressScreenshotSink,
+    /** SWR: 読んだフォーカスの確かめを受ける口（照らし合わせの読み込み直しの幅）。 */
+    onFocusChecks?: (checks: FocusCheckEvidence) => void,
+  ): (stressView: AuditView, width: number, layout: LayoutEvidence) => Promise<void> {
     return async (stressView, width, layout) => {
       if (sink.screenshots) {
         const startedAt = this.#clock().toISOString();
@@ -2038,9 +2233,9 @@ export class PageAuditor {
         try {
           const screenshot = await stressView.captureViewportScreenshot(
             { outputPath, relativeArtifactPath },
-            { pageId: sink.pageId, viewport: 'desktop', stressWidth: width },
+            { pageId: sink.pageId, viewport: 'desktop', stressWidth: width, markTargets: markTargetsOf(layout) },
           );
-          sink.record('screenshot', screenshot, this.#stageCapture(stateId, 'stress-layout', startedAt));
+          sink.record('screenshot', withHiddenFrameCount(screenshot, sink.hiddenFrameCountOf(width)), this.#stageCapture(stateId, 'stress-layout', startedAt));
         } catch {
           await rm(outputPath, { force: true }).catch(() => undefined);
         }
@@ -2051,12 +2246,14 @@ export class PageAuditor {
       });
       // AUD-4d: その幅の layout と画像の後（次の幅の読み込みの前）に、その幅のフォーカスの確かめを読む（その幅の最後の読み取り）。
       const startedAt = this.#clock().toISOString();
+      // AUD-3（REV-AUD3 の後の判断）: 幅の走査の幅では、通常の Tab の確かめはしない（主の読み込みだけ）。
       const checks = await stressView.collectFocusChecks({
         stressWidth: width,
         settleIntervalMs: this.#windows.scroll.stepWaitMs,
         onFocused: this.#focusedScreenshot({ ...sink, view: stressView, stateId, viewport: 'desktop', stressWidth: width }),
       });
       sink.record('focus', checks, this.#stageCapture(stateId, 'focus-check', startedAt));
+      onFocusChecks?.(checks);
     };
   }
 
@@ -2099,34 +2296,35 @@ export class PageAuditor {
    * EV-2: 対象まで動かして測り直した viewport の画像を撮って、Evidence に残す口（段 `phase`・その読み込みの状態 ID。`reveal-<番号>`。番号は `count` で数える）。
    * 撮れなかったら、書きかけのファイルを消して `null`。
    */
-  #revealCapture(target: {
-    readonly view: AuditView;
-    readonly pageId: PageId;
-    readonly retryAttempt: number | null;
-    readonly stateId: EvidenceStateId;
-    readonly viewport: ViewportProfile;
-    readonly stressWidth: number | null;
-    readonly phase: PageAuditStage;
-    readonly record: StressScreenshotSink['record'];
-  }, count: { value: number }): RevealCapturePort<EvidenceId> {
-    return async (reveal) => {
-      count.value += 1;
-      const startedAt = this.#clock().toISOString();
-      const relativeArtifactPath = screenshotRelativePath(
-        target.pageId, target.viewport, 'VIEWPORT', target.retryAttempt, target.stressWidth, false, null, null, count.value, this.#screenshotRevisit,
+  #revealCapture(target: NumberedCaptureTarget, count: { value: number }): RevealCapturePort<EvidenceId> {
+    return (reveal) => this.#numberedCapture(target, count, reveal);
+  }
+
+  /**
+   * FRET: 窓を開くボタンの確かめの、押す前と閉じた後の viewport の画像を撮る口（番号は、同じ読み込みの `reveal-<番号>` と共有して数える。測り直しの記録はない）。
+   */
+  #dialogFocusCapture(target: NumberedCaptureTarget, count: { value: number }): () => Promise<EvidenceId | null> {
+    return () => this.#numberedCapture(target, count, undefined);
+  }
+
+  /** EV-2・FRET: `reveal-<番号>` の viewport の画像を撮って、Evidence に残す（撮れなかったら、書きかけのファイルを消して `null`）。 */
+  async #numberedCapture(target: NumberedCaptureTarget, count: { value: number }, reveal: RevealCaptureEvidence | undefined): Promise<EvidenceId | null> {
+    count.value += 1;
+    const startedAt = this.#clock().toISOString();
+    const relativeArtifactPath = screenshotRelativePath(
+      target.pageId, target.viewport, 'VIEWPORT', target.retryAttempt, target.stressWidth, false, null, null, count.value, this.#screenshotRevisit,
+    );
+    const outputPath = artifactFilePath(this.#screenshotRootDirectory, relativeArtifactPath);
+    try {
+      const screenshot = await target.view.captureViewportScreenshot(
+        { outputPath, relativeArtifactPath },
+        { pageId: target.pageId, viewport: target.viewport, stressWidth: target.stressWidth, ...(reveal === undefined ? {} : { reveal }) },
       );
-      const outputPath = artifactFilePath(this.#screenshotRootDirectory, relativeArtifactPath);
-      try {
-        const screenshot = await target.view.captureViewportScreenshot(
-          { outputPath, relativeArtifactPath },
-          { pageId: target.pageId, viewport: target.viewport, stressWidth: target.stressWidth, reveal },
-        );
-        return target.record('screenshot', screenshot, this.#stageCapture(target.stateId, target.phase, startedAt)).evidenceId;
-      } catch {
-        await rm(outputPath, { force: true }).catch(() => undefined);
-        return null;
-      }
-    };
+      return target.record('screenshot', screenshot, this.#stageCapture(target.stateId, target.phase, startedAt)).evidenceId;
+    } catch {
+      await rm(outputPath, { force: true }).catch(() => undefined);
+      return null;
+    }
   }
 
   /** AUD-3d・4d: 段の集めた状態と時刻（ビューポートの読み込みの状態 ID、段、始めた時刻から今まで。URL と位置は読まない）。 */
@@ -2183,10 +2381,27 @@ export class PageAuditor {
   }
 
   /**
+   * AUD-3（設計書 `2026-11-19-beaksight-audit-result-review-fixes-design.md` 6.2 の 4）: 通常の Tab の確かめ。直の focus で隠れたままの項目（`focusCheckOutcomeOf`
+   * の判定。Rule と同じ 1 か所）がある記録だけ、その項目を候補にして確かめる（候補がなければ Tab を押さない）。確かめられなければ、記録を変えずに返す。
+   * REV-AUD3 の後の判断: 主の読み込み（ビューポートごと）だけで呼ぶ。期限は、この段の見張り（`signals`）。
+   */
+  async #sequentialTab(view: AuditView, checks: FocusCheckEvidence, signals: ProgressSignals): Promise<FocusCheckEvidence> {
+    const viewport = { width: checks.viewportWidth, height: checks.viewportHeight };
+    const candidates = checks.items.flatMap((item, index) => (isHiddenFocusCheckOutcome(focusCheckOutcomeOf(item, viewport)) ? [index] : []));
+    // AUDR2: 走らなかった・確かめられなかった理由を、記録に残す。
+    if (candidates.length === 0) {
+      return Object.freeze({ ...checks, sequentialTabOutcome: 'NO_CANDIDATES' });
+    }
+    return view.checkSequentialTab(checks, {
+      candidates, settleIntervalMs: this.#windows.scroll.stepWaitMs, track: (work) => signals.track(work), signal: signals.signal,
+    }).catch(() => Object.freeze({ ...checks, sequentialTabOutcome: 'READ_FAILED' as const }));
+  }
+
+  /**
    * AUD-3d の続き: 落ち着いた後の確かめ直しの段の viewport の画像を撮り、Evidence に残す（段 `recheck`。直前に集め直した layout と同じ状態と時刻の範囲）。
    * 撮れなければ、書きかけのファイルを消し、Evidence を残さない（例外を投げない）。
    */
-  async #recheckScreenshot(state: RecheckTarget): Promise<void> {
+  async #recheckScreenshot(state: RecheckTarget, layout: LayoutEvidence | null): Promise<void> {
     const { view, pageId, profile, attempt } = state;
     // COV-4 の区切り 3: 開いた状態の確かめ直しの画像は、その状態の `state-<番号>/recheck/viewport.png`。
     const relativeArtifactPath = screenshotRelativePath(
@@ -2194,7 +2409,7 @@ export class PageAuditor {
     );
     const outputPath = artifactFilePath(this.#screenshotRootDirectory, relativeArtifactPath);
     const shot = await attempt('recheck', async () => {
-      return view.captureViewportScreenshot({ outputPath, relativeArtifactPath }, { pageId, viewport: profile, stressWidth: null });
+      return view.captureViewportScreenshot({ outputPath, relativeArtifactPath }, { pageId, viewport: profile, stressWidth: null, markTargets: markTargetsOf(layout) });
     });
     if (!shot.ok) {
       await rm(outputPath, { force: true }).catch(() => undefined);
@@ -2213,12 +2428,31 @@ export class PageAuditor {
 
     const dom = await attempt('dom', () => view.collectDomEvidence(pageId));
     if (dom.ok) {
-      record('dom', dom.value);
+      // DUP（REV-DUP の M-4）: 欄の表示の値の digest は記録に残さない（中身の要約にだけ使う）。
+      record('dom', recordedDomEvidenceOf(dom.value));
+    }
+    // DUP: 同じ作りの画面の口があれば、Desktop の DOM の後に、作りの鍵を作る（候補の形を読む。読み込みは足さない）。
+    const sameness = profile === 'desktop' ? this.#pageSameness : undefined;
+    let templateKey: string | null = null;
+    if (sameness !== undefined && dom.ok) {
+      const found = await attempt('interaction-discovery', () => view.discoverInteractionCandidates(undefined, this.#openEndedAtMs()));
+      templateKey = found.ok ? auditPageTemplateKeyOf(dom.value, state.url, found.value.candidates) : null;
+      this.#pageTemplateKey = templateKey;
     }
 
-    const primary = await attempt('layout', () => view.collectLayoutEvidence(viewportSize));
+    // AUD-4: layout の状態の印に、今の記録の隠した通知の枠の数を足す（状態の画像も同じ数を足す）。
+    const primary = await attempt('layout', async () =>
+      layoutResultWithHiddenFrameCount(await view.collectLayoutEvidence(viewportSize), hiddenFrameCountOf(state.notification.overlay)));
     // AUD-2a: 主の形を測った段の、集めた状態と時刻（次の段で上書きされる前に控える）。
     const primaryCapture = state.currentCapture();
+    // DUP: Desktop の layout の後に、ページの点検の深さを決めて、口に知らせる（Mobile は、決めた深さに従う）。
+    if (sameness !== undefined) {
+      const contentDigest = dom.ok && primary.ok ? auditPageContentDigestOf(dom.value, primary.value.layout) : null;
+      const decision = pageAuditDepthOf({ templateKey, contentDigest, referenceOf: sameness.referenceOf, sameContentAs: sameness.sameContentAs });
+      this.#pageDecision = decision;
+      sameness.decided(Object.freeze({ ...decision, pageId, templateKey, contentDigest }));
+    }
+    const depthStages = pageAuditStagesOf(this.#pageDecision.depth, profile);
     if (primary.ok) {
       if (primary.value.status === 'PARTIAL') {
         reasons.push(collectorIncompleteReason('layout', primary.value.reason));
@@ -2230,12 +2464,16 @@ export class PageAuditor {
       if (profile === 'desktop') {
         // L14（設計書 `2026-11-09-beaksight-remove-limits-design.md` 6 の L14、網羅の設計書 3.3）: 幅の走査に、この page の CSS の media query の境目の
         // 両側の幅を足す。境目は、Context を閉じる前のこの page から読む（読むだけ。読めなければ設定の幅だけ）。
-        const breakpoints = await attempt('layout', async () => breakpointSideWidthsOf(await view.readMediaQueryConditionTexts()));
+        // DUP: 幅の走査をしない深さでは、境目を読まない（主の形は、走査をしないまま Context を閉じた後に記録する）。
+        const breakpoints = depthStages.stressSweep
+          ? await attempt('layout', async () => breakpointSideWidthsOf(await view.readMediaQueryConditionTexts()))
+          : null;
         state.deferredStressSweep.value = {
           primary: primary.value,
           primaryCapture,
           stateId: state.stateId,
-          breakpointWidths: breakpoints.ok ? breakpoints.value : [],
+          breakpointWidths: breakpoints?.ok === true ? breakpoints.value : [],
+          sweep: depthStages.stressSweep,
         };
       } else {
         record('layout', layoutPayloadOf(primary.value, null, state.notification), primaryCapture);
@@ -2244,8 +2482,9 @@ export class PageAuditor {
 
     // AUD-2c（整理の文書 `2026-11-09-beaksight-audit-precision-triage.md` の AUD-2c）: viewport の画像は、DOM・layout の直後（axe の前）に撮る（DOM・layout と
     // 同じ状態の見た目を残す）。全体の画像は、今の位置（performance の後）のまま撮る。
-    const screenshots = config.audit.screenshots ? this.#screenshotCapture(state) : null;
-    await screenshots?.capture('VIEWPORT');
+    // DUP: layout の後の画像・reveal・確かめ直し、axe、性能、Interaction、フォーカスの確かめは、深さの段の表（`depthStages`）にもよる。
+    const screenshots = config.audit.screenshots && depthStages.afterLayout ? this.#screenshotCapture(state) : null;
+    await screenshots?.capture('VIEWPORT', markTargetsOf(primary.ok ? primary.value.layout : null));
 
     // REC-1: 色（color）の Evidence は集めない（Rule・表示・報告で読む所がない。コントラストは axe が見る）。
 
@@ -2254,7 +2493,7 @@ export class PageAuditor {
     // 見張りの 1 つだけにする（collector の PARTIAL の理由を重ねない）。
     // AUD-2d・2e: 1 回目の axe の結果（確かめ直しで、1 回目と同じ設定の axe を流し直すか決め、比べたルールを記録するため）。
     let firstAccessibility: EvidencePayloadByType['accessibility'] | null = null;
-    if (config.audit.accessibility) {
+    if (config.audit.accessibility && depthStages.accessibility) {
       const accessibility = await attempt('accessibility', (signals) =>
         view.collectAccessibilityEvidence({ watch: { progress: signalsOf(signals) } }), true, undefined, true);
       if (accessibility.ok) {
@@ -2266,7 +2505,7 @@ export class PageAuditor {
       }
     }
 
-    if (config.audit.performance && state.performanceInstalled) {
+    if (config.audit.performance && state.performanceInstalled && depthStages.performance) {
       const network = state.network;
       const performance = await attempt('performance', async (signals) => {
         const watch = { progress: signalsOf(signals) };
@@ -2288,7 +2527,7 @@ export class PageAuditor {
 
     // EV-2（設計書 `2026-11-16-beaksight-finding-evidence-design.md` 3.2）: 主の layout の重なりと覆いの指摘の対象まで動かして測り直し、撮る（撮った後に
     // 元の位置へ戻す。読み込みは足さない）。段は画像の段 `screenshot`。EV-4: 見切れの指摘の対象も撮る。
-    const primaryRevealTargets = primary.ok && config.audit.screenshots ? revealTargetsOf(primary.value.layout, true) : [];
+    const primaryRevealTargets = primary.ok && config.audit.screenshots && depthStages.afterLayout ? revealTargetsOf(primary.value.layout, true) : [];
     const revealCount = { value: 0 };
     if (primaryRevealTargets.length > 0) {
       await attempt('screenshot', (signals) => this.#revealTargets({
@@ -2309,7 +2548,9 @@ export class PageAuditor {
 
     // AUD-2d（整理の文書 `2026-11-09-beaksight-audit-precision-triage.md` の AUD-2d）: 画像の後に、落ち着いた後の確かめ直しをする（読み込み直さない）。
     // AUD-2e: 主の layout を集めたら、確かめ直しで主の layout も集め直す。
-    state.recheck.value = await this.#recheckAfterSettled(state, dom.ok ? dom.value : null, firstAccessibility, primary.ok);
+    state.recheck.value = depthStages.afterLayout
+      ? await this.#recheckAfterSettled(state, dom.ok ? dom.value : null, firstAccessibility, primary.ok)
+      : null;
 
     // Link は、ビューポートごとに 1 回だけ抽出する（ARCH03、設計書 4.4）。L5 の N5（INV-LIMITS の表 A）: Mobile のビューポートでも抽出し、Mobile にだけある
     // 導線の出た先も、巡回の辺にする（Desktop だけの決まりはやめた）。
@@ -2323,8 +2564,11 @@ export class PageAuditor {
 
     // Interaction は、Link の抽出の後、Safety の Evidence と Rule の評価の前に、Desktop だけで行う（設計書 4.5.2）。
     // L5 の N5: Mobile でも行う（Mobile では、Desktop の同じページになかった候補だけ。`mobileOnlyInteractionCandidates`）。
-    if (config.audit.interactions) {
+    if (config.audit.interactions && depthStages.interactions) {
       await this.#auditInteractions(state);
+    }
+    if (!depthStages.focusCheck) {
+      return;
     }
 
     // AUD-4d（整理の文書 `2026-11-09-beaksight-audit-precision-triage.md` の AUD-4d）: そのビューポートの最後に、画面の外の、フォーカスできる要素のフォーカスの
@@ -2334,6 +2578,8 @@ export class PageAuditor {
       stressWidth: null,
       settleIntervalMs: this.#windows.scroll.stepWaitMs,
       track: (work) => signalsOf(signals).track(work),
+      // REV-AUD3 の M-4: 位置の落ち着きの待ちは、この段の期限で終える。
+      signal: signalsOf(signals).signal,
       onFocused: this.#focusedScreenshot({
         view,
         pageId,
@@ -2344,7 +2590,8 @@ export class PageAuditor {
         stressWidth: null,
         record: (type, payload, capture) => record(type, payload, capture),
       }),
-    }));
+      // REV-AUD3 の 2 回目の I-A: 見張りが段を終えたら、collector は途中の記録（落ち着かなかった項目を含む）を同じ回りのうちに返す。その記録を残す。
+    }), true, undefined, true);
     // EV-4（設計書 `2026-11-16-beaksight-finding-evidence-design.md` 3.4）: axe の `scrollable-region-focusable` の要素ごとに、領域まで動かして撮り、Tab で
     // 届くか・矢印のキーで動くかを試す（フォーカスの確かめの後。値は変えず、位置とフォーカスを元へ戻す）。結果は、このフォーカスの確かめの記録に足す。
     const regionTargets = scrollableRegionTargetsOf(firstAccessibility);
@@ -2358,8 +2605,38 @@ export class PageAuditor {
         }, revealCount)
         : undefined,
     }));
+    // AUD-3（設計書 `2026-11-19-beaksight-audit-result-review-fixes-design.md` 6.2 の 4）: ほかの証拠を集め終えた後に、直の focus で隠れたままの項目がある画面
+    // だけ、文書の先頭からの通常の Tab の確かめをする（元のフォーカスと位置に戻す）。結果は、このフォーカスの確かめの記録の項目に足す。
     if (checks.ok) {
-      const payload = regions?.ok === true ? Object.freeze({ ...checks.value, scrollableRegions: regions.value }) : checks.value;
+      // REV-AUD3 の 3 回目の M-1: 直の focus の確かめが見張りで終わった（落ち着かなかった）ビューポートでは、Tab の確かめを始めない（反応なしの待ちを
+      // 重ねず、直の focus の戻す処理と重ならない）。
+      const directEnded = checks.watchEnded !== undefined || checks.value.items.some((item) => item.unsettled === true);
+      const tabbed = directEnded
+        ? { ok: false as const }
+        : await attempt('focus-check', (signals) => this.#sequentialTab(view, checks.value, signalsOf(signals)));
+      // AUDR2: 走らなかった（見張りで終わった）・Tab の確かめの段が見張りで終わった（期限）ことを、記録に残す。
+      const focus: FocusCheckEvidence = tabbed.ok
+        ? tabbed.value
+        : Object.freeze({ ...checks.value, sequentialTabOutcome: directEnded ? 'WATCH_ENDED' : 'DEADLINE' });
+      // FRET（設計書 `2026-11-24-beaksight-dialog-focus-return-design.md` 1.2）: そのビューポートの点検の最後に、窓を開くボタンを押して、窓を閉じた後のフォーカスの
+      // 戻り先を確かめる（窓を開けた状態が、ほかの証拠に混ざらないため）。同じ物は Run で 1 回。結果は、このフォーカスの確かめの記録に足す。
+      const dialog = await attempt('focus-check', (signals) => view.checkDialogFocus({
+        keyScope: profile,
+        accept: (keyDigest) => {
+          if (this.#dialogFocusPressed.has(keyDigest)) return false;
+          this.#dialogFocusPressed.add(keyDigest);
+          return true;
+        },
+        settleIntervalMs: this.#windows.scroll.stepWaitMs,
+        track: (work) => signalsOf(signals).track(work),
+        signal: signalsOf(signals).signal,
+        capture: config.audit.screenshots ? this.#dialogFocusCapture({
+          view, pageId, retryAttempt: state.screenshotRetryAttempt, stateId: state.stateId, viewport: profile, stressWidth: null, phase: 'focus-check',
+          record: (type, payload, capture) => record(type, payload, capture),
+        }, revealCount) : undefined,
+      }));
+      const withRegions = regions?.ok === true ? Object.freeze({ ...focus, scrollableRegions: regions.value }) : focus;
+      const payload = dialog.ok ? Object.freeze({ ...withRegions, dialogFocus: dialog.value }) : withRegions;
       record('focus', payload, this.#stageCapture(state.stateId, 'focus-check', focusStartedAt));
     }
   }
@@ -2371,6 +2648,11 @@ export class PageAuditor {
    * 渡す期限は切らない値（`openEndedStageDeadline`）。各幅の落ち着きの待ちと通知の枠の扱いは、その幅の page を進みの見張りで包む（`#watchOnPage`）。
    * 段階の実行は `runner`（D の page の crash とは競わせない。見放さずに終わりを待つ）。幅の走査の結果を返す（段階が終わらなければ `null`）。
    * 違反・サイトの不調・セッションの切れの確かめ、幅の Ledger と読み込みの一覧の記録は、前の順のときと同じ。
+   * SWR（設計者の判断 2026-11-17。案 B）: 幅が 2 つ以上なら、REVISIT の Context を 1 つだけ作り、一番広い幅で 1 回だけ読み込み、広い順に viewport の大きさだけを
+   * 変えて測る（一番狭い幅は、照らし合わせのために測るだけで、証拠を残さない）。その後に一番狭い幅を新しい REVISIT の Context で読み込み直して測り（今の幅ごと
+   * の読み込みと同じ）、その幅の事実（`sameStressLayoutFacts`）が大きさを変えて測ったものと違えば、大きさを変えて集めた幅の証拠を捨てて、残りの幅を今どおり
+   * 幅ごとに読み込み直す。大きさを変えて回す途中で幅が終わった（失敗・page を閉じた・見張りが静まらない幅を終えた）ときも、全部の幅を幅ごとに読み込み直す。
+   * 1 画面の幅の走査の読み込みは、ふだん 2 回、違いが出た画面は幅の数 + 1 回まで。違反・不調・セッションの切れの確かめは、大きさを変える前にも行う。
    */
   async #sweepStressWidths(
     url: NormalizedHttpUrlEvidence,
@@ -2379,6 +2661,8 @@ export class PageAuditor {
     state: Pick<CollectionState, 'reasons' | 'safety' | 'siteUnavailability' | 'authSessionLoss' | 'sessionLossLoads' | 'notification'> & {
       /** AUD-3d・4d: 幅の画像とフォーカスの確かめを残す口。 */
       readonly stressScreenshots: StressScreenshotSink;
+      /** fix round 3・SWR の 4: 押す期間に移動かポップアップを止めた幅（ここで足し、捨てた幅は除く）。 */
+      readonly pressBlockedWidths: Set<number>;
     },
   ): Promise<EvidencePayloadByType['layout']['stressSweep']> {
     const { reasons, safety, siteUnavailability } = state;
@@ -2389,9 +2673,8 @@ export class PageAuditor {
     // である（幅の走査が自分の期限を延ばすのと同じ量）。上限は幅ごとに変わるので、幅ごとにセッションの factory を作る。期限の注入（R15r-4）も、そのまま渡す。
     // 作ったセッションの Ledger は、作成の途中で失敗した場合も含めて、作った順に残す。
     // サイトの不調を検知した後も、次の幅を始めない（サイトが応答しないときに Run を止める設計書 3.1。理由は `stress-layout:SITE_UNAVAILABLE`）。
-    // 読み込み中の幅の値（通知の枠の記録に付ける）。走査は、幅ごとにセッションを作ってから、その幅を読み込むので、セッションを作るときの幅が、
-    // 次に受け口に渡る幅である。この対応付けは、collector（`collectStressLayout`）が、幅ごとに `beforeNavigation → createSession → goto →
-    // afterNavigation` を直列に行うことを前提にしている（DEF-209 で、待ちをセッションの作成の前に移した）。
+    // 読み込み中の幅の値（通知の枠の記録に付ける）。幅ごとの見張り（`watchWidth`）が、その幅の段を始めるときに入れる（SWR: 大きさを変えて回す幅も、
+    // 読み込み直す幅も、幅の段は 1 つずつ直列に行う）。
     let loadingStressWidth: number | null = null;
     // T25c: 読み込み中の幅のセッションの page と、DEF-138 の経路の記録（認証つきの Run だけ）。読み込みの後に、セッションの切れを確かめるため。
     // DF-3: 読み込んだ幅は、このビューポートの読み込みの一覧（`state.sessionLossLoads`）にも加え、後の時機にも確かめ直す。
@@ -2404,7 +2687,8 @@ export class PageAuditor {
     let widthNavigated = false;
     // DEF-209: 次の幅を始めないかの確かめは、その幅の読み込みの間隔の待ち（`beforeNavigation`）の前に行う（待ちを移す前と同じく、始めない幅では待たない。
     // 待ちの数を変えない）。当たれば、待たずに投げる（collector は、待ちの失敗をセッションの作成の失敗と同じく例外で返す）。
-    const beforeStressNavigation = async (): Promise<number> => {
+    // SWR: 大きさを変える幅の前も、同じ確かめで次の幅を始めない（読み込まないので、間隔は待たない）。
+    const abortIfNextWidthMustNotStart = (): void => {
       // 順は `stressWidthAbortOf`（違反 → 不調 → セッションの切れ）。DF-3（DEF-167）: 幅の走査の前と、各幅の前に、それまでに読み込んだ page（Passive と前の幅）を
       // 確かめ直す。当たれば、この幅を始めない。
       switch (stressWidthAbortOf({
@@ -2424,10 +2708,16 @@ export class PageAuditor {
         case 'AUTH_SESSION_LOST':
           throw new AuthSessionLostAbortError();
         case null:
-          return await this.#pacer.beforeNavigation();
+          return;
       }
     };
-    const createSession = async (viewport: Viewport): Promise<AuditStressSession> => {
+    const beforeStressNavigation = async (): Promise<number> => {
+      abortIfNextWidthMustNotStart();
+      // DBG-1: 幅の走査の読み込みの間隔の待ちを測る（切なら何もしない）。
+      return await this.#debugTiming.measure('PACING_WAIT', () => ({ pageId: state.stressScreenshots.pageId, part: 'stress-layout' }), () => this.#pacer.beforeNavigation());
+    };
+    // SWR の 3: 大きさを変えて回す Context は、Ledger 1 つに走査した幅の一覧（`sweptWidths`。走査の順に足す）を付ける。読み込み直す幅は `null`（今どおり幅ごと）。
+    const createSessionFor = (sweptWidths: number[] | null) => async (viewport: Viewport): Promise<AuditStressSession> => {
       loadingStressWidth = viewport.width;
       loadingStressLoad = null;
       loadingStressClose = null;
@@ -2469,8 +2759,10 @@ export class PageAuditor {
           },
         });
       } finally {
-        // BN-a: 幅のセッションの Ledger を、その幅と組にして残す（safety の Evidence の読み込みの印）。
-        safety.stressLedgers.push(...sessions.ledgers().map((ledger) => ({ ledger, width: viewport.width })));
+        // BN-a: 幅のセッションの Ledger を、その幅と組にして残す（safety の Evidence の読み込みの印）。SWR の 3: 大きさを変えて回す Context は、走査した幅の一覧も。
+        safety.stressLedgers.push(...sessions.ledgers().map((ledger) => (sweptWidths === null
+          ? { ledger, width: viewport.width }
+          : { ledger, width: viewport.width, widths: sweptWidths })));
       }
     };
     // 走査は、自分で期限を守る（見放さない）。各幅の読み込みの前には、ページの読み込みの間隔を守る（負荷の制御の設計書 4.1）。
@@ -2481,82 +2773,107 @@ export class PageAuditor {
     // L1: 幅ごとに、その幅の読み込み・落ち着き・測りを進みの見張りで包む（幅の page の通信・画面の変化と、幅の区切りの印を、どれも中身の進みに数える。
     // 幅の走査の期限は撤廃した）。見張りが幅を終えたら、理由を残し、止まった幅の page を閉じて、その幅を collector に失敗として返させる（それまでの幅の
     // 記録を残す）。応答しない・Run の時間の上限なら、残りの幅は始めない。静まらないなら、次の幅へ進む。
-    const sweepWidths = async (
-      sweepWidth: (widths: readonly number[]) => Promise<StressSweepResults>,
-    ): Promise<StressSweepResults> => {
-      const results: StressSweepResults[number][] = [];
-      // AUD-2b・2d の指示書の 3: 各幅の結果に、その幅を集めた状態と時刻を付ける（状態 ID は Desktop の読み込みのもの。位置は読まない）。
-      const withCapture = (results: StressSweepResults, startedAt: string): StressSweepResults => {
-        const capture: EvidenceCapture = Object.freeze({
-          stateId: pending.stateId,
-          phase: 'stress-layout',
-          startedAt,
-          finishedAt: this.#clock().toISOString(),
-          url: null,
-          scrollPosition: null,
-        });
-        return Object.freeze(results.map((result) => Object.freeze({ ...result, capture })));
-      };
-      for (const width of stressSweepWidths(config, pending.breakpointWidths)) {
-        let running: Promise<StressSweepResults> | undefined;
-        widthNavigated = false;
-        const widthStartedAt = this.#clock().toISOString();
-        loadingStressClose = null;
-        // C（DEF-245 の続き。発見の側の `documentGoneOf` と同じ考え方）: その幅の page が外部スキームへ移ろうとした記録が入るか、読み込んだ後に文書が消えたら
-        // （誤りの画面に替わった・閉じた）、その幅の page を閉じて終える（collector は、その幅を失敗として返す）。Playwright の 1 手には期限を付けず、事実を
-        // 確かめの間隔ごとに見る。
-        let widthDocumentEnded = false;
-        const widthDocumentWatch = setInterval(() => {
-          const load = loadingStressLoad;
-          if (widthDocumentEnded || load === null) {
-            return;
-          }
-          // REV-SD の I-1: 読み込んだ後に範囲の外へ移った幅の page も、使うのをやめる。
-          if (load.view.documentLeftCause(widthNavigated) !== null || (widthNavigated && !this.#inAuditScope(load.view))) {
-            widthDocumentEnded = true;
-            // DEF-247: page だけを閉じず、その幅の session の口で Context ごと閉じる（collector の後片付けと共有する 1 回の閉じ）。
-            void loadingStressClose?.().catch(() => undefined);
-          }
-        }, this.#windows.pageSettle.pollIntervalMs);
-        let watched: WatchedOutcome<StressSweepResults>;
-        try {
-          watched = await watchProgress((signals) => {
-            widthSignals = signals;
-            running = sweepWidth([width]);
-            return running;
-          }, this.#watchOptions(PROGRESS_SIGNAL_KINDS));
-        } finally {
-          clearInterval(widthDocumentWatch);
-        }
-        widthSignals = null;
-        if (watched.status === 'REJECTED') {
-          throw watched.reason;
-        }
-        if (watched.status === 'FULFILLED') {
-          results.push(...withCapture(watched.value, widthStartedAt));
-          continue;
-        }
-        reasons.push(progressWatchEndReason('stress-layout', watched.end));
-        // 読み込みの最中なら、読み込みは部品の中の期限（Playwright の既定。L2 の範囲）で終わり、時間切れの観測でサイトの不調を今までどおり判定するので、
-        // 閉じない。読み込みの後（落ち着き・測り）で止まったなら、その幅の page を閉じて終わらせる。
-        // DEF-247: page だけを閉じず、その幅の session の口で Context ごと閉じる（collector の後片付けと共有する 1 回の閉じ）。
-        // 閉じる口は、collector が作った幅の session で決まる（この関数の外の受け口で入れるので、型の絞り込みを外す）。
-        const closeStalled = loadingStressClose as (() => Promise<void>) | null;
-        if (widthNavigated) {
-          await closeStalled?.().catch(() => undefined);
-        }
-        if (running !== undefined) {
-          results.push(...withCapture(await running, widthStartedAt));
-        }
-        if (watched.end !== 'STAGE_NEVER_QUIET') {
-          break;
-        }
-      }
-      return Object.freeze(results);
+    // AUD-2b・2d の指示書の 3: 各幅の結果に、その幅を集めた状態と時刻を付ける（状態 ID は Desktop の読み込みのもの。位置は読まない）。
+    const withCapture = (results: StressSweepResults, startedAt: string): StressSweepResults => {
+      const capture: EvidenceCapture = Object.freeze({
+        stateId: pending.stateId,
+        phase: 'stress-layout',
+        startedAt,
+        finishedAt: this.#clock().toISOString(),
+        url: null,
+        scrollPosition: null,
+      });
+      // AUD-4: 幅の layout の状態の印に、その幅の今の記録の隠した通知の枠の数を足す（その幅の画像も同じ数を足す）。
+      return Object.freeze(results.map((result) => Object.freeze({
+        ...layoutResultWithHiddenFrameCount(result, state.stressScreenshots.hiddenFrameCountOf(result.width)),
+        capture,
+      })));
     };
-    const swept = await runner.attempt(
-      'stress-layout',
-      () => sweepWidths((widths) => this.#ports.collectStressLayout(createSession, url, widths, {
+    /**
+     * 1 つの幅の段を見張る（`run` が、その幅を読み込むか大きさを変えて測る）。`hardStop` は、応答しない・Run の時間の上限で、残りの幅を始めないこと。
+     * SWR: 大きさを変えた幅（`resized`）は、読み込み済みの page を続けて使う（読み込みは終わっている。その幅の見張りに page の印を付け直す）。押す期間の移動は、
+     * その幅の間に増えた数で決める（SWR の 4）。
+     */
+    // DBG-1: 幅の走査の幅ごとの時間を測る（切なら何もしない）。
+    const watchWidth = (
+      width: number,
+      resized: boolean,
+      run: () => Promise<StressSweepResults>,
+    ): Promise<{ readonly results: StressSweepResults; readonly hardStop: boolean }> => this.#debugTiming.measure(
+      'AUDIT_STRESS_WIDTH', () => ({ pageId: state.stressScreenshots.pageId, counts: { width } }), () => watchOneWidth(width, resized, run));
+    const watchOneWidth = async (
+      width: number,
+      resized: boolean,
+      run: () => Promise<StressSweepResults>,
+    ): Promise<{ readonly results: StressSweepResults; readonly hardStop: boolean }> => {
+      let running: Promise<StressSweepResults> | undefined;
+      widthNavigated = resized;
+      loadingStressWidth = width;
+      const widthStartedAt = this.#clock().toISOString();
+      if (!resized) {
+        loadingStressClose = null;
+      }
+      const loadBefore = resized ? loadingStressLoad as SessionLossLoad | null : null;
+      const pressesBefore = loadBefore?.view.pressNavigations() ?? 0;
+      // C（DEF-245 の続き。発見の側の `documentGoneOf` と同じ考え方）: その幅の page が外部スキームへ移ろうとした記録が入るか、読み込んだ後に文書が消えたら
+      // （誤りの画面に替わった・閉じた）、その幅の page を閉じて終える（collector は、その幅を失敗として返す）。Playwright の 1 手には期限を付けず、事実を
+      // 確かめの間隔ごとに見る。
+      let widthDocumentEnded = false;
+      const widthDocumentWatch = setInterval(() => {
+        const load = loadingStressLoad;
+        if (widthDocumentEnded || load === null) {
+          return;
+        }
+        // REV-SD の I-1: 読み込んだ後に範囲の外へ移った幅の page も、使うのをやめる。
+        if (load.view.documentLeftCause(widthNavigated) !== null || (widthNavigated && !this.#inAuditScope(load.view, url))) {
+          widthDocumentEnded = true;
+          // DEF-247: page だけを閉じず、その幅の session の口で Context ごと閉じる（collector の後片付けと共有する 1 回の閉じ）。
+          void loadingStressClose?.().catch(() => undefined);
+        }
+      }, this.#windows.pageSettle.pollIntervalMs);
+      const attached: { detach: (() => void) | null } = { detach: null };
+      let watched: WatchedOutcome<StressSweepResults>;
+      try {
+        watched = await watchProgress((signals) => {
+          widthSignals = signals;
+          if (loadBefore !== null) {
+            attached.detach = loadBefore.view.attachProgressSignals(signals);
+          }
+          running = run();
+          return running;
+        }, this.#watchOptions(PROGRESS_SIGNAL_KINDS));
+      } finally {
+        clearInterval(widthDocumentWatch);
+        attached.detach?.();
+      }
+      widthSignals = null;
+      if (watched.status === 'REJECTED') {
+        throw watched.reason;
+      }
+      const notePresses = (): void => {
+        const load = loadingStressLoad as SessionLossLoad | null;
+        if ((load?.view.pressNavigations() ?? 0) > (load === loadBefore ? pressesBefore : 0)) {
+          state.pressBlockedWidths.add(width);
+        }
+      };
+      if (watched.status === 'FULFILLED') {
+        notePresses();
+        return { results: withCapture(watched.value, widthStartedAt), hardStop: false };
+      }
+      reasons.push(progressWatchEndReason('stress-layout', watched.end));
+      // 読み込みの最中なら、読み込みは部品の中の期限（Playwright の既定。L2 の範囲）で終わり、時間切れの観測でサイトの不調を今までどおり判定するので、
+      // 閉じない。読み込みの後（落ち着き・測り）で止まったなら、その幅の page を閉じて終わらせる。
+      // DEF-247: page だけを閉じず、その幅の session の口で Context ごと閉じる（collector の後片付けと共有する 1 回の閉じ）。
+      // 閉じる口は、collector が作った幅の session で決まる（この関数の外の受け口で入れるので、型の絞り込みを外す）。
+      const closeStalled = loadingStressClose as (() => Promise<void>) | null;
+      if (widthNavigated) {
+        await closeStalled?.().catch(() => undefined);
+      }
+      const results = running === undefined ? Object.freeze([]) : withCapture(await running, widthStartedAt);
+      notePresses();
+      return { results, hardStop: watched.end !== 'STAGE_NEVER_QUIET' };
+    };
+    const stressOptions: AuditStressLayoutOptions = {
         deadlineAtMs: this.#openEndedAtMs(),
         beforeNavigation: beforeStressNavigation,
         // T44 P1-5: 幅の走査の読み込みも、最初の読み込みと同じ落ち着きの待ち（`#waitForSettled`）の後に形を測る。L1: 期限は撤廃し、その幅の page を見張る
@@ -2570,21 +2887,31 @@ export class PageAuditor {
           const width = loadingStressWidth;
           const progress: NotificationDismissalProgress = { current: null };
           // REV-SD の I-1: 範囲の外へ移った幅の page では押さず、その幅を測らない（その幅を失敗にする）。
-          const inAuditScope = (): boolean => this.#inAuditScope(stressView);
+          const inAuditScope = (): boolean => this.#inAuditScope(stressView, url);
           if (!inAuditScope()) {
             throw new Error('the stress page moved out of the audit scope');
           }
+          // AUD-2（5.2）: その幅で隠す前の画面の画像（隠したときだけ残す）。
+          const sink = state.stressScreenshots;
+          const shotStartedAt = this.#clock().toISOString();
+          const beforeHide = width === null
+            ? null
+            : this.#beforeHideScreenshot({ view: stressView, pageId: sink.pageId, profile: 'desktop', retryAttempt: sink.retryAttempt, stressWidth: width });
           const handled = await this.#watchOnPage(stressView, () => stressView.dismissNotificationFrames({
             deadlineAtMs: this.#openEndedAtMs(),
             pressMode: 'AUDIT',
             seenDigests: this.#seenNotificationDigestsOf(STRESS_NOTIFICATION_SEEN_KEY),
             progress,
             inAuditScope,
+            ...(beforeHide === null ? {} : { beforeFirstHide: beforeHide.capture }),
           }));
+          const overlay = handled.status === 'FULFILLED' ? handled.value : notificationOverlayAfterTimeout(progress);
+          await beforeHide?.commit(overlay.frames, (shot) => {
+            sink.record('screenshot', shot, this.#stageCapture(pending.stateId, 'stress-layout', shotStartedAt));
+          });
           if (!inAuditScope()) {
             throw new Error('the stress page moved out of the audit scope');
           }
-          const overlay = handled.status === 'FULFILLED' ? handled.value : notificationOverlayAfterTimeout(progress);
           if (width !== null && hasNotificationFacts(overlay)) {
             state.notification.stress.push(Object.freeze({ width, overlay }));
           }
@@ -2620,7 +2947,114 @@ export class PageAuditor {
           widthNavigated = true;
           widthSignals?.mark('BROWSER_RESPONSE');
         },
-      })),
+    };
+    const afterStressLayout = stressOptions.afterLayout;
+    /** 幅ごとに読み込み直す（今の形）。`hardStop` なら、残りの幅を始めない。 */
+    const reloadWidths = async (
+      widths: readonly number[],
+      afterLayout = afterStressLayout,
+    ): Promise<{ readonly results: StressSweepResults; readonly hardStop: boolean }> => {
+      const results: StressSweepResults[number][] = [];
+      for (const width of widths) {
+        const outcome = await watchWidth(width, false, () => this.#ports.collectStressLayout(createSessionFor(null), url, [width], { ...stressOptions, afterLayout }));
+        results.push(...outcome.results);
+        if (outcome.hardStop) {
+          return { results: Object.freeze(results), hardStop: true };
+        }
+      }
+      return { results: Object.freeze(results), hardStop: false };
+    };
+    /** SWR: 大きさを変えて集めた幅の証拠（画像・フォーカスの確かめ・通知の枠の記録・押す期間の移動）を捨てる（読み込み直した幅で集め直す）。 */
+    const discardResizedWidths = async (widths: readonly number[]): Promise<void> => {
+      const discarded = new Set(widths);
+      await state.stressScreenshots.discardWidths(discarded);
+      for (const width of discarded) {
+        state.pressBlockedWidths.delete(width);
+      }
+      const { stress } = state.notification;
+      for (let index = stress.length - 1; index >= 0; index -= 1) {
+        if (discarded.has(stress[index]?.width ?? Number.NaN)) {
+          stress.splice(index, 1);
+        }
+      }
+    };
+    const sweepAllWidths = async (): Promise<StressSweepResults> => {
+      const widths = stressSweepWidths(config, pending.breakpointWidths);
+      const narrowest = widths.at(-1);
+      if (widths.length < 2 || narrowest === undefined) {
+        return (await reloadWidths(widths)).results;
+      }
+      // 1. 一番広い幅で 1 回だけ読み込み、広い順に大きさだけを変えて測る。一番狭い幅は、照らし合わせのために測るだけ（証拠は残さない）。
+      const sweptWidths: number[] = [];
+      const resizedState: { focus: FocusCheckEvidence | null; hardStop: boolean } = { focus: null, hardStop: false };
+      const resized = await this.#ports.collectResizedStressLayout(createSessionFor(sweptWidths), url, widths, {
+        ...stressOptions,
+        afterLayout: async (view, width, layout) => {
+          if (width === narrowest) {
+            resizedState.focus = await view.collectFocusChecks({ stressWidth: width, settleIntervalMs: this.#windows.scroll.stepWaitMs });
+            return;
+          }
+          await afterStressLayout?.(view, width, layout);
+        },
+        aroundWidth: async (width, work) => {
+          const resizedWidth = width !== widths[0];
+          if (resizedWidth) {
+            abortIfNextWidthMustNotStart();
+          }
+          const outcome = await watchWidth(width, resizedWidth, async () => [await work()]);
+          sweptWidths.push(width);
+          resizedState.hardStop ||= outcome.hardStop;
+          const [result] = outcome.results;
+          if (result === undefined) {
+            throw new Error('the resized stress width produced no result');
+          }
+          return result;
+        },
+      });
+      // REV-SWR の M-1: 大きさを変えた Context の Ledger の `widths` は、大きさを変えて測り、結果を残した幅だけにする（`beaksight-block-relation` が、ほかの幅の
+      // 指摘を、この Context の止めた要求に結び付けないため）。
+      const keepSweptWidths = (kept: readonly StressSweepResults[number][]): void => {
+        sweptWidths.splice(0, sweptWidths.length, ...kept.map((result) => result.width));
+      };
+      if (resizedState.hardStop) {
+        // REV-SWR の M-2: 一番狭い幅は結果を残さないので、ほかの終わり方と同じく、その幅の記録を捨てる。
+        await discardResizedWidths([narrowest]);
+        const kept = resized.filter((result) => result.width !== narrowest);
+        keepSweptWidths(kept);
+        return Object.freeze(kept);
+      }
+      // 大きさを変えて回す途中で幅が終わったら、全部の幅を幅ごとに読み込み直す。
+      if (resized.length !== widths.length || resized.some((result) => result.status === 'FAILED')) {
+        await discardResizedWidths(widths);
+        keepSweptWidths([]);
+        return (await reloadWidths(widths)).results;
+      }
+      // 2. 一番狭い幅を読み込み直して測り（証拠は、ここで残す）、大きさを変えて測った事実と照らし合わせる。
+      await discardResizedWidths([narrowest]);
+      const loadedFacts: { focus: FocusCheckEvidence | null } = { focus: null };
+      const verified = await reloadWidths([narrowest], this.#stressWidthScreenshot(pending.stateId, state.stressScreenshots, (checks) => {
+        loadedFacts.focus = checks;
+      }));
+      const others = resized.slice(0, -1);
+      keepSweptWidths(others);
+      const loadedLayout = verified.results[0]?.layout ?? null;
+      const resizedLayout = resized.at(-1)?.layout ?? null;
+      if (verified.hardStop || loadedLayout === null || (resizedLayout !== null && sameStressLayoutFacts(
+        { layout: resizedLayout, focus: resizedState.focus },
+        { layout: loadedLayout, focus: loadedFacts.focus },
+      ))) {
+        return Object.freeze([...others, ...verified.results]);
+      }
+      // 3. 違いが出たら、大きさを変えて集めた幅の証拠を捨てて、残りの幅を幅ごとに読み込み直す。
+      const otherWidths = others.map((result) => result.width);
+      await discardResizedWidths(otherWidths);
+      keepSweptWidths([]);
+      const reloaded = await reloadWidths(otherWidths);
+      return Object.freeze([...reloaded.results, ...verified.results]);
+    };
+    const swept = await runner.attempt(
+      'stress-layout',
+      sweepAllWidths,
       false,
       (error) => (this.#safetyViolationRecorded() ? SAFETY_VIOLATION_ABORT_CODE : stressSweepFailureReason(error) ?? STRESS_SWEEP_FAILED_REASON),
     );
@@ -2748,7 +3182,7 @@ export class PageAuditor {
     const { url, viewportSize, reasons, safety, record, attempt } = state;
     // ページの読み込みの間隔を守る（負荷の制御の設計書 4.1）。候補の監査は、隔離した Context で対象のページを読み込むためである。
     // 2件目以降の候補の開始の時刻は、待った後の現在の時刻である。
-    await this.#pacer.beforeNavigation();
+    await this.#pacedNavigation({ pageId: state.pageId, stateId: state.stateId });
     const deadlineAtMs = this.#interactionCandidateDeadline(this.#now());
     if (deadlineAtMs === null) {
       reasons.push(interactionStoppedReason(INTERACTION_STOP_REASONS.budget, remaining));
@@ -2759,7 +3193,9 @@ export class PageAuditor {
     // COV-4 の区切り 3: 確かめ終えた操作で開いた状態の監査（操作の部品の口 `afterVerified` から呼ばれる）。
     let opened: Omit<PendingOpenedState, 'interactionEvidenceId'> | null = null;
     const afterVerified = async (openedView: AuditView): Promise<void> => {
-      opened = await this.#auditOpenedState(state, openedView, [...trail, { candidateId: candidate.candidateId, ordinal: candidate.ordinal }]);
+      // DBG-1: 開いた状態の確かめの時間を測る（切なら何もしない）。
+      opened = await this.#debugTiming.measure('AUDIT_STAGE', () => ({ pageId: state.pageId, stateId: state.stateId, part: 'opened-state' }),
+        () => this.#auditOpenedState(state, openedView, [...trail, { candidateId: candidate.candidateId, ordinal: candidate.ordinal }]));
     };
     // 入れ子の候補は、押し直した後の page が、記録した開いた状態と同じ構造かを確かめる。
     const nested = trail.length === 0 || trailStructureKey === null
@@ -2837,11 +3273,17 @@ export class PageAuditor {
       const dom = await view.collectDomEvidence(pageId);
       openedCandidates = (await view.discoverInteractionCandidates(undefined, this.#openEndedAtMs())).candidates;
       structureKey = openedStateStructureKeyOf(dom, url, openedCandidates.map(({ candidateId }) => candidateId));
+      // REV-AUD2 の I-1（設計書 5.3 の「REV-AUD2 の後の判断」）: 開いた状態がモーダルなら、入れ子の点検の候補は小窓の中だけにする（背景は操作できない）。
+      // 構造の鍵は、今までどおり全部の候補から作る。
+      const insideModal = await view.readModalCandidateOrdinals(this.#openEndedAtMs());
+      if (insideModal !== null) {
+        openedCandidates = openedCandidates.filter(({ ordinal }) => insideModal.includes(ordinal));
+      }
       if (!this.#acceptOpenedStructure(structureKey)) {
         seen = true;
         return;
       }
-      keep(record('dom', dom, capture()));
+      keep(record('dom', recordedDomEvidenceOf(dom), capture()));
       const layout = await view.collectLayoutEvidence(viewportSize);
       keep(record('layout', layoutPayloadOf(layout, null, { overlay: null, beforeDismissal: null, stress: [] }), capture()));
       let accessibility: EvidencePayloadByType['accessibility'] | null = null;
@@ -2855,7 +3297,9 @@ export class PageAuditor {
         );
         const outputPath = artifactFilePath(this.#screenshotRootDirectory, relativeArtifactPath);
         try {
-          const screenshot = await view.captureViewportScreenshot({ outputPath, relativeArtifactPath }, { pageId, viewport: profile, stressWidth: null });
+          const screenshot = await view.captureViewportScreenshot(
+            { outputPath, relativeArtifactPath }, { pageId, viewport: profile, stressWidth: null, markTargets: markTargetsOf(layout.layout) },
+          );
           keep(record('screenshot', screenshot, capture()));
         } catch {
           await rm(outputPath, { force: true }).catch(() => undefined);
@@ -2897,10 +3341,12 @@ export class PageAuditor {
       recheck = Object.freeze({ ...recheck, layout: null, evidenceIds: Object.freeze([...new Set([...recheck.evidenceIds, ...recheckIds])]) });
       // 主の画面と同じく、フォーカスしても隠れたままの部品は、フォーカスを当てたままの画像を撮る（その状態の `state-<番号>/focus-<番号>`）。
       const focusStartedAt = this.#clock().toISOString();
+      // AUD-3（REV-AUD3 の後の判断）: 開いた状態では、通常の Tab の確かめはしない（主の読み込みだけ）。M-4: 位置の落ち着きの待ちは、この段の期限で終える。
       const checks = await view.collectFocusChecks({
         stressWidth: null,
         settleIntervalMs: this.#windows.scroll.stepWaitMs,
         track: (work) => signals.track(work),
+        signal: signals.signal,
         onFocused: this.#focusedScreenshot({
           view,
           pageId,
@@ -3135,6 +3581,8 @@ interface DeferredStressSweep {
   readonly stateId: EvidenceStateId;
   /** L14: Desktop の page の CSS の media query の境目の両側の幅（`breakpointSideWidthsOf`）。 */
   readonly breakpointWidths: readonly number[];
+  /** DUP: 幅の走査をするか（偽なら、走査をせずに主の形だけを記録する。`pageAuditStagesOf`）。 */
+  readonly sweep: boolean;
 }
 
 /** DEF-210（設計書 3.2・3.3・3.6）: 1 つのビューポートの通知の枠の事実。 */
@@ -3257,6 +3705,22 @@ interface StressScreenshotSink {
   readonly retryAttempt: number | null;
   readonly screenshots: boolean;
   readonly record: <TType extends 'screenshot' | 'focus'>(type: TType, payload: EvidencePayloadByType[TType], capture: EvidenceCapture) => EvidenceRecord;
+  /** SWR: その幅の画像とフォーカスの確かめの Evidence を捨てる（大きさを変えて集め、読み込み直しに戻した幅）。 */
+  readonly discardWidths: (widths: ReadonlySet<number>) => Promise<void>;
+  /** AUD-4: その幅の、今の記録の隠した通知の枠の数（状態の印に足す）。 */
+  readonly hiddenFrameCountOf: (width: number) => number;
+}
+
+/** EV-2・FRET: `reveal-<番号>` の画像を撮る先（読み込みの page・ページ・試行の番号・状態 ID・ビューポート・幅・段・Evidence を残す関数）。 */
+interface NumberedCaptureTarget {
+  readonly view: AuditView;
+  readonly pageId: PageId;
+  readonly retryAttempt: number | null;
+  readonly stateId: EvidenceStateId;
+  readonly viewport: ViewportProfile;
+  readonly stressWidth: number | null;
+  readonly phase: PageAuditStage;
+  readonly record: StressScreenshotSink['record'];
 }
 
 /**
@@ -3707,6 +4171,39 @@ function notificationHandlingRecordOf(overlay: NotificationOverlayEvidence | nul
   });
 }
 
+/** AUD-4: 状態の画像の印で矩形を読み直す、直前の layout の対象（layout がなければ `undefined`。読み直さない）。 */
+const markTargetsOf = (layout: LayoutEvidence | null | undefined): readonly string[] | undefined =>
+  (layout === null || layout === undefined ? undefined : stateMarkTargetSelectorsOf(layout));
+
+/** AUD-4: 通知の枠の事実の、隠した枠の数（事実がなければ 0）。 */
+const hiddenFrameCountOf = (overlay: NotificationOverlayEvidence | null | undefined): number => overlay?.frames.filter((frame) => frame.hidden).length ?? 0;
+
+/**
+ * AUD-4（設計書 `2026-11-19-beaksight-audit-result-review-fixes-design.md` 7.2 の 1）: 状態の印に、今の記録の隠した通知の枠の数を足す（印がなければそのまま）。
+ * layout と状態の画像の Evidence が使う。
+ */
+function withHiddenFrameCount<T extends { readonly stateMark?: EvidenceStateMark }>(value: T, count: number): T {
+  return value.stateMark === undefined ? value : Object.freeze({ ...value, stateMark: Object.freeze({ ...value.stateMark, hiddenNotificationFrameCount: count }) });
+}
+
+/** AUD-4: layout の収集の結果（幅の結果を含む）の layout の状態の印に、隠した通知の枠の数を足す（layout か印がなければそのまま）。 */
+function layoutResultWithHiddenFrameCount<T extends { readonly layout: LayoutEvidence | null }>(result: T, count: number): T {
+  const { layout } = result;
+  return layout?.stateMark === undefined ? result : Object.freeze({ ...result, layout: withHiddenFrameCount(layout, count) });
+}
+
+/** S-03a: 幅の走査で隠した枠の数（digest で数える）を、主の読み込みの数と分けて足す（幅の走査で枠を見なければ足さない）。 */
+function withStressHiddenCount(
+  record: ViewportNotificationHandlingRecord,
+  stress: readonly StressNotificationOverlayEvidence[],
+): ViewportNotificationHandlingRecord {
+  if (stress.length === 0) {
+    return record;
+  }
+  const hidden = new Set(stress.flatMap(({ overlay }) => overlay.frames.filter((frame) => frame.hidden).map((frame) => frame.digest)));
+  return Object.freeze({ ...record, stressHiddenCount: hidden.size });
+}
+
 /** AUD-2a: 段を終えたときの main frame の URL と、文書のスクロールの位置。 */
 export interface CaptureLocation {
   readonly url: string | null;
@@ -3779,12 +4276,12 @@ export function interactionTimeoutsOf(config: AuditConfig): InteractionTimeouts 
 
 /**
  * 幅の走査で調べる幅。設定の `stressWidths`（この順）に、L14 で media query の境目の両側の幅（`breakpointWidths`。小さい順。設定にある幅は重ねない）を
- * 足し、主要な2つのビューポートの幅を除く（設計書 4.5.6）。
+ * 足し、主要な2つのビューポートの幅を除く（設計書 4.5.6）。SWR: 広い順に並べる（狭い幅で開いた枠を、広い幅へ持ち越さない）。
  */
 function stressSweepWidths(config: AuditConfig, breakpointWidths: readonly number[]): readonly number[] {
   const primaryWidths = new Set(VIEWPORT_PROFILES.map((profile) => viewportSizeFor(config, profile).width));
   const widths = [...new Set([...config.viewports.stressWidths, ...breakpointWidths])];
-  return widths.filter((width) => !primaryWidths.has(width));
+  return widths.filter((width) => !primaryWidths.has(width)).sort((left, right) => right - left);
 }
 
 /**

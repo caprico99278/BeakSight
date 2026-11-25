@@ -9,7 +9,7 @@
  * 値は匿名（ループバック）。画面のサーバとブラウザは起動しない。
  */
 import { describe, expect, it } from 'vitest';
-import { LOCAL_UI_JOB_SUMMARY_TEXT } from '../../../src/presentation/messages.js';
+import { LOCAL_UI_AUDIT_TEXT, LOCAL_UI_JOB_SUMMARY_TEXT } from '../../../src/presentation/messages.js';
 import {
   jobSummaryOf,
   progressRemainingMs,
@@ -47,6 +47,7 @@ const BASE: Facts = Object.freeze({
   autoLogin: null,
   write: null,
   stageChain: null,
+  chainStageProgress: null,
   stageChainWriteKind: null,
   inspectionWrite: null,
   loginSetup: null,
@@ -63,6 +64,7 @@ const BASE: Facts = Object.freeze({
   entryCheckAuthSetup: null,
   runEnd: null,
   profileJobEnd: null,
+  searchCheck: null,
   writePrecheckDetail: null,
   reportSummary: null,
   loginEndDetection: null,
@@ -352,34 +354,48 @@ describe('PL-2: the estimate while waiting (13 章の 11。DEF-192: 2026-11-04 �
     requests: { allowedOrigins: { count: 3, peakPerMinute: 3 }, otherOrigins: { count: 0, peakPerMinute: 0 }, servedFromCache: 0, withheldOtherOrigins: 0 },
     recentPerMinute: { allowedOrigins: 3, otherOrigins: 0 },
   });
-  const limits = { maxRuntimeMs: 3 * 3_600_000 };
+  /** DPROG (b): 見積もりの基準（そのワーカーの実行から最初に受けた進み）。ここでは実行の始まり（0 ページ・0 ms）。 */
+  const FROM_START = { pagesFinished: 0, elapsedMs: 0 };
+  const limits = { maxRuntimeMs: 3 * 3_600_000, baseline: FROM_START };
   const running: Partial<Facts> = { active: true, state: 'RUNNING', runStatus: null, finishedAt: null };
 
   it('is the remaining pages times the actual time of one page, not over the rest of the runtime limit', () => {
     // 140 ページを 140 × 50 秒で読んだ。残り 3 ページ × 50 秒 = 150 秒。
-    expect(progressRemainingMs({ pagesFinished: 140, pagesTotal: 143, elapsedMs: 140 * 50_000, maxRuntimeMs: 3 * 3_600_000 })).toBe(150_000);
+    expect(progressRemainingMs({ pagesFinished: 140, pagesTotal: 143, elapsedMs: 140 * 50_000, maxRuntimeMs: 3 * 3_600_000, baseline: FROM_START })).toBe(150_000);
     // 時間の上限の残り（10 秒）を超えない。
-    expect(progressRemainingMs({ pagesFinished: 2, pagesTotal: 20, elapsedMs: 3_590_000, maxRuntimeMs: 3_600_000 })).toBe(10_000);
+    expect(progressRemainingMs({ pagesFinished: 2, pagesTotal: 20, elapsedMs: 3_590_000, maxRuntimeMs: 3_600_000, baseline: FROM_START })).toBe(10_000);
     // L14: 時間の上限を指定していなければ、残りのページの時間だけ（18 ページ × 1,795 秒）。
-    expect(progressRemainingMs({ pagesFinished: 2, pagesTotal: 20, elapsedMs: 3_590_000, maxRuntimeMs: undefined })).toBe(18 * 1_795_000);
-    expect(progressRemainingMs({ pagesFinished: 20, pagesTotal: 20, elapsedMs: 0, maxRuntimeMs: 3_600_000 })).toBe(0);
-    expect(progressRemainingMs({ pagesFinished: 1, pagesTotal: 20, elapsedMs: 4_000_000, maxRuntimeMs: 3_600_000 })).toBe(0);
+    expect(progressRemainingMs({ pagesFinished: 2, pagesTotal: 20, elapsedMs: 3_590_000, maxRuntimeMs: undefined, baseline: FROM_START })).toBe(18 * 1_795_000);
+    expect(progressRemainingMs({ pagesFinished: 20, pagesTotal: 20, elapsedMs: 0, maxRuntimeMs: 3_600_000, baseline: FROM_START })).toBe(0);
+    expect(progressRemainingMs({ pagesFinished: 1, pagesTotal: 20, elapsedMs: 4_000_000, maxRuntimeMs: 3_600_000, baseline: FROM_START })).toBe(0);
     // 読んだページがまだなければ、求めない。
-    expect(progressRemainingMs({ pagesFinished: 0, pagesTotal: 20, elapsedMs: 1_000, maxRuntimeMs: 3_600_000 })).toBeNull();
+    expect(progressRemainingMs({ pagesFinished: 0, pagesTotal: 20, elapsedMs: 1_000, maxRuntimeMs: 3_600_000, baseline: FROM_START })).toBeNull();
+  });
+
+  it('DPROG (b): measures one page by the pages this worker run read since its first progress, not by the pages of the earlier runs', () => {
+    // 続きの実行: 前の実行で 100 ページ。この実行の最初の進みは 101 ページ・50 秒。今 120 ページ・1,000 秒 → 19 ページを 950 秒（1 ページ 50 秒）。残り 3 ページ = 150 秒。
+    const resumed = { pagesFinished: 120, pagesTotal: 123, elapsedMs: 1_000_000, maxRuntimeMs: undefined, baseline: { pagesFinished: 101, elapsedMs: 50_000 } };
+    expect(progressRemainingMs(resumed)).toBe(150_000);
+    // 最初の 1 回の進みだけでは求めない。
+    expect(progressRemainingMs({ ...resumed, pagesFinished: 101, elapsedMs: 50_000 })).toBeNull();
+    // 基準がない（画面のサーバがその実行の進みを受けていない）ときも、見積もりを出さない。
+    expect(jobSummaryOf({ ...BASE, ...running, lastProgress: progressOf(3, 5, 20, 30_000) }, {
+      estimateLimits: { maxRuntimeMs: undefined, baseline: null }, awaitingRegistration: false,
+    }).estimate).toBeNull();
   });
 
   it('divides by the found pages up to the page limit, which grows with the found pages', () => {
     const at = (pagesDiscovered: number) =>
       jobSummaryOf({ ...BASE, ...running, lastProgress: progressOf(140, pagesDiscovered, 1000, 140 * 50_000) }, { estimateLimits: limits, awaitingRegistration: false }).estimate;
-    expect(at(143)).toEqual({ pagesFinished: 140, pagesTotal: 143, remainingMs: 150_000 });
-    expect(at(150)).toEqual({ pagesFinished: 140, pagesTotal: 150, remainingMs: 500_000 });
+    expect(at(143)).toEqual({ jobKind: 'AUDIT', pagesFinished: 140, pagesTotal: 143, remainingMs: 150_000 });
+    expect(at(150)).toEqual({ jobKind: 'AUDIT', pagesFinished: 140, pagesTotal: 150, remainingMs: 500_000 });
     // 見つけたページがページの上限を超えても、分母は上限まで。
     expect(at(1500)?.pagesTotal).toBe(1000);
     // 時間の上限の残りを超えない。
     expect(jobSummaryOf(
       { ...BASE, ...running, lastProgress: progressOf(3, 500, 1000, 3_500_000) },
-      { estimateLimits: { maxRuntimeMs: 3_600_000 }, awaitingRegistration: false },
-    ).estimate).toEqual({ pagesFinished: 3, pagesTotal: 500, remainingMs: 100_000 });
+      { estimateLimits: { maxRuntimeMs: 3_600_000, baseline: FROM_START }, awaitingRegistration: false },
+    ).estimate).toEqual({ jobKind: 'AUDIT', pagesFinished: 3, pagesTotal: 500, remainingMs: 100_000 });
   });
 
   it('shows nothing before the first page is read, or without the limits', () => {
@@ -392,13 +408,46 @@ describe('PL-2: the estimate while waiting (13 章の 11。DEF-192: 2026-11-04 �
     expect(jobSummaryOf(
       { ...BASE, ...running, jobKind: 'DISCOVERY', lastProgress: progressOf(2, 6, 20, 20_000) },
       { estimateLimits: limits, awaitingRegistration: false },
-    ).estimate).toEqual({ pagesFinished: 2, pagesTotal: 6, remainingMs: 40_000 });
+    ).estimate).toEqual({ jobKind: 'DISCOVERY', pagesFinished: 2, pagesTotal: 6, remainingMs: 40_000 });
+  });
+
+  // DSEED2: 連鎖の操作さがしは、見つけた画面の分け方（ワーカーの数）を、分母が見つけた画面そのものの間だけ見積もりに添える。語は 1 か所で組み立てる。
+  it('DSEED2: adds the split of the found screens of a chained discovery to the estimate, worded in one place', () => {
+    const split = { fromAuditStage: 4, newlyFound: 2 };
+    const estimateOf = (maxPages: number) => jobSummaryOf(
+      { ...BASE, ...running, jobKind: 'DISCOVERY', lastProgress: { ...progressOf(2, 6, maxPages, 20_000), pagesDiscoveredSplit: split } },
+      { estimateLimits: limits, awaitingRegistration: false },
+    ).estimate;
+    expect(estimateOf(20)).toEqual({ jobKind: 'DISCOVERY', pagesFinished: 2, pagesTotal: 6, pagesTotalSplit: split, remainingMs: 40_000 });
+    // ページの上限で分母が見つけた画面より小さいときは、分けない。
+    expect(estimateOf(5)?.pagesTotalSplit).toBeUndefined();
+    expect(LOCAL_UI_AUDIT_TEXT.job.screensDiscoveredSplit('237', '225', '12')).toBe('237（点検から引き継いだ 225・新しく見つけた 12）');
+  });
+
+  // RCA-8（検索の確かめの設計書 2.3）: 見るだけの確かめも、この段が数えた検索の確かめの組（確かめた N / 全部 M）で見積もる。
+  it('RCA-8: gives the READ check job the estimate of its search checks', () => {
+    expect(jobSummaryOf(
+      { ...BASE, ...running, jobKind: 'READ_CHECK', lastProgress: progressOf(2, 6, 20, 20_000) },
+      { estimateLimits: limits, awaitingRegistration: false },
+    ).estimate).toEqual({ jobKind: 'READ_CHECK', pagesFinished: 2, pagesTotal: 6, remainingMs: 40_000 });
+  });
+
+  it('DPROG: gives the inspection screen the estimate of the running stage while the chain runs', () => {
+    const discovering = chainOf('RUNNING', [['DONE', BASE.jobId], ['RUNNING', 'job-dprog-discovery']]);
+    const stage = { jobId: 'job-dprog-discovery', kind: 'DISCOVERY', progress: progressOf(2, 6, 20, 20_000) } as const;
+    // 点検の作業は終わり、自分の進み具合（点検の数）は見積もりに使わない。
+    expect(jobSummaryOf(
+      { ...BASE, lastProgress: progressOf(217, 217, 1000, 1_000_000), stageChain: discovering, chainStageProgress: stage },
+      { estimateLimits: limits, awaitingRegistration: false },
+    ).estimate).toEqual({ jobKind: 'DISCOVERY', pagesFinished: 2, pagesTotal: 6, remainingMs: 40_000 });
   });
 
   it('does not say "at most" in the line (見つけたページが増えうる)', () => {
     const line = LOCAL_UI_JOB_SUMMARY_TEXT.progressEstimate('140', '143', '3');
     expect(line).toBe('読んだページ 140 / 143。あと 約 3 分');
     expect(line).not.toContain('長くても');
+    // DPROG: 操作さがしの段は画面の語で、新しい画面が見つかると延びることを言う。
+    expect(LOCAL_UI_JOB_SUMMARY_TEXT.stageProgressEstimate('2', '6', '1')).toBe('確かめた画面 2 / 見つけた画面 6。あと 約 1 分（新しい画面が見つかると延びます）');
   });
 });
 

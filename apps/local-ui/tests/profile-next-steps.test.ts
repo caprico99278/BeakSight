@@ -18,6 +18,7 @@ import {
   profileStageAfterAuditArrivalOf,
   profileStageOf,
   profileStageShowsContinue,
+  siteAuditRunningOf,
   type ProfileStageFacts,
 } from '../src/display/next-steps';
 
@@ -308,5 +309,25 @@ describe('NL-3: the stage of a test site without login has no login word', () =>
   it('skips the login setup and the credential steps after saving', () => {
     expect(nextStepAfter('AUTH_SETUP', 'TEST_AUTH_PASSIVE', 'NONE')).toBe('AUDIT_START');
     expect(nextStepAfter('AUDIT_START', 'TEST_APPROVED_WRITE', 'NONE')).toBeNull();
+  });
+});
+
+// DEF-197・DEF-301: サイトの点検が動いているか。終えた（FINISHED）まとめて実行の連鎖の段の作業は、ワーカーが閉じるまで動いている行のまま残るが、動いているとしない
+// （連鎖が終わると作業の画面はサイトの画面へ移すので、移った先で「結果を見る」が出ないまま残らない）。
+describe('whether the audit of the site is running', () => {
+  const chain = (state: 'RUNNING' | 'FINISHED' | 'STOPPED') => ({
+    state, stages: [{ jobId: 'audit-1' }, { jobId: 'discovery-1' }, { jobId: null }], writeStageJobIds: ['write-1'],
+  });
+  it('is running while a job runs or the chain runs, and not after the chain finished even if its last stage job is closing', () => {
+    expect(siteAuditRunningOf({ lastJob: { jobId: 'write-1', active: true }, lastAuditChain: chain('FINISHED') })).toBe(false);
+    expect(siteAuditRunningOf({ lastJob: { jobId: 'discovery-1', active: true }, lastAuditChain: chain('FINISHED') })).toBe(false);
+    expect(siteAuditRunningOf({ lastJob: { jobId: 'write-1', active: true }, lastAuditChain: chain('RUNNING') })).toBe(true);
+    expect(siteAuditRunningOf({ lastJob: { jobId: 'write-1', active: false }, lastAuditChain: chain('RUNNING') })).toBe(true);
+    // 止まった連鎖と、連鎖の外の作業は、今どおり行が動いている間は動いている。
+    expect(siteAuditRunningOf({ lastJob: { jobId: 'write-1', active: true }, lastAuditChain: chain('STOPPED') })).toBe(true);
+    expect(siteAuditRunningOf({ lastJob: { jobId: 'other-1', active: true }, lastAuditChain: chain('FINISHED') })).toBe(true);
+    expect(siteAuditRunningOf({ lastJob: { jobId: 'other-1', active: true }, lastAuditChain: null })).toBe(true);
+    expect(siteAuditRunningOf({ lastJob: { jobId: 'write-1', active: false }, lastAuditChain: chain('FINISHED') })).toBe(false);
+    expect(siteAuditRunningOf({ lastJob: null, lastAuditChain: null })).toBe(false);
   });
 });

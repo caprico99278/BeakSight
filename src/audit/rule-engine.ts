@@ -18,7 +18,7 @@ import {
 } from '../core/ids.js';
 import { deepFreeze } from '../core/immutable.js';
 import { compareCodeUnits } from '../core/text.js';
-import { groupingKeysOf } from './finding-grouping-keys.js';
+import { groupingKeysOf, isFingerprintFreeKeyFieldName } from './finding-grouping-keys.js';
 import type { AuditRule, FindingDraft, PageRuleInput } from './rule.js';
 import { RULE_CATALOG, freezeCatalog, isFindingRuleIdOf } from './rule-catalog.js';
 import { distinctSorted } from './rule-helpers.js';
@@ -296,6 +296,17 @@ const validateDraft = (draft: unknown, owner: FindingDraftOwner, evidenceIds: Re
     }
     return { name: field.name, value: field.value };
   });
+  // REV-AUD3 の I-2: 結びの鍵は、決まった名前（`LINK_KEY_FIELD_NAMES`。AUD-5: と区分の鍵 `GROUP_CLASS_KEY_FIELD_NAMES`）と文字の値だけ。
+  const { linkKeys } = draft;
+  if (linkKeys !== undefined && !Array.isArray(linkKeys)) {
+    throw new TypeError('finding draft link keys must be an array');
+  }
+  const linkCopy = ((linkKeys ?? []) as unknown[]).map((field): FindingFingerprintIdentityField => {
+    if (!isRecord(field) || typeof field.name !== 'string' || typeof field.value !== 'string' || !isFingerprintFreeKeyFieldName(field.name)) {
+      throw new TypeError('finding draft link key must have a link key name and a string value');
+    }
+    return { name: field.name, value: field.value };
+  });
 
   return {
     ruleId,
@@ -305,6 +316,7 @@ const validateDraft = (draft: unknown, owner: FindingDraftOwner, evidenceIds: Re
     message,
     evidenceRefs: distinctSorted(evidenceRefs as EvidenceId[]),
     identityFields: identityCopy,
+    ...(linkCopy.length === 0 ? {} : { linkKeys: linkCopy }),
   };
 };
 
@@ -333,7 +345,8 @@ const toFinding = (draft: FindingDraft, context: FindingDraftContext, targetId: 
   viewport: context.viewport,
   message: draft.message,
   evidenceRefs: draft.evidenceRefs,
-  groupingKeys: groupingKeysOf(draft.identityFields),
+  // REV-AUD3 の I-2: 結びの鍵（`linkKeys`）は、fingerprint に入れず、`groupingKeys` の後ろに足す（候補群の鍵からは除く）。
+  groupingKeys: [...groupingKeysOf(draft.identityFields), ...(draft.linkKeys ?? [])],
 });
 
 /**

@@ -188,6 +188,7 @@ describe('DEF-136: the run status of a job stopped by the site unavailability', 
     expect(readEvidenceRunStatusOf({
       endReason: 'SITE_UNAVAILABLE',
       checks: [{ readCheckId: 'read-1', readCheckRevision: 1, targetKind: 'CANDIDATE', targetIdentityDigest: `sha256:${'a'.repeat(64)}`, state: 'NOT_EXECUTED', reason: 'SITE_UNAVAILABLE' }],
+      searchChecks: [],
     } as Parameters<typeof readEvidenceRunStatusOf>[0])).toBe('PARTIAL');
   });
 });

@@ -139,10 +139,16 @@ export interface StateStructureFacts {
 const factItem = <T>(value: T | null, toItem: (present: T) => unknown): unknown => (value === null ? null : toItem(value));
 
 /**
+ * 数字の並びを `{n}` にした型（唯一の作り。CALDAY fix round 1 で共通にした）。番号だけ違う同じ作りの物を同じ型にする。欄の名前の型と、押す対象の文字の型
+ * （`src/discovery/probe.ts` の `submitterTextShapeOf`）が使う。
+ */
+export const digitTemplateOf = (text: string): string => text.replace(/[0-9]+/gu, '{n}');
+
+/**
  * 欄の名前の型（番号を `{n}` にする）。行を足す画面（押すと `name` に番号の付いた同じ作りの行が増える）で、番号だけ違う名前の欄が増えただけでは別の鍵に
  * しない（COV-2c の I-1 の 2 の「同じ作りの部品が増えただけでは同じ鍵」を欄の名前にも当てる。path の型 `pageTemplatePathOf` と同じ考え方）。
  */
-const fieldNameTemplateOf = (name: string): string => name.replace(/[0-9]+/gu, '{n}');
+const fieldNameTemplateOf = (name: string): string => digitTemplateOf(name);
 
 const fieldItemOf = (field: StateStructureField): string => JSON.stringify([
   fieldNameTemplateOf(field.name),

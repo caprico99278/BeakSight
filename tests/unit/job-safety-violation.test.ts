@@ -4,6 +4,7 @@
 // - 違反の中身（`jobSafetyViolationOf`）: `run.json` と同じ部品（`summarizePageSafety`）の形に、段・画面の path・押した候補を足す。文は 1 行にし、URL の値を伏せる。
 import { describe, expect, it } from 'vitest';
 import { validateArtifact } from '../../src/core/schema-validator.js';
+import { READ_EVIDENCE_ARTIFACT_SCHEMA_VERSION } from '../../src/discovery/read-check-evaluation.js';
 import { summarizeRunSafety } from '../../src/orchestration/run-aggregation.js';
 import { pointsToExternalScheme } from '../../src/interaction/submission-probe.js';
 import {
@@ -99,8 +100,8 @@ describe('DEF-144: the safety violation of a discovery or READ check job (jobSaf
     expect(violation.invariantViolations).toHaveLength(17);
     expect(violation.invariantViolationCount).toBe(17);
     const readEvidence = await validateArtifact('read-evidence', {
-      schemaVersion: 'read-evidence-schema/1.2', jobId: 'job-lz3a', runId: 'RUN-20261113010101', startedAt: '20261113010101', finishedAt: '20261113010102',
-      runStatus: 'ABORTED_BY_SAFETY', endReason: 'SAFETY_VIOLATION', checks: [], safetyViolation: violation,
+      schemaVersion: READ_EVIDENCE_ARTIFACT_SCHEMA_VERSION, jobId: 'job-lz3a', runId: 'RUN-20261113010101', startedAt: '20261113010101', finishedAt: '20261113010102',
+      runStatus: 'ABORTED_BY_SAFETY', endReason: 'SAFETY_VIOLATION', checks: [], searchChecks: [], safetyViolation: violation,
     });
     expect(readEvidence.ok ? [] : readEvidence.errors).toEqual([]);
   });
@@ -169,7 +170,7 @@ describe('DEF-144: the safety violation of a discovery or READ check job (jobSaf
     });
     expect(discovery.ok ? [] : discovery.errors).toEqual([]);
     const readEvidence = await validateArtifact('read-evidence', {
-      schemaVersion: 'read-evidence-schema/1.2', ...common, endReason: 'SAFETY_VIOLATION', checks: [], safetyViolation,
+      schemaVersion: READ_EVIDENCE_ARTIFACT_SCHEMA_VERSION, ...common, endReason: 'SAFETY_VIOLATION', checks: [], searchChecks: [], safetyViolation,
     });
     expect(readEvidence.ok ? [] : readEvidence.errors).toEqual([]);
   });

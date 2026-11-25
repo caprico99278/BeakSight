@@ -110,7 +110,9 @@ import {
   countViewportPages,
 } from '../../src/orchestration/run-aggregation.js';
 import { earlierAttemptEvidenceIds } from '../../src/report/artifact-writer.js';
-import { auditRunArrayOf } from '../helpers/audit-run-fixture.js';
+import { auditRunArrayOf, dom } from '../helpers/audit-run-fixture.js';
+import { EMPTY_STRESS_LAYOUT, NO_RULES, createFakeAuditLoadPorts } from '../helpers/fake-audit-load-ports.js';
+import { PageAuditor } from '../../src/orchestration/page-auditor.js';
 import { createTestConfig, type TestConfigOverrides } from '../helpers/test-config.js';
 
 // Cross-page rule の失敗と例外を再現するため、評価の関数だけを差し替えられるようにする（既定は本物の関数）。
@@ -577,6 +579,8 @@ interface HarnessOptions {
   readonly automaticRelogin?: RunCoordinatorDependencies['automaticRelogin'];
   /** WSO: チェックした画面だけを読む範囲（URL）。省略すると、渡さない（全部の画面）。 */
   readonly pageScope?: RunCoordinatorDependencies['pageScope'];
+  /** DUP: Page Auditor を作る関数（本物の Page Auditor に偽の読み込みの口を渡すとき）。省略すると、偽の Page Auditor（`site` で決める）。 */
+  readonly createPageAuditor?: RunCoordinatorDependencies['createPageAuditor'];
 }
 
 /**
@@ -746,7 +750,7 @@ function createHarness(options: HarnessOptions): Harness {
     clock: options.clock ?? (() => STARTED_AT),
     now: () => world.nowMs,
     outputDirectory,
-    createPageAuditor: fakePageAuditorFactory(options.site, world, options.paceNavigations === true),
+    createPageAuditor: options.createPageAuditor ?? fakePageAuditorFactory(options.site, world, options.paceNavigations === true),
     collectSiteMetadata: metadata as unknown as typeof collectSiteMetadata,
     runPreflight: preflight as unknown as typeof runPreflight,
     ...(options.realEnvironmentFactory === undefined
@@ -1344,11 +1348,28 @@ describe('RunCoordinator: PREFLIGHT and Run Status inputs (design 5.6.6)', () =>
   it('records the number of the audited pages for each incomplete reason of the pages, and none when no page has a reason (T44c)', async () => {
     const site: FakeSite = { [START_PATH]: { partial: true, links: ['/second.html', '/third.html'] }, '/second.html': { partial: true }, '/third.html': {} };
     const result = await createHarness({ site }).coordinator.run();
-    expect(result.run.pageIncompleteReasonCounts).toEqual([{ code: 'COLLECTOR_INCOMPLETE', pages: 2 }]);
+    // PIR: 理由ごとに、そのページのアドレスを全部持つ。
+    expect(result.run.pageIncompleteReasonCounts).toEqual([
+      { code: 'COLLECTOR_INCOMPLETE', pages: 2, pageUrls: [`${ORIGIN}${START_PATH}`, `${ORIGIN}/second.html`] },
+    ]);
     const validation = await validateArtifact('run', JSON.parse(JSON.stringify(result.run)));
     expect(validation.ok ? [] : validation.errors).toEqual([]);
     const broken = await validateArtifact('run', JSON.parse(JSON.stringify({ ...result.run, pageIncompleteReasonCounts: [{ code: 'NOT_A_CODE', pages: 1 }] })));
     expect(broken.ok).toBe(false);
+    // PIR: 点検の範囲の外へ移ったページは、ほかの読み込みの失敗と分けて数える（detail が鍵）。
+    const navigation = await createHarness({
+      site: {
+        [START_PATH]: { links: ['/away.html', '/slow.html'] },
+        '/away.html': { attempts: [{ outcome: 'BLOCKED_EXTERNAL_REDIRECT', detail: 'BLOCKED_EXTERNAL_REDIRECT' }] },
+        '/slow.html': { attempts: [{ outcome: 'TIMEOUT' }, { outcome: 'TIMEOUT' }] },
+      },
+    }).coordinator.run();
+    expect(navigation.run.pageIncompleteReasonCounts).toEqual([
+      { code: 'NAVIGATION_FAILED', pages: 1, pageUrls: [`${ORIGIN}/slow.html`] },
+      { code: 'NAVIGATION_FAILED', detail: 'BLOCKED_EXTERNAL_REDIRECT', pages: 1, pageUrls: [`${ORIGIN}/away.html`] },
+    ]);
+    const navigationValidation = await validateArtifact('run', JSON.parse(JSON.stringify(navigation.run)));
+    expect(navigationValidation.ok ? [] : navigationValidation.errors).toEqual([]);
     const complete = await createHarness({ site: { [START_PATH]: {} } }).coordinator.run();
     expect(complete.run).not.toHaveProperty('pageIncompleteReasonCounts');
     // 上限で監査しなかった（SKIPPED の）ページの理由は、Run の理由にあるので数えない。
@@ -5578,6 +5599,57 @@ describe('MEM-3b: the Run finished with the page store is the same as the Run ma
     expect(result.statusInput.incompleteCollectorCount).toBe(countPartialViewports(evaluated));
     expect(codesOf(result.run.incompleteReasons)).toContain('MAX_PAGES_REACHED');
     await expectValidRun(result);
+  });
+});
+
+// DUP（設計書 `2026-11-18-beaksight-same-structure-pages-design.md`）: 本物の Page Auditor に偽の読み込みの口を渡し、同じ作りの 2 つ目以降を軽い点検に、中身も
+// 同じ画面を省く（Mobile を始めない）。チェックした画面だけの点検（WSO）では使わない。
+describe('RunCoordinator: the pages of the same template (DUP)', () => {
+  const CUSTOMERS = ['/customers/1', '/customers/2', '/c/3?returnTo=%2Fa', '/c/3?returnTo=%2Fb'];
+  const sameTemplateHarness = (pageScope?: readonly string[]) => {
+    const fake = createFakeAuditLoadPorts({
+      view: (_name, { url }) => ({
+        // 本文は path だけで決まる（戻り先の query だけが違う画面は、同じ中身）。
+        collectDomEvidence: async (pageId) => dom(1, pageId, 'desktop', `本文 ${new URL(url()).pathname}`).payload,
+        collectLayoutEvidence: async () => ({ status: 'COMPLETE', layout: EMPTY_STRESS_LAYOUT }),
+        discoverLinks: async (pageId) => ({
+          links: new URL(url()).pathname === START_PATH ? CUSTOMERS.map((href) => linkEvidence(pageId, url(), href)) : [],
+          omittedLinkCount: 0,
+        }),
+      }),
+    });
+    const harness = createHarness({
+      site: {},
+      // 幅の走査はしない（偽の口の幅の走査は、見本の layout で照らし合わせに落ちる。1 回目と認めるには、軽い点検で省く段を終えている必要がある）。
+      config: { audit: { screenshots: false, accessibility: false, performance: false, interactions: false }, viewports: { stressWidths: [] } },
+      ...(pageScope === undefined ? {} : { pageScope }),
+      createPageAuditor: ({ contextFactory: _contextFactory, ...dependencies }) =>
+        new PageAuditor({ ...dependencies, auditLoadPorts: fake.ports, createRuleEngine: NO_RULES }),
+    });
+    return { harness, fake };
+  };
+  const pageOf = (result: AuditRunResult, path: string): PageAuditResult | undefined => result.pages.find(({ pageUrl }) => pageUrl === `${ORIGIN}${path}`);
+
+  it('audits lightly the second page of a template, skips Mobile of a page of the same content, and counts them in run.json', async () => {
+    const { harness, fake } = sameTemplateHarness();
+    const result = await harness.coordinator.run();
+    expect(pageOf(result, '/customers/1')?.sameness).toBeUndefined();
+    expect(pageOf(result, '/customers/2')?.sameness).toEqual({ depth: 'LIGHT', sameAs: pageOf(result, '/customers/1')?.pageId });
+    expect(pageOf(result, '/c/3?returnTo=%2Fb')?.sameness).toEqual({ depth: 'SAME', sameAs: pageOf(result, '/c/3?returnTo=%2Fa')?.pageId });
+    expect(pageOf(result, '/c/3?returnTo=%2Fb')?.status).toBe('AUDITED');
+    expect(fake.events.filter((event) => event === 'open:mobile')).toHaveLength(4);
+    expect(result.run.pageSamenessCounts).toEqual({ lightPages: 1, samePages: 1 });
+    // 省いた画面の Mobile は、途中で止まった理由として数えない。
+    expect((result.run.pageIncompleteReasonCounts ?? []).map(({ code }) => code)).not.toContain('SAME_CONTENT_AS_EARLIER_PAGE');
+    // REV-DUP の M-9: まだ見ていない Mobile の数にも入れない。
+    expect(result.run.viewportPageCounts.mobile.skipped).toBe(0);
+  });
+
+  it('audits fully every checked screen of the inspection of the checked screens only (WSO)', async () => {
+    const { harness } = sameTemplateHarness(['/customers/1', '/customers/2'].map((path) => `${ORIGIN}${path}`));
+    const result = await harness.coordinator.run();
+    expect(result.pages.map(({ sameness }) => sameness)).toEqual([undefined, undefined]);
+    expect(result.run.pageSamenessCounts).toBeUndefined();
   });
 });
 

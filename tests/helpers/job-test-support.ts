@@ -81,9 +81,15 @@ export interface FakeWorkerJobManagerOptions extends Omit<AuditJobManagerOptions
   readonly worker: Pick<FakeWorker, 'path'>;
 }
 
-/** 偽のワーカーでジョブの管理を作る（時間は `CONTROL_JOB_TEST_TIMING` に `timing` を重ねる）。 */
+/** PAR-b: テストの端末のメモリ（2 本目のジョブも始められる空き。テストの結果を、流す端末の空きに左右させない）。 */
+export const ENOUGH_MACHINE_MEMORY = Object.freeze({ freeBytes: 1024 ** 4, totalBytes: 1024 ** 4 });
+
+/**
+ * 偽のワーカーでジョブの管理を作る（時間は `CONTROL_JOB_TEST_TIMING` に `timing` を重ねる。端末のメモリは、渡さなければ `ENOUGH_MACHINE_MEMORY`）。
+ */
 export const createFakeWorkerJobManager = ({ workDirectory, worker, timing, ...options }: FakeWorkerJobManagerOptions): AuditJobManager =>
   createAuditJobManager({
+    machineMemory: () => ENOUGH_MACHINE_MEMORY,
     ...options,
     repositoryRoot: workDirectory,
     workerPath: worker.path,

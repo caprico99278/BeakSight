@@ -206,6 +206,10 @@ const UI06_EXCLUDED_FILES: ReadonlyMap<string, string> = new Map([
   ['src/core/secret-query-names.ts', '秘密に見える名前の方針で照らす語の一覧（表示の文言ではない）'],
   // AUD-7（設計者の判断 2026-11-10）: 画面の誤りの表示の手がかりにする、汎用の語の閉じた一覧（利用者に見せる文言ではない）。
   ['src/core/error-display-words.ts', '画面の誤りの表示と照らす汎用の語の一覧（表示の文言ではない）'],
+  // RCA-4（検索の確かめの設計書 2.2）: 検索の確かめで文字の欄に入れる値（空・半角・全角）の閉じた一覧（利用者に見せる文言ではない）。
+  ['src/discovery/search-check-text-values.ts', '検索の確かめで欄に入れる値の一覧（表示の文言ではない）'],
+  // BS-2（設計書 `2026-11-20-beaksight-key-action-positions-design.md` 2.1）: 主要な行動の候補の名前と照らす、汎用の語の閉じた一覧（利用者に見せる文言ではない）。
+  ['src/core/key-actions.ts', '主要な行動の候補の名前と照らす汎用の語の一覧（表示の文言ではない）'],
 ]);
 
 /** GATE-UI06 の除外の、Rule の定義のファイル（Finding の `message` は Rule が持つ）。 */

@@ -15,6 +15,7 @@
  * - すべての書き込みが終わるのを待ってから、終了コードを返す。
  */
 import { loadConfig } from '../config/load-config.js';
+import type { DebugTimingSwitch } from '../core/debug-timing.js';
 import { CLI_TEXT } from '../presentation/messages.js';
 import { parseCliArguments } from './arguments.js';
 import { CONFIG_ERROR_OUTCOME, FAILURE_EXIT_CODE, SUCCESS_EXIT_CODE } from './exit-codes.js';
@@ -38,6 +39,11 @@ export interface CliDependencies {
    * （`resolveRunCommandDependencies`）。`validate-config` と `--help` では使わない。省略すると、止めない。
    */
   readonly stopSignal?: AbortSignal;
+  /**
+   * DBG-1（設計書 `2026-11-20-beaksight-discovery-skip-and-debug-timing-design.md` 2.2）: 測りの記録の入切を読む口（`index.ts` が作って渡す）。`run` のときだけ、
+   * `run` の依存に加えて Run Coordinator に届ける（Run の始めに 1 回呼ぶ）。省略すると切。
+   */
+  readonly debugTimingSwitch?: DebugTimingSwitch;
 }
 
 /**
@@ -50,7 +56,9 @@ export function resolveRunCommandDependencies(
   production: RunCommandDependencies,
 ): RunCommandDependencies {
   const base = dependencies.run ?? production;
-  return dependencies.stopSignal === undefined ? base : { ...base, stopSignal: dependencies.stopSignal };
+  const stopped = dependencies.stopSignal === undefined ? base : { ...base, stopSignal: dependencies.stopSignal };
+  // DBG-1: 測りの記録の入切を読む口があれば加える。
+  return dependencies.debugTimingSwitch === undefined ? stopped : { ...stopped, debugTimingSwitch: dependencies.debugTimingSwitch };
 }
 
 /**

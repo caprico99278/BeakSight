@@ -17,6 +17,7 @@ import { CONTROL_SCHEMA_V19 } from './control-schema-v19.js';
 import { CONTROL_SCHEMA_V20 } from './control-schema-v20.js';
 import { CONTROL_SCHEMA_V21 } from './control-schema-v21.js';
 import { CONTROL_SCHEMA_V22 } from './control-schema-v22.js';
+import { CONTROL_SCHEMA_V23 } from './control-schema-v23.js';
 import { STORE_META_KEYS } from './profile-records.js';
 import { ControlStoreError, toControlStoreError } from './store-errors.js';
 import type { SqliteConnection } from './sqlite-module.js';
@@ -65,9 +66,10 @@ export const CONTROL_SCHEMA_BASE: ControlSchemaBase = Object.freeze({ ...CONTROL
  *   全体の長さの上限を外す（空でないこと・形の決まりは残す）。
  * - 版 21（LZ-3a。`control-schema-v21.ts`）: 発見のジョブの、読み切れた画面の path の数の上限（10,000）を外す（JSON の配列の決まりは残す）。
  * - 版 22（DN-1。`control-schema-v22.ts`）: プロファイルの表示の設定に、画面に出す名前の列を足す（前の版の行は名前なし）。
+ * - 版 23（PAR-b。`control-schema-v23.ts`）: 終わっていないジョブの一意の部分索引を、プロファイルごとにする（行は変えない）。
  */
 export const CONTROL_MIGRATIONS: readonly ControlMigration[] = Object.freeze([
-  CONTROL_SCHEMA_V18, CONTROL_SCHEMA_V19, CONTROL_SCHEMA_V20, CONTROL_SCHEMA_V21, CONTROL_SCHEMA_V22,
+  CONTROL_SCHEMA_V18, CONTROL_SCHEMA_V19, CONTROL_SCHEMA_V20, CONTROL_SCHEMA_V21, CONTROL_SCHEMA_V22, CONTROL_SCHEMA_V23,
 ]);
 
 

@@ -92,6 +92,10 @@ export type {
   ReadRowSource,
 } from '../discovery/read-check-evaluation.js';
 
+// RCA-8（検索の確かめの設計書 2.4）: 検索の確かめの結果の見せ方の材料（ためした数と、開けなかった検索の一覧）。
+export { searchCheckOutcomeOf } from '../discovery/search-check-results.js';
+export type { SearchCheckErrorItem, SearchCheckOutcome } from '../discovery/search-check-results.js';
+
 // T37c（Task 37 の設計書 3.4、3.6）: 送らずに観察する probe の結果の契約（結果と理由の閉じた一覧と、結果の形）。
 // T38f: probe の型の鍵と欄の対応（API のシナリオの作成の画面の案）。
 // T38R-fix の M-2: 書き込みの probe の結果と、シナリオの種類と method の対応（契約の 1 か所）。

@@ -248,6 +248,7 @@ describe('T27e: the read-evidence.json document', () => {
     finishedAt: '20261011000100',
     runStatus: 'COMPLETE',
     endReason: 'COMPLETED',
+    searchChecks: [],
     checks: [
       {
         readCheckId: 'read-1',
@@ -367,23 +368,24 @@ describe('T27e: the read-evidence.json document', () => {
 
   it('counts the checks and the executed ones, and leaves the Run Status to deriveRunStatus', () => {
     const document = sample();
-    expect(readEvidenceSummaryOf(document)).toEqual({ checks: 2, executed: 2 });
+    expect(readEvidenceSummaryOf(document)).toEqual({ checks: 2, executed: 2, searchChecks: 0, searchCheckErrors: 0 });
     expect(readEvidenceRunStatusOf(document)).toBe('COMPLETE');
     const [first, second] = document.checks;
     if (first?.state !== 'EXECUTED' || second === undefined) {
       throw new Error('the sample has two checks');
     }
-    expect(readEvidenceRunStatusOf({ endReason: 'COMPLETED', checks: [{ ...first, result: 'NOT_MATCHED' }] })).toBe('COMPLETE');
-    expect(readEvidenceRunStatusOf({ endReason: 'COMPLETED', checks: [{ ...first, result: 'UNDETERMINED' }] })).toBe('PARTIAL');
+    const searchChecks = [] as const;
+    expect(readEvidenceRunStatusOf({ endReason: 'COMPLETED', checks: [{ ...first, result: 'NOT_MATCHED' }], searchChecks })).toBe('COMPLETE');
+    expect(readEvidenceRunStatusOf({ endReason: 'COMPLETED', checks: [{ ...first, result: 'UNDETERMINED' }], searchChecks })).toBe('PARTIAL');
     const notExecuted = {
       readCheckId: 'read-3', readCheckRevision: 1, targetKind: 'CANDIDATE', targetIdentityDigest: DIGEST, state: 'NOT_EXECUTED', reason: 'STOPPED',
     } as const;
-    expect(readEvidenceSummaryOf({ checks: [first, notExecuted] })).toEqual({ checks: 2, executed: 1 });
-    expect(readEvidenceRunStatusOf({ endReason: 'STOPPED', checks: [first, notExecuted] })).toBe('PARTIAL');
-    expect(readEvidenceRunStatusOf({ endReason: 'AUTH_SESSION_LOST', checks: [first] })).toBe('PARTIAL');
-    expect(readEvidenceRunStatusOf({ endReason: 'SAFETY_VIOLATION', checks: [first] })).toBe('ABORTED_BY_SAFETY');
-    expect(readEvidenceRunStatusOf({ endReason: 'PREFLIGHT_FAILED', checks: [{ ...notExecuted, reason: 'PREFLIGHT_FAILED' }] })).toBe('FAILED');
-    expect(readEvidenceRunStatusOf({ endReason: 'MAX_RUNTIME_REACHED', checks: [first] })).toBe('PARTIAL');
+    expect(readEvidenceSummaryOf({ checks: [first, notExecuted], searchChecks })).toEqual({ checks: 2, executed: 1, searchChecks: 0, searchCheckErrors: 0 });
+    expect(readEvidenceRunStatusOf({ endReason: 'STOPPED', checks: [first, notExecuted], searchChecks })).toBe('PARTIAL');
+    expect(readEvidenceRunStatusOf({ endReason: 'AUTH_SESSION_LOST', checks: [first], searchChecks })).toBe('PARTIAL');
+    expect(readEvidenceRunStatusOf({ endReason: 'SAFETY_VIOLATION', checks: [first], searchChecks })).toBe('ABORTED_BY_SAFETY');
+    expect(readEvidenceRunStatusOf({ endReason: 'PREFLIGHT_FAILED', checks: [{ ...notExecuted, reason: 'PREFLIGHT_FAILED' }], searchChecks })).toBe('FAILED');
+    expect(readEvidenceRunStatusOf({ endReason: 'MAX_RUNTIME_REACHED', checks: [first], searchChecks })).toBe('PARTIAL');
   });
 });
 
@@ -419,6 +421,7 @@ describe('T37d: the target kinds, the version 1.2 and the UNDETERMINED rule of t
     runStatus: 'PARTIAL',
     endReason: 'COMPLETED',
     checks,
+    searchChecks: [],
   });
 
   it('adds the two details of the audit stage, both UNDETERMINED', () => {

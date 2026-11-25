@@ -90,6 +90,8 @@ describe('FM2d: whether the chained run goes to the next stage', () => {
       'MAX_RUNTIME_REACHED', 'COLLECTOR_INCOMPLETE', 'RULE_EVALUATION_FAILED', 'PAGE_CRASHED',
       // L0: 進みの見張りが段を終えた（ページ単位の理由）。
       'STAGE_UNRESPONSIVE', 'STAGE_NEVER_QUIET',
+      // DUP: 表示の中身が点検した画面と同じなので、Mobile を始めなかった。
+      'SAME_CONTENT_AS_EARLIER_PAGE',
     ]);
     // 一覧にない値（型の外から来たもの）は、止める側に倒す。
     expect(chainAdvanceDecisionOf(ran({ stageRunStatus: 'PARTIAL', incompleteReasonCodes: ['NOT_A_CODE' as never] })))

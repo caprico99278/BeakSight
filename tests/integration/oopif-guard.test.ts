@@ -403,3 +403,37 @@ describe('C18i: the OOPIF sessions are bounded, and a closed OOPIF releases its 
     });
   }, MANY_OOPIF_TEST_TIMEOUT_MS);
 });
+
+/** CDPX: 子の OOPIF が要求をまとめて出した直後に消える iframe を、くり返し作る頁（`kind` は `read` か `nonread`）。終えたら題が `done` になる。 */
+const OOPIF_DETACH_CHURN_PAGE = '/oopif-detach-churn.html';
+
+/** CDPX: 頁がくり返しを終えるか、Guard が Context を無効にするまで待つ（Context が閉じると待ちは失敗するので、その失敗は受け流す）。 */
+const awaitChurnEnd = (page: Page): Promise<unknown> =>
+  page.waitForFunction(() => document.title === 'done', undefined, { timeout: 0 }).catch(() => undefined);
+
+describe('CDPX: an OOPIF that detaches while the Guard holds its requests', () => {
+  it('allowed reads: a continue that fails because the OOPIF target is gone is recorded, not a violation, and the Context stays open', async () => {
+    await withGuardedPassivePage(headlessFactory, viewport, async (page, context, ledger) => {
+      await page.goto(`${server.origin}${OOPIF_DETACH_CHURN_PAGE}?kind=read`, { waitUntil: 'load' });
+      await awaitChurnEnd(page);
+      await wait(QUIET_PERIOD_MS);
+
+      expect(ledger.snapshot().invariantViolations).toEqual([]);
+      expect(isPassiveRequestGuardClosed(context)).toBe(false);
+      expect(ledger.snapshot().detachedTargetContinues?.count ?? 0).toBeGreaterThan(0);
+    });
+  });
+
+  it('blocked writes: a block that fails because the OOPIF target is gone is still a violation that closes the Context, and no write reaches the server', async () => {
+    const window = openServerWindow(server);
+    await withGuardedPassivePage(headlessFactory, viewport, async (page, context, ledger) => {
+      await page.goto(`${server.origin}${OOPIF_DETACH_CHURN_PAGE}?kind=nonread`, { waitUntil: 'load' });
+      await awaitChurnEnd(page);
+
+      expect(ledger.snapshot().invariantViolations.map(({ code }) => code)).toContain('CDP_FAIL_REQUEST_FAILED');
+      await expect.poll(() => isPassiveRequestGuardClosed(context)).toBe(true);
+    });
+    await wait(QUIET_PERIOD_MS);
+    expect(window.nonReadCounters()).toEqual(NO_NON_READ_REQUESTS);
+  });
+});

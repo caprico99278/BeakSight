@@ -675,6 +675,11 @@ export interface DuplicateIdEvidence {
   readonly count: number;
   /** 古い版の記録を読むためだけに残す: `id` を長さの上限で切り詰めたか（LZ-3b の後の記録では常に false）。 */
   readonly truncated: boolean;
+  /**
+   * RVP-5（設計書 `2026-11-24-beaksight-review-pending-evidence-design.md` 2.6）: その id を参照する要素の数（`label[for]`・`aria-labelledby`・`aria-describedby`・
+   * `aria-controls` などの id の並びの属性・`list`・`form`・`headers`・ページの中のリンク `#id`）。この項目より前の記録にはない。
+   */
+  readonly referenceCount?: number;
 }
 
 /**
@@ -736,7 +741,18 @@ export interface DomEvidence {
   readonly errorDisplay?: ErrorDisplayEvidence;
   /** EV-1: 見えている読み込み中の表示の数（前の版の記録にはない。EV-3 が準備の状態に使う）。 */
   readonly loadingIndicators?: LoadingIndicatorEvidence;
+  /**
+   * SKIP-1（設計書 `2026-11-20-beaksight-discovery-skip-and-debug-timing-design.md` 2.1）: 操作さがしが押しにかかる候補の数（選び方は probe と共通の部品
+   * `discoveryCandidateElementOf`）。点検の深さにかかわらず記録する。数えられなかったときと前の版の記録にはない（ないときは「分からない → 読む」）。
+   */
+  readonly discoveryCandidateCount?: number;
 }
+
+/**
+ * DUP（REV-DUP の M-4）: DOM の collector が返す、DOM の Evidence と、記録に残さない欄の表示の値の digest（`fieldValuesDigest`。見えている欄の値を文書の順に
+ * 並べた digest。パスワードの欄は入れない。中身が同じ画面かの判定にだけ使う）。記録するときは `recordedDomEvidenceOf`（`src/evidence/dom-collector.ts`）で外す。
+ */
+export type CollectedDomEvidence = DomEvidence & { readonly fieldValuesDigest?: string };
 
 /**
  * EV-1: 見えている読み込み中の表示の数。`ariaBusyCount` は `aria-busy="true"` の要素、`progressbarCount` は `role="progressbar"` と `progress` の要素、
@@ -901,6 +917,12 @@ export interface ZeroSizeInteractiveEvidence {
   readonly truncated: boolean;
 }
 
+/** S-06: 外枠で端が切れる、内側のスクロール領域（`ClippedTextEvidence.cutScrollRegions`）。 */
+export interface CutScrollRegionEvidence {
+  readonly selector: string;
+  readonly rect: RectangleEvidence;
+}
+
 export interface ClippedTextEvidence {
   readonly selector: string;
   /**
@@ -942,6 +964,12 @@ export interface ClippedTextEvidence {
    * `LayoutTruncationEvidence.clippedTextNodeScanLimitReachedCount` に数えた）。
    */
   readonly partiallyClippedText: boolean;
+  /**
+   * S-06（設計書 `doc/design/2026-11-19-beaksight-audit-result-review-fixes-design.md` 4.4）: 文字とこの箱の間にある、スクロールできる祖先（いちばん外側）のうち、
+   * 箱がこの箱からはみ出すもの（内側のスクロール領域の端が、この箱で切れる）。スクロールできる祖先の中の文字は、その祖先の箱で判定し、`partiallyClippedText` の
+   * 判定には使わない（祖先の箱がこの箱に収まれば、内側のスクロールで見える）。はみ出す祖先があるときだけ。この項目より前の記録にはない。
+   */
+  readonly cutScrollRegions?: readonly CutScrollRegionEvidence[];
   /** 古い版の記録を読むためだけに残す: selector かテキストを上限で切り詰めたか（LZ-2・LZ-3b の後の記録では常に false）。 */
   readonly truncated: boolean;
   /** AUD-4a: 省略の書き方の計算値（この項目より前に記録した Evidence にはない）。 */
@@ -1039,8 +1067,23 @@ export interface OverlapHitTestEvidence {
   readonly points: readonly OverlapHitPointEvidence[];
   /** 覆う要素そのものの事実（`pointer-events: none` で hit-test に出ないときも、描画の事実を読むため）。`relation` は `OVERLAY`。 */
   readonly overlay: OverlapHitLayerEvidence;
-  /** モーダルの印（覆う要素か祖先の、開いたモーダルの `dialog`・`aria-modal="true"`）。 */
-  readonly modal: { readonly dialogModal: boolean; readonly ariaModal: boolean };
+  /**
+   * モーダルの印（覆う要素か祖先の、開いたモーダルの `dialog`・`aria-modal="true"`）。AUD-2（設計書 `2026-11-19-beaksight-audit-result-review-fixes-design.md` 5.1）:
+   * `openModal` は、覆う要素が、見えているモーダルの小窓（判定の 1 か所 `R.openModalDialogs`）か、その中の要素か、その暗転の要素のとき。`coveredInside` は、
+   * 覆われる要素が、そのモーダルの小窓の中にあるとき（小窓の中が塞がる形なので、モーダルとして数えない）。どちらも真のときだけ書き、この項目より前の
+   * Evidence にはない。
+   */
+  readonly modal: {
+    readonly dialogModal: boolean;
+    readonly ariaModal: boolean;
+    readonly openModal?: true;
+    readonly coveredInside?: true;
+    /**
+     * RVP-2（設計書 `2026-11-24-beaksight-review-pending-evidence-design.md` 2.3）: 覆う要素が、前面の窓（判定の 1 か所 `R.frontWindows`）か、その中の要素のとき
+     * （`coveredInside` は、覆われる要素がその窓の中にあるときも付ける）。真のときだけ書き、この項目より前の Evidence にはない。
+     */
+    readonly frontWindow?: true;
+  };
 }
 
 export interface FixedHeadingOverlapEvidence {
@@ -1124,6 +1167,25 @@ export interface ElementOverlapEvidence {
   readonly coveredScrollContainer?: ScrollContainerEvidence;
   /** EV-1: どちらも固定要素でない組の、行ごとの矩形の重なり（前の版の記録にはない）。 */
   readonly lineOverlap?: LineOverlapEvidence;
+  /** AUD-5（S-02）: どちらも固定要素でない組の、片方ごとの置き方の事実（前の版の記録にはない）。 */
+  readonly placement?: OverlapPlacementEvidence;
+}
+
+/**
+ * AUD-5（設計書 `2026-11-19-beaksight-audit-result-review-fixes-design.md` 8.1）: 重なりの組の片方の置き方の事実。
+ * - `positionedInSharedContainer`: 自分か祖先のうち、組のもう片方と共通の入れ物より下に、位置指定の要素（`absolute`・`fixed`・`sticky`、または
+ *   `relative` と z-index）があるか。
+ * - `controlAncestorSelector`: いちばん近い押せる祖先（自分を除く。ボタンかリンクの種類）の selector。なければ `null`。
+ */
+export interface OverlapSidePlacementEvidence {
+  readonly positionedInSharedContainer: boolean;
+  readonly controlAncestorSelector: string | null;
+}
+
+/** AUD-5: 重なりの組の、文書の順の片方ごとの置き方の事実。 */
+export interface OverlapPlacementEvidence {
+  readonly first: OverlapSidePlacementEvidence;
+  readonly second: OverlapSidePlacementEvidence;
 }
 
 /** 可視で大きさのある固定要素（`position: fixed | sticky`）と、ビューポートに対する面積の比。 */
@@ -1188,6 +1250,87 @@ export interface LayoutEvidence {
    * 主要要素どうしの重なり・固定要素）は、件数の上限で打ち切らずに、`LAYOUT_COLLECTION_PART_SIZE` 件ずつ分けて全部を集める。
    */
   readonly collectedInParts?: number;
+  /** AUD-4: layout を読み終えたときの状態の印（`EvidenceStateMark`）。この項目より前の記録にはない。 */
+  readonly stateMark?: EvidenceStateMark;
+  /**
+   * BS-2（設計書 `2026-11-20-beaksight-key-action-positions-design.md` 2.2）: 主要な行動の候補（押せる要素のうち、`src/core/key-actions.ts` の一覧に当たるもの。
+   * 見えない要素も含む。文書の順）の位置の事実。読むだけで、要求と読み込みを足さない。この項目より前の記録にはない（ないときは、読んでいない）。
+   */
+  readonly keyActionElements?: readonly KeyActionElementEvidence[];
+}
+
+/**
+ * BS-2: 主要な行動の候補 1 つの事実。行き先は scheme とホスト（http・https のときだけ）だけで、電話番号・宛先・path は持たない。文字（`text`・`ariaLabel`・
+ * `title`）の電話番号とメールアドレスに見える部分は伏せる（`maskContactValues`）。種類は記録せず、読む側が `keyActionKindOf` で決める。
+ */
+export interface KeyActionElementEvidence {
+  readonly selector: string;
+  /** 要素の名前（小文字）と `role` の属性（なければ `null`）。 */
+  readonly tagName: string;
+  readonly role: string | null;
+  /** 見える文字（空白を整えた `innerText`。入力のボタンは `value`）。 */
+  readonly text: string;
+  readonly ariaLabel: string | null;
+  readonly title: string | null;
+  readonly hrefScheme: string | null;
+  readonly hrefHost: string | null;
+  /** 矩形（ビューポートの座標。読んだときの文書のスクロール位置は `LayoutEvidence.scrollPosition`）。 */
+  readonly rect: RectangleEvidence;
+  /** 可視か（`checkVisibility`）。 */
+  readonly visible: boolean;
+  /** いちばん近い `position: fixed | sticky` の要素（自分を含む）の selector。固定の表示の中になければ `null`。 */
+  readonly fixedContainerSelector: string | null;
+}
+
+/** AUD-4（設計書 `2026-11-19-beaksight-audit-result-review-fixes-design.md` 7.2 の 1）: スクロールできる箱（`isScrollableBox`）1 つの位置。 */
+export interface StateMarkScrollBoxEvidence {
+  readonly selector: string;
+  readonly scrollLeft: number;
+  readonly scrollTop: number;
+  /** 箱の中身が見える範囲（枠線とスクロールバーを除いた箱。viewport の座標）。 */
+  readonly clientRect: RectangleEvidence;
+}
+
+/**
+ * AUD-4（同じ設計書 7.2 の 1）: 状態の印。layout を読んだときと、状態の画像を撮ったときに、同じ部品（`src/evidence/state-mark.ts`）で読む。値と文字は持たない。
+ * 読むだけで、要求と読み込みを足さない。
+ */
+export interface EvidenceStateMark {
+  /** 文書のスクロール位置（定義は `ScrollPosition`）。 */
+  readonly documentScroll: ScrollPosition;
+  /** スクロールできる箱（文書の根・body・`scrollingElement` を除く）の位置（文書の順）。 */
+  readonly scrollBoxes: readonly StateMarkScrollBoxEvidence[];
+  /**
+   * DOM の構造の要約（要素の名前と入れ子の深さだけの digest。描かない要素は除く）。記録だけで、比べには使わない（設計者の判断 2026-11-19: 対象と関係のない所の
+   * 変化で、指摘を保留にしない）。
+   */
+  readonly structureDigest: string;
+  /** 隠した通知の枠の数（AUD-1・2 の記録から取る。記録を持たない読み取りにはない）。 */
+  readonly hiddenNotificationFrameCount?: number;
+  /**
+   * layout の印だけ: layout の対象の selector ごとの、祖先のスクロールできる箱（`scrollBoxes` の番号。内から外の順）。祖先に箱のない対象は持たない。
+   */
+  readonly targetScrollBoxes?: readonly StateMarkTargetScrollBoxesEvidence[];
+  /**
+   * 状態の画像の印だけ: 直前の layout の対象（`stateMarkTargetSelectorsOf`）ごとに、撮る直前に読み直した要素の数と矩形（設計者の判断 2026-11-19）。対象を
+   * 渡さずに撮った画像にはない。
+   */
+  readonly targetRects?: readonly StateMarkTargetRectEvidence[];
+}
+
+/** AUD-4: 状態の画像を撮る直前に読み直した、layout の対象 1 つ。 */
+export interface StateMarkTargetRectEvidence {
+  readonly selector: string;
+  /** selector に当たった要素の数。 */
+  readonly matchCount: number;
+  /** 最初に当たった要素の矩形（viewport の座標。当たらなければ `null`）。 */
+  readonly rect: RectangleEvidence | null;
+}
+
+/** AUD-4: layout の対象 1 つの、祖先のスクロールできる箱。 */
+export interface StateMarkTargetScrollBoxesEvidence {
+  readonly selector: string;
+  readonly boxes: readonly number[];
 }
 
 /**
@@ -1300,6 +1443,20 @@ export interface NotificationFrameEvidence {
   readonly hiddenReason: NotificationFrameHiddenReason | null;
   /** この Run（このビューポートの種類）で初めて見た枠か（設計書 3.3）。 */
   readonly firstSeen: boolean;
+  /**
+   * AUD-2（設計書 `2026-11-19-beaksight-audit-result-review-fixes-design.md` 5.1）: モーダルの小窓（`aria-modal`・modal の `dialog`・暗転の要素を伴う role=dialog と、
+   * その中の要素・暗転の要素）を、隠さずに開いたまま点検した（閉じて消えた小窓には付けない）。モーダルでない枠と、この項目より前の Evidence にはない。
+   */
+  readonly keptOpen?: true;
+  /** AUD-2（5.2）: 実際に隠した（`hidden` が真の）ときの、画面の幅とスクロールの位置。隠さなかった枠と、この項目より前の Evidence にはない。 */
+  readonly hiddenAt?: NotificationFrameHiddenAt;
+}
+
+/** AUD-2（5.2）: 枠を隠したときの、画面の幅（px）と文書のスクロールの位置（px）。 */
+export interface NotificationFrameHiddenAt {
+  readonly viewportWidth: number;
+  readonly scrollX: number;
+  readonly scrollY: number;
 }
 
 /** 通知の枠を読めたかの状態。 */
@@ -1717,7 +1874,19 @@ export interface AccessibilityCheckEvidence {
   /** 測れない理由など、axe の文言の鍵（例: `bgImage`・`bgGradient`・`bgOverlap`・`fgAlpha`・`pseudoContent`・`complexTextShadows`）。なければ `null`。 */
   readonly messageKey: string | null;
   readonly data: Readonly<Record<string, AccessibilityCheckDataValue>>;
+  /**
+   * AUD-6（設計書 `2026-11-19-beaksight-audit-result-review-fixes-design.md` 9.3。S-10）: 確かめに関わる別の要素（axe の `relatedNodes`。重複 ID の他の出現・
+   * 参照先など）の目印（axe の target の selector だけ。HTML・文字・値は持たない）。関わる要素がない確かめと、古い版の記録にはない。
+   */
+  readonly relatedNodes?: readonly { readonly targetSelectors: readonly AccessibilityTargetSelector[] }[];
 }
+
+/**
+ * AUD-6（S-10）: 抜粋の切り詰めの種類の閉じた一覧。`SOURCE_TRUNCATED` は、axe 自身が HTML の抜粋を切り詰めた（末尾の `...`）。BeakSight は切り詰めない
+ * （秘匿・未取得・空値とは別の事実）。
+ */
+export const ACCESSIBILITY_TRUNCATION_KINDS = Object.freeze(['SOURCE_TRUNCATED'] as const);
+export type AccessibilityTruncationKind = (typeof ACCESSIBILITY_TRUNCATION_KINDS)[number];
 
 /** AUD-8: 1 つの値の長さで切った欄（`field` は要素の Evidence の中の JSON Pointer。例: `/failureSummary`、`/targetSelectors/0`、`/checks/0/data/fgColor`）。 */
 export interface AccessibilityValueTruncationEvidence {
@@ -1765,8 +1934,13 @@ export interface AccessibilityNodeEvidence {
   readonly targetSelectors: readonly AccessibilityTargetSelector[];
   readonly failureSummary: string | null;
   readonly htmlSnippet: string;
-  /** selector・`failureSummary`・HTML の抜粋・確かめの data のどれかを上限で切り詰めたか（どの欄かは `truncations`）。 */
+  /**
+   * selector・`failureSummary`・HTML の抜粋・確かめの data のどれかを上限で切り詰めたか（どの欄かは `truncations`）。AUD-6（S-10）: axe 自身が HTML の抜粋を
+   * 切り詰めたときも真（種類は `truncationKind`）。
+   */
   readonly truncated: boolean;
+  /** AUD-6（S-10）: 切り詰めの種類（`ACCESSIBILITY_TRUNCATION_KINDS`。切り詰めていなければ、項目なし）。古い版の記録にはない。 */
+  readonly truncationKind?: AccessibilityTruncationKind;
   /** AUD-8: 確かめ（`any`・`all`・`none` の順）。古い版の記録にはない。 */
   readonly checks?: readonly AccessibilityCheckEvidence[];
   /** AUD-8: 値の長さで切った欄（切らなければ空）。古い版の記録にはない。 */
@@ -1781,8 +1955,9 @@ export interface AccessibilityNodeEvidence {
    */
   readonly region?: AccessibilityTargetRegionEvidence;
   /**
-   * AUD-4b: 名前の不一致（`label-content-name-mismatch`）の違反の要素の、AX（ブラウザのアクセシビリティの木）の名前の文脈。ほかの Rule の要素と、古い版の記録には
-   * ない。
+   * AUD-4b: 名前の不一致（`label-content-name-mismatch`）の違反の要素の、AX（ブラウザのアクセシビリティの木）の名前の文脈。AUD-6（S-10）: 名前の規則
+   * （button-name・link-name・入力欄の名前など。`NAME_CONTEXT_AXE_RULE_IDS`）の違反の要素にも付ける（名前の根拠 `nameSource`）。ほかの Rule の要素と、古い版の
+   * 記録にはない。
    */
   readonly nameContext?: AccessibilityNameContextEvidence;
   /**
@@ -1790,6 +1965,25 @@ export interface AccessibilityNodeEvidence {
    * 要素・古い版の記録にはない。
    */
   readonly computedContrastRatio?: number;
+  /**
+   * RVP-5（設計書 `2026-11-24-beaksight-review-pending-evidence-design.md` 2.6）: 名前の規則（`NAME_CONTEXT_AXE_RULE_IDS`）の違反の要素が `aria-labelledby` を
+   * 持つときの、参照先の事実。持たない要素・読めなかった要素・ほかの Rule の要素と、この項目より前の記録にはない。
+   */
+  readonly labelledBy?: AccessibilityLabelledByEvidence;
+}
+
+/** RVP-5: `aria-labelledby` の参照先の見え方の閉じた一覧（見える・見えない・参照先がない）。 */
+export const ACCESSIBILITY_LABELLED_BY_VISIBILITIES = Object.freeze(['VISIBLE', 'HIDDEN', 'MISSING'] as const);
+export type AccessibilityLabelledByVisibility = (typeof ACCESSIBILITY_LABELLED_BY_VISIBILITIES)[number];
+
+/**
+ * RVP-5: `aria-labelledby` の参照先の事実。`idCount` は書かれた id の数、`foundCount` は同じ文書（か shadow root）で見つかった要素の数。`visibility` は、見つかった
+ * 要素のどれかが描かれて見えれば `VISIBLE`、見つかったがどれも見えなければ `HIDDEN`、1 つも見つからなければ `MISSING`。
+ */
+export interface AccessibilityLabelledByEvidence {
+  readonly idCount: number;
+  readonly foundCount: number;
+  readonly visibility: AccessibilityLabelledByVisibility;
 }
 
 /**
@@ -1929,6 +2123,11 @@ export interface InteractionCandidateEvidence {
    * `isDestructiveAction` の結果）。真の候補は押さない（`DESTRUCTIVE_ACTION_SKIPPED`）。前の版の記録にはない（スキーマでは任意）。
    */
   readonly destructiveAction: boolean;
+  /**
+   * AIW（ユーザーの判断 2026-11-20）: AI の操作か（操作の前の判定 `isAiAction` の結果）。真の候補は押さない（`AI_ACTION_SKIPPED`）。前の版の記録にはない（型でも
+   * スキーマでも任意。ないときは AI の操作でない）。
+   */
+  readonly aiAction?: boolean;
   readonly boundingBox: InteractionBoundingBoxEvidence;
 }
 
@@ -1949,6 +2148,8 @@ export const INTERACTION_REJECTION_REASONS = Object.freeze([
   'MALFORMED_CANDIDATE',
   // SD-1（設計書 `2026-11-16-beaksight-action-based-delete-guard-design.md` 2.3）: 削除に関する操作（消す・取り消すなど）なので押さない。
   'DESTRUCTIVE_ACTION_SKIPPED',
+  // AIW（ユーザーの判断 2026-11-20）: 名前に AI の語があるボタンなので押さない（サイトの AI の生成を起こさない）。
+  'AI_ACTION_SKIPPED',
 ] as const);
 
 /** Interaction の候補を実行しない理由。`src/safety/interaction-policy.ts` の `InteractionRejectionReason` は、この型の別名。 */
@@ -2053,6 +2254,8 @@ export const INTERACTION_NOT_VERIFIABLE_REASON_CODES = Object.freeze([
   'DEADLINE_DURING_EXACT_NODE_ADMISSION',
   'TARGET_NOT_SCROLL_PREPARED',
   'DEADLINE_BEFORE_EXACT_NODE_CLICK',
+  // DEF-294（REV-AUD2）: 押す前の hit-test で、対象がほかの表示に覆われていた（押さない）。値の追加だけで、記録の版は今のまま。
+  'TARGET_COVERED_BY_OTHER',
   /** click の期限切れ。詳細は、整えた click のエラーの文言（残らなければ null）。ほかの click の失敗は `CLICK_FAILED`。 */
   'CLICK_TIMED_OUT',
   // click の後の観測（SPEC-5: 書くのは `DEADLINE_DURING_POST_CONDITION_OBSERVATION`（押した後の期限切れ）・`NO_OBSERVABLE_CHANGE`・
@@ -2292,10 +2495,78 @@ export interface FocusCheckItemEvidence {
    * 前の版の記録にはない（そのときは、文書を動かさずに読んだ）。
    */
   readonly scroll?: FocusCheckScrollEvidence;
+  /**
+   * AUD-3（設計書 `2026-11-19-beaksight-audit-result-review-fixes-design.md` 6.2 の 1）: 項目の種別（判定はページの中の 1 か所の読み取り）と、その根拠。
+   * 大きさの根拠は `beforeRect`。前の版の記録にはない。
+   */
+  readonly kind?: FocusCheckItemKind;
+  readonly kindBasis?: FocusCheckItemKindBasis;
+  /**
+   * REV-AUD3 の 2 回目の I-A: フォーカスの後の位置が、確かめの段の期限（見張りの反応なしの長さ）までに落ち着かなかった（動き続けた）。矩形などは、最後に
+   * 読んだ値。落ち着いた項目と、前の版の記録にはない。
+   */
+  readonly unsettled?: true;
+  /**
+   * AUD-3（6.2 の 4）: 通常の Tab の確かめの記録（直の focus の記録とは別の欄）。直の focus で隠れたままの項目があった画面の、その項目だけ。確かめを終えられ
+   * なかった（Guard の口を始められない・途中で読めなくなった）とき、前の版の記録、ほかの項目にはない。
+   */
+  readonly sequentialTab?: FocusCheckSequentialTabEvidence;
+  /**
+   * RVP-1（設計書 `2026-11-24-beaksight-review-pending-evidence-design.md` 2.2）: 直の focus で押せる点が 0 で、どの点も、最前面が前面の窓（判定の 1 か所
+   * `R.frontWindows`）の中の要素で、この要素はその窓の外だった（開いた前面の窓が背後を覆う形）。そうでない項目と、この項目より前の記録にはない。
+   */
+  readonly frontWindowCovered?: true;
 }
 
-/** EV-1: フォーカスの確かめの操作の方法の閉じた一覧。 */
-export const FOCUS_CHECK_OPERATIONS = Object.freeze(['DIRECT_FOCUS'] as const);
+/**
+ * AUD-3: 1 つの項目の、通常の Tab の確かめの事実。文書の外へ出るまで Tab を押してから記録を始め（Blocker の判断の回り込み）、もう一度外へ出た・前に見た
+ * 要素に戻った・候補を全部確かめたら終える。届いたら、位置が落ち着いた後の矩形・見えるか・押せるか（直の focus と同じ読み）と、押せないときに最前面にあった要素。
+ */
+export interface FocusCheckSequentialTabEvidence {
+  readonly operation: Extract<FocusCheckOperation, 'SEQUENTIAL_TAB'>;
+  /** Tab で届いたか（`document.activeElement` がその要素になったか）。 */
+  readonly reached: boolean;
+  /** 届いたときの矩形（届かなければ `null`）。 */
+  readonly afterRect: RectangleEvidence | null;
+  readonly visibleAfterFocus: boolean;
+  readonly hitAfterFocus: boolean;
+  readonly hitTestPointCount: number;
+  readonly hitPointCount: number;
+  /** 押せなかったときに、hit-test の点の最前面にあった要素の selector（遮る要素。なければ `null`）。 */
+  readonly coveredBySelector: string | null;
+  /** RVP-1: 届いたとき、前面の窓（`R.frontWindows`）が開いていて、この要素はどの窓の外（背後）にもあった。そうでない記録と、この項目より前の記録にはない。 */
+  readonly behindFrontWindow?: true;
+}
+
+/**
+ * AUD-3: フォーカスの確かめの項目の種別の閉じた一覧。
+ * - `GUARD`: 循環の守り（幅か高さが 1px 以下で、名前がなく、role も押せる要素の型もない `[tabindex]` で、小窓・フォーカスの罠の始めか終わりにあるもの。
+ *   AUDR2: 小窓の外の、開いた小窓の直前か直後の兄弟に置いたものも）。
+ * - `CONTROL`: 押せる要素の型か role を持つもの。
+ * - `UNKNOWN`: どちらとも決められないもの。
+ */
+export const FOCUS_CHECK_ITEM_KINDS = Object.freeze(['GUARD', 'CONTROL', 'UNKNOWN'] as const);
+export type FocusCheckItemKind = (typeof FOCUS_CHECK_ITEM_KINDS)[number];
+
+/**
+ * AUD-3: 項目の種別の根拠（ページの中で読んだ事実だけ。ページの文字は持たない）。`trapEdge` は、いちばん近い小窓（小窓の外は偽。REV-AUD3 の M-1）の中の、フォーカス
+ * できる要素の始めか終わりか。
+ */
+export interface FocusCheckItemKindBasis {
+  readonly tiny: boolean;
+  readonly named: boolean;
+  readonly hasRole: boolean;
+  readonly controlType: boolean;
+  readonly trapEdge: boolean;
+  /**
+   * AUDR2: 小窓の外の、開いた小窓（か、それを含む入れ物）の直前か直後の兄弟か（モーダルの部品が小窓の外の兄弟に置く守りの部品の形）。この項目より前の記録には
+   * ない。
+   */
+  readonly dialogSiblingEdge?: boolean;
+}
+
+/** EV-1: フォーカスの確かめの操作の方法の閉じた一覧。AUD-3: `SEQUENTIAL_TAB` は、文書の先頭からの通常の Tab の移動（`sequentialTab` の欄）。 */
+export const FOCUS_CHECK_OPERATIONS = Object.freeze(['DIRECT_FOCUS', 'SEQUENTIAL_TAB'] as const);
 export type FocusCheckOperation = (typeof FOCUS_CHECK_OPERATIONS)[number];
 
 /** EV-1: スクロールの祖先 1 つの、前と後の位置。 */
@@ -2310,6 +2581,29 @@ export interface FocusCheckScrollEvidence {
   readonly document: { readonly before: ScrollPosition; readonly after: ScrollPosition };
   readonly ancestors: readonly ScrollAncestorPositionEvidence[];
 }
+
+/**
+ * AUDR2: 通常の Tab の確かめの結果の閉じた一覧。
+ * - `CHECKED`: 確かめ終えた（候補の項目に `sequentialTab` がある）。
+ * - 走らなかった: `NO_CANDIDATES`（直の focus で隠れたままの項目がない）、`WATCH_ENDED`（直の focus の確かめが見張りで終わった・落ち着かなかった）。
+ * - 確かめられなかった（項目の記録は変えない）: `KEY_GUARD_UNAVAILABLE`（キーの押下の期間の Guard の口を始められない）、`NO_START`（文書の外へ出る前に前に
+ *   見た要素へ戻った。始めを作れない）、`FRAME`（枠の中へ入った）、`VALUE_ENTRY`（値を入れる所に来た）、`NEW_ELEMENT`（確かめ始めたときになかった要素に
+ *   来た）、`UNSETTLED`（届いた後の位置が落ち着かない）、`DEADLINE`（今の確かめの期限が来た）、`READ_FAILED`（途中で読めなくなった）。
+ */
+export const FOCUS_SEQUENTIAL_TAB_OUTCOMES = Object.freeze([
+  'CHECKED',
+  'NO_CANDIDATES',
+  'WATCH_ENDED',
+  'KEY_GUARD_UNAVAILABLE',
+  'NO_START',
+  'FRAME',
+  'VALUE_ENTRY',
+  'NEW_ELEMENT',
+  'UNSETTLED',
+  'DEADLINE',
+  'READ_FAILED',
+] as const);
+export type FocusSequentialTabOutcome = (typeof FOCUS_SEQUENTIAL_TAB_OUTCOMES)[number];
 
 /** AUD-4d: フォーカスの確かめの状態の閉じた一覧（`PARTIAL` は、途中で読めなくなった。それまでの要素だけ）。 */
 export const FOCUS_CHECK_STATUSES = Object.freeze(['COMPLETE', 'PARTIAL'] as const);
@@ -2326,10 +2620,101 @@ export interface FocusCheckEvidence {
   /** 幅の走査の幅なら、その幅（px）。主の読み込みにはない。 */
   readonly stressWidth?: number;
   /**
+   * AUDR2: 通常の Tab の確かめの結果（確かめ終えた・走らなかった・確かめられなかった理由）。主の読み込みだけ。幅の走査の幅・開いた状態と、この項目より前の
+   * 記録にはない。
+   */
+  readonly sequentialTabOutcome?: FocusSequentialTabOutcome;
+  /**
    * EV-4（設計書 `2026-11-16-beaksight-finding-evidence-design.md` 3.4）: 主の読み込みの、axe の `scrollable-region-focusable` の要素ごとの、キーボードの
    * 実操作の結果（axe の静的な判定とは別の記録）。axe の要素の順。主の読み込みのほか（幅の走査・開いた状態）と、この項目より前の記録にはない。
    */
   readonly scrollableRegions?: readonly ScrollableRegionKeyboardEvidence[];
+  /**
+   * FRET（設計書 `2026-11-24-beaksight-dialog-focus-return-design.md` 1.4）: 主の読み込みの、窓を開くボタンを押して窓を閉じた後のフォーカスの戻り先の確かめ。
+   * 主の読み込みのほか（幅の走査・開いた状態）と、この項目より前の記録にはない。
+   */
+  readonly dialogFocus?: DialogFocusEvidence;
+}
+
+/**
+ * FRET: 窓を開くボタンの確かめの終わり方の閉じた一覧。
+ * - `COMPLETE`: 押す物を全部確かめた（押す物がなかったときも。そのときは `items` が空で `pressableCount` が 0）。
+ * - `NAVIGATED`: 押した後に画面が移った（URL の path か文書が変わった）ので、その画面の残りを確かめなかった。
+ * - `NOT_CLOSABLE`: Esc でも閉じるボタンでも窓を閉じられなかったので、その画面の残りを確かめなかった。
+ * - `KEY_GUARD_UNAVAILABLE`: キーを押す期間の Guard の口を始められなかったので、押さなかった。
+ * - `PARTIAL`: 読めなくなった・段の期限が来た。
+ */
+export const DIALOG_FOCUS_STATUSES = Object.freeze(['COMPLETE', 'NAVIGATED', 'NOT_CLOSABLE', 'KEY_GUARD_UNAVAILABLE', 'PARTIAL'] as const);
+export type DialogFocusStatus = (typeof DIALOG_FOCUS_STATUSES)[number];
+
+/**
+ * FRET: 1 つの押す物の確かめの結果の閉じた一覧（`NOT_FOCUSED` はフォーカスが当たらず押さなかった、`NO_WINDOW` は押しても前面の窓が出なかった、`NAVIGATED` は
+ * 押した後に画面が移った、`CHECKED` は窓が出て、閉じ方と閉じた後のフォーカスの先を記録した）。
+ */
+export const DIALOG_FOCUS_ITEM_OUTCOMES = Object.freeze(['NOT_FOCUSED', 'NO_WINDOW', 'NAVIGATED', 'CHECKED'] as const);
+export type DialogFocusItemOutcome = (typeof DIALOG_FOCUS_ITEM_OUTCOMES)[number];
+
+/** FRET: 窓の閉じ方（Esc・窓の中の閉じるボタン・どちらでも閉じられない）。 */
+export const DIALOG_FOCUS_CLOSINGS = Object.freeze(['ESCAPE', 'CLOSE_BUTTON', 'NOT_CLOSABLE'] as const);
+export type DialogFocusClosing = (typeof DIALOG_FOCUS_CLOSINGS)[number];
+
+/** FRET: 閉じた後のフォーカスの先（押す物・ほかの要素・body・押す物が消えた）。 */
+export const DIALOG_FOCUS_RETURNS = Object.freeze(['TRIGGER', 'OTHER', 'BODY', 'TRIGGER_GONE'] as const);
+export type DialogFocusReturn = (typeof DIALOG_FOCUS_RETURNS)[number];
+
+/** FRET: 主の読み込みの、窓を開くボタンの確かめの記録。 */
+export interface DialogFocusEvidence {
+  readonly status: DialogFocusStatus;
+  /** 見つけた押す物の数（同じ物を Run で前に確かめたので押さなかった物を含む）。0 なら「押す物なし」。 */
+  readonly pressableCount: number;
+  /** 同じ物を Run で前に確かめたので、押さなかった数。 */
+  readonly alreadyCheckedCount: number;
+  readonly items: readonly DialogFocusItemEvidence[];
+  /**
+   * 2026-11-25: 押す期間（Enter を押してから、窓を閉じて落ち着くまで）の後、確かめを終えて記録を書くまでに、ページが遅れて出した読み取りでない要求の数（押した後の
+   * 止めの続きで Guard が止める。その後に止めた分は Ledger で数える）。0 のときは持たない。押下が原因とは限らない（その間のサイトの自動の送信も数える。
+   * 2026-11-26）。
+   */
+  readonly lateNonReadRequestCount?: number;
+  /**
+   * fix round 5: 押す期間の後、確かめの終わりまでに、押す前から開いていた WebSocket の接続が送った frame の数（止めない。押下が原因とは限らない。送信の扱いの
+   * 観察のある Context だけ数える）。その後に送った分は Ledger（`passedAuditSendWebSockets.framesAfterDialogPress`。page を閉じるまでの全部）で数える。0 のときは
+   * 持たない。
+   */
+  readonly lateWebSocketFrameSentCount?: number;
+}
+
+/** FRET: 1 つの押す物の確かめの記録。 */
+export interface DialogFocusItemEvidence {
+  readonly selector: string;
+  /** 押す物の名前（見える文字・aria-label などの最初のもの。なければ空）。 */
+  readonly name: string;
+  /** 同じ物を Run で 1 回にする鍵の digest（共通の枠の中の物は枠の鍵、ほかは data を除いた path と識別の鍵から作る）。 */
+  readonly keyDigest: string;
+  readonly outcome: DialogFocusItemOutcome;
+  /** 窓が出たとき、フォーカスが窓の中へ移ったか（窓が出なければ `null`）。 */
+  readonly focusMovedIntoWindow: boolean | null;
+  /** 窓の閉じ方（窓が出なければ `null`）。 */
+  readonly closedBy: DialogFocusClosing | null;
+  /** 閉じた後のフォーカスの先（閉じられなかった・窓が出なければ `null`）。 */
+  readonly focusAfterClose: DialogFocusReturn | null;
+  /** 閉じた後のフォーカスの先が、ほかの要素のときの selector（ほかは `null`）。 */
+  readonly focusAfterCloseSelector: string | null;
+  /**
+   * 押す期間に、ページが出そうとした読み取りでない送信（GET・HEAD・OPTIONS のほか。2026-11-25 から Guard が止める）の数。0 のときは持たない。押下が原因とは限らない
+   * （その間のサイトの自動の送信も数える。2026-11-26）。
+   */
+  readonly nonReadRequestCount?: number;
+  /**
+   * fix round 4（2026-11-26）: 押す期間に、押す前から開いていた WebSocket の接続が送った frame の数（止めない。押下が原因とは限らない。送信の扱いの観察のある
+   * Context だけ数える）。0 のときは持たない。
+   */
+  readonly webSocketFrameSentCount?: number;
+  /** 押してから戻すまでに、Guard が止めた画面の移動とポップアップの数。0 のときは持たない。 */
+  readonly guardBlockedCount?: number;
+  /** 押す前と、閉じた後（閉じられなければ、最後の状態）の viewport の画像の Evidence（撮らない設定・撮れなかったときは `null`）。 */
+  readonly beforeScreenshotEvidenceId: EvidenceId | null;
+  readonly afterScreenshotEvidenceId: EvidenceId | null;
 }
 
 /**
@@ -2387,6 +2772,13 @@ export interface ScreenshotEvidence {
    * 撮ったときに測り直した対象の記録（部品 `revealAndCapture`）。先頭へ戻さずに撮るので、`scrollPosition` は撮った位置。ほかの画像と、前の版の記録にはない。
    */
   readonly reveal?: RevealCaptureEvidence;
+  /**
+   * AUD-2（設計書 `2026-11-19-beaksight-audit-result-review-fixes-design.md` 5.2）: 通知の枠を隠す前に撮った画像（`before-hide/`。隠したときだけ残す）。状態の画像と
+   * しては引かない。ほかの画像と、この項目より前の Evidence にはない。
+   */
+  readonly beforeNotificationHide?: true;
+  /** AUD-4: 状態の画像（先頭へ戻して撮る viewport の画像）を撮ったときの状態の印。対象まで動かして撮った画像と、この項目より前の記録にはない。 */
+  readonly stateMark?: EvidenceStateMark;
 }
 
 /** EV-2: 撮った画像の範囲に、対象が入ったかの閉じた一覧（全部・一部・入らない。機械で決める）。 */
@@ -2542,7 +2934,8 @@ export type MetadataEvidence = RobotsTxtMetadataEvidence | SitemapXmlMetadataEvi
  *   許可の外の Origin への送信と資格情報つきの送信、操作さがしの凍結の読み取りの決まりに当たらない要求）。判定は `src/safety/request-policy.ts` の
  *   `notificationPressDecisionOf`。
  * - `SCROLL_KEY_PRESS_RESTRICTED`（REV-EV4。設計書 `2026-11-16-beaksight-finding-evidence-design.md` 3.4）: 横にスクロールする領域のキーの押下の期間に、
- *   ページが始めた main frame の移動（BeakSight の操作が起こしたものとして止めた。違反にしない）。判定は `scrollKeyPressDecisionOf`。
+ *   ページが始めた main frame の移動（BeakSight の操作が起こしたものとして止めた。違反にしない）。判定は `scrollKeyPressDecisionOf`。FRET（2026-11-25）: 窓を開く
+ *   ボタンの押す期間の、読み取りでない要求（main frame と子の frame）も、この理由で止める。
  */
 export const BLOCKED_REQUEST_REASONS = Object.freeze([
   'NON_READ_METHOD',
@@ -2582,12 +2975,15 @@ export const WORKER_CONNECT_POLICY_REASON = 'WORKER_CONNECT_POLICY';
  *   （前は 10。L10 で撤廃したので今は止めない。前の記録を読むために値を残す）を超えた。
  * - `WEBSOCKET_SEND_QUEUE_FULL`（DEF-276-relay。REV-DEF276 の M-2）: 操作さがしの画面の文書の WebSocket の中継で、ページの送りがサーバへ書き出せずに
  *   たまる量の上限（`WEBSOCKET_RELAY_MAX_SEND_QUEUE_BYTES`）を超えたので、その接続を閉じた。
+ * - `SCROLL_KEY_PRESS_RESTRICTED`（FRETWS。設計書 `2026-11-25-beaksight-discovery-sibling-press-design.md` 2.2）: 窓を開くボタンの押す期間と止めの続きに
+ *   新しく開いた接続（BeakSight の押下の記録。HTTP の同じ理由と同じ扱いで、安全の指摘 `SAFETY_WEBSOCKET_BLOCKED` にしない）。判定は `scrollKeyPressDecisionOf`。
  */
 export const BLOCKED_WEBSOCKET_REASONS = Object.freeze([
   'PASSIVE_WEBSOCKET',
   WORKER_CONNECT_POLICY_REASON,
   'AUDIT_SEND_OVER_LIMIT',
   'WEBSOCKET_SEND_QUEUE_FULL',
+  'SCROLL_KEY_PRESS_RESTRICTED',
 ] as const);
 
 /** Interaction の凍結中に、ページが起こした通信・遷移・popup・WebSocket を遮断した理由の閉じた一覧。 */
@@ -3009,12 +3405,23 @@ export interface SafetyEventsEvidence {
   readonly frameClassificationFailures?: FrameClassificationFailuresRecord;
   /** SAFE-2 の 4: 読み取りの main frame の移動の失敗の記録（1 件でもあった Ledger の記録にだけ現れる。SAFETY の Finding にしない）。 */
   readonly readNavigationFailures?: ReadNavigationFailuresRecord;
+  /**
+   * CDPX: Guard が許した要求を続ける命令が、OOPIF の target が先に外れたために送れなかった数（違反にしない。target が外れると Chromium は要求を、続けたのと
+   * 同じに解き放つ）。1 件でもあった Ledger の記録にだけ現れる。SAFETY の Finding にしない。
+   */
+  readonly detachedTargetContinues?: DetachedTargetContinuesRecord;
+}
+
+/** CDPX: Guard が許した要求を続ける命令が、OOPIF の target が先に外れたために送れなかった数の記録（`SafetyEventsEvidence.detachedTargetContinues`。数だけ）。 */
+export interface DetachedTargetContinuesRecord {
+  readonly count: number;
 }
 
 /**
  * BN-a（設計書 3.1 の 4）: safety の Evidence のもとになった読み込みの種類の閉じた一覧。
  * - `PAGE_AUDIT`: ページの監査の読み込み（Desktop と Mobile の Passive の Context）。
- * - `STRESS_WIDTH`: 幅の走査の 1 つの幅の読み込み（`width` は、その幅の CSS px）。
+ * - `STRESS_WIDTH`: 幅の走査の 1 つの幅の読み込み（`width` は、その幅の CSS px）。SWR: 1 回読み込んで大きさを変えて回した Context は、`width` に読み込んだ幅、
+ *   `widths` に大きさを変えて測り、結果を残した幅の一覧（走査の順。残した幅がなければ空）を持つ（読み込み直した幅は、今どおり `widths` を持たない）。
  * - `INTERACTION`: Interaction の 1 つの候補の隔離した読み込み（`candidateIndex` は、候補の発見の順の番号で 0 から）。
  */
 export const SAFETY_EVIDENCE_LOAD_KINDS = Object.freeze(['PAGE_AUDIT', 'STRESS_WIDTH', 'INTERACTION'] as const);
@@ -3023,7 +3430,7 @@ export type SafetyEvidenceLoadKind = (typeof SAFETY_EVIDENCE_LOAD_KINDS)[number]
 /** BN-a: safety の Evidence の読み込みの印。 */
 export type SafetyEvidenceLoad =
   | { readonly kind: Extract<SafetyEvidenceLoadKind, 'PAGE_AUDIT'> }
-  | { readonly kind: Extract<SafetyEvidenceLoadKind, 'STRESS_WIDTH'>; readonly width: number }
+  | { readonly kind: Extract<SafetyEvidenceLoadKind, 'STRESS_WIDTH'>; readonly width: number; readonly widths?: readonly number[] }
   | { readonly kind: Extract<SafetyEvidenceLoadKind, 'INTERACTION'>; readonly candidateIndex: number };
 
 /** AS-c: 通した WebSocket の接続の 1 行（Origin・path・数）。 */
@@ -3058,6 +3465,11 @@ export interface PassedAuditSendWebSocketsRecord {
   readonly outsideGuard: number;
   /** AS-c fix round 1: そのうち危険な語に当たる接続の数（飽和。一覧に入れなかった分も数える）。 */
   readonly dangerous: number;
+  /**
+   * FRET fix round 5（設計者の判断 (A)）: 窓を開くボタンの確かめが押した page で、押す期間の後から page を閉じるまで（止めの続きの間）に、押す前から開いていた
+   * 接続が送った frame の数（止めない。押下が原因とは限らない。飽和）。1 以上のときだけ持つ。
+   */
+  readonly framesAfterDialogPress?: number;
 }
 
 /** AS-a: 通した読み取りでない要求の 1 行（method・Origin・path・回数。query・fragment・本文・値は持たない）。 */
@@ -3085,6 +3497,12 @@ export interface PassedAuditSendRequestsRecord {
    * AS-c: 通した要求のうち、許可 Origin と承認したサービスの Origin のほか（ほかの Origin）へのものの数（飽和）。
    */
   readonly otherOrigins: number;
+  /**
+   * FRET fix round 4（設計書 `2026-11-24-beaksight-dialog-focus-return-design.md` の設計変更履歴の 2026-11-26）: そのうち、窓を開くボタンの確かめが押した page の、
+   * 閉じる前の離れる手順の間に通した数。押した画面の閉じる時に通した数で、サイト自身の後始末を含む（押下が pagehide などに登録した送信と見分けない。限界の
+   * 記録）。1 件以上のときだけ持つ。
+   */
+  readonly afterDialogPressLeave?: number;
 }
 
 /**

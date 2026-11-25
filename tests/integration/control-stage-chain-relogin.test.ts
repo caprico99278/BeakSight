@@ -35,6 +35,8 @@ import { writeFakeWorker, type FakeWorker, type FakeWorkerValues } from '../help
 import { awaitWorkersExit, createFakeWorkerJobManager, fakeWorkerValuesOf, withOutputDirectory } from '../helpers/job-test-support.js';
 import { createTestCredentialStore, type TestCredentialStore } from '../helpers/test-credential-store.js';
 import { createCountingFork } from '../helpers/worker-fork.js';
+import { candidateOf } from '../unit/approval-samples.js';
+import { SAMPLE_ORIGIN, sampleAction, sampleField, sampleForm } from '../unit/discovery-candidate-samples.js';
 import { PUBLIC_TARGET_PATH, TEST_ORIGIN, TEST_TARGET_PATH, resolveTestContext, testAuthProfile } from './control-profile-fixtures.js';
 
 const RUN_IDS = Object.freeze(['RUN-20261104000000', 'RUN-20261104000100', 'RUN-20261104000200']);
@@ -95,15 +97,30 @@ let nowMs = START_TIME_MS;
 let waits: number[] = [];
 const forks = createCountingFork();
 
-const fakeWorker = (chain: NonNullable<FakeWorkerValues['chain']>): FakeWorker => writeFakeWorker(
+/** RCA-6: GET の検索フォームが 1 つある発見の段の成果物（検索の確かめの組ができる）。 */
+const SEARCH_DISCOVERY_DOCUMENT: DiscoveryDocument = {
+  ...DISCOVERY_DOCUMENT,
+  pages: [{
+    url: `${SAMPLE_ORIGIN}/admin/items`, state: 'READ', blockedRequests: 0,
+    record: {
+      location: { origin: SAMPLE_ORIGIN, path: '/admin/items' }, incompleteReasons: [],
+      candidates: [candidateOf(sampleForm({
+        page: { origin: SAMPLE_ORIGIN, path: '/admin/items' }, formMethod: 'GET', action: sampleAction('/admin/items'), submitterText: '表示',
+        fields: [sampleField('q', 'search')],
+      }))],
+    },
+  }],
+};
+
+const fakeWorker = (chain: NonNullable<FakeWorkerValues['chain']>, document: DiscoveryDocument = DISCOVERY_DOCUMENT): FakeWorker => writeFakeWorker(
   workDirectory,
   'chain',
   fakeWorkerValuesOf({ runId: RUN_IDS[0] ?? '', otherRunId: 'RUN-20261104009999' }, {
     chain: { reloginRunIds: RELOGIN_RUN_IDS, ...chain },
     discovery: {
       outputDirectory: resolve(workDirectory, OUTPUT_DIRECTORY),
-      documentText: JSON.stringify(DISCOVERY_DOCUMENT),
-      summary: { ...discoverySummaryOf(DISCOVERY_DOCUMENT) },
+      documentText: JSON.stringify(document),
+      summary: { ...discoverySummaryOf(document) },
       runStatus: 'COMPLETE',
     },
     readCheck: { outputDirectory: resolve(workDirectory, OUTPUT_DIRECTORY), results: [] },
@@ -272,6 +289,20 @@ describe('DEF-200: the chained run signs in again after the sign-in is lost', ()
     const reads = jobsInOrder(jobManager).filter(({ jobKind }) => jobKind === 'READ_CHECK');
     expect(reads.map(({ runId, startNew }) => [runId, startNew])).toEqual([[RUN_IDS[2], true], [RELOGIN_RUN_IDS[0], true], [RELOGIN_RUN_IDS[1], true]]);
   }, TEST_TIMEOUT_MS);
+
+  // RCA-6（検索の確かめの設計書 2.3）: READ の確かめの段のログインし直しでは、前のジョブで確かめた検索の確かめの組を除いた残りだけを渡す（順は保つ）。
+  it('passes only the search checks not yet checked to the READ check stage started again after the re-login', async () => {
+    const worker = fakeWorker({ runIds: RUN_IDS, sessionLosses: [0, 0, 1] }, SEARCH_DISCOVERY_DOCUMENT);
+    const jobManager = managerWith(worker);
+    const chain = await waitForChainEnd(jobManager, await startChain(jobManager));
+
+    expect(chain).toMatchObject({ state: 'FINISHED' });
+    const keysOf = (message: Record<string, unknown> | undefined): readonly string[] =>
+      ((message?.['searchChecks'] ?? []) as readonly { readonly key: string }[]).map(({ key }) => key);
+    const stage = worker.received().find((message) => message['type'] === 'NEXT_STAGE' && message['jobKind'] === 'READ_CHECK');
+    expect(keysOf(stage).length).toBeGreaterThan(1);
+    expect(relogins(worker).map((message) => [message['jobKind'], keysOf(message)])).toEqual([['READ_CHECK', keysOf(stage).slice(1)]]);
+  });
 
   // DEF-200（ユーザーの指示「回数の上限は点検と操作さがしで共有せず、操作さがしの段階で上限2回にカウントをリセットすること」）: 監査で 2 回ログインし直した後でも、
   // 操作さがしで、また 2 回までログインし直せる（同じ Run の続き）。操作さがしの 3 回目で止まる。

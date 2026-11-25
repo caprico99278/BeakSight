@@ -85,6 +85,10 @@
       "items": { "$ref": "#/$defs/digest" }
     },
     "crawledPages": { "type": "integer", "minimum": 0 },
+    "pagesFromAuditStage": {
+      "description": "Optional (DSEED2): only for a discovery chained after the audit stage. How many of the found pages were taken over from the audit stage at the start (the continuation carries it over; the version stays 2.0).",
+      "$ref": "#/$defs/count"
+    },
     "sharedLayoutDigests": {
       "description": "Optional (DEF-208-4; discovery coverage design 3.7 A): the identity digests of the shared layout buttons pressed so far (digests only; no values and no paths). The continuation does not press them again. Absent when there are none.",
       "type": "array",

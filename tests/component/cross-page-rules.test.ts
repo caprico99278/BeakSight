@@ -478,6 +478,15 @@ describe('evaluateCrossPageRules: internal links', () => {
     // リンク元のページとリンク先のURLの組ごとに数える: (/, /not-crawled)、(/, /skipped)、(/ok, /not-crawled)。
     expect(result.unverifiedInternalLinkCount).toBe(3);
   });
+
+  // DEF-296: 巡回の候補から外した行き先（読む範囲の外など）へのリンクは、確かめていないリンクに数えない。
+  it('does not count the links to a target outside the read scope', () => {
+    const result = evaluate([
+      page({ sequence: 1, path: '/', links: [{ href: '/outside' }, { href: '/not-crawled' }] }),
+    ], { isOutsideReadScope: (url) => url.endsWith('/outside') });
+
+    expect(result.unverifiedInternalLinkCount).toBe(1);
+  });
 });
 
 describe('evaluateCrossPageRules: titles', () => {
@@ -515,6 +524,37 @@ describe('evaluateCrossPageRules: titles', () => {
     ]);
 
     expect(findingsOf(result, 'DUPLICATE_PAGE_TITLE')).toEqual([]);
+  });
+
+  // AUD-5（S-07）: 作りの鍵が同じ画面どうしの題名の重なりは、区分の鍵と同じまとめの鍵を付ける。作りの鍵の違う組は今どおり。
+  it('marks the pages of the same template with the same title as the same screen of other data, and keeps the pages of other templates', () => {
+    const template = (key: string) => `sha256:${key.repeat(64)}`;
+    const result = evaluate([
+      ...[1, 2, 3].map((sequence) => ({ ...page({ sequence, path: `/edit-${'abc'.charAt(sequence - 1)}`, title: '編集' }), templateKey: template('a') })),
+      { ...page({ sequence: 4, path: '/guide', title: '案内' }), templateKey: template('b') },
+      { ...page({ sequence: 5, path: '/about', title: '案内' }), templateKey: template('c') },
+    ]);
+    const keysOf = (pageId: number) => findingsOf(result, 'DUPLICATE_PAGE_TITLE').find((finding) => finding.pageId === createPageId(pageId))?.groupingKeys;
+    const sameTemplate = [1, 2, 3].map(keysOf);
+    expect(sameTemplate[0]).toContainEqual({ name: 'findingClass', value: 'SAME_TEMPLATE' });
+    expect(new Set(sameTemplate.map((keys) => JSON.stringify(keys))).size).toBe(1);
+    expect(keysOf(4)).toEqual(keysOf(5));
+    expect(keysOf(4)).not.toEqual(sameTemplate[0]);
+  });
+
+  // DEF-305: データを除いた path が同じ画面どうし（query だけ・記録の番号だけ違う）の題名の重なりは指摘しない。違う画面どうしは、題名ごとに 1 つの群にする。
+  it('does not report the same title of one screen with other data, and makes one group of the same title of different screens', () => {
+    const result = evaluate([
+      page({ sequence: 1, path: '/x/1', title: '詳細' }),
+      page({ sequence: 2, path: '/x/2?a=1', title: '詳細' }),
+      ...[3, 4, 5].map((sequence) => page({ sequence, path: `/${'abc'.charAt(sequence - 3)}`, title: '案内' })),
+    ]);
+    const findings = findingsOf(result, 'DUPLICATE_PAGE_TITLE');
+    expect(findings.map((finding) => finding.pageId).sort()).toEqual([createPageId(3), createPageId(4), createPageId(5)]);
+    const keys = new Set(findings.map((finding) => JSON.stringify(finding.groupingKeys)));
+    expect(keys.size).toBe(1);
+    expect(findings[0]?.groupingKeys).not.toEqual([]);
+    expect([...keys][0]).not.toContain('案内');
   });
 });
 

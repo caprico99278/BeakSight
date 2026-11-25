@@ -37,10 +37,12 @@ import { getProfile } from '../../../../src/control/store/profile-store.js';
 import { ACTIVE_PROFILE_STATUS } from '../../../../src/control/store/profile-records.js';
 import {
   writeScreenNotCheckableKindOf,
+  writeScreenSameSendRowsOf,
   writeScreenWordOf,
   type WriteScreenKindResultView,
   type WriteScreenLastResultView,
   type WriteScreenNotCheckableKind,
+  type WriteScreenSendShape,
   type WriteScreenUpdateState,
 } from '../display/write-screen-values';
 import { localUiAuditJobs } from './audit-jobs';
@@ -94,7 +96,14 @@ export interface WriteScreenRowView {
    */
   readonly updateOpenerUnnamedOnly: boolean;
   readonly lastResult: WriteScreenLastResultView | null;
+  /** WDEDUP: この行にまとめた、同じ画面の同じ送信の形の行の数（ひとりの行は 1。見せ方だけ。チェックは代表の行の鍵 `rowKey` に行う）。 */
+  readonly sameSendCount: number;
+  /** WDEDUP: まとめた行のうち、チェック済み（`CHECKED`）の行の数（見せ方だけ）。 */
+  readonly sameSendCheckedCount: number;
 }
+
+/** 一覧の行の、まとめる前の値（まとめた数は、一覧の値を返すときに添える）。 */
+type WriteScreenEntryRow = Omit<WriteScreenRowView, 'sameSendCount' | 'sameSendCheckedCount'>;
 
 /** 一覧の値（出さないサイトは null）。 */
 export interface WriteScreensView {
@@ -180,10 +189,12 @@ const approvalValidOf = (scenarioId: string, external: Awaited<ReturnType<typeof
 
 /** 一覧の行と、その行の登録と更新の手順（OP-T fix round 1・2: 行に結び付く手順を、まとめて実行の始めが知るため。画面には返さない）。 */
 interface WriteScreenEntry {
-  readonly row: WriteScreenRowView;
+  readonly row: WriteScreenEntryRow;
   readonly createScenarioId: string | null;
   /** 行が対象にする更新の手順（`rowUpdateOf`。なければ null）。 */
   readonly updateScenarioId: string | null;
+  /** WDEDUP: 行の画面と送信の形（一覧の見せ方のまとめだけに使う。画面には返さない）。 */
+  readonly sendShape: Omit<WriteScreenSendShape, 'checked'>;
 }
 
 /** 一覧の行と手順、行の判定に使った承認の事実（読めなければ null。そのときは、どの承認済みの行も「もう一度チェックが要る」になる）。 */
@@ -204,7 +215,7 @@ const writeScreenListingOf = async (profileId: string): Promise<WriteScreenListi
   }
   const scenarios = listScenarios(localUiStore(), profileId);
   const external = await approvalExternalFactsOf(stored);
-  const rowOf = async (screen: (typeof screens)[number]): Promise<WriteScreenRowView> => {
+  const rowOf = async (screen: (typeof screens)[number]): Promise<WriteScreenEntryRow> => {
     const create = screen.scenarioId === null ? null : scenarios.find(({ scenarioId }) => scenarioId === screen.scenarioId) ?? null;
     const update = create === null ? null : rowUpdateOf(scenarios, create.scenarioId, screen.existingUpdateScenarioIds);
     const base = {
@@ -242,14 +253,23 @@ const writeScreenListingOf = async (profileId: string): Promise<WriteScreenListi
     row: await rowOf(screen),
     createScenarioId: screen.scenarioId,
     updateScenarioId: screen.scenarioId === null ? null : rowUpdateOf(scenarios, screen.scenarioId, screen.existingUpdateScenarioIds)?.scenarioId ?? null,
+    sendShape: { screen: screen.pagePath, sendShape: screen.sendShapeDigest },
   })));
   return { entries, external };
 };
 
-/** 一覧の値を求める（書き込みを試せないサイト・操作さがしがないサイトは null）。 */
+/**
+ * 一覧の値を求める（書き込みを試せないサイト・操作さがしがないサイトは null）。WDEDUP: 同じ画面の同じ送信の形の行は、一覧の順で最初の行にまとめて数を添える
+ * （見せ方だけ。まとめる前の行と手順 `writeScreenListingOf` は、まとめて実行の始めの守りがそのまま使う）。
+ */
 const writeScreensOf = async (profileId: string): Promise<WriteScreensView | null> => {
   const listing = await writeScreenListingOf(profileId);
-  return listing === null ? null : { profileId, rows: listing.entries.map(({ row }) => row) };
+  return listing === null ? null : {
+    profileId,
+    // 代表は、チェック済みの行を優先する（隠れた側にチェック済みの行が残らないように。承認と書き込みの振る舞いは変えない）。
+    rows: writeScreenSameSendRowsOf(listing.entries, ({ row, sendShape }) => ({ ...sendShape, checked: row.state === 'CHECKED' }))
+      .map(({ item, count, checkedCount }) => ({ ...item.row, sameSendCount: count, sameSendCheckedCount: checkedCount })),
+  };
 };
 
 /** 書き込みのモードへ切り替える（まだなら。隔離の参照は内部の固定の値。D6）。切り替えられなければ偽。 */

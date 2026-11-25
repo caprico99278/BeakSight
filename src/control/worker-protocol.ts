@@ -63,7 +63,6 @@ import { errorCodeOf } from '../core/errors.js';
 import { deepFreeze } from '../core/immutable.js';
 import { jsonPointerOf } from '../core/json-pointer.js';
 import { apiKeyFieldValueTypeOf, isJsonValueConvertible } from '../core/json-value.js';
-import { isUsableRecordId } from '../core/record-id-path-pattern.js';
 import { MINUTE_MS } from '../core/time-units.js';
 import { isSecretUrlQueryParameterName } from '../core/secret-query-names.js';
 import { hasValueLikePathSegment } from '../core/url-path-redaction.js';
@@ -72,7 +71,8 @@ import { hasControlOrLineSeparator, hasLoneSurrogate, replaceControlOrLineSepara
 import { isCompactUtcTimestamp } from '../core/utc-timestamp.js';
 import { canonicalHttpOriginOf, isOriginInAllowedOrigins } from '../crawl/normalize-url.js';
 import { isMethodOverrideFieldName, type CandidateField, type CandidateFieldType, type CandidateLocation } from '../discovery/candidate-contracts.js';
-import { isApiRowKeyNameUsable } from '../discovery/classify.js';
+import { isApiRowKeyNameUsable, readParametersHaveDestructiveWord } from '../discovery/classify.js';
+import { SEARCH_CHECK_TEXT_VALUES, type SearchCheckCombo } from '../discovery/search-check-plan.js';
 import { PATH_TEMPLATE_ID_SEGMENT, concretePathOfTemplate } from '../discovery/fingerprint.js';
 import {
   readListPagePathOf,
@@ -154,8 +154,10 @@ import { isAcceptedTargetConfigPath } from './profile-policy.js';
  * OP-H（撮影 UI-W4 の 3）で 6 に上げた（`START` の `chain` に、チェックした画面の数 `writeScreenCount` を足したため）。
  * OP-L（L2）で 7 に上げた（`CREDENTIAL_SAVED` に、書けなかった理由のコード `failureCode` を足したため）。
  * WSO で 9 に上げた（段の並びに「チェックした画面だけ」の点検の段 1 つを足し、`START` の `chain` に読む画面 `checkedScreenPages` を足したため）。
+ * RCA-5・RCA-6（検索の確かめの設計書 2.5）で 10 に上げた（READ の確かめの段の `START`・`NEXT_STAGE`・`RELOGIN_STAGE` に検索の確かめの組 `searchChecks` を足し、
+ * 定義の一覧を空にできるようにし、DEF-235 の番号 `recordIds` を外し、件数の要約に組の数と誤りの数を足したため）。
  */
-export const WORKER_PROTOCOL_VERSION = 'beaksight-worker-message/9';
+export const WORKER_PROTOCOL_VERSION = 'beaksight-worker-message/10';
 
 /**
  * OP-1: ログインの段の後に、ワーカーが親の登録の返事（`CREDENTIAL_SAVE_ALLOWED`・`LOGIN_REGISTERED`・`LOGIN_REGISTRATION_SKIPPED`）を待つ上限（ms。1 分）。
@@ -733,8 +735,13 @@ export interface WorkerStartMessage extends WorkerMessageBase<'START'> {
    * 省略は公開の監査（T25d）。
    */
   readonly authentication?: WorkerStartAuthentication;
-  /** READ の確かめの定義の一覧（`READ_CHECK` のときだけ、必ず持つ。1 件以上。L4: 件数の上限なし。T27e）。 */
+  /**
+   * READ の確かめの定義の一覧（`READ_CHECK` のときだけ、必ず持つ。L4: 件数の上限なし。T27e）。RCA-6: 空でもよい（検索の確かめの組 `searchChecks` と合わせて
+   * 1 件以上）。
+   */
   readonly readChecks?: readonly WorkerStartReadCheck[];
+  /** RCA-6: 検索の確かめの組（`READ_CHECK` のときだけ持てる。省略は 0 件）。 */
+  readonly searchChecks?: readonly WorkerStartSearchCheck[];
   /**
    * 書き込みの指定（`WRITE_CREATE` と、T31f から `WRITE_UPDATE` のときだけ、必ず持つ。T30e）。T40a: 送り方 API の登録の書き込みの指定
    * （`WorkerStartApiWrite`。`WRITE_CREATE` だけ）も受ける。
@@ -1018,17 +1025,20 @@ export interface WorkerStartWriteListRow {
  * - `targetPage`: 対象の候補の画面（Origin と path）。親が、候補を最後に見た発見の成果物から決める。決められなければ `null`（ワーカーは読まずに
  *   `READ_CANDIDATE_DRIFTED` にする）。
  * - `definition`: 定義の中身（対象の識別の digest、送る値、期待）。
- * - `recordIds`（DEF-235。任意）: 画面の path の型（`{id}`）の定義を READ の確かめの段で読むときに、親が番号の元（`read-check-record-ids.ts` の
- *   `readCheckRecordIdsOf`）で見つけた番号（近い順に全部。重ねない。件数の上限は持たない）。型の定義だけが持てる。書き込みの照合の READ は持たない。ないときは、
- *   ワーカーが一覧の画面を 1 回読んで番号を探す。
+ * RCA-6: DEF-235 の番号（`recordIds`）は外した（段で型の定義を読まない）。
  */
 export interface WorkerStartReadCheck {
   readonly readCheckId: string;
   readonly readCheckRevision: number;
   readonly targetPage: CandidateLocation | null;
   readonly definition: ReadCheckDefinition;
-  readonly recordIds?: readonly string[];
 }
+
+/**
+ * RCA-6（検索の確かめの設計書 2.2）: 検索の確かめの組 1 つ（`START`・`NEXT_STAGE`・`RELOGIN_STAGE` の `searchChecks`）。親が、最新の操作さがしの記録から
+ * 始める前に作る（`search-check-plan.ts` の `searchCheckPlanOf`）。組の数が進み具合の分母。
+ */
+export type WorkerStartSearchCheck = SearchCheckCombo;
 
 /**
  * 認証つきの監査の指定（`START` の `authentication`。T25d）。秘密を含まない。
@@ -1187,6 +1197,8 @@ export interface WorkerNextStageMessage extends WorkerMessageBase<'NEXT_STAGE'> 
   readonly jobId: string;
   readonly jobKind: WorkerNextStageJobKind;
   readonly readChecks?: readonly WorkerStartReadCheck[];
+  /** RCA-6: 検索の確かめの組（READ の確かめの段だけ持てる。省略は 0 件）。 */
+  readonly searchChecks?: readonly WorkerStartSearchCheck[];
   /**
    * OP-2（設計書 4.1.2 の案 C）: 書き込みの段の書き込みの指定（`START` の `write` と同じ形。書き込みの段だけ必ず持つ）。親が、段の前ごとに許可を発行し、
    * 消費し、値を作り、送る前の記録を書いてから載せる。ワーカーは、`START` の確かめ（承認したサービスの Origin を含む）と同じ確かめをしてから使う。
@@ -1221,6 +1233,13 @@ export interface WorkerReloginStageMessage extends WorkerMessageBase<'RELOGIN_ST
   readonly jobKind: WorkerReloginStageJobKind;
   readonly count: number;
   readonly readChecks?: readonly WorkerStartReadCheck[];
+  /** RCA-6: 検索の確かめの組（READ の確かめの段だけ持てる。省略は 0 件。親が、前のジョブで確かめた組を除いた残り）。 */
+  readonly searchChecks?: readonly WorkerStartSearchCheck[];
+  /**
+   * REV-RCA の I-4: 前のジョブでログインの画面へ戻された組の鍵（READ の確かめの段だけ。`searchChecks` のどれかの鍵。人の定義で戻されたときは省略）。ワーカーは、
+   * その組を最初に確かめ、その組でまた戻されたときだけ 2 回目の戻し（誤り）にする。
+   */
+  readonly bouncedSearchCheckKey?: string;
 }
 
 export type ParentToWorkerMessage =
@@ -1396,6 +1415,9 @@ export interface WorkerReadCheckSummary {
   readonly checks: number;
   /** 確かめた定義の数。 */
   readonly executed: number;
+  /** RCA-5: 検索の確かめの組の数と、そのうち誤りの数。 */
+  readonly searchChecks: number;
+  readonly searchCheckErrors: number;
   /** 監査の段の数（T37a。成果物 `read-evidence.json` の `authentication` と同じ値。監査の段の口のあるジョブだけ。数だけ）。 */
   readonly authentication?: WorkerAuditStageSummary;
   /** DEF-144: 違反で止まったときの違反の中身（成果物 `read-evidence.json` の `safetyViolation` と同じ値。値を持たない）。 */
@@ -1696,11 +1718,10 @@ const parentRuleErrors = (message: ParentToWorkerMessage): readonly string[] => 
     if (!WORKER_JOB_ID_PATTERN.test(message.jobId)) {
       errors.push(`/jobId must match ${WORKER_JOB_ID_PATTERN.source}`);
     }
-    if ((message.jobKind === WORKER_READ_CHECK_JOB_KIND) !== (message.readChecks !== undefined)) {
-      errors.push(`/readChecks is required for ${WORKER_READ_CHECK_JOB_KIND} and allowed only for it`);
-    }
-    if (message.readChecks !== undefined) {
-      errors.push(...readCheckRuleErrors(message.readChecks));
+    errors.push(...readCheckStageRuleErrors(message.jobKind, message));
+    // REV-RCA の I-4: 戻された組の鍵は、渡す組のどれかの鍵。
+    if (message.bouncedSearchCheckKey !== undefined && !(message.searchChecks ?? []).some(({ key }) => key === message.bouncedSearchCheckKey)) {
+      errors.push('/bouncedSearchCheckKey must be the key of one of /searchChecks');
     }
     return errors;
   }
@@ -1763,20 +1784,11 @@ const parentRuleErrors = (message: ParentToWorkerMessage): readonly string[] => 
   if (message.jobKind === WORKER_ENTRY_CHECK_JOB_KIND && message.authentication !== undefined) {
     errors.push(`/authentication is not allowed for ${WORKER_ENTRY_CHECK_JOB_KIND}`);
   }
-  // T27e: READ の確かめのジョブは、認証つきで、定義の一覧を必ず持つ。ほかの種類は、定義の一覧を持たない。
-  if (message.jobKind === WORKER_READ_CHECK_JOB_KIND) {
-    if (message.authentication === undefined) {
-      errors.push(`/authentication is required for ${WORKER_READ_CHECK_JOB_KIND}`);
-    }
-    if (message.readChecks === undefined) {
-      errors.push(`/readChecks is required for ${WORKER_READ_CHECK_JOB_KIND}`);
-    }
-  } else if (message.readChecks !== undefined) {
-    errors.push(`/readChecks is allowed only for ${WORKER_READ_CHECK_JOB_KIND}`);
+  // T27e: READ の確かめのジョブは、認証つきで、定義の一覧を必ず持つ。ほかの種類は、定義の一覧を持たない。RCA-6: 検索の確かめの組も同じ。
+  if (message.jobKind === WORKER_READ_CHECK_JOB_KIND && message.authentication === undefined) {
+    errors.push(`/authentication is required for ${WORKER_READ_CHECK_JOB_KIND}`);
   }
-  if (message.readChecks !== undefined) {
-    errors.push(...readCheckRuleErrors(message.readChecks));
-  }
+  errors.push(...readCheckStageRuleErrors(message.jobKind, message));
   // T30e: 書き込みのジョブは、認証つき（ログインを使う方式）で、書き込みの指定を必ず持つ。ほかの種類は、書き込みの指定を持たない。
   // T31f: 更新の書き込みのジョブ（`WRITE_UPDATE`）も同じ。UPDATE の指定（`write.update`）は `WRITE_UPDATE` で必ず持ち、ほかの種類では持てない。
   if (isWorkerWriteJobKind(message.jobKind)) {
@@ -1885,16 +1897,7 @@ const nextStageRuleErrors = (message: WorkerNextStageMessage): readonly string[]
   } else if (message.write !== undefined) {
     errors.push(`/write is allowed only for ${WORKER_WRITE_JOB_KINDS.join(' and ')}`);
   }
-  if (message.jobKind === WORKER_READ_CHECK_JOB_KIND) {
-    if (message.readChecks === undefined) {
-      errors.push(`/readChecks is required for ${WORKER_READ_CHECK_JOB_KIND}`);
-    }
-  } else if (message.readChecks !== undefined) {
-    errors.push(`/readChecks is allowed only for ${WORKER_READ_CHECK_JOB_KIND}`);
-  }
-  if (message.readChecks !== undefined) {
-    errors.push(...readCheckRuleErrors(message.readChecks));
-  }
+  errors.push(...readCheckStageRuleErrors(message.jobKind, message));
   return errors;
 };
 
@@ -1961,7 +1964,7 @@ const writeRuleErrors = (write: WorkerStartWrite): readonly string[] => {
       errors.push(`/write/values (value ${index}) must be a value of a sendable field of the candidate whose name does not look like a secret`);
     }
   });
-  errors.push(...readCheckItemRuleErrors(WRITE_READ_VERIFICATION_POINTER_SEGMENTS, write.readVerification, false, false));
+  errors.push(...readCheckItemRuleErrors(WRITE_READ_VERIFICATION_POINTER_SEGMENTS, write.readVerification, false));
   // T37d（設計者の判断 5）: 書き込みの照合の READ に、画面の path の定義は使わない（安全側。親も開始の前に拒む）。
   if (write.readVerification.definition.targetPagePath !== undefined) {
     errors.push('/write/readVerification/definition must target a READ candidate (a page path definition is not used for the verification of a write)');
@@ -2056,7 +2059,7 @@ const apiWriteRuleErrors = (write: WorkerStartApiWrite, origins: { readonly appr
       || !isFieldOfElement(keyField)))) {
     errors.push('/write/api/keyFields must have the path key[i] of its element and a field role at that position for a key of a list position');
   }
-  errors.push(...readCheckItemRuleErrors(WRITE_READ_VERIFICATION_POINTER_SEGMENTS, write.readVerification, false, false));
+  errors.push(...readCheckItemRuleErrors(WRITE_READ_VERIFICATION_POINTER_SEGMENTS, write.readVerification, false));
   const { targetPage, definition } = write.readVerification;
   // OP-R（設計書 `2026-10-27-beaksight-one-pass-flow-design.md` 4.1.9 の R1。T37d の判断 5 を改めた）: API の登録に限って、書き込みの画面（登録の画面）の 1 つ上の
   // 一覧の画面の path（唯一の判定 `readListPagePathOf`）も受ける（送る値なし。下の生成した値と比べる期待の確かめは同じ）。
@@ -2233,10 +2236,8 @@ const WRITE_READ_VERIFICATION_POINTER_SEGMENTS: readonly string[] = Object.freez
  */
 const readCheckItemRuleErrors = (
   at: readonly string[],
-  { readCheckId, targetPage, definition, recordIds }: WorkerStartReadCheck,
+  { readCheckId, targetPage, definition }: WorkerStartReadCheck,
   duplicate: boolean,
-  /** DEF-235: 番号（`recordIds`）を持ってよい位置か（READ の確かめの定義の一覧だけ。書き込みの照合の READ は持てない）。 */
-  recordIdsAllowed = true,
 ): readonly string[] => {
   const errors: string[] = [];
   const pointerOf = (...segments: readonly string[]): string => jsonPointerOf([...at, ...segments]);
@@ -2261,14 +2262,6 @@ const readCheckItemRuleErrors = (
       errors.push(`${pointerOf('definition', 'parameters')} (parameter ${parameterIndex}) looks like a secret and is never sent`);
     }
   });
-  // DEF-235: 番号は、READ の確かめの段の画面の path の型の定義だけが持つ（使える形はスキーマ、重ならないことはここ）。誤りの文に番号を入れない。
-  if (recordIds !== undefined) {
-    if (!recordIdsAllowed || definition.targetPagePath === undefined || !isReadCheckPageTemplatePath(definition.targetPagePath)) {
-      errors.push(`${pointerOf('recordIds')} is allowed only for a page path template`);
-    } else if (new Set(recordIds).size !== recordIds.length || !recordIds.every((recordId) => isUsableRecordId(recordId))) {
-      errors.push(`${pointerOf('recordIds')} must be unique`);
-    }
-  }
   return errors;
 };
 
@@ -2280,6 +2273,58 @@ const readCheckRuleErrors = (readChecks: readonly WorkerStartReadCheck[]): reado
     seen.add(readCheck.readCheckId);
     return readCheckItemRuleErrors([...READ_CHECKS_POINTER_SEGMENTS, String(index)], readCheck, duplicate);
   });
+};
+
+/**
+ * RCA-6: 検索の確かめの組の、スキーマで書けない規則の誤り（誤りの文に値と名前を入れない。位置だけ）: 組の鍵が重ならない、画面が http(s) の Origin の正規の直列化と
+ * `/` で始まる path、フォームの組の送る値に秘密に見える名前・危険な語がない（親が除いた後の確かめ直し。fail-closed）、スクリプトの組のきっかけは押下か入力。
+ */
+const searchCheckRuleErrors = (searchChecks: readonly WorkerStartSearchCheck[]): readonly string[] => {
+  const seen = new Set<string>();
+  return searchChecks.flatMap((combo, index) => {
+    const pointerOf = (...segments: readonly string[]): string => jsonPointerOf(['searchChecks', String(index), ...segments]);
+    const errors: string[] = [];
+    if (seen.has(combo.key)) errors.push(`${pointerOf('key')} must be unique`);
+    seen.add(combo.key);
+    const { origin, path } = combo.page;
+    if (canonicalHttpOriginOf(origin) !== origin || !path.startsWith('/')) {
+      errors.push(`${pointerOf('page')} must be the canonical origin of an http(s) page and an absolute path`);
+    }
+    if (combo.kind === 'FORM') {
+      if (Object.keys(combo.parameters).some((name) => isSecretUrlQueryParameterName(name)) || readParametersHaveDestructiveWord(combo.parameters)) {
+        errors.push(`${pointerOf('parameters')} must not send a secret-like name or a dangerous word`);
+      }
+    } else if (combo.trigger.kind !== 'PRESS' && combo.trigger.kind !== 'TYPED') {
+      errors.push(`${pointerOf('trigger')} must be a press or an input`);
+    } else if (!(SEARCH_CHECK_TEXT_VALUES as readonly string[]).includes(combo.text)) {
+      errors.push(`${pointerOf('text')} must be one of the search check text values`);
+    }
+    return errors;
+  });
+};
+
+/**
+ * RCA-6: READ の確かめの段の定義の一覧と検索の確かめの組の規則（`START`・`NEXT_STAGE`・`RELOGIN_STAGE` で共通）: READ の確かめは定義の一覧を必ず持ち（空でもよい）、
+ * 組（省略は 0 件）と合わせて 1 件以上。ほかの種類はどちらも持たない。
+ */
+const readCheckStageRuleErrors = (
+  jobKind: string,
+  message: { readonly readChecks?: readonly WorkerStartReadCheck[] | undefined; readonly searchChecks?: readonly WorkerStartSearchCheck[] | undefined },
+): readonly string[] => {
+  const errors: string[] = [];
+  if (jobKind === WORKER_READ_CHECK_JOB_KIND) {
+    if (message.readChecks === undefined) {
+      errors.push(`/readChecks is required for ${WORKER_READ_CHECK_JOB_KIND}`);
+    } else if (message.readChecks.length + (message.searchChecks?.length ?? 0) === 0) {
+      errors.push(`/readChecks and /searchChecks must have at least one item for ${WORKER_READ_CHECK_JOB_KIND}`);
+    }
+  } else {
+    if (message.readChecks !== undefined) errors.push(`/readChecks is allowed only for ${WORKER_READ_CHECK_JOB_KIND}`);
+    if (message.searchChecks !== undefined) errors.push(`/searchChecks is allowed only for ${WORKER_READ_CHECK_JOB_KIND}`);
+  }
+  if (message.readChecks !== undefined) errors.push(...readCheckRuleErrors(message.readChecks));
+  if (message.searchChecks !== undefined) errors.push(...searchCheckRuleErrors(message.searchChecks));
+  return errors;
 };
 
 /** 資格情報のフォルダを決める根として受けるか（T26d-2。絶対パスで、パスの最大長以下で、制御文字・対になっていないサロゲートを含まない）。 */
@@ -2619,6 +2664,10 @@ const workerRuleErrors = (message: WorkerToParentMessage): readonly string[] => 
         }
         if (message.readCheck.executed > message.readCheck.checks) {
           errors.push('/readCheck/executed must not be more than /readCheck/checks');
+        }
+        // RCA-5: 誤りの組の数は、組の数を超えない。
+        if (message.readCheck.searchCheckErrors > message.readCheck.searchChecks) {
+          errors.push('/readCheck/searchCheckErrors must not be more than /readCheck/searchChecks');
         }
       }
       // T43c: 入口の確かめの件数の要約も、Run を実行した結果だけ。ほかの要約と同時には持たない。案のセレクタの数は欄の数まで。

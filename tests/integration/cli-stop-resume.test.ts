@@ -109,9 +109,12 @@ const readState = async (runDirectory: string): Promise<RunCheckpoint> =>
 const readRun = async (runDirectory: string): Promise<RunSummary> =>
   await readJson(artifactFilePath(runDirectory, RUN_ARTIFACT_FILE_NAMES.run)) as RunSummary;
 
+/** このファイルの設定の対象の ID（監査中の印は出力先 + 対象の ID。PAR-a）。 */
+const CLI_STOP_RESUME_TARGET_ID = 'cli-stop-resume';
+
 /** Run のディレクトリの出力先の監査中の印が、今は誰にも持たれていないか（SPEC-2。取れたら、すぐ離す）。 */
 async function isExclusionFree(runDirectory: string): Promise<boolean> {
-  const exclusion = await acquireRunExclusion(dirname(runDirectory));
+  const exclusion = await acquireRunExclusion(dirname(runDirectory), CLI_STOP_RESUME_TARGET_ID);
   if (exclusion.kind === 'ACQUIRED') {
     await exclusion.release();
   }
@@ -128,7 +131,7 @@ describe('R5a: a Run stopped by the stop signal is resumed by the same command (
 
   beforeAll(async () => {
     outputDirectory = join(workDirectory, 'stop-and-resume');
-    const config = fastRunConfig(server.origin, START_PATH, { target: { id: 'cli-stop-resume' }, output: { directory: outputDirectory } });
+    const config = fastRunConfig(server.origin, START_PATH, { target: { id: CLI_STOP_RESUME_TARGET_ID }, output: { directory: outputDirectory } });
     stopped = await runCommand(config, realDependencies(PAGES_BEFORE_STOP));
     stoppedRunDirectory = await onlyRunDirectoryIn(outputDirectory);
     stoppedState = await readState(stoppedRunDirectory);

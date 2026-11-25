@@ -662,8 +662,8 @@ const EXCLUSIONS: Readonly<Record<ExclusionScope, ReadonlyMap<string, string>>> 
       'Interaction の候補の Evidence（hrefKind の判定の入力）として読む。クロールのリンクの抽出ではない',
     ],
     [
-      'src/interaction/submission-probe.ts: a[href',
-      'REV-SD の M-4: 共通の枠の部分の構造の鍵に、枠の中のリンクの path の型の集合を入れるために読む。クロールのリンクの抽出ではない',
+      'src/interaction/layout-frame-read.ts: a[href',
+      'REV-SD の M-4: 共通の枠の部分の構造の鍵に、枠の中のリンクの path の型の集合を入れるために読む（FRET で submission-probe.ts から共通の読み取りへ移した）。クロールのリンクの抽出ではない',
     ],
     [
       'src/browser/in-page-readers.ts: a[href',
@@ -673,6 +673,14 @@ const EXCLUSIONS: Readonly<Record<ExclusionScope, ReadonlyMap<string, string>>> 
       'src/evidence/layout-collector.ts: a[href',
       'レイアウトの要素の種類（link）の分類と、大きさ0の操作できる要素の判定のセレクタ。href の値を読まない',
     ],
+    [
+      'src/core/key-actions.ts: a[href',
+      'BS-2: 主要な行動の候補を選ぶ前の、押せる要素のセレクタ（layout の読み取りが使う）。クロールのリンクの抽出ではない',
+    ],
+    [
+      'src/evidence/layout-collector.ts: HTMLAnchorElement',
+      'BS-2: 押せる要素の行き先の scheme とホストだけを、主要な行動の候補の種類の判定の入力として読む（行き先の値は記録しない）。クロールのリンクの抽出ではない',
+    ],
   ]),
   'ARCH03-discovery': new Map([
     // T27d（Task 27 の設計書 4.2、T27d の指示書の「リンクの抽出（`discoverLinks`）を使って」）: 発見のジョブは、監査の Page Auditor を通らずに
@@ -681,12 +689,6 @@ const EXCLUSIONS: Readonly<Record<ExclusionScope, ReadonlyMap<string, string>>> 
     [
       'src/worker/discovery-run.ts',
       '発見のジョブの巡回（Task 27 の設計書 3 章、4.2）が、リンクの抽出の唯一の入口 `discoverLinks` を、発見と同じページで 1 回だけ呼ぶ',
-    ],
-    // DEF-235（設計書 `2026-11-09-beaksight-read-check-record-id-fill-design.md` 3.2）: READ の確かめの段は、番号の入る画面の型の番号を探すため、一覧の画面を
-    // 1 回だけ読み、凍結の後にリンクの抽出の唯一の入口 `discoverLinks` を呼ぶ（巡回はしない。Link の Evidence は作らない）。
-    [
-      'src/worker/read-check-run.ts',
-      'READ の確かめの段（DEF-235 の設計書 3.2）が、番号を探す一覧の画面で、リンクの抽出の唯一の入口 `discoverLinks` を 1 回だけ呼ぶ',
     ],
   ]),
   ARCH04: new Map([
@@ -874,6 +876,12 @@ const EXCLUSIONS: Readonly<Record<ExclusionScope, ReadonlyMap<string, string>>> 
     [
       'src/control/job/write-report-check.ts: validateArtifact(',
       '書き込みのジョブの締めに、ワーカーの書いた action-evidence.json と approval-summary.json を、成果物のスキーマで確かめる（Task 32 の設計書 4.1）',
+    ],
+    // DBG-1（設計書 `2026-11-20-beaksight-discovery-skip-and-debug-timing-design.md` 2.2）: 測りの記録の共通部品が、入のときだけ Run のフォルダの
+    // `debug-timing.jsonl` に、ためた行をまとめて足す（成果物ではない。バンドルと報告には入れない。既定は切で書かない）。
+    [
+      'src/core/debug-timing.ts: appendFile(',
+      '測りの記録（入のときだけ。成果物・バンドル・報告ではない開発者向けの記録）を、Run のフォルダの 1 つのファイルにまとめて足す（DBG-1）',
     ],
     [
       'src/control/credentials/credential-store.ts: writeFile(',

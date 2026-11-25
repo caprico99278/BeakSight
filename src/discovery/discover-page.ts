@@ -52,7 +52,7 @@ import {
   InFlightRequestCounter, waitForDiscoverySettled, waitForDiscoverySettledWatched, type DiscoverySettlePolicy, DISCOVERY_SETTLE_POLICY,
 } from './settle.js';
 import { openReadDeadline } from '../orchestration/stage-deadline.js';
-import { screenWatchOf, screenWatchQuietLimitOf, trackOnScreen } from './screen-watch.js';
+import { screenWatchOf, screenWatchQuietLimitOf, timedOnScreen, trackOnScreen } from './screen-watch.js';
 
 /**
  * 凍結の後の読み取り（probe と、JS の結び付き）の、それぞれの時間の上限（ms）。L6/L3-1（設計書 `2026-11-09-beaksight-remove-limits-design.md` 5 の 1）:
@@ -282,9 +282,10 @@ export async function settleAndFreezePage(
     // L10 の調べの直し: 読む文書が消えたら（閉じた・止めた移動で誤りの画面 `chrome-error://` に替わった。場所がない）、待たずに待ちを終える（下の確かめで
     // `INCOMPLETE_FREEZE_UNAVAILABLE`。DEF-242 と同じ事実）。待ちが続く間に Chromium が page を閉じると、Guard が印のない閉じとして止める。
     const documentGone = (): boolean => documentGoneOf(page);
-    const settled = screenWatchOf(page) === undefined
-      ? await waitForDiscoverySettled(counter, readCandidateSet, policy, undefined, documentGone)
-      : await waitForDiscoverySettledWatched(counter, readCandidateSet, policy, { quietLimitMs: screenWatchQuietLimitOf(page), documentGone });
+    // DTIME: 発見の落ち着きの待ちを測る（測るだけ。page の口がなければ、そのまま待つ）。
+    const settled = await timedOnScreen(page, 'SETTLE', () => (screenWatchOf(page) === undefined
+      ? waitForDiscoverySettled(counter, readCandidateSet, policy, undefined, documentGone)
+      : waitForDiscoverySettledWatched(counter, readCandidateSet, policy, { quietLimitMs: screenWatchQuietLimitOf(page), documentGone, outer: screenWatchOf(page) })));
     if (settled.status === 'TIMED_OUT') {
       reasons.add('INCOMPLETE_SETTLE_TIMEOUT');
     }
@@ -484,7 +485,8 @@ export const withRevealedRowFormFields = (
  */
 export async function discoverPageCandidates(page: Page, options: DiscoverPageOptions): Promise<DiscoveryReadPageRecord> {
   // OP-K（K1）: SPA の見出しが後から描かれるのを、凍結の前に、上限まで待つ（凍結の後は、ページの JS が描かない）。
-  await waitForScreenHeading(page);
+  // DTIME: 見出しの待ちも、落ち着きの待ちとして測る。
+  await timedOnScreen(page, 'SETTLE', () => waitForScreenHeading(page));
   // L6/L3-1: 凍結の後の読み取りと Guard の準備の待ちは、期限を置かない（固まった画面は 1 画面の見張り `screen-watch.ts` が終える）。
   const frozen = await settleAndFreezePage(page, options, openReadDeadline);
   const reasons = new Set<IncompleteReason>(frozen.reasons);

@@ -20,6 +20,7 @@ import {
   countWithPeakPerMinuteText,
   countWithRecentAndPeakPerMinuteText,
   describeIncompleteReason,
+  describeIncompleteReasonOf,
   describeInteractionReason,
   differentConfigRunText,
   differentVersionRunText,
@@ -27,6 +28,7 @@ import {
   finishedCheckpointCleanupFailedText,
   listText,
   nextStepOfIncompleteReason,
+  nextStepOfIncompleteReasonOf,
   ordinalText,
   progressItemsText,
   resumingRunText,
@@ -103,6 +105,15 @@ describe('incomplete reason descriptions', () => {
     for (const code of ['UNHANDLED_FAILURE', 'REQUIRED_ARTIFACT_INVALID', 'RULE_EVALUATION_FAILED', 'INVALID_BROWSER_DATA'] as const) {
       expect(nextStepOfIncompleteReason(code), code).toContain('BeakSight の開発者に知らせてください');
     }
+  });
+
+  // PIR: 点検の範囲の外へ移った読み込みの失敗（detail が鍵）は、ほかの読み込みの失敗と別の文。ほかの理由は、コードの文のまま。
+  it('describes a navigation that left the audit scope apart from the other navigation failures (PIR)', () => {
+    const outside = { code: 'NAVIGATION_FAILED', detail: 'BLOCKED_EXTERNAL_REDIRECT' } as const;
+    expect(describeIncompleteReasonOf(outside)).toBe('点検の範囲の外へ移るページなので、点検しませんでした。');
+    expect(nextStepOfIncompleteReasonOf(outside)).toContain('点検してよいサイトのアドレス');
+    expect(describeIncompleteReasonOf({ code: 'NAVIGATION_FAILED', detail: 'TIMEOUT' })).toBe(describeIncompleteReason('NAVIGATION_FAILED'));
+    expect(nextStepOfIncompleteReasonOf({ code: 'NAVIGATION_FAILED', detail: null })).toBe(nextStepOfIncompleteReason('NAVIGATION_FAILED'));
   });
 
   // SU1（サイトが応答しないときに Run を止める設計書 3.4）: サイトの不調で、その後の監査を始めなかった理由の説明。
@@ -319,7 +330,7 @@ describe('resume text of the CLI', () => {
   });
 
   it('tells that another Run is running in the same output directory', () => {
-    expect(runActiveInOutputDirectoryText).toBe('同じ出力先で、別の Run が実行中です。その Run が終わってから実行してください。');
+    expect(runActiveInOutputDirectoryText).toBe('同じ出力先で、同じ対象の別の Run が実行中です。その Run が終わってから実行してください。');
   });
 
   it('tells that a checkpoint cannot be read, and that a run with another configuration is not resumed', () => {

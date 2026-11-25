@@ -6,6 +6,9 @@
 // - バンドルの `finding-groups.json` と `findings-by-rule.json` の群の ID は、表示用モデルの写し。
 import { unzipSync } from 'fflate';
 import { describe, expect, it } from 'vitest';
+import { ACCESSIBILITY_RULES } from '../../src/audit/accessibility-rules.js';
+import { roundSelectorNumbers } from '../../src/audit/finding-grouping-keys.js';
+import { RuleEngine } from '../../src/audit/rule-engine.js';
 import { RULE_VERIFICATION_BASES } from '../../src/audit/rule-verification-basis.js';
 import { RUN_ARTIFACT_FILE_NAMES, pageArtifactRelativePath } from '../../src/core/artifact-layout.js';
 import type { AuditRunResult, EvidencePayloadByType, Finding, PageId } from '../../src/core/contracts.js';
@@ -13,8 +16,8 @@ import { CHATGPT_BUNDLE_GUIDE_TEXT } from '../../src/presentation/messages.js';
 import { CHATGPT_BUNDLE_FILE_NAMES, createChatGptBundle, type ReadArtifactFile } from '../../src/report/chatgpt-bundle.js';
 import {
   FINDING_GROUP_CONFIDENCE_BY_BASIS,
+  FINDING_GROUP_CONFIDENCES,
   findingGroupConfidenceOf,
-  roundSelectorNumbers,
   structureOfHtmlSnippet,
 } from '../../src/report/finding-groups.js';
 import { renderHtmlReport } from '../../src/report/html-report.js';
@@ -219,6 +222,105 @@ describe('AUD-9b: the candidate groups of the view model', () => {
     const model = buildReportViewModel(repeatedRun(), { missingArtifactPaths: [pageArtifactRelativePath(PAGE_2, 'page')] });
     const overflow = model.findingGroups.find((group) => group.ruleId === 'DOCUMENT_HORIZONTAL_OVERFLOW' && group.pageIds[0] === PAGE_2);
     expect(overflow).toMatchObject({ missingEvidenceFindingCount: 1, confidence: 'MEDIUM', verification: { byStatus: { UNVERIFIED: 1 } } });
+  });
+});
+
+// AUD-5（S-02・S-07）: 区分の鍵の付いた指摘は、区分のない指摘と別の群にし、群の確信度を 1 段下げる（重さは変えない）。
+describe('AUD-5: the class keys of the findings', () => {
+  it.each([
+    ['ELEMENT_OVERLAP', 'INTENDED_PLACEMENT', [{ name: 'firstSelector', value: '#photo' }, { name: 'secondSelector', value: '#edit' }]],
+    ['DUPLICATE_PAGE_TITLE', 'SAME_TEMPLATE', [{ name: 'sameTemplate', value: 'abc' }]],
+  ] as const)('makes one lowered group of the %s findings of the class %s on three pages', (ruleId, findingClass, keys) => {
+    const pages: PageId[] = [PAGE_1, PAGE_2, PAGE_3];
+    const doms = pages.map((pageId, index) => dom(index + 1, pageId, 'desktop', `page ${index}`));
+    const findings = pages.flatMap((pageId, index) => [true, false].map((classed, offset) => finding(index * 2 + offset + 1, 'WARN', 'LAYOUT', pageId, [idOf(doms[index]!)], {
+      schemaVersion: 'finding-schema/1.1',
+      ruleId,
+      groupingKeys: [...keys, ...(classed ? [{ name: 'findingClass', value: findingClass }] : [])],
+    })));
+    const model = buildReportViewModel(auditRun({
+      pages: pages.map((pageId, index) => page(pageId, `/p${index}.html`, 'AUDITED', [doms[index]!], findings.filter((value) => value.pageId === pageId))),
+      findings,
+    }));
+    const groups = model.findingGroups.filter((group) => group.ruleId === ruleId);
+    const classed = groups.find((group) => group.groupingKeys.some(({ name }) => name === 'findingClass'));
+    const plain = groups.find((group) => !group.groupingKeys.some(({ name }) => name === 'findingClass'));
+    expect(groups).toHaveLength(2);
+    expect(classed?.occurrenceCount).toBe(3);
+    expect(FINDING_GROUP_CONFIDENCES.indexOf(classed!.confidence)).toBe(FINDING_GROUP_CONFIDENCES.indexOf(plain!.confidence) + 1);
+  });
+});
+
+// DEF-297: axe の指摘は、対象の selector（番号と描画の順の id を丸めた形）で群にする。名前の不一致は selector と区分の両方で群にする。fingerprint は変えない。
+describe('DEF-297: the groups of the axe findings across the pages', () => {
+  const axeNode = (selector: string, html: string, label?: { readonly axName: string; readonly segments: readonly string[] }) => ({
+    impact: 'serious', targetSelectors: [selector], failureSummary: null, htmlSnippet: html, truncated: false,
+    ...(label === undefined ? {} : {
+      nameContext: { status: 'READ', axName: label.axName, axRole: 'link', axDisabled: false, nameSource: { type: 'contents' }, labelSegments: label.segments },
+    }),
+  });
+  const violation = (ruleId: string, nodes: readonly unknown[]) => ({ ruleId, impact: 'serious', help: 'h', helpUrl: 'https://rules.test/x', tags: [], omittedNodeCount: 0, nodes });
+  const pages: PageId[] = [PAGE_1, PAGE_2, PAGE_3];
+  const missing = { axName: 'home-icon', segments: ['ホーム'] };
+  const runOf = (): AuditRunResult => {
+    const evaluated = pages.map((pageId, index) => {
+      const axe = record('accessibility', 30 + index, pageId, 'desktop', {
+        status: 'COMPLETE', frameScope: 'SAME_ORIGIN_ONLY', scrollPosition: { scrollX: 0, scrollY: 0 },
+        violations: [
+          violation('color-contrast', [
+            // 共通の枠の同じ部品（属性の値の selector）と、描画の順の id だけ違う同じ部品。1 ページ目だけの違う部品。
+            axeNode('a[href="/home"]', '<a class="home">'),
+            axeNode(`#\\:r${String(index + 1)}\\: > span`, '<span class="badge">'),
+            ...(index === 0 ? [axeNode('button[aria-label="close"]', '<button class="close">')] : []),
+          ]),
+          violation('label-content-name-mismatch', [
+            // 同じ部品で区分が違う（1・2 ページ目。2 ページ目は名前の文脈を読めない）。区分が同じで違う部品（1・3 ページ目）。
+            index === 2 ? axeNode('footer > a[href="/help"]', '<a class="help">', missing) : axeNode('nav > a[href="/news"]', '<a class="news">', index === 0 ? missing : undefined),
+          ]),
+        ],
+        incomplete: [],
+      } as never);
+      const { findings } = new RuleEngine({ targetId: 'def297', firstFindingSequence: index * 100 + 1, catalog: ACCESSIBILITY_RULES })
+        .evaluate({ pageId, pageUrl: page(pageId, `/p${String(index)}.html`).pageUrl, viewport: 'desktop', evidence: [axe] });
+      return { axe, findings };
+    });
+    return auditRun({
+      pages: pages.map((pageId, index) => page(pageId, `/p${String(index)}.html`, 'AUDITED', [evaluated[index]!.axe], evaluated[index]!.findings)),
+      findings: evaluated.flatMap(({ findings }) => findings),
+    });
+  };
+  const groupsOf = (model: ReturnType<typeof buildReportViewModel>, ruleId: string, selector: string) => model.findingGroups.filter((group) => group.ruleId === ruleId
+    && group.findingIds.some((id) => model.findings.find(({ finding }) => finding.findingId === id)?.finding.message.includes(selector)));
+
+  it('makes one group of the same common part on three pages, also when only the render-order id differs, and separate groups of different parts', () => {
+    const model = buildReportViewModel(runOf());
+    expect(groupsOf(model, 'COLOR_CONTRAST_VIOLATION', 'a[href="/home"]').map((group) => group.pageCount)).toEqual([3]);
+    expect(groupsOf(model, 'COLOR_CONTRAST_VIOLATION', ' > span').map((group) => group.pageCount)).toEqual([3]);
+    expect(groupsOf(model, 'COLOR_CONTRAST_VIOLATION', 'close').map((group) => group.pageCount)).toEqual([1]);
+    expect(model.findingGroups.filter((group) => group.ruleId === 'COLOR_CONTRAST_VIOLATION')).toHaveLength(3);
+  });
+
+  it('groups the label-in-name findings by both the part and the class', () => {
+    const model = buildReportViewModel(runOf());
+    expect(groupsOf(model, 'A11Y_LABEL_CONTENT_NAME_MISMATCH', '/news').map((group) => group.occurrenceCount)).toEqual([1, 1]);
+    expect(groupsOf(model, 'A11Y_LABEL_CONTENT_NAME_MISMATCH', '/help').map((group) => group.occurrenceCount)).toEqual([1]);
+    expect(model.findingGroups.filter((group) => group.ruleId === 'A11Y_LABEL_CONTENT_NAME_MISMATCH')).toHaveLength(3);
+  });
+
+  it('changes the group count of findings-by-rule.json in the bundle, and keeps the fingerprints', async () => {
+    const result = runOf();
+    // 今の Run と同じ fingerprint（群の鍵を足す前の Rule Engine で求めた値）。
+    expect(result.findings.filter(({ pageId }) => pageId === PAGE_1).map(({ fingerprint }) => fingerprint)).toEqual([
+      'sha256:b89c0627717ad9972fd2e2428b83487c8b2b6d4d3f00b37162bc498174d571c6',
+      'sha256:2caead86ddf43de512db0174cd560574c7137e5a5cde7a0b4fc3769a0c4e9ceb',
+      'sha256:364d6478ee4b41ca1a1859ab6b9b6500b43744b1a14b5a7701da1767276603ec',
+      'sha256:cc2a576052cb9d0f9bf29cddb05d40cbdc8b2c25594ec51fc7e44ab442799ec2',
+    ]);
+    const entries = unzipSync(await createChatGptBundle(buildReportViewModel(result), result, readAll(result)));
+    const byRule = JSON.parse(decoder.decode(entries[CHATGPT_BUNDLE_FILE_NAMES.findingsByRule])) as {
+      readonly main: readonly { readonly ruleId: string; readonly groupCount: number }[];
+    };
+    expect(byRule.main.find((digest) => digest.ruleId === 'COLOR_CONTRAST_VIOLATION')?.groupCount).toBe(3);
   });
 });
 

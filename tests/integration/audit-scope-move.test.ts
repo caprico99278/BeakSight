@@ -34,6 +34,16 @@ const movingPage = (to: string, delayMs: number): string =>
   html(`<p>移ります</p><script>setTimeout(function(){location.href=${JSON.stringify(to)};},${delayMs});</script>`);
 /** 移る画面の path と、移るまでの時間（ms）。`/to-scope` は同じ Origin の危険な語の画面へ移る。 */
 const MOVES: readonly (readonly [string, number])[] = [['/to-ext-300', 300], ['/to-ext-800', 800], ['/to-ext-1500', 1_500], ['/to-scope', 300]];
+/**
+ * DEF-304（設計書 `2026-11-20-beaksight-audit-precision-and-scope-design.md` 2.1）: 読み込みの後に `history.replaceState` で URL を書き換える画面（移動はしない）。
+ * `/self-query` は query だけを足す（危険な語を含む。点検する）。`/self-path` は path を危険な語の path に変える（範囲の外）。
+ */
+const REPLACES: readonly (readonly [string, string, string])[] = [
+  ['/self-query', '?state_cancelled=1&from=delete', 'OK'],
+  ['/self-path', '/x/delete', 'BLOCKED_EXTERNAL_REDIRECT'],
+];
+const replacingPage = (to: string): string =>
+  html(`<p>書き換えます</p><script>setTimeout(function(){history.replaceState(null,'',${JSON.stringify(to)});},300);</script>`);
 
 const own: string[] = [];
 const outside: string[] = [];
@@ -55,13 +65,16 @@ beforeAll(async () => {
       const path = new URL(request.url ?? '/', 'http://127.0.0.1').pathname;
       own.push(`${request.method ?? ''} ${path}`);
       const move = MOVES.find(([movePath]) => movePath === path);
+      const replace = REPLACES.find(([replacePath]) => replacePath === path);
       const page = path === '/start'
-        ? html(MOVES.map(([movePath], index) => `<a href="${movePath}">案内 ${index + 1}</a>`).join(''))
+        ? html([...MOVES, ...REPLACES].map(([movePath], index) => `<a href="${movePath}">案内 ${index + 1}</a>`).join(''))
         : path === '/account/delete-confirm'
           ? MOVED_TO
-          : move === undefined
-            ? undefined
-            : movingPage(path === '/to-scope' ? '/account/delete-confirm' : `${outer.origin}/ext`, move[1]);
+          : replace !== undefined
+            ? replacingPage(replace[1])
+            : move === undefined
+              ? undefined
+              : movingPage(path === '/to-scope' ? '/account/delete-confirm' : `${outer.origin}/ext`, move[1]);
       if (page === undefined) {
         response.writeHead(204);
         response.end();
@@ -104,6 +117,10 @@ describe.each(BOTH_CHROMIUM_LAUNCHERS)('REV-SD I-1: a page that moves itself out
         expect([page?.viewports.desktop.navigationOutcome, page?.viewports.mobile.navigationOutcome], path)
           .toEqual(['BLOCKED_EXTERNAL_REDIRECT', 'BLOCKED_EXTERNAL_REDIRECT']);
         expect(page?.evidence.filter((record) => record.type === 'dom' || record.type === 'interaction'), path).toEqual([]);
+      }
+      for (const [path, , outcome] of REPLACES) {
+        const page = result.pages.find((candidate) => pathOf(candidate.pageUrl) === path);
+        expect([page?.viewports.desktop.navigationOutcome, page?.viewports.mobile.navigationOutcome], path).toEqual([outcome, outcome]);
       }
     } finally {
       await rm(outputDirectory, { recursive: true, force: true });

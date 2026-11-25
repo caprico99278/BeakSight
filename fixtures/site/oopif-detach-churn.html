@@ -1,0 +1,31 @@
+<!doctype html>
+<html lang="en">
+  <head><meta charset="utf-8"><title>Fixture OOPIF Detach Churn</title></head>
+  <body>
+    <h1>Fixture OOPIF Detach Churn</h1>
+    <script>
+      // CDPX: 別のホスト名（`127.0.0.1` と `localhost` を入れ替える。ポートは同じ）の iframe（`--site-per-process` で OOPIF）を作り、子が要求をまとめて
+      // 出した直後に消す（Guard が要求を止めている間に、OOPIF の target が外れる形）。これを `rounds` 回くり返し、終えたら題を `done` にする。
+      // - `kind`: 子が出す要求の種類（`read`: GET だけ。`nonread`: POST だけ）。
+      // - インターネット上のサイトは使わない。
+      const params = new URLSearchParams(location.search);
+      const kind = params.get('kind') === 'nonread' ? 'nonread' : 'read';
+      const rounds = Number(params.get('rounds') ?? '40');
+      const otherHost = location.hostname === 'localhost' ? '127.0.0.1' : 'localhost';
+      let round = 0;
+      let frame = null;
+      const open = () => {
+        frame = document.createElement('iframe');
+        frame.title = 'Detaching cross-site frame';
+        frame.src = `${location.protocol}//${otherHost}:${location.port}/oopif-detach-burst.html?kind=${kind}&round=${round}`;
+        document.body.append(frame);
+      };
+      addEventListener('message', () => {
+        frame?.remove();
+        round += 1;
+        if (round < rounds) open(); else document.title = 'done';
+      });
+      open();
+    </script>
+  </body>
+</html>

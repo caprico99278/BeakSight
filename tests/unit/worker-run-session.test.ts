@@ -20,8 +20,8 @@ vi.mock('../../src/core/run-exclusion.js', async (importOriginal) => {
   const actual = await importOriginal<typeof import('../../src/core/run-exclusion.js')>();
   return {
     ...actual,
-    acquireRunExclusion: async (outputDirectory: string): Promise<RunExclusion> => exclusionFailure.cause === undefined
-      ? await actual.acquireRunExclusion(outputDirectory)
+    acquireRunExclusion: async (outputDirectory: string, targetId: string): Promise<RunExclusion> => exclusionFailure.cause === undefined
+      ? await actual.acquireRunExclusion(outputDirectory, targetId)
       : Object.freeze<RunExclusion>({ kind: 'UNAVAILABLE', cause: exclusionFailure.cause }),
   };
 });
@@ -45,6 +45,9 @@ function newOutputDirectory(): string {
 
 const clock = (): Date => new Date();
 
+/** 印の対象の ID（設定の `target.id`。PAR-a）。 */
+const TARGET_ID = 'test-target';
+
 /** 取った排他を離す（取れたときだけ）。 */
 async function releaseIfAcquired(exclusion: RunExclusion): Promise<void> {
   if (exclusion.kind === 'ACQUIRED') {
@@ -54,7 +57,7 @@ async function releaseIfAcquired(exclusion: RunExclusion): Promise<void> {
 
 /** 出力先の印が、今は誰にも持たれていないか（取れたら、すぐ離す）。 */
 async function isFree(outputDirectory: string): Promise<boolean> {
-  const exclusion = await acquireRunExclusion(outputDirectory);
+  const exclusion = await acquireRunExclusion(outputDirectory, TARGET_ID);
   await releaseIfAcquired(exclusion);
   return exclusion.kind === 'ACQUIRED';
 }
@@ -63,7 +66,7 @@ describe('startWorkerRun and endWorkerRun: the exclusion of the output directory
   it('starts a Run holding the exclusion until endWorkerRun releases it', async () => {
     const outputDirectory = newOutputDirectory();
 
-    const run = await startWorkerRun(outputDirectory, clock);
+    const run = await startWorkerRun(outputDirectory, TARGET_ID,clock);
 
     expect(run.kind).toBe('STARTED');
     if (run.kind !== 'STARTED') {
@@ -79,9 +82,9 @@ describe('startWorkerRun and endWorkerRun: the exclusion of the output directory
 
   it('respects the exclusion held by another start: RUN_ACTIVE, exit code 4, no Run', async () => {
     const outputDirectory = newOutputDirectory();
-    const other = await acquireRunExclusion(outputDirectory);
+    const other = await acquireRunExclusion(outputDirectory, TARGET_ID);
     try {
-      const run = await startWorkerRun(outputDirectory, clock);
+      const run = await startWorkerRun(outputDirectory, TARGET_ID,clock);
 
       expect(run).toEqual({ kind: 'RUN_ACTIVE', exitCode: RUN_UNAVAILABLE_EXIT_CODE });
       expect(await listRunDirectories(outputDirectory)).toEqual([]);
@@ -94,11 +97,11 @@ describe('startWorkerRun and endWorkerRun: the exclusion of the output directory
   it('starts a second Run in the same second under the run ID with a two-digit suffix', async () => {
     const outputDirectory = newOutputDirectory();
     const sameSecond = (): Date => new Date('2026-11-17T01:02:03.000Z');
-    const first = await startWorkerRun(outputDirectory, sameSecond);
+    const first = await startWorkerRun(outputDirectory, TARGET_ID,sameSecond);
     if (first.kind !== 'STARTED') throw new Error(`the first Run did not start: ${first.kind}`);
     await endWorkerRun(first);
 
-    const second = await startWorkerRun(outputDirectory, sameSecond);
+    const second = await startWorkerRun(outputDirectory, TARGET_ID,sameSecond);
 
     expect(second).toMatchObject({ kind: 'STARTED', runId: `${first.runId}01` });
     if (second.kind === 'STARTED') await endWorkerRun(second);
@@ -110,7 +113,7 @@ describe('startWorkerRun and endWorkerRun: the exclusion of the output directory
     // 出力先のパスがファイル（出力先を作れない）。
     await writeFile(outputDirectory, 'not a directory');
 
-    const run = await startWorkerRun(outputDirectory, clock);
+    const run = await startWorkerRun(outputDirectory, TARGET_ID,clock);
 
     expect(run).toMatchObject({ kind: 'RUN_DIRECTORY_UNAVAILABLE', runStatus: 'FAILED' });
   });
@@ -120,7 +123,7 @@ describe('startWorkerRun and endWorkerRun: the exclusion of the output directory
     const failure = new Error('the exclusion cannot be made');
     exclusionFailure.cause = failure;
     try {
-      await expect(startWorkerRun(outputDirectory, clock)).rejects.toBe(failure);
+      await expect(startWorkerRun(outputDirectory, TARGET_ID,clock)).rejects.toBe(failure);
     } finally {
       exclusionFailure.cause = undefined;
     }
@@ -131,7 +134,7 @@ describe('startWorkerRun and endWorkerRun: the exclusion of the output directory
     // 不正な開始の時刻（Run の ID を作れずに `RangeError`。Run のディレクトリを作る前に終わる）。
     const invalidClock = (): Date => new Date(Number.NaN);
 
-    await expect(startWorkerRun(outputDirectory, invalidClock)).rejects.toBeInstanceOf(RangeError);
+    await expect(startWorkerRun(outputDirectory, TARGET_ID,invalidClock)).rejects.toBeInstanceOf(RangeError);
 
     expect(await isFree(outputDirectory)).toBe(true);
   });

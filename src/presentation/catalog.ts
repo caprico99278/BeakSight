@@ -22,7 +22,9 @@ import type { AuditSendPolicyName } from '../core/audit-send-policy.js';
 import type { BeakSightBlockRelation } from '../core/beaksight-block-relation.js';
 import type { BlockedEventPhase, InteractionNotVerifiableKind, SafetyEventKind, ScreenshotCaptureType } from '../core/evidence-types.js';
 import { deepFreeze } from '../core/immutable.js';
-import { DESTRUCTIVE_ACTION_SKIPPED_TEXT } from './messages.js';
+import type { MeasurementServiceGroup, MeasurementServiceKind } from '../core/measurement-services.js';
+import type { KeyActionKind } from '../core/key-actions.js';
+import { AI_ACTION_SKIPPED_TEXT, DESTRUCTIVE_ACTION_SKIPPED_TEXT } from './messages.js';
 
 /**
  * 色のトークンの名前の閉じた一覧。バッジや強調の色は、この名前で選ぶ。
@@ -376,7 +378,7 @@ export const SAFETY_EVENT_KIND_CATALOG = deepFreeze({
     tone: 'shield',
     // DEF-040（NP4）: 理由のコードごとの意味を示す（レポートは、事象の理由のコードをそのまま表示する）。
     description:
-      'WebSocket の接続を、遮断しました。理由が PASSIVE_WEBSOCKET の記録は、ページ（文書）が開いた接続を Guard が止めたものです。理由が WORKER_CONNECT_POLICY の記録は、Worker の中で開いた接続を、BeakSight が文書と Worker に加える通信の制限（CSP の connect-src）が止めたものです。この記録は観察によるもので、止めた接続のすべてが残るとは限りません。理由が AUDIT_SEND_OVER_LIMIT の記録は、ページが出す送信を通す扱いで、1 つの読み込みで通す接続の数の上限を超えたものです。理由が WEBSOCKET_SEND_QUEUE_FULL の記録は、送る量が多すぎたため、リアルタイムの通信を 1 つ閉じたものです。',
+      'WebSocket の接続を、遮断しました。理由が PASSIVE_WEBSOCKET の記録は、ページ（文書）が開いた接続を Guard が止めたものです。理由が WORKER_CONNECT_POLICY の記録は、Worker の中で開いた接続を、BeakSight が文書と Worker に加える通信の制限（CSP の connect-src）が止めたものです。この記録は観察によるもので、止めた接続のすべてが残るとは限りません。理由が AUDIT_SEND_OVER_LIMIT の記録は、ページが出す送信を通す扱いで、1 つの読み込みで通す接続の数の上限を超えたものです。理由が WEBSOCKET_SEND_QUEUE_FULL の記録は、送る量が多すぎたため、リアルタイムの通信を 1 つ閉じたものです。理由が SCROLL_KEY_PRESS_RESTRICTED の記録は、点検のために窓を開くボタンを押した間に開いた接続を止めたもので、サイトの問題ではありません。',
   },
   blockedExternalActions: {
     label: '押さなかった、外への動きのある操作',
@@ -1075,6 +1077,22 @@ export const SUBMISSION_PROBE_REASON_CATALOG = deepFreeze({
   COVERED_BY_OTHER: { label: 'ほかの表示に覆われていたので、押せませんでした', order: 32, tone: 'neutral', description: null },
   // SD-1（設計書 `2026-11-16-beaksight-action-based-delete-guard-design.md` 2.3）: 削除に関する操作なので押さなかった（文は Interaction の理由と同じ）。
   DESTRUCTIVE_ACTION_SKIPPED: { label: DESTRUCTIVE_ACTION_SKIPPED_TEXT, order: 33, tone: 'neutral', description: null },
+  // DEF-289（案 1）: 押そうとするたびに、画面がボタンを作り直した。
+  TARGET_VANISHED: { label: '押そうとするたびに画面がボタンを作り直したので、押せませんでした', order: 34, tone: 'caution', description: null },
+  // DEF-289（案 5）: この画面を終えるまで、押す順が来なかった。
+  NOT_REACHED: { label: 'このボタンを押す前に、この画面の確かめを終えました', order: 35, tone: 'neutral', description: null },
+  // DEF-295: 押す前に確かめたとき、ボタンが動き続けるなどで押せる状態にならなかった。
+  TARGET_NOT_STABLE: { label: 'ボタンが動き続けるなどで押せる状態にならなかったので、押せませんでした', order: 36, tone: 'caution', description: null },
+  // DEF-295: ボタンが見えなかった（狭い画面用の複製・閉じたメニューの中・入力の後に隠れたなど）。
+  TARGET_NOT_VISIBLE: { label: 'ボタンが見えなかったので、押せませんでした', order: 37, tone: 'neutral', description: null },
+  // DEF-295: 読み込み直した画面で、前の押下をたどってボタンのある状態を作り直せなかった。
+  STATE_NOT_REBUILT: { label: 'ボタンのある状態を作り直せなかったので、押せませんでした', order: 38, tone: 'caution', description: null },
+  // AIW: 名前に AI の語があるボタン（サイトの AI の生成を起こさない。文は Interaction の理由と同じ）。
+  AI_ACTION_SKIPPED: { label: AI_ACTION_SKIPPED_TEXT, order: 39, tone: 'neutral', description: null },
+  // AIW の 4: 押すとサイトの AI が動いたので、登録・更新を試さない。
+  AI_GENERATION_REQUEST: { label: '押すとサイトの AI が動くので、登録として試さない', order: 40, tone: 'caution', description: null },
+  // CALDAY: カレンダーの日など、同じ形のボタンが並ぶ所で、1 つ目を押しても何も起きなかった。
+  SAME_SHAPE_NO_CHANGE: { label: '同じ形のボタンの 1 つ目を押しても何も起きなかったので、ここは押さなかった', order: 41, tone: 'neutral', description: null },
 } as const satisfies Record<string, DisplaySpec>);
 
 /** 発見のジョブの終わり方（`DISCOVERY_END_REASONS`）の表示。 */
@@ -1991,6 +2009,39 @@ export const AUDIT_SEND_POLICY_CATALOG = deepFreeze({
     prominent: true,
   },
 } as const satisfies Record<AuditSendPolicyName, DisplaySpec & { readonly prominent: boolean }>);
+
+// ---------------------------------------------------------------------------------------------------------------
+// BS-1: 計測サービスの種類と分け方（設計書 `2026-11-19-beaksight-measurement-tag-inventory-design.md`。一覧の owner は `src/core/measurement-services.ts`）
+// ---------------------------------------------------------------------------------------------------------------
+
+export const MEASUREMENT_SERVICE_CATALOG = deepFreeze({
+  TAG_MANAGER: { label: 'タグの管理の入れ物', order: 1, tone: 'neutral', description: null },
+  GOOGLE_TAG: { label: 'まとめて読み込むタグ', order: 2, tone: 'neutral', description: null },
+  ANALYTICS_COLLECT: { label: 'アクセスの分析の送信', order: 3, tone: 'neutral', description: null },
+  CLARITY: { label: '画面の操作の分析', order: 4, tone: 'neutral', description: null },
+  ADS_CONVERSION: { label: '広告の成果の計測', order: 5, tone: 'neutral', description: null },
+  META_PIXEL: { label: 'SNS の広告の計測', order: 6, tone: 'neutral', description: null },
+} as const satisfies Record<MeasurementServiceKind, DisplaySpec>);
+
+export const MEASUREMENT_SERVICE_GROUP_CATALOG = deepFreeze({
+  TAG_MANAGEMENT: { label: 'タグの管理', order: 1, tone: 'neutral', description: null },
+  ANALYTICS: { label: '分析', order: 2, tone: 'neutral', description: null },
+  ADVERTISING: { label: '広告', order: 3, tone: 'neutral', description: null },
+} as const satisfies Record<MeasurementServiceGroup, DisplaySpec>);
+
+// ---------------------------------------------------------------------------------------------------------------
+// BS-2: 主要な行動の候補の種類（設計書 `2026-11-20-beaksight-key-action-positions-design.md`。一覧の owner は `src/core/key-actions.ts`）
+// ---------------------------------------------------------------------------------------------------------------
+
+export const KEY_ACTION_KIND_CATALOG = deepFreeze({
+  PHONE: { label: '電話をかける', order: 1, tone: 'neutral', description: null },
+  EMAIL: { label: 'メールを送る', order: 2, tone: 'neutral', description: null },
+  MESSAGE: { label: 'メッセージを送る', order: 3, tone: 'neutral', description: null },
+  BOOKING: { label: '予約', order: 4, tone: 'neutral', description: null },
+  CONTACT: { label: '問い合わせ・相談', order: 5, tone: 'neutral', description: null },
+  PURCHASE: { label: '購入', order: 6, tone: 'neutral', description: null },
+  OTHER: { label: '申し込み・資料請求・見積もり', order: 7, tone: 'neutral', description: null },
+} as const satisfies Record<KeyActionKind, DisplaySpec>);
 
 // ---------------------------------------------------------------------------------------------------------------
 // BeakSight の遮断と指摘の関係（BN-c・BN-d。設計書 `2026-10-23-beaksight-bundle-beaksight-block-noise-design.md` 3.3・3.5）

@@ -52,8 +52,10 @@ describe.each(DEFAULT_CHROMIUM_LAUNCHERS)('NO-2: the discovery closes the notifi
     // 枠のボタン（最小化と閉じる）は、閉じた後なので候補にならない。本文の 3 つは、どれも押した（押す数を閉じる押下に使っていない）。
     // fix round 2: 閉じる押下が 1.5 秒後に出す POST は、本文のボタンを押している間に出ることがある（そのときは、その押下の観察した送信に数えられ、結果が
     // `NO_REQUEST` でなくなる）。押したこと（押す数の上限で止めていない、観察できなかったのでない）だけを確かめる。
+    // CALDAY: 本文の 3 つは番号だけ違う同じ形の兄弟なので、最初の押下で何も起きなければ、残りは押さない（`SAME_SHAPE_NO_CHANGE`）。
     expect(lines).toHaveLength(3);
-    expect(lines.filter((line) => line.startsWith('NOT_OBSERVED ') || line.includes('PRESS_LIMIT_REACHED'))).toEqual([]);
+    expect(lines.filter((line) => !line.startsWith('NOT_OBSERVED ')).length).toBeGreaterThanOrEqual(1);
+    expect(lines.filter((line) => (line.startsWith('NOT_OBSERVED ') && line !== 'NOT_OBSERVED SAME_SHAPE_NO_CHANGE') || line.includes('PRESS_LIMIT_REACHED'))).toEqual([]);
     expect(run.seen.filter(({ method }) => !READ_METHODS.has(method))).toEqual([]);
   }, TEST_TIMEOUT_MS);
 

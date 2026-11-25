@@ -11,6 +11,7 @@ import {
   type AccessibilityDisabledFactsEvidence,
   type AccessibilityDisabledPlace,
   type AccessibilityEvidence,
+  type AccessibilityLabelledByEvidence,
   type AccessibilityNodeEvidence,
   type AccessibilityRuleEvidence,
   type AccessibilityNameContextEvidence,
@@ -27,7 +28,7 @@ import { readAccessibilityAxFacts } from './accessibility-ax.js';
 // L2（設計書 `2026-11-09-beaksight-remove-limits-design.md` 5 の 1）: 期限を指定されなかったときの axe の実行の期限（前は 30 秒）は撤廃した（期限を
 // 受けないときは、進みの見張り `watchCollection` で待つ）。LZ-2: 文の長さの上限（前の `ACCESSIBILITY_LIMITS` の `maxHtmlSnippetLength`・
 // `maxFailureSummaryLength`・`maxCheckDataValueLength`・`maxStyleValueLength` と、axe の対象の selector の `MAX_SELECTOR_LENGTH`）も撤廃した。
-// 切り詰めない（要素の Evidence の `truncated` は偽、`truncations` は空。前の記録の形のために残す）。
+// 切り詰めない（要素の Evidence の `truncations` は空。前の記録の形のために残す）。AUD-6（S-10）: `truncated` は、axe 自身が抜粋を切り詰めたときだけ真。
 
 export interface AccessibilityCollectionOptions {
   /**
@@ -106,14 +107,33 @@ function checkEvidence(
       }
     }
   }
+  const relatedNodes = relatedNodeTargetsOf(check['relatedNodes']);
   return Object.freeze({
     id: check['id'],
     group,
     result,
     messageKey,
     data: Object.freeze(data),
+    ...(relatedNodes.length === 0 ? {} : { relatedNodes }),
   });
 }
+
+/**
+ * AUD-6（設計書 `2026-11-19-beaksight-audit-result-review-fixes-design.md` 9.3。S-10）: 確かめに関わる別の要素（axe の `relatedNodes`）の目印。axe の target の
+ * selector だけを残し、HTML・文字・値は持たない（LZ-2: 切り詰めない）。形の違う要素は残さない。
+ */
+const relatedNodeTargetsOf = (raw: unknown): readonly { readonly targetSelectors: readonly AccessibilityTargetSelector[] }[] =>
+  Object.freeze((Array.isArray(raw) ? raw : []).flatMap((node: unknown) => {
+    const target = isPlainRecord(node) ? node['target'] : undefined;
+    const valid = Array.isArray(target) && target.length > 0
+      && target.every((step: unknown) => typeof step === 'string' || (Array.isArray(step) && step.every((part: unknown) => typeof part === 'string')));
+    return valid ? [Object.freeze({ targetSelectors: targetSelectorsOf(target as readonly (string | readonly string[])[]) })] : [];
+  }));
+
+/**
+ * AUD-6（S-10）: axe 自身が HTML の抜粋を切り詰めた印（axe の抜粋の作り方で、文字の末尾の `...`、または属性を省いた開きのタグの末尾の ` ...>`）。
+ */
+const AXE_SOURCE_TRUNCATION_MARK = /\.\.\.>?$/u;
 
 /** EV-1: 不透明な sRGB の色（16 進の 3 桁・6 桁・不透明の 8 桁と、関数の形の rgb・透明度 1 の rgba）の 0〜255 の成分。読めない色・透明度のある色は `null`。 */
 function opaqueRgbOf(color: string): readonly [number, number, number] | null {
@@ -182,12 +202,15 @@ function nodeEvidence(node: AxeNode, ruleId: string, result: AccessibilityCheckR
       }
     }
   }
+  // AUD-6（S-10）: BeakSight は切り詰めない。axe が切り詰めた抜粋だけ、種類 `SOURCE_TRUNCATED` で印を付ける。
+  const sourceTruncated = AXE_SOURCE_TRUNCATION_MARK.test(node.html);
   return Object.freeze({
     impact: node.impact ?? null,
     targetSelectors: targetSelectorsOf(node.target),
     failureSummary,
     htmlSnippet: node.html,
-    truncated: false,
+    truncated: sourceTruncated,
+    ...(sourceTruncated ? { truncationKind: 'SOURCE_TRUNCATED' as const } : {}),
     checks: Object.freeze(checks),
     truncations: Object.freeze([]),
     disabledFacts: null,
@@ -286,6 +309,8 @@ interface AxeTargetRequest {
   readonly disabled: boolean;
   /** 矩形を読むか（違反の要素）。 */
   readonly region: boolean;
+  /** RVP-5: `aria-labelledby` の参照先を読むか（名前の規則の違反の要素）。省略は読まない。 */
+  readonly labelledBy?: boolean;
 }
 
 /** AUD-3d の続き: ページの中で読んだ矩形（ビューポートの座標）か、読めなかった理由（`IN_FRAME`・`NOT_FOUND`・`NO_BOX`）。 */
@@ -296,7 +321,12 @@ type RawTargetRegion =
 /** AUD-3d の続き: ページの中で読んだ、axe の対象の事実（読まなかったものは `undefined`）と、矩形を読んだときのスクロール位置。 */
 interface RawAxeTargetFacts {
   readonly scrollPosition: { readonly scrollX: number; readonly scrollY: number };
-  readonly items: readonly { readonly disabled?: RawDisabledFacts | null; readonly region?: RawTargetRegion }[];
+  readonly items: readonly {
+    readonly disabled?: RawDisabledFacts | null;
+    readonly region?: RawTargetRegion;
+    /** RVP-5: 参照先の事実（`aria-labelledby` がない・要素がないときは `null`）。 */
+    readonly labelledBy?: { readonly idCount: number; readonly foundCount: number; readonly visibleCount: number } | null;
+  }[];
 }
 
 /**
@@ -410,13 +440,33 @@ export function readAxeTargetsReader(
       rect: { x: box.x, y: box.y, top: box.top, right: box.right, bottom: box.bottom, left: box.left, width: box.width, height: box.height },
     };
   };
+  // RVP-5: `aria-labelledby` の参照先（同じ文書か shadow root の中の id）の数と、描かれて見える数。
+  const labelledByOf = (element: Element | null): { idCount: number; foundCount: number; visibleCount: number } | null => {
+    const value = element === null ? null : attributeOf(element, 'aria-labelledby');
+    if (element === null || value === null) {
+      return null;
+    }
+    const ids = value.split(/\s+/u).filter((id) => id !== '');
+    const root = Node.prototype.getRootNode.call(element);
+    let foundCount = 0;
+    let visibleCount = 0;
+    for (const id of ids) {
+      const found = root instanceof ShadowRoot ? DocumentFragment.prototype.getElementById.call(root, id) : Document.prototype.getElementById.call(document, id);
+      if (found !== null) {
+        foundCount += 1;
+        visibleCount += Element.prototype.checkVisibility.call(found, { visibilityProperty: true }) ? 1 : 0;
+      }
+    }
+    return { idCount: ids.length, foundCount, visibleCount };
+  };
   return {
     scrollPosition: { scrollX: window.scrollX, scrollY: window.scrollY },
-    items: targets.map(({ target, disabled, region }) => {
+    items: targets.map(({ target, disabled, region, labelledBy }) => {
       const element = locate(target);
       return {
         ...(disabled ? { disabled: element === null ? null : disabledFactsOf(element) } : {}),
         ...(region ? { region: regionOf(target, element) } : {}),
+        ...(labelledBy === true ? { labelledBy: labelledByOf(element) } : {}),
       };
     }),
   };
@@ -440,6 +490,8 @@ const axeTargetRequestsOf = (analyzed: AxeResults): AxeTargetRequest[] => [
     target: node.target as AxeTargetRequest['target'],
     disabled: CONTRAST_AXE_RULE_IDS.has(rule.id),
     region: true,
+    // RVP-5: 名前の規則の違反の要素は、`aria-labelledby` の参照先も読む。
+    labelledBy: NAME_CONTEXT_AXE_RULE_IDS.has(rule.id),
   }))),
   ...analyzed.incomplete.filter((rule) => CONTRAST_AXE_RULE_IDS.has(rule.id)).flatMap((rule) => rule.nodes.map((node): AxeTargetRequest => ({
     target: node.target as AxeTargetRequest['target'],
@@ -494,13 +546,15 @@ function attachTargetFacts(
       const item = items?.[index];
       index += 1;
       const region = targetRegionEvidenceOf(item === undefined ? null : (item as { readonly region?: unknown }).region);
-      if (rule.ruleId !== LABEL_IN_NAME_AXE_RULE_ID) {
+      if (!NAME_CONTEXT_AXE_RULE_IDS.has(rule.ruleId)) {
         return Object.freeze({ ...node, region });
       }
-      // AUD-4b: 名前の不一致の要素には、AX の名前の文脈を付ける（読まなかったときは `NOT_READ`）。
+      // AUD-4b: 名前の不一致の要素には、AX の名前の文脈を付ける（読まなかったときは `NOT_READ`）。AUD-6（S-10）: 名前の規則の違反の要素にも付ける。
       const nameContext = ax.nameContexts[mismatchIndex] ?? NOT_READ_NAME_CONTEXT;
       mismatchIndex += 1;
-      return Object.freeze({ ...node, region, nameContext });
+      // RVP-5: `aria-labelledby` の参照先の事実（読めない・持たない要素は付けない）。
+      const labelledBy = labelledByEvidenceOf(item === undefined ? null : (item as { readonly labelledBy?: unknown }).labelledBy);
+      return Object.freeze({ ...node, region, nameContext, ...(labelledBy === null ? {} : { labelledBy }) });
     })),
   })));
   const scroll = facts?.scrollPosition;
@@ -510,17 +564,47 @@ function attachTargetFacts(
   return { violations, incomplete: withDisabled.incomplete, regionScrollPosition, ...axeVersionFieldOf(lists) };
 }
 
+/** RVP-5: ページの中で読んだ `aria-labelledby` の参照先の形を確かめて、Evidence にする（形が違う・なければ `null`）。 */
+const labelledByEvidenceOf = (raw: unknown): AccessibilityLabelledByEvidence | null => {
+  if (typeof raw !== 'object' || raw === null) {
+    return null;
+  }
+  const { idCount, foundCount, visibleCount } = raw as Record<string, unknown>;
+  const counts = [idCount, foundCount, visibleCount];
+  if (!counts.every((value): value is number => typeof value === 'number' && Number.isSafeInteger(value) && value >= 0)) {
+    return null;
+  }
+  const [ids, found, visible] = counts as [number, number, number];
+  return Object.freeze({ idCount: ids, foundCount: found, visibility: found === 0 ? 'MISSING' : visible > 0 ? 'VISIBLE' : 'HIDDEN' });
+};
+
 /** EV-1: axe の版の項目（読めなかったら、項目なし）。 */
 const axeVersionFieldOf = (lists: Pick<RuleEvidenceLists, 'axeVersion'>): { readonly axeVersion?: string } =>
   (lists.axeVersion === undefined ? {} : { axeVersion: lists.axeVersion });
 
-/** AUD-4b: 名前の不一致の axe の Rule の ID。 */
-const LABEL_IN_NAME_AXE_RULE_ID = 'label-content-name-mismatch';
+/**
+ * AUD-4b: AX の名前の文脈（名前の根拠 `nameSource` など）を読む違反の axe の Rule の ID。名前の不一致（`label-content-name-mismatch`）に、AUD-6（設計書
+ * `2026-11-19-beaksight-audit-result-review-fixes-design.md` 9.3。S-10）で、名前の規則（ボタン・リンク・入力欄・画像などの名前）を足した。CDP の読み取りが
+ * 増えるだけで、サイトへの要求は増えない。
+ */
+const NAME_CONTEXT_AXE_RULE_IDS: ReadonlySet<string> = new Set([
+  'label-content-name-mismatch',
+  'button-name',
+  'link-name',
+  'input-button-name',
+  'input-image-alt',
+  'image-alt',
+  'label',
+  'select-name',
+  'aria-input-field-name',
+  'aria-toggle-field-name',
+  'aria-command-name',
+]);
 
 /** AUD-4b: AX を読めなかった名前の文脈。 */
 const NOT_READ_NAME_CONTEXT: AccessibilityNameContextEvidence = Object.freeze({ status: 'UNREADABLE', reason: 'NOT_READ' });
 
-/** AUD-4b: axe の結果の要素の AX の事実（色差の要素の無効の状態は `contrastTargetsOf` の順、名前の不一致の違反の要素の文脈は違反の順）。 */
+/** AUD-4b: axe の結果の要素の AX の事実（色差の要素の無効の状態は `contrastTargetsOf` の順、名前の文脈は `nameContextTargetsOf` の順）。 */
 interface AxFactsOfAnalyzed {
   readonly contrastAxDisabled: readonly (boolean | null)[];
   readonly nameContexts: readonly AccessibilityNameContextEvidence[];
@@ -528,9 +612,9 @@ interface AxFactsOfAnalyzed {
 
 const NO_AX_FACTS: AxFactsOfAnalyzed = Object.freeze({ contrastAxDisabled: [], nameContexts: [] });
 
-/** AUD-4b: 名前の不一致の違反の要素の axe の target（違反の順）。 */
-const labelInNameTargetsOf = (analyzed: AxeResults): AxeNode['target'][] =>
-  analyzed.violations.filter((rule) => rule.id === LABEL_IN_NAME_AXE_RULE_ID).flatMap((rule) => rule.nodes.map((node) => node.target));
+/** AUD-4b: 名前の文脈を読む違反の要素の axe の target（違反の順。`attachTargetFacts` が付ける順と同じ）。 */
+const nameContextTargetsOf = (analyzed: AxeResults): AxeNode['target'][] =>
+  analyzed.violations.filter((rule) => NAME_CONTEXT_AXE_RULE_IDS.has(rule.id)).flatMap((rule) => rule.nodes.map((node) => node.target));
 
 /**
  * AUD-4b: 色差の要素と名前の不一致の違反の要素の AX の事実を、CDP の Accessibility から 1 回の session で読む（`readAccessibilityAxFacts`。ページの main world で
@@ -542,7 +626,7 @@ async function readAxFactsOf(
   track?: <T>(work: Promise<T>) => Promise<T>,
 ): Promise<AxFactsOfAnalyzed> {
   const contrast = contrastTargetsOf(analyzed);
-  const mismatch = labelInNameTargetsOf(analyzed);
+  const mismatch = nameContextTargetsOf(analyzed);
   if (contrast.length === 0 && mismatch.length === 0) {
     return NO_AX_FACTS;
   }

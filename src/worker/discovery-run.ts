@@ -16,11 +16,14 @@
  *    OP-J（J1。設計書 `2026-10-27-beaksight-one-pass-flow-design.md` 4.1.6）: まとめて実行の連鎖で、直前の点検の段の Run のディレクトリ
  *    （`chainedAuditRunDirectory`）を渡されたときは、その段の成果物（各ページの `page.json` の Desktop の `link` の Evidence。点検の段が見つけたリンクの
  *    持ち主は 1 つ）から、登録の画面らしいリンク（`isCreatePageLink`）を、先に読む（COV-2: 数の上限なし）。
- *    続けて、今どおり入口から読む（登録の画面の数は、ページの上限に数えない。すでに読んだページは読み直さない）。読まないパス・危険な語・読む範囲・許可 Origin は、巡回の候補の除外と
- *    同じ判定（`isExcludedCrawlCandidate`）で外し、間隔・時間の上限・Guard は今のまま。読む先が 1 つもなければ、今どおり（入口から、ページの上限まで）。
+ *    DSEED（設計書 `2026-11-19-beaksight-discovery-seed-from-audit-design.md`。J1 の「続けて入口から」を置き換えた）: 続けて、点検の段で読んだ画面
+ *    （`readAuditStagePageUrls`。点検の順。範囲の外は入れず、失敗は入れる）を最初から全部待ち行列に入れ、その後に入口を入れる（すでに入っていれば重ねない）。
+ *    その後は今の BFS のまま、見つかった新しい画面を後ろに足す。登録の画面の数は、ページの上限に数えない（点検の段の画面は数える。すでに読んだページは
+ *    読み直さない）。読まないパス・危険な語・読む範囲・許可 Origin は、巡回の候補の除外と同じ判定（`isExcludedCrawlCandidate`）で外し、間隔・時間の上限・
+ *    Guard は今のまま。読む先が 1 つもなければ、今どおり（入口から、ページの上限まで）。
  *    OP-R（設計書 4.1.9 の R2）: 登録の画面ごとに、その 1 つ上の一覧の画面（`readListPagePathOf`）も、点検の段のリンクにあるときだけ、登録の画面の直後に読む。
- *    点検の段の成果物のリンクの読み方は、共通の部品
- *    （`src/core/audit-stage-links.ts` の `readAuditStageLinks`。画面のサーバの自動の下書きも使う）。
+ *    点検の段の成果物のリンクと画面の読み方は、共通の部品
+ *    （`src/core/audit-stage-links.ts` の `readAuditStageLinks`・`readAuditStagePageUrls`。リンクは画面のサーバの自動の下書きも使う）。
  * 4. 画面ごと（凍結は戻せないので、画面ごとに新しい Context）: Guard の付いた新しい Passive の Context と page
  *    （`openPassiveSessionBeforeDeadline`。認証の状態は factory が世代つきで受け継ぐ）→ 進行中の要求の数え方（`InFlightRequestCounter`）を
  *    `goto` の前に作る → 読み込みの間隔を待つ → 読み込み（`navigatePage`）→ セッションの切れの確かめ → 発見（`discoverPageCandidates`。落ち着きの待ち → 凍結 → 読む）
@@ -71,7 +74,7 @@ import type { BrowserContextFactory } from '../browser/context-factory.js';
 import { EXIT_CODES, RUN_UNAVAILABLE_EXIT_CODE } from '../cli/exit-codes.js';
 import type { AuditConfig } from '../config/types.js';
 import { auditSendPolicyOf } from '../core/audit-send-policy.js';
-import type { RunId, RunProgressReport, RunStatus, SessionLostDetail } from '../core/contracts.js';
+import type { DiscoveredPagesSplit, RunId, RunProgressReport, RunStatus, SessionLostDetail } from '../core/contracts.js';
 import { deepFreeze } from '../core/immutable.js';
 import { observationWindowsOrProduction, type ObservationWindows } from '../core/observation-windows.js';
 import { acquireRunExclusion } from '../core/run-exclusion.js';
@@ -83,7 +86,8 @@ import { destructiveLinkTextUrlsOf, internalNavigableUrlsOf } from '../crawl/int
 import { createLoadMeter } from '../crawl/load-meter.js';
 import { createNavigationPacer, type NavigationPacer } from '../crawl/navigation-pacer.js';
 import { isOriginInAllowedOrigins, normalizeUrl } from '../crawl/normalize-url.js';
-import { readAuditStageLinks } from '../core/audit-stage-links.js';
+import { readAuditStageLinks, readAuditStagePages } from '../core/audit-stage-links.js';
+import { createDebugTimingLog, DEBUG_TIMING_OFF, type DebugTimingLog, type DebugTimingSwitch } from '../core/debug-timing.js';
 import { isCreatePageLink } from '../discovery/classify.js';
 import {
   CoverageQueue,
@@ -102,8 +106,9 @@ import { discoverPageCandidates, settleAndFreezePage, type SettledFreezeOutcome 
 import { openReadDeadline } from '../orchestration/stage-deadline.js';
 import type { DiscoveryCandidate } from '../discovery/candidate-contracts.js';
 import { locationOfUrl } from '../discovery/probe.js';
-import { trackOnScreen, watchDiscoveryScreen } from '../discovery/screen-watch.js';
-import { discoverySettlePolicyOf, type DiscoverySettlePolicy } from '../discovery/settle.js';
+import { timedOnScreen, trackOnScreen, watchDiscoveryScreen } from '../discovery/screen-watch.js';
+import { createPageTimeRecorder, type PageTimeRecorder } from '../discovery/page-time-breakdown.js';
+import { createDataEndpointMemory, discoverySettlePolicyOf, type DiscoverySettlePolicy } from '../discovery/settle.js';
 import {
   DISCOVERY_ARTIFACT_SCHEMA_VERSION,
   discoveryRunStatusOf,
@@ -139,6 +144,7 @@ import {
   pageStateStructureKeyOf,
   probeDiscoveredSubmissions,
   replaySubmissionProbeMove,
+  type SubmissionProbeEndSnapshot,
   type SubmissionProbeMoveFacts,
   type SubmissionProbeOpenerMoveFacts,
   type SubmissionProbeMovedPage,
@@ -297,6 +303,11 @@ export interface DiscoveryRunRequest {
    */
   readonly observationWindows?: ObservationWindows | undefined;
   /**
+   * DBG-1（設計書 `2026-11-20-beaksight-discovery-skip-and-debug-timing-design.md` 2.2）: 測りの記録の入切を読む口（ワーカーの起動の入口が作る。段の始めに 1 回
+   * 呼ぶ）。入なら、1 画面の時間の内訳（DTIME の `timeBreakdown`）を書き、押下の点も Run のフォルダの測りの記録にまとめて書く。省略すると切（内訳も書かない）。
+   */
+  readonly debugTimingSwitch?: DebugTimingSwitch | undefined;
+  /**
    * L6/L3-1（設計書 `2026-11-09-beaksight-remove-limits-design.md` 5 の 1）: 1 画面の進みの見張りの、反応なしの長さ（ms。省略すると
    * `PROGRESS_WATCH_QUIET_LIMIT_MS`）。ワーカーの流れは渡さない。テストが、全く反応のない画面の場面を短く確かめるために渡す（`navigationPacer` と同じ注入の形）。
    */
@@ -372,6 +383,8 @@ export interface DiscoveryCrawlCheckpoint {
   readonly crawledPages: number;
   /** DEF-208-4（A）: それまでに押した共通の枠のボタンの識別の digest（値と path を持たない。ないときは持たない）。続きでも押さない。 */
   readonly sharedLayoutDigests?: readonly string[];
+  /** DSEED2: 連鎖の操作さがしだけ。最初に点検の段から引き継いだ画面の数（続きで持ち越す。連鎖でないときは持たない）。 */
+  readonly pagesFromAuditStage?: number;
 }
 
 /** DEF-200: 状態の保存のファイルの全体（巡回の部分と、続きにしてよいかを確かめる値）。 */
@@ -414,7 +427,7 @@ export interface DiscoveryRunObserver {
   readonly onNotice?: ((notice: JobRunNotice) => void) | undefined;
   /**
    * DEF-195（設計書 `2026-10-26-beaksight-plain-ui-design.md` 13 章の 11）: 進み具合（監査と同じ形の `RunProgressReport`。ワーカーは監査と同じ `PROGRESS` で送る）。
-   * 画面を読み終えるたびに 1 回まで（同じ型の画面を読まずに飛ばしたときは送らない）。サイトへの要求は増やさない。受け手の失敗で発見を止めない。
+   * 画面を終えるたびに 1 回まで（DPROG (a): 凍結の外で読まなかった画面も終えた画面に数えて送る）。サイトへの要求は増やさない。受け手の失敗で発見を止めない。
    */
   readonly onProgress?: ((report: RunProgressReport) => void) | undefined;
   /**
@@ -567,6 +580,8 @@ interface CrawlResult {
   readonly omittedUnreadPages: 0;
   /** COV-2c の M-1: 祖先を最初から凍結して読めず、今の形に戻した回数（省略は 0）。 */
   readonly frozenStartFallbacks?: number;
+  /** DSEED2: 連鎖の操作さがしだけが持つ、見つけた画面の分け方（最後の進み具合と同じ数）。 */
+  readonly pagesDiscoveredSplit?: DiscoveredPagesSplit;
   /** 終わり方の詳しい理由（T37a。鍵の消失によるセッションの切れのときだけ）。 */
   readonly endReasonDetail: SessionLostDetail | null;
   /** ジョブの監査の段の状態（T37a。口がなければ `null`）。 */
@@ -582,6 +597,45 @@ interface CrawlResult {
   readonly maxPages?: number;
 }
 
+/** 点検の段の成果物から読んだ URL を、操作さがしの待ち行列に入れてよいかの判定に使う設定。 */
+interface ChainedUrlOptions {
+  readonly allowedQueryParameters: ReadonlySet<string>;
+  readonly allowedOrigins: ReadonlySet<string>;
+  readonly authentication: Pick<RunAuthentication, 'auditExclusions' | 'sessionLostPathPrefix'>;
+}
+
+/**
+ * 点検の段の成果物から読んだ URL を正規化し直し（`normalizeUrl`。許す query の名前は設定のもの）、許可 Origin の外と巡回の候補の除外（`isExcludedCrawlCandidate`）に
+ * 当たらなければ返す。当たれば `null`。
+ */
+const usableChainedUrlOf = (url: string, options: ChainedUrlOptions): NormalizedHttpUrlEvidence | null => {
+  const normalized = normalizeUrl(url, url, options.allowedQueryParameters);
+  return normalized.ok && isOriginInAllowedOrigins(options.allowedOrigins, new URL(normalized.url).origin)
+    && !isExcludedCrawlCandidate(normalized.url, options.allowedOrigins, options.authentication) ? normalized.url : null;
+};
+
+/**
+ * DSEED（設計書 `2026-11-19-beaksight-discovery-seed-from-audit-design.md` 2 章の 1）: 直前の点検の段で読んだ画面（`readAuditStagePages`。点検の順。範囲の外は
+ * 入らない）の URL を、登録の画面と同じ判定（`usableChainedUrlOf`）で外したうえで、重なりなく返す。
+ * SKIP-1（設計書 `2026-11-20-beaksight-discovery-skip-and-debug-timing-design.md` 2.1）: 押す物がないと点検の段の証拠で分かった URL（同じ URL のどの画面もそう
+ * 分かったときだけ）も返す。
+ */
+async function chainedAuditPagesOf(
+  auditRunDirectory: string,
+  options: ChainedUrlOptions,
+): Promise<{ readonly urls: readonly NormalizedHttpUrlEvidence[]; readonly withoutCandidates: ReadonlySet<string> }> {
+  const found = new Set<NormalizedHttpUrlEvidence>();
+  const pressable = new Set<string>();
+  const withoutCandidates = new Set<string>();
+  for (const page of await readAuditStagePages(auditRunDirectory)) {
+    const url = usableChainedUrlOf(page.url, options);
+    if (url === null) continue;
+    found.add(url);
+    (page.withoutDiscoveryCandidates ? withoutCandidates : pressable).add(url);
+  }
+  return { urls: [...found], withoutCandidates: new Set([...withoutCandidates].filter((url) => !pressable.has(url))) };
+}
+
 /**
  * OP-J（J1）: 直前の点検の段の成果物（`readAuditStageLinks`。ページの ID の順、リンクは文書の順）から、登録の画面らしいリンク（`isCreatePageLink`）の
  * 正規化した URL を、見つけた順に重なりなく返す。正規化し直し（`normalizeUrl`。許す query の名前は設定のもの）、許可 Origin の外と、巡回の候補の除外
@@ -592,17 +646,9 @@ interface CrawlResult {
  */
 export async function chainedCreatePageUrlsOf(
   auditRunDirectory: string,
-  options: {
-    readonly allowedQueryParameters: ReadonlySet<string>;
-    readonly allowedOrigins: ReadonlySet<string>;
-    readonly authentication: Pick<RunAuthentication, 'auditExclusions' | 'sessionLostPathPrefix'>;
-  },
+  options: ChainedUrlOptions,
 ): Promise<readonly NormalizedHttpUrlEvidence[]> {
-  const usable = (url: string): NormalizedHttpUrlEvidence | null => {
-    const normalized = normalizeUrl(url, url, options.allowedQueryParameters);
-    return normalized.ok && isOriginInAllowedOrigins(options.allowedOrigins, new URL(normalized.url).origin)
-      && !isExcludedCrawlCandidate(normalized.url, options.allowedOrigins, options.authentication) ? normalized.url : null;
-  };
+  const usable = (url: string): NormalizedHttpUrlEvidence | null => usableChainedUrlOf(url, options);
   const links = await readAuditStageLinks(auditRunDirectory);
   const linked = new Set(links.flatMap((link) => {
     const url = usable(link.url);
@@ -636,6 +682,8 @@ async function crawl(
   saved: DiscoveryCrawlCheckpoint | null = null,
   /** DEF-200: 1 画面ごとに状態を保存する口（なければ保存しない）。 */
   saveCheckpoint: ((state: DiscoveryCrawlCheckpoint) => Promise<void>) | null = null,
+  /** DBG-1: 測りの記録（切なら何もしない口）。 */
+  debugTiming: DebugTimingLog = DEBUG_TIMING_OFF,
 ): Promise<CrawlResult> {
   const { config, authentication, stopSignal, now } = request;
   const allowedQueryParameters: ReadonlySet<string> = new Set(config.crawl.allowedQueryParameters);
@@ -670,6 +718,13 @@ async function crawl(
   const chainedCreatePages: readonly string[] = saved !== null || request.chainedAuditRunDirectory === undefined
     ? []
     : await chainedCreatePageUrlsOf(request.chainedAuditRunDirectory, { allowedQueryParameters, allowedOrigins: crawlAllowedOrigins, authentication });
+  // DSEED: 連鎖では、直前の点検の段で読んだ画面も最初から全部入れる（登録の画面の後、入口の前。ページの上限に数える）。続きなら前の実行の待ち行列にもう入っている。
+  // SKIP-1: 押す物がないと分かった画面は、続きでも読み込まない（点検の段の成果物から毎回読む）。
+  const auditStagePages = request.chainedAuditRunDirectory === undefined
+    ? null
+    : await chainedAuditPagesOf(request.chainedAuditRunDirectory, { allowedQueryParameters, allowedOrigins: crawlAllowedOrigins, authentication });
+  const chainedAuditPages: readonly string[] = saved !== null ? [] : auditStagePages?.urls ?? [];
+  const pagesWithoutCandidates: ReadonlySet<string> = auditStagePages?.withoutCandidates ?? new Set();
   /** COV-2: ページの上限に数えない状態の ID（先に読む登録の画面と、移った先の編集の画面）。 */
   const uncounted = new Set<string>(saved?.uncountedStateIds ?? []);
   // L14 の後の段（設計書 `2026-11-09-beaksight-remove-limits-design.md` 6.1）: ページの数と時間の上限は、利用者が指定したときだけ確かめる。
@@ -720,18 +775,40 @@ async function crawl(
      */
     const markerValuesByState = new Map<string, readonly string[]>();
     const runMarkerValues = new Set<string>();
+    /** DSEED2: 点検の段で読んだ画面から最初に入れた状態（登録の画面としてもう入っていたものを含む）。 */
+    const fromAuditStage = new Set<string>();
     if (saved === null) {
-      // OP-J（J1）: 登録の画面を先に読む（待ち行列の先頭。ページの上限に数えない）。続けて入口から（入口は設定の URL のまま。query の名前と値を持つ）。
+      // OP-J（J1）: 登録の画面を先に読む（待ち行列の先頭。ページの上限に数えない）。DSEED: 続けて点検の段で読んだ画面（点検の順。ページの上限に数える）、
+      // その後に入口（入口は設定の URL のまま。query の名前と値を持つ。すでに入っていれば重ねない）。
       for (const url of chainedCreatePages) {
         const queued = queue.enqueue({ kind: 'LINK', url, frame: null, openedRegion: null }, { preferred: true });
         if (queued.status === 'QUEUED') uncounted.add(queued.stateId);
       }
+      for (const url of chainedAuditPages) {
+        const queued = queue.enqueue({ kind: 'LINK', url, frame: null, openedRegion: null });
+        if (queued.stateId !== null) fromAuditStage.add(queued.stateId);
+      }
       queue.enqueue({ kind: 'LINK', url: config.site.startUrl, frame: null, openedRegion: null });
     }
+    /**
+     * DSEED2: 連鎖のときだけ、点検の段から引き継いだ画面の数（続きなら保存から持ち越す）。連鎖でなければ `null`（見つけた画面を分けない）。進み具合と成果物の
+     * 分け方の唯一の元（新しく見つけた画面は、見つけた画面からこの数を引いたもの）。
+     */
+    const pagesFromAuditStage: number | null = saved !== null
+      ? saved.pagesFromAuditStage ?? null
+      : request.chainedAuditRunDirectory === undefined ? null : fromAuditStage.size;
+    const discoveredSplitItem = (discovered: number): { readonly pagesDiscoveredSplit?: DiscoveredPagesSplit } => (pagesFromAuditStage === null
+      ? {}
+      : { pagesDiscoveredSplit: { fromAuditStage: pagesFromAuditStage, newlyFound: discovered - pagesFromAuditStage } });
     /** OP-J（J1）: ページの上限に数える、読んだ画面の数（先に読んだ登録の画面・移った先の編集の画面は数えない）。DEF-200: 続きなら前の実行の数から。 */
     let crawledPages = saved?.crawledPages ?? 0;
     /** DEF-208-4（設計書 3.7 の A）: 操作さがし全体で押した、共通の枠のボタンの識別の digest（続きなら前の実行の分から）。 */
     const sharedLayoutDigests = new Set<string>(saved?.sharedLayoutDigests ?? []);
+    /**
+     * REV-DQF fix round 3: この Run で前の画面までに出たデータの送り先（落ち着きの待ちが、この画面で新しい送り先への要求だけ答えを待つ）。メモリの中だけで、状態の
+     * 保存には入れない（続きから始めた Run では空から覚え直す。最初にその送り先を出す画面で 1 回だけ待つ）。
+     */
+    const dataEndpointMemory = createDataEndpointMemory();
     /**
      * COV-2c の M-1（設計者の判断）: この実行で、凍結の外で読み込んだ URL（ふつうの画面の読み込みと、祖先の根の読み込み）。凍結の中でだけ読む状態の祖先の根は、
      * ここにあれば（最初の 1 回の後は）、最初から凍結した Context で読み込む（読み込みのときの自動の書き込みを、作り直すたびに届けない）。メモリの中だけ。
@@ -744,6 +821,8 @@ async function crawl(
      * （読み込めない・作り直しの押下で移り先を作れない・お知らせの枠を閉じる押下が止められた）、今の形に戻して読み、戻した回数を数える。
      */
     const visitOnce = async (url: NormalizedHttpUrlEvidence, pageOptions: DiscoveryVisitOptions): Promise<PageVisit> => {
+      // DTIME: 残りの候補を押すための読み込み直しを数える。
+      if (pageOptions.reprobe !== undefined) pageOptions.timing?.countReload();
       const root = pageOptions.frozenPath?.rootUrl ?? url;
       if (pageOptions.frozenPath !== undefined && unfrozenLoads.has(root)) {
         const frozen = await session.visit(url, { ...pageOptions, frozenFromStart: true });
@@ -768,6 +847,9 @@ async function crawl(
      * 失敗は発見を止めない（続きにできないだけ。続きの側は、使えない保存なら新しい Run を始めずに止める。SFIX-1104 の M-2）。
      */
     const persist = async (): Promise<void> => {
+      // SLIM（設計書 `2026-11-25-beaksight-discovery-input-check-slim-design.md` 2.3 (a)）: 測りの記録を画面 1 枚ごとに書き出す（読んだ画面も読まなかった
+      // 画面もここを通る。切なら何もしない。途中で止まった Run でも、終えた画面の行が残る）。
+      await debugTiming.flush();
       if (saveCheckpoint === null) {
         return;
       }
@@ -781,6 +863,7 @@ async function crawl(
           uncountedStateIds: [...uncounted],
           crawledPages,
           ...(sharedLayoutDigests.size === 0 ? {} : { sharedLayoutDigests: [...sharedLayoutDigests] }),
+          ...(pagesFromAuditStage === null ? {} : { pagesFromAuditStage }),
         });
       } catch {
         // 保存できなくても、発見は続ける。
@@ -802,9 +885,11 @@ async function crawl(
       }
       try {
         const paced = pacer.snapshot();
+        const { discovered } = queueCounts();
         const returned: unknown = observer.onProgress(deepFreeze({
           pagesFinished,
-          pagesDiscovered: queueCounts().discovered,
+          pagesDiscovered: discovered,
+          ...discoveredSplitItem(discovered),
           ...maxPagesItem(uncounted.size),
           elapsedMs: Math.max(0, now() - startedAtMs),
           navigationCount: paced.navigationCount,
@@ -970,17 +1055,28 @@ async function crawl(
         break;
       }
       const entryUrl = entry.url as NormalizedHttpUrlEvidence;
+      // DTIME: この画面の時間の内訳（差し込める時計で測る。読み込み直し・確かめ直しの読み込みも、この画面に足す。測るだけで、待ちを変えない）。
+      // DBG-1: 測りの記録が入のときだけ作る（切なら測らず、内訳も書かない）。
+      const timing = debugTiming.enabled ? createPageTimeRecorder(now, { log: debugTiming, stateId: entry.stateId }) : undefined;
       // COV-2c（SREV-COV の C-1）・fix round 4（3 回目の C-1。設計者の判断の 2）: 凍結の外で読み込む入口の守り（唯一の判定 `unfrozenLoadRefusalOf`）。この状態を
       // 読むときに凍結の外で読み込む URL（凍結の中でだけ読む状態では、押下を経ていない祖先）が、押下から生まれた状態か、伏せた query を持てば、読み込まずに、
       // 読まなかった画面として理由つきで残す。凍結の中でだけ読む状態で、たどり方の URL が分からないときも、凍結の外では読まない（読み込みの失敗として残す）。
       // COV-2c fix round 5（M-2）: この実行で入れた目印の値でも照らす。
       const unfrozenRefusal = entry.unfrozenLoad === null ? null : unfrozenLoadRefusalOf(entry.unfrozenLoad, [...runMarkerValues]);
-      if (entry.unfrozenLoad === null || unfrozenRefusal !== null) {
+      // SKIP-1: 点検の段の証拠で押す物がないと分かった画面（リンクで来た最上位の文書の状態だけ）は、読み込まずに読まなかった画面として残す。
+      const withoutCandidates = entry.kind === 'LINK' && entry.frame === null && entry.openedRegion === null && entry.trail === null
+        && !entry.frozenRequired && pagesWithoutCandidates.has(entry.url);
+      if (entry.unfrozenLoad === null || unfrozenRefusal !== null || withoutCandidates) {
         // COV-2c fix round 5（I-2）: たどり方の URL が分からない（伏せた祖先を作り直せなかった）ときは、専用の理由で残す。
-        const reason: DiscoveryUnreadReason = unfrozenRefusal === null ? 'REBUILD_FAILED' : UNFROZEN_LOAD_REFUSED_REASON;
+        const reason: DiscoveryUnreadReason = withoutCandidates
+          ? 'NO_PRESSABLE_ELEMENTS'
+          : unfrozenRefusal === null ? 'REBUILD_FAILED' : UNFROZEN_LOAD_REFUSED_REASON;
         queue.completeRead(entry.stateId, { structureKey: unreadStructureKeyOf(reason), edges: [] });
         if (!entry.rebuild) unreadReasons.set(entry.stateId, reason);
         await persist();
+        // DPROG (a): 読まなかった画面も確かめ終えた画面に数え、進みを送る（待ち行列では読み終えた状態。数えないと、確かめた画面が見つけた画面に届かない）。
+        if (!entry.rebuild) pagesFinished += 1;
+        reportProgress();
         continue;
       }
       // COV-2（L7 の N37）: 同じ型の画面を 1 つだけ読む決まり（`SAME_TEMPLATE_PAGE_READ`）はなくした。全部の画面を読み、押すのは、まだ見ていない構造の鍵の
@@ -989,7 +1085,7 @@ async function crawl(
         config, allowedQueryParameters, linkPolicy, classificationPolicy, authentication, pageId: allocator.allocatePageId(), auditStage,
         submissionProbeQuietWaitMs: observationWindowsOrProduction(request.observationWindows).afterPress.probeQuietWaitMs,
         settlePolicy: discoverySettlePolicyOf(request.observationWindows), observationWindows: request.observationWindows, pressRegistry: queue,
-        progressQuietLimitMs: request.progressQuietLimitMs,
+        progressQuietLimitMs: request.progressQuietLimitMs, dataEndpointMemory, timing,
         // COV-2: 読み戻した後の作り直し（祖先の画面を読み直し、伏せた値の URL を埋める）は、押さない。
         linksOnly: entry.rebuild,
         sharedLayout: { pressed: sharedLayoutDigests, onPressed: (digest: string): void => { sharedLayoutDigests.add(digest); } },
@@ -1078,6 +1174,8 @@ async function crawl(
           // DEF-144: 発見を続けた違反の中身と、読み込み直したこと（あるときだけ）。
           ...(continued === null || continued.safetyViolations.length === 0 ? {} : { safetyViolations: continued.safetyViolations }),
           ...(continued?.reloaded === true ? { reloadedForProbe: true } : {}),
+          // DTIME: この画面の時間の内訳（読み始めから記録まで。DBG-1: 測りの記録が入のときだけ）。
+          ...(timing === undefined ? {} : { timeBreakdown: timing.finish() }),
         });
         // COV-2（網羅の設計書 3.2 の 1）: 出た先を全部、辺として待ち行列に入れる（リンク・SPA の経路・移った先の編集の画面・同じ Origin の frame）。
         // DEF-190・OP-J: 移った先の編集の画面は、待ち行列の先に入れ、ページの上限に数えない（L7 の N37: 数と同じ型の 1 回の上限は外した）。
@@ -1157,6 +1255,7 @@ async function crawl(
       pages: [...readPages, ...unread],
       omittedUnreadPages: 0,
       frozenStartFallbacks,
+      ...discoveredSplitItem(queueCounts().discovered),
       endReasonDetail,
       auditStage,
       sessionLoss,
@@ -1267,10 +1366,14 @@ async function visitPage(
      * 読み込みのときの自動の書き込みを届けない。根の画面は凍結を始めずに読む。
      */
     readonly frozenFromStart?: true | undefined;
+    /** DTIME: この画面の時間の内訳を測る口（`visitGuardedPage` が読み込みと間隔の待ちを測り、page ごとの口で、深い部品が待ちを測る）。 */
+    readonly timing?: PageTimeRecorder | undefined;
   },
 ): Promise<PageVisit> {
   // DEF-144: この画面の Context の違反の中身（閉じた後に `visitGuardedPage` が渡す）と、probe の押下の事実。
   const safety: { violation: JobSafetyViolation | null } = { violation: null };
+  // DEF-295（設計書 `2026-11-19-beaksight-probe-wait-and-target-found-design.md` 2 の 1）: 押す前の準備の確かめの窓（観察の窓の一式の、開いた要求の静まりの長さ）。
+  const probeReadyCheckMs = observationWindowsOrProduction(options.observationWindows).pageSettle.openDataRequestQuietMs;
   const probe: {
     culprit: number | null; continuation: ProbeViolationContinuation | null; current: number | null; pressed: number;
     leftBehind: Map<number, readonly SubmissionProbeReplayStep[]>;
@@ -1295,13 +1398,14 @@ async function visitPage(
     }
     // DEF-210（通知の枠の設計書 3.2）: 発見の読み取り（凍結）の前に、落ち着くのを待って、通知の枠を閉じる（閉じられない枠は隠す）。閉じる押下は、probe の
     // 押す数（1 画面 3 回）に数えない。押した後の送信は、この Context の Guard が今の段の判定で扱う。
-    await settleAndDismissNotificationFrames(page, { requestCounter: counter, settlePolicy: options.settlePolicy });
+    // DTIME: 通知の枠の前の落ち着きの待ちも、落ち着きの待ちとして測る。
+    await timedOnScreen(page, 'SETTLE', () => settleAndDismissNotificationFrames(page, { requestCounter: counter, settlePolicy: options.settlePolicy }));
     // L6/L3-1（設計書 `2026-11-09-beaksight-remove-limits-design.md` 5 の 1）: 1 画面の発見と押す輪を、1 つの進みの見張り（`watchDiscoveryScreen`）で包む。読み取り
     // と押す操作は期限を置かずに待ち、ブラウザからの応答・ページの通信・画面の変化のどれもない状態が続いたときだけ、見張りが画面を終える。終えたら、その時点
     // までの記録（押しにかかった対象の記録）を残し、残りを「応答しなかった」（`STAGE_UNRESPONSIVE`・`STAGE_NEVER_QUIET`）として、次の画面へ進む。
     const screen: {
       discovered: DiscoveryReadPageRecord | null;
-      snapshot: ((reason: 'STAGE_UNRESPONSIVE' | 'STAGE_NEVER_QUIET') => DiscoveryReadPageRecord) | null;
+      snapshot: ((reason: 'STAGE_UNRESPONSIVE' | 'STAGE_NEVER_QUIET') => SubmissionProbeEndSnapshot) | null;
       structureKey: string | null;
       links: readonly string[];
       preferredLinks: ReadonlySet<string>;
@@ -1336,10 +1440,11 @@ async function visitPage(
           },
           loadHop: async (hop) => {
             // 読み込みの間隔は今どおり守る。L6/L3-1: 凍結の中の読み込みも、返ったら進みの印を付ける（読み込みの間の通信と画面の変化も、見張りが見る）。
-            await pacer.beforeNavigation();
-            return pageLoadVerdictOf(await trackOnScreen(page, factory.loadFrozenDocument(page, hop, () => navigatePage(page, hop, {
+            // DTIME: 間隔の待ちと読み込みを測る。
+            await timedOnScreen(page, 'PACING_WAIT', () => pacer.beforeNavigation());
+            return pageLoadVerdictOf(await timedOnScreen(page, 'LOAD', () => trackOnScreen(page, factory.loadFrozenDocument(page, hop, () => navigatePage(page, hop, {
               timeoutMs: options.config.crawl.navigationTimeoutMs, ledger, allowedQueryParameters: options.allowedQueryParameters,
-            })))).kind;
+            }))))).kind;
           },
           // DF-3（DEF-167）: 根の落ち着きの後と、hop ごとに、セッションの切れを確かめる。
           afterStep: stopIfSessionLostAfterSettling,
@@ -1387,6 +1492,7 @@ async function visitPage(
           enterSubmissionProbe(null);
           replayedMove = await replaySubmissionProbeMove(page, replayObservation, discovered, options.replayMove, {
             quietWaitMs: options.submissionProbeQuietWaitMs,
+            readyCheckMs: probeReadyCheckMs,
             onPress: () => enterSubmissionProbe(null),
             dataActivity: () => counter.dataActivity(),
           });
@@ -1481,6 +1587,7 @@ async function visitPage(
           isExcludedPage: (location) => isExcludedCrawlCandidate(`${location.origin}${location.path}`, options.linkPolicy.allowedOrigins, options.authentication),
         },
         quietWaitMs: options.submissionProbeQuietWaitMs,
+        readyCheckMs: probeReadyCheckMs,
         // L6/L3-1: 見張りが画面を終えた後は、見放した押下の知らせ（押した組・枠のボタン・移り先など）を受けない（`live`）。
         sharedLayout: options.sharedLayout === undefined ? undefined : { pressed: options.sharedLayout.pressed, onPressed: live(options.sharedLayout.onPressed) },
         // DEF-144: 押す候補（送信ボタンの語と識別の digest。値を持たない）。前の押下の後の違反は、前の押下に結びつける。
@@ -1559,13 +1666,16 @@ async function visitPage(
         // セッションの切れの知らせ（`stopIfSessionLostAfterSettling`）などは、今どおり外へ投げる。
         throw watched.reason;
       case 'ENDED': {
-        // L6/L3-1: 見張りが画面を終えた。押しにかかった対象の記録を残し、残りの対象と画面の記録に理由を付けて、次の画面へ進む（読み込み直さない）。
+        // L6/L3-1: 見張りが画面を終えた。押しにかかった対象の記録を残し、残りの対象と画面の記録に理由を付けて、次の画面へ進む。
+        // DEF-289（DQ の案 3）: 対象を押している途中で終えたときは、理由はその対象だけに付き、残りの対象は押下の並びつきで残る（呼ぶ側の `reprobeRemaining` が、
+        // 読み込み直した Context で続きを押す。読み込みの間隔は今の決まりのまま）。押している対象がなければ、今までどおり読み込み直さない。
         screen.ended = true;
         const end = watched.end === 'STAGE_NEVER_QUIET' ? 'STAGE_NEVER_QUIET' : 'STAGE_UNRESPONSIVE';
-        probe.leftBehind = new Map();
+        const ended = screen.snapshot?.(end) ?? null;
+        probe.leftBehind = new Map(ended?.leftBehind ?? []);
         probe.optionStages = [];
         const pageLocation = page.isClosed() ? null : locationOfUrl(page.url());
-        const partial = screen.snapshot?.(end) ?? screen.discovered ?? Object.freeze({
+        const partial = ended?.record ?? screen.discovered ?? Object.freeze({
           location: pageLocation === null || pageLocation.url === null ? null : pageLocation.location, incompleteReasons: Object.freeze([]), candidates: Object.freeze([]),
         });
         return {
@@ -1826,10 +1936,11 @@ const usableDiscoveryCheckpointOf = (
  */
 async function resumeDiscoveryWorkerRun(
   outputDirectory: string,
+  targetId: string,
   runDirectory: string,
   startedAt: Date,
 ): Promise<Extract<WorkerRunStart, { readonly kind: 'STARTED' }> | Extract<WorkerRunStart, { readonly kind: 'RUN_ACTIVE' }> | null> {
-  const runLock = await acquireRunExclusion(outputDirectory);
+  const runLock = await acquireRunExclusion(outputDirectory, targetId);
   switch (runLock.kind) {
     case 'HELD':
       return { kind: 'RUN_ACTIVE', exitCode: RUN_UNAVAILABLE_EXIT_CODE };
@@ -1857,7 +1968,7 @@ export async function executeDiscoveryRun(request: DiscoveryRunRequest, observer
     : usableDiscoveryCheckpointOf(await writer.readDiscoveryCheckpoint(resumeRunDirectory), resumeRunDirectory, { ...checkpointOptions, resume }, config.crawl);
   const resumed = saved === null || resumeRunDirectory === null
     ? null
-    : await resumeDiscoveryWorkerRun(outputDirectory, resumeRunDirectory, dateOfCompactUtcTimestamp(saved.startedAt));
+    : await resumeDiscoveryWorkerRun(outputDirectory, config.target.id, resumeRunDirectory, dateOfCompactUtcTimestamp(saved.startedAt));
   if (resumed !== null && resumed.kind === 'RUN_ACTIVE') {
     return resumed;
   }
@@ -1866,7 +1977,7 @@ export async function executeDiscoveryRun(request: DiscoveryRunRequest, observer
   if (resumeRunDirectory !== null && resumed === null) {
     return { kind: 'RESUME_UNAVAILABLE', runId: basename(resumeRunDirectory) as RunId, runDirectory: resumeRunDirectory, exitCode: RUN_UNAVAILABLE_EXIT_CODE };
   }
-  const run = resumed ?? await startWorkerRun(outputDirectory, request.clock);
+  const run = resumed ?? await startWorkerRun(outputDirectory, config.target.id, request.clock);
   if (run.kind !== 'STARTED') {
     return run;
   }
@@ -1889,7 +2000,15 @@ export async function executeDiscoveryRun(request: DiscoveryRunRequest, observer
   try {
     // 知らせの口の例外でも、監査中の印を離す（finally の `endWorkerRun`。REV-SPEC2 第 2 回の M-6）。
     observer.onRunStarted({ runId, runDirectory });
-    const crawled = await crawl(request, outputDirectory, observer, resumed === null ? null : saved, saveCheckpoint);
+    // DBG-1: 測りの記録（入切は段の始めに 1 回読む。入のときだけ。Run のフォルダの 1 つのファイルに、段の終わりにまとめて書く）。
+    const debugTimingOn = request.debugTimingSwitch !== undefined && await request.debugTimingSwitch().catch(() => false);
+    const debugTiming = createDebugTimingLog({ enabled: debugTimingOn, directory: runDirectory, now: request.now });
+    let crawled: CrawlResult;
+    try {
+      crawled = await crawl(request, outputDirectory, observer, resumed === null ? null : saved, saveCheckpoint, debugTiming);
+    } finally {
+      await debugTiming.flush();
+    }
     // DEF-143: ここから成果物を組み立てて書く段。入る前に 1 回だけ知らせる。
     observer.onFinalizing?.();
     const document: DiscoveryDocument = {
@@ -1906,6 +2025,8 @@ export async function executeDiscoveryRun(request: DiscoveryRunRequest, observer
       omittedUnreadPages: crawled.omittedUnreadPages,
       // COV-2c の M-1: 祖先を最初から凍結して読めず、今の形に戻した回数（あるときだけ）。
       ...((crawled.frozenStartFallbacks ?? 0) > 0 ? { frozenStartFallbacks: crawled.frozenStartFallbacks } : {}),
+      // DSEED2: 連鎖の操作さがしだけ、見つけた画面の分け方（最後の進み具合と同じ数）。
+      ...(crawled.pagesDiscoveredSplit === undefined ? {} : { pagesDiscoveredSplit: crawled.pagesDiscoveredSplit }),
       // T37a: 鍵の消失の詳しい理由と、監査の段の数（ブラウザを閉じた後の数。口がなければ書かない）。
       ...(crawled.endReasonDetail === null ? {} : { endReasonDetail: crawled.endReasonDetail }),
       ...(crawled.auditStage === null ? {} : { authentication: runAuthenticationSummaryOf(crawled.auditStage) }),

@@ -3,11 +3,11 @@
   "description": "The result of one READ check job (read-evidence.json in the Run directory; Task 27 design 4.5, 4.8; T27e). The value lists and limits are owned by src/discovery/read-check-evaluation.ts. The expectations are the read-check-definition schema (schemas/control/read-check-definition.schema.json), referenced and not copied. Only counts and the checked items are kept: never the whole table, a cookie, a token or a hidden value.",
   "type": "object",
   "additionalProperties": false,
-  "required": ["schemaVersion", "jobId", "runId", "startedAt", "finishedAt", "runStatus", "endReason", "checks"],
+  "required": ["schemaVersion", "jobId", "runId", "startedAt", "finishedAt", "runStatus", "endReason", "checks", "searchChecks"],
   "properties": {
     "schemaVersion": {
-      "description": "T37d: the current version 1.2 (the target kind and the page path of each check, and the two details of the audit stage); the writer writes 1.2 (src/discovery/read-check-evaluation.ts). LG-4: the previous versions 1.0 and 1.1 are no longer read.",
-      "enum": ["read-evidence-schema/1.2"]
+      "description": "RCA-5 (search check design 2.5): the current version 1.3 (the search checks searchChecks; the record results of DEF-235 and RECORD_ID_NOT_AVAILABLE removed); the writer writes 1.3 (src/discovery/read-check-evaluation.ts). LG-4: the previous versions are no longer read.",
+      "enum": ["read-evidence-schema/1.3"]
     },
     "jobId": { "$ref": "#/$defs/id" },
     "runId": { "$ref": "urn:beaksight:schema:run:1.0#/properties/runId" },
@@ -18,6 +18,15 @@
       "enum": ["COMPLETED", "MAX_RUNTIME_REACHED", "STOPPED", "AUTH_SESSION_LOST", "SERVICE_REQUEST_LIMIT_REACHED", "SITE_UNAVAILABLE", "SAFETY_VIOLATION", "PREFLIGHT_FAILED"]
     },
     "checks": { "type": "array", "items": { "$ref": "#/$defs/check" } },
+    "searchChecks": {
+      "description": "RCA-5 (search check design 2.2): the search checks of the job in the START order (a GET search form or a script search, with the automatic values). Never a URL or a value: the how is the kind of the change, the text among the closed list, and for a form the field name (the same as discovery.json).",
+      "type": "array",
+      "items": { "$ref": "#/$defs/searchCheck" }
+    },
+    "sessionLostSearchCheckKey": {
+      "description": "Optional (REV-RCA I-4): the key of the search check that was being checked when the session was lost (endReason AUTH_SESSION_LOST). The parent passes it to the job after the re-login, which checks that combo first. Absent when the session was lost on a definition of a person, and otherwise.",
+      "$ref": "#/$defs/digest"
+    },
     "endReasonDetail": {
       "description": "Optional (T37a; Task 37 design 3.1): the detail of the end (the same list as discovery.json). Absent otherwise.",
       "$ref": "urn:beaksight:schema:discovery:1.0#/properties/endReasonDetail"
@@ -112,7 +121,6 @@
             "HTTP_ERROR_STATUS",
             "RESULT_PAGE_UNREADABLE",
             "SESSION_LOST",
-            "RECORD_ID_NOT_AVAILABLE",
             "STAGE_UNRESPONSIVE",
             "STAGE_NEVER_QUIET",
             "SERVICE_READ_REFUSED",
@@ -138,32 +146,92 @@
         "subresourceRequests": {
           "description": "Optional (DEF-130-fix): the requests other than documents (images, fetch, xhr and so on) that the Guard sent when the READ URL was loaded (a separate count).",
           "$ref": "#/$defs/count"
-        },
-        "records": {
-          "description": "Optional (DEF-235): the results of each record id filled into a page path template, in the read order (no item limit: the coverage is not cut by a count). The fields of the check above are the representative one (the first NOT_MATCHED, else the first that is not MATCHED, else the first).",
-          "type": "array",
-          "minItems": 1,
-          "items": { "$ref": "#/$defs/recordEvidence" }
         }
       }
     },
-    "recordEvidence": {
-      "description": "DEF-235: one read of a page path template with a record id (the record id is in the URL).",
+    "searchCheck": {
+      "description": "RCA-5: one search check (executed or not executed).",
       "type": "object",
-      "additionalProperties": false,
-      "required": ["result", "detail", "url", "httpStatus", "blockedRequests", "structure", "expectations"],
+      "required": ["key", "trigger", "pagePath", "how", "state"],
       "properties": {
-        "result": { "$ref": "#/$defs/executed/properties/result" },
-        "detail": { "$ref": "#/$defs/executed/properties/detail" },
-        "url": { "$ref": "#/$defs/executed/properties/url" },
-        "httpStatus": { "$ref": "#/$defs/executed/properties/httpStatus" },
-        "blockedRequests": { "$ref": "#/$defs/count" },
-        "structure": { "$ref": "#/$defs/executed/properties/structure" },
-        "expectations": { "$ref": "#/$defs/executed/properties/expectations" },
-        "documentRequests": { "$ref": "#/$defs/count" },
-        "childFrameDocumentRequests": { "$ref": "#/$defs/count" },
-        "subresourceRequests": { "$ref": "#/$defs/count" }
-      }
+        "key": { "$ref": "#/$defs/digest" },
+        "trigger": { "enum": ["FORM", "PRESS", "TYPED"] },
+        "pagePath": { "type": "string", "minLength": 1 },
+        "how": {
+          "oneOf": [
+            { "type": "object", "additionalProperties": false, "required": ["kind"], "properties": { "kind": { "const": "BASELINE" } } },
+            {
+              "type": "object",
+              "additionalProperties": false,
+              "required": ["kind", "text"],
+              "properties": { "kind": { "const": "TEXT" }, "text": { "enum": ["EMPTY", "HALF_WIDTH", "FULL_WIDTH"] }, "field": { "type": "string", "minLength": 1 } }
+            },
+            {
+              "type": "object",
+              "additionalProperties": false,
+              "required": ["kind", "field", "optionIndex"],
+              "properties": { "kind": { "const": "OPTION" }, "field": { "type": "string", "minLength": 1 }, "optionIndex": { "$ref": "#/$defs/count" } }
+            },
+            {
+              "type": "object",
+              "additionalProperties": false,
+              "required": ["kind", "field"],
+              "properties": { "kind": { "const": "CHECK" }, "field": { "type": "string", "minLength": 1 } }
+            }
+          ]
+        },
+        "state": { "enum": ["EXECUTED", "NOT_EXECUTED"] }
+      },
+      "oneOf": [
+        {
+          "additionalProperties": false,
+          "required": ["result", "detail", "httpStatus", "reads"],
+          "properties": {
+            "key": true,
+            "trigger": true,
+            "pagePath": true,
+            "how": true,
+            "state": { "const": "EXECUTED" },
+            "result": { "enum": ["NO_ERROR", "ERROR", "UNDETERMINED"] },
+            "detail": {
+              "enum": [
+                "OPENED",
+                "CLIENT_ERROR_STATUS",
+                "SERVER_ERROR",
+                "NOT_OPENED",
+                "LOGIN_BOUNCE",
+                "UNSENT_HIDDEN_FIELDS",
+                "BLOCKED_BY_BEAKSIGHT",
+                "EMPTY_NOT_SEARCHED",
+                "NO_READ",
+                "STATE_NOT_REBUILT",
+                "NO_RESPONSE",
+                "NON_STANDARD_STATUS",
+                "SITE_UNAVAILABLE_STATUS",
+                "SERVICE_READ_REFUSED",
+                "AUDIT_STAGE_REQUEST_BLOCKED"
+              ]
+            },
+            "httpStatus": { "$ref": "#/$defs/executed/properties/httpStatus" },
+            "reads": {
+              "type": "array",
+              "items": { "$ref": "urn:beaksight:schema:discovery:1.0#/$defs/searchTrigger/properties/reads/items" }
+            }
+          }
+        },
+        {
+          "additionalProperties": false,
+          "required": ["reason"],
+          "properties": {
+            "key": true,
+            "trigger": true,
+            "pagePath": true,
+            "how": true,
+            "state": { "const": "NOT_EXECUTED" },
+            "reason": { "$ref": "#/$defs/notExecuted/properties/reason" }
+          }
+        }
+      ]
     },
     "notExecuted": {
       "type": "object",

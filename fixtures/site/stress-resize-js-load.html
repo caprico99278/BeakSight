@@ -1,0 +1,22 @@
+<!doctype html>
+<html lang="ja">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>幅の走査（読み込みの時だけ幅を読む画面）</title>
+<style>
+  body { margin: 0; font: 16px/1.5 sans-serif; }
+  #slider { height: 80px; background: #cde; }
+</style>
+</head>
+<body>
+<main>
+  <h1>幅の走査</h1>
+  <div id="slider">スライダー</div>
+</main>
+<script>
+  // 読み込みの時だけ幅を読んで、部品の幅を px で決める（大きさを変えても直さない）。
+  document.getElementById('slider').style.width = `${window.innerWidth}px`;
+</script>
+</body>
+</html>

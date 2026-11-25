@@ -3,6 +3,8 @@ import type { PageRuleInput } from '../../src/audit/rule.js';
 import { RULE_CATALOG } from '../../src/audit/rule-catalog.js';
 import { RuleEngine } from '../../src/audit/rule-engine.js';
 import { TECHNICAL_RULES } from '../../src/audit/technical-rules.js';
+import { hasLoweredFindingClass } from '../../src/audit/finding-grouping-keys.js';
+import { DUPLICATE_ELEMENT_ID_TEXT } from '../../src/presentation/messages.js';
 import type {
   EvidenceRecord,
   EvidenceRecordFor,
@@ -912,6 +914,17 @@ describe('DUPLICATE_ELEMENT_ID', () => {
   it('重複がなければ作らない', () => {
     expect(findingsOf(evaluate([domRecord({ duplicateIds: [] })]), 'DUPLICATE_ELEMENT_ID')).toEqual([]);
   });
+
+  it('RVP-5: その id を参照する要素がなければ、文にその事実を書き、確信度を下げる区分の鍵を付ける', () => {
+    const duplicates = findingsOf(evaluate([domRecord({
+      duplicateIds: [{ id: 'free', count: 2, truncated: false, referenceCount: 0 }, { id: 'used', count: 2, truncated: false, referenceCount: 1 }],
+    })]), 'DUPLICATE_ELEMENT_ID');
+    const of = (id: string) => duplicates.find((finding) => finding.message.includes(id));
+    expect(of('free')?.message).toContain(DUPLICATE_ELEMENT_ID_TEXT.unreferencedNote);
+    expect(hasLoweredFindingClass(of('free')?.groupingKeys ?? [])).toBe(true);
+    expect(of('used')?.message).not.toContain(DUPLICATE_ELEMENT_ID_TEXT.unreferencedNote);
+    expect(hasLoweredFindingClass(of('used')?.groupingKeys ?? [])).toBe(false);
+  });
 });
 
 describe('INVALID_CANONICAL_URL', () => {
@@ -956,6 +969,8 @@ describe('FORM_WITHOUT_ACTION', () => {
     expect(forms).toHaveLength(1);
     expect(forms[0]).toMatchObject({ category: 'FORM', severity: 'INFO' });
     expect(forms[0]?.message).toContain('post');
+    // AUD-6（S-09）: 利用者向けの文は事実の記録で、送れないとは書かない。
+    expect(TECHNICAL_RULES.find(({ ruleId }) => ruleId === 'FORM_WITHOUT_ACTION')?.plainMessage).not.toMatch(/送れない|送られない|無効/u);
   });
 
   it('action のある form では作らない', () => {

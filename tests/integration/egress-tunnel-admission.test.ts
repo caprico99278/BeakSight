@@ -192,8 +192,8 @@ const EXPECTED_TITLE = 'done:api,w';
 const AUDIT_PAGE_PATH = '/stress-connect/page.html';
 /** DEF-209: 幅の走査の幅（2 つ）。 */
 const STRESS_WIDTHS = [320, 768];
-/** DEF-209: 読み込みの数（Desktop、幅の走査の幅、Mobile）。 */
-const PAGE_LOADS = 2 + STRESS_WIDTHS.length;
+/** DEF-209・SWR: 読み込みの数（Desktop、幅の走査の 2 回（大きさを変えて回す 1 回と、一番狭い幅の照らし合わせの 1 回）、Mobile）。 */
+const PAGE_LOADS = 2 + 2;
 /** DEF-209: 読み込みの間隔（ms）。中継が知らせのない CONNECT を待つ時間より長くする（待つ間に張った接続は、知らせが来ないまま拒まれる）。 */
 const NAVIGATION_INTERVAL_MS = EGRESS_TUNNEL_ADMISSION_WAIT_MS + 1_500;
 /** DEF-209・DEF-215 の場面の期限（ms）。 */
@@ -371,7 +371,7 @@ describe.each(BOTH_CHROMIUM_LAUNCHERS)('DEF-125: the egress proxy admits CONNECT
     })();
 
     const [layout] = audited.outcome.result.evidence.filter((record): record is EvidenceRecordFor<'layout'> => record.type === 'layout' && record.viewport === 'desktop');
-    expect(layout?.payload.stressSweep?.map(({ width, status }) => [width, status])).toEqual(STRESS_WIDTHS.map((width) => [width, 'COMPLETE']));
+    expect(layout?.payload.stressSweep?.map(({ width, status }) => [width, status])).toEqual([...STRESS_WIDTHS].reverse().map((width) => [width, 'COMPLETE']));
     expect(connectRecordsOf(audited.outcome)).toEqual([]);
     expect(safetyRuleIdsOf(audited)).toEqual([]);
     expect(received).toEqual(Array.from({ length: PAGE_LOADS }, () => `GET ${AUDIT_PAGE_PATH}`));

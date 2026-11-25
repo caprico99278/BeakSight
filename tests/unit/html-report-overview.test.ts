@@ -270,3 +270,14 @@ describe('renderHtmlReport: the planned writes after the audit stage (OP-H)', ()
     expect(renderHtmlReport(buildReportViewModel(auditRun()))).not.toContain(escapeHtml(line));
   });
 });
+
+// DUP（設計書 `2026-11-18-beaksight-same-structure-pages-design.md` 3 章）: まとめの 1 文と画面ごとの 1 文を、表示用モデルの文のまま描く。
+describe('renderHtmlReport: the pages of the same template (DUP)', () => {
+  it('shows the sentence of the summary and the sentence of a page audited lightly', () => {
+    const run = auditRun({ pages: [page(PAGE_1, '/customers/1'), page(PAGE_2, '/customers/2', 'AUDITED', [], [], { sameness: { depth: 'LIGHT', sameAs: PAGE_1 } })] });
+    const html = render(run);
+    const model = buildReportViewModel(run);
+    expect(html).toContain(escapeHtml(model.summary.samenessNote ?? 'missing'));
+    expect(html).toContain(escapeHtml(model.pages[1]?.samenessNote ?? 'missing'));
+  });
+});

@@ -4,10 +4,12 @@
 //   すべての文字列の URL に、伏せ字の部品（`redactUrlSecretsInValue`）を通す。`writeRun` が返す最終の Run（表示用モデル、HTML、バンドルの
 //   もと）も伏せ字の後の値。スキーマに合う。
 // - T44g（Task 44 の設計書 P4-1。案 2）: 既定（公開監査）の書き手も、同じく伏せる。名前で伏せる段を外した書き手（`urlSecretRedaction: false`）だけが値を通さない。
-import { mkdtemp, readFile, rm } from 'node:fs/promises';
+import { mkdtemp, readdir, readFile, rm } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
+import { unzipSync } from 'fflate';
 import { afterEach, describe, expect, it } from 'vitest';
+import { writeAuditRunOutputs } from '../../src/cli/audit-run.js';
 import {
   RUN_ARTIFACT_FILE_NAMES,
   artifactFilePath,
@@ -189,5 +191,43 @@ describe('ArtifactWriter: the URL secrets of an authenticated Run (Task 25 desig
     expect(written.schemaValid).toBe(true);
     expect(written.result).toEqual(redactUrlSecretsInValue(redactRecordedRequestUrlsInValue(result)));
     expect(leakedSecrets(JSON.stringify(written.result))).toEqual([]);
+  });
+
+  // DEF-298: くり返しをまとめた記録（`repeatedReads`）の `first`・`slowest` の URL も、記録した要求の URL と同じく伏せる（page.json・保存のページ・束）。
+  // BS-1 の M-5: 伏せた後の Run から作った計測のタグの一覧に、識別子だけは残る。値は作り物。
+  it('redacts the URLs of the repeated reads in every written file, and keeps the measurement tag identifier in the list (DEF-298)', async () => {
+    const tagUrl = 'https://www.googletagmanager.com/gtm.js?id=GTM-TEST001';
+    const firstUrl = `${FIXTURE_ORIGIN}/api/poll?userId=${SECRETS.sid}&t=1`;
+    const slowestUrl = `${FIXTURE_ORIGIN}/api/poll?userId=${SECRETS.code}&t=2`;
+    const { timing, method, resourceType, isMainFrame, isNavigationRequest } = networkFailure(firstUrl, 'fetch', '');
+    const request = (requestId: string, url: string) => ({ requestId, url, method, resourceType, headers: { status: 'OBSERVED' as const, values: {} }, timing,
+      redirectFromRequestId: null, redirectToRequestId: null, redirectChainRequestIds: [], truncated: false, isMainFrame, isNavigationRequest });
+    const evidence = record('network', 1, PAGE_1, 'desktop', {
+      requests: [request('R0', tagUrl), request('R1', firstUrl)], responses: [], failures: [],
+      repeatedReads: [{
+        method, origin: FIXTURE_ORIGIN, path: '/api/poll', resourceType, status: 200, isMainFrame, count: 3, firstRequestId: 'R1',
+        first: { url: firstUrl, timing }, slowest: { url: slowestUrl, timing }, firstStartTime: 0, lastStartTime: 1,
+        transfer: { observedCount: 0, totalBytes: 0 }, distinctQueryCount: 2,
+      }],
+      omittedRequestCount: 0, omittedResponseCount: 0, omittedFailureCount: 0,
+    });
+    const result = auditRun({ pages: [page(PAGE_1, '/', 'AUDITED', [evidence])] });
+    const root = await outputDirectory();
+    const writer = new ArtifactWriter({ urlSecretRedaction: true });
+    const outputs = await writeAuditRunOutputs(result, root, writer);
+    const runDirectory = runArtifactDirectory(root, RUN_ID);
+    await writer.writeCheckpointPage(runDirectory, createRunCheckpointPage({ result: result.pages[0] as PageAuditResult, retryEvidence: [], safetyLedgerSnapshots: [] }));
+
+    const texts = await Promise.all([pageArtifactRelativePath(PAGE_1, 'page'), checkpointPageArtifactRelativePath(PAGE_1)]
+      .map(async (path) => readFile(artifactFilePath(runDirectory, path), 'utf8')));
+    const bundles = (await readdir(runDirectory)).filter((name) => name.endsWith('.zip'));
+    expect(bundles.length).toBeGreaterThan(0);
+    for (const name of bundles) {
+      const entries = unzipSync(new Uint8Array(await readFile(join(runDirectory, name))));
+      texts.push(...Object.values(entries).map((bytes) => new TextDecoder().decode(bytes)));
+    }
+    expect(texts.flatMap(leakedSecrets)).toEqual([]);
+    expect(texts[0]).toContain(`userId=${REDACTED}&t=${REDACTED}`);
+    expect(outputs.summary.measurementTags.tags.map(({ tagId }) => tagId)).toEqual(['GTM-TEST001']);
   });
 });

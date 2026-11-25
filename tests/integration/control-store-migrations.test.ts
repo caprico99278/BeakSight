@@ -508,7 +508,7 @@ describe('Control store migrations: version 20 drops the length limits of the UR
     expect(tableNamesOf(connection).filter((name) => name.includes('_v20'))).toEqual([]);
     expect((connection.prepare("SELECT name FROM sqlite_schema WHERE type = 'index' AND tbl_name IN ('discovery_candidates', 'jobs', 'write_results', 'read_checks') "
       + 'AND sql IS NOT NULL ORDER BY name').all() as { name: string }[]).map(({ name }) => name))
-      .toEqual(['discovery_candidates_profile_last_seen', 'jobs_created_at', 'jobs_single_active', 'read_checks_profile_created', 'write_results_profile',
+      .toEqual(['discovery_candidates_profile_last_seen', 'jobs_created_at', 'jobs_profile_single_active', 'read_checks_profile_created', 'write_results_profile',
         'write_results_scenario_recorded']);
     // 外部キーは、替えた表を指したまま（確かめの結果が定義を参照する）。
     expect(connection.prepare('PRAGMA foreign_key_check').all()).toEqual([]);
@@ -580,6 +580,34 @@ describe('Control store migrations: version 22 adds the display name to the disp
     setName(connection, 'あ'.repeat(80));
     expect(() => setName(connection, '')).toThrow();
     expect(() => setName(connection, 'あ'.repeat(81))).toThrow();
+    expect(connection.prepare('PRAGMA integrity_check').get()).toEqual({ integrity_check: 'ok' });
+  });
+});
+
+// PAR-b（設計書 `2026-11-17-beaksight-parallel-site-audits-design.md` 2 章）: 版 23 は、終わっていないジョブの一意の部分索引を、管理データ全体で 1 つから
+// プロファイルごとに 1 つにする。
+describe('Control store migrations: version 23 allows one active job per profile (PAR-b)', () => {
+  const AT = '20261117000000';
+  const insertJob = (connection: DatabaseSync, jobId: string, profileId: string): unknown =>
+    connection.prepare("INSERT INTO jobs (job_id, profile_id, profile_revision, state, start_new, created_at, job_kind) VALUES (?, ?, 1, 'RUNNING', 1, ?, 'AUDIT')")
+      .run(jobId, profileId, AT);
+
+  it('keeps the job rows of version 22, and then accepts active jobs of two profiles but not two of one profile', () => {
+    const connection = rawConnection('v23.sqlite');
+    connection.exec('PRAGMA foreign_keys = ON');
+    expect(runControlMigrations(connection, CONTROL_MIGRATIONS.slice(0, 5))).toEqual({ foundSchemaVersion: 0, schemaVersion: BASE_VERSION + 5 });
+    for (const profileId of ['example-par-one', 'example-par-two']) {
+      connection.prepare('INSERT INTO profiles (profile_id, revision, status, document, updated_at) VALUES (?, 1, ?, ?, ?)').run(profileId, 'ACTIVE', '{}', AT);
+    }
+    insertJob(connection, 'job-one', 'example-par-one');
+    // 版 22 では、ほかのプロファイルのジョブも同時に動かせない。
+    expect(() => insertJob(connection, 'job-two', 'example-par-two')).toThrow();
+    const before = connection.prepare('SELECT * FROM jobs ORDER BY job_id').all();
+
+    expect(runControlMigrations(connection)).toEqual({ foundSchemaVersion: BASE_VERSION + 5, schemaVersion: CONTROL_SCHEMA_VERSION });
+    expect(connection.prepare('SELECT * FROM jobs ORDER BY job_id').all()).toEqual(before);
+    insertJob(connection, 'job-two', 'example-par-two');
+    expect(() => insertJob(connection, 'job-three', 'example-par-one')).toThrow();
     expect(connection.prepare('PRAGMA integrity_check').get()).toEqual({ integrity_check: 'ok' });
   });
 });

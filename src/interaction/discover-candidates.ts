@@ -14,7 +14,7 @@ import {
   type IsolatedReadOutcome,
 } from '../discovery/isolated-read.js';
 import { composeInPage, type StandardReaders } from '../browser/in-page-readers.js';
-import { destructiveActionFactsFrom, isDestructiveAction, type DestructiveActionFacts } from '../discovery/destructive-action.js';
+import { destructiveActionFactsFrom, isAiAction, isDestructiveAction, type DestructiveActionFacts } from '../discovery/destructive-action.js';
 import { isHttpProtocol } from '../crawl/normalize-url.js';
 import { CLASS_ATTRIBUTE_NAME } from '../evidence/interaction-collector.js';
 import {
@@ -700,6 +700,7 @@ function candidateFromRaw(candidate: unknown, label: string): InteractionCandida
     throw new Error(`Invalid browser interaction candidate: ${label}`);
   }
   const { href, hrefKind } = classifyHref(candidate.rawHref, candidate.documentUrl, candidate.documentOrigin);
+  const actionFacts = destructiveFactsField(candidate.destructiveFacts, `${label}.destructiveFacts`);
   const withoutId: Omit<InteractionCandidate, 'candidateId'> = {
     ordinal: ordinalField(candidate.ordinal, `${label}.ordinal`),
     tagName: stringField(candidate.tagName, `${label}.tagName`),
@@ -720,7 +721,9 @@ function candidateFromRaw(candidate: unknown, label: string): InteractionCandida
     type: nullableStringField(candidate.type, `${label}.type`),
     disabled: booleanField(candidate.disabled, `${label}.disabled`),
     visible: booleanField(candidate.visible, `${label}.visible`),
-    destructiveAction: isDestructiveAction(destructiveFactsField(candidate.destructiveFacts, `${label}.destructiveFacts`)),
+    destructiveAction: isDestructiveAction(actionFacts),
+    // AIW: AI の操作の印は、当たるときだけ付ける（前の記録の形のまま）。
+    ...(isAiAction(actionFacts) ? { aiAction: true } : {}),
     boundingBox: boundingBoxField(candidate.boundingBox, `${label}.boundingBox`),
   };
   return freezeInteractionCandidate({

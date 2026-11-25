@@ -91,6 +91,8 @@ describe('L4: the schemas have no count limit of the READ checks', () => {
       schemaVersion: READ_EVIDENCE_ARTIFACT_SCHEMA_VERSION, jobId: 'job-read-1', runId: 'RUN-20261109000000', startedAt: '20261109000000',
       finishedAt: '20261109000100', runStatus: 'COMPLETE', endReason: 'COMPLETED',
       checks: Array.from({ length: MANY }, (_value, index) => ({ ...check, readCheckId: `read-${index}` })),
+      // RCA-5: 版 1.3 は検索の確かめの組（`searchChecks`）を必ず持つ。
+      searchChecks: [],
     };
     expect(await validateArtifact('read-evidence', document)).toEqual({ ok: true });
   });

@@ -139,8 +139,11 @@ const schemaUrlFor = (schemaName: ControlSchemaName): URL => {
  * `REFERENCED_SCHEMA_PATHS` と同じ考え方）。
  * - `approval-summary.schema.json`: IPC の `START` の書き込みの指定の承認の要約（`write.approvalFacts`）の形（`$defs/facts`）。
  * - `action-run.schema.json`・`run.schema.json`: `approval-summary` が参照する ID の形（成果物のスキーマの中の参照を解決するため）。
+ * - `discovery.schema.json`・`read-evidence.schema.json`（RCA-6）: IPC の検索の確かめの組（`startSearchCheck`）の、きっかけの形と試し方の形。
  */
-const REFERENCED_ARTIFACT_SCHEMA_FILES: readonly string[] = Object.freeze(['run.schema.json', 'action-run.schema.json', 'approval-summary.schema.json']);
+const REFERENCED_ARTIFACT_SCHEMA_FILES: readonly string[] = Object.freeze([
+  'run.schema.json', 'action-run.schema.json', 'approval-summary.schema.json', 'discovery.schema.json', 'read-evidence.schema.json',
+]);
 
 const artifactSchemaUrlFor = (fileName: string): URL =>
   new URL(`${isDistributionBuild ? '../schemas/' : '../../schemas/'}${fileName}`, import.meta.url);

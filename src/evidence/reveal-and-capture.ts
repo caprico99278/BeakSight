@@ -5,6 +5,8 @@
  *   viewport を撮る（呼ぶ側の口）→ 撮った画像の範囲に対象が入ったか（`TargetImageInclusion`）を機械で決める → 元の位置へ戻す。
  * - 対象が箱（viewport とスクロールの祖先の箱の小さい方）より大きいときは、箱の大きさに分けて、全部の部分を撮る（終わりは、部分の数という構造の事実）。
  * - 重なりは、同じ帯に入るほかの重なり（動かした位置で全部が画像に入るもの）を同じ 1 枚にまとめる。
+ * - TII（DEF-285）: 重なり・見切れは、動かす前に画面の中で見えていれば動かさずに撮る（`AS_IS`）。動かして交わりが消えたら、元の位置で撮る（layout の測りと
+ *   同じ位置関係を優先する）。
  * - 固定の枠の覆いは、対象を動かした位置（`TARGET`）と、文書と祖先を末尾まで動かした位置（`END`）の両方で測って撮る（区分は Rule の側の 1 か所）。
  * - フォーカスの確かめは、動かさずに（フォーカスの後の位置のまま）測って撮る（`captureAsIs`）。
  * - EV-4（設計書 3.4）: 文字の見切れは、重なりと同じく帯ごとに撮る。横にスクロールする領域は、領域まで動かして撮った後に、Tab で届くか・矢印のキーで動くかを
@@ -28,7 +30,7 @@ import type {
 } from '../core/evidence-types.js';
 import { wait } from '../core/deadline.js';
 import { MAX_SELECTOR_DEPTH } from '../core/limits.js';
-import { inclusionOfVisiblePart, isUncoveredMeasurement } from '../core/target-image-inclusion.js';
+import { inclusionOfVisiblePart, isShownInPlace, isUncoveredMeasurement, vanishedByMove } from '../core/target-image-inclusion.js';
 import { LAYOUT_THRESHOLDS } from './layout-collector.js';
 
 /** hit-test の点を内側へ寄せる量（px。layout の hit-test と同じ値）。 */
@@ -139,10 +141,9 @@ function measureReader(R: StandardReaders, { targets, insetPx, controlSelector }
       boxWidth = Math.min(boxWidth, box.width);
       boxHeight = Math.min(boxHeight, box.height);
     }
-    // REV-EV12 の I-2: 内容を切り取る祖先（`overflow` が visible でない向き。hidden・clip・auto・scroll など）の箱で、見える部分を切る（文書の根と body は除く）。
-    const parentOf = R.standardGetter<Element | null>(Node.prototype, 'parentElement');
-    for (let node = parentOf(first); node !== null && node !== root && node !== body; node = parentOf(node)) {
-      const style = window.getComputedStyle(node);
+    // REV-EV12 の I-2: 内容を切り取る祖先（`overflow` が visible でない向き。hidden・clip・auto・scroll など）の箱で、見える部分を切る。TII（DEF-285）: 切り取りうる
+    // 祖先は、layout と同じ決まりの 1 か所（`R.clippingAncestorsOf`。overflow が効かない inline・contents の箱と、包含ブロックの外の箱では切らない）。
+    for (const [node, style] of R.clippingAncestorsOf(first, window.getComputedStyle(first))) {
       const clipX = style.overflowX !== 'visible';
       const clipY = style.overflowY !== 'visible';
       if (!clipX && !clipY) continue;
@@ -288,6 +289,20 @@ function moveReader(R: StandardReaders, { spec, segment, position, maxSelectorDe
 }
 const moveInPage = composeInPage(moveReader);
 
+/** TII（DEF-285）: ページの中で、動かさずに今の位置を記録する（前と後が同じ。祖先は動かさない）。要素がなければ `null`。 */
+function stayReader(_R: StandardReaders, { spec }: { readonly spec: RevealTargetSpec }): FocusCheckScrollEvidence | null {
+  for (const selector of spec.selectors) {
+    try {
+      if (Document.prototype.querySelector.call(document, selector) === null) return null;
+    } catch {
+      return null;
+    }
+  }
+  const here = { scrollX: window.scrollX, scrollY: window.scrollY };
+  return { document: { before: here, after: here }, ancestors: [] };
+}
+const stayInPage = composeInPage(stayReader);
+
 /**
  * ページの中で、動かした祖先と文書を、前の位置へ戻す。REV-EV12 の M-1: 祖先は、対象から引き直さず、記録した祖先の selector で引く（仮想の一覧などで、動かした
  * 後に対象の行が消えても戻す）。
@@ -393,23 +408,48 @@ export async function revealAndCapture(page: RevealPage, targets: readonly Revea
     position: Extract<RevealPosition, 'TARGET' | 'ONE_SCREEN' | 'END'>,
     group: readonly RevealTargetSpec[],
     whole: boolean,
+    initial?: RawMeasure,
   ): Promise<Shot> => {
-    const scroll = await track(page.evaluate(moveInPage, { spec: lead, segment: segment?.box ?? null, position, maxSelectorDepth: MAX_SELECTOR_DEPTH }));
+    // TII（DEF-285）: 重なり・見切れは、動かす前に画面の中で見えていれば、動かさずにその位置（`AS_IS`）で撮る（覆いは、動かした位置の測りで区分するので除く）。
+    const inPlace = position === 'TARGET' && segment === null && lead.purpose !== 'FIXED_ELEMENT_OCCLUSION' && initial !== undefined;
+    const stay = (): Promise<FocusCheckScrollEvidence | null> => track(page.evaluate(stayInPage, { spec: lead }));
+    const shownInPlace = inPlace && isShownInPlace(initial);
+    const scroll = shownInPlace
+      ? await stay()
+      : await track(page.evaluate(moveInPage, { spec: lead, segment: segment?.box ?? null, position, maxSelectorDepth: MAX_SELECTOR_DEPTH }));
     if (scroll === null) {
       return null;
     }
     try {
-      await track(wait(options.settleMs));
-      const state = await measure([{ spec: lead, segment: segment?.box ?? null }, ...group.map((other) => ({ spec: other, segment: null }))]);
+      const specs = [{ spec: lead, segment: segment?.box ?? null }, ...group.map((other) => ({ spec: other, segment: null }))];
+      let taken: { readonly scroll: FocusCheckScrollEvidence; readonly position: RevealPosition } = { scroll, position: shownInPlace ? 'AS_IS' : position };
+      if (!shownInPlace) {
+        await track(wait(options.settleMs));
+      }
+      let state = await measure(specs);
+      // 動かしたことで交わりが消えた（片方だけが動いた）ら、元の位置へ戻して、その位置で撮る（元の位置で画面の外なら、今どおり保留になる）。
+      if (inPlace && !shownInPlace && vanishedByMove(initial.rect, state.measures[0]?.rect ?? null)) {
+        await track(page.evaluate(restoreInPage, { scroll }));
+        const here = await stay();
+        if (here === null) {
+          return null;
+        }
+        taken = { scroll: here, position: 'AS_IS' };
+        await track(wait(options.settleMs));
+        state = await measure(specs);
+      }
       const [own, ...others] = state.measures;
       if (own === undefined) {
         return null;
       }
-      const shot = [{ spec: lead, measured: freezeMeasured(lead, position, scroll, own, segment === null ? null : { index: segment.index, count: segment.count }) }];
+      const shot = [{
+        spec: lead,
+        measured: freezeMeasured(lead, taken.position, taken.scroll, own, segment === null ? null : { index: segment.index, count: segment.count }),
+      }];
       others.forEach((measured, index) => {
         const other = group[index];
         if (other !== undefined && measured.found && (whole || targetImageInclusionOf(measured, true) === 'INSIDE')) {
-          shot.push({ spec: other, measured: freezeMeasured(other, position, scroll, measured, null) });
+          shot.push({ spec: other, measured: freezeMeasured(other, taken.position, taken.scroll, measured, null) });
         }
       });
       await options.capture(Object.freeze({
@@ -435,7 +475,9 @@ export async function revealAndCapture(page: RevealPage, targets: readonly Revea
         }
         const segments = split ? revealSegmentsOf(first.rect, first.boxWidth, first.boxHeight) : [null];
         for (const [index, box] of segments.entries()) {
-          const shot = await shoot(current, box === null ? null : { box, index, count: segments.length }, 'TARGET', box === null ? pending : [], false);
+          const shot = box === null
+            ? await shoot(current, null, 'TARGET', pending, false, first)
+            : await shoot(current, { box, index, count: segments.length }, 'TARGET', [], false);
           for (const { spec, measured } of shot ?? []) {
             measuredAll.push(measured);
             if (spec !== current) {
@@ -512,20 +554,38 @@ export interface KeyboardRevealPage extends RevealPage {
 }
 
 /**
- * EV-4: 押してよいキーの閉じた一覧（Tab・Shift+Tab・矢印。文字・Enter・Space は押さない）。キーを押すのは `pressRegionKey` の 1 か所だけ（Architecture Gate
- * `tests/architecture/worker-login-hooks.test.ts` の (q) が、この一覧と押す所を確かめる）。
+ * EV-4: 横にスクロールする領域と Tab の確かめが押してよいキーの閉じた一覧（Tab・Shift+Tab・矢印。文字・Enter・Space は押さない）。Enter と Esc は、窓を開く
+ * ボタンの確かめだけの別の一覧（`DIALOG_CHECK_KEYS`）にある。キーを押すのは `pressRegionKey` の 1 か所だけ（Architecture Gate
+ * `tests/architecture/worker-login-hooks.test.ts` の (q) が、両方の一覧と押す所と、`pressDialogCheckKey` を使うファイルを確かめる）。
  */
 export const SCROLLABLE_REGION_KEYS = Object.freeze(['Tab', 'Shift+Tab', 'ArrowRight', 'ArrowLeft', 'ArrowDown', 'ArrowUp'] as const);
 type ScrollableRegionKey = (typeof SCROLLABLE_REGION_KEYS)[number];
 type ScrollableRegionArrowKey = Exclude<ScrollableRegionKey, 'Tab' | 'Shift+Tab'>;
 
-/** 一覧のキーだけを押す（一覧の外は押さずに投げる）。 */
-const pressRegionKey = (page: KeyboardRevealPage, key: ScrollableRegionKey): Promise<unknown> => {
-  if (!(SCROLLABLE_REGION_KEYS as readonly string[]).includes(key)) {
+/**
+ * FRET（設計書 `2026-11-24-beaksight-dialog-focus-return-design.md` 1.2）: 窓を開くボタンの確かめだけが押してよいキーの、別の閉じた一覧（押す物と閉じるボタンを
+ * 押す Enter と、窓を閉じる Esc）。押す物は、送信の要素・リンク・削除と AI の操作（SD-1・AIW の判定）・値を入れる要素を除いた、窓を開くボタンだけで、押す期間は
+ * Guard が読み取りでない要求も止める（`src/interaction/dialog-focus-check.ts` だけが使う。Gate (q)）。
+ */
+export const DIALOG_CHECK_KEYS = Object.freeze(['Enter', 'Escape'] as const);
+type DialogCheckKey = (typeof DIALOG_CHECK_KEYS)[number];
+
+/** 一覧のキーだけを押す（どちらの一覧の外も、押さずに投げる）。 */
+const pressRegionKey = (page: KeyboardRevealPage, key: ScrollableRegionKey | DialogCheckKey): Promise<unknown> => {
+  if (!(SCROLLABLE_REGION_KEYS as readonly string[]).includes(key) && !(DIALOG_CHECK_KEYS as readonly string[]).includes(key)) {
     throw new RangeError(`a key outside the scrollable region keys: ${String(key)}`);
   }
   return page.keyboard.press(key);
 };
+
+/** FRET: 窓を開くボタンの確かめのキーの押下（押す所は `pressRegionKey` の 1 か所）。 */
+export const pressDialogCheckKey = (page: KeyboardRevealPage, key: DialogCheckKey): Promise<unknown> => pressRegionKey(page, key);
+
+/**
+ * AUD-3（設計書 `2026-11-19-beaksight-audit-result-review-fixes-design.md` 6.2 の 4）: 通常の Tab の確かめ（`src/evidence/focus-check-collector.ts`）の Tab の
+ * 押下。キーを押すのは、このファイルの一覧のキーの 1 か所（`pressRegionKey`）だけにする。
+ */
+export const pressSequentialTabKey = (page: KeyboardRevealPage): Promise<unknown> => pressRegionKey(page, 'Tab');
 
 /**
  * Tab の起点にする、フォーカスできる要素（リンクは `:any-link`。行き先は読まない。GATE-ARCH03）。値を入れる要素（入力欄・選択の部品・編集できる要素）は、
@@ -533,8 +593,10 @@ const pressRegionKey = (page: KeyboardRevealPage, key: ScrollableRegionKey): Pro
  */
 const TAB_START_SELECTOR = ':any-link, button, [tabindex]';
 
-/** 値を入れる要素（ここにフォーカスが来たら、Tab も矢印のキーも押さない）。 */
-const EDITABLE_SELECTOR = 'input, select, textarea, [contenteditable]:not([contenteditable="false" i])';
+/** 値を入れる要素（ここにフォーカスが来たら、Tab も矢印のキーも押さない）。AUD-3 の通常の Tab の確かめも、同じ判定で止める。 */
+export const EDITABLE_SELECTOR = 'input, select, textarea, [contenteditable]:not([contenteditable="false" i]), '
+  // REV-AUD3 の 2 回目の M-A: 文字を入れる役割（role）の部品も、値を入れる要素とみなす。
+  + '[role="textbox" i], [role="searchbox" i], [role="combobox" i], [role="spinbutton" i]';
 
 /**
  * REV-EV4: ページの中に、確かめの間だけ置く物の名前（window の、列挙されないプロパティ。確かめた後に消す）。`between` は準備の時点の起点と領域の間の要素の
@@ -675,9 +737,8 @@ function tabStepReader(R: StandardReaders, { selector, startPath, forward, edita
   }
   const between = (window as unknown as Record<string, WeakSet<Element> | undefined>)[betweenKey];
   if (between?.has(active) === true) {
-    const editable = Element.prototype.matches.call(deep, editableSelector)
-      || (deep instanceof HTMLElement && R.standardGetter<boolean>(HTMLElement.prototype, 'isContentEditable')(deep));
-    return { state: editable ? 'EDITABLE' : 'BETWEEN', activePath };
+    // REV-AUD3 の 2 回目の M-A: 判定は部品の 1 か所（`R.isValueEntryFocus`。closed な影の木の host も止める）。
+    return { state: R.isValueEntryFocus(deep, editableSelector) ? 'EDITABLE' : 'BETWEEN', activePath };
   }
   const [toward, away] = forward
     ? [Node.DOCUMENT_POSITION_FOLLOWING, Node.DOCUMENT_POSITION_PRECEDING]

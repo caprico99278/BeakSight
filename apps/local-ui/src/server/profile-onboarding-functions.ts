@@ -20,11 +20,10 @@ import type { EntryCheckAuthSetupState } from '../../../../src/control/auth/auth
 // PRE42-CC 組 3（N4-8b）: 終わったジョブの状態は、owner の `job-records.ts` の名前つきの定数から読む。
 import { ACTIVE_AUDIT_JOB_STATES, FINISHED_AUDIT_JOB_STATE, type AuditJobState } from '../../../../src/control/job/job-records.js';
 import type { AuditJobView } from '../../../../src/control/job/job-store.js';
-import { RUNNING_CHAIN_STATE } from '../../../../src/core/stage-chain-states.js';
 import { listProfiles } from '../../../../src/control/store/profile-store.js';
 // T44g（Task 44 の設計書 P4-8 の CC-105）: ジョブの種類の値は、IPC の契約の名前つきの定数から読む（画面のサーバに同じ定数を置かない）。
 import { WORKER_AUDIT_JOB_KIND, WORKER_ENTRY_CHECK_JOB_KIND } from '../../../../src/control/worker-protocol.js';
-import { profileStageOf, type ProfileStage } from '../display/next-steps';
+import { profileStageOf, siteAuditRunningOf, type ProfileStage } from '../display/next-steps';
 import { auditJobRowOf, type AuditJobRowView } from './audit-job-functions';
 import { auditStartCheckOf, type AuditStartBlocker } from './audit-start-check';
 import { listJobArtifacts, type JobArtifactKind, type JobArtifactView } from './artifact-files';
@@ -80,12 +79,13 @@ const BUNDLE_ARTIFACT_KIND: JobArtifactKind = 'BUNDLE';
 const ACTIVE_JOB_STATES: ReadonlySet<AuditJobState> = new Set(ACTIVE_AUDIT_JOB_STATES);
 
 /**
- * DEF-197: このサイトの点検が動いているか（決める所はここ 1 か所。サイトの画面とサイトの一覧の段が使う）。いちばん新しいジョブ（種類を問わない）が動いている
- * 状態か、最新の点検のジョブのまとめて実行の連鎖が動いている（段と段の間を含む）か。
+ * DEF-197: このサイトの点検が動いているか（サイトの画面とサイトの一覧の段が使う）。事実を読んで、判定の 1 か所 `siteAuditRunningOf`（`display/next-steps.ts`）に渡す。
  */
-const isAuditRunning = (lastJob: AuditJobView | null, lastAuditJob: AuditJobView | null): boolean =>
-  (lastJob !== null && ACTIVE_JOB_STATES.has(lastJob.state))
-  || (lastAuditJob !== null && localUiAuditJobs().getStageChainOfJob(lastAuditJob.jobId)?.state === RUNNING_CHAIN_STATE);
+const isAuditRunning = (lastJob: AuditJobView | null, lastAuditJob: AuditJobView | null): boolean => siteAuditRunningOf({
+  lastJob: lastJob === null ? null : { jobId: lastJob.jobId, active: ACTIVE_JOB_STATES.has(lastJob.state) },
+  // DEF-301: 判定は表示の部品の 1 か所（終えた連鎖の段のジョブが閉じる間は、動いているとしない）。
+  lastAuditChain: lastAuditJob === null ? null : localUiAuditJobs().getStageChainOfJob(lastAuditJob.jobId),
+});
 
 /** サイトの画面の要点の値と、一覧の「前回の点検」のジョブ（サーバの中だけで使う）。 */
 interface ProfileStageReading {

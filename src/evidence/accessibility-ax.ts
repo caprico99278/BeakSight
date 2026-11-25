@@ -44,16 +44,21 @@ const disabledOf = (node: Record<string, unknown>): boolean => {
   return properties.some((property) => isRecord(property) && property['name'] === 'disabled' && axValueOf(property['value']) === true);
 };
 
-/** 要素の下の、無視されない `StaticText` の名前（木の順）。 */
+/**
+ * 要素の下の、無視されない `StaticText` の名前（木の順）。S-01a: `display: contents` の入れ物などで同じ AX の節に 2 回届くことがあるので、たどった節を覚えて
+ * 同じ節は 2 回数えない（別の節の同じ文字は両方数える）。
+ */
 async function labelSegmentsOf(session: CDPSession, axNodeId: string): Promise<readonly string[]> {
   const segments: string[] = [];
+  const visited = new Set<string>([axNodeId]);
   const visit = async (id: string): Promise<void> => {
     const result = await send(session, 'Accessibility.getChildAXNodes', { id });
     const children = Array.isArray(result['nodes']) ? result['nodes'] : [];
     for (const child of children) {
-      if (!isRecord(child) || typeof child['nodeId'] !== 'string') {
+      if (!isRecord(child) || typeof child['nodeId'] !== 'string' || visited.has(child['nodeId'])) {
         continue;
       }
+      visited.add(child['nodeId']);
       const text = axValueOf(child['name']);
       if (axValueOf(child['role']) === 'StaticText' && child['ignored'] !== true && typeof text === 'string') {
         segments.push(text);

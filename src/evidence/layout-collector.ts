@@ -22,12 +22,15 @@ import {
   type FixedHeadingOverlapEvidence,
   type HorizontalClipAncestorKind,
   type IntendedClippingKind,
+  type KeyActionElementEvidence,
   type LayoutCollectionResult,
   type LayoutDocumentEvidence,
   type LayoutElementEvidence,
   type LayoutElementKind,
   type LayoutEvidence,
   type LayoutIncompleteReason,
+  type OverlapPlacementEvidence,
+  type OverlapSidePlacementEvidence,
   type LayoutTruncationEvidence,
   type LineOverlapEvidence,
   OVERLAP_HIT_RELATIONS,
@@ -46,14 +49,16 @@ import {
   type ZeroSizeInteractiveEvidence,
 } from '../core/evidence-types.js';
 import { isNonNegativeFiniteNumber, isNonNegativeSafeInteger, isPositiveFiniteNumber } from '../core/guards.js';
+import { KEY_ACTION_ELEMENT_SELECTOR, keyActionHrefTargetOf, keyActionKindOf, maskContactValues } from '../core/key-actions.js';
 import {
   GEOMETRY_EPSILON_PX,
   MAX_SELECTOR_DEPTH,
 } from '../core/limits.js';
 import { VISIBILITY_CHECK_OPTIONS } from '../core/visibility.js';
-import { composeInPage, type StandardReaders } from '../browser/in-page-readers.js';
+import { composeInPage, FRONT_WINDOW_MIN_VIEWPORT_RATIO, type StandardReaders } from '../browser/in-page-readers.js';
 import { paintsOwnSurfaceOf, type OwnSurfaceFacts } from '../core/own-surface.js';
 import { readInParts } from '../core/read-in-parts.js';
+import { readStateMark, stateMarkTargetSelectorsOf } from './state-mark.js';
 
 export const LAYOUT_THRESHOLDS = Object.freeze({
   stressViewportHeight: 900,
@@ -94,6 +99,8 @@ export const LAYOUT_THRESHOLDS = Object.freeze({
   hitTestPointInsetPx: 4,
   /** AUD-3b: 要素そのものが中身を描く種類（hit-test の点の要素の、描く面の事実に使う）。 */
   replacedContentSelector: 'img, picture, video, canvas, svg, iframe, embed, object, input, textarea, select',
+  /** RVP-2: 前面の窓（`R.frontWindows`）とみなす面積の割合の下限（値は部品の側の 1 か所）。 */
+  frontWindowMinViewportRatio: FRONT_WINDOW_MIN_VIEWPORT_RATIO,
 });
 
 
@@ -114,6 +121,8 @@ const LAYOUT_PART_LIST_NAMES = Object.freeze([
   'fixedHeadingOverlaps',
   'elementOverlaps',
   'fixedElements',
+  // BS-2: 押せる要素（主要な行動の候補を選ぶ前の、全部）。
+  'keyActionElements',
 ] as const);
 type LayoutPartListName = (typeof LAYOUT_PART_LIST_NAMES)[number];
 
@@ -130,6 +139,7 @@ const FIRST_LAYOUT_PART_CURSOR: LayoutPartCursor = Object.freeze({
   fixedHeadingOverlaps: 0,
   elementOverlaps: 0,
   fixedElements: 0,
+  keyActionElements: 0,
 });
 
 /**
@@ -209,6 +219,7 @@ interface RawElementOverlapEvidence {
   readonly hitTest?: RawOverlapHitTest;
   readonly coveredScrollContainer?: ScrollContainerEvidence;
   readonly lineOverlap?: LineOverlapEvidence;
+  readonly placement?: OverlapPlacementEvidence;
 }
 
 type RawFixedHeadingOverlapEvidence = Omit<FixedHeadingOverlapEvidence, 'hitTest'> & { readonly hitTest?: RawOverlapHitTest };
@@ -220,6 +231,12 @@ interface RawFixedElementEvidence extends RawLayoutElementEvidence {
   readonly pointerEvents: string;
   readonly hitTest?: RawOverlapHitTest;
 }
+
+/**
+ * BS-2: ブラウザが返す押せる要素の事実（行き先は絶対の URL のまま。Node の側で scheme とホストだけにし、主要な行動の候補だけを残し、文字の電話番号と
+ * メールアドレスを伏せる）。
+ */
+type RawKeyActionElement = Omit<KeyActionElementEvidence, 'hrefScheme' | 'hrefHost'> & { readonly href: string | null };
 
 /** AUD-4a: ブラウザが返す見切れの候補（区分と行数の省略の数は Node の側で導く）。 */
 type RawClippedTextEvidence = Omit<ClippedTextEvidence, 'lineClampCount' | 'intendedClipping'>;
@@ -244,6 +261,7 @@ interface RawLayoutPart {
   readonly fixedHeadingOverlaps: readonly RawFixedHeadingOverlapEvidence[];
   readonly elementOverlaps: readonly RawElementOverlapEvidence[];
   readonly fixedElements: readonly RawFixedElementEvidence[];
+  readonly keyActionElements: readonly RawKeyActionElement[];
   readonly next: LayoutPartCursor;
   readonly truncation: RawLayoutTruncation;
   /** ブラウザ内の走査が止まった理由（期限だけ）。比べる組の上限は `truncation.overlapComparisonLimitReached` で返す。 */
@@ -293,6 +311,15 @@ export interface StressLayoutOptions {
    * （その幅の指摘の対象まで動かして撮るため）。
    */
   readonly afterLayout?: ((page: Page, width: number, layout: LayoutEvidence) => Promise<void>) | undefined;
+}
+
+/** SWR: 1 つのセッションで大きさを変えて回す幅の走査（`collectResizedStressLayout`）の口。 */
+export interface ResizedStressLayoutOptions extends StressLayoutOptions {
+  /**
+   * 各幅の段（最初の幅は読み込みと測り、後の幅は大きさを変えて測る）を包む口（Page Auditor は、幅ごとの進みの見張りを付ける）。`work` の結果を返す。
+   * 省略すると、そのまま行う。
+   */
+  readonly aroundWidth?: ((width: number, work: () => Promise<StressLayoutEvidence>) => Promise<StressLayoutEvidence>) | undefined;
 }
 
 function positiveFiniteDimension(value: number, name: string): void {
@@ -497,6 +524,10 @@ function freezeHitTest(hitTest: RawOverlapHitTest | undefined, name: string): Ov
     modal: Object.freeze({
       dialogModal: flag(hitTest.modal.dialogModal, `${name}.modal.dialogModal`),
       ariaModal: flag(hitTest.modal.ariaModal, `${name}.modal.ariaModal`),
+      // AUD-2: 真のときだけ書く（前の Evidence の形のまま）。
+      ...(hitTest.modal.openModal === true ? { openModal: true as const } : {}),
+      ...(hitTest.modal.coveredInside === true ? { coveredInside: true as const } : {}),
+      ...(hitTest.modal.frontWindow === true ? { frontWindow: true as const } : {}),
     }),
   });
 }
@@ -540,6 +571,18 @@ const lineOverlapField = (lineOverlap: LineOverlapEvidence | undefined, name: st
       bothHitPointCount: count(lineOverlap.bothHitPointCount, `${name}.bothHitPointCount`),
     }),
   };
+};
+
+/** AUD-5（S-02）: 片方ごとの置き方の事実があれば `{ placement }`、なければ空。 */
+const placementField = (placement: OverlapPlacementEvidence | undefined, name: string): { readonly placement?: OverlapPlacementEvidence } => {
+  if (placement === undefined) {
+    return {};
+  }
+  const side = (value: OverlapSidePlacementEvidence, sideName: string): OverlapSidePlacementEvidence => Object.freeze({
+    positionedInSharedContainer: flag(value.positionedInSharedContainer, `${sideName}.positionedInSharedContainer`),
+    controlAncestorSelector: value.controlAncestorSelector === null ? null : validateSelector(value.controlAncestorSelector, `${sideName}.controlAncestorSelector`),
+  });
+  return { placement: Object.freeze({ first: side(placement.first, `${name}.first`), second: side(placement.second, `${name}.second`) }) };
 };
 
 function freezeFixedElement(
@@ -670,6 +713,13 @@ function freezeClippedText(candidate: RawClippedTextEvidence, name: string): Cli
     rect: freezeRect(candidate.rect, `${name}.rect`),
     visibility: freezeVisibility(candidate.visibility, `${name}.visibility`),
     partiallyClippedText: flag(candidate.partiallyClippedText, `${name}.partiallyClippedText`),
+    // S-06: 端が箱で切れる、内側のスクロール領域（あるときだけ。前の Evidence の形のまま）。
+    ...(candidate.cutScrollRegions === undefined ? {} : {
+      cutScrollRegions: Object.freeze(candidate.cutScrollRegions.map((region, index) => Object.freeze({
+        selector: validateSelector(region.selector, `${name}.cutScrollRegions[${index}].selector`),
+        rect: freezeRect(region.rect, `${name}.cutScrollRegions[${index}].rect`),
+      }))),
+    }),
     truncated: flag(candidate.truncated, `${name}.truncated`),
     clippingStyle,
     lineHeightPx: optionalMeasure(candidate.lineHeightPx, `${name}.lineHeightPx`),
@@ -800,9 +850,11 @@ function assembleLayout(parts: readonly RawLayoutPart[]): LayoutEvidence {
       ...hitTestField(candidate.hitTest, `elementOverlaps[${index}].hitTest`),
       ...scrollContainerField(candidate.coveredScrollContainer, `elementOverlaps[${index}].coveredScrollContainer`),
       ...lineOverlapField(candidate.lineOverlap, `elementOverlaps[${index}].lineOverlap`),
+      ...placementField(candidate.placement, `elementOverlaps[${index}].placement`),
     })));
   const fixedElements = Object.freeze(allOf((part) => part.fixedElements)
     .map((candidate, index) => freezeFixedElement(candidate, documentEvidence, `fixedElements[${index}]`)));
+  const keyActionElements = Object.freeze(allOf((part) => part.keyActionElements).flatMap((candidate, index) => freezeKeyActionElement(candidate, `keyActionElements[${index}]`)));
   const sumOf = (name: 'clippedTextNodeScanLimitReachedCount' | 'renderedDescendantScanLimitReachedCount'): number => parts
     .reduce((sum, part, index) => sum + count(part.truncation[name], `parts[${index}].truncation.${name}`), 0);
 
@@ -831,7 +883,32 @@ function assembleLayout(parts: readonly RawLayoutPart[]): LayoutEvidence {
       renderedDescendantScanLimitReachedCount: sumOf('renderedDescendantScanLimitReachedCount'),
     }),
     collectedInParts: parts.length,
+    keyActionElements,
   });
+}
+
+const nullableText = (value: string | null, name: string): string | null => (value === null ? null : maskContactValues(text(value, name)));
+
+/**
+ * BS-2: ブラウザが返した押せる要素のうち、主要な行動の候補（`keyActionKindOf` が種類を返すもの）だけを、記録の形にする（行き先は scheme とホストだけ。文字の
+ * 電話番号とメールアドレスは伏せる）。候補でなければ空。
+ */
+function freezeKeyActionElement(raw: RawKeyActionElement, name: string): readonly KeyActionElementEvidence[] {
+  const target = keyActionHrefTargetOf(raw.href === null ? null : text(raw.href, `${name}.href`));
+  const facts = { text: text(raw.text, `${name}.text`), ariaLabel: nullableText(raw.ariaLabel, `${name}.ariaLabel`), title: nullableText(raw.title, `${name}.title`), ...target };
+  if (keyActionKindOf(facts) === null) {
+    return [];
+  }
+  return [Object.freeze({
+    selector: validateSelector(raw.selector, name),
+    tagName: text(raw.tagName, `${name}.tagName`),
+    role: raw.role === null ? null : text(raw.role, `${name}.role`),
+    ...facts,
+    text: maskContactValues(facts.text),
+    rect: freezeRect(raw.rect, `${name}.rect`),
+    visible: flag(raw.visible, `${name}.visible`),
+    fixedContainerSelector: raw.fixedContainerSelector === null ? null : validateSelector(raw.fixedContainerSelector, `${name}.fixedContainerSelector`),
+  })];
 }
 
 interface LayoutEvaluationArgument {
@@ -848,6 +925,8 @@ interface LayoutEvaluationArgument {
   readonly cursor: LayoutPartCursor;
   /** COV-6: この回に一覧ごとに返す最大の件数（`LAYOUT_COLLECTION_PART_SIZE`）。 */
   readonly partSize: number;
+  /** BS-2: 押せる要素の selector（`KEY_ACTION_ELEMENT_SELECTOR`）。 */
+  readonly keyActionSelector: string;
 }
 
 /**
@@ -867,6 +946,7 @@ function collectLayoutReader(R: StandardReaders, {
   scanDeadlineAtMs,
   cursor,
   partSize,
+  keyActionSelector,
 }: LayoutEvaluationArgument): RawLayoutPart {
   // COV-6: 一覧を読むか（読み終えていないか）と、一覧の中の番号がこの回に返す範囲にあるか。
   const wants = (name: keyof LayoutPartCursor): boolean => cursor[name] !== null;
@@ -1112,54 +1192,15 @@ function collectLayoutReader(R: StandardReaders, {
       : null;
   };
 
-  // 祖先の overflow による切り取り（R4 の M3、RT12 の I1）。
-  // - 祖先は、親から `maxSelectorDepth` 個までに限る（上限の外の祖先の切り取りは考慮しない）。
-  // - html・body・`scrollingElement` は、ビューポートのスクロールとして扱い、祖先の切り取りに数えない。
-  // - `position: fixed` の要素は、祖先の overflow で切り取られないものとして扱う（transform を持つ祖先の中の場合を除く近似）。
-  // - `position: absolute` の要素は、包含ブロック（position が static でないか、transform を持つ祖先）とその祖先だけが切り取る。
-  // - overflow が効かない箱（`display: inline`・`contents`）は、切り取りに数えない。
+  // 祖先の overflow による切り取り（R4 の M3、RT12 の I1）。切り取りうる祖先の決まりは、部品 `R.clippingAncestorsOf` の 1 か所（TII: 対象まで動かして撮る
+  // 部品と共有する。段数では打ち切らない）。
   const horizontalClipOf = (overflow: string): Exclude<HorizontalClipAncestorKind, 'NONE'> | undefined => (
     Object.hasOwn(horizontalClipByOverflow, overflow)
       ? horizontalClipByOverflow[overflow as keyof typeof horizontalClipByOverflow]
       : undefined
   );
   const clippingOverflows = new Set<string>(Object.keys(horizontalClipByOverflow));
-  const documentScrollers = new Set<Element>([documentElement]);
-  if (documentBody !== null) {
-    documentScrollers.add(documentBody);
-  }
-  if (scrollingElement !== null) {
-    documentScrollers.add(scrollingElement);
-  }
-  /** 要素を overflow で切り取りうる祖先と、その計算値を、近い順に返す（上の決まりに従う）。`fixed` の祖先は、返した後で止める。 */
-  function* clippingAncestorsOf(
-    element: Element,
-    style: CSSStyleDeclaration,
-  ): Generator<readonly [Element, CSSStyleDeclaration]> {
-    if (style.position === 'fixed') {
-      return;
-    }
-    let waitForContainingBlock = style.position === 'absolute';
-    let ancestor = parentElementOf(element);
-    for (
-      let depth = 0;
-      ancestor !== null && depth < thresholds.maxSelectorDepth && !documentScrollers.has(ancestor);
-      depth += 1, ancestor = parentElementOf(ancestor)
-    ) {
-      const ancestorStyle = window.getComputedStyle(ancestor);
-      const establishesContainingBlock = ancestorStyle.position !== 'static' || ancestorStyle.transform !== 'none';
-      if (waitForContainingBlock && !establishesContainingBlock) {
-        continue;
-      }
-      if (ancestorStyle.display !== 'inline' && ancestorStyle.display !== 'contents') {
-        yield [ancestor, ancestorStyle];
-      }
-      if (ancestorStyle.position === 'fixed') {
-        return;
-      }
-      waitForContainingBlock = ancestorStyle.position === 'absolute';
-    }
-  }
+  const clippingAncestorsOf = R.clippingAncestorsOf;
   // 重なりの候補を集めるときに、祖先で切り取った後に見える部分が残るかを確かめる（R4 の M3）。
   const hasVisibleAreaAfterAncestorClip = (element: Element, style: CSSStyleDeclaration, rect: RectangleEvidence): boolean => {
     let { left, top, right, bottom } = rect;
@@ -1223,12 +1264,14 @@ function collectLayoutReader(R: StandardReaders, {
   // 横方向: このずれがないので、箱の外に出た量が、文字の少しの張り出しとして許す固定の値を超える行を数える（RT12d の発見事項2）。
   // どちらの方向も、箱の片側ずつに出た量を比べ、両側の量を合計しない（RT12r2 の I1）。
   // 見えない要素（`VISIBILITY_CHECK_OPTIONS` の `checkVisibility` が偽の要素）の中のテキストは、判定に使わない（RT12r2 の M1）。
+  // S-06: 文字とこの箱の間にスクロールできる祖先があれば、文字の行ではなく、その祖先（いちばん外側）の箱で判定する。祖先の箱が箱に収まれば、内側のスクロールで
+  // 見えるので数えない。はみ出せば、その祖先を「内側のスクロール領域の端が箱で切れる」領域として返す（`cutScrollRegions`）。
   const textLineClipOf = (
     element: HTMLElement,
     rect: RectangleEvidence,
     widthClipped: boolean,
     heightClipped: boolean,
-  ): { readonly clipped: boolean } => {
+  ): { readonly clipped: boolean; readonly cutScrollRegions: readonly Element[] } => {
     const left = rect.left + clientLeftOf(element);
     const top = rect.top + clientTopOf(element);
     const right = left + clientWidthOf(element);
@@ -1240,15 +1283,60 @@ function collectLayoutReader(R: StandardReaders, {
     const sticksOutBeyond = (start: number, end: number, boxStart: number, boxEnd: number, limit: number): boolean => (
       boxStart - start > limit || end - boxEnd > limit
     );
+    // 要素から箱までの間（箱は含まない）の、いちばん外側のスクロールできる祖先（なければ null）。祖先ごとに 1 回だけ調べる。
+    const outermostScrollers = new Map<Element, Element | null>([[element, null]]);
+    const outermostScrollerOf = (node: Element | null): Element | null => {
+      if (node === null) {
+        return null;
+      }
+      const known = outermostScrollers.get(node);
+      if (known !== undefined) {
+        return known;
+      }
+      const outer = outermostScrollerOf(parentElementOf(node));
+      const found = outer ?? (R.isScrollableBox(node) ? node : null);
+      outermostScrollers.set(node, found);
+      return found;
+    };
+    // スクロールできる祖先ごとの判定（箱からはみ出すか）。はみ出す祖先は、見つけた順に `cutScrollRegions` に入れる。
+    const scrollerVerdicts = new Map<Element, boolean>();
+    const cutScrollRegions: Element[] = [];
+    const scrollerSticksOut = (scroller: Element): boolean => {
+      const known = scrollerVerdicts.get(scroller);
+      if (known !== undefined) {
+        return known;
+      }
+      const box = boundingClientRectOf(scroller);
+      const overlapsHorizontally = Math.min(box.right, right) - Math.max(box.left, left) > epsilon;
+      const sticksOut = overlapsHorizontally && (
+        (heightClipped && sticksOutBeyond(box.top, box.bottom, top, bottom, epsilon))
+        || (widthClipped && sticksOutBeyond(box.left, box.right, left, right, maxIgnoredHorizontalOverflow))
+      );
+      scrollerVerdicts.set(scroller, sticksOut);
+      if (sticksOut) {
+        cutScrollRegions.push(scroller);
+      }
+      return sticksOut;
+    };
     const walker = createTreeWalker(element, NodeFilter.SHOW_TEXT);
     const range = createRange();
     // 箱の中に見える行があったか。箱の上か下に丸ごと出た行があったか（見える行が見つかるまで、判定を保留する）。
     let visibleLineFound = false;
     let lineWhollyAboveOrBelow = false;
+    let clipped = false;
     // COV-6: テキストのノードの数で打ち切らない（打ち切ると、見切れを見落とす）。期限を過ぎたら、この回の走査ごと止める（`PARTIAL`）。
     for (let node = walker.nextNode(); node !== null && !deadlinePassed(); node = walker.nextNode()) {
       const textParent = parentElementOf(node);
       if (!hasText(node.nodeValue) || (textParent !== null && !checkVisibilityOf(textParent, visibilityOptions))) {
+        continue;
+      }
+      const scroller = outermostScrollerOf(textParent);
+      if (scroller !== null) {
+        scrollerSticksOut(scroller);
+        continue;
+      }
+      // 箱の文字切れが決まった後は、はみ出すスクロールの領域だけを探し続ける（取りこぼさない）。
+      if (clipped) {
         continue;
       }
       range.selectNodeContents(node);
@@ -1261,18 +1349,20 @@ function collectLayoutReader(R: StandardReaders, {
             || (heightClipped
               && sticksOutBeyond(line.top, line.bottom, top, bottom, (line.bottom - line.top) * minOutsideRatio))
           ) {
-            return { clipped: true };
+            clipped = true;
+            break;
           }
           visibleLineFound = true;
         } else if (heightClipped && overlapsHorizontally && !overlapsVertically) {
           lineWhollyAboveOrBelow = true;
         }
         if (visibleLineFound && lineWhollyAboveOrBelow) {
-          return { clipped: true };
+          clipped = true;
+          break;
         }
       }
     }
-    return { clipped: false };
+    return { clipped, cutScrollRegions };
   };
   // 子孫に、可視で大きさのある要素があるか（設計書 5.1.2、RT12 の I3）。幅か高さが 1 px 以下の子孫（visually hidden）は数えない（RT12r の N5）。
   // 文書の左か上の外に丸ごと置かれた子孫（文書の座標で、右端か下端が 0 以下のもの。`left:-9999px` など）も数えない（RT12r2 の M2）。
@@ -1406,6 +1496,12 @@ function collectLayoutReader(R: StandardReaders, {
   const primaryElements: ObservedElement[] = [];
   let zeroSizeInteractiveCount = 0;
   let clippedTextCount = 0;
+  // BS-2: 押せる要素（見えない要素も含む。主要な行動の候補を選ぶのは Node の側）と、いちばん近い固定の要素（自分を含む）。
+  const keyActionElements: RawKeyActionElement[] = [];
+  let keyActionElementCount = 0;
+  const fixedContainerOf = new Map<Element, Element | null>();
+  const anchorHrefOf = standardGetter<string>(HTMLAnchorElement.prototype, 'href');
+  const inputValueOf = standardGetter<string>(HTMLInputElement.prototype, 'value');
   // 要素（とその祖先）に `position: fixed | sticky` があるか。親は子より先に走査されるので、親の値を引き継ぐ。
   const withinFixedOrSticky = new Map<Element, boolean>();
   // DEF-205: 要素（とその祖先）の `clip`・`clip-path` で、描く面が 0 になるか。親は子より先に走査されるので、親の値を引き継ぐ
@@ -1430,6 +1526,34 @@ function collectLayoutReader(R: StandardReaders, {
       || ownClipLeavesNoArea(element, style);
     clippedToZeroAreaOf.set(element, clippedToZeroArea);
     const visible = checkVisibilityOf(element, visibilityOptions);
+    if (wants('keyActionElements')) {
+      const fixedContainer = fixed ? element : (parent === null ? null : fixedContainerOf.get(parent) ?? null);
+      fixedContainerOf.set(element, fixedContainer);
+      if (matchesOf(element, keyActionSelector)) {
+        const index = keyActionElementCount;
+        keyActionElementCount += 1;
+        if (inPart('keyActionElements', index)) {
+          const textOf = (): string => {
+            if (element instanceof HTMLInputElement) {
+              return inputValueOf(element);
+            }
+            return element instanceof HTMLElement ? innerTextOf(element) : '';
+          };
+          keyActionElements.push({
+            selector: selectorFor(element).selector,
+            tagName: tagNameOf(element).toLowerCase(),
+            role: getAttributeOf(element, 'role'),
+            text: normalize(textOf()),
+            ariaLabel: getAttributeOf(element, 'aria-label'),
+            title: getAttributeOf(element, 'title'),
+            href: element instanceof HTMLAnchorElement && getAttributeOf(element, 'href') !== null ? anchorHrefOf(element) : null,
+            rect: rectFor(element),
+            visible,
+            fixedContainerSelector: fixedContainer === null ? null : selectorFor(fixedContainer).selector,
+          });
+        }
+      }
+    }
     if (!visible) {
       continue;
     }
@@ -1528,6 +1652,10 @@ function collectLayoutReader(R: StandardReaders, {
               widthClipped,
               heightClipped,
               partiallyClippedText: lineCheck.clipped,
+              // S-06: 端が箱で切れる、内側のスクロール領域（あるときだけ）。
+              ...(lineCheck.cutScrollRegions.length === 0 ? {} : {
+                cutScrollRegions: lineCheck.cutScrollRegions.map((region) => ({ selector: selectorFor(region).selector, rect: rectFor(region) })),
+              }),
               truncated,
               // AUD-4a: 意図した省略を見分けるための事実（区分は Node の側で導く）。
               clippingStyle: {
@@ -1632,8 +1760,30 @@ function collectLayoutReader(R: StandardReaders, {
   /** 交わり（ビューポートの中の部分）の中心と、内側に寄せた四隅（EV-2: 点の作り方は部品 `R.hitPointsOf` の 1 か所）。 */
   const hitPointsOf = (area: RectangleEvidence): (readonly [number, number])[] =>
     R.hitPointsOf(area, actualViewport.width, actualViewport.height, thresholds.hitTestPointInsetPx);
+  // AUD-2（設計書 `2026-11-19-beaksight-audit-result-review-fixes-design.md` 5.1）: 見えているモーダルの小窓と暗転の要素（判定は部品の 1 か所。初めて要るときに 1 回読む）。
+  let modalDialogs: { readonly dialog: Element; readonly backdrop: Element | null }[] | null = null;
+  let frontWindows: Element[] | null = null;
+  /**
+   * 覆う要素か祖先が、開いたモーダル（`dialog` の showModal・`aria-modal="true"`）か。AUD-2: 覆う要素が、見えているモーダルの小窓か、その中か、その暗転の要素なら
+   * `openModal`。覆われる要素が、その小窓の中にあれば `coveredInside`（小窓の中が塞がる形）。
+   */
+  const modalOf = (overlay: Element, covered: Element | null): RawOverlapHitTest['modal'] => {
+    modalDialogs ??= R.openModalDialogs();
+    const owner = modalDialogs.find(({ dialog, backdrop }) => overlay === backdrop || overlay === dialog || containsOf(dialog, overlay));
+    // RVP-2: モーダルの小窓でないときは、前面の窓（判定は部品の 1 か所。初めて要るときに 1 回読む）か、その中の要素かを見る。
+    frontWindows ??= R.frontWindows(thresholds.frontWindowMinViewportRatio);
+    const front = owner === undefined ? frontWindows.find((candidate) => overlay === candidate || containsOf(candidate, overlay)) : undefined;
+    const inside = owner?.dialog ?? front;
+    const coveredInside = inside !== undefined && covered !== null && (covered === inside || containsOf(inside, covered));
+    return {
+      ...ancestorModalOf(overlay),
+      ...(owner === undefined ? {} : { openModal: true as const }),
+      ...(coveredInside ? { coveredInside: true as const } : {}),
+      ...(front === undefined ? {} : { frontWindow: true as const }),
+    };
+  };
   /** 覆う要素か祖先が、開いたモーダル（`dialog` の showModal・`aria-modal="true"`）か。 */
-  const modalOf = (overlay: Element): RawOverlapHitTest['modal'] => {
+  const ancestorModalOf = (overlay: Element): { dialogModal: boolean; ariaModal: boolean } => {
     let dialogModal = false;
     let ariaModal = false;
     for (let current: Element | null = overlay; current !== null; current = parentElementOf(current)) {
@@ -1684,7 +1834,7 @@ function collectLayoutReader(R: StandardReaders, {
       };
     }),
     overlay: hitLayerOf(overlay, 'OVERLAY'),
-    modal: modalOf(overlay),
+    modal: modalOf(overlay, covered),
   });
 
   // EV-1（設計書 `2026-11-16-beaksight-finding-evidence-design.md` 3.1）: 覆われる側のいちばん近い、縦にスクロールできる祖先（祖先の見つけ方は部品
@@ -1801,6 +1951,29 @@ function collectLayoutReader(R: StandardReaders, {
     overflowY: observed.style.overflowY,
     fixedOrStickyAncestor: observed.fixedOrStickyAncestor,
   });
+  // AUD-5（設計書 `2026-11-19-beaksight-audit-result-review-fixes-design.md` 8.1）: 重なりの組の片方の置き方（読むだけ）。位置指定の要素は、自分から
+  // もう片方と共通の祖先の手前までで探す。押せる祖先は、主要要素の種類の selector のボタンかリンク（自分を除く）。
+  const isPositionedContainer = (style: CSSStyleDeclaration): boolean =>
+    ['absolute', 'fixed', 'sticky'].includes(style.position) || (style.position === 'relative' && style.zIndex !== 'auto');
+  const sidePlacementOf = (element: Element, other: Element): { side: OverlapSidePlacementEvidence; truncated: boolean } => {
+    const otherChain = new Set<Element>();
+    for (let current: Element | null = other; current !== null; current = parentElementOf(current)) {
+      otherChain.add(current);
+    }
+    let positionedInSharedContainer = false;
+    for (let current: Element | null = element; current !== null && !otherChain.has(current); current = parentElementOf(current)) {
+      positionedInSharedContainer ||= isPositionedContainer(window.getComputedStyle(current));
+    }
+    for (let current = parentElementOf(element); current !== null; current = parentElementOf(current)) {
+      const kind = kindOf(current);
+      if (kind === 'button' || kind === 'link') {
+        const { selector, truncated } = selectorFor(current);
+        return { side: { positionedInSharedContainer, controlAncestorSelector: selector }, truncated };
+      }
+    }
+    return { side: { positionedInSharedContainer, controlAncestorSelector: null }, truncated: false };
+  };
+
   const elementOverlaps: RawElementOverlapEvidence[] = [];
   let elementOverlapCount = 0;
   const recordOverlap = (first: ObservedElement, second: ObservedElement): void => {
@@ -1822,13 +1995,20 @@ function collectLayoutReader(R: StandardReaders, {
     // AUD-3b: 片方だけが固定要素の組は、固定要素を覆う側として hit-test を読む。
     const fixedSide = first.fixed === second.fixed ? null : first.fixed ? first : second;
     const otherSide = fixedSide === first ? second : first;
+    // AUD-5: どちらも固定要素でない組だけ、片方ごとの置き方を読む。
+    const placement = fixedSide === null
+      ? [sidePlacementOf(earlier.element, later.element), sidePlacementOf(later.element, earlier.element)] as const
+      : null;
     elementOverlaps.push({
       first: elementFacts(earlier, earlierSelector.selector),
       second: elementFacts(later, laterSelector.selector),
       intersection,
-      truncated: earlierSelector.truncated || laterSelector.truncated,
+      truncated: earlierSelector.truncated || laterSelector.truncated || (placement?.some(({ truncated }) => truncated) ?? false),
       ...(fixedSide === null
-        ? { lineOverlap: lineOverlapOf(first.element, second.element) }
+        ? {
+          lineOverlap: lineOverlapOf(first.element, second.element),
+          ...(placement === null ? {} : { placement: { first: placement[0].side, second: placement[1].side } }),
+        }
         : { hitTest: hitTestOf(fixedSide.element, otherSide.element, intersection), ...scrollContainerFieldOf(otherSide.element) }),
     });
   };
@@ -1935,6 +2115,7 @@ function collectLayoutReader(R: StandardReaders, {
     fixedHeadingOverlaps,
     elementOverlaps,
     fixedElements,
+    keyActionElements,
     next: {
       boxesOutsideViewport: nextOf('boxesOutsideViewport', outsideIndexes.size, outsideInPart.length),
       zeroSizeInteractive: nextOf('zeroSizeInteractive', zeroSizeInteractiveCount, zeroSizeInteractive.length),
@@ -1942,6 +2123,7 @@ function collectLayoutReader(R: StandardReaders, {
       fixedHeadingOverlaps: nextOf('fixedHeadingOverlaps', fixedHeadingOverlapCount, fixedHeadingOverlaps.length),
       elementOverlaps: nextOf('elementOverlaps', elementOverlapCount, elementOverlaps.length),
       fixedElements: nextOf('fixedElements', fixedPrimary.length, fixedElements.length),
+      keyActionElements: nextOf('keyActionElements', keyActionElementCount, keyActionElements.length),
     },
     // COV-6: 比べる組・テキストのノード・子孫の要素の数で打ち切らないので、印は常に偽と 0（古い記録と同じ形を保つ）。
     truncation: {
@@ -1998,6 +2180,7 @@ export async function collectLayoutEvidence(
       scanDeadlineAtMs: deadlineAtMs === undefined ? null : deadlineAtMs - LAYOUT_THRESHOLDS.partialResultReserveMs,
       cursor,
       partSize: LAYOUT_COLLECTION_PART_SIZE,
+      keyActionSelector: KEY_ACTION_ELEMENT_SELECTOR,
     } satisfies LayoutEvaluationArgument);
     const evaluated = deadlineAtMs === undefined
       ? await reading.then(
@@ -2034,9 +2217,22 @@ export async function collectLayoutEvidence(
   // 期限を優先する。比べる組の上限に達した場合も COMPLETE にしない（R4 の M2）。
   const reason: LayoutIncompleteReason | null = incompleteReason
     ?? (evidence.truncation.overlapComparisonLimitReached ? 'LAYOUT_COMPARISON_LIMIT_REACHED' : null);
+  const marked = await withStateMark(page, evidence, deadlineAtMs);
   return reason === null
-    ? Object.freeze({ status: 'COMPLETE', layout: evidence })
-    : Object.freeze({ status: 'PARTIAL', reason, layout: evidence });
+    ? Object.freeze({ status: 'COMPLETE', layout: marked })
+    : Object.freeze({ status: 'PARTIAL', reason, layout: marked });
+}
+
+/**
+ * AUD-4（設計書 `2026-11-19-beaksight-audit-result-review-fixes-design.md` 7.2 の 1）: 読み終えた layout に、状態の印（`readStateMark`）を足す。layout の対象の
+ * selector ごとの祖先のスクロールできる箱も読む。読めなかったとき・期限を過ぎたときは、印なしの layout のまま（layout の結果は変えない）。
+ */
+async function withStateMark(page: Page, layout: LayoutEvidence, deadlineAtMs: number | undefined): Promise<LayoutEvidence> {
+  if (deadlineAtMs !== undefined && Date.now() >= deadlineAtMs) {
+    return layout;
+  }
+  const read = await awaitBeforeDeadline(readStateMark(page, { selectors: stateMarkTargetSelectorsOf(layout), read: 'SCROLL_BOXES' }), deadlineAtMs);
+  return read.status === 'FULFILLED' ? Object.freeze({ ...layout, stateMark: read.value }) : layout;
 }
 
 function failedWidth(
@@ -2074,6 +2270,111 @@ export async function collectStressLayout(
   widths: readonly number[],
   options: StressLayoutOptions,
 ): Promise<readonly StressLayoutEvidence[]> {
+  validateStressLayoutInput(pageFactory, widths, options);
+  let { deadlineAtMs } = options;
+  const results: StressLayoutEvidence[] = [];
+  for (const width of widths) {
+    if (Date.now() >= deadlineAtMs) {
+      results.push(failedWidth(width, 'NOT_STARTED', 'DEADLINE_EXCEEDED', undefined));
+      continue;
+    }
+    const viewport = Object.freeze({ width, height: STRESS_VIEWPORT_HEIGHT });
+    // DEF-209: 読み込みの間隔を待ってから、その幅のセッション（Context と空の page）を作る（ビューポートの監査と同じ順。待つ間に、空の page の窓を
+    // 出さない）。待った時間は、期限を消費しない（サイトへの負荷の制御の設計書 4.4）。待ちの失敗は、セッションを作る前の失敗なので、セッションの作成の
+    // 失敗と同じく例外で返す。
+    deadlineAtMs += await options.beforeNavigation();
+    const session = await pageFactory(viewport);
+    const work: StressWidthWork = { error: undefined };
+    let closeError: unknown;
+    let result: StressLayoutEvidence | undefined;
+    try {
+      result = await loadStressWidth(session.page, url, width, deadlineAtMs, options, work)
+        ?? await measureStressWidth(session.page, viewport, deadlineAtMs, options);
+    } catch (error) {
+      work.error = error;
+      result = failedWidth(width, 'COLLECTION', pageFailureReason(session.page), error);
+    } finally {
+      closeError = await closeStressSession(session);
+    }
+    throwStressCloseError(work.error, closeError);
+    if (result === undefined) {
+      throw new Error('Responsive stress collection produced no result');
+    }
+    results.push(result);
+  }
+  return Object.freeze(results);
+}
+
+/**
+ * SWR（設計者の判断 2026-11-17）: 幅の走査を、1 つのセッションで 1 回だけ読み込み、幅ごとに viewport の大きさだけを変えて行う。
+ * - 最初の幅の前に 1 回だけ `beforeNavigation` を待ち、最初の幅の大きさでセッションを作って読み込む（読み込みの観測は `afterNavigation`）。
+ * - 後の幅は、同じ page の大きさを変えてから、落ち着きを待って測る（`collectStressLayout` と同じ測りと `afterLayout`）。
+ * - 幅が `FAILED` になるか、page が閉じたら、残りの幅を測らずに、それまでの結果を返す（残りの扱いは呼ぶ側が決める）。
+ * - 最後に 1 回だけセッションを閉じる。セッションの作成と close の失敗は、`collectStressLayout` と同じく例外で返す。
+ */
+export async function collectResizedStressLayout(
+  pageFactory: PassiveStressSessionFactory,
+  url: string,
+  widths: readonly number[],
+  options: ResizedStressLayoutOptions,
+): Promise<readonly StressLayoutEvidence[]> {
+  validateStressLayoutInput(pageFactory, widths, options);
+  const around = options.aroundWidth ?? ((_width: number, run: () => Promise<StressLayoutEvidence>) => run());
+  let { deadlineAtMs } = options;
+  let session: PassiveStressSession | null = null;
+  const work: StressWidthWork = { error: undefined };
+  const results: StressLayoutEvidence[] = [];
+  let closeError: unknown;
+  try {
+    for (const [index, width] of widths.entries()) {
+      const viewport = Object.freeze({ width, height: STRESS_VIEWPORT_HEIGHT });
+      const result = await around(width, async () => {
+        if (index === 0) {
+          deadlineAtMs += await options.beforeNavigation();
+          session = await pageFactory(viewport);
+        }
+        const page = (session as PassiveStressSession | null)?.page;
+        if (page === undefined) {
+          throw new Error('Responsive stress resize sweep has no session');
+        }
+        try {
+          if (index === 0) {
+            const failed = await loadStressWidth(page, url, width, deadlineAtMs, options, work);
+            if (failed !== null) {
+              return failed;
+            }
+          } else {
+            await page.setViewportSize(viewport);
+          }
+          return await measureStressWidth(page, viewport, deadlineAtMs, options);
+        } catch (error) {
+          work.error = error;
+          return failedWidth(width, 'COLLECTION', pageFailureReason(page), error);
+        }
+      });
+      results.push(result);
+      const current = session as PassiveStressSession | null;
+      if (result.status === 'FAILED' || current === null || current.page.isClosed()) {
+        break;
+      }
+    }
+  } finally {
+    const opened = session as PassiveStressSession | null;
+    if (opened !== null) {
+      closeError = await closeStressSession(opened);
+    }
+  }
+  throwStressCloseError(work.error, closeError);
+  return Object.freeze(results);
+}
+
+/** 幅の段の失敗（close の失敗と合わせて投げるため）。 */
+interface StressWidthWork {
+  error: unknown;
+}
+
+/** 幅の走査の入力を確かめる（`collectStressLayout`・`collectResizedStressLayout` の共通）。 */
+function validateStressLayoutInput(pageFactory: PassiveStressSessionFactory, widths: readonly number[], options: StressLayoutOptions): void {
   if (typeof pageFactory !== 'function') {
     throw new Error('A passive stress session factory is required');
   }
@@ -2084,8 +2385,7 @@ export async function collectStressLayout(
     throw new Error('Responsive stress requires options with a deadline and a beforeNavigation function');
   }
   const { beforeNavigation, afterNavigation, settleBeforeLayout } = options;
-  let { deadlineAtMs } = options;
-  if (!Number.isFinite(deadlineAtMs)) {
+  if (!Number.isFinite(options.deadlineAtMs)) {
     throw new Error('Responsive stress deadline must be finite');
   }
   if (typeof beforeNavigation !== 'function') {
@@ -2097,80 +2397,73 @@ export async function collectStressLayout(
   if (afterNavigation !== undefined && typeof afterNavigation !== 'function') {
     throw new Error('Responsive stress afterNavigation must be a function when given');
   }
-  const results: StressLayoutEvidence[] = [];
-  for (const width of widths) {
-    if (Date.now() >= deadlineAtMs) {
-      results.push(failedWidth(width, 'NOT_STARTED', 'DEADLINE_EXCEEDED', undefined));
-      continue;
-    }
-    const viewport = Object.freeze({ width, height: STRESS_VIEWPORT_HEIGHT });
-    // DEF-209: 読み込みの間隔を待ってから、その幅のセッション（Context と空の page）を作る（ビューポートの監査と同じ順。待つ間に、空の page の窓を
-    // 出さない）。待った時間は、期限を消費しない（サイトへの負荷の制御の設計書 4.4）。待ちの失敗は、セッションを作る前の失敗なので、セッションの作成の
-    // 失敗と同じく例外で返す。
-    deadlineAtMs += await beforeNavigation();
-    const session = await pageFactory(viewport);
-    let workError: unknown;
-    let closeError: unknown;
-    let result: StressLayoutEvidence | undefined;
-    try {
-      // 受け口があれば、読み込みの観測を渡す（サイトが応答しないときに Run を止める設計書 2.1）。追跡は読み込みの前に付け、観測を渡した後に
-      // 外す。判定はしない。
-      const tracker = afterNavigation === undefined ? null : trackMainFrameDocument(session.page);
-      let navigated: MainFrameLoadSettlement;
-      try {
-        // DEF-129: BeakSight 自身の読み込みであることを Guard に知らせる（ページが始めた読み込みの数を数え直す）。
-        announceOwnMainFrameNavigation(session.page);
-        navigated = await awaitBeforeDeadline(session.page.goto(url, { waitUntil: 'load' }), deadlineAtMs);
-        if (tracker !== null && afterNavigation !== undefined) {
-          afterNavigation(observeMainFrameLoad(tracker, navigated));
-        }
-      } finally {
-        tracker?.dispose();
-      }
-      if (navigated.status === 'DEADLINE_EXCEEDED') {
-        result = failedWidth(width, 'NAVIGATION', 'DEADLINE_EXCEEDED', undefined);
-      } else if (navigated.status === 'REJECTED') {
-        workError = navigated.reason;
-        result = failedWidth(width, 'NAVIGATION', 'NAVIGATION_FAILED', navigated.reason);
-      } else {
-        // T44 P1-5: 最初の読み込みと同じ落ち着きの待ちの後に測る（後から描く画面のデータを見る）。
-        await settleBeforeLayout(session.page, deadlineAtMs);
-        const collected = await collectLayoutEvidence(session.page, viewport, { deadlineAtMs });
-        // AUD-3d: layout を読んだ直後に、その幅の画像を撮る口を呼ぶ（読めなかった幅では呼ばない）。
-        if (collected.layout !== null && options.afterLayout !== undefined) {
-          await options.afterLayout(session.page, width, collected.layout);
-        }
-        result = collected.status === 'COMPLETE'
-          ? Object.freeze({ width, height: STRESS_VIEWPORT_HEIGHT, status: 'COMPLETE', layout: collected.layout })
-          : Object.freeze({
-            width,
-            height: STRESS_VIEWPORT_HEIGHT,
-            status: 'PARTIAL',
-            reason: collected.reason,
-            layout: collected.layout,
-          });
-      }
-    } catch (error) {
-      workError = error;
-      result = failedWidth(width, 'COLLECTION', pageFailureReason(session.page), error);
-    } finally {
-      try {
-        await session.close();
-      } catch (error) {
-        closeError = error;
-      }
-    }
+}
 
-    if (closeError !== undefined) {
-      if (workError !== undefined) {
-        throw new AggregateError([workError, closeError], 'Responsive stress work and owner close both failed');
-      }
-      throw closeError;
+/** 幅の page を読み込む。読み込めたら `null`、読み込めなければ、その幅の失敗の結果。 */
+async function loadStressWidth(
+  page: Page,
+  url: string,
+  width: number,
+  deadlineAtMs: number,
+  options: StressLayoutOptions,
+  work: StressWidthWork,
+): Promise<StressLayoutEvidence | null> {
+  const { afterNavigation } = options;
+  // 受け口があれば、読み込みの観測を渡す（サイトが応答しないときに Run を止める設計書 2.1）。追跡は読み込みの前に付け、観測を渡した後に
+  // 外す。判定はしない。
+  const tracker = afterNavigation === undefined ? null : trackMainFrameDocument(page);
+  let navigated: MainFrameLoadSettlement;
+  try {
+    // DEF-129: BeakSight 自身の読み込みであることを Guard に知らせる（ページが始めた読み込みの数を数え直す）。
+    announceOwnMainFrameNavigation(page);
+    navigated = await awaitBeforeDeadline(page.goto(url, { waitUntil: 'load' }), deadlineAtMs);
+    if (tracker !== null && afterNavigation !== undefined) {
+      afterNavigation(observeMainFrameLoad(tracker, navigated));
     }
-    if (result === undefined) {
-      throw new Error('Responsive stress collection produced no result');
-    }
-    results.push(result);
+  } finally {
+    tracker?.dispose();
   }
-  return Object.freeze(results);
+  if (navigated.status === 'DEADLINE_EXCEEDED') {
+    return failedWidth(width, 'NAVIGATION', 'DEADLINE_EXCEEDED', undefined);
+  }
+  if (navigated.status === 'REJECTED') {
+    work.error = navigated.reason;
+    return failedWidth(width, 'NAVIGATION', 'NAVIGATION_FAILED', navigated.reason);
+  }
+  return null;
+}
+
+/** 読み込んだ（大きさを変えた）幅の page で、落ち着きを待って形を測り、`afterLayout` を呼ぶ。 */
+async function measureStressWidth(page: Page, viewport: Viewport, deadlineAtMs: number, options: StressLayoutOptions): Promise<StressLayoutEvidence> {
+  const { width } = viewport;
+  // T44 P1-5: 最初の読み込みと同じ落ち着きの待ちの後に測る（後から描く画面のデータを見る）。
+  await options.settleBeforeLayout(page, deadlineAtMs);
+  const collected = await collectLayoutEvidence(page, viewport, { deadlineAtMs });
+  // AUD-3d: layout を読んだ直後に、その幅の画像を撮る口を呼ぶ（読めなかった幅では呼ばない）。
+  if (collected.layout !== null && options.afterLayout !== undefined) {
+    await options.afterLayout(page, width, collected.layout);
+  }
+  return collected.status === 'COMPLETE'
+    ? Object.freeze({ width, height: STRESS_VIEWPORT_HEIGHT, status: 'COMPLETE', layout: collected.layout })
+    : Object.freeze({ width, height: STRESS_VIEWPORT_HEIGHT, status: 'PARTIAL', reason: collected.reason, layout: collected.layout });
+}
+
+/** 幅のセッションを閉じる（失敗は返す）。 */
+async function closeStressSession(session: PassiveStressSession): Promise<unknown> {
+  try {
+    await session.close();
+    return undefined;
+  } catch (error) {
+    return error;
+  }
+}
+
+/** close の失敗を、段の失敗と合わせて投げる（close の失敗がなければ投げない）。 */
+function throwStressCloseError(workError: unknown, closeError: unknown): void {
+  if (closeError !== undefined) {
+    if (workError !== undefined) {
+      throw new AggregateError([workError, closeError], 'Responsive stress work and owner close both failed');
+    }
+    throw closeError;
+  }
 }

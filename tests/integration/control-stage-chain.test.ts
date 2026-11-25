@@ -7,7 +7,7 @@
 //   OP-1（設計書 `2026-10-27-beaksight-one-pass-flow-design.md` 4.1 の D4、4.1.3 の 1）で置き換えた: 登録は、ログインの直後（点検と操作さがしの前）に 1 回だけ。
 //   連鎖は、親が自分で進めた改訂を基準に進み、後の段のジョブの行は登録の後の改訂。
 // - 止める理由: 止める要求（連鎖の全体を止める）、段の未完了の理由（サービスの要求の上限など）、改訂の変化。止めたら次の段を始めない（`CHAIN_END`）。
-// - 段の間に、ほかのジョブを始められない。
+// - 段の間に、同じプロファイルのほかのジョブを始められない。ほかのサイトのジョブが動いていても、連鎖は次の段へ進む（PAR-b）。
 // 管理データと出力先は一時のフォルダだけを使う。起動したワーカーは、すべて止まったことを確かめる。
 import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
@@ -48,11 +48,23 @@ import {
   withOutputDirectory,
 } from '../helpers/job-test-support.js';
 import { sampleAction, sampleField, sampleForm } from '../unit/discovery-candidate-samples.js';
-import { PUBLIC_TARGET_PATH, TEST_ORIGIN, TEST_TARGET_PATH, publicProfile, resolveTestContext, testAuthProfile, testWriteProfile } from './control-profile-fixtures.js';
+import {
+  DRIFTED_CONTEXT,
+  PUBLIC_TARGET_PATH,
+  SECOND_PUBLIC_TARGET_PATH,
+  TEST_ORIGIN,
+  TEST_TARGET_PATH,
+  publicProfile,
+  resolveTestContext,
+  testAuthProfile,
+  testWriteProfile,
+} from './control-profile-fixtures.js';
 
 const RUN_IDS = Object.freeze(['RUN-20261022000000', 'RUN-20261022000100', 'RUN-20261022000200']);
 const TARGET_CONFIG_TEXT = JSON.stringify({ target: { id: 'example-test' } });
 const PROFILE_ID = 'example-stage-chain';
+/** 別のサイトの公開の点検のプロファイル（PAR-b）。 */
+const OTHER_SITE_PROFILE_ID = 'example-stage-chain-other-site';
 const OUTPUT_DIRECTORY = 'stage-chain-output';
 const SERVICE_ORIGIN = 'https://service.example.invalid';
 const TEST_TIMEOUT_MS = 60_000;
@@ -109,21 +121,31 @@ const DISCOVERY_DOCUMENT: DiscoveryDocument = {
   omittedUnreadPages: 0,
 };
 
+/**
+ * RCA-6: 発見の段の既定の成果物（GET の検索フォームなし。検索の確かめの組ができないので、READ の段を行うかは人の定義だけで決まる）。組のある場面は
+ * `DISCOVERY_DOCUMENT` を渡す。
+ */
+const NO_SEARCH_DOCUMENT: DiscoveryDocument = { ...DISCOVERY_DOCUMENT, pages: [] };
+
 let workDirectory = '';
 let database: ControlDatabase;
 let manager: AuditJobManager | undefined;
 const forks = createCountingFork();
 const children = forks.children;
 
-const fakeWorker = (chain: NonNullable<FakeWorkerValues['chain']>, extra: Partial<FakeWorkerValues> = {}): FakeWorker => writeFakeWorker(
+const fakeWorker = (
+  chain: NonNullable<FakeWorkerValues['chain']>,
+  extra: Partial<FakeWorkerValues> = {},
+  document: DiscoveryDocument = NO_SEARCH_DOCUMENT,
+): FakeWorker => writeFakeWorker(
   workDirectory,
   'chain',
   fakeWorkerValuesOf({ runId: RUN_IDS[0] ?? '', otherRunId: 'RUN-20261022009999' }, {
     chain,
     discovery: {
       outputDirectory: resolve(workDirectory, OUTPUT_DIRECTORY),
-      documentText: JSON.stringify(DISCOVERY_DOCUMENT),
-      summary: { ...discoverySummaryOf(DISCOVERY_DOCUMENT) },
+      documentText: JSON.stringify(document),
+      summary: { ...discoverySummaryOf(document) },
       runStatus: 'COMPLETE',
     },
     readCheck: { outputDirectory: resolve(workDirectory, OUTPUT_DIRECTORY), results: [] },
@@ -233,7 +255,7 @@ describe('FM2d: the chained run in the job management', () => {
   it('runs the audit, the discovery and the READ check as three job rows, gives the READ target from the discovery stage, and registers the login once right after it', async () => {
     createAuthProfile();
     createDefinition();
-    const worker = fakeWorker({ runIds: RUN_IDS }, { loginStage: { passedRequests: PASSED_REQUESTS, loginObservation: LOGIN_OBSERVATION } });
+    const worker = fakeWorker({ runIds: RUN_IDS }, { loginStage: { passedRequests: PASSED_REQUESTS, loginObservation: LOGIN_OBSERVATION } }, DISCOVERY_DOCUMENT);
     const jobManager = managerWith(worker);
     const chainId = await startChain(jobManager);
     const chain = await waitForChainEnd(jobManager, chainId);
@@ -266,7 +288,19 @@ describe('FM2d: the chained run in the job management', () => {
     await expectWorkersExited(children);
   }, TEST_TIMEOUT_MS);
 
-  it('does not run the READ check without a definition, and ends the chain without a failure', async () => {
+  // RCA-6（検索の確かめの設計書 2.2）: 人の定義がなくても、操作さがしの段の記録に検索の確かめの組があれば、READ の段を行い、組を渡す。
+  it('runs the READ check stage with the search checks of the discovery stage when there is no definition', async () => {
+    createAuthProfile();
+    const worker = fakeWorker({ runIds: RUN_IDS }, {}, DISCOVERY_DOCUMENT);
+    const jobManager = managerWith(worker);
+    const chain = await waitForChainEnd(jobManager, await startChain(jobManager));
+    expect(chain.stages.map(({ kind, state }) => [kind, state])).toEqual([['AUDIT', 'DONE'], ['DISCOVERY', 'DONE'], ['READ_CHECK', 'DONE']]);
+    const stage = worker.received().find((message) => message['type'] === 'NEXT_STAGE' && message['jobKind'] === 'READ_CHECK');
+    expect(stage?.['readChecks']).toEqual([]);
+    expect((stage?.['searchChecks'] as readonly unknown[]).length).toBeGreaterThan(0);
+  });
+
+  it('does not run the READ check without a definition and without a search check, and ends the chain without a failure', async () => {
     createAuthProfile();
     const worker = fakeWorker({ runIds: RUN_IDS });
     const jobManager = managerWith(worker);
@@ -493,4 +527,34 @@ describe('FM2d: the chained run in the job management', () => {
     expect(new Set(attempts)).toEqual(new Set(['JOB_ALREADY_ACTIVE']));
     await waitForChainEnd(jobManager, chainId);
   }, TEST_TIMEOUT_MS);
+
+  // PAR-b（設計書 `2026-11-17-beaksight-parallel-site-audits-design.md` 4 章）: ほかのサイトのジョブが動いていても、連鎖は次の段へ進む（段の移りは、同じ
+  // プロファイルの確かめで通る）。
+  it('advances the chain through its stages while a job of another site is running (PAR-b)', async () => {
+    createAuthProfile();
+    createDefinition();
+    writeTarget(SECOND_PUBLIC_TARGET_PATH);
+    const siteResolver = (path: string): ReturnType<typeof resolveTestContext> => (path === SECOND_PUBLIC_TARGET_PATH ? DRIFTED_CONTEXT : resolveTestContext(path));
+    expect(createProfile(database, publicProfile(OTHER_SITE_PROFILE_ID, MIN_PROFILE_REVISION, SECOND_PUBLIC_TARGET_PATH), { resolveContext: siteResolver }).ok).toBe(true);
+    const holding = writeFakeWorker(workDirectory, 'hold', fakeWorkerValuesOf({ runId: 'RUN-20261117000000', otherRunId: 'RUN-20261117009999' }));
+    // 1 つ目の起動（ほかのサイトのジョブ）だけ、止めるまで動き続ける偽のワーカーにする。
+    const holdingFirst: AuditWorkerForker = (modulePath, args, options) => forks.fork(forks.count() === 0 ? holding.path : modulePath, args, options);
+    manager = createFakeWorkerJobManager({
+      database, workDirectory, worker: fakeWorker({ runIds: RUN_IDS }), resolveContext: withOutputDirectory(siteResolver, OUTPUT_DIRECTORY), forkWorker: holdingFirst,
+    });
+    const jobManager = manager;
+    const other = await jobManager.startAuditJob({ profileId: OTHER_SITE_PROFILE_ID, expectedRevision: MIN_PROFILE_REVISION, startNew: true });
+    const otherJobId = other.ok ? other.job.jobId : '';
+    await waitFor(() => (jobManager.getAuditJob(otherJobId)?.state === 'RUNNING' ? true : null));
+
+    const chainId = await startChain(jobManager);
+    const chain = await waitFor(() => {
+      const current = jobManager.getStageChainOfJob(chainId);
+      return current !== null && current.state !== 'RUNNING' ? current : null;
+    });
+
+    expect(chain).toMatchObject({ state: 'FINISHED', stopReason: null });
+    expect(chain.stages.map(({ kind, state }) => [kind, state])).toEqual([['AUDIT', 'DONE'], ['DISCOVERY', 'DONE'], ['READ_CHECK', 'DONE']]);
+    expect(jobManager.getAuditJob(otherJobId)).toMatchObject({ state: 'RUNNING', finishedAt: null });
+  });
 });

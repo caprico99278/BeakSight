@@ -11,18 +11,23 @@
  * - EV-4（同じ設計書 3.4）: 文字の見切れと横にスクロールする領域の指摘も、重なりと同じく、測り直して撮った画像（なければ状態の画像）と、入ったか・保留の理由を持つ。
  * - EV-5（同じ設計書 3.5。設計者の判断 2026-11-16）: 保留の理由の決め方は、表示用モデル（`src/report/view-model.ts`）と再開の列の決まり
  *   （`src/orchestration/resume-revisit.ts`）の両方が使うので、core に置く（前は `src/report/finding-image-regions.ts`）。
+ * - AUD-4（設計書 `2026-11-19-beaksight-audit-result-review-fixes-design.md` 7.2）: 動かして撮る規則でない layout の指摘は、layout と画像の状態の印を比べてから
+ *   重ねる（`alignedToImageState`）。合わなければ保留の理由 `EVIDENCE_MISMATCH`。色差の背景色と画像の画素の照合はしない。
  */
 import type { AuditRunResult, EvidenceId, EvidenceRecord, Finding, PageAuditResult } from './contracts.js';
 import {
   ACCESSIBILITY_TARGET_REGION_REASONS,
+  type EvidenceStateMark,
   type LayoutEvidence,
   type RectangleEvidence,
   type RevealedTargetEvidence,
   type ScrollPosition,
+  type StateMarkTargetRectEvidence,
   type TargetImageInclusion,
 } from './evidence-types.js';
+import { focusCheckItemOfFinding } from './focus-check-items.js';
 import { PAGE_READINESS_RULE_IDS, stateReadyOf } from './page-readiness.js';
-import { combinedInclusion, inclusionInImage } from './target-image-inclusion.js';
+import { combinedInclusion, inclusionInImage, TARGET_IMAGE_INCLUSION_TOLERANCE_PX } from './target-image-inclusion.js';
 
 /** 矩形の役目（指摘の要素・覆う要素・覆われる要素）。 */
 export const FINDING_IMAGE_REGION_ROLES = Object.freeze(['TARGET', 'OVERLAY', 'COVERED'] as const);
@@ -86,8 +91,13 @@ export interface FindingImageRegionView {
  * - `TARGET_NOT_IN_IMAGE`: 画像はあるが、対象が画像の範囲に全部は入らなかった。
  * - `PAGE_NOT_READY`: 画面の準備が終わらないまま集めた（EV-3。内容の規則の指摘だけ。`src/core/page-readiness.ts`）。
  * - `NOT_OPERATED`: 対象まで動かして撮れなかった（画像を撮らない設定・撮れなかった・前の版の記録など。参照する画像がない）。
+ * - `EVIDENCE_MISMATCH`: AUD-4（設計書 `2026-11-19-beaksight-audit-result-review-fixes-design.md` 7.2 の 2）。動かして撮る規則でない layout の指摘で、layout を
+ *   読んだときと画像を撮ったときの状態の印が合わない（隠した通知の枠の数が違う、対象そのものが動いた・消えた・複数に当たる、対象の祖先のスクロールできる箱が
+ *   片方にない、箱の位置の差で動かすと箱の見える範囲から出る）。撮り直しを待つ。
+ * - `PAGE_READINESS_UNKNOWN`: AUD-6（同じ設計書 9.1。S-08）。内容の規則の指摘で、その状態の落ち着きの待ちを終えられなかった（`NOT_COMPLETED`・`PARTIAL`）か、
+ *   落ち着きの記録がない（準備の状態が分からない）。確かめ直しで同じ指摘が出たなら付けない。読み直しで取りに行く。
  */
-export const FINDING_HOLD_REASONS = Object.freeze(['TARGET_NOT_IN_IMAGE', 'PAGE_NOT_READY', 'NOT_OPERATED'] as const);
+export const FINDING_HOLD_REASONS = Object.freeze(['TARGET_NOT_IN_IMAGE', 'PAGE_NOT_READY', 'NOT_OPERATED', 'EVIDENCE_MISMATCH', 'PAGE_READINESS_UNKNOWN'] as const);
 export type FindingHoldReason = (typeof FINDING_HOLD_REASONS)[number];
 
 /** EV-4: 横にスクロールする領域の指摘（axe の `scrollable-region-focusable`）の Rule の ID。 */
@@ -264,7 +274,8 @@ export function findingHoldReasonsOnPage(page: PageAuditResult): readonly (Findi
 
 /**
  * そのページ（指摘のページ）の上の、指摘の画像の参照と対象の領域。ビューポートによらない指摘と、参照する Evidence がそのページにない指摘は `null`。
- * EV-3: 内容の規則（`PAGE_READINESS_RULE_IDS`）の指摘は、その状態の準備が終わらないまま集めたなら、保留の理由 `PAGE_NOT_READY`（`pageNotReadyOf`）。
+ * EV-3: 内容の規則（`PAGE_READINESS_RULE_IDS`）の指摘は、その状態の準備が終わらないまま集めたなら、保留の理由 `PAGE_NOT_READY`、AUD-6: 準備の状態が分からない
+ * なら `PAGE_READINESS_UNKNOWN`（`pageReadinessHoldOf`）。
  */
 function regionOfFindingOnPage(page: PageAuditResult, finding: Finding): FindingImageRegionView | null {
   if (finding.viewport === null) {
@@ -277,16 +288,19 @@ function regionOfFindingOnPage(page: PageAuditResult, finding: Finding): Finding
     return null;
   }
   const view = imageRegionOfRecord(page, finding, record);
-  return PAGE_READINESS_RULE_IDS.has(finding.ruleId) && pageNotReadyOf(page, finding, record) ? { ...view, holdReason: 'PAGE_NOT_READY' } : view;
+  const readinessHold = PAGE_READINESS_RULE_IDS.has(finding.ruleId) ? pageReadinessHoldOf(page, finding, record) : null;
+  return readinessHold === null ? view : { ...view, holdReason: readinessHold };
 }
 
 /**
- * EV-3: 指摘の Evidence の状態の画面の準備が終わっていなかったか。後から出た指摘（`LATE`）は確かめ直しの値、ずっとある指摘（`PERSISTENT`）は 1 回目と
- * 確かめ直しの両方で終わっていないとき、確かめ直しの表に印のない指摘は 1 回目の状態の値。`INITIAL_ONLY` は保留にしない。記録がなければ、終わったものとする。
+ * EV-3: 指摘の Evidence の状態の画面の準備による保留の理由（なければ `null`）。後から出た指摘（`LATE`）は確かめ直しの値、ずっとある指摘（`PERSISTENT`）は
+ * 1 回目と確かめ直しの両方で終わっていないとき、確かめ直しの表に印のない指摘は 1 回目の状態の値で `PAGE_NOT_READY`。`INITIAL_ONLY` は保留にしない。
+ * AUD-6（S-08）: 1 回目の状態の落ち着きの待ちを終えられなかった・記録がない指摘は `PAGE_READINESS_UNKNOWN`（確かめ直しで同じ指摘が出たなら今どおり付けない）。
+ * 状態の ID のない前の版の記録は、終わったものとする。
  */
-function pageNotReadyOf(page: PageAuditResult, finding: Finding, record: EvidenceRecord): boolean {
+function pageReadinessHoldOf(page: PageAuditResult, finding: Finding, record: EvidenceRecord): 'PAGE_NOT_READY' | 'PAGE_READINESS_UNKNOWN' | null {
   if (finding.viewport === null) {
-    return false;
+    return null;
   }
   const stateId = record.capture?.stateId;
   const viewport = page.viewports[finding.viewport];
@@ -295,19 +309,26 @@ function pageNotReadyOf(page: PageAuditResult, finding: Finding, record: Evidenc
   const mark = recheck?.findings.find((entry) => entry.fingerprint === finding.fingerprint)?.state;
   const notReadyAtRecheck = recheck?.pageReady === false;
   if (mark === 'LATE') {
-    return notReadyAtRecheck;
+    return notReadyAtRecheck ? 'PAGE_NOT_READY' : null;
   }
   // 設計者の判断（2026-11-16）: 確かめ直しで消えた指摘（`INITIAL_ONLY`、「初めだけ」）は、保留にしない。
   if (mark === 'INITIAL_ONLY') {
-    return false;
+    return null;
   }
-  // REV-EV3 の M-2: 1 回目の状態の準備は、主の状態の落ち着きの待ちの終わり方と、その状態の DOM の表示の数で決める（`stateReadyOf`）。主でない状態は、
-  // 表示を待たないので、終わったものとする。
+  // 主でない状態は、表示を待たないので、終わったものとする。
+  if (stateId === undefined || viewport.stateId !== stateId) {
+    return null;
+  }
+  // AUD-6（S-08）: 1 回目の状態の落ち着きの待ちを終えられなかった・記録がないなら、準備の状態が分からない。
+  const settling = viewport.settling;
+  if (settling === undefined || settling.status !== 'SETTLED') {
+    return mark === 'PERSISTENT' ? null : 'PAGE_READINESS_UNKNOWN';
+  }
+  // REV-EV3 の M-2: 1 回目の状態の準備は、主の状態の落ち着きの待ちの終わり方と、その状態の DOM の表示の数で決める（`stateReadyOf`）。
   const dom = page.evidence.find((candidate) => candidate.type === 'dom' && candidate.viewport === finding.viewport && candidate.capture?.stateId === stateId);
-  const notReadyAtFirst = stateId !== undefined && viewport.stateId === stateId
-    && !stateReadyOf(viewport.settling?.reason, dom?.type === 'dom' ? dom.payload.loadingIndicators : undefined);
+  const notReadyAtFirst = !stateReadyOf(settling.reason, dom?.type === 'dom' ? dom.payload.loadingIndicators : undefined);
   // 1 回目に準備ができていた指摘には、確かめ直しの値で保留を付けない。ずっとある指摘は、確かめ直しでも終わっていないときだけ。
-  return mark === 'PERSISTENT' ? notReadyAtFirst && notReadyAtRecheck : notReadyAtFirst;
+  return (mark === 'PERSISTENT' ? notReadyAtFirst && notReadyAtRecheck : notReadyAtFirst) ? 'PAGE_NOT_READY' : null;
 }
 
 /** 指摘の Evidence（`record`）から、画像の参照と対象の領域を作る。 */
@@ -353,7 +374,9 @@ function imageRegionOfRecord(page: PageAuditResult, finding: Finding, record: Ev
   // EV-2: 対象まで動かして撮った画像は、状態の画像として引かない（位置が違う）。
   const screenshot = found.screenshotEvidenceId !== undefined
     ? viewportShots.find((candidate) => candidate.evidenceId === found.screenshotEvidenceId)
-    : viewportShots.find((candidate) => sameState(candidate) && candidate.capture?.phase !== 'focus-check' && candidate.payload.reveal === undefined);
+    // AUD-2: 通知の枠を隠す前の画像も、状態の画像として引かない（隠した後の状態を測るため）。
+    : viewportShots.find((candidate) => sameState(candidate) && candidate.capture?.phase !== 'focus-check' && candidate.payload.reveal === undefined
+      && candidate.payload.beforeNotificationHide !== true);
   if (screenshot === undefined) {
     return unavailable('NO_SCREENSHOT_OF_STATE');
   }
@@ -361,11 +384,16 @@ function imageRegionOfRecord(page: PageAuditResult, finding: Finding, record: Ev
   // 矩形を読んだ位置と画像を撮った位置の差だけ動かす（画像の座標 = 要素の座標 + 矩形を読んだ位置 - 画像の位置）。
   const dx = (regionScrollPosition?.scrollX ?? 0) - image.scrollX;
   const dy = (regionScrollPosition?.scrollY ?? 0) - image.scrollY;
-  const regions = found.regions.map(({ role, selector, rect }) => ({
+  const placed = found.regions.map(({ role, selector, rect }) => ({
     role,
     selector,
     rect: { x: rect.left + dx, y: rect.top + dy, width: rect.width, height: rect.height },
   }));
+  // AUD-4: 動かして撮る規則でない layout の指摘は、layout と画像の状態の印を比べてから重ねる（祖先の箱の位置の差だけなら、その差で動かす）。
+  const layoutMark = record.type === 'layout' && !revealRule ? layoutOfFinding(record, stressWidth)?.stateMark : undefined;
+  const aligned = layoutMark === undefined ? placed : alignedToImageState(placed, layoutMark, screenshot.payload.stateMark);
+  const mismatch = aligned === null;
+  const regions = aligned ?? [];
   // EV-2: 画像の範囲に対象が入ったか。動かさずに測って撮った画像（フォーカス）は、その測り。ほかは、画像の大きさ（その Evidence の viewport）と矩形から決める。
   const imageSize = imageSizeOf(page, record, stressWidth);
   const asIs = screenshot.payload.reveal?.targets[0];
@@ -376,7 +404,7 @@ function imageRegionOfRecord(page: PageAuditResult, finding: Finding, record: Ev
   // 矩形が証拠なので、画像の外でも保留にしない（`targetInImage` は記録する）。保留は、引き直せなかったとき（`NOT_OPERATED`）だけ。
   const holdReason = record.type === 'focus'
     ? (asIs?.found === false ? 'NOT_OPERATED' : null)
-    : holdReasonOf(targetInImage);
+    : mismatch ? 'EVIDENCE_MISMATCH' : holdReasonOf(targetInImage);
   return {
     screenshotEvidenceId: screenshot.evidenceId,
     relativePath: screenshot.payload.relativePath,
@@ -393,6 +421,70 @@ function imageRegionOfRecord(page: PageAuditResult, finding: Finding, record: Ev
 }
 
 type ViewportScreenshotRecord = Extract<EvidenceRecord, { type: 'screenshot' }>;
+
+/**
+ * AUD-4（設計書 `2026-11-19-beaksight-audit-result-review-fixes-design.md` 7.2 の 2）: layout の座標を文書のスクロールの差で画像にそろえた矩形（`placed`）を、
+ * layout の状態の印と画像の状態の印で比べて、画像の状態にそろえる。合わなければ `null`（`EVIDENCE_MISMATCH`）。画像に印がない（前の版の記録・読めなかった）
+ * ときは、そのまま返す。
+ * - 隠した通知の枠の数（両方にあるとき）が違えば合わない。DOM の構造の要約は比べない（設計者の判断 2026-11-19: 対象と関係のない所の変化 — 後から差し込まれる
+ *   窓・広告の枠・回るカルーセル — で、指摘を保留にしない）。
+ * - 矩形ごとに、その要素の祖先のスクロールできる箱（layout の印の `targetScrollBoxes`）の位置の差だけ動かす。箱が画像の印にないか、動かした矩形がどれかの祖先の
+ *   箱の見える範囲（画像の印の `clientRect`）に全部は入らなければ合わない。祖先の箱が動いていない要素は、そのまま。
+ * - 画像の印が対象の矩形を読み直していれば（`targetRects`）、要素が 1 つだけ当たり、その矩形が、動かした後の矩形と同じ（誤差は、画像に入ったかの決め方と同じ
+ *   `TARGET_IMAGE_INCLUSION_TOLERANCE_PX`。小数の矩形の丸め）でなければ合わない（対象そのものが動いた・消えた・複数に当たる）。
+ */
+function alignedToImageState(
+  placed: readonly FindingImageRegionEntryView[],
+  layoutMark: EvidenceStateMark,
+  imageMark: EvidenceStateMark | undefined,
+): readonly FindingImageRegionEntryView[] | null {
+  if (imageMark === undefined) {
+    return placed;
+  }
+  const { hiddenNotificationFrameCount: layoutHidden } = layoutMark;
+  const { hiddenNotificationFrameCount: imageHidden } = imageMark;
+  if (layoutHidden !== undefined && imageHidden !== undefined && layoutHidden !== imageHidden) {
+    return null;
+  }
+  const aligned: FindingImageRegionEntryView[] = [];
+  for (const entry of placed) {
+    const ancestors = layoutMark.targetScrollBoxes?.find(({ selector }) => selector === entry.selector)?.boxes ?? [];
+    let shiftX = 0;
+    let shiftY = 0;
+    const visibleAreas: RectangleEvidence[] = [];
+    for (const index of ancestors) {
+      const before = layoutMark.scrollBoxes[index];
+      const after = before === undefined ? undefined : imageMark.scrollBoxes.find(({ selector }) => selector === before.selector);
+      if (before === undefined || after === undefined) {
+        return null;
+      }
+      shiftX += before.scrollLeft - after.scrollLeft;
+      shiftY += before.scrollTop - after.scrollTop;
+      visibleAreas.push(after.clientRect);
+    }
+    const rect = { ...entry.rect, x: entry.rect.x + shiftX, y: entry.rect.y + shiftY };
+    if (imageMark.targetRects !== undefined && !sameRectAtImage(rect, imageMark.targetRects.find(({ selector }) => selector === entry.selector))) {
+      return null;
+    }
+    if (shiftX === 0 && shiftY === 0) {
+      aligned.push(entry);
+      continue;
+    }
+    // 箱の見える範囲に入るときだけ重ねる（箱の座標に移して、箱の大きさの画像に入るかで決める。誤差は画像に入ったかの決め方と同じ）。
+    if (!visibleAreas.every((area) => inclusionInImage([{ ...rect, x: rect.x - area.left, y: rect.y - area.top }], area.width, area.height) === 'INSIDE')) {
+      return null;
+    }
+    aligned.push({ ...entry, rect });
+  }
+  return aligned;
+}
+
+/** AUD-4: 画像の座標にそろえた矩形が、撮る直前に読み直した対象（1 つだけ当たったもの）の矩形と同じか。 */
+const sameRectAtImage = (rect: FindingImageRectView, reread: StateMarkTargetRectEvidence | undefined): boolean => {
+  const found = reread?.matchCount === 1 ? reread.rect : null;
+  const near = (first: number, second: number): boolean => Math.abs(first - second) <= TARGET_IMAGE_INCLUSION_TOLERANCE_PX;
+  return found !== null && near(rect.x, found.left) && near(rect.y, found.top) && near(rect.width, found.width) && near(rect.height, found.height);
+};
 
 /** EV-2: 測り直して撮った画像と、その中の、指摘の対象の記録。 */
 interface RevealedOfFinding {
@@ -496,9 +588,8 @@ const sourceRegionsOf = (finding: Finding, record: EvidenceRecord, stressWidth: 
   }
   if (record.type === 'focus') {
     // AUD-4d: フォーカスを当てた後の矩形と、フォーカスを当てたまま撮った画像。EV-1: 矩形を読んだ位置は、フォーカスのスクロールの後の文書の位置（前の版の記録は、
-    // 確かめを読んだ位置）。
-    const selector = keyValueOf(finding, 'selector');
-    const item = record.payload.items.find((candidate) => candidate.selector === selector);
+    // 確かめを読んだ位置）。AUD-3: 項目は、指摘の項目の番号で引く（同じ selector の別の項目を根拠にしない）。
+    const item = focusCheckItemOfFinding(finding.groupingKeys ?? [], record.payload);
     return {
       regions: item?.afterRect === null || item === undefined ? [] : [{ role: 'TARGET', selector: item.selector, rect: item.afterRect }],
       scrollPosition: item?.scroll?.document.after ?? record.payload.scrollPosition,

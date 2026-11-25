@@ -4,13 +4,13 @@
 // - 同じディレクトリの別の綴り（Windows の大文字、`\\?\` の前置き）は、同じ排他になる（名前の元は、ディレクトリの `dev` と `ino`）。
 // - 中核（`executeAuditRun`）: 持たれていれば `RUN_ACTIVE`（終了コード 4、Run Coordinator を作らない）。自分の印は Run の終わりまで持ち、
 //   例外の経路と、Run を始めない結果でも離す。印を持てたかを決められなければ、保存のセッションを始めない（止まる側。差し替えで作る）。
-//   印のために作った出力先は、Run を始めずに終われば残さない（DEF-081）。
+//   出力先は別の対象と共有するので、印を離しても出力先そのものは消さない（REV-PAR の m-1。前の DEF-081 の後始末はやめた）。
 // - CLI（`runAuditCommand`）: 別の Run が動いているときは、Run の ID のない文を標準エラーに出し、終了コード 4。
 // 偽の Run Coordinator（`createRunCoordinator`）で確かめる（Browser を起動しない）。同じ出力先の 2 つの起動の結合は
 // `tests/integration/output-start-lock.test.ts`（SLIM-GROUP: 2 つの CLI の process の結合は、ここの子 process の排他と重なるので消した）。
 // 注意: Claude Code の sandbox の中では、パイプの listen が `EACCES` になる（環境の制約。sandbox の外で流す）。
 import { spawn } from 'node:child_process';
-import { existsSync } from 'node:fs';
+import { statSync } from 'node:fs';
 import { mkdir, mkdtemp, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
@@ -42,8 +42,8 @@ vi.mock('../../src/core/run-exclusion.js', async (importOriginal) => {
   const actual = await importOriginal<typeof import('../../src/core/run-exclusion.js')>();
   return {
     ...actual,
-    acquireRunExclusion: async (outputDirectory: string): Promise<RunExclusion> => exclusionFailure.cause === undefined
-      ? await actual.acquireRunExclusion(outputDirectory)
+    acquireRunExclusion: async (outputDirectory: string, targetId: string): Promise<RunExclusion> => exclusionFailure.cause === undefined
+      ? await actual.acquireRunExclusion(outputDirectory, targetId)
       : Object.freeze<RunExclusion>({ kind: 'UNAVAILABLE', cause: exclusionFailure.cause }),
   };
 });
@@ -73,6 +73,10 @@ function newOutputDirectory(): string {
 /** テストごとに別の出力先に書く設定。 */
 const newConfig = (): AuditConfig => createTestConfig(FIXTURE_ORIGIN, '/', { output: { directory: newOutputDirectory() } });
 
+/** 印の対象の ID（設定の `target.id`）と、同じ出力先に書く別の対象の ID（PAR-a）。 */
+const TARGET_ID = createTestConfig(FIXTURE_ORIGIN, '/').target.id;
+const OTHER_TARGET_ID = `${TARGET_ID}-other`;
+
 const failingLaunch = async (): Promise<never> => {
   throw new Error('browser launch is not allowed in this test');
 };
@@ -91,7 +95,7 @@ async function releaseIfAcquired(exclusion: RunExclusion): Promise<void> {
 const CONTENDER_SOURCE = `${TYPESCRIPT_SOURCE_RESOLVE_HOOK}
 const { existsSync } = await import('node:fs');
 const { acquireRunExclusion } = await import(${JSON.stringify(pathToFileURL(resolve('src/core/run-exclusion.ts')).href)});
-const [outputDirectory, goFile] = process.argv.slice(1);
+const [outputDirectory, goFile, targetId] = process.argv.slice(1);
 const waitFor = async (path) => {
   while (!existsSync(path)) {
     await new Promise((resolveWait) => setTimeout(resolveWait, 5));
@@ -101,7 +105,7 @@ process.stdout.write('ready\\n');
 if (goFile !== '-') {
   await waitFor(goFile);
 }
-const result = await acquireRunExclusion(outputDirectory);
+const result = await acquireRunExclusion(outputDirectory, targetId);
 process.stdout.write('kind:' + result.kind + '\\n');
 if (goFile === '-') {
   setInterval(() => undefined, 1000);
@@ -117,7 +121,7 @@ function startContender(outputDirectory: string, goFile: string): {
   readonly closed: Promise<void>;
   readonly kill: () => void;
 } {
-  const child = spawn(process.execPath, ['--input-type=module', '-e', CONTENDER_SOURCE, outputDirectory, goFile], { stdio: ['ignore', 'pipe', 'pipe'] });
+  const child = spawn(process.execPath, ['--input-type=module', '-e', CONTENDER_SOURCE, outputDirectory, goFile, TARGET_ID], { stdio: ['ignore', 'pipe', 'pipe'] });
   let output = '';
   let markReady: () => void = () => undefined;
   let markAnswer: (kind: string) => void = () => undefined;
@@ -198,7 +202,7 @@ describe('acquireRunExclusion: the OS releases the exclusion when its owner ends
     const outputDirectory = newOutputDirectory();
     const owner = await startOwner(outputDirectory);
     try {
-      await expect(acquireRunExclusion(outputDirectory)).resolves.toEqual({ kind: 'HELD' });
+      await expect(acquireRunExclusion(outputDirectory, TARGET_ID)).resolves.toEqual({ kind: 'HELD' });
     } finally {
       owner.kill();
       await owner.closed;
@@ -211,7 +215,7 @@ describe('acquireRunExclusion: the OS releases the exclusion when its owner ends
     owner.kill();
     await owner.closed;
 
-    const exclusion = await acquireRunExclusion(outputDirectory);
+    const exclusion = await acquireRunExclusion(outputDirectory, TARGET_ID);
     expect(exclusion.kind).toBe('ACQUIRED');
     await releaseIfAcquired(exclusion);
   }, CHILD_TEST_TIMEOUT_MS);
@@ -237,14 +241,44 @@ describe('acquireRunExclusion: the OS releases the exclusion when its owner ends
     expect(acquiredPerRound).toEqual(Array.from({ length: CONTENTION_ROUNDS }, () => 1));
   }, CHILD_TEST_TIMEOUT_MS);
 
+  // PAR-a: 印は「出力先 + 対象の ID」の単位。同じ出力先でも対象が違えば両方取れ、同じ対象なら今どおり持たれている。
+  it('is per output directory and target: another target in the same directory is acquired, the same target is held', async () => {
+    const outputDirectory = newOutputDirectory();
+    const first = await acquireRunExclusion(outputDirectory, TARGET_ID);
+    const other = await acquireRunExclusion(outputDirectory, OTHER_TARGET_ID);
+    try {
+      expect([first.kind, other.kind]).toEqual(['ACQUIRED', 'ACQUIRED']);
+      await expect(acquireRunExclusion(outputDirectory, TARGET_ID)).resolves.toEqual({ kind: 'HELD' });
+    } finally {
+      await releaseIfAcquired(first);
+      await releaseIfAcquired(other);
+    }
+  });
+
+  // REV-PAR の m-1: 出力先は別の対象と共有するので、印を離しても出力先そのものは消さない（別の対象の起動が持つ出力先を作り直させない。DEF-081 の
+  // 後始末はやめた）。
+  it('keeps the shared output directory when a target releases it while another target holds it', async () => {
+    const outputDirectory = newOutputDirectory();
+    const first = await acquireRunExclusion(outputDirectory, TARGET_ID);
+    const other = await acquireRunExclusion(outputDirectory, OTHER_TARGET_ID);
+    try {
+      const before = statSync(outputDirectory).ino;
+      await releaseIfAcquired(first);
+      expect(statSync(outputDirectory).ino).toBe(before);
+      await expect(acquireRunExclusion(outputDirectory, OTHER_TARGET_ID)).resolves.toEqual({ kind: 'HELD' });
+    } finally {
+      await releaseIfAcquired(other);
+    }
+  });
+
   // REV-SPEC2 第 2 回の C-3（`race2.mjs alias` の順）: 同じディレクトリを別の綴り（大文字、`\\?\` の前置き）で指しても、同じ排他になる。
   it.runIf(process.platform === 'win32')('is the same exclusion for the other spellings of the same output directory (the case, the \\\\?\\ prefix)', async () => {
     const outputDirectory = newOutputDirectory();
-    const exclusion = await acquireRunExclusion(outputDirectory);
+    const exclusion = await acquireRunExclusion(outputDirectory, TARGET_ID);
     try {
       expect(exclusion.kind).toBe('ACQUIRED');
       for (const spelling of [outputDirectory.toUpperCase(), `\\\\?\\${outputDirectory}`]) {
-        await expect(acquireRunExclusion(spelling), spelling).resolves.toEqual({ kind: 'HELD' });
+        await expect(acquireRunExclusion(spelling, TARGET_ID), spelling).resolves.toEqual({ kind: 'HELD' });
       }
     } finally {
       await releaseIfAcquired(exclusion);
@@ -255,7 +289,7 @@ describe('acquireRunExclusion: the OS releases the exclusion when its owner ends
 describe('executeAuditRun: the exclusion of the output directory', () => {
   it('respects the exclusion held by another start: RUN_ACTIVE, exit code 4, no Run Coordinator', async () => {
     const config = newConfig();
-    const other = await acquireRunExclusion(config.output.directory);
+    const other = await acquireRunExclusion(config.output.directory, config.target.id);
     const { dependencies, created } = fakeDependencies();
     const { observer, hooks } = recordingObserver();
     try {
@@ -271,7 +305,7 @@ describe('executeAuditRun: the exclusion of the output directory', () => {
 
   it('prints the text to stderr and exits with code 4 in the CLI', async () => {
     const config = newConfig();
-    const other = await acquireRunExclusion(config.output.directory);
+    const other = await acquireRunExclusion(config.output.directory, config.target.id);
     const stdout = captureCliOutput();
     const stderr = captureCliOutput();
     try {
@@ -289,14 +323,14 @@ describe('executeAuditRun: the exclusion of the output directory', () => {
     const config = newConfig();
     const record: { during?: string } = {};
     const { dependencies } = fakeDependencies(async () => {
-      record.during = (await acquireRunExclusion(config.output.directory)).kind;
+      record.during = (await acquireRunExclusion(config.output.directory, config.target.id)).kind;
       return auditRun();
     });
 
     expect((await executeAuditRun(config, dependencies, { startNew: false })).kind).toBe('RAN');
 
     expect(record.during).toBe('HELD');
-    const after = await acquireRunExclusion(config.output.directory);
+    const after = await acquireRunExclusion(config.output.directory, config.target.id);
     expect(after.kind).toBe('ACQUIRED');
     await releaseIfAcquired(after);
   });
@@ -316,17 +350,6 @@ describe('executeAuditRun: the exclusion of the output directory', () => {
     } finally {
       exclusionFailure.cause = undefined;
     }
-  });
-
-  it('does not leave the output directory that it created when the Run does not start (DEF-081)', async () => {
-    const config = newConfig();
-    const { dependencies } = fakeDependencies(async () => {
-      throw new Error('the Run failed before the run directory');
-    });
-
-    await expect(executeAuditRun(config, dependencies, { startNew: false })).rejects.toBeInstanceOf(Error);
-
-    expect(existsSync(config.output.directory)).toBe(false);
   });
 
   const failures: readonly { readonly name: string; readonly dependencies: (config: AuditConfig) => AuditRunDependencies }[] = [
@@ -354,7 +377,7 @@ describe('executeAuditRun: the exclusion of the output directory', () => {
 
     await executeAuditRun(config, dependencies(config), { startNew: false }).catch(() => undefined);
 
-    const after = await acquireRunExclusion(config.output.directory);
+    const after = await acquireRunExclusion(config.output.directory, config.target.id);
     expect(after.kind).toBe('ACQUIRED');
     await releaseIfAcquired(after);
   });

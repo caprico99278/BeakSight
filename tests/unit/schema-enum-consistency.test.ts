@@ -31,6 +31,8 @@ import * as discoveryClassificationWords from '../../src/discovery/classificatio
 import * as loginObservation from '../../src/discovery/login-observation.js';
 import * as discoveryResult from '../../src/discovery/discovery-result.js';
 import * as coverageQueue from '../../src/discovery/coverage-queue.js';
+import * as searchReadContracts from '../../src/discovery/search-read-contracts.js';
+import * as searchCheckTextValues from '../../src/discovery/search-check-text-values.js';
 import * as readCheckContracts from '../../src/discovery/read-check-contracts.js';
 import * as readCheckEvaluation from '../../src/discovery/read-check-evaluation.js';
 import { SUBMISSION_STAGE_BLOCK_REASONS } from '../../src/safety/request-policy.js';
@@ -100,6 +102,9 @@ const ENUM_MAPPINGS: readonly EnumMapping[] = Object.freeze([
   mapping('checkpoint', '/properties/state/enum', 'RUN_CHECKPOINT_STATES'),
   mapping('checkpoint', '/$defs/execution/properties/endReason/enum', 'RUN_EXECUTION_END_REASONS', NULLABLE),
   mapping('checkpoint', '/$defs/frontierEntry/properties/state/enum', 'CRAWL_URL_STATES'),
+  // DUP: 同じ作りの表に入れた、点検を終えたページの深さと、軽い点検・点検を省いたページの記録の深さ。
+  mapping('checkpoint', '/properties/frontier/properties/pageReferences/items/properties/depth/enum', 'PAGE_REFERENCE_DEPTHS'),
+  mapping('page', '/properties/sameness/properties/depth/enum', 'PAGE_SAMENESS_DEPTHS'),
   // page.schema.json: ページとビューポート
   // BN-a（設計書 `2026-10-23-beaksight-bundle-beaksight-block-noise-design.md` 3.1 の 5）: 読める page.json の版と、止めた事象の時点。
   mapping('page', '/properties/schemaVersion/enum', 'PAGE_READABLE_SCHEMA_VERSIONS'),
@@ -162,12 +167,23 @@ const ENUM_MAPPINGS: readonly EnumMapping[] = Object.freeze([
   mapping('page', '/$defs/focusCheckEvidence/properties/status/enum', 'FOCUS_CHECK_STATUSES'),
   // EV-1: フォーカスの確かめの操作の方法。
   mapping('page', '/$defs/focusCheckEvidence/properties/items/items/properties/operation/enum', 'FOCUS_CHECK_OPERATIONS'),
+  // AUD-3: フォーカスの確かめの項目の種別。
+  mapping('page', '/$defs/focusCheckEvidence/properties/items/items/properties/kind/enum', 'FOCUS_CHECK_ITEM_KINDS'),
+  // AUDR2: 通常の Tab の確かめの結果。
+  mapping('page', '/$defs/focusCheckEvidence/properties/sequentialTabOutcome/enum', 'FOCUS_SEQUENTIAL_TAB_OUTCOMES'),
   // EV-2: 対象まで動かして撮った画像の測り直しの記録（使う所・位置・画像に入ったか）。
   mapping('page', '/$defs/revealCapture/properties/targets/items/properties/purpose/enum', 'REVEAL_PURPOSES'),
   mapping('page', '/$defs/revealCapture/properties/targets/items/properties/position/enum', 'REVEAL_POSITIONS'),
   mapping('page', '/$defs/revealCapture/properties/targets/items/properties/inclusion/enum', 'TARGET_IMAGE_INCLUSIONS'),
   // EV-4: 横にスクロールする領域のキーボードの実操作の結果。
   mapping('page', '/$defs/focusCheckEvidence/properties/scrollableRegions/items/properties/outcome/enum', 'SCROLLABLE_REGION_KEYBOARD_OUTCOMES'),
+  // DEF-310（FRET）: 窓を開くボタンの確かめの状態・項目の結果・閉じ方・閉じた後のフォーカス。
+  mapping('page', '/$defs/focusCheckEvidence/properties/dialogFocus/properties/status/enum', 'DIALOG_FOCUS_STATUSES'),
+  mapping('page', '/$defs/focusCheckEvidence/properties/dialogFocus/properties/items/items/properties/outcome/enum', 'DIALOG_FOCUS_ITEM_OUTCOMES'),
+  mapping('page', '/$defs/focusCheckEvidence/properties/dialogFocus/properties/items/items/properties/closedBy/enum', 'DIALOG_FOCUS_CLOSINGS', NULLABLE),
+  mapping('page', '/$defs/focusCheckEvidence/properties/dialogFocus/properties/items/items/properties/focusAfterClose/enum', 'DIALOG_FOCUS_RETURNS', NULLABLE),
+  // DEF-310（RVP-5）: `aria-labelledby` の参照先の見え方。
+  mapping('page', '/$defs/accessibilityRule/properties/nodes/items/properties/labelledBy/properties/visibility/enum', 'ACCESSIBILITY_LABELLED_BY_VISIBILITIES'),
   // AUD-7: 誤りの応答の本文の要旨（形・値の型・要旨なしの理由）と、画面の誤りの表示の手がかりの所。
   mapping('page', '/$defs/responseErrorContext/properties/bodySummary/oneOf/0/properties/format/enum', 'RESPONSE_BODY_SUMMARY_FORMATS'),
   mapping('page', '/$defs/responseErrorContext/properties/bodySummary/oneOf/0/properties/fields/items/properties/valueType/enum', 'RESPONSE_SUMMARY_VALUE_TYPES'),
@@ -253,6 +269,8 @@ const ENUM_MAPPINGS: readonly EnumMapping[] = Object.freeze([
     'ACCESSIBILITY_COUNT_EXCLUSIONS',
     NULLABLE,
   ),
+  // AUD-6（S-10）: axe が切り詰めた抜粋の種類。
+  mapping('page', '/$defs/accessibilityRule/properties/nodes/items/properties/truncationKind/enum', 'ACCESSIBILITY_TRUNCATION_KINDS'),
   mapping('page', '/$defs/accessibilityCheck/properties/group/enum', 'ACCESSIBILITY_CHECK_GROUPS'),
   mapping('page', '/$defs/accessibilityCheck/properties/result/enum', 'ACCESSIBILITY_CHECK_RESULTS'),
   mapping('page', '/$defs/accessibilityDisabledPlace/enum', 'ACCESSIBILITY_DISABLED_PLACES', NULLABLE),
@@ -339,6 +357,10 @@ const ENUM_MAPPINGS: readonly EnumMapping[] = Object.freeze([
   mapping('discovery', '/properties/schemaVersion/enum', 'DISCOVERY_ARTIFACT_READABLE_SCHEMA_VERSIONS'),
   // COV-3（網羅の設計書 3.3）: 選択肢を選んだ欄の種類（値の一覧は `src/discovery/discovery-result.ts`）。
   mapping('discovery', '/$defs/optionChoice/properties/field/properties/kind/enum', 'DISCOVERY_OPTION_FIELD_KINDS'),
+  // RCA-1（検索の確かめの設計書 2.1）: 読み取りを起こしたきっかけと読み取りの形（値の一覧は `src/discovery/search-read-contracts.ts`）。
+  mapping('discovery', '/$defs/searchTrigger/properties/trigger/properties/kind/enum', 'SEARCH_TRIGGER_KINDS'),
+  mapping('discovery', '/$defs/searchTrigger/properties/reads/items/properties/method/enum', 'SEARCH_READ_METHODS'),
+  mapping('discovery', '/$defs/searchTrigger/properties/reads/items/properties/resourceType/enum', 'SEARCH_READ_RESOURCE_TYPES'),
   // COV-2: 操作さがしの checkpoint の再帰の待ち行列の書き出し（値の一覧は `src/discovery/coverage-queue.ts`）。
   mapping('discovery-checkpoint', '/$defs/edgeKind/enum', 'COVERAGE_EDGE_KINDS'),
   mapping('discovery-checkpoint', '/$defs/state/properties/status/enum', 'COVERAGE_STATE_STATUSES'),
@@ -353,6 +375,12 @@ const ENUM_MAPPINGS: readonly EnumMapping[] = Object.freeze([
   mapping('read-evidence', '/$defs/executed/properties/result/enum', 'READ_CHECK_RESULTS'),
   mapping('read-evidence', '/$defs/executed/properties/detail/enum', 'READ_CHECK_DETAILS'),
   mapping('read-evidence', '/$defs/notExecuted/properties/reason/enum', 'READ_CHECK_NOT_EXECUTED_REASONS'),
+  // RCA-5（検索の確かめの設計書 2.5）: 検索の確かめの組（値の一覧は `src/discovery/read-check-evaluation.ts` と `search-check-text-values.ts`）。
+  mapping('read-evidence', '/$defs/searchCheck/properties/trigger/enum', 'SEARCH_CHECK_TRIGGERS'),
+  mapping('read-evidence', '/$defs/searchCheck/properties/how/oneOf/1/properties/text/enum', 'SEARCH_CHECK_TEXT_VALUES'),
+  mapping('read-evidence', '/$defs/searchCheck/properties/state/enum', 'READ_CHECK_EVIDENCE_STATES'),
+  mapping('read-evidence', '/$defs/searchCheck/oneOf/0/properties/result/enum', 'SEARCH_CHECK_RESULTS'),
+  mapping('read-evidence', '/$defs/searchCheck/oneOf/0/properties/detail/enum', 'SEARCH_CHECK_DETAILS'),
   // T37d（Task 37 の設計書 3.5）: 版 1.2 の定義の対象の種類。
   mapping('read-evidence', '/$defs/targetKind/enum', 'READ_CHECK_TARGET_KINDS'),
   mapping('read-evidence', '/$defs/structure/properties/region/enum', 'READ_PAGE_REGIONS'),
@@ -413,6 +441,8 @@ const coreExports: Readonly<Record<string, unknown>> = Object.freeze({
   ...evidenceTypes,
   ...discoveryResult,
   ...coverageQueue,
+  ...searchReadContracts,
+  ...searchCheckTextValues,
   ...readCheckContracts,
   ...readCheckEvaluation,
   ...actionContracts,
@@ -676,10 +706,13 @@ const CONTROL_ENUM_MAPPINGS: readonly ControlEnumMapping[] = Object.freeze([
   // DEF-200: ログインし直す段の種類。
   controlMapping('worker-message', '/$defs/reloginStage/properties/jobKind/enum', 'WORKER_RELOGIN_STAGE_JOB_KINDS'),
   controlMapping('worker-message', '/$defs/finished/properties/incompleteReasonCodes/items/enum', 'WORKER_INCOMPLETE_REASON_CODES'),
+  // RCA-6: 検索の確かめの組の文字の値（値の一覧は `src/discovery/search-check-text-values.ts`）。
+  controlMapping('worker-message', '/$defs/startSearchCheck/oneOf/1/properties/text/enum', 'SEARCH_CHECK_TEXT_VALUES'),
 ]);
 
 const controlExports: Readonly<Record<string, unknown>> = Object.freeze({
   ...controlContracts,
+  ...searchCheckTextValues,
   ...authSetupContracts,
   ...workerProtocol,
   ...credentialStore,
@@ -858,8 +891,6 @@ const RECORD_ID_SHAPE_MAPPINGS: readonly RecordIdShapeMapping[] = Object.freeze(
   { file: 'action-run.schema.json', pointer: '/properties/update/properties/targetRecordId' },
   // T31f: `START` の書き込みの指定の、UPDATE の対象の ID。
   { file: 'control/worker-message.schema.json', pointer: '/$defs/startWrite/properties/update/properties/targetRecordId' },
-  // DEF-235: `START` の READ の確かめの定義の、型の画面の path に入れる番号。
-  { file: 'control/worker-message.schema.json', pointer: '/$defs/startReadCheck/properties/recordIds/items' },
 ]);
 
 /** スキーマの中の、`pattern` が登録の ID の形のパターンと同じ項目の JSON Pointer を集める。 */

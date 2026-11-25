@@ -31,12 +31,18 @@ import {
 import type { AuditSendPolicyName } from '../core/audit-send-policy.js';
 import { BEAKSIGHT_BLOCK_RELATIONS } from '../core/beaksight-block-relation.js';
 import { INTERACTION_NOT_VERIFIABLE_KINDS } from '../core/evidence-types.js';
+import { MEASUREMENT_SERVICE_GROUPS } from '../core/measurement-services.js';
+import { KEY_ACTION_KINDS } from '../core/key-actions.js';
+import type { KeyActionsView } from './key-actions.js';
 import {
   AUDIT_SEND_POLICY_CATALOG,
+  KEY_ACTION_KIND_CATALOG,
   BEAKSIGHT_BLOCK_RELATION_CATALOG,
   EVIDENCE_TYPE_CATALOG,
   INTERACTION_NOT_VERIFIABLE_KIND_CATALOG,
   INTERACTION_STATUS_CATALOG,
+  MEASUREMENT_SERVICE_CATALOG,
+  MEASUREMENT_SERVICE_GROUP_CATALOG,
   REPORT_CATEGORY_SECTION_CATALOG,
   REPORT_SECTION_CATALOG,
   REPORT_SECTIONS,
@@ -65,12 +71,16 @@ import {
   AUDIT_SEND_TEXT,
   FINDING_HOLD_REASON_TEXT,
   HTML_REPORT_TEXT,
+  KEY_ACTION_TEXT,
+  MEASUREMENT_TAG_TEXT,
   PAGE_COVERAGE_ITEMS,
   REPORT_COMPONENT_TEXT,
   RUN_SUMMARY_TEXT,
+  cliCountText,
   describeBlockedRequestReason,
   earlierAttemptRecordText,
   evidenceSufficiencyEntries,
+  listText,
   ordinalText,
   retryAttemptText,
   ruleVersionText,
@@ -115,6 +125,7 @@ import type {
   FindingSectionView,
   FindingView,
   InteractionView,
+  MeasurementTagsView,
   OverviewProblemView,
   PageView,
   ReasonView,
@@ -146,6 +157,10 @@ const SUMMARY_ANCHORS = Object.freeze({
   counts: toAnchorId('record', 'counts'),
   limits: toAnchorId('record', 'limits'),
   load: toAnchorId('record', 'load'),
+  // BS-1: 計測のタグ（読み込みを観測したもの）。
+  measurementTags: toAnchorId('record', 'measurement-tags'),
+  // BS-2: 主要な行動の候補の位置。
+  keyActions: toAnchorId('record', 'key-actions'),
   executions: toAnchorId('record', 'executions'),
   reasons: toAnchorId('record', 'reasons'),
   environment: toAnchorId('record', 'environment'),
@@ -422,6 +437,65 @@ const auditSendNotice = (auditSend: RunSummaryView['auditSend']): readonly Fragm
     ]
     : [];
 
+/** BS-1: 計測のタグの節（種類・識別子・ページの数・ビューポートごとの観測、構成の要約、限界の文）。1 行もなければ空。 */
+const measurementTagsSection = (view: MeasurementTagsView, level: SectionHeadingLevel): readonly Fragment[] => {
+  if (view.tags.length === 0) {
+    return [];
+  }
+  const text = MEASUREMENT_TAG_TEXT;
+  const { limits } = view;
+  const groups = sortByDisplayOrder(MEASUREMENT_SERVICE_GROUPS, MEASUREMENT_SERVICE_GROUP_CATALOG)
+    .map((group) => cliCountText(MEASUREMENT_SERVICE_GROUP_CATALOG[group].label, formatInteger(view.countsByGroup[group])));
+  const viewports = sortByDisplayOrder(VIEWPORT_PROFILES, VIEWPORT_PROFILE_CATALOG);
+  return [subsection(level, text.heading, SUMMARY_ANCHORS.measurementTags, [
+    renderParagraph(text.factNote),
+    renderParagraph(text.groupSummary(listText(groups))),
+    renderTable({
+      caption: null,
+      columns: text.columns,
+      rows: view.tags.map((tag) => renderTableRow([
+        MEASUREMENT_SERVICE_CATALOG[tag.service].label,
+        renderCode(tag.tagId),
+        formatCount(tag.pageCount),
+        ...viewports.map((viewport) => (tag.viewports[viewport] ? text.observed : text.notObserved)),
+      ])),
+    }),
+    renderParagraph(text.auditSendNote[limits.auditSendPolicy]),
+    ...(limits.incomplete
+      ? [renderParagraph(text.incompleteNote(formatInteger(limits.failedPageCount), formatInteger(limits.uncollectedPageCount), formatInteger(limits.runReasonCount)))]
+      : []),
+    ...(limits.blockedRequestCount > 0 ? [renderParagraph(text.blockedNote(formatCount(limits.blockedRequestCount)))] : []),
+  ])];
+};
+
+/** BS-2: 主要な行動の候補の位置の節（種類ごとの候補を持つページの数、固定の表示の候補、最初の画面に候補がないページ、限界の文）。候補が 1 つもなければ空。 */
+const keyActionsSection = (view: KeyActionsView, level: SectionHeadingLevel): readonly Fragment[] => {
+  if (!view.pages.some(({ actions }) => actions.length > 0)) {
+    return [];
+  }
+  const text = KEY_ACTION_TEXT;
+  const { summary } = view;
+  const firstView = sortByDisplayOrder(VIEWPORT_PROFILES, VIEWPORT_PROFILE_CATALOG)
+    .map((viewport) => cliCountText(VIEWPORT_PROFILE_CATALOG[viewport].label, formatInteger(summary.pagesWithoutFirstViewCandidate[viewport])));
+  return [subsection(level, text.heading, SUMMARY_ANCHORS.keyActions, [
+    renderParagraph(text.limitNote),
+    renderTable({
+      caption: null,
+      columns: text.columns,
+      rows: sortByDisplayOrder(KEY_ACTION_KINDS, KEY_ACTION_KIND_CATALOG)
+        .filter((kind) => summary.pagesWithKind[kind] > 0)
+        .map((kind) => renderTableRow([
+          KEY_ACTION_KIND_CATALOG[kind].label,
+          formatCount(summary.pagesWithKind[kind]),
+          formatCount(summary.pagesWithKindInBody[kind]),
+          formatCount(summary.pagesWithKindInSharedFrame[kind]),
+        ])),
+    }),
+    renderParagraph(text.fixedNote(formatCount(summary.pagesWithFixedCandidate))),
+    renderParagraph(text.firstViewNote(listText(firstView))),
+  ])];
+};
+
 function renderSummary(summary: RunSummaryView, level: SectionHeadingLevel): readonly Fragment[] {
   const text = HTML_REPORT_TEXT.summary;
   const counts = summary.findingCounts;
@@ -449,6 +523,8 @@ function renderSummary(summary: RunSummaryView, level: SectionHeadingLevel): rea
     subsection(level, RUN_SUMMARY_TEXT.coverageHeading, SUMMARY_ANCHORS.coverage, [
       // T44R2 の M-8: 項目の並びは `PAGE_COVERAGE_ITEMS`（1 か所）。
       renderKeyValueList(PAGE_COVERAGE_ITEMS.map((item) => ({ label: RUN_SUMMARY_TEXT.coverage[item], value: formatCount(summary.coverage[item]) }))),
+      // DUP: 軽い点検にした画面と、点検を省いた画面のまとめの 1 文（表示用モデルの文のまま）。
+      ...(summary.samenessNote === null ? [] : [renderParagraph(summary.samenessNote)]),
     ]),
     subsection(level, text.countsHeading, SUMMARY_ANCHORS.counts, [
       renderParagraph(text.countsNote),
@@ -484,7 +560,7 @@ function renderSummary(summary: RunSummaryView, level: SectionHeadingLevel): rea
         // AUD-2d の直し: 確かめ直しで新しく出た問題（本体に含める。易しい数だけ）。
         { label: text.lateFindings, value: formatCount(summary.recheck.byMark.LATE) },
         // EV-5: 証拠の足り方（表示用モデルの数のまま。2 行）。
-        ...evidenceSufficiencyEntries(summary.evidenceSufficiency, formatCount),
+        ...evidenceSufficiencyEntries(summary.evidenceSufficiency, formatCount, summary.operationRecordCount),
       ]),
     ]),
     subsection(level, text.limitsHeading, SUMMARY_ANCHORS.limits, [
@@ -518,6 +594,10 @@ function renderSummary(summary: RunSummaryView, level: SectionHeadingLevel): rea
       renderParagraph(text.loadNote),
       renderKeyValueList(loadEntries(summary.load)),
     ]),
+    // BS-1: 計測のタグ（表示用モデルの一覧を描くだけ。1 行もなければ節を出さない）。
+    ...measurementTagsSection(summary.measurementTags, level),
+    // BS-2: 主要な行動の候補の位置（表示用モデルの値を描くだけ。候補がなければ節を出さない）。
+    ...keyActionsSection(summary.keyActions, level),
     // 実行の記録（R6）。回数は、表示用モデルの値をそのまま書式にかける（数え直さない）。CLI の結果の行の順と同じく、負荷の後に置く。
     subsection(level, text.executionsHeading, SUMMARY_ANCHORS.executions, [
       renderParagraph(text.executionsNote),
@@ -893,6 +973,8 @@ function renderPage(context: RenderContext, view: PageView, index: number, level
   const text = HTML_REPORT_TEXT.pages;
   const subLevel = (level + 1) as SectionHeadingLevel;
   return subsection(level, text.heading(formatInteger(index + 1)), pageAnchorOf(view.pageId), [
+    // DUP: 軽い点検にしたか、点検を省いたページの 1 文（表示用モデルの文のまま）。
+    ...(view.samenessNote === null ? [] : [renderParagraph(view.samenessNote)]),
     renderKeyValueList([
       { label: text.url, value: renderUrl(view.pageUrl, context.allowedOrigins) },
       { label: text.status, value: renderPageAuditStatusBadge(view.status) },

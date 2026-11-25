@@ -22,6 +22,7 @@ import {
   type WorkerStartApiWrite,
   type WorkerStartMessage,
   type WorkerStartReadCheck,
+  type WorkerStartSearchCheck,
   type WorkerStartWrite,
 } from '../control/worker-protocol.js';
 import type { NavigationPacer } from '../crawl/navigation-pacer.js';
@@ -50,9 +51,13 @@ export interface ChainStage {
   readonly kind: WorkerChainStageKind | WorkerChainWriteStageJobKind;
   readonly jobId: string;
   readonly readChecks: readonly WorkerStartReadCheck[] | undefined;
+  /** RCA-7: 検索の確かめの組（READ の確かめの段だけ。省略は 0 件）。 */
+  readonly searchChecks?: readonly WorkerStartSearchCheck[] | undefined;
   readonly write: ValidatedChainWrite | undefined;
   /** DEF-200: ログインし直して始めた段なら、その段のログインし直しの回数（1 から）。ほかは `undefined`。 */
   readonly relogin?: number | undefined;
+  /** REV-RCA の I-4: ログインし直して始めた READ の確かめの段で、前のジョブで戻された組の鍵（`RELOGIN_STAGE` の `bouncedSearchCheckKey`。なければ省略）。 */
+  readonly bouncedSearchCheckKey?: string | undefined;
 }
 
 /** 前の段の結果（段に入るときに与えるもの。メモリの中だけ）。 */
@@ -82,6 +87,8 @@ export interface ChainStageRunners {
   readonly readCheck: ((
     jobId: string, readChecks: readonly WorkerStartReadCheck[], config: AuditConfig, authentication: RunAuthentication,
     navigationPacer: NavigationPacer, stageCarry: RunStageCarry,
+    /** RCA-7: 検索の確かめの組と、REV-RCA の I-4: ログインし直す前に戻された組の鍵（なければ undefined）。 */
+    searchChecks: readonly WorkerStartSearchCheck[], bouncedSearchCheckKey: string | undefined,
   ) => Promise<number>) | null;
   readonly write: ((
     stage: ChainStage & { readonly kind: WorkerChainWriteStageJobKind }, write: ValidatedChainWrite, config: AuditConfig,
@@ -133,7 +140,8 @@ export async function runChainStageOnce(input: ChainStageInput, runners: ChainSt
       case WORKER_READ_CHECK_JOB_KIND:
         return runners.readCheck === null || stage.readChecks === undefined
           ? runners.unsupported(stage)
-          : runners.readCheck(stage.jobId, stage.readChecks, input.config, seed.authentication, seed.navigationPacer, stageCarry);
+          : runners.readCheck(stage.jobId, stage.readChecks, input.config, seed.authentication, seed.navigationPacer, stageCarry,
+            stage.searchChecks ?? [], stage.relogin === undefined ? undefined : stage.bouncedSearchCheckKey);
       case WORKER_WRITE_CREATE_JOB_KIND:
       case WORKER_WRITE_UPDATE_JOB_KIND:
         return runners.write === null || stage.write === undefined || !isWorkerChainWriteStageJobKind(stage.kind)

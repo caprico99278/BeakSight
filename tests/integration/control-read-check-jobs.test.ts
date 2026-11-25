@@ -44,6 +44,7 @@ import {
 } from '../../src/discovery/discovery-result.js';
 import { computeCandidateDigests } from '../../src/discovery/fingerprint.js';
 import type { ReadCheckDefinition } from '../../src/discovery/read-check-contracts.js';
+import { searchCheckPlanOf } from '../../src/discovery/search-check-plan.js';
 import { writeFakeWorker, type FakeWorker, type FakeWorkerMode, type FakeWorkerValues } from '../helpers/fake-audit-worker.js';
 import { blockingAfterStartFork, createCountingFork } from '../helpers/worker-fork.js';
 import {
@@ -121,8 +122,7 @@ const definitionFor = (targetIdentityDigest: string, q = 'x'): ReadCheckDefiniti
   expectations: [{ kind: 'ROW_COUNT_AT_LEAST', count: 1 }],
 });
 
-/** DEF-235: 読み切れた画面に足す path（候補なし。番号の元 1 の確かめに使う）。 */
-const discoveryDocument = (jobId: string, readPaths: readonly string[] = []): DiscoveryDocument => ({
+const discoveryDocument = (jobId: string): DiscoveryDocument => ({
   schemaVersion: DISCOVERY_ARTIFACT_SCHEMA_VERSION,
   jobId,
   runId: FAKE_RUN_ID,
@@ -134,9 +134,6 @@ const discoveryDocument = (jobId: string, readPaths: readonly string[] = []): Di
   pages: [
     { url: `${TEST_ORIGIN}/admin/items`, state: 'READ', record: { location: location('/admin/items'), incompleteReasons: [], candidates: [SEARCH] }, blockedRequests: 0 },
     { url: `${TEST_ORIGIN}/admin/lookup`, state: 'READ', record: { location: location('/admin/lookup'), incompleteReasons: [], candidates: [LOOKUP] }, blockedRequests: 0 },
-    ...readPaths.map((path) => ({
-      url: `${TEST_ORIGIN}${path}`, state: 'READ' as const, record: { location: location(path), incompleteReasons: [], candidates: [] }, blockedRequests: 0,
-    })),
   ],
   omittedUnreadPages: 0,
 });
@@ -172,8 +169,8 @@ async function managerWith(worker: FakeWorker, forkWorker: AuditWorkerForker = c
 const currentManager: JobViewSource = { getAuditJob: (jobId) => manager?.getAuditJob(jobId) ?? null };
 
 /** 発見のジョブを 1 回、偽のワーカーで行い、索引と `discovery.json` を作る。 */
-async function discover(profileId = PROFILE_ID, readPaths: readonly string[] = []): Promise<void> {
-  const document = discoveryDocument('__JOB_ID__', readPaths);
+async function discover(profileId = PROFILE_ID): Promise<void> {
+  const document = discoveryDocument('__JOB_ID__');
   const worker = fakeWorker('discovery', {
     discovery: {
       outputDirectory: resolve(workDirectory, OUTPUT_DIRECTORY),
@@ -341,20 +338,18 @@ describe('READ check jobs (T27e): the start', () => {
     expect(readRecentReadCheckResults(database, PROFILE_ID)).toHaveLength(count);
   }, TEST_TIMEOUT_MS);
 
-  // DEF-235（設計書 3.1。FIX-235 の読み替え）: 画面の path の型の定義には、番号の元（最新の操作さがしで読み切れた同じ型の画面）の番号を全部付ける。番号のない
-  // 型の定義は付けない（ワーカーが一覧の画面を読む）。型でない定義は今のまま。
-  it('sends a page path template with every record id of the pages read by the last discovery (DEF-235)', async () => {
-    await discover(PROFILE_ID, ['/admin/items/12', '/admin/items/7', '/admin/items/new', '/admin/other/3']);
-    const template: ReadCheckDefinition = { targetPagePath: '/admin/items/{id}', parameters: {}, expectations: [{ kind: 'ROW_COUNT_AT_LEAST', count: 1 }] };
-    const unlisted: ReadCheckDefinition = { ...template, targetPagePath: '/admin/members/{id}' };
-    createDefinition('read-1', template);
-    createDefinition('read-2', unlisted);
-    const ended = await runReadCheckJob('record-ids', { results: ['MATCHED', 'UNDETERMINED'] });
+  // RCA-6（検索の確かめの設計書 2.2）: 検索の確かめの組を最新の操作さがしの記録から作って `START` に入れる。人の定義がなくても、組があれば始める。`{id}` の型の
+  // 画面の path の定義（DEF-235 の段の読み込み）は入れない。
+  it('sends the search checks of the last discovery, starts without a definition, and leaves out a page path template (RCA-6)', async () => {
+    await discover(PROFILE_ID);
+    createDefinition('read-1', { targetPagePath: '/admin/items/{id}', parameters: {}, expectations: [{ kind: 'ROW_COUNT_AT_LEAST', count: 1 }] });
+    const ended = await runReadCheckJob('search-checks', { results: [] });
     expect(ended).toMatchObject({ jobKind: 'READ_CHECK', state: 'FINISHED', failureReason: null });
-    expect(ended.received.find((message) => message['type'] === 'START')?.['readChecks']).toEqual([
-      { readCheckId: 'read-1', readCheckRevision: 1, targetPage: location('/admin/items/{id}'), definition: template, recordIds: ['12', '7'] },
-      { readCheckId: 'read-2', readCheckRevision: 1, targetPage: location('/admin/members/{id}'), definition: unlisted },
-    ]);
+    const start = ended.received.find((message) => message['type'] === 'START');
+    expect(start?.['readChecks']).toEqual([]);
+    expect((start?.['searchChecks'] as readonly { key: string }[]).map(({ key }) => key))
+      .toEqual(searchCheckPlanOf(discoveryDocument('job')).combos.map(({ key }) => key));
+    expect((start?.['searchChecks'] as readonly unknown[]).length).toBeGreaterThan(0);
   }, TEST_TIMEOUT_MS);
 });
 

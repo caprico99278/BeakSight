@@ -320,6 +320,14 @@ describe('SAFETY_RULES', () => {
       });
       expect(ruleById('SAFETY_WEBSOCKET_BLOCKED').evaluate(input([record]))).toEqual([]);
     });
+
+    // FRETWS（設計書 `2026-11-25-beaksight-discovery-sibling-press-design.md` 2.2）: 窓を開くボタンの押す期間に止めた接続は、BeakSight の押下の記録で、安全の指摘にしない。
+    it('窓を開くボタンの押す期間に止めた接続（SCROLL_KEY_PRESS_RESTRICTED）は数えない', () => {
+      const record = safetyRecord((ledger) => {
+        ledger.recordBlockedWebSocket({ url: 'ws://127.0.0.1:4173/socket', reason: 'SCROLL_KEY_PRESS_RESTRICTED', phase: 'LOAD' });
+      });
+      expect(ruleById('SAFETY_WEBSOCKET_BLOCKED').evaluate(input([record]))).toEqual([]);
+    });
   });
 
   describe('SAFETY_INTERACTION_CANDIDATE_EXCLUDED', () => {

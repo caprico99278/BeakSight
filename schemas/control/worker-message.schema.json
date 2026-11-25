@@ -26,7 +26,7 @@
     { "$ref": "#/$defs/credentialSaved" }
   ],
   "$defs": {
-    "protocol": { "const": "beaksight-worker-message/9" },
+    "protocol": { "const": "beaksight-worker-message/10" },
     "count": { "type": "integer", "minimum": 0, "maximum": 9007199254740991 },
     "path": { "type": "string", "minLength": 1, "maxLength": 1024 },
     "runId": { "type": "string", "pattern": "^RUN-[0-9]{6,}$" },
@@ -48,10 +48,11 @@
         },
         "authentication": { "$ref": "#/$defs/startAuthentication" },
         "readChecks": {
+          "description": "RCA-6 (protocol 10): the READ check definitions made by a person (may be empty when there are search checks; worker-protocol.ts requires at least one of the two lists to have an item).",
           "type": "array",
-          "minItems": 1,
           "items": { "$ref": "#/$defs/startReadCheck" }
         },
+        "searchChecks": { "$ref": "#/$defs/startSearchChecks" },
         "write": { "oneOf": [{ "$ref": "#/$defs/startWrite" }, { "$ref": "#/$defs/startApiWrite" }] },
         "showJobBrowser": {
           "description": "FM-2: launch the job browser headed (the display setting of the profile, read by the parent when the job starts). Only for the job kinds that launch the run browser.",
@@ -364,13 +365,51 @@
             { "type": "null" }
           ]
         },
-        "definition": { "$ref": "urn:beaksight:schema:control:read-check-definition:1" },
-        "recordIds": {
-          "description": "Optional (DEF-235): the record ids that the parent found for a page path template of the READ check stage (nearest source first, all of them, each once; no item limit). Only for a page path template (worker-protocol.ts).",
-          "type": "array",
-          "minItems": 1,
-          "items": { "type": "string", "minLength": 1, "pattern": "^[A-Za-z0-9_-]+$" }
+        "definition": { "$ref": "urn:beaksight:schema:control:read-check-definition:1" }
+      }
+    },
+    "startSearchChecks": {
+      "description": "RCA-6 (protocol 10; search check design 2.2): the search checks of the READ check job, made by the parent from the latest discovery before the job starts (src/discovery/search-check-plan.ts). Their number is the denominator of the progress. The guarded ones are already left out; worker-protocol.ts checks again the secret-like names and the dangerous words of the values sent.",
+      "type": "array",
+      "items": { "$ref": "#/$defs/startSearchCheck" }
+    },
+    "startSearchCheck": {
+      "oneOf": [
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["kind", "key", "page", "targetIdentityDigest", "parameters", "change", "unsentHiddenFields"],
+          "properties": {
+            "kind": { "const": "FORM" },
+            "key": { "type": "string", "pattern": "^sha256:[a-f0-9]{64}$" },
+            "page": { "$ref": "#/$defs/searchCheckPage" },
+            "targetIdentityDigest": { "type": "string", "pattern": "^sha256:[a-f0-9]{64}$" },
+            "parameters": { "type": "object", "additionalProperties": { "type": "string" } },
+            "change": { "$ref": "urn:beaksight:schema:read-evidence:1.0#/$defs/searchCheck/properties/how" },
+            "unsentHiddenFields": { "type": "boolean" }
+          }
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["kind", "key", "page", "trigger", "text"],
+          "properties": {
+            "kind": { "const": "SCRIPT" },
+            "key": { "type": "string", "pattern": "^sha256:[a-f0-9]{64}$" },
+            "page": { "$ref": "#/$defs/searchCheckPage" },
+            "trigger": { "$ref": "urn:beaksight:schema:discovery:1.0#/$defs/searchTrigger/properties/trigger" },
+            "text": { "description": "REV-RCA fix round 2: the kind of the value (the worker makes the marker for each combo).", "enum": ["EMPTY", "HALF_WIDTH", "FULL_WIDTH"] }
+          }
         }
+      ]
+    },
+    "searchCheckPage": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["origin", "path"],
+      "properties": {
+        "origin": { "type": "string", "minLength": 1 },
+        "path": { "type": "string", "minLength": 1 }
       }
     },
     "startAuthentication": {
@@ -514,7 +553,8 @@
         "type": { "const": "NEXT_STAGE" },
         "jobId": { "type": "string", "pattern": "^[a-z0-9][a-z0-9-]{0,63}$" },
         "jobKind": { "enum": ["DISCOVERY", "READ_CHECK", "WRITE_CREATE", "WRITE_UPDATE"] },
-        "readChecks": { "type": "array", "minItems": 1, "items": { "$ref": "#/$defs/startReadCheck" } },
+        "readChecks": { "type": "array", "items": { "$ref": "#/$defs/startReadCheck" } },
+        "searchChecks": { "$ref": "#/$defs/startSearchChecks" },
         "write": {
           "description": "OP-2: the write specification of a write stage of the chained run (the same shape as the START write; required for the write stages only). The parent issued, consumed and recorded the grant of this stage before it sent it.",
           "oneOf": [{ "$ref": "#/$defs/startWrite" }, { "$ref": "#/$defs/startApiWrite" }]
@@ -532,7 +572,13 @@
         "jobId": { "type": "string", "pattern": "^[a-z0-9][a-z0-9-]{0,63}$" },
         "jobKind": { "enum": ["AUDIT", "DISCOVERY", "READ_CHECK"] },
         "count": { "type": "integer", "minimum": 1, "maximum": 2 },
-        "readChecks": { "type": "array", "minItems": 1, "items": { "$ref": "#/$defs/startReadCheck" } }
+        "readChecks": { "type": "array", "items": { "$ref": "#/$defs/startReadCheck" } },
+        "searchChecks": { "$ref": "#/$defs/startSearchChecks" },
+        "bouncedSearchCheckKey": {
+          "description": "REV-RCA I-4: the key of the search check that was bounced to the login page in the previous job (READ_CHECK only; the key of one of searchChecks). The worker checks it first.",
+          "type": "string",
+          "pattern": "^sha256:[a-f0-9]{64}$"
+        }
       }
     },
     "chainEnd": {
@@ -627,6 +673,16 @@
           "properties": {
             "pagesFinished": { "$ref": "#/$defs/count" },
             "pagesDiscovered": { "$ref": "#/$defs/count" },
+            "pagesDiscoveredSplit": {
+              "description": "Optional (DSEED2): only in the progress of a discovery chained after the audit stage. The found pages split into the pages taken over from the audit stage and the pages the discovery newly found (the sum is pagesDiscovered).",
+              "type": "object",
+              "additionalProperties": false,
+              "required": ["fromAuditStage", "newlyFound"],
+              "properties": {
+                "fromAuditStage": { "$ref": "#/$defs/count" },
+                "newlyFound": { "$ref": "#/$defs/count" }
+              }
+            },
             "maxPages": { "$ref": "#/$defs/count" },
             "elapsedMs": { "$ref": "#/$defs/count" },
             "navigationCount": { "$ref": "#/$defs/count" },
@@ -1038,10 +1094,10 @@
         "incompleteReasonCodes": {
           "description": "FM2d: the incomplete reason codes of a stage of the chained run (codes only; no detail, no URL; INCOMPLETE_REASON_CODES of src/core/contracts.ts). Only for the outcome kind RAN.",
           "type": "array",
-          "maxItems": 46,
+          "maxItems": 47,
           "uniqueItems": true,
           "items": {
-            "enum": ["DEADLINE_EXCEEDED", "EVALUATION_FAILED", "PAGE_CLOSED", "NAVIGATION_FAILED", "DOM_READINESS_FAILED", "SCROLL_TARGET_UNRESOLVED", "SCROLL_NOT_ADVANCED", "INNER_SCROLL_CONTAINER_NOT_TRAVERSED", "INNER_SCROLL_SCAN_LIMIT_REACHED", "SCROLL_TARGET_UNSTABLE", "POSITION_NOT_AT_ORIGIN", "LAYOUT_COMPARISON_LIMIT_REACHED", "RESOURCE_LIMIT_REACHED", "INVALID_BROWSER_DATA", "PAGE_NAVIGATION_LIMIT_REACHED", "PAGE_SUBRESOURCE_LIMIT_REACHED", "NOTIFICATION_DISMISSAL_NAVIGATION_BLOCKED", "DOCUMENT_LEFT_DURING_AUDIT", "DOWNLOAD_RESPONSE", "PREFLIGHT_FAILED", "RUN_DIRECTORY_UNAVAILABLE", "SAFETY_INVARIANT_VIOLATION", "SAFETY_LEDGER_TRUNCATED", "UNHANDLED_FAILURE", "MAX_PAGES_REACHED", "MAX_DEPTH_REACHED", "MAX_RUNTIME_REACHED", "REQUIRED_ARTIFACT_INVALID", "EXECUTION_INCOMPLETE", "REQUIRED_WORK_SKIPPED", "REQUIRED_WORK_BLOCKED", "REQUIRED_WORK_TIMED_OUT", "REQUIRED_WORK_NOT_OBSERVED", "REQUIRED_WORK_NOT_VERIFIED", "REQUIRED_WORK_FAILED", "COLLECTOR_INCOMPLETE", "RULE_EVALUATION_FAILED", "PAGE_CRASHED", "SAFETY_VIOLATION_ABORT", "CHECKPOINT_WRITE_FAILED", "RUN_INTERRUPTED", "SITE_UNAVAILABLE", "AUTH_SESSION_LOST", "SERVICE_REQUEST_LIMIT_REACHED", "STAGE_UNRESPONSIVE", "STAGE_NEVER_QUIET"]
+            "enum": ["DEADLINE_EXCEEDED", "EVALUATION_FAILED", "PAGE_CLOSED", "NAVIGATION_FAILED", "DOM_READINESS_FAILED", "SCROLL_TARGET_UNRESOLVED", "SCROLL_NOT_ADVANCED", "INNER_SCROLL_CONTAINER_NOT_TRAVERSED", "INNER_SCROLL_SCAN_LIMIT_REACHED", "SCROLL_TARGET_UNSTABLE", "POSITION_NOT_AT_ORIGIN", "LAYOUT_COMPARISON_LIMIT_REACHED", "RESOURCE_LIMIT_REACHED", "INVALID_BROWSER_DATA", "PAGE_NAVIGATION_LIMIT_REACHED", "PAGE_SUBRESOURCE_LIMIT_REACHED", "NOTIFICATION_DISMISSAL_NAVIGATION_BLOCKED", "DOCUMENT_LEFT_DURING_AUDIT", "DOWNLOAD_RESPONSE", "PREFLIGHT_FAILED", "RUN_DIRECTORY_UNAVAILABLE", "SAFETY_INVARIANT_VIOLATION", "SAFETY_LEDGER_TRUNCATED", "UNHANDLED_FAILURE", "MAX_PAGES_REACHED", "MAX_DEPTH_REACHED", "MAX_RUNTIME_REACHED", "REQUIRED_ARTIFACT_INVALID", "EXECUTION_INCOMPLETE", "REQUIRED_WORK_SKIPPED", "REQUIRED_WORK_BLOCKED", "REQUIRED_WORK_TIMED_OUT", "REQUIRED_WORK_NOT_OBSERVED", "REQUIRED_WORK_NOT_VERIFIED", "REQUIRED_WORK_FAILED", "COLLECTOR_INCOMPLETE", "RULE_EVALUATION_FAILED", "PAGE_CRASHED", "SAFETY_VIOLATION_ABORT", "CHECKPOINT_WRITE_FAILED", "RUN_INTERRUPTED", "SITE_UNAVAILABLE", "AUTH_SESSION_LOST", "SERVICE_REQUEST_LIMIT_REACHED", "STAGE_UNRESPONSIVE", "STAGE_NEVER_QUIET", "SAME_CONTENT_AS_EARLIER_PAGE"]
           }
         }
       }
@@ -1060,10 +1116,12 @@
     "readCheckSummary": {
       "type": "object",
       "additionalProperties": false,
-      "required": ["checks", "executed"],
+      "required": ["checks", "executed", "searchChecks", "searchCheckErrors"],
       "properties": {
         "checks": { "type": "integer", "minimum": 0, "maximum": 9007199254740991 },
         "executed": { "type": "integer", "minimum": 0, "maximum": 9007199254740991 },
+        "searchChecks": { "description": "RCA-5 (protocol 10): the number of the search checks.", "type": "integer", "minimum": 0, "maximum": 9007199254740991 },
+        "searchCheckErrors": { "description": "RCA-5 (protocol 10): the number of the search checks that found an error of the site.", "type": "integer", "minimum": 0, "maximum": 9007199254740991 },
         "authentication": { "$ref": "#/$defs/auditStageSummary" },
         "safetyViolation": { "$ref": "#/$defs/jobSafetyViolation" }
       }

@@ -6,6 +6,7 @@ import {
   FIXED_OVERLAP_FINDING_CLASSES,
   fixedOverlapClassOf,
   hitTestJudgementOf,
+  isModalOverlap,
   layerPaintLevelOf,
   strongestFixedOverlapClass,
 } from '../../src/audit/fixed-overlap-classes.js';
@@ -119,6 +120,19 @@ describe('the hit-test judgement of the points', () => {
     // 下に内容があれば、その点を数える。
     const above = hitTest([point({ topRelation: 'OVERLAY_DESCENDANT' })], { target: 'BENEATH' });
     expect(hitTestJudgementOf(above, { overlayAbove: true })).toEqual({ render: 'OPAQUE', capturedPointCount: 1, pointCount: 1 });
+  });
+});
+
+describe('AUD-2: the modal side of an overlap', () => {
+  it('is modal for an open modal dialog and its dimming backdrop, but not for a cover inside the same dialog', () => {
+    const modal = (facts: OverlapHitTestEvidence['modal']): boolean => isModalOverlap(hitTest([point()], { modal: facts }));
+    expect(modal({ dialogModal: false, ariaModal: false })).toBe(false);
+    expect(modal({ dialogModal: false, ariaModal: true })).toBe(true);
+    expect(modal({ dialogModal: false, ariaModal: false, openModal: true })).toBe(true);
+    expect(modal({ dialogModal: false, ariaModal: true, openModal: true, coveredInside: true })).toBe(false);
+    // RVP-2: 開いた前面の窓が下を覆うのも作りどおり。窓の中の要素どうしは、今どおり判定する。
+    expect(modal({ dialogModal: false, ariaModal: false, frontWindow: true })).toBe(true);
+    expect(modal({ dialogModal: false, ariaModal: false, frontWindow: true, coveredInside: true })).toBe(false);
   });
 });
 

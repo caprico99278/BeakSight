@@ -7,8 +7,13 @@
  *   群にする（同じ作りのカードがページの数だけ分かれない。作りの違う要素は混ざらない）。作りの印が取れない Finding は、番号を丸めない。作りの印には、文字の中身と
  *   class のほかの属性の値を入れない。
  * - `groupingKeys` が空か、ない（古い Run の Finding）Finding は、1 件だけの群にする（鍵に Finding の ID を入れる）。
+ * - DEF-297: axe の指摘は、対象の selector を丸めた形の鍵（`roundedTarget`。番号と描画の順の id を丸めた形の digest）で、ページをまたいで群にする（丸める前の
+ *   `target` の代わり。`groupKeyFieldsOf`）。名前の不一致は、その鍵と区分（`labelClass`）の両方で群にする。
  * - 確信度は `FINDING_GROUP_CONFIDENCE_BY_BASIS` と `findingGroupConfidenceOf` の 1 か所で決める。確信度は、並びに使わない（並びは severity の順のまま）。
  */
+import { groupKeyFieldsOf, hasLoweredFindingClass, labelClassOfKeys, roundSelectorNumbers } from '../audit/finding-grouping-keys.js';
+import { isAvoidableOcclusion } from '../audit/fixed-overlap-classes.js';
+import { focusCheckLowersConfidence } from '../audit/focus-check.js';
 import { labelInNameLowersConfidence } from '../audit/label-in-name.js';
 import type { RuleVerificationBasis } from '../audit/rule-verification-basis.js';
 import {
@@ -53,10 +58,13 @@ const lower = (confidence: FindingGroupConfidence): FindingGroupConfidence =>
  * 1. もとの値は、検証の根拠の表（`FINDING_GROUP_CONFIDENCE_BY_BASIS`）。
  * 2. 証拠の参照に欠けのある指摘が 1 件でもあれば、1 段下げる。
  * 3. 文書の構造から見た候補（`STATIC_CANDIDATE`）で、発生が `FINDING_GROUP_REPEATED_OCCURRENCE_COUNT` より少なければ、1 段下げる。発生が多くても上げない。
- * 4. AUD-2d: 落ち着いた後の確かめ直しで消えた（`INITIAL_ONLY`）指摘が 1 件でもあれば、1 段下げる（初めの骨組みの時だけの見え方の候補）。
+ * 4. AUD-2d: 落ち着いた後の確かめ直しで消えた（`INITIAL_ONLY`）指摘が 1 件でもあれば、1 段下げる（初めの骨組みの時だけの見え方の候補）。S-06: 固定の覆いで、
+ *    動かして測り直した区分が `SCROLL_AVOIDABLE`・`INITIAL_ONLY`（`isAvoidableOcclusion`）の指摘も、この印で 1 段下げる（重さは変えない）。
  * 5. AUD-3c: 固定の要素の重なりで、描画の遮蔽を決められない（`verification.overlap.renderDetermined` が偽）指摘が 1 件でもあれば、1 段下げる
  *    （設計者の判断 2026-11-10: 押下だけを捕まえる `POINTER_ONLY` は、hit-test で直接確かめた事実なので下げない）。AUD-4b: 名前の不一致で、主なラベルの欠けと
  *    言い切れない指摘（`labelInNameLowersConfidence`）も、この印で 1 段下げる（同じ「決めきれない」の印）。AUD-7: 4xx・5xx の区分が `UNDETERMINED` の指摘も同じ。
+ *    AUD-3: フォーカスの確かめの項目が循環の守りの部品（`focusCheckLowersConfidence`）の指摘も同じ。AUD-5: 確信度を下げる区分の鍵（`hasLoweredFindingClass`）の
+ *    指摘も同じ。
  */
 export function findingGroupConfidenceOf(
   basis: RuleVerificationBasis,
@@ -141,12 +149,6 @@ export function structureOfHtmlSnippet(snippet: string): FindingStructureView | 
   return { tagName: tag[1].toLowerCase(), classNames };
 }
 
-/** selector の番号（`:nth-of-type(<数>)`・`:nth-child(<数>)`）。 */
-const SELECTOR_NUMBER = /:(nth-of-type|nth-child)\(\s*\d+\s*\)/gu;
-
-/** selector の番号を `n` に丸める（作りの印のある Finding の鍵だけに使う）。 */
-export const roundSelectorNumbers = (value: string): string => value.replace(SELECTOR_NUMBER, (_whole, kind: string) => `:${kind}(n)`);
-
 /** Finding のまとめの鍵 `target`（作りの印を取る要素の selector の並び。なければ `undefined`）。 */
 export const structureTargetOf = (finding: Pick<Finding, 'groupingKeys'>): string | undefined =>
   (finding.groupingKeys ?? []).find(({ name }) => name === 'target')?.value;
@@ -186,7 +188,9 @@ interface GroupKey {
  * 群の鍵（ruleId と groupingKeys。作りの印があれば、selector の番号を丸めた鍵と作りの印。鍵のない指摘は、その Finding の ID を入れて 1 件の群にする）。
  */
 const groupKeyOf = (view: FindingView, structure: FindingStructureView | null): GroupKey => {
-  const keys = (view.finding.groupingKeys ?? []).map(({ name, value }) => ({ name, value }));
+  // REV-AUD3 の I-2: 指摘と Evidence の項目を結ぶだけの鍵は、群の鍵に入れない。DEF-297: 丸めた対象の鍵があれば、丸める前の target の代わりにする
+  // （決まりは `groupKeyFieldsOf` の 1 か所）。
+  const keys = groupKeyFieldsOf(view.finding.groupingKeys ?? []);
   if (keys.length === 0) {
     return { key: JSON.stringify(['SINGLE', view.finding.ruleId, view.finding.findingId]), groupingKeys: [], structure: null };
   }
@@ -251,12 +255,20 @@ export function buildFindingGroups(
           basis,
           views.length,
           missingEvidenceFindingCount > 0,
-          views.some(({ verification }) => verification.recheck === 'INITIAL_ONLY'),
+          // S-06: 動かせば避けられる・初めの位置だけの覆い（`isAvoidableOcclusion`）も、同じく 1 段下げる。
+          views.some(({ verification }) => verification.recheck === 'INITIAL_ONLY' || isAvoidableOcclusion(verification.overlap)),
           // AUD-4b: 名前の不一致で、主なラベルの欠けと言い切れない指摘（補足だけ・見分けられない・AX の名前には含まれる）も、同じく 1 段下げる。
           // AUD-7: 4xx・5xx の区分を決められない（`UNDETERMINED`）指摘も、同じく 1 段下げる。
-          views.some(({ verification }) => verification.overlap?.renderDetermined === false
-            || (verification.labelInName !== undefined && labelInNameLowersConfidence(verification.labelInName.labelClass))
-            || verification.httpError?.errorClass === 'UNDETERMINED'),
+          // AUD-3: フォーカスの確かめの、循環の守りの部品の項目の指摘（`focusCheckLowersConfidence`）も、同じく 1 段下げる（重さは変えない）。
+          // AUD-5: 確信度を下げる区分の鍵（`hasLoweredFindingClass`。画像の上に意図して置いた部品・同じ画面の別のデータ）の指摘も、同じく 1 段下げる。
+          views.some(({ finding, verification }) => verification.overlap?.renderDetermined === false
+            || hasLoweredFindingClass(finding.groupingKeys ?? [])
+            // APS-2: 名前の文脈を読めない指摘（表示用の文脈がなく、鍵の区分が `UNDETERMINED`）も下げる。
+            || (verification.labelInName !== undefined
+              ? labelInNameLowersConfidence(verification.labelInName.labelClass)
+              : labelClassOfKeys(finding.groupingKeys ?? []) === 'UNDETERMINED')
+            || verification.httpError?.errorClass === 'UNDETERMINED'
+            || (verification.focusCheck !== undefined && focusCheckLowersConfidence(verification.focusCheck))),
         ),
         missingEvidenceFindingCount,
       };

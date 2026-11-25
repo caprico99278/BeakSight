@@ -12,6 +12,11 @@ import { DEFAULT_EXCLUDED_URL_WORDS } from '../core/default-excluded-url-words.j
 import { foldNfkcCase } from '../core/text.js';
 import { isRecord } from '../core/guards.js';
 import {
+  AI_ACTION_WORDS,
+  AI_ICON_WORDS,
+  AI_REGION_RUN_WORDS,
+  AI_REGION_WORDS,
+  AI_REQUEST_PATH_WORDS,
   CRAWL_URL_EXTRA_NOUN_WORDS,
   CRAWL_URL_NOUN_GUIDE_WORDS,
   DESTRUCTIVE_ACTION_EXTRA_WORDS,
@@ -71,6 +76,10 @@ export interface DestructiveActionFacts {
   readonly inRow: boolean;
   readonly frame: { readonly names: readonly string[]; readonly text?: string } | null;
   readonly confirmText: string | null;
+  /** AIW の 2: 中のアイコン（svg・i・use・span）の class・data 属性の名前と値・aria-label（前の読み取りの値にはない）。 */
+  readonly iconTokens?: readonly string[];
+  /** AIW の 3: 入った枠（section・article・fieldset・region などの役割・見出しを持つ入れ物）の見出しとラベル（前の読み取りの値にはない）。 */
+  readonly regionTexts?: readonly string[];
 }
 
 /** 名前だけの事実（名前のほかを読めない呼び出し・前の読み取りの値のため）。 */
@@ -83,9 +92,10 @@ const isStringArray = (value: unknown): value is readonly string[] => Array.isAr
 /** ページから受け取った値を、事実の形に確かめる（形が違えば null）。 */
 export const destructiveActionFactsFrom = (value: unknown): DestructiveActionFacts | null => {
   if (!isRecord(value)) return null;
-  const { names, methods, htmxDelete, urls, baseUrl, chosenTexts, inRow, frame, confirmText } = value;
+  const { names, methods, htmxDelete, urls, baseUrl, chosenTexts, inRow, frame, confirmText, iconTokens, regionTexts } = value;
   if (!isStringArray(names) || !isStringArray(methods) || typeof htmxDelete !== 'boolean' || !isStringArray(urls) || typeof baseUrl !== 'string'
-    || !isStringArray(chosenTexts) || typeof inRow !== 'boolean' || !(confirmText === null || typeof confirmText === 'string')) {
+    || !isStringArray(chosenTexts) || typeof inRow !== 'boolean' || !(confirmText === null || typeof confirmText === 'string')
+    || !(iconTokens === undefined || isStringArray(iconTokens)) || !(regionTexts === undefined || isStringArray(regionTexts))) {
     return null;
   }
   if (!(frame === null || (isRecord(frame) && isStringArray(frame['names']) && (frame['text'] === undefined || typeof frame['text'] === 'string')))) return null;
@@ -95,6 +105,8 @@ export const destructiveActionFactsFrom = (value: unknown): DestructiveActionFac
       names: [...(frame['names'] as readonly string[])], ...(typeof frame['text'] === 'string' ? { text: frame['text'] } : {}),
     }),
     confirmText,
+    ...(iconTokens === undefined ? {} : { iconTokens: [...iconTokens] }),
+    ...(regionTexts === undefined ? {} : { regionTexts: [...regionTexts] }),
   });
 };
 
@@ -196,4 +208,38 @@ export const isDestructiveAction = (facts: DestructiveActionFacts): boolean => {
   if (textsHaveDestructiveWord(facts.chosenTexts)) return true;
   if (facts.inRow && facts.names.some(isCloseSymbolOnly)) return true;
   return textsHaveDestructiveWord(facts.names) && !isFrameClosingCancel(facts);
+};
+
+/**
+ * AIW（ユーザーの判断 2026-11-20）: AI の操作か（比べ方は削除の語と同じ）。真なら押さない（サイトの AI の生成を起こさない）。操作さがしの押下と見るだけの点検の
+ * 押下が、押す前にここを通す（判定の 1 か所）。どれかに当たれば真。
+ * - 名前が AI の語（`AI_ACTION_WORDS`。✨ を含む）に当たる。
+ * - 中のアイコンの手がかり（`iconTokens`）が、キラキラの印の語（`AI_ICON_WORDS`）に当たる。
+ * - 入った枠の見出しかラベル（`regionTexts`）が AI の枠の語（`AI_REGION_WORDS`）に当たり、名前が生成・作成・実行の語（`AI_REGION_RUN_WORDS`）に当たる。
+ */
+export const isAiAction = (facts: DestructiveActionFacts): boolean =>
+  textsHaveBoundedWord(facts.names, AI_ACTION_WORDS)
+  || textsHaveBoundedWord(facts.iconTokens ?? [], AI_ICON_WORDS)
+  || (textsHaveBoundedWord(facts.regionTexts ?? [], AI_REGION_WORDS) && textsHaveBoundedWord(facts.names, AI_REGION_RUN_WORDS));
+
+/** AIW の 4: AI の送信の見分けで数えない要求の種類（静的なファイルと画面の移動）。 */
+const AI_REQUEST_IGNORED_RESOURCE_TYPES: ReadonlySet<string> = new Set(['document', 'script', 'stylesheet', 'image', 'font', 'media', 'manifest', 'texttrack']);
+
+/** AIW の 4: 流し続ける答えの媒体の型。 */
+const EVENT_STREAM_MEDIA_TYPE = 'text/event-stream';
+
+/**
+ * AIW の 4（ユーザーの判断 2026-11-20）: 押下で出た送信（凍結で止めた書き込みの形も、通した読み取りも）が AI の送信か。静的なファイルと画面の移動は数えない。
+ * 行き先の path の区切りが AI の語（`AI_REQUEST_PATH_WORDS`。語の境界つき）に当たるか、答えが流し続ける形（`text/event-stream`）なら真。
+ */
+export const isAiRequest = (request: { readonly url: string; readonly resourceType: string; readonly contentType?: string | undefined }): boolean => {
+  if (AI_REQUEST_IGNORED_RESOURCE_TYPES.has(request.resourceType)) return false;
+  if (request.contentType !== undefined && comparable(request.contentType).split(';')[0]?.trim() === EVENT_STREAM_MEDIA_TYPE) return true;
+  let path: string;
+  try {
+    path = new URL(request.url).pathname;
+  } catch {
+    path = request.url;
+  }
+  return textsHaveBoundedWord([path], AI_REQUEST_PATH_WORDS);
 };

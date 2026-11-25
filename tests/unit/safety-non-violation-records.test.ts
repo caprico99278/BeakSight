@@ -4,6 +4,8 @@
 // - 外部スキームの frame の分かる移動: 既存の `externalSchemeNavigations`（違反と Context を閉じることだけを外す。Guard の側）。
 // 記録は 1 件でもあるときだけ snapshot と safety の Evidence に現れる（`count` と `events`）。`summarizePageSafety` は数を持つ。発見の probe の続け方は、
 // 違反でなく記録から決める（`probeRecordContinuationOf`）。
+import { readFileSync } from 'node:fs';
+import { Ajv } from 'ajv';
 import { describe, expect, it } from 'vitest';
 import { probeRecordContinuationOf } from '../../src/safety/job-safety-violation.js';
 import { SafetyLedger, safetyEventsEvidenceFromSnapshot, summarizePageSafety } from '../../src/safety/safety-ledger.js';
@@ -36,6 +38,26 @@ describe('the records that replace the violations of category (3)', () => {
     const snapshot = new SafetyLedger().snapshot();
     expect(Object.hasOwn(snapshot, 'frameClassificationFailures')).toBe(false);
     expect(Object.hasOwn(snapshot, 'readNavigationFailures')).toBe(false);
+    expect(Object.hasOwn(snapshot, 'detachedTargetContinues')).toBe(false);
+  });
+
+  // CDPX: 許した要求を続ける命令が、OOPIF の target が先に外れて送れなかった数（違反でない。数だけ）。page と checkpoint の schema が受ける。
+  it('counts the continues that could not be sent because the OOPIF target had detached, and the schemas accept the record', () => {
+    const ledger = new SafetyLedger();
+    ledger.recordDetachedTargetContinue();
+    ledger.recordDetachedTargetContinue();
+    const snapshot = ledger.snapshot();
+    expect(snapshot.invariantViolationCount).toBe(0);
+    expect(snapshot.detachedTargetContinues).toEqual({ count: 2 });
+
+    const ajv = new Ajv({ allErrors: true, strict: true });
+    for (const name of ['run', 'audit', 'page', 'finding', 'checkpoint', 'checkpoint-page']) {
+      ajv.addSchema(JSON.parse(readFileSync(new URL(`../../schemas/${name}.schema.json`, import.meta.url), 'utf8')) as object);
+    }
+    const validateEvidence = ajv.getSchema('urn:beaksight:schema:page:1.0#/$defs/safetyEventsEvidence');
+    const validateSnapshot = ajv.getSchema('urn:beaksight:schema:checkpoint:1.0#/$defs/safetyLedgerSnapshot');
+    expect(validateEvidence?.(JSON.parse(JSON.stringify(safetyEventsEvidenceFromSnapshot(snapshot, 'PASSIVE', { kind: 'PAGE_AUDIT' }))))).toBe(true);
+    expect(validateSnapshot?.(JSON.parse(JSON.stringify(snapshot)))).toBe(true);
   });
 
   it('counts the records in the page safety summary', () => {

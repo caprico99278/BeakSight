@@ -97,6 +97,25 @@ export const normalizeUrl = (
   return { ok: true, url: url.toString() as NormalizedHttpUrl };
 };
 
+/**
+ * DEF-304（設計書 `2026-11-20-beaksight-audit-precision-and-scope-design.md` 2.1）: `url` と `requestedUrl` の Origin と path が同じなら、`url` の query を
+ * `requestedUrl` の query に置き換えた URL（画面自身が変えた query を、点検の範囲の判定に使わないため。唯一の使い手は `auditScopeLeftUrl`）。Origin か path が
+ * 違うか、読めなければ `url` のまま。
+ */
+export const withRequestedQueryOnSamePath = (url: string, requestedUrl: string): string => {
+  try {
+    const current = new URL(url);
+    const requested = new URL(requestedUrl);
+    if (current.origin !== requested.origin || current.pathname !== requested.pathname) {
+      return url;
+    }
+    current.search = requested.search;
+    return current.href;
+  } catch {
+    return url;
+  }
+};
+
 /** `URL.protocol` の値が `http:` または `https:` か。 */
 export const isHttpProtocol = (protocol: string): boolean => protocol === 'http:' || protocol === 'https:';
 
@@ -159,6 +178,26 @@ export const canonicalHttpOriginOf = (value: string): string | undefined => {
  */
 export const isOriginInAllowedOrigins = (allowedOrigins: Iterable<string>, origin: string): boolean =>
   canonicalizeAllowedOrigins(allowedOrigins).has(origin);
+
+/** 同時に始める判定のサイトの鍵で、ホスト名の先頭から除く部分（REV-PAR の m-2）。 */
+const CONCURRENT_SITE_IGNORED_HOST_PREFIX = 'www.';
+
+/**
+ * 同時に始める判定（ジョブの管理のサイトごとに同時に 1 つ。PAR-b、REV-PAR の I-1・m-2）だけで使う、サイトの鍵の集合。許可 Origin の設定値を
+ * `canonicalizeAllowedOrigins` で正規の形にしてから、ホスト名の先頭の `www.` を除く（`www.` の有無だけが違う 2 つの Origin は、同じサーバへの負荷を
+ * 2 倍にしないため、同じサイトとみなす）。ほかの判定（許可 Origin の所属、DEF-180 の間隔の鍵など）には使わない。
+ */
+export const concurrentSiteKeysOf = (allowedOrigins: Iterable<string>): ReadonlySet<string> => {
+  const keys = new Set<string>();
+  for (const origin of canonicalizeAllowedOrigins(allowedOrigins)) {
+    const url = new URL(origin);
+    if (url.hostname.startsWith(CONCURRENT_SITE_IGNORED_HOST_PREFIX)) {
+      url.hostname = url.hostname.slice(CONCURRENT_SITE_IGNORED_HOST_PREFIX.length);
+    }
+    keys.add(url.origin);
+  }
+  return keys;
+};
 
 /** 伏せ字の表記を、URLの解析器がユーザー名として直列化した値。 */
 const REDACTED_USERNAME = new URL(`http://${REDACTED}@redacted.invalid/`).username;

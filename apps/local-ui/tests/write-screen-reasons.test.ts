@@ -26,6 +26,7 @@ import {
   writeScreenListRowUpdateNotSentTextOf,
   writeScreenNotCheckableKindOf,
   writeScreenRowResultLinesOf,
+  writeScreenSameSendRowsOf,
 } from '../src/display/write-screen-values';
 
 const text = LOCAL_UI_WRITE_SCREENS_TEXT;
@@ -240,6 +241,40 @@ describe('OP-H: the result lines of a row, in order and each ending with a full 
           expect(confirmed, `${create} ${String(update)} ${String(pending)}`).toMatch(/。$/u);
         }
       }
+    }
+  });
+});
+
+// WDEDUP: 同じ画面の中の、同じ送信の形の行は 1 行にまとめ、数を添える（見せ方だけ。代表は一覧の順で最初の行）。画面をまたいではまとめない。
+describe('WDEDUP: rows of the same screen that send the same way are shown as one row', () => {
+  it('folds five rows of one shape into the first of them and keeps another shape and another screen apart', () => {
+    const rows = [
+      ...['a1', 'a2', 'a3', 'a4', 'a5'].map((key) => ({ key, screen: '/edit', sendShape: 'save', checked: false })),
+      { key: 'b', screen: '/edit', sendShape: 'publish', checked: false },
+      { key: 'c', screen: '/other', sendShape: 'save', checked: false },
+    ];
+    expect(writeScreenSameSendRowsOf(rows, (row) => row).map(({ item, count }) => [item.key, count]))
+      .toEqual([['a1', 5], ['b', 1], ['c', 1]]);
+  });
+
+  it('does not fold rows whose way of sending is not known', () => {
+    const rows = [{ key: 'f1', screen: '/new', sendShape: null, checked: false }, { key: 'f2', screen: '/new', sendShape: null, checked: false }];
+    expect(writeScreenSameSendRowsOf(rows, (row) => row).map(({ count }) => count)).toEqual([1, 1]);
+  });
+
+  it('shows a checked row in place of the first one, and counts the checked rows of the group', () => {
+    const row = (key: string, checked: boolean) => ({ key, screen: '/edit', sendShape: 'save', checked });
+    const one = writeScreenSameSendRowsOf([row('a1', false), row('a2', true), row('a3', false)], (item) => item);
+    expect(one.map(({ item, count, checkedCount }) => [item.key, count, checkedCount])).toEqual([['a2', 3, 1]]);
+    const two = writeScreenSameSendRowsOf([row('a1', false), row('a2', true), row('a3', true)], (item) => item);
+    expect(two.map(({ item, checkedCount }) => [item.key, checkedCount])).toEqual([['a2', 2]]);
+  });
+
+  it('says the count in plain words', () => {
+    expect(text.sameSendCount('5', null)).toContain('5');
+    expect(text.sameSendCount('5', '2')).toContain('うち 2 件をチェック済み');
+    for (const line of [text.sameSendCount('5', null), text.sameSendCount('5', '2')]) {
+      expect(line).not.toMatch(/[A-Za-z]|\//u);
     }
   });
 });

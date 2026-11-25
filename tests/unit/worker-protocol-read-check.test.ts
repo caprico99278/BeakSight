@@ -83,6 +83,33 @@ describe('T27e: START of a READ check job', () => {
     expect(errorsOf(unauthenticated)).toContain('/authentication is required for READ_CHECK');
   });
 
+  // RCA-6（検索の確かめの設計書 2.2、版 10）: 検索の確かめの組。人の定義が空でも、組が 1 つ以上あれば始められる。守りに当たる組と、ほかの種類の組は拒む。
+  it('accepts the search checks with an empty list of definitions, and rejects a guarded combo or the combos on another kind', () => {
+    const key = (letter: string): string => `sha256:${letter.repeat(64)}`;
+    const form = {
+      kind: 'FORM', key: key('a'), page: { origin: ORIGIN, path: '/items' }, targetIdentityDigest: DIGEST, parameters: { q: '' },
+      change: { kind: 'TEXT', field: 'q', text: 'FULL_WIDTH' }, unsentHiddenFields: false,
+    };
+    const script = {
+      kind: 'SCRIPT', key: key('b'), page: { origin: ORIGIN, path: '/items' }, text: 'EMPTY',
+      trigger: { kind: 'TYPED', stage: 1, priorPresses: [], field: { name: 'kw', selector: '#kw', type: 'search' } },
+    };
+    expect(errorsOf(start(WORKER_READ_CHECK_JOB_KIND, { readChecks: [], searchChecks: [form, script] }))).toEqual([]);
+    expect(errorsOf(start(WORKER_READ_CHECK_JOB_KIND, { readChecks: [], searchChecks: [] })).length).toBeGreaterThan(0);
+    expect(errorsOf(start(WORKER_READ_CHECK_JOB_KIND, { readChecks: [], searchChecks: [{ ...form, parameters: { api_key: '' } }] })))
+      .toEqual(['/searchChecks/0/parameters must not send a secret-like name or a dangerous word']);
+    expect(errorsOf(start(WORKER_READ_CHECK_JOB_KIND, { readChecks: [], searchChecks: [form, { ...script, key: key('a') }] })))
+      .toEqual(['/searchChecks/1/key must be unique']);
+    expect(errorsOf(start('DISCOVERY', { searchChecks: [form] }))).toContain('/searchChecks is allowed only for READ_CHECK');
+    // REV-RCA の I-4: ログインし直す段の、戻された組の鍵は、渡す組のどれかの鍵。
+    const relogin = (bouncedSearchCheckKey: string): Record<string, unknown> => ({
+      protocol: WORKER_PROTOCOL_VERSION, type: 'RELOGIN_STAGE', jobId: 'job-read-2', jobKind: WORKER_READ_CHECK_JOB_KIND, count: 1, readChecks: [],
+      searchChecks: [form, script], bouncedSearchCheckKey,
+    });
+    expect(errorsOf(relogin(key('b')))).toEqual([]);
+    expect(errorsOf(relogin(key('c')))).toEqual(['/bouncedSearchCheckKey must be the key of one of /searchChecks']);
+  });
+
   it('rejects definitions on any other job kind', () => {
     for (const jobKind of ['AUDIT', 'DISCOVERY'] as const) {
       expect(errorsOf(start(jobKind, { readChecks: [readCheck(1)] })), jobKind).toContain('/readChecks is allowed only for READ_CHECK');
@@ -169,17 +196,22 @@ describe('T27e: FINISHED of a READ check job', () => {
   };
 
   it('accepts the counts only for a Run that ran, not with the discovery counts, and not more executed than checks', () => {
-    expect(finishedErrors(finished({ readCheck: { checks: 2, executed: 1 } }))).toEqual([]);
-    expect(finishedErrors(finished({ readCheck: { checks: 2, executed: 3 } }))).toEqual(['/readCheck/executed must not be more than /readCheck/checks']);
-    expect(finishedErrors(finished({ readCheck: { checks: 1, executed: 1 }, discovery: { pagesRead: 1, pagesNotRead: 0, candidates: 0 } })).length).toBeGreaterThan(0);
+    const search = { searchChecks: 3, searchCheckErrors: 1 };
+    expect(finishedErrors(finished({ readCheck: { checks: 2, executed: 1, ...search } }))).toEqual([]);
+    expect(finishedErrors(finished({ readCheck: { checks: 2, executed: 3, ...search } }))).toEqual(['/readCheck/executed must not be more than /readCheck/checks']);
+    // RCA-5: 誤りの組の数は、組の数を超えない。
+    expect(finishedErrors(finished({ readCheck: { checks: 0, executed: 0, searchChecks: 1, searchCheckErrors: 2 } })))
+      .toEqual(['/readCheck/searchCheckErrors must not be more than /readCheck/searchChecks']);
+    expect(finishedErrors(finished({ readCheck: { checks: 1, executed: 1, ...search }, discovery: { pagesRead: 1, pagesNotRead: 0, candidates: 0 } })).length)
+      .toBeGreaterThan(0);
     expect(finishedErrors({
       protocol: WORKER_PROTOCOL_VERSION,
       type: 'FINISHED',
       outcome: { kind: 'RUN_ACTIVE', exitCode: 4, runId: null, runDirectory: null, runStatus: null },
-      readCheck: { checks: 1, executed: 0 },
+      readCheck: { checks: 1, executed: 0, ...search },
     }).length).toBeGreaterThan(0);
-    expect(finishedErrors(finished({ readCheck: { checks: 1, executed: 1, results: ['MATCHED'] } })).length).toBeGreaterThan(0);
+    expect(finishedErrors(finished({ readCheck: { checks: 1, executed: 1, ...search, results: ['MATCHED'] } })).length).toBeGreaterThan(0);
     // L4: 前の上限 20 を超える数も受ける。
-    expect(finishedErrors(finished({ readCheck: { checks: 21, executed: 0 } }))).toEqual([]);
+    expect(finishedErrors(finished({ readCheck: { checks: 21, executed: 0, ...search } }))).toEqual([]);
   });
 });

@@ -20,6 +20,7 @@
  */
 import type { MainFrameLoadObservation } from '../browser/main-frame-load.js';
 import type { IncompleteReason, IncompleteReasonCode, ViewportProfile } from '../core/contracts.js';
+import { SITE_UNAVAILABLE_HTTP_STATUSES } from '../core/http-status.js';
 import { isNetworkLayerFailure } from '../safety/network-layer-failure.js';
 import { chromiumNetErrorCode, navigationFailureDetail } from './page-navigation.js';
 
@@ -33,18 +34,10 @@ export const SITE_UNAVAILABILITY_KINDS = Object.freeze(['TIMEOUT', 'NETWORK_FAIL
 export type SiteUnavailabilityKind = (typeof SITE_UNAVAILABILITY_KINDS)[number];
 
 /**
- * サイトの不調とみなす HTTP の status の閉じた一覧（設計書 2章）。500 は、そのページだけの不具合のことが多いので含めない。
+ * サイトの不調とみなす HTTP の status の閉じた一覧（設計書 2章）。RCA-1: 一覧は `src/core/http-status.ts` に移した（検索の読み取りの判定と共有する）。ここは同じ
+ * 名前で公開し直す。
  */
-export const SITE_UNAVAILABLE_HTTP_STATUSES = Object.freeze([
-  /** 429 Too Many Requests: サイトが、要求が多すぎると答えた（これ以上の読み込みを控えるべき合図）。 */
-  429,
-  /** 502 Bad Gateway: 中継のサーバが、その先のサーバから正しい応答を受け取れなかった。 */
-  502,
-  /** 503 Service Unavailable: メンテナンスや過負荷で、サーバが一時的に応答できない。 */
-  503,
-  /** 504 Gateway Timeout: 中継のサーバが、その先のサーバの応答を待ちきれなかった。 */
-  504,
-] as const);
+export { SITE_UNAVAILABLE_HTTP_STATUSES };
 
 const SITE_UNAVAILABLE_HTTP_STATUS_SET: ReadonlySet<number> = new Set(SITE_UNAVAILABLE_HTTP_STATUSES);
 

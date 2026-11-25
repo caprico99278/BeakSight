@@ -1,7 +1,7 @@
 // RB-8（再構築の設計書 2 章 1・3、INV-REBUILD の plan 2 章の 5・6）: 発見の巡回の輪（`executeDiscoveryRun` の `crawl`）を、偽の巡回の口（`crawlPorts`）で、
 // ブラウザなしに確かめる。1 画面の読み込みの中身（読み取り・押下・Guard）は口の向こうにあり、ここでは口の答えを前提として信じる（決まり 3）。
 // - 終わり方: 全部読む・ページの上限・セッションの切れ・止める印・時間の上限・押す輪の途中の停止・Run の前の確認の失敗・違反。
-// - 辺: 除外の記録、先に読む登録の画面（点検の段の成果物から）とその一覧、移った先の編集の画面（上限に数えない）、最後の画面の後は間隔を待たない（DEF-236）。
+// - 辺: 除外の記録、先に読む登録の画面（点検の段の成果物から）とその一覧、その後に最初から入れる点検の段の画面（DSEED）、移った先の編集の画面（上限に数えない）、最後の画面の後は間隔を待たない（DEF-236）。
 // - 凍結の中でだけ読む状態: たどり方（根）を渡す、根を凍結の外で読み込むのは最初の 1 回だけ（M-1）と戻し、目印の値を記録と checkpoint に残さない、続きでは
 //   祖先の押し直しで作り直す。
 // - 続き: 読んだ画面を読み直さず同じ Run で続ける。使えない保存は、口を開かずに止める。
@@ -13,6 +13,8 @@ import { join } from 'node:path';
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 import { filterAuthenticatedState } from '../../src/control/auth/authenticated-state.js';
 import { DISCOVERY_ARTIFACT_FILE_NAME, DISCOVERY_CHECKPOINT_RELATIVE_PATH, artifactFilePath } from '../../src/core/artifact-layout.js';
+import type { RunProgressReport } from '../../src/core/contracts.js';
+import { DEBUG_TIMING_FILE_NAME } from '../../src/core/debug-timing.js';
 import { DEFAULT_EXCLUDED_URL_WORDS } from '../../src/core/default-excluded-url-words.js';
 import { createSha256Fingerprint } from '../../src/core/ids.js';
 import { validateArtifact } from '../../src/core/schema-validator.js';
@@ -69,7 +71,7 @@ interface VisitCall {
 
 /** 偽の口（`answer` が 1 回の読み込みの答えを決める。省略は、リンクの表 `links` のとおりに読めた画面）。 */
 const fakePorts = (
-  answer: (call: VisitCall, calls: readonly VisitCall[]) => DiscoveryPageVisit,
+  answer: (call: VisitCall, calls: readonly VisitCall[]) => DiscoveryPageVisit | Promise<DiscoveryPageVisit>,
   opened = true,
 ): { readonly ports: DiscoveryCrawlPorts; readonly calls: VisitCall[]; readonly opens: number[] } => {
   const calls: VisitCall[] = [];
@@ -125,6 +127,11 @@ describe('RB-8: the discovery crawl loop on a fake crawl port', () => {
       readonly chainedAuditRunDirectory?: string;
       readonly jobId?: string;
       readonly startPath?: string;
+      readonly onProgress?: (report: RunProgressReport) => void;
+      /** SLIM: Run のディレクトリを受ける（省略は受けない）。 */
+      readonly onRunStarted?: (runDirectory: string) => void;
+      /** DBG-1: 測りの記録の入切（省略は切）。 */
+      readonly debugTiming?: boolean;
       /** 出力先（Run の ID は秒の単位なので、同じ場面の Run ごとに分ける。続きは前の Run と同じ出力先）。 */
       readonly output?: string;
     } = {},
@@ -148,7 +155,11 @@ describe('RB-8: the discovery crawl loop on a fake crawl port', () => {
       crawlPorts: ports,
       ...(options.checkpoint === undefined ? {} : { checkpoint: options.checkpoint }),
       ...(options.chainedAuditRunDirectory === undefined ? {} : { chainedAuditRunDirectory: options.chainedAuditRunDirectory }),
-    }, { onRunStarted: () => undefined, onSessionLost: (lost) => sessionLost.push(lost) });
+      ...(options.debugTiming === undefined ? {} : { debugTimingSwitch: async () => options.debugTiming === true }),
+    }, {
+      onRunStarted: ({ runDirectory }) => options.onRunStarted?.(runDirectory), onSessionLost: (lost) => sessionLost.push(lost),
+      ...(options.onProgress === undefined ? {} : { onProgress: options.onProgress }),
+    });
     if (outcome.kind !== 'RAN') {
       return { outcome, document: null, checkpointText: null, sessionLost };
     }
@@ -249,6 +260,77 @@ describe('RB-8: the discovery crawl loop on a fake crawl port', () => {
     const result = await run(fakePorts(byLinks(SITE)).ports, { maxPages: 1, chainedAuditRunDirectory: audit });
     expect(readPaths(result.document)).toEqual(['/admin/entries/form', '/admin/items/new', '/admin/items', '/admin']);
     expect(result.document).toMatchObject({ endReason: 'MAX_PAGES_REACHED', maxPages: 4 });
+  });
+
+  it('DSEED: queues every page the audit stage read from the start, after the create pages, and reads each once without the pages outside the audit scope', async () => {
+    const audit = join(directory, 'audit-run');
+    const pages: readonly (readonly [string, Record<string, unknown>])[] = [
+      ['/admin', { evidence: [{ type: 'link', viewport: 'desktop', payload: { links: [
+        { anchorText: '新規登録', ariaLabel: null, title: null, normalized: { ok: true, url: url('/admin/entries/form') }, admission: { kind: 'INTERNAL_NAVIGABLE' } },
+      ] } }] }],
+      ['/admin/list', {}], ['/admin/list/1', {}], ['/admin/hidden', {}],
+      ['/admin/broken', { status: 'FAILED', incompleteReasons: [{ code: 'NAVIGATION_FAILED', detail: null }] }],
+      ['/admin/away', { status: 'FAILED', incompleteReasons: [{ code: 'NAVIGATION_FAILED', detail: 'BLOCKED_EXTERNAL_REDIRECT' }] }],
+    ];
+    for (const [index, [path, record]] of pages.entries()) {
+      const pageId = `PAGE-${String(index + 1).padStart(6, '0')}`;
+      await mkdir(join(audit, 'pages', pageId), { recursive: true });
+      await writeFile(join(audit, 'pages', pageId, 'page.json'), JSON.stringify({ pageUrl: url(path), status: 'AUDITED', incompleteReasons: [], ...record }), 'utf8');
+    }
+    const reports: RunProgressReport[] = [];
+    const fake = fakePorts(byLinks({ '/admin': ['/admin/list', '/admin/fresh'], '/admin/list': ['/admin/list/1', '/admin'] }));
+    const result = await run(fake.ports, { chainedAuditRunDirectory: audit, onProgress: (report) => reports.push(report) });
+    expect(fake.calls.map(({ path }) => path)).toEqual(['/admin/entries/form', '/admin', '/admin/list', '/admin/list/1', '/admin/hidden', '/admin/broken', '/admin/fresh']);
+    expect(result.document?.endReason).toBe('COMPLETED');
+    expect(reports[0]?.pagesDiscovered).toBeGreaterThanOrEqual(6);
+    // DSEED2: 見つけた画面を、点検から引き継いだ画面（点検で読んだ 5）と新しく見つけた画面（登録の画面と、押して出た画面）に分けて送り、成果物にも残す。
+    expect(reports.at(-1)).toMatchObject({ pagesDiscovered: 7, pagesDiscoveredSplit: { fromAuditStage: 5, newlyFound: 2 } });
+    expect(result.document?.pagesDiscoveredSplit).toEqual({ fromAuditStage: 5, newlyFound: 2 });
+  });
+
+  it('SKIP-1: does not load an audit-stage page whose both viewports have no pressable element, and keeps it as a page not read', async () => {
+    const audit = join(directory, 'audit-run');
+    const dom = (viewport: string, count?: number): Record<string, unknown> =>
+      ({ type: 'dom', viewport, payload: count === undefined ? {} : { discoveryCandidateCount: count } });
+    const pages: readonly (readonly [string, readonly unknown[]])[] = [
+      ['/admin', [dom('desktop', 3), dom('mobile', 3)]],
+      ['/admin/plain', [dom('desktop', 0), dom('mobile', 0)]],
+      ['/admin/narrow', [dom('desktop', 0), dom('mobile', 1)]],
+      ['/admin/older', [dom('desktop'), dom('mobile')]],
+    ];
+    for (const [index, [path, evidence]] of pages.entries()) {
+      const pageId = `PAGE-${String(index + 1).padStart(6, '0')}`;
+      await mkdir(join(audit, 'pages', pageId), { recursive: true });
+      await writeFile(join(audit, 'pages', pageId, 'page.json'), JSON.stringify({ pageUrl: url(path), status: 'AUDITED', incompleteReasons: [], evidence }), 'utf8');
+    }
+    const fake = fakePorts(byLinks({}));
+    const result = await run(fake.ports, { chainedAuditRunDirectory: audit });
+    expect(fake.calls.map(({ path }) => path)).toEqual(['/admin', '/admin/narrow', '/admin/older']);
+    expect(notRead(result.document)).toEqual(['/admin/plain NO_PRESSABLE_ELEMENTS']);
+    expect(result.outcome).toMatchObject({ runStatus: 'COMPLETE', endReason: 'COMPLETED' });
+  });
+
+  it('DSEED2: carries the number of pages from the audit stage over to the continuation', async () => {
+    const audit = join(directory, 'audit-run');
+    for (const [index, path] of ['/admin', '/admin/list'].entries()) {
+      const pageId = `PAGE-${String(index + 1).padStart(6, '0')}`;
+      await mkdir(join(audit, 'pages', pageId), { recursive: true });
+      await writeFile(join(audit, 'pages', pageId, 'page.json'), JSON.stringify({ pageUrl: url(path), status: 'AUDITED', incompleteReasons: [] }), 'utf8');
+    }
+    const stop = new AbortController();
+    const output = join(directory, 'resume-chained');
+    const site = byLinks({ '/admin': ['/admin/list', '/admin/fresh'] });
+    const first = await run(fakePorts((call) => { stop.abort(); return site(call); }).ports, {
+      chainedAuditRunDirectory: audit, checkpoint: { identity: IDENTITY }, stop, jobId: 'job-first', output,
+    });
+    if (first.outcome.kind !== 'RAN') throw new Error('the first crawl did not run');
+    const reports: RunProgressReport[] = [];
+    const resume = { runDirectory: first.outcome.runDirectory, previousJobId: 'job-first' };
+    const second = await run(fakePorts(site).ports, {
+      chainedAuditRunDirectory: audit, checkpoint: { identity: IDENTITY, resume }, jobId: 'job-second', output, onProgress: (report) => reports.push(report),
+    });
+    expect(second.document?.endReason).toBe('COMPLETED');
+    expect(reports.at(-1)).toMatchObject({ pagesDiscovered: 3, pagesDiscoveredSplit: { fromAuditStage: 2, newlyFound: 1 } });
   });
 
   it('reads every edit page that an opener moved to first, without counting it in the page limit (DEF-190)', async () => {
@@ -374,6 +456,77 @@ describe('RB-8: the discovery crawl loop on a fake crawl port', () => {
     ]);
     const document = JSON.parse(readFileSync(artifactFilePath(outcome.runDirectory, DISCOVERY_ARTIFACT_FILE_NAME), 'utf8')) as DiscoveryDocument;
     expect(document.pages.find((page) => page.state === 'READ')).toMatchObject({ reloadedForProbe: true });
+  });
+
+  it('DTIME (DBG-1): records the time breakdown of a read page only when the debug timing is on, also in the debug timing file', async () => {
+    let clock = 0;
+    const left = { submissionProbe: { reason: 'PAGE_CHANGED' } } as unknown as DiscoveryCandidate;
+    const record: DiscoveryReadPageRecord = { location: { origin: ORIGIN, path: '/admin/new' }, incompleteReasons: [], candidates: [left] };
+    const ports = () => fakePorts(async (call) => {
+      // 口の向こうの 1 回の読み込み（100 ms）と、測らない処理（10 ms）。
+      await call.options.timing?.measure('LOAD', async () => { clock += 100; });
+      clock += 10;
+      return call.options.reprobe === undefined
+        ? readVisit(url(call.path), { record, probe: { culprit: null, continuation: null, pressed: 1, leftBehind: new Map([[0, TRAIL]]), candidateKeys: undefined, optionStages: [] } })
+        : readVisit(url(call.path));
+    }).ports;
+    const debugFileOf = (outcome: DiscoveryRunOutcome): string | null => {
+      if (outcome.kind !== 'RAN') return null;
+      try {
+        return readFileSync(artifactFilePath(outcome.runDirectory, DEBUG_TIMING_FILE_NAME), 'utf8');
+      } catch {
+        return null;
+      }
+    };
+    // SLIM（設計書 2.3 (a)）: 画面を終えるたびに書き出す（進み具合を送る時点で、その画面の行がファイルにある）。
+    let runDirectory = '';
+    const writtenAtProgress: string[] = [];
+    const on = await run(ports(), {
+      startPath: '/admin/new?token=secret-value', now: () => clock, debugTiming: true,
+      onRunStarted: (directory) => { runDirectory = directory; },
+      onProgress: () => {
+        try {
+          writtenAtProgress.push(readFileSync(artifactFilePath(runDirectory, DEBUG_TIMING_FILE_NAME), 'utf8'));
+        } catch {
+          writtenAtProgress.push('');
+        }
+      },
+    });
+    const page = on.document?.pages.find((entry) => entry.state === 'READ');
+    expect(page?.state === 'READ' ? page.timeBreakdown : null).toMatchObject({ totalMs: 220, loadMs: 200, loads: 2, reloads: 1, otherMs: 20, stageEndMs: 0 });
+    const text = debugFileOf(on.outcome) ?? '';
+    expect(text).toContain('"point":"DISCOVERY_PAGE"');
+    expect(writtenAtProgress.some((written) => written.includes('"point":"DISCOVERY_PAGE"'))).toBe(true);
+    expect(text).not.toContain('secret-value');
+
+    const off = await run(ports(), { startPath: '/admin/new', now: () => clock });
+    const offPage = off.document?.pages.find((entry) => entry.state === 'READ');
+    expect(offPage?.state === 'READ' ? offPage.timeBreakdown : null).toBeUndefined();
+    expect(debugFileOf(off.outcome)).toBeNull();
+  });
+
+  it('DPROG (a): counts a page left unread outside the freeze as checked, so the progress reaches the found pages', async () => {
+    // 入口の画面のリンクの 1 つが、押下で入れた目印の値を持つ（凍結の外では読まない画面になる）。
+    const site = (call: VisitCall): DiscoveryPageVisit => (call.path === '/find' && call.options.replayMove === undefined && call.options.linksOnly !== true
+      ? readVisit(url('/find'), {
+        links: [url(`/echo?v=${MARKER}`)],
+        movedPages: [{ url: url(`/results?q=${MARKER}`), markerQueryNames: ['q'], trail: TRAIL, markerValues: [MARKER] }],
+      })
+      : readVisit(url(call.path)));
+    const fake = fakePorts(site);
+    const reports: RunProgressReport[] = [];
+    const config = createTestConfig(ORIGIN, '/find', { audit: { screenshots: false }, output: { directory } });
+    const outcome = await executeDiscoveryRun({
+      config, jobId: 'job-dprog-a', authentication, launchBrowser: () => Promise.reject(new Error('no browser')),
+      clock: () => new Date(), now: () => Date.now(), sleep: async () => undefined, stopSignal: new AbortController().signal, crawlPorts: fake.ports,
+    }, { onRunStarted: () => undefined, onSessionLost: () => undefined, onProgress: (report) => { reports.push(report); } });
+    if (outcome.kind !== 'RAN') throw new Error('the crawl did not run');
+    const document = JSON.parse(readFileSync(artifactFilePath(outcome.runDirectory, DISCOVERY_ARTIFACT_FILE_NAME), 'utf8')) as DiscoveryDocument;
+    expect(notRead(document)).toHaveLength(1);
+    expect(reports.at(-1)).toMatchObject({ pagesFinished: 3, pagesDiscovered: 3 });
+    // DSEED2: 連鎖でない操作さがし（点検の段がない）は、見つけた画面を分けない（今のまま）。
+    expect(reports.some((report) => report.pagesDiscoveredSplit !== undefined)).toBe(false);
+    expect(document.pagesDiscoveredSplit).toBeUndefined();
   });
 });
 

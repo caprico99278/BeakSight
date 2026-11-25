@@ -65,6 +65,11 @@ export interface DataEndpointActivity {
   readonly inFlight: readonly string[];
   readonly completed: readonly string[];
   readonly failed?: readonly string[] | undefined;
+  /**
+   * QUIET-3: 口ごとの、要求が始まった数（通しの数。省略はなし）。押下の窓の外で出た口を、押下の前後の数の差で見分ける（操作さがしの押下の観察）。静まりの判定は
+   * 読まない。
+   */
+  readonly started?: Readonly<Record<string, number>> | undefined;
 }
 
 /** 落ち着きの判定が読む、データの静まりの事実。 */
@@ -128,6 +133,17 @@ export function dataQuietnessOf(data: DataActivity): DataQuietness {
   const pending = data.endpoints.inFlight.filter((endpoint) => !ended.has(endpoint));
   return { pending: pending.length, mark: JSON.stringify([...pending].sort()), pendingEndpoints: [...new Set(pending)] };
 }
+
+/**
+ * DEF-283 の C（設計者の判断 2026-11-16。判定はここだけ）: 動き（中身の進み・まだ届いていない口の途中の要求の組の変わり）が最後にあった時刻から、開いた要求の
+ * 静まりの長さ（`openDataRequestQuietMs`）が過ぎたか。過ぎたら、まだ届いていない要求が残っていても、進みが止まったとみなす（送り続ける画面・答えない長い要求で、
+ * 見張りまで待たない）。DEF-290: 発見の前の落ち着きの待ち（`src/discovery/settle.ts`）も、この判定を使う。
+ */
+export const progressStoppedOf = (lastMovedAtMs: number, nowMs: number, openDataRequestQuietMs: number | undefined): boolean =>
+  nowMs - lastMovedAtMs >= openDataRequestQuietOf(openDataRequestQuietMs);
+
+/** 開いた要求の静まりの長さ（差し込まれた値。なければ本番の値）。 */
+const openDataRequestQuietOf = (given: number | undefined): number => given ?? OPEN_DATA_REQUEST_QUIET_MS;
 
 export interface PageSettlingObservation {
   readonly observedAtMs: number;
@@ -309,7 +325,7 @@ export async function waitForPageSettledWith(
   const enterPhase = (phase: PageLoadPhase, observedAtMs: number): void => {
     if (loadPhases.at(-1)?.phase !== phase) loadPhases.push({ phase, observedAtMs });
   };
-  const openDataRequestQuietMs = policy.openDataRequestQuietMs ?? OPEN_DATA_REQUEST_QUIET_MS;
+  const openDataRequestQuietMs = openDataRequestQuietOf(policy.openDataRequestQuietMs);
   const progress = policy.progress;
   /** 今までに見た作りの印（L9 の `scrollStructureSignaturesOf` の集合）と、L0 の見た高さ・前の `readyState`。 */
   const seenStructure = new Set<string>();
@@ -368,7 +384,7 @@ export async function waitForPageSettledWith(
     if (contentMoved || contentMovedAtMs === undefined) {
       contentMovedAtMs = observedAtMs;
     }
-    const contentStopped = observedAtMs - contentMovedAtMs >= openDataRequestQuietMs;
+    const contentStopped = progressStoppedOf(contentMovedAtMs, observedAtMs, openDataRequestQuietMs);
     if (progressed) {
       progress?.mark('BROWSER_RESPONSE');
     }

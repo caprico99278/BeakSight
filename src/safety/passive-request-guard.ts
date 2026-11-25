@@ -2510,7 +2510,30 @@ interface GuardState {
    * `endScrollKeyPress` と凍結が外す）。判定の口に `scrollKeyPress` として渡し、その期間の main frame の移動とポップアップを止める（違反にしない）。
    */
   scrollKeyPress: boolean;
-  /** REV-EV4: キーの押下の期間に止めた main frame の移動とポップアップの数（`scrollKeyPressGuardOf` の `blocked` で読む）。 */
+  /**
+   * FRET（設計書 `2026-11-24-beaksight-dialog-focus-return-design.md` の設計変更履歴の 2026-11-25）: キーの押下の期間のうち、窓を開くボタンの押す期間（Enter を
+   * 押してから、窓を閉じて落ち着くまで）か（`scrollKeyPressGuardOf` の `pressPeriod` が入れ、外す。凍結とキーの押下の期間の終わりも外す）。判定の口に
+   * `scrollKeyPress: 'DIALOG_PRESS'` として渡し、読み取りでない要求も止める。
+   */
+  dialogPress: boolean;
+  /**
+   * FRET（2026-11-25 fix round 1 の判断）: 窓を開くボタンの確かめが 1 つでも押した後、その Context の page を閉じるまで（BeakSight 自身の次の読み込み
+   * `announceOwnMainFrameNavigation`・閉じる前の離れる手順 `announcePageLeave`（fix round 3）・凍結で外す）、押す期間の止め（`DIALOG_PRESS`）を続けるか（`scrollKeyPressGuardOf` の `holdPressStop` が入れる）。FRET は
+   * ビューポートの点検の最後の段なので、その後の点検の証拠には混ざらない。止めた要求は今の止めの記録のまま Ledger に残る。
+   */
+  dialogPressHold: boolean;
+  /**
+   * FRET fix round 4（2026-11-26）: 止めの続きのある（押した）page が、閉じる前の離れる手順を始めた（`announcePageLeave`）。真の後に通した読み取りでない要求は、
+   * Ledger の通した要求の記録の `afterDialogPressLeave` に数える。
+   */
+  dialogPressLeaving: boolean;
+  /**
+   * FRET fix round 4: 押す期間に、押す前から開いていた WebSocket の接続が送った frame の数（止めない。`scrollKeyPressGuardOf` の `webSocketFramesSent` で読む）。
+   */
+  dialogPressWebSocketFrames: number;
+  /** fix round 5: 押す期間の外の、止めの続き（hold）の間に、前から開いていた接続が送った frame の数（止めない。`webSocketFramesSentAfterPress` で読む）。 */
+  dialogPressHoldWebSocketFrames: number;
+  /** REV-EV4: キーの押下の期間に止めた main frame の移動とポップアップの数（`scrollKeyPressGuardOf` の `blocked` で読む）。FRET: 押す期間に止めた要求も数える。 */
   scrollKeyPressBlocks: number;
   /**
    * COV-2c（SREV-COV の C-1）: 凍結の段で、1 回だけ通してよい main frame の文書の移動の行き先（fragment を外した URL。`admitFrozenMainFrameDocument` が入れ、
@@ -3362,6 +3385,157 @@ function isDownloadCancelAfterContextGoneFailure(message: string): boolean {
 /** 命令の失敗の文言が、session か target が閉じた形（`CLOSED_TARGET_FAILURE_TEXTS` のどれか）と完全に一致するか。 */
 function isClosedTargetFailure(message: string): boolean {
   return CLOSED_TARGET_FAILURE_TEXTS.has(message);
+}
+
+/**
+ * CDPX: OOPIF の target が先に外れたために、その session への命令が失敗したときの文言の閉じた一覧（完全一致）。
+ * - 親の session（Playwright の `CDPSession.send`）の `Target.sendMessageToTarget` が、もうない session に送ったときの文言（Playwright 1.64.1。
+ *   両方の Chromium で、要求を止めている間に iframe が消えたときに実際に起きた失敗から取った）。
+ * - Guard が `Target.detachedFromTarget` を受けて閉じた OOPIF の session への命令の文言（`OOPIF_SESSION_CLOSED_MESSAGE`）。
+ */
+const DETACHED_OOPIF_TARGET_FAILURE_TEXTS: ReadonlySet<string> = new Set([
+  'cdpSession.send: Protocol error (Target.sendMessageToTarget): No session with given id',
+  OOPIF_SESSION_CLOSED_MESSAGE,
+]);
+
+/**
+ * CDPX: Guard が許した（ALLOW）要求を続ける命令を送り、失敗を扱う（Request の段階と Response の段階の、すべての `continueRequest` の失敗の判定の 1 か所）。
+ * - Request の段階で、OOPIF の target が先に外れた失敗（`DETACHED_OOPIF_TARGET_FAILURE_TEXTS`）は、違反にせず数だけ記録する。target が外れると、Chromium は
+ *   止めていた要求を、続けたのと同じに解き放つ（両方の Chromium で確かめた）。許した要求なので、届いても安全の決まりに反しない。
+ * - ほかの失敗と、Response の段階の失敗は、今どおり違反にして Context を無効にする（fail-closed）。止める命令（`failRequest`）の失敗は、ここを通さない
+ *   （外れると止めるはずの要求が解き放たれるので、違反のまま）。
+ * - DEF-292 の残り: target が外れた失敗のとき、`onDetachedContinue` を呼ぶ（解き放たれた要求を、呼ぶ側が「通した」一覧に記録する）。
+ */
+async function continueAllowedRequest(
+  continueRequest: () => Promise<void>,
+  stage: 'REQUEST' | 'RESPONSE',
+  context: BrowserContext,
+  ledger: SafetyLedger,
+  onDetachedContinue?: () => void,
+): Promise<void> {
+  try {
+    await continueRequest();
+  } catch (error) {
+    const message = errorMessage(error);
+    if (stage === 'REQUEST' && DETACHED_OOPIF_TARGET_FAILURE_TEXTS.has(message)) {
+      ledger.recordDetachedTargetContinue();
+      onDetachedContinue?.();
+      return;
+    }
+    ledger.recordInvariantViolation({ code: 'CDP_CONTINUE_REQUEST_FAILED', message });
+    initiateInvalidation(context, ledger);
+  }
+}
+
+/** DEF-292 の残り: URL の fragment（`#` から後）を除いた形。 */
+const withoutUrlFragment = (url: string): string => {
+  const at = url.indexOf('#');
+  return at < 0 ? url : url.slice(0, at);
+};
+
+/** DEF-292 の残り: route の層の記録を待つ要求（method と URL）。 */
+interface AwaitedRouteRequest {
+  readonly method: string;
+  readonly url: string;
+}
+
+/** DEF-292 の残り: 記録待ちの行（命令を送る session と、その page と、要求）。 */
+interface AwaitedRouteEntry {
+  readonly owner: object;
+  readonly page: object;
+  readonly request: AwaitedRouteRequest;
+}
+
+/**
+ * DEF-292 の残り: 監査の段の送信の扱いの口が通した、Network の要求の ID のある要求の「通した」の記録は、route の層が残す（ブラウザが送る時点）。CDP の層が続ける
+ * 命令を送る前に、その要求を、命令を送る session（`owner`）ごとに「route の層の記録待ち」に置く。
+ * - route の層は、要求を見たら（判定によらず）待ちの行を 1 つ外す（method と URL で対応付ける。`takeAtRoute`）。
+ * - 続ける命令が失敗したら、呼ぶ側が行を外す（`withdraw`）。
+ * - 続ける命令は届いたが、route の層に着く前に OOPIF の target が外れたら、その session の待ちの行を「通した」へ移す（`moveDetached`）。移した行は覚えておき、後から
+ *   route の層に同じ要求が来ても、二重に記録しない（`takeAtRoute` が `MOVED` を返す）。
+ * - session を閉じたら（target が外れたのでないとき）、その session の行は記録せずに捨てる（`discard`）。page を閉じたら、その page の行（移した行も）を
+ *   捨てる（`discardPage`）。Context を閉じたら、すべて捨てる（`clear`）。
+ * - REV-CP の Minor-1: route の層は、要求の frame の page（持ち主の page）の行だけを外す。Playwright の公開の口からは、要求の frame の CDP の session（OOPIF）を
+ *   引けないので、同じ page の中では、最初に一致した行を外す。page を引けない要求は、どの page の行でも外す。
+ * 単体テストが、page ごとに外すことと、閉じたら捨てることを確かめるために公開する（Guard の外では使わない）。
+ */
+export class AwaitedRouteAuditSends {
+  readonly #awaiting: AwaitedRouteEntry[] = [];
+  readonly #moved: { readonly page: object; readonly request: AwaitedRouteRequest }[] = [];
+
+  /** 待ちに置き、その行を返す（`withdraw` に渡す）。 */
+  add(owner: object, page: object, request: AwaitedRouteRequest): AwaitedRouteEntry {
+    const entry = { owner, page, request };
+    this.#awaiting.push(entry);
+    return entry;
+  }
+
+  /** 置いた行を外す（続ける命令が失敗したとき）。まだ待ちにあった（route の層も、target の外れも、まだ外していない）なら真。 */
+  withdraw(entry: AwaitedRouteEntry): boolean {
+    const at = this.#awaiting.indexOf(entry);
+    if (at < 0) return false;
+    this.#awaiting.splice(at, 1);
+    return true;
+  }
+
+  /**
+   * route の層が見た要求の行を外す。待ちの行なら `AWAITING`、target が外れて移した行なら `MOVED`、どちらでもなければ `null`。URL は fragment を除いて比べる
+   * （CDP の要求の URL は fragment を持たず、Playwright の文書の要求の URL は持つことがある）。
+   */
+  takeAtRoute(page: object | undefined, method: string, url: string): 'AWAITING' | 'MOVED' | null {
+    const target = withoutUrlFragment(url);
+    const same = (row: { readonly page: object; readonly request: AwaitedRouteRequest }): boolean =>
+      (page === undefined || row.page === page) && row.request.method === method && withoutUrlFragment(row.request.url) === target;
+    const awaiting = this.#awaiting.findIndex(same);
+    if (awaiting >= 0) {
+      this.#awaiting.splice(awaiting, 1);
+      return 'AWAITING';
+    }
+    const moved = this.#moved.findIndex(same);
+    if (moved >= 0) {
+      this.#moved.splice(moved, 1);
+      return 'MOVED';
+    }
+    return null;
+  }
+
+  /** target が外れた session の待ちの行を外して返す（呼ぶ側が「通した」に記録する）。 */
+  moveDetached(owner: object): readonly AwaitedRouteRequest[] {
+    const rows = this.#takeWhere((entry) => entry.owner === owner);
+    this.#moved.push(...rows);
+    return rows.map(({ request }) => request);
+  }
+
+  /** 閉じた session の待ちの行を、記録せずに捨てる。 */
+  discard(owner: object): void {
+    this.#takeWhere((entry) => entry.owner === owner);
+  }
+
+  /** 閉じた page の待ちの行と移した行を、記録せずに捨てる。 */
+  discardPage(page: object): void {
+    this.#takeWhere((entry) => entry.page === page);
+    for (let at = this.#moved.length - 1; at >= 0; at -= 1) {
+      if (this.#moved[at]?.page === page) this.#moved.splice(at, 1);
+    }
+  }
+
+  /** Context を閉じたら、すべての行を捨てる。 */
+  clear(): void {
+    this.#awaiting.length = 0;
+    this.#moved.length = 0;
+  }
+
+  #takeWhere(matches: (entry: AwaitedRouteEntry) => boolean): AwaitedRouteEntry[] {
+    const taken: AwaitedRouteEntry[] = [];
+    for (let at = this.#awaiting.length - 1; at >= 0; at -= 1) {
+      const entry = this.#awaiting[at];
+      if (entry !== undefined && matches(entry)) {
+        taken.unshift(entry);
+        this.#awaiting.splice(at, 1);
+      }
+    }
+    return taken;
+  }
 }
 
 /**
@@ -4264,6 +4438,14 @@ const mainFrameNavigationStateOf = (page: Page): MainFrameNavigationState => {
 export function announcePageLeave(page: Page): void {
   const state = mainFrameNavigationStateOf(page);
   state.leaving = true;
+  // FRET fix round 3（設計書の設計変更履歴の 2026-11-26）: 閉じる前の離れる手順の前に、窓を開くボタンを押した後の止めの続きを外す（SD-2 2.4 の閉じる時の後始末の
+  // 送信を、今の判定で届ける）。読み込みの間隔の待ち（`announcePacingWait`）の間は外さない。
+  const guardState = guardStates.get(page.context());
+  if (guardState !== undefined) {
+    // FRET fix round 4: 押した page の離れる手順の間に通した読み取りでない要求を、記録で見分けられるようにする（止めない。限界の記録）。
+    guardState.dialogPressLeaving ||= guardState.dialogPressHold;
+    guardState.dialogPressHold = false;
+  }
 }
 
 /**
@@ -4290,6 +4472,11 @@ export function isPacingWaitAnnounced(page: Page): boolean {
 export function announceOwnMainFrameNavigation(page: Page): void {
   const state = mainFrameNavigationStateOf(page);
   state.ownNavigationPending = true;
+  // FRET（2026-11-25 fix round 1 の判断）: BeakSight 自身の次の読み込みの前に、窓を開くボタンの押した後の止めの続きを外す（読み込みと、その後の点検は今の扱い）。
+  const guardState = guardStates.get(page.context());
+  if (guardState !== undefined) {
+    guardState.dialogPressHold = false;
+  }
 }
 
 /**
@@ -5009,9 +5196,36 @@ export function endNotificationPress(page: Page): void {
 /**
  * REV-EV4（設計書 `2026-11-16-beaksight-finding-evidence-design.md` 3.4）: 横にスクロールする領域のキーの押下の期間の口（`begin` は Guard が付いて Passive の段の
  * 準備のできた page でなければ始めず偽を返す。呼ぶ側は押さない。`blocked` は、その期間に止めた main frame の移動とポップアップの数）。例外を投げない。
+ * FRET（2026-11-25）: `pressPeriod` は、キーの押下の期間の中の、窓を開くボタンの押す期間を入れ外しする（その間は読み取りでない要求も止める）。キーの押下の期間で
+ * ないときは入れない。`end` は押す期間も外す。
  */
-export function scrollKeyPressGuardOf(page: Page): { readonly begin: () => boolean; readonly end: () => void; readonly blocked: () => number } {
+export function scrollKeyPressGuardOf(page: Page): {
+  readonly begin: () => boolean;
+  readonly end: () => void;
+  readonly blocked: () => number;
+  readonly pressPeriod: (on: boolean) => void;
+  readonly holdPressStop: () => void;
+  readonly webSocketFramesSent: () => number;
+  readonly webSocketFramesSentAfterPress: () => number;
+} {
   return {
+    // fix round 5: 押した後の止めの続き（hold）の間に、前から開いていた接続が送った frame の数（止めない）。
+    webSocketFramesSentAfterPress: () => guardStates.get(page.context())?.dialogPressHoldWebSocketFrames ?? 0,
+    // FRET fix round 4: 押す期間に、押す前から開いていた WebSocket の接続が送った frame の数（止めない。観察のある Context だけ数える）。
+    webSocketFramesSent: () => guardStates.get(page.context())?.dialogPressWebSocketFrames ?? 0,
+    pressPeriod: (on: boolean) => {
+      const guardState = guardStates.get(page.context());
+      if (guardState !== undefined) {
+        guardState.dialogPress = on && guardState.scrollKeyPress;
+      }
+    },
+    // FRET（2026-11-25 fix round 1 の判断）: キーの押下の期間の中で呼ぶと、押す期間の止めを、BeakSight 自身の次の読み込み（か凍結・Context を閉じる）まで続ける。
+    holdPressStop: () => {
+      const guardState = guardStates.get(page.context());
+      if (guardState !== undefined && guardState.scrollKeyPress) {
+        guardState.dialogPressHold = true;
+      }
+    },
     begin: () => {
       try {
         const guardState = requireActiveGuardState(page.context(), ['PASSIVE_ACTIVE']);
@@ -5028,6 +5242,7 @@ export function scrollKeyPressGuardOf(page: Page): { readonly begin: () => boole
       const guardState = guardStates.get(page.context());
       if (guardState !== undefined) {
         guardState.scrollKeyPress = false;
+        guardState.dialogPress = false;
       }
     },
     blocked: () => guardStates.get(page.context())?.scrollKeyPressBlocks ?? 0,
@@ -5111,8 +5326,10 @@ function enterInteractionFreeze(guardState: GuardState): void {
   guardState.phase = 'FROZEN_ACTIVE';
   // DEF-210（通知の枠の設計書 3.2.1 の 3）: 操作さがしの閉じる押下の期間は、凍結で終わる（凍結の後は、凍結の決まりで扱う）。
   guardState.notificationPress = null;
-  // REV-EV4: 領域のキーの押下の期間も、凍結で終わる。
+  // REV-EV4: 領域のキーの押下の期間も、凍結で終わる。FRET: 窓を開くボタンの押す期間も。
   guardState.scrollKeyPress = false;
+  guardState.dialogPress = false;
+  guardState.dialogPressHold = false;
   // DEF-085 fix round 3（I2）: Guard が凍結の段に入った直後に、出口の中継も凍結する（発見の凍結を含む。Guard の凍結の前に中継を凍結すると、
   // まだ正当な要求を中継が拒むので、この順にする）。
   freezeEgress(guardState, 'INTERACTION_FREEZE');
@@ -5787,6 +6004,10 @@ export async function installPassiveRequestGuard(
   const withNotificationPress = (policy: PassiveRequestPolicyOptions | undefined): PassiveRequestPolicyOptions | undefined => {
     const mode = guardState.notificationPress;
     const pressed = mode === null ? policy : { ...policy, notificationPress: mode };
+    // FRET: 窓を開くボタンの押す期間と、押した後に page を閉じるまでの続きは、読み取りでない要求も止める印を渡す。
+    if (guardState.dialogPress || guardState.dialogPressHold) {
+      return { ...pressed, scrollKeyPress: 'DIALOG_PRESS' };
+    }
     return guardState.scrollKeyPress ? { ...pressed, scrollKeyPress: true } : pressed;
   };
   /** CDP の層の判定の口。 */
@@ -5847,8 +6068,37 @@ export async function installPassiveRequestGuard(
   };
   const recordPassedAuditSendRequest = (method: string, url: string): void => {
     if (auditSendAdmission !== undefined) {
-      ledger.recordPassedAuditSendRequest({ method, url, otherOrigin: auditSendAdmission.isOtherOrigin(url) });
+      ledger.recordPassedAuditSendRequest({
+        method, url, otherOrigin: auditSendAdmission.isOtherOrigin(url), ...(guardState.dialogPressLeaving ? { afterDialogPressLeave: true } : {}),
+      });
     }
+  };
+  /** DEF-292 の残り: route の層の「通した」の記録を待つ要求（続ける命令の後に OOPIF の target が外れたら、ここから「通した」へ移す）。 */
+  const awaitedRouteAuditSends = new AwaitedRouteAuditSends();
+  /**
+   * DEF-292 の残り: route の層が「通した」を記録する要求（Network の要求の ID のある、口が通した要求）を続ける。続ける前に記録待ちに置き、target が外れて命令が
+   * 失敗したら（Chromium が解き放つ）、ここで「通した」に記録する。ほかの失敗では記録しない（今どおり違反）。
+   */
+  const continueRouteRecordedAuditSend = async (
+    owner: object,
+    ownerPage: Page,
+    request: AwaitedRouteRequest,
+    continueRequest: () => Promise<void>,
+  ): Promise<void> => {
+    const entry = awaitedRouteAuditSends.add(owner, ownerPage, request);
+    let continued = false;
+    await continueAllowedRequest(async () => {
+      await continueRequest();
+      continued = true;
+    }, 'REQUEST', context, ledger, () => {
+      // 命令を待つ間に target の外れで既に移した（記録した）行は、二重に記録しない。
+      if (awaitedRouteAuditSends.withdraw(entry)) recordPassedAuditSendRequest(request.method, request.url);
+    });
+    if (!continued) awaitedRouteAuditSends.withdraw(entry);
+  };
+  /** DEF-292 の残り: OOPIF の target が外れた session の、route の層の記録待ちの要求を「通した」に記録する。 */
+  const recordDetachedAwaitedAuditSends = (owner: object): void => {
+    for (const { method, url } of awaitedRouteAuditSends.moveDetached(owner)) recordPassedAuditSendRequest(method, url);
   };
   const webSocketKeyOf = (url: string): string => {
     try {
@@ -5884,7 +6134,16 @@ export async function installPassiveRequestGuard(
     try {
       session = await context.newCDPSession(page);
       const opened = session;
-      const stop = await observeCreatedWebSockets(opened, recordObservedWebSocket);
+      // FRET fix round 4: 押す期間に、押す前から開いていた接続が送った frame を数える（止めない）。
+      // fix round 5: 押した後の止めの続き（hold）の間に送った frame も、「押した後」の数として別に数える（止めない）。
+      const stop = await observeCreatedWebSockets(opened, recordObservedWebSocket, () => {
+        if (guardState.dialogPress) guardState.dialogPressWebSocketFrames = saturatingIncrement(guardState.dialogPressWebSocketFrames);
+        else if (guardState.dialogPressHold) {
+          guardState.dialogPressHoldWebSocketFrames = saturatingIncrement(guardState.dialogPressHoldWebSocketFrames);
+          // fix round 5（設計者の判断 (A)）: 確かめの後に送った分も分かるように、Ledger に数える（止めない）。
+          ledger.recordWebSocketFrameAfterDialogPress();
+        }
+      });
       listenerGroup.cleanups.push(() => {
         stop();
         void opened.detach().catch(() => undefined);
@@ -6077,6 +6336,11 @@ export async function installPassiveRequestGuard(
     notificationPressNavigations: 0,
     notificationPressNavigationTargets: [],
     scrollKeyPress: false,
+    dialogPress: false,
+    dialogPressHold: false,
+    dialogPressLeaving: false,
+    dialogPressWebSocketFrames: 0,
+    dialogPressHoldWebSocketFrames: 0,
     scrollKeyPressBlocks: 0,
     // COV-2c（C-1）: 凍結の段で 1 回だけ通す main frame の文書の移動（既定はなし）。
     frozenMainFrameDocument: null,
@@ -6290,15 +6554,7 @@ export async function installPassiveRequestGuard(
                 initiateInvalidation(context, ledger);
                 return;
               }
-              try {
-                await commands.continueRequest();
-              } catch (error) {
-                ledger.recordInvariantViolation({
-                  code: 'CDP_CONTINUE_REQUEST_FAILED',
-                  message: errorMessage(error),
-                });
-                initiateInvalidation(context, ledger);
-              }
+              await continueAllowedRequest(commands.continueRequest, 'RESPONSE', context, ledger);
               return;
             }
             const isMainFrame = event.frameId === rootFrameId;
@@ -6828,6 +7084,10 @@ export async function installPassiveRequestGuard(
               const blockDecision = verdict.kind === 'BLOCK_POLICY' ? verdict.decision : serviceRequestLimitOf(verdict.decision, request.url);
               if (blockDecision !== null) {
                 if (await fail('CDP_FAIL_REQUEST_FAILED')) {
+                  // FRET（2026-11-25 fix round 1 の判断）: 窓を開くボタンの押す期間の止めで止めた、文書でない要求（main frame の fetch など）も数える。
+                  if (blockDecision.action === 'BLOCK' && blockDecision.category === 'REQUEST' && blockDecision.reason === SCROLL_KEY_PRESS_BLOCK_REASON) {
+                    guardState.scrollKeyPressBlocks = saturatingIncrement(guardState.scrollKeyPressBlocks);
+                  }
                   recordBlockedDecision(
                     ledger,
                     blockDecision,
@@ -6865,6 +7125,8 @@ export async function installPassiveRequestGuard(
               }
               // AS-a: 監査の段の送信の扱いの口が通した要求を、続ける前に記録する（RB-4a の X2: 数えない）。
               const auditSendNetworkId = typeof event.networkId === 'string' && event.networkId.length > 0 ? event.networkId : null;
+              /** DEF-292 の残り: 「通した」の記録を route の層に任せる要求か（続ける命令の後に target が外れたら、ここで記録する）。 */
+              let routeRecordedAuditSend = false;
               if (
                 auditSendAdmission !== undefined
                 && verdict.decision.auditSendAdmission === true
@@ -6886,6 +7148,8 @@ export async function installPassiveRequestGuard(
                 // 進めず届かない要求は残さない）。ID のない要求（ページを離れるときの送信など）は、Playwright が route を呼ばずに進めるので、ここで残す。
                 if (!(typeof event.networkId === 'string' && event.networkId.length > 0)) {
                   recordPassedAuditSendRequest(request.method, request.url);
+                } else {
+                  routeRecordedAuditSend = true;
                 }
               }
               // T25b: フォームの送信のログインの段の口は、ナビゲーションでない要求の POST を許さない（ここで ALLOW になる非読み取りの要求はない）。
@@ -6928,15 +7192,11 @@ export async function installPassiveRequestGuard(
                 await handOffApiWrite(event, commands, apiWriteStage, apiPageKeyValues);
                 return;
               }
-              try {
-                await commands.continueRequest();
-              } catch (error) {
-                ledger.recordInvariantViolation({
-                  code: 'CDP_CONTINUE_REQUEST_FAILED',
-                  message: errorMessage(error),
-                });
-                initiateInvalidation(context, ledger);
+              if (routeRecordedAuditSend) {
+                await continueRouteRecordedAuditSend(channel, page, { method: request.method, url: request.url }, commands.continueRequest);
+                return;
               }
+              await continueAllowedRequest(commands.continueRequest, 'REQUEST', context, ledger);
             }, 'REQUEST');
           };
           const onRequestPaused = (event: PausedDocumentEvent): void => {
@@ -7223,6 +7483,10 @@ export async function installPassiveRequestGuard(
                 let expectedFailure: ExpectedCdpFailure | undefined;
                 /** REV-EV4: 領域のキーの押下の期間に止めた main frame の移動を、204 で応えるか。 */
                 let keyPressNoContent = false;
+                // FRET: 窓を開くボタンの押す期間に止めた子の frame の要求も数える（main frame の要求は下の登録で数える）。
+                if (decision.category === 'REQUEST' && decision.reason === SCROLL_KEY_PRESS_BLOCK_REASON && event.frameId !== rootFrameId) {
+                  guardState.scrollKeyPressBlocks = saturatingIncrement(guardState.scrollKeyPressBlocks);
+                }
                 if (redirectedFrom !== undefined) {
                   expectedFailure = expectedCdpFailures.register(page, redirectedFrom, Date.now()) ?? undefined;
                 } else if (
@@ -7291,15 +7555,13 @@ export async function installPassiveRequestGuard(
                 await submitAdmittedWrite(event, writeStage.monitor, writeSubmission);
                 return;
               }
-              try {
-                await commands.continueRequest();
-              } catch (error) {
-                ledger.recordInvariantViolation({
-                  code: 'CDP_CONTINUE_REQUEST_FAILED',
-                  message: errorMessage(error),
-                });
-                initiateInvalidation(context, ledger);
+              // DEF-292 の残り: 口が通した文書の要求の「通した」の記録は route の層が残す（リダイレクトの先の段は route の層に来ないので、今どおり記録しない）。
+              // 続ける命令の後に target が外れたら、ここで記録する。
+              if (auditSendAdmission !== undefined && decision.action === 'ALLOW' && decision.auditSendAdmission === true && redirectedFrom === undefined) {
+                await continueRouteRecordedAuditSend(channel, page, interceptedRequest, commands.continueRequest);
+                return;
               }
+              await continueAllowedRequest(commands.continueRequest, 'REQUEST', context, ledger);
             });
           };
           /**
@@ -7411,6 +7673,8 @@ export async function installPassiveRequestGuard(
         };
         /** OOPIF の session を閉じ、その登録（リダイレクトの対応付け）と、入れ子の OOPIF の session を消す。 */
         const disposeOopifSession = (node: OopifGuardNode): void => {
+          // DEF-292 の残り: target が外れたのでなく閉じた session の、route の層の記録待ちの行は、記録せずに捨てる（外れたときは先に移してある）。
+          awaitedRouteAuditSends.discard(node.channel);
           node.channel.close();
           node.interception.clear();
           disposeOopifSessions(node.children);
@@ -7529,6 +7793,12 @@ export async function installPassiveRequestGuard(
             // OOPIF が閉じた（iframe が消えた、または親と同じプロセスに移った）。その session と登録を消す。違反にはしない。
             if (node !== undefined && typeof event.sessionId === 'string') {
               sessions.delete(event.sessionId);
+              // DEF-292 の残り: 続ける命令は届いたが route の層に着く前に外れた要求（Chromium が解き放つ）を、「通した」に記録する（入れ子の OOPIF も）。
+              const recordDetached = (detached: OopifGuardNode): void => {
+                recordDetachedAwaitedAuditSends(detached.channel);
+                for (const child of detached.children.values()) recordDetached(child);
+              };
+              recordDetached(node);
               disposeOopifSession(node);
             }
             return true;
@@ -7545,6 +7815,7 @@ export async function installPassiveRequestGuard(
           onTargetEvent(session, pageOopifSessions, 'Target.detachedFromTarget', params);
         };
         const onSessionClose = (): void => {
+          awaitedRouteAuditSends.discard(session);
           pageInterception.clear();
           disposeOopifSessions(pageOopifSessions);
           expectedCdpFailures.clear(page);
@@ -7567,6 +7838,8 @@ export async function installPassiveRequestGuard(
         }
         session.on('close', onSessionClose);
         listenerGroup.cleanups.push(() => session.off('close', onSessionClose));
+        // DEF-292 の残り（REV-CP の Minor-3）: page の後片付けで、その page の「通した」の記録待ちの行を捨てる。
+        listenerGroup.cleanups.push(() => awaitedRouteAuditSends.discardPage(page));
         session.on('Fetch.requestPaused', pageInterception.onRequestPaused);
         listenerGroup.cleanups.push(() => session.off('Fetch.requestPaused', pageInterception.onRequestPaused));
         // DEF-026: page の session の `Network.loadingFailed`（一時停止した文書の要求の取り消しの証拠）。
@@ -7837,7 +8110,8 @@ export async function installPassiveRequestGuard(
   const notificationPressPopups = new WeakSet<Page>();
   const isNotificationPressPopupRequest = (request: Request): boolean => {
     // REV-EV4: 領域のキーの押下の期間に開いたポップアップも同じ扱い。
-    if (guardState.notificationPress === null && !guardState.scrollKeyPress) return false;
+    // FRET: 窓を開くボタンを押した後の止めの続きの間のポップアップも同じ扱い。
+    if (guardState.notificationPress === null && !guardState.scrollKeyPress && !guardState.dialogPressHold) return false;
     try {
       const requestPage = request.frame().page();
       return notificationPressPopups.has(requestPage) || pageGuards.get(requestPage)?.status !== 'READY';
@@ -7872,7 +8146,7 @@ export async function installPassiveRequestGuard(
       return;
     }
     // REV-EV4: 領域のキーの押下の期間に開いたポップアップも、Guard が止めたポップアップとして記録して閉じる（違反にしない）。
-    if (guardState.scrollKeyPress && !guardState.listenerCleanups.pages.has(page)) {
+    if ((guardState.scrollKeyPress || guardState.dialogPressHold) && !guardState.listenerCleanups.pages.has(page)) {
       notificationPressPopups.add(page);
       guardState.scrollKeyPressBlocks = saturatingIncrement(guardState.scrollKeyPressBlocks);
       ledger.recordBlockedPopup({ url: page.url(), reason: SCROLL_KEY_PRESS_BLOCK_REASON });
@@ -8209,6 +8483,8 @@ export async function installPassiveRequestGuard(
       guardState.contextCloseObserved = true;
       // T36b: Context を閉じたら、自動ログインの資格情報の値を捨てる。
       discardCredentialGuard();
+      // DEF-292 の残り（REV-CP の Minor-3）: 「通した」の記録待ちの行と、target の外れで移した行の覚えも捨てる。
+      awaitedRouteAuditSends.clear();
     };
     context.on('close', onContextClose);
     guardState.listenerCleanups.context.cleanups.push(() => context.off('close', onContextClose));
@@ -8380,7 +8656,8 @@ export async function installPassiveRequestGuard(
             baseWebSocketPolicy ?? requestPolicyOf(submissionAdmission?.cdpStagePolicy(), auditExclusions, auditReadAdmission?.cdpPolicy()),
           )
           : baseWebSocketPolicy;
-        const decision = classifyPassiveRequest({ kind: 'WEBSOCKET', url: webSocketRoute.url() }, authoritySnapshot, webSocketPolicy);
+        // FRET fix round 3: 窓を開くボタンの押す期間と押した後の止めの続きは、その印も渡す（新しい接続を止める）。ほかの期間は今の判定のまま。
+        const decision = classifyPassiveRequest({ kind: 'WEBSOCKET', url: webSocketRoute.url() }, authoritySnapshot, withNotificationPress(webSocketPolicy));
         if (
           decision.action === 'ALLOW'
           && decision.auditSendWebSocketAdmission === true
@@ -8442,6 +8719,10 @@ export async function installPassiveRequestGuard(
         }
         // BN-a: 止めた時点。WebSocket の route は page を持たないので、Guard の段階だけで決める（ここは `PASSIVE_ACTIVE` なので `LOAD`）。
         ledger.recordBlockedWebSocket({ url: webSocketRoute.url(), reason: decision.reason, phase: blockedEventPhaseOf(phase, null) });
+        // FRETWS（設計書 `2026-11-25-beaksight-discovery-sibling-press-design.md` 2.2）: 窓を開くボタンの押す期間に止めた接続も、押す期間の止めの数に数える。
+        if (decision.reason === SCROLL_KEY_PRESS_BLOCK_REASON) {
+          guardState.scrollKeyPressBlocks = saturatingIncrement(guardState.scrollKeyPressBlocks);
+        }
         // T26g-1: 送信の窓の中の WebSocket も、予期しない要求として数える。OP-N（N1）: 書き込みの段の、値を入れた後の目印のない WebSocket（張り直し）は、止めた
         // まま、予期しない要求の数に数えない。
         submissionAdmission?.monitor.recordOtherBlock(
@@ -8468,7 +8749,8 @@ export async function installPassiveRequestGuard(
         // (2) キャッシュの返し: 許した要求の届け方（`resourceDelivery`。サイトへの負荷の制御の設計書 4.7）。
         // 動作と記録は、CDP の層と同じ `decideGuardRequest` で決める。ここは、その結果に従って route の命令を送る。
         const request = route.request();
-        const isNavigationRequest = request.isNavigationRequest();
+        // DEF-292 の残り: CDP の層が置いた「通した」の記録待ちの行を外す（判定によらず。target の外れで既に記録した要求は、下で二重に記録しない）。
+        const awaitedAtRoute = awaitedRouteAuditSends.takeAtRoute(requestPageForPhase(request) ?? undefined, request.method().toUpperCase(), request.url());        const isNavigationRequest = request.isNavigationRequest();
         // fix round 3（設計書 3.2.2 の 4）: 通知の枠の閉じる押下の期間に開いたポップアップの文書の要求は、Guard が止めた要求として止める（CDP の付いていない page の
         // 違反 `PASSIVE_GUARD_PAGE_NOT_READY` にしない）。止めたポップアップは `onPage` が記録する。
         if (guardState.phase === 'PASSIVE_ACTIVE' && isNavigationRequest && isNotificationPressPopupRequest(request)) {
@@ -8591,6 +8873,10 @@ export async function installPassiveRequestGuard(
         }
         if (verdict.kind === 'BLOCK_POLICY') {
           expectedRouteFailures.add(request);
+          // FRET（2026-11-25 fix round 1 の判断）: 窓を開くボタンの押す期間の止めを、route の層で止めた要求（main frame の fetch など）も数える。
+          if (verdict.decision.category === 'REQUEST' && verdict.decision.reason === SCROLL_KEY_PRESS_BLOCK_REASON && !(isNavigationRequest && isMainFrame)) {
+            guardState.scrollKeyPressBlocks = saturatingIncrement(guardState.scrollKeyPressBlocks);
+          }
           await abortHttpRequest(requestInvalidation, route, ledger, verdict.decision, {
             method: verdict.request.method,
             url: verdict.request.url,
@@ -8613,7 +8899,7 @@ export async function installPassiveRequestGuard(
           // T35b: 監査の段の登録した読み取りの手続きの呼び出しも、CDP の層が置いた印を 1 つ使う（この層では数えない）。
           auditReadAdmission.consumeAtRoute(verdict.request.method, verdict.request.url);
         }
-        if (auditSendAdmission !== undefined && verdict.decision.auditSendAdmission === true) {
+        if (auditSendAdmission !== undefined && verdict.decision.auditSendAdmission === true && awaitedAtRoute !== 'MOVED') {
           // AS-c fix round 1（M-3）: 通した要求の記録は、ブラウザが送る時点（ここで進める）に残す。
           recordPassedAuditSendRequest(verdict.request.method, verdict.request.url);
         }

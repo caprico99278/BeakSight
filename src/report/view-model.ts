@@ -24,17 +24,27 @@
  *   ページの置き場所（`RunPageStore`）の Run も、配列の Run と同じ値になる（`buildPublishedReportViewModel`）。Evidence の記録そのものは持たず、表示に要る値と、
  *   指摘ごとに先に引いた小さな値だけを持つ。
  */
-import { rulePlainMessageOf } from '../audit/cross-page-rules.js';
+import { isOperationRecordFindingRuleId, rulePlainMessageOf } from '../audit/cross-page-rules.js';
 import {
   FIXED_OCCLUSION_RULE_ID,
   FIXED_OVERLAP_CLASSES,
   OVERSIZED_FIXED_ELEMENT_RULE_ID,
   fixedOverlapOfFinding,
   fixedOverlapsNotCountedOf,
+  revealedTargetsInState,
   type FixedOverlapFindingView,
   type FixedOverlapNotCountedEntry,
 } from '../audit/fixed-overlap-classes.js';
-import { FOCUS_CHECK_OUTCOMES, focusCheckOutcomeOf, type FocusCheckOutcome } from '../audit/focus-check.js';
+import {
+  FOCUS_CHECK_OUTCOMES,
+  FOCUSED_CONTROL_HIDDEN_RULE_ID,
+  focusCheckFindingViewOf,
+  focusCheckOutcomeOf,
+  frontWindowFocusDispositionOf,
+  isHiddenFocusCheckOutcome,
+  type FocusCheckFindingView,
+  type FocusCheckOutcome,
+} from '../audit/focus-check.js';
 import { LABEL_IN_NAME_RULE_ID, labelInNameOfFinding, type LabelInNameFindingView } from '../audit/label-in-name.js';
 import {
   createHttpErrorCollector,
@@ -68,6 +78,7 @@ import {
   type PageAuditResult,
   type PageAuditStatus,
   type PageId,
+  type PageSamenessRecord,
   type RecheckState,
   type RunEnvironment,
   type RunExecution,
@@ -115,11 +126,14 @@ import {
   type ReportCategorySection,
   type SeverityGroup,
 } from '../presentation/catalog.js';
+import { formatInteger } from '../presentation/format.js';
 import {
   FINDING_UNVERIFIED_NEXT_STEP_TEXT,
-  describeIncompleteReason,
+  describeIncompleteReasonOf,
   describeInteractionReason,
-  nextStepOfIncompleteReason,
+  nextStepOfIncompleteReasonOf,
+  samenessPageText,
+  samenessSummaryText,
 } from '../presentation/messages.js';
 import {
   artifactReferenceDraftsOfPage,
@@ -137,13 +151,14 @@ import {
   type FindingGroupView,
   type FindingStructureView,
 } from './finding-groups.js';
-import { isUncollectedAuditStatus } from '../core/status.js';
+import { isFailedAuditStatus, isSameContentSkippedViewport, isUncollectedAuditStatus } from '../core/status.js';
 import {
   createFindingImageRegionCollector,
   FINDING_HOLD_REASONS,
   type FindingHoldReason,
   type FindingImageRegionView,
 } from '../core/finding-image-regions.js';
+import { focusCheckItemOfFinding } from '../core/focus-check-items.js';
 import {
   beaksightBlockRelationOf,
   createBeakSightBlockIndexBuilder,
@@ -151,10 +166,13 @@ import {
   type BeakSightBlockIndexBuilder,
   type BeakSightBlockRelationView,
 } from './beaksight-block-relation.js';
+import { createMeasurementTagCollector, type MeasurementTagsView } from './measurement-tags.js';
+import { createKeyActionCollector, fixedOverlapKeyActionsOf, type FixedOverlapKeyActionView, type KeyActionsView } from './key-actions.js';
 
 export type { BeakSightBlockRefView, BeakSightBlockRelationView } from './beaksight-block-relation.js';
 export type { ArtifactReferenceView } from './artifact-references.js';
 export type { FindingGroupView } from './finding-groups.js';
+export type { MeasurementTagView, MeasurementTagsView } from './measurement-tags.js';
 
 // ---------------------------------------------------------------------------------------------------------------
 // 型
@@ -162,7 +180,7 @@ export type { FindingGroupView } from './finding-groups.js';
 
 /**
  * 理由の表示（コード、詳細、日本語の説明）。`TCode` は理由のコードの型で、既定は未完了の理由（`IncompleteReasonCode`）。
- * `description` は、理由のコードの日本語の説明（`messages.ts` の `describeIncompleteReason`、`describeInteractionReason`）。
+ * `description` は、理由の日本語の説明（`messages.ts` の `describeIncompleteReasonOf`、`describeInteractionReason`）。
  * `detail` は、技術的な詳細のまま（Interaction では Evidence の `reasonDetail`）。
  */
 export interface ReasonView<TCode extends string = IncompleteReasonCode> {
@@ -419,7 +437,24 @@ export interface RunSummaryView {
    * `recheck` にある。HTML・CLI・`summary.json` は、この値を描くだけ。
    */
   readonly evidenceSufficiency: EvidenceSufficiencyView;
+  /**
+   * BS-1（設計書 `2026-11-19-beaksight-measurement-tag-inventory-design.md`）: 計測タグの一覧と、根拠・限界の印（`createMeasurementTagCollector`。ここで 1 回だけ
+   * 数える）。HTML の節と CLI の 1 行は、これを描くだけ。ChatGPT 用バンドルは `summary.json` から外し、`measurement-tags.json` に出す。
+   */
+  readonly measurementTags: MeasurementTagsView;
+  /**
+   * BS-2（設計書 `2026-11-20-beaksight-key-action-positions-design.md`）: 主要な行動の候補の位置の事実（`createKeyActionCollector`。ここで 1 回だけ集める）。HTML の
+   * 節は、これを描くだけ。ChatGPT 用バンドルは `summary.json` から外し、`key-actions.json` に出す。CLI とローカルの画面には出さない。
+   */
+  readonly keyActions: KeyActionsView;
+  /**
+   * S-12: 点検のための操作の記録（通知の枠を閉じたなど。Rule Catalog の `isOperationRecordRuleId`）の数。指摘の数（`findingCounts` など）と確かめ待ちの数には
+   * 入れない（Finding の記録には残る）。
+   */
+  readonly operationRecordCount: number;
   readonly environment: RunEnvironment;
+  /** DUP: 軽い点検にした画面と、点検を省いた画面のまとめの 1 文（`samenessSummaryText`。どちらもなければ `null`）。 */
+  readonly samenessNote: string | null;
 }
 
 /**
@@ -428,6 +463,7 @@ export interface RunSummaryView {
  * - `targetImageJudgedCount`・`targetInImageCount`: 画像に対象が入ったかを決めた指摘（`targetInImage` が `null` でない）の数と、そのうち全部写った（`INSIDE`）数
  *   （割合は、この 2 つの比）。
  * - `uncollectedPageCount`・`uncollectedViewportCount`: まだ見ていない（`SKIPPED`）ページとビューポートの数（見ていないページのビューポートも数える）。
+ * - `failedPageCount`: S-12: 読み込めなかった（`FAILED`）ページの数（まだ見ていない数とは分ける）。
  */
 export interface EvidenceSufficiencyView {
   readonly heldFindingCount: number;
@@ -436,6 +472,7 @@ export interface EvidenceSufficiencyView {
   readonly targetInImageCount: number;
   readonly uncollectedPageCount: number;
   readonly uncollectedViewportCount: number;
+  readonly failedPageCount: number;
 }
 
 /** 設計者の判断 2026-11-11: まとめた記録の数、その中の要求の数（最初の 1 件を含む）、1 件ずつ記録しなかった要求の数（最初の 1 件を除く）。 */
@@ -456,8 +493,27 @@ export interface OpenedStatesView {
 /** AUD-4d: フォーカスの確かめの数（結果ごと。`FOCUS_CHECK_OUTCOMES` の順。0 件の結果は持たない）。 */
 export interface FocusChecksView {
   readonly checked: number;
-  readonly byOutcome: readonly { readonly outcome: FocusCheckOutcome; readonly count: number }[];
+  /**
+   * 結果ごとの数。RVP-1（設計書 `2026-11-24-beaksight-review-pending-evidence-design.md` 2.2）: 前面の窓の背後で指摘にしなかった項目は、`NOT_HITTABLE` と分けて
+   * `FRONT_WINDOW_COVERED` に数える（Tab で背後へ移った項目は、指摘なので `NOT_HITTABLE`）。
+   */
+  readonly byOutcome: readonly { readonly outcome: FocusCheckCountOutcome; readonly count: number }[];
+  /** RVP-1: 指摘にした項目のうち、通常の Tab の確かめのないもの（直の focus だけの事実の指摘）の数。 */
+  readonly findingsWithoutSequentialTab: number;
+  /**
+   * FRET（設計書 `2026-11-24-beaksight-dialog-focus-return-design.md` 1.4）: 窓を開くボタンの確かめをした画面の数、そのうち押す物のなかった画面（「押す物なし」）の
+   * 数、押して確かめた物の数、同じ物を Run で前に確かめたので押さなかった物の数。確かめの記録がなければ持たない。
+   */
+  readonly dialogFocus?: {
+    readonly screens: number;
+    readonly screensWithoutPressables: number;
+    readonly pressed: number;
+    readonly alreadyChecked: number;
+  };
 }
+
+/** RVP-1: フォーカスの確かめの数の区分（結果の一覧と、前面の窓の背後で指摘にしなかった項目）。 */
+export type FocusCheckCountOutcome = FocusCheckOutcome | 'FRONT_WINDOW_COVERED';
 
 /** AUD-4c: http・https 以外の scheme のリンクの件数（scheme ごと。scheme の順）と、リンクごとの事実（ページの順、ページの中はリンクの順）。 */
 export interface SpecialSchemeLinksView {
@@ -597,6 +653,16 @@ export interface FindingVerificationView {
    * 決め、BeakSight の遮断と結び付く指摘は `COLLECTION_CAUSED`）。`UNDETERMINED` の指摘は、候補群の確信度を 1 段下げる。
    */
   readonly httpError?: HttpErrorFindingView;
+  /**
+   * AUD-3（設計書 `2026-11-19-beaksight-audit-result-review-fixes-design.md` 6.2）: フォーカスの確かめの指摘の項目の文脈（項目の番号で引いた項目の種別。項目を
+   * 引けたときだけ）。循環の守りの部品（`focusCheckLowersConfidence`）は、候補群の確信度を 1 段下げる。
+   */
+  readonly focusCheck?: FocusCheckFindingView;
+  /**
+   * BS-2（設計書 `2026-11-20-beaksight-key-action-positions-design.md` 2.3）: 固定の表示の覆いの指摘の、覆う側・覆われる側の主要な行動の候補の種類と、押せないかを
+   * 確かめた証拠の有無（`fixedOverlapKeyActionsOf`。候補の記録のある layout のときだけ）。証拠がなければ `NOT_CHECKED`（操作の支障は確かめていない）。
+   */
+  readonly keyActions?: FixedOverlapKeyActionView;
   /** AUD-6b: 検証できなかった指摘（`UNVERIFIED`）の、次に要る手順（やさしい文）。ほかの指摘は持たない。 */
   readonly nextStep?: string;
 }
@@ -682,6 +748,8 @@ export interface PageView {
   readonly mainFindingCounts: SeverityCountsView;
   readonly excludedFindingCounts: SeverityCountsView;
   readonly retryAttempts: readonly RetryAttemptView[];
+  /** DUP: 軽い点検にしたか、点検を省いたページの 1 文（`samenessPageText`。しっかり点検したページは `null`）。 */
+  readonly samenessNote: string | null;
 }
 
 /** Interaction の対象の要素（操作の前の記録。なければ後の記録）。 */
@@ -831,6 +899,11 @@ export interface ReportRunFacts {
    * 省略は「確かめていない」（欠けの数は `null`）。参照にないパスを渡すと `RangeError`。
    */
   readonly missingArtifactPaths?: readonly string[];
+  /**
+   * DEF-296: 巡回の候補の除外の判定（読む範囲の外・読まないパス・危険な語。Run の設定から作る `excludedCrawlCandidateOf` の 1 か所）。渡すと、行き先が当たる
+   * 読んでいないリンクを `OUTSIDE_READ_SCOPE` にし、確かめていないリンクの数に入れない。省略は、除外なし。
+   */
+  readonly isOutsideReadScope?: (url: string) => boolean;
 }
 
 /** 表示用モデル。HTML レポート、ChatGPT 用バンドル、CLI の要約は、どれもこれを使う。 */
@@ -901,9 +974,10 @@ const CRITICAL_SEVERITIES: ReadonlySet<Severity> = new Set(
 const reasonView = ({ code, detail }: IncompleteReason): ReasonView => ({
   code,
   detail,
-  description: describeIncompleteReason(code),
+  // PIR: 点検の範囲の外へ移った読み込みの失敗は、detail で別の文にする（`describeIncompleteReasonOf`）。
+  description: describeIncompleteReasonOf({ code, detail }),
   // T44c: 次にできること（示せる理由だけ）。
-  nextStep: nextStepOfIncompleteReason(code),
+  nextStep: nextStepOfIncompleteReasonOf({ code, detail }),
 });
 
 /** Interaction の理由（Evidence の `reason` と `reasonDetail`）に、コードの日本語の説明を添える（C18o）。 */
@@ -1052,7 +1126,11 @@ const evidenceSufficiencyOf = (findings: readonly FindingView[], pages: readonly
     targetImageJudgedCount,
     targetInImageCount,
     uncollectedPageCount: pages.filter(({ status }) => isUncollectedAuditStatus(status)).length,
-    uncollectedViewportCount: pages.flatMap(({ viewports }) => viewports).filter(({ status }) => isUncollectedAuditStatus(status)).length,
+    // DUP: 表示の中身が同じなので始めなかったビューポートは、まだ見ていない数に入れない。
+    uncollectedViewportCount: pages.flatMap(({ viewports }) => viewports)
+      .filter((viewport) => isUncollectedAuditStatus(viewport.status) && !isSameContentSkippedViewport(viewport)).length,
+    // S-12: 読み込めなかったページ（見なかったページとは分ける）。
+    failedPageCount: pages.filter(({ status }) => isFailedAuditStatus(status)).length,
   };
 };
 
@@ -1161,7 +1239,7 @@ const overviewView = (
           }];
       }),
     runReasons: runReasonCodes.map((code) => reasonView({ code, detail: null })),
-    pageReasons: (run.pageIncompleteReasonCounts ?? []).map(({ code, pages }) => ({ reason: reasonView({ code, detail: null }), pages })),
+    pageReasons: (run.pageIncompleteReasonCounts ?? []).map(({ code, detail, pages }) => ({ reason: reasonView({ code, detail: detail ?? null }), pages })),
     plannedWriteScreenCount: facts.plannedWriteScreenCount ?? 0,
     pageScope: run.pageScope === undefined ? null : { kind: run.pageScope.kind, pageCount: run.pageScope.pageCount },
   };
@@ -1362,13 +1440,17 @@ function findingVerificationOf(
   overlap: FixedOverlapFindingView | null = null,
   labelInName: LabelInNameFindingView | null = null,
   httpError: HttpErrorFindingView | null = null,
+  focusCheck: FocusCheckFindingView | null = null,
+  keyActions: FixedOverlapKeyActionView | null = null,
 ): FindingVerificationView {
   const basis = ruleVerificationBasisOf(ruleId);
-  // AUD-3c・AUD-4b・AUD-7: 区分は、ある指摘にだけ付ける（ほかの指摘の形を変えない）。
+  // AUD-3c・AUD-4b・AUD-7・AUD-3・BS-2: 区分は、ある指摘にだけ付ける（ほかの指摘の形を変えない）。
   const overlapField = {
     ...(overlap === null ? {} : { overlap }),
     ...(labelInName === null ? {} : { labelInName }),
     ...(httpError === null ? {} : { httpError }),
+    ...(focusCheck === null ? {} : { focusCheck }),
+    ...(keyActions === null ? {} : { keyActions }),
   };
   // AUD-6b: 検証できなかった指摘には、次に要る手順（やさしい文）を付ける。
   const unverified = (reason: FindingUnverifiedReason): FindingVerificationView =>
@@ -1445,25 +1527,44 @@ interface PageCollector<TResult> {
  * AUD-4d: フォーカスの確かめの数（数えるのは、ここだけ）。単位は、各ページの最終の試行のフォーカスの確かめの Evidence（主の読み込みと幅の走査の幅）の要素。
  */
 function focusChecksCollector(): PageCollector<FocusChecksView> {
-  const counts = new Map<FocusCheckOutcome, number>();
+  const counts = new Map<FocusCheckCountOutcome, number>();
   let checked = 0;
+  let findingsWithoutSequentialTab = 0;
+  const dialog = { screens: 0, screensWithoutPressables: 0, pressed: 0, alreadyChecked: 0 };
   return {
     addPage: (page, earlier) => {
       for (const record of page.evidence) {
         if (record.type !== 'focus' || earlier.has(record.evidenceId)) {
           continue;
         }
+        // FRET: 窓を開くボタンの確かめ（主の読み込みの記録だけが持つ）。
+        const dialogFocus = record.payload.dialogFocus;
+        if (dialogFocus !== undefined) {
+          dialog.screens += 1;
+          dialog.screensWithoutPressables += dialogFocus.pressableCount === 0 ? 1 : 0;
+          dialog.pressed += dialogFocus.items.length;
+          dialog.alreadyChecked += dialogFocus.alreadyCheckedCount;
+        }
         const viewport = { width: record.payload.viewportWidth, height: record.payload.viewportHeight };
         for (const item of record.payload.items) {
+          // RVP-1: 指摘にするか（前面の窓の背後か）は Rule と同じ 1 か所（`frontWindowFocusDispositionOf`）で決める。
           const outcome = focusCheckOutcomeOf(item, viewport);
-          counts.set(outcome, (counts.get(outcome) ?? 0) + 1);
+          const excluded = frontWindowFocusDispositionOf(item, viewport) === 'EXCLUDED';
+          const counted: FocusCheckCountOutcome = excluded ? 'FRONT_WINDOW_COVERED' : outcome;
+          counts.set(counted, (counts.get(counted) ?? 0) + 1);
           checked += 1;
+          if (!excluded && isHiddenFocusCheckOutcome(outcome) && item.sequentialTab === undefined) {
+            findingsWithoutSequentialTab += 1;
+          }
         }
       }
     },
     result: () => ({
       checked,
-      byOutcome: FOCUS_CHECK_OUTCOMES.flatMap((outcome) => (counts.has(outcome) ? [{ outcome, count: counts.get(outcome) ?? 0 }] : [])),
+      byOutcome: [...FOCUS_CHECK_OUTCOMES, 'FRONT_WINDOW_COVERED' as const]
+        .flatMap((outcome) => (counts.has(outcome) ? [{ outcome, count: counts.get(outcome) ?? 0 }] : [])),
+      findingsWithoutSequentialTab,
+      ...(dialog.screens === 0 ? {} : { dialogFocus: { ...dialog } }),
     }),
   };
 }
@@ -1762,9 +1863,10 @@ function addScreenshotRelationFact(
   // AUD-3d の続き: 確かめ直しの段の画像も、それを参照する指摘にだけ関係づける。
   // AUD-4d: フォーカスの確かめの画像も同じ（それを参照する指摘にだけ関係づける）。
   // REV-EV12 の I-3: 対象まで動かして撮った画像（`reveal` のある画像）も同じ（`revealScreenshotEvidenceIds` で関係づける）。
+  // AUD-2: 通知の枠を隠す前の画像も、ページの画像として並べない。
   if (record.type === 'screenshot'
     && (record.payload.stressWidth !== undefined || record.capture?.phase === 'recheck' || record.capture?.phase === 'focus-check'
-      || record.payload.reveal !== undefined)) {
+      || record.payload.reveal !== undefined || record.payload.beforeNotificationHide === true)) {
     state.referenceOnlyScreenshots.add(record.evidenceId);
     return;
   }
@@ -1831,7 +1933,9 @@ function relateScreenshotsToFindings(
 /** MEM-4: ページを足すときに作る、ページの表示（Finding との対応・関係づけ・欠けは、最後に付ける）。 */
 interface PageDraft {
   readonly view: Omit<PageView, 'screenshots' | 'findings' | 'findingCounts' | 'mainFindingIds' | 'excludedFindingIds' | 'initialOnlyFindingIds'
-    | 'mainFindingCounts' | 'excludedFindingCounts' | 'retryAttempts'>;
+    | 'mainFindingCounts' | 'excludedFindingCounts' | 'retryAttempts' | 'samenessNote'>;
+  /** DUP: 軽い点検にしたか、点検を省いたページの記録（文は、全部のページを足した後に、同じ作り・同じ内容のページの URL で作る）。 */
+  readonly sameness: PageSamenessRecord | null;
   readonly index: PageEvidenceIndex;
   /** 最終の試行のスクリーンショット（`page.json` の中の順）。 */
   readonly finalScreenshots: readonly ScreenshotDraft[];
@@ -1845,12 +1949,16 @@ interface PageDraft {
  *   小さな値（遮断との関係の索引・重なりの区分・名前の文脈・作りの印・画像の領域・確かめ直しの印・4xx・5xx の区分）だけ。Evidence の記録そのものは持たない。
  * - Finding との対応（関係づけ・ページの Finding）と、発表の前の確かめの欠けは、全部のページを足した後に付ける。
  */
-function createReportViewModelAssembly(run: RunSummary, sourceFindings: readonly Finding[]): {
+function createReportViewModelAssembly(run: RunSummary, runFindings: readonly Finding[]): {
   readonly addPage: (page: PageAuditResult) => void;
   /** 足したページの成果物のファイルの参照（パスの重なりを含む、ページの順）。発表の前の確かめに使う。 */
   readonly artifactReferencePaths: () => readonly Pick<ArtifactReferenceView, 'path'>[];
   readonly finish: (facts: ReportRunFacts) => ReportViewModel;
 } {
+  // S-12: 点検のための操作の記録（種類は Rule Catalog の `isOperationRecordRuleId`。`isOperationRecordFindingRuleId` で引く）は、指摘として扱わず（総数・
+  // 重さごとの数・確かめ待ちの数に入れない）、数だけを別に持つ（Finding の記録 `findings.json` には残る）。
+  const sourceFindings = runFindings.filter((finding) => !isOperationRecordFindingRuleId(finding.ruleId));
+  const operationRecordCount = runFindings.length - sourceFindings.length;
   // Evidence の ID から、それを参照する Finding の ID（`AuditRunResult.findings` の順）。
   const findingIdsByEvidence = new Map<EvidenceId, FindingId[]>();
   for (const finding of sourceFindings) {
@@ -1883,6 +1991,8 @@ function createReportViewModelAssembly(run: RunSummary, sourceFindings: readonly
   const labelsInName = new FindingRecordValues<LabelInNameFindingView | null>(sourceFindings, (finding) => finding.ruleId === LABEL_IN_NAME_RULE_ID);
   // AUD-9b: 候補群の要素の作りの印（axe の Evidence。同じ ID の記録は、先のもので引く）。
   const structures = new FindingRecordValues<FindingStructureView | null>(sourceFindings, (finding) => structureTargetOf(finding) !== undefined);
+  // AUD-3: フォーカスの確かめの指摘の項目の文脈（フォーカスの確かめの Evidence。項目の番号で引く。同じ ID の記録は、後のもので引く）。
+  const focusChecks = new FindingRecordValues<FocusCheckFindingView>(sourceFindings, (finding) => finding.ruleId === FOCUSED_CONTROL_HIDDEN_RULE_ID);
   // AUD-7: 4xx・5xx の指摘の区分と、Finding にしなかった応答。
   const httpErrors = createHttpErrorCollector(run);
   // AUD-6b: リンクごとの確かめの状態。
@@ -1890,6 +2000,11 @@ function createReportViewModelAssembly(run: RunSummary, sourceFindings: readonly
   // AUD-6c: 性能の値の観測の範囲（ページの順）。
   const performanceObservations: PerformanceObservationView[] = [];
   const counted = pageCountCollectors();
+  // BS-1: 計測タグの一覧（最終の試行の network と Safety の記録）。
+  const measurementTags = createMeasurementTagCollector();
+  // BS-2: 主要な行動の候補の位置（最終の試行の layout と scroll の記録）と、固定の表示の覆いの指摘の候補の種類（layout の Evidence。同じ ID の記録は、後のもので引く）。
+  const keyActions = createKeyActionCollector();
+  const fixedOverlapKeyActions = new FindingRecordValues<FixedOverlapKeyActionView | null>(sourceFindings, isFixedOverlapFinding);
 
   const addPage = (page: PageAuditResult): void => {
     const earlier = earlierAttemptEvidenceIds(run, page);
@@ -1925,6 +2040,7 @@ function createReportViewModelAssembly(run: RunSummary, sourceFindings: readonly
         pageJsonPath: pageArtifactRelativePath(page.pageId, 'page'),
         visibleTextPath: visibleTextOf(run, page) === null ? null : pageArtifactRelativePath(page.pageId, 'visibleText'),
       },
+      sameness: page.sameness ?? null,
       index,
       finalScreenshots: index.screenshots.filter((screenshot) => !earlier.has(screenshot.evidenceId)),
       retryAttempts: retryRecordsOf(run, page).map((retry) => {
@@ -1948,12 +2064,26 @@ function createReportViewModelAssembly(run: RunSummary, sourceFindings: readonly
       if (record.type === 'layout') {
         fixedOverlaps.visit(record, (findingIndex) => {
           const finding = sourceFindings[findingIndex] as Finding;
-          return fixedOverlapOfFinding({ ruleId: finding.ruleId, keys: finding.groupingKeys ?? [] }, record.payload);
+          // S-06: 同じ状態の測り直しの記録から、動かして測り直した区分も付ける（Rule と同じ選び方）。
+          return fixedOverlapOfFinding({ ruleId: finding.ruleId, keys: finding.groupingKeys ?? [] }, record.payload,
+            (stressWidth) => revealedTargetsInState(page.evidence, record.capture?.stateId, stressWidth));
+        });
+        fixedOverlapKeyActions.visit(record, (findingIndex) => {
+          const finding = sourceFindings[findingIndex] as Finding;
+          return fixedOverlapKeyActionsOf({ ruleId: finding.ruleId, keys: finding.groupingKeys ?? [] }, record.payload,
+            (stressWidth) => revealedTargetsInState(page.evidence, record.capture?.stateId, stressWidth));
         });
       } else if (record.type === 'accessibility') {
         labelsInName.visit(record, (findingIndex) => {
           const finding = sourceFindings[findingIndex] as Finding;
           return labelInNameOfFinding({ ruleId: finding.ruleId, keys: finding.groupingKeys ?? [] }, record.payload);
+        });
+      } else if (record.type === 'focus') {
+        focusChecks.visit(record, (findingIndex) => {
+          const item = focusCheckItemOfFinding((sourceFindings[findingIndex] as Finding).groupingKeys ?? [], record.payload);
+          return item === undefined
+            ? undefined
+            : focusCheckFindingViewOf(item, { width: record.payload.viewportWidth, height: record.payload.viewportHeight });
         });
       }
     }
@@ -1966,6 +2096,8 @@ function createReportViewModelAssembly(run: RunSummary, sourceFindings: readonly
     for (const collector of Object.values(counted)) {
       collector.addPage(page, earlier);
     }
+    measurementTags.addPage(page, earlier);
+    keyActions.addPage(page, earlier);
   };
 
   return {
@@ -1974,6 +2106,7 @@ function createReportViewModelAssembly(run: RunSummary, sourceFindings: readonly
     finish: (facts) => assembleReportViewModel({
       run,
       sourceFindings,
+      operationRecordCount,
       pageDrafts,
       referenceDrafts,
       locationById,
@@ -1985,10 +2118,14 @@ function createReportViewModelAssembly(run: RunSummary, sourceFindings: readonly
       fixedOverlaps,
       labelsInName,
       structures,
+      focusChecks,
       httpErrors,
       linkChecks,
       performanceObservations,
       counted,
+      measurementTags,
+      keyActions,
+      fixedOverlapKeyActions,
     }, facts),
   };
 }
@@ -2007,7 +2144,10 @@ const pageCountCollectors = () => ({
 /** MEM-4: 全部のページを足した後の値（`createReportViewModelAssembly` が集めたもの）。 */
 interface CollectedPages {
   readonly run: RunSummary;
+  /** 指摘（点検のための操作の記録を除いた Finding。`AuditRunResult.findings` の順）。 */
   readonly sourceFindings: readonly Finding[];
+  /** S-12: 点検のための操作の記録の数。 */
+  readonly operationRecordCount: number;
   readonly pageDrafts: readonly PageDraft[];
   readonly referenceDrafts: readonly ArtifactReferenceDraft[];
   readonly locationById: ReadonlyMap<EvidenceId, EvidenceLocationView>;
@@ -2019,10 +2159,14 @@ interface CollectedPages {
   readonly fixedOverlaps: FindingRecordValues<FixedOverlapFindingView | null>;
   readonly labelsInName: FindingRecordValues<LabelInNameFindingView | null>;
   readonly structures: FindingRecordValues<FindingStructureView | null>;
+  readonly focusChecks: FindingRecordValues<FocusCheckFindingView>;
   readonly httpErrors: HttpErrorCollector;
   readonly linkChecks: ReturnType<typeof createLinkChecksCollector>;
   readonly performanceObservations: readonly PerformanceObservationView[];
   readonly counted: ReturnType<typeof pageCountCollectors>;
+  readonly measurementTags: ReturnType<typeof createMeasurementTagCollector>;
+  readonly keyActions: ReturnType<typeof createKeyActionCollector>;
+  readonly fixedOverlapKeyActions: FindingRecordValues<FixedOverlapKeyActionView | null>;
 }
 
 /**
@@ -2089,6 +2233,8 @@ function assembleReportViewModel(collected: CollectedPages, facts: ReportRunFact
         collected.fixedOverlaps.firstOf(index, finding) ?? null,
         collected.labelsInName.firstOf(index, finding) ?? null,
         httpError,
+        collected.focusChecks.firstOf(index, finding) ?? null,
+        collected.fixedOverlapKeyActions.firstOf(index, finding) ?? null,
       ),
       beaksightBlockRelation,
       safetyBlockPhaseCounts: isSiteQualitySeverity(finding.severity) ? null : safetyBlockPhaseCountsOf(blockIndex, finding),
@@ -2112,7 +2258,9 @@ function assembleReportViewModel(collected: CollectedPages, facts: ReportRunFact
   const viewportOrder = sortByDisplayOrder(VIEWPORT_PROFILES, VIEWPORT_PROFILE_CATALOG);
   // T44i: Rule の別の件数と、Rule ごとの要約（同じ分け方から、1 回だけ数える）。
   const ruleGroups = groupFindingsByRule(findings);
-  const pages: readonly PageView[] = pageDrafts.map(({ view, finalScreenshots, retryAttempts }) => {
+  // DUP: 同じ作り・同じ内容のページの URL（ページの ID から引く）。
+  const pageUrlById = new Map<PageId, string>(pageDrafts.map(({ view }) => [view.pageId, view.pageUrl]));
+  const pages: readonly PageView[] = pageDrafts.map(({ view, sameness, finalScreenshots, retryAttempts }) => {
     const pageFindings = findings.filter(({ finding }) => finding.pageId === view.pageId);
     const pageMainFindings = pageFindings.filter(isMainFinding);
     const pageExcludedFindings = pageFindings.filter(isBlockExcludedFinding);
@@ -2128,6 +2276,7 @@ function assembleReportViewModel(collected: CollectedPages, facts: ReportRunFact
       mainFindingCounts: countFindings(pageMainFindings),
       excludedFindingCounts: countFindings(pageExcludedFindings),
       retryAttempts: retryAttempts.map((attempt) => ({ ...attempt, screenshots: attempt.screenshots.map(screenshotViewOf) })),
+      samenessNote: sameness === null ? null : samenessPageText(sameness.depth, pageUrlById.get(sameness.sameAs) ?? sameness.sameAs),
     };
   });
 
@@ -2163,6 +2312,17 @@ function assembleReportViewModel(collected: CollectedPages, facts: ReportRunFact
   const groupIdByFinding = new Map(findingGroups.flatMap((group) => group.findingIds.map((findingId) => [findingId, group.groupId] as const)));
   const groupIdOf = (findingId: FindingId): string => groupIdByFinding.get(findingId) ?? '';
   const ruleDigests = buildRuleDigests(ruleGroups, viewportOrder, groupIdOf);
+  const evidenceSufficiency = evidenceSufficiencyOf(findings, pages);
+  const auditSend = auditSendView(run);
+  // BS-1: 計測タグの一覧の限界は、表示用モデルの今の値を使う（数え直さない）。
+  const measurementTags = collected.measurementTags.result((evidenceId) => locationById.get(evidenceId) ?? null, {
+    runStatus: run.runStatus,
+    incomplete: evidenceSufficiency.failedPageCount + evidenceSufficiency.uncollectedPageCount + run.incompleteReasons.length > 0,
+    failedPageCount: evidenceSufficiency.failedPageCount,
+    uncollectedPageCount: evidenceSufficiency.uncollectedPageCount,
+    runReasonCount: run.incompleteReasons.length,
+    auditSendPolicy: auditSend.policy,
+  });
   const model: ReportViewModel = {
     summary: {
       runId: run.runId,
@@ -2203,7 +2363,7 @@ function assembleReportViewModel(collected: CollectedPages, facts: ReportRunFact
       load: structuredClone(run.load),
       executions,
       siteUnavailableStop: siteUnavailableStopView(run, executions),
-      auditSend: auditSendView(run),
+      auditSend,
       incompleteReasons: run.incompleteReasons.map(reasonView),
       unverifiedInteractionCount: run.unverifiedInteractionCount,
       unverifiedInternalLinkCount: run.unverifiedInternalLinkCount,
@@ -2217,8 +2377,16 @@ function assembleReportViewModel(collected: CollectedPages, facts: ReportRunFact
       performanceObservations: collected.performanceObservations,
       openedStates: counted.openedStates.result(),
       repeatedReads: counted.repeatedReads.result(),
-      evidenceSufficiency: evidenceSufficiencyOf(findings, pages),
+      evidenceSufficiency,
+      measurementTags,
+      keyActions: collected.keyActions.result((evidenceId) => locationById.get(evidenceId) ?? null),
+      operationRecordCount: collected.operationRecordCount,
       environment: structuredClone(run.environment),
+      samenessNote: samenessSummaryText(
+        pageDrafts.filter(({ sameness }) => sameness?.depth === 'LIGHT').length,
+        pageDrafts.filter(({ sameness }) => sameness?.depth === 'SAME').length,
+        formatInteger,
+      ),
     },
     // PL-R: まとめの段（Rule ごとの要約と件数は、上で 1 回だけ作ったものを使う）。
     overview: overviewView(run, ruleDigests, findingCounts, facts, findings, findingGroups),
@@ -2238,7 +2406,7 @@ function assembleReportViewModel(collected: CollectedPages, facts: ReportRunFact
     pages,
     artifactReferences,
     missingArtifactCount: facts.missingArtifactPaths === undefined ? null : missingPaths.size,
-    linkChecks: collected.linkChecks.result(),
+    linkChecks: collected.linkChecks.result(facts.isOutsideReadScope),
   };
   return deepFreeze(model);
 }

@@ -79,6 +79,13 @@ import {
 import { createTestConfig, TEST_FACTORY_OPTIONS } from '../helpers/test-config.js';
 import { roundsOf } from '../helpers/test-rounds.js';
 
+/**
+ * DEF-313（DEF-310 と同じ形）: 読み込みの前の Guard への知らせ（`announceOwnMainFrameNavigation`）は、FRET fix round 1 から page の Context の Guard の状態も
+ * 読む。本物の page はいつも Context を持つので、読み込みを差し替えた偽の page にも Context（Guard のない空の物）を持たせる。
+ */
+const FAKE_GUARD_CONTEXT = Object.freeze({});
+const fakeGuardContext = (): object => FAKE_GUARD_CONTEXT;
+
 type ExpectedStructuredInteractionResult = Awaited<ReturnType<typeof auditInteraction>> & {
   readonly work: {
     readonly status: InteractionStatus;
@@ -1874,7 +1881,7 @@ describe('isolated fail-closed interaction audit', () => {
     vi.useFakeTimers();
     vi.setSystemTime(1_000);
     const page = {
-      goto: async () => { vi.setSystemTime(3_000); },
+      context: fakeGuardContext, goto: async () => { vi.setSystemTime(3_000); },
     } as unknown as Page;
     const session: InteractionGuardedSession = {
       page,
@@ -1903,7 +1910,7 @@ describe('isolated fail-closed interaction audit', () => {
   it('Task 2 fix round 2 keeps identity unestablished for navigation work errors', async () => {
     const candidate = await candidateNamed('/accordion.html', 'Toggle details');
     const session: InteractionGuardedSession = {
-      page: { goto: async (): Promise<never> => { throw new Error('navigation work failed'); } } as unknown as Page,
+      page: { context: fakeGuardContext, goto: async (): Promise<never> => { throw new Error('navigation work failed'); } } as unknown as Page,
       ledger: new SafetyLedger(),
       activateInteractionFreeze: async () => undefined,
       ...fakeCloseLifecycle(),
@@ -1933,7 +1940,7 @@ describe('isolated fail-closed interaction audit', () => {
   ] as const)('normalizes an execution failure reason with %s', async (_label, message, expectedReasonDetail) => {
     const candidate = await candidateNamed('/accordion.html', 'Toggle details');
     const session: InteractionGuardedSession = {
-      page: { goto: async (): Promise<never> => { throw new Error(message); } } as unknown as Page,
+      page: { context: fakeGuardContext, goto: async (): Promise<never> => { throw new Error(message); } } as unknown as Page,
       ledger: new SafetyLedger(),
       activateInteractionFreeze: async () => undefined,
       ...fakeCloseLifecycle(),
@@ -1952,7 +1959,7 @@ describe('isolated fail-closed interaction audit', () => {
   it('Task 2 fix round 2 keeps identity unestablished for an unresolved safety transition', async () => {
     const candidate = await candidateNamed('/accordion.html', 'Toggle details');
     const page = {
-      goto: async () => undefined,
+      context: fakeGuardContext, goto: async () => undefined,
       evaluate: async () => true,
     } as unknown as Page;
     const session: InteractionGuardedSession = {
@@ -1988,7 +1995,7 @@ describe('isolated fail-closed interaction audit', () => {
       dispose: async () => undefined,
     };
     const page = {
-      goto: async () => undefined,
+      context: fakeGuardContext, goto: async () => undefined,
       evaluate: async (_callback: unknown, argument?: unknown) => (
         argument === undefined ? true : { candidates: [rawCandidate], completeness: 'COMPLETE', domWorkUsed: 20 }
       ),
@@ -2020,7 +2027,7 @@ describe('isolated fail-closed interaction audit', () => {
       dispose: async () => undefined,
     };
     const page = {
-      goto: async () => undefined,
+      context: fakeGuardContext, goto: async () => undefined,
       evaluate: async (_callback: unknown, argument?: unknown) => (
         argument === undefined ? true : { candidates: [rawCandidate], completeness: 'COMPLETE', domWorkUsed: 20 }
       ),
@@ -2054,7 +2061,7 @@ describe('isolated fail-closed interaction audit', () => {
         dispose: async () => undefined,
       });
       const page = {
-        goto: async () => undefined,
+        context: fakeGuardContext, goto: async () => undefined,
         evaluate: async (_callback: unknown, argument?: unknown) => (
           argument === undefined
             ? true
@@ -2526,7 +2533,7 @@ describe('isolated fail-closed interaction audit', () => {
       boundingBox: candidate.boundingBox,
     };
     const page = {
-      goto: async () => undefined,
+      context: fakeGuardContext, goto: async () => undefined,
       evaluate: async (_callback: unknown, argument?: unknown) => {
         if (argument === undefined) {
           return true;
@@ -2599,7 +2606,7 @@ describe('isolated fail-closed interaction audit', () => {
       boundingBox: candidate.boundingBox,
     };
     const page = {
-      goto: async () => undefined,
+      context: fakeGuardContext, goto: async () => undefined,
       evaluate: async (_callback: unknown, argument?: unknown) => (
         argument === undefined ? true : { candidates: [rawCandidate], completeness: 'COMPLETE', domWorkUsed: 0 }
       ),
@@ -2702,7 +2709,7 @@ describe('isolated fail-closed interaction audit', () => {
     const clickError = new Error(expectedReason);
     clickError.name = errorKind === 'TimeoutError' ? 'TimeoutError' : 'Error';
     const page = {
-      goto: async () => undefined,
+      context: fakeGuardContext, goto: async () => undefined,
       evaluate: async (_callback: unknown, argument?: unknown) => (
         argument === undefined ? true : { candidates: [rawCandidate], completeness: 'COMPLETE', domWorkUsed: 0 }
       ),
@@ -2780,7 +2787,7 @@ describe('isolated fail-closed interaction audit', () => {
     const clickError = new Error(`${errorKind} after state change`);
     clickError.name = errorKind === 'TimeoutError' ? 'TimeoutError' : 'Error';
     const page = {
-      goto: async () => undefined,
+      context: fakeGuardContext, goto: async () => undefined,
       evaluate: async (_callback: unknown, argument?: unknown) => (
         argument === undefined ? true : { candidates: [rawCandidate()], completeness: 'COMPLETE', domWorkUsed: 0 }
       ),
@@ -2847,7 +2854,7 @@ describe('isolated fail-closed interaction audit', () => {
       boundingBox: candidate.boundingBox,
     };
     const page = {
-      goto: async () => undefined,
+      context: fakeGuardContext, goto: async () => undefined,
       evaluate: async (_callback: unknown, argument?: unknown) => (
         argument === undefined ? true : { candidates: [rawCandidate], completeness: 'COMPLETE', domWorkUsed: 0 }
       ),
@@ -2901,7 +2908,7 @@ describe('isolated fail-closed interaction audit', () => {
     const candidate = await candidateNamed('/accordion.html', 'Toggle details');
     let closeCalls = 0;
     const page = {
-      goto: async (): Promise<never> => { throw new Error('fixture work failed'); },
+      context: fakeGuardContext, goto: async (): Promise<never> => { throw new Error('fixture work failed'); },
     } as unknown as Page;
     const session: InteractionGuardedSession & { readonly isClosed: () => boolean } = {
       page,
@@ -3060,7 +3067,7 @@ describe('isolated fail-closed interaction audit', () => {
     let closeCalls = 0;
     let closed = false;
     const session: InteractionGuardedSession = {
-      page: { goto: async (): Promise<never> => { throw new Error('fulfilled retry work failed'); } } as unknown as Page,
+      page: { context: fakeGuardContext, goto: async (): Promise<never> => { throw new Error('fulfilled retry work failed'); } } as unknown as Page,
       ledger,
       activateInteractionFreeze: async () => undefined,
       isClosed: () => closed,
@@ -3101,7 +3108,7 @@ describe('isolated fail-closed interaction audit', () => {
     let closeCalls = 0;
     let closed = false;
     const session: InteractionGuardedSession = {
-      page: { goto: async (): Promise<never> => { throw new Error('undefined retry work failed'); } } as unknown as Page,
+      page: { context: fakeGuardContext, goto: async (): Promise<never> => { throw new Error('undefined retry work failed'); } } as unknown as Page,
       ledger,
       activateInteractionFreeze: async () => undefined,
       isClosed: () => closed,
@@ -3164,7 +3171,7 @@ describe('isolated fail-closed interaction audit', () => {
     let closeCalls = 0;
     const ledger = new SafetyLedger();
     const session: InteractionGuardedSession & { readonly isClosed: () => boolean } = {
-      page: { goto: async (): Promise<never> => { throw new Error('fulfilled non-terminal work failed'); } } as unknown as Page,
+      page: { context: fakeGuardContext, goto: async (): Promise<never> => { throw new Error('fulfilled non-terminal work failed'); } } as unknown as Page,
       ledger,
       activateInteractionFreeze: async () => undefined,
       isClosed: () => false,
@@ -3363,7 +3370,7 @@ describe('isolated fail-closed interaction audit', () => {
     let closeCalls = 0;
     const ledger = new SafetyLedger();
     const page = {
-      goto: async (): Promise<never> => { throw new Error('undefined-close work failed'); },
+      context: fakeGuardContext, goto: async (): Promise<never> => { throw new Error('undefined-close work failed'); },
     } as unknown as Page;
     let closed = false;
     const session: InteractionGuardedSession & { readonly isClosed: () => boolean } = {
@@ -3422,7 +3429,7 @@ describe('isolated fail-closed interaction audit', () => {
       },
     });
     const page = {
-      goto: async (): Promise<never> => { throw hostileWorkError; },
+      context: fakeGuardContext, goto: async (): Promise<never> => { throw hostileWorkError; },
     } as unknown as Page;
     const session: InteractionGuardedSession = {
       page,
@@ -3484,7 +3491,7 @@ describe('isolated fail-closed interaction audit', () => {
       },
     });
     const page = {
-      goto: async () => undefined,
+      context: fakeGuardContext, goto: async () => undefined,
       evaluate: async (_callback: unknown, argument?: unknown) => (
         argument === undefined ? true : { candidates: [rawCandidate], completeness: 'COMPLETE', domWorkUsed: 0 }
       ),
@@ -3545,7 +3552,7 @@ describe('isolated fail-closed interaction audit', () => {
     };
     const ledger = new SafetyLedger();
     const page = {
-      goto: async (): Promise<never> => { throw new Error('hostile-close work failed'); },
+      context: fakeGuardContext, goto: async (): Promise<never> => { throw new Error('hostile-close work failed'); },
     } as unknown as Page;
     const session: InteractionGuardedSession = {
       page,
@@ -3605,7 +3612,7 @@ describe('isolated fail-closed interaction audit', () => {
       boundingBox: candidate.boundingBox,
     });
     const page = {
-      goto: async () => undefined,
+      context: fakeGuardContext, goto: async () => undefined,
       evaluate: async (_callback: unknown, argument?: unknown) => (
         argument === undefined ? true : { candidates: [rawCandidate()], completeness: 'COMPLETE', domWorkUsed: 0 }
       ),
@@ -3685,7 +3692,7 @@ describe('isolated fail-closed interaction audit', () => {
       boundingBox: candidate.boundingBox,
     });
     const page = {
-      goto: async () => undefined,
+      context: fakeGuardContext, goto: async () => undefined,
       evaluate: async (_callback: unknown, argument?: unknown) => (
         argument === undefined ? true : { candidates: [rawCandidate()], completeness: 'COMPLETE', domWorkUsed: 0 }
       ),
@@ -3759,7 +3766,7 @@ describe('isolated fail-closed interaction audit', () => {
       boundingBox: candidate.boundingBox,
     });
     const page = {
-      goto: async () => undefined,
+      context: fakeGuardContext, goto: async () => undefined,
       evaluate: async (_callback: unknown, argument?: unknown) => (
         argument === undefined ? true : { candidates: [rawCandidate()], completeness: 'COMPLETE', domWorkUsed: 0 }
       ),
@@ -3862,7 +3869,7 @@ describe('isolated fail-closed interaction audit', () => {
       boundingBox: candidate.boundingBox,
     });
     const page = {
-      goto: async () => undefined,
+      context: fakeGuardContext, goto: async () => undefined,
       evaluate: async (_callback: unknown, argument?: unknown) => (
         argument === undefined ? true : { candidates: [rawCandidate()], completeness: 'COMPLETE', domWorkUsed: 0 }
       ),
@@ -3938,7 +3945,7 @@ describe('isolated fail-closed interaction audit', () => {
       boundingBox: candidate.boundingBox,
     });
     const page = {
-      goto: async () => undefined,
+      context: fakeGuardContext, goto: async () => undefined,
       evaluate: async (_callback: unknown, argument?: unknown) => (
         argument === undefined ? true : { candidates: [rawCandidate()], completeness: 'COMPLETE', domWorkUsed: 0 }
       ),
@@ -4019,7 +4026,7 @@ describe('isolated fail-closed interaction audit', () => {
       boundingBox: candidate.boundingBox,
     };
     const page = {
-      goto: async () => undefined,
+      context: fakeGuardContext, goto: async () => undefined,
       evaluate: async (_callback: unknown, argument?: unknown) => (
         argument === undefined ? true : { candidates: [rawCandidate], completeness: 'COMPLETE', domWorkUsed: 0 }
       ),
@@ -4093,7 +4100,7 @@ describe('isolated fail-closed interaction audit', () => {
             });
             const session: InteractionGuardedSession = Object.freeze({
               ...owned,
-              page: { goto: async (): Promise<never> => { throw new Error('deadline fixture work'); } } as unknown as Page,
+              page: { context: fakeGuardContext, goto: async (): Promise<never> => { throw new Error('deadline fixture work'); } } as unknown as Page,
               close: async () => {
                 auditCloseCalls += 1;
                 await owned.close();
@@ -4143,7 +4150,7 @@ describe('isolated fail-closed interaction audit', () => {
       let closed = false;
       let terminalTransitionScheduled = false;
       const session: InteractionGuardedSession = {
-        page: { goto: async (): Promise<never> => { throw new Error('timeout yield work'); } } as unknown as Page,
+        page: { context: fakeGuardContext, goto: async (): Promise<never> => { throw new Error('timeout yield work'); } } as unknown as Page,
         ledger: new SafetyLedger(),
         activateInteractionFreeze: async () => undefined,
         close: async () => {
@@ -4189,7 +4196,7 @@ describe('isolated fail-closed interaction audit', () => {
       let closed = false;
       let transitionScheduled = false;
       const session: InteractionGuardedSession = {
-        page: { goto: async (): Promise<never> => { throw new Error('rejected yield work'); } } as unknown as Page,
+        page: { context: fakeGuardContext, goto: async (): Promise<never> => { throw new Error('rejected yield work'); } } as unknown as Page,
         ledger: new SafetyLedger(),
         activateInteractionFreeze: async () => undefined,
         close: async (): Promise<never> => {
@@ -4224,7 +4231,7 @@ describe('isolated fail-closed interaction audit', () => {
       const unhandled: unknown[] = [];
       const observeUnhandled = (reason: unknown) => { unhandled.push(reason); };
       const session: InteractionGuardedSession = {
-        page: { goto: async (): Promise<never> => { throw new Error('late rejection work'); } } as unknown as Page,
+        page: { context: fakeGuardContext, goto: async (): Promise<never> => { throw new Error('late rejection work'); } } as unknown as Page,
         ledger: new SafetyLedger(),
         activateInteractionFreeze: async () => undefined,
         close: () => {
@@ -4346,7 +4353,7 @@ describe('C3 corrections (foundation corrections design 4.2-4.8, 5.5)', () => {
       dispose: async () => undefined,
     };
     const page = {
-      goto: async () => { hooks.onGoto?.(); },
+      context: fakeGuardContext, goto: async () => { hooks.onGoto?.(); },
       evaluate: async (_callback: unknown, argument?: unknown) => (
         argument === undefined ? true : { candidates: [rawCandidate], completeness: 'COMPLETE', domWorkUsed: 20 }
       ),
@@ -4431,7 +4438,7 @@ describe('C3 corrections (foundation corrections design 4.2-4.8, 5.5)', () => {
       let closed = false;
       let transitionScheduled = false;
       const session: InteractionGuardedSession = {
-        page: { goto: async (): Promise<never> => { throw new Error('fulfilled yield work'); } } as unknown as Page,
+        page: { context: fakeGuardContext, goto: async (): Promise<never> => { throw new Error('fulfilled yield work'); } } as unknown as Page,
         ledger: new SafetyLedger(),
         activateInteractionFreeze: async () => undefined,
         close: async () => { closeCalls += 1; },
@@ -4585,7 +4592,7 @@ describe('C3 corrections (foundation corrections design 4.2-4.8, 5.5)', () => {
       let discoveryCalls = 0;
       try {
         const page = {
-          goto: async () => undefined,
+          context: fakeGuardContext, goto: async () => undefined,
           evaluate: async (_callback: unknown, argument?: unknown) => {
             if (argument === undefined) return true;
             discoveryCalls += 1;
@@ -4631,7 +4638,7 @@ describe('C3 corrections (foundation corrections design 4.2-4.8, 5.5)', () => {
       };
       const rawCandidate = rawCandidateFor(candidate);
       const page = {
-        goto: async () => undefined,
+        context: fakeGuardContext, goto: async () => undefined,
         evaluate: async (_callback: unknown, argument?: unknown) => (
           argument === undefined ? true : { candidates: [rawCandidate], completeness: 'COMPLETE', domWorkUsed: 20 }
         ),
@@ -4927,7 +4934,7 @@ describe('C3 corrections (foundation corrections design 4.2-4.8, 5.5)', () => {
         dispose,
       };
       const page = {
-        goto: async () => undefined,
+        context: fakeGuardContext, goto: async () => undefined,
         evaluate: async (_callback: unknown, argument?: unknown) => (
           argument === undefined ? true : { candidates: [rawCandidate], completeness: 'COMPLETE', domWorkUsed: 20 }
         ),
@@ -5016,7 +5023,7 @@ describe('C3 corrections (foundation corrections design 4.2-4.8, 5.5)', () => {
         dispose: async () => undefined,
       };
       const page = {
-        goto: async () => undefined,
+        context: fakeGuardContext, goto: async () => undefined,
         evaluate: async (_callback: unknown, argument?: unknown) => (
           argument === undefined ? true : { candidates: [rawCandidate], completeness: 'COMPLETE', domWorkUsed: 20 }
         ),
@@ -5094,7 +5101,7 @@ describe('C3 corrections (foundation corrections design 4.2-4.8, 5.5)', () => {
         dispose: async () => { options.events.push('dispose'); },
       };
       const page = {
-        goto: async () => undefined,
+        context: fakeGuardContext, goto: async () => undefined,
         evaluate: async (_callback: unknown, argument?: unknown) => (
           argument === undefined ? true : { candidates: [rawCandidate], completeness: 'COMPLETE', domWorkUsed: 0 }
         ),
@@ -5155,7 +5162,7 @@ describe('C3 corrections (foundation corrections design 4.2-4.8, 5.5)', () => {
         dispose: async () => { events.push('dispose'); },
       };
       const page = {
-        goto: async () => undefined,
+        context: fakeGuardContext, goto: async () => undefined,
         evaluate: async (_callback: unknown, argument?: unknown) => {
           if (argument === undefined) return true;
           discoveryIndex += 1;
@@ -5221,7 +5228,7 @@ describe('C3 corrections (foundation corrections design 4.2-4.8, 5.5)', () => {
         dispose: async () => undefined,
       };
       const page = {
-        goto: async () => undefined,
+        context: fakeGuardContext, goto: async () => undefined,
         evaluate: async (_callback: unknown, argument?: unknown) => (
           argument === undefined ? true : { candidates: [rawCandidate], completeness: 'COMPLETE', domWorkUsed: 0 }
         ),
@@ -5358,7 +5365,7 @@ describe('C3 corrections (foundation corrections design 4.2-4.8, 5.5)', () => {
         dispose: async () => undefined,
       };
       const page = {
-        goto: async () => undefined,
+        context: fakeGuardContext, goto: async () => undefined,
         evaluate: async (_callback: unknown, argument?: unknown) => (
           argument === undefined ? true : { candidates: [rawCandidate], completeness: 'COMPLETE', domWorkUsed: 0 }
         ),
@@ -5426,7 +5433,7 @@ describe('C3 corrections (foundation corrections design 4.2-4.8, 5.5)', () => {
         dispose: async () => { throw new Error(ESCAPE_AT_BOUND); },
       };
       const page = {
-        goto: async () => undefined,
+        context: fakeGuardContext, goto: async () => undefined,
         evaluate: async (_callback: unknown, argument?: unknown) => (
           argument === undefined ? true : { candidates: [rawCandidate], completeness: 'COMPLETE', domWorkUsed: 0 }
         ),
@@ -5459,7 +5466,7 @@ describe('C3 corrections (foundation corrections design 4.2-4.8, 5.5)', () => {
         dispose: async () => undefined,
       };
       const page = {
-        goto: async () => undefined,
+        context: fakeGuardContext, goto: async () => undefined,
         evaluate: async (_callback: unknown, argument?: unknown) => (
           argument === undefined ? true : { candidates: [rawCandidate], completeness: 'COMPLETE', domWorkUsed: 0 }
         ),
@@ -5519,7 +5526,7 @@ describe('C3 corrections (foundation corrections design 4.2-4.8, 5.5)', () => {
         dispose: async () => undefined,
       };
       const page = {
-        goto: async () => undefined,
+        context: fakeGuardContext, goto: async () => undefined,
         evaluate: async (_callback: unknown, argument?: unknown) => (
           argument === undefined ? true : { candidates: [rawCandidate], completeness: 'COMPLETE', domWorkUsed: 0 }
         ),
@@ -5611,7 +5618,7 @@ describe('C3 corrections (foundation corrections design 4.2-4.8, 5.5)', () => {
       function gotoRecordingSession(gotoTimeouts: unknown[]): InteractionGuardedSession {
         return {
           page: {
-            goto: async (_url: string, options: { readonly timeout?: number }): Promise<never> => {
+            context: fakeGuardContext, goto: async (_url: string, options: { readonly timeout?: number }): Promise<never> => {
               gotoTimeouts.push(options.timeout);
               throw new Error('stop after navigation');
             },
@@ -5660,7 +5667,7 @@ describe('C3 corrections (foundation corrections design 4.2-4.8, 5.5)', () => {
         const candidate = await candidateNamed('/accordion.html', 'Toggle details');
         const session: InteractionGuardedSession = {
           page: {
-            goto: async (): Promise<never> => {
+            context: fakeGuardContext, goto: async (): Promise<never> => {
               const timeout = new Error('page.goto: Timeout 5000ms exceeded.');
               timeout.name = 'TimeoutError';
               throw timeout;
@@ -5799,7 +5806,7 @@ describe('I15a: the kind of NOT_VERIFIABLE in Interaction Evidence', () => {
   /** 読み込み（`goto`）だけを差し替えた偽のセッション。 */
   function gotoSession(goto: () => Promise<unknown>, close?: () => Promise<void>): InteractionGuardedSession {
     return {
-      page: { goto } as unknown as Page,
+      page: { context: fakeGuardContext, goto } as unknown as Page,
       ledger: new SafetyLedger(),
       activateInteractionFreeze: async () => undefined,
       ...fakeCloseLifecycle(close),
@@ -5821,7 +5828,7 @@ describe('I15a: the kind of NOT_VERIFIABLE in Interaction Evidence', () => {
       dispose: async () => undefined,
     };
     const page = {
-      goto: async () => undefined,
+      context: fakeGuardContext, goto: async () => undefined,
       evaluate: async (_callback: unknown, argument?: unknown) => (
         argument === undefined ? true : { candidates: [rawCandidate], completeness: 'COMPLETE', domWorkUsed: 0 }
       ),
@@ -6006,7 +6013,7 @@ describe('P18c: deadlines of the Interaction session open and the freeze activat
     let closeCalls = 0;
     let gotoCalls = 0;
     const lateSession: InteractionGuardedSession = {
-      page: { goto: async () => { gotoCalls += 1; } } as unknown as Page,
+      page: { context: fakeGuardContext, goto: async () => { gotoCalls += 1; } } as unknown as Page,
       ledger: new SafetyLedger(),
       activateInteractionFreeze: async () => undefined,
       isClosed: () => closeCalls > 0,
@@ -6077,7 +6084,7 @@ describe('P18c: deadlines of the Interaction session open and the freeze activat
     const candidate = await candidateNamed('/accordion.html', 'Toggle details');
     const ledger = new SafetyLedger();
     const page = {
-      goto: async () => undefined,
+      context: fakeGuardContext, goto: async () => undefined,
       evaluate: async () => true,
     } as unknown as Page;
     let closeCalls = 0;
@@ -6219,7 +6226,7 @@ describe('the observation of the target load of an interaction candidate (site u
     vi.setSystemTime(startedAtMs);
     const session: InteractionGuardedSession = {
       page: {
-        goto: async () => { gotoCalls += 1; },
+        context: fakeGuardContext, goto: async () => { gotoCalls += 1; },
       } as unknown as Page,
       ledger: new SafetyLedger(),
       activateInteractionFreeze: async () => undefined,

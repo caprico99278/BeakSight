@@ -1,5 +1,7 @@
 import { describe, expect, it } from 'vitest';
+import { hasLoweredFindingClass } from '../../src/audit/finding-grouping-keys.js';
 import { PERFORMANCE_RULES, POOR_WEB_VITAL_THRESHOLDS } from '../../src/audit/performance-rules.js';
+import { PERFORMANCE_SINGLE_MEASUREMENT_TEXT } from '../../src/presentation/messages.js';
 import type { AuditRule, PageRuleInput } from '../../src/audit/rule.js';
 import { RuleEngine } from '../../src/audit/rule-engine.js';
 import type { EvidenceRecord, ViewportProfile } from '../../src/core/contracts.js';
@@ -119,6 +121,9 @@ describe('PERFORMANCE_RULES', () => {
         for (const fact of text) {
           expect(drafts[0]?.message).toContain(fact);
         }
+        // AUD-6（S-11）: 1 回の測りの印（確信度を 1 段下げる区分の鍵）と文。
+        expect(hasLoweredFindingClass(drafts[0]?.linkKeys ?? [])).toBe(true);
+        expect(drafts[0]?.message).toContain(PERFORMANCE_SINGLE_MEASUREMENT_TEXT.note);
       });
 
       it(`${metric} が poor の境界ちょうど以下なら、Finding を作らない`, () => {

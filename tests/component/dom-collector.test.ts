@@ -1,7 +1,8 @@
 import type { Browser, Page } from 'playwright';
 import { describe, expect, it, vi } from 'vitest';
 import { createPageId } from '../../src/core/ids.js';
-import { DOM_COLLECTION_PART_SIZE, DOM_TEXT_PART_LENGTH, collectDomEvidence } from '../../src/evidence/dom-collector.js';
+import { DOM_COLLECTION_PART_SIZE, DOM_TEXT_PART_LENGTH, collectDomEvidence, recordedDomEvidenceOf } from '../../src/evidence/dom-collector.js';
+import { probePageCandidates } from '../../src/discovery/probe.js';
 import { useHeadlessChromium } from '../helpers/chromium.js';
 
 let browser: Browser;
@@ -467,14 +468,16 @@ describe('collectDomEvidence facts for Task 12 rules (V5)', () => {
         <html><body>
           <div id="dup">One</div><span id="unique">Two</span><p id="dup">Three</p>
           <section id="twice"></section><section id="twice"></section><em id="dup"></em><i id=""></i><b id=""></b>
+          <label for="dup">Label</label><a href="#dup">Jump</a><span aria-describedby="other dup"></span>
         </body></html>
       `);
 
       const evidence = await collectDomEvidence(page, createPageId(34));
 
+      // RVP-5: その id を参照する要素の数（0 と 1 以上を区別する）。
       expect(evidence.duplicateIds).toEqual([
-        { id: 'dup', count: 3, truncated: false },
-        { id: 'twice', count: 2, truncated: false },
+        { id: 'dup', count: 3, truncated: false, referenceCount: 3 },
+        { id: 'twice', count: 2, truncated: false, referenceCount: 0 },
       ]);
       expect(evidence.truncation.omittedDuplicateIdCount).toBe(0);
       expect(Object.isFrozen(evidence.duplicateIds)).toBe(true);
@@ -744,6 +747,32 @@ describe('collectDomEvidence collection in parts and truncation records (V9, COV
   });
 });
 
+// DUP（ユーザーの判断 2026-11-18）: 中身が同じ画面かを決めるために、見えている欄の値の digest だけを残す（値そのものは残さない。パスワードの値は入れない）。
+describe('collectDomEvidence field values digest (DUP)', () => {
+  const digestOf = async (fields: string): Promise<string | undefined> => {
+    const page = await browser.newPage();
+    try {
+      await page.setContent(`<html><body><form>${fields}</form></body></html>`);
+      const evidence = await collectDomEvidence(page, createPageId(60));
+      expect(JSON.stringify(evidence)).not.toContain('secret-value');
+      expect(evidence.forms[0]?.fields[0]).not.toHaveProperty('shownValue');
+      // REV-DUP の M-4: digest は判定にだけ使い、記録（page.json）には残さない。
+      expect(recordedDomEvidenceOf(evidence)).not.toHaveProperty('fieldValuesDigest');
+      return evidence.fieldValuesDigest;
+    } finally {
+      await page.close();
+    }
+  };
+
+  it('changes with the shown value and the check of a field, and not with a password', async () => {
+    const taro = await digestOf('<input name="name" value="太郎"><input type="checkbox" name="vip" checked><input type="password" name="pw" value="secret-value">');
+    expect(taro).toMatch(/^sha256:[0-9a-f]{64}$/u);
+    expect(await digestOf('<input name="name" value="太郎"><input type="checkbox" name="vip" checked><input type="password" name="pw" value="other">')).toBe(taro);
+    expect(await digestOf('<input name="name" value="花子"><input type="checkbox" name="vip" checked><input type="password" name="pw" value="secret-value">')).not.toBe(taro);
+    expect(await digestOf('<input name="name" value="太郎"><input type="checkbox" name="vip"><input type="password" name="pw" value="secret-value">')).not.toBe(taro);
+  });
+});
+
 describe('collectDomEvidence fields outside forms (R4 N2)', () => {
   it('records input fields that do not belong to any form, with the visibility of each field', async () => {
     const page = await browser.newPage();
@@ -914,6 +943,33 @@ describe('collectDomEvidence fields in open shadow roots (R\'2 m4)', () => {
       expect(evidence.unassociatedFields[1]?.name).toBe('shadow-0');
       expect(evidence.unassociatedFields.at(-1)?.name).toBe(`shadow-${shadowCount - 1}`);
       expect(evidence.truncation.omittedUnassociatedFieldCount).toBe(0);
+    } finally {
+      await page.close();
+    }
+  });
+});
+
+describe('collectDomEvidence: the number of elements the discovery would press (SKIP-1)', () => {
+  it('counts the same candidates as the discovery probe, and none on a page of links and text only', async () => {
+    const page = await browser.newPage();
+    try {
+      await page.setContent(`
+        <form action="/a"><input name="q"><button>Find</button><input type="submit" value="Go"></form>
+        <form action="/b"><input name="r"></form>
+        <input type="button" value="Open"><input type="reset"><div role="button link">Menu</div>
+        <div id="host"></div><a href="/next">Next</a>
+      `);
+      await page.evaluate(() => {
+        const root = document.getElementById('host')?.attachShadow({ mode: 'open' });
+        if (root !== undefined) root.innerHTML = '<button type="button">Inside</button>';
+      });
+      const probe = await probePageCandidates(page, Date.now() + 10_000);
+      const evidence = await collectDomEvidence(page, createPageId(60));
+      expect(probe.status === 'READ' ? probe.candidates.length : -1).toBeGreaterThan(0);
+      expect(evidence.discoveryCandidateCount).toBe(probe.status === 'READ' ? probe.candidates.length : -1);
+
+      await page.setContent('<main><h1>Notice</h1><p>Text</p><a href="/back">Back</a></main>');
+      expect((await collectDomEvidence(page, createPageId(61))).discoveryCandidateCount).toBe(0);
     } finally {
       await page.close();
     }

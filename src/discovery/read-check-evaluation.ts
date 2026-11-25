@@ -36,12 +36,16 @@ import type {
   ReadCheckResult,
   ReadCheckTargetKind,
 } from './read-check-contracts.js';
+import type { SearchCheckCombo } from './search-check-plan.js';
+import type { SearchCheckTextValue } from './search-check-text-values.js';
+import { searchReadVerdictOf, type SearchReadRecord } from './search-read-contracts.js';
 
 /**
  * 成果物の版（書き手が書く版）。T37a: 1.1（終わり方・詳しい理由・監査の段の数を足した）。T37d: 1.2（定義ごとの対象の種類 `targetKind` と画面の path
- * `targetPagePath`、監査の段の 2 つの詳しい理由を足した。画面の path の定義は識別の digest を持たない）。
+ * `targetPagePath`、監査の段の 2 つの詳しい理由を足した。画面の path の定義は識別の digest を持たない）。RCA-5（検索の確かめの設計書 2.5）: 1.3（検索の確かめの
+ * 組の結果 `searchChecks` を足し、DEF-235 の番号ごとの結果 `records` と理由 `RECORD_ID_NOT_AVAILABLE` を外した）。
  */
-export const READ_EVIDENCE_ARTIFACT_SCHEMA_VERSION = 'read-evidence-schema/1.2';
+export const READ_EVIDENCE_ARTIFACT_SCHEMA_VERSION = 'read-evidence-schema/1.3';
 
 /**
  * 読み手が受ける版（スキーマの `schemaVersion` の enum。T37a fix round 1）。LG-4（テストの組の設計書 3.7.3）: 前の版（1.0・1.1）は捨て、今の版だけを
@@ -109,8 +113,6 @@ export type ReadCheckEvidenceState = (typeof READ_CHECK_EVIDENCE_STATES)[number]
  * - `RESULT_PAGE_UNREADABLE`: READ の URL は読み込めたが、構造を読めなかった（読み取りの失敗、時間切れ）→ `UNDETERMINED`。
  * - `SESSION_LOST`: READ の URL の読み込みで、セッションの切れを見つけた → `UNDETERMINED`（ジョブは止まる）。T37d: ログインの状態の鍵の消失も
  *   これ（ジョブの終わり方の詳しい理由が `session-key`）。
- * - `RECORD_ID_NOT_AVAILABLE`（DEF-235）: 番号の入る画面の path の型の定義で、番号の元（読めた画面、点検の段のリンク、作った登録）にも、一覧の画面のリンクにも、
- *   型に当たる番号がなかった（見る登録がまだない）→ `UNDETERMINED`（断らない。利用者に番号を求めない）。
  * - `STAGE_UNRESPONSIVE`・`STAGE_NEVER_QUIET`（L4。L0 の進みの見張り `src/core/progress-watch.ts`）: READ の URL の構造の読み取りで、ブラウザからもページからも全く
  *   反応がなかった（応答しなかった）、またはページの自発の変化だけが続いた（静まらない）ので、読み取りを終えた → `UNDETERMINED`（ほかの定義へ進む）。
  * - `SERVICE_READ_REFUSED`（T37d。Task 37 の設計書 3.5）: 読んで照らしたが、その読み込みの間に、上限で断った承認したサービスの Origin への要求か、
@@ -134,7 +136,6 @@ export const READ_CHECK_DETAILS = Object.freeze([
   'HTTP_ERROR_STATUS',
   'RESULT_PAGE_UNREADABLE',
   'SESSION_LOST',
-  'RECORD_ID_NOT_AVAILABLE',
   'STAGE_UNRESPONSIVE',
   'STAGE_NEVER_QUIET',
   'SERVICE_READ_REFUSED',
@@ -164,7 +165,6 @@ export const READ_CHECK_DETAIL_RESULTS: Readonly<Record<ReadCheckDetail, ReadChe
   HTTP_ERROR_STATUS: 'UNDETERMINED',
   RESULT_PAGE_UNREADABLE: 'UNDETERMINED',
   SESSION_LOST: 'UNDETERMINED',
-  RECORD_ID_NOT_AVAILABLE: 'UNDETERMINED',
   STAGE_UNRESPONSIVE: 'UNDETERMINED',
   STAGE_NEVER_QUIET: 'UNDETERMINED',
   SERVICE_READ_REFUSED: 'UNDETERMINED',
@@ -328,19 +328,7 @@ export type ReadCheckExecutedEvidence = ReadCheckEvidenceTarget & {
   readonly documentRequests?: number;
   readonly childFrameDocumentRequests?: number;
   readonly subresourceRequests?: number;
-  /**
-   * DEF-235: 番号の入る画面の path の型の定義を、番号を埋めて読んだときの、番号ごとの結果（読んだ順）。定義の結果（上の項目）は、この中の代表
-   * （`readCheckRecordsEvidenceOf`）。番号を埋めて読まなかった定義にはない。
-   */
-  readonly records?: readonly ReadCheckRecordEvidence[];
 };
-
-/** DEF-235: 番号を埋めて読んだ 1 回の結果（番号は URL に入る。ArtifactWriter が書くときに URL の伏せ字を通す）。 */
-export type ReadCheckRecordEvidence = Pick<
-  ReadCheckExecutedEvidence,
-  'result' | 'detail' | 'url' | 'httpStatus' | 'blockedRequests' | 'structure' | 'expectations'
-  | 'documentRequests' | 'childFrameDocumentRequests' | 'subresourceRequests'
->;
 
 /** 確かめなかった定義 1 件（止まった後の残り）。 */
 export type ReadCheckNotExecutedEvidence = ReadCheckEvidenceTarget & {
@@ -364,6 +352,13 @@ export interface ReadEvidenceDocument {
   readonly endReason: ReadCheckEndReason;
   /** 定義（`START` の順）。 */
   readonly checks: readonly ReadCheckEvidence[];
+  /** RCA-5: 検索の確かめの組（`START` の順）。 */
+  readonly searchChecks: readonly SearchCheckEvidence[];
+  /**
+   * REV-RCA の I-4: セッションが切れたときに確かめていた組の鍵（終わり方が `AUTH_SESSION_LOST` で、組で切れたときだけ。人の定義で切れたときは持たない）。親が、
+   * ログインし直した後のジョブにこの鍵を渡し、そのジョブはこの組を最初に確かめる。
+   */
+  readonly sessionLostSearchCheckKey?: string;
   /** 終わり方の詳しい理由（T37a。鍵の消失によるセッションの切れのときだけ。ほかは持たない）。 */
   readonly endReasonDetail?: JobEndReasonDetail;
   /** 監査の段の数（T37a。`run.json` の `authentication` と同じ形。認証の指定に監査の段の口があるジョブだけ）。 */
@@ -385,6 +380,9 @@ export interface ReadEvidenceSummary {
   readonly checks: number;
   /** 確かめた定義の数。 */
   readonly executed: number;
+  /** RCA-5: 検索の確かめの組の数と、そのうち誤り（`ERROR`）の数。 */
+  readonly searchChecks: number;
+  readonly searchCheckErrors: number;
   /** 監査の段の数（T37a。成果物にあるときだけ。成果物と同じ値）。 */
   readonly authentication?: RunAuthenticationSummary;
   /** DEF-144: 違反の中身（成果物にあるときだけ。成果物と同じ値）。 */
@@ -633,33 +631,196 @@ export const withReadCheckAuditStageDetail = (
   ? evidence
   : Object.freeze({ ...evidence, result: 'UNDETERMINED', detail }));
 
-/**
- * DEF-235（設計書 3.4）: 自動の下書きが作った型の定義（`read-check-record-ids.ts` の `isPageOpenedReadCheckDefinition`）を READ の確かめの段で読んだ結果を、「画面が
- * 開けた」で照らし直す（純粋）。読んで照らした結果（`EXPECTATIONS_EVALUATED`。2xx で、ログインの切れでなく、構造を読めた画面）は `MATCHED`（仮の期待の結果は
- * 写さない）。読めなかった・エラーの状態・監査の段の詳しい理由のある結果は、そのまま返す。
- */
-export const pageOpenedEvidenceOf = (evidence: ReadCheckExecutedEvidence): ReadCheckExecutedEvidence =>
-  (evidence.detail === 'EXPECTATIONS_EVALUATED' ? Object.freeze({ ...evidence, result: 'MATCHED', expectations: Object.freeze([]) }) : evidence);
+// ---------------------------------------------------------------------------------------------------------------
+// RCA-5（検索の確かめの設計書 2.2・2.5）: 検索の確かめ（組ごとの判定と、成果物の `searchChecks`）
+// ---------------------------------------------------------------------------------------------------------------
 
-/** 1 回の結果を、番号ごとの結果の形にする（定義の ID・版・対象・状態・番号ごとの結果は写さない）。 */
-const readCheckRecordEvidenceOf = (evidence: ReadCheckExecutedEvidence): ReadCheckRecordEvidence => {
-  const { readCheckId: _id, readCheckRevision: _revision, targetKind: _kind, targetIdentityDigest: _digest, targetPagePath: _path, state: _state,
-    records: _records, ...record } = evidence;
-  return Object.freeze(record);
+/** 組の結果（閉じた一覧）。`NO_ERROR`: 誤りは出なかった。`ERROR`: サイトの誤り。`UNDETERMINED`: 判定できない。 */
+export const SEARCH_CHECK_RESULTS = Object.freeze(['NO_ERROR', 'ERROR', 'UNDETERMINED'] as const);
+export type SearchCheckResult = (typeof SEARCH_CHECK_RESULTS)[number];
+
+/**
+ * 組の結果の詳しい理由（閉じた一覧。結果との対応は `SEARCH_CHECK_DETAIL_RESULTS`）。
+ * - `OPENED`・`CLIENT_ERROR_STATUS`: 開けた（4xx があっても誤りにしない。入力の確かめの正しい答えもある）→ `NO_ERROR`。
+ * - `SERVER_ERROR`: 主の文書か、きっかけが出した読み取りが 500・501・505〜599 → `ERROR`。
+ * - `NOT_OPENED`: 確かめ直しの後も検索が開けず、フォームの画面は開けた → `ERROR`。
+ * - `LOGIN_BOUNCE`: ログインし直した後のやり直しでも、ログインの画面へ戻された → `ERROR`。
+ * - `UNSENT_HIDDEN_FIELDS`: hidden の欄を送らないフォームの組が 5xx（基準の組に限らない。BeakSight が値を省いたせいかもしれない。REV-RCA の I-1）→ `UNDETERMINED`。
+ * - `BLOCKED_BY_BEAKSIGHT`: BeakSight の守りが移動か読み取りを止めた → `UNDETERMINED`。
+ * - `EMPTY_NOT_SEARCHED`: 空の値の組で、スクリプトのきっかけが読み取りを出さなかった（空では検索しないサイトの正しい動き。REV-RCA の I-2）→ `NO_ERROR`。
+ * - `NO_READ`: 空でない値の組で、スクリプトのきっかけが読み取りを出さなかった → `UNDETERMINED`。
+ * - `STATE_NOT_REBUILT`: 記録した押下の並びをたどり直して、同じ状態を作れなかった（欄・候補が見つからない、選択肢がない）→ `UNDETERMINED`。
+ * - `NO_RESPONSE`・`NON_STANDARD_STATUS`・`SITE_UNAVAILABLE_STATUS`: 応答がない、600 以上、429・502・503・504 が残った → `UNDETERMINED`。
+ * - `SERVICE_READ_REFUSED`・`AUDIT_STAGE_REQUEST_BLOCKED`: 監査の段の詳しい理由（定義の READ と同じ）→ `UNDETERMINED`。
+ */
+export const SEARCH_CHECK_DETAILS = Object.freeze([
+  'OPENED',
+  'CLIENT_ERROR_STATUS',
+  'SERVER_ERROR',
+  'NOT_OPENED',
+  'LOGIN_BOUNCE',
+  'UNSENT_HIDDEN_FIELDS',
+  'BLOCKED_BY_BEAKSIGHT',
+  'EMPTY_NOT_SEARCHED',
+  'NO_READ',
+  'STATE_NOT_REBUILT',
+  'NO_RESPONSE',
+  'NON_STANDARD_STATUS',
+  'SITE_UNAVAILABLE_STATUS',
+  'SERVICE_READ_REFUSED',
+  'AUDIT_STAGE_REQUEST_BLOCKED',
+] as const);
+export type SearchCheckDetail = (typeof SEARCH_CHECK_DETAILS)[number];
+
+/** 詳しい理由ごとの結果。 */
+export const SEARCH_CHECK_DETAIL_RESULTS: Readonly<Record<SearchCheckDetail, SearchCheckResult>> = Object.freeze({
+  OPENED: 'NO_ERROR',
+  CLIENT_ERROR_STATUS: 'NO_ERROR',
+  SERVER_ERROR: 'ERROR',
+  NOT_OPENED: 'ERROR',
+  LOGIN_BOUNCE: 'ERROR',
+  UNSENT_HIDDEN_FIELDS: 'UNDETERMINED',
+  BLOCKED_BY_BEAKSIGHT: 'UNDETERMINED',
+  EMPTY_NOT_SEARCHED: 'NO_ERROR',
+  NO_READ: 'UNDETERMINED',
+  STATE_NOT_REBUILT: 'UNDETERMINED',
+  NO_RESPONSE: 'UNDETERMINED',
+  NON_STANDARD_STATUS: 'UNDETERMINED',
+  SITE_UNAVAILABLE_STATUS: 'UNDETERMINED',
+  SERVICE_READ_REFUSED: 'UNDETERMINED',
+  AUDIT_STAGE_REQUEST_BLOCKED: 'UNDETERMINED',
+});
+
+/** 組 1 つを確かめた事実（ワーカーが集める。値を持たない）。 */
+export interface SearchCheckObservation {
+  readonly kind: SearchCheckCombo['kind'];
+  /** フォームの組の検索の URL の主の文書の状態（応答がなければ null。スクリプトの組は null）。 */
+  readonly documentStatus: number | null;
+  /** スクリプトの組のきっかけが出した読み取り（フォームの組は空）。 */
+  readonly reads: readonly SearchReadRecord[];
+  /** hidden の欄を送らないフォームの組か（REV-RCA の I-1: 基準の組に限らない）。 */
+  readonly unsentHiddenFields: boolean;
+  /** 空の値の組か（REV-RCA の I-2: 読み取りがなければ、空では検索しない正しい動き）。 */
+  readonly emptyValue: boolean;
+  readonly blockedByBeakSight: boolean;
+  readonly loginBouncedAgain: boolean;
+  readonly searchNotOpened: boolean;
+  readonly stateNotRebuilt: boolean;
+  readonly auditStageDetail: ReadCheckAuditStageDetail | null;
+}
+
+/** 状態の番号の並びの、いちばん強い判定（誤り → サイトの不調 → 決まっていない → 応答なし → 4xx → 開けた）。 */
+const strongestStatusDetailOf = (statuses: readonly (number | null)[]): SearchCheckDetail => {
+  const verdicts = new Set(statuses.map(searchReadVerdictOf));
+  if (verdicts.has('SERVER_ERROR')) return 'SERVER_ERROR';
+  if (verdicts.has('SITE_UNAVAILABLE')) return 'SITE_UNAVAILABLE_STATUS';
+  if (verdicts.has('NON_STANDARD')) return 'NON_STANDARD_STATUS';
+  if (verdicts.has('NO_RESPONSE')) return 'NO_RESPONSE';
+  return verdicts.has('CLIENT_ERROR') ? 'CLIENT_ERROR_STATUS' : 'OPENED';
 };
 
 /**
- * DEF-235: 番号ごとに読んだ結果（1 件以上。読んだ順）を、1 つの定義の結果にする（純粋）。定義の結果は代表の 1 回（`NOT_MATCHED` の最初、なければ `MATCHED` でない
- * 最初、なければ最初）の項目で、番号ごとの結果をすべて `records` に持つ。管理データの `read_check_results` は、代表の結果を 1 行だけ記録する（表の形は変えない）。
+ * 組 1 つの判定（純粋。判定の順）: 守りが止めた → 2 回目のログインへの戻し → 検索だけ開けない → たどり直せない → 状態の番号（5xx は、hidden を送らないフォームの
+ * 組なら判定できない）→ 監査の段の詳しい理由 → スクリプトのきっかけが読み取りを出さない（空の値なら問題なし）→ 状態の番号のいちばん強い判定。
  */
-export const readCheckRecordsEvidenceOf = (evidences: readonly ReadCheckExecutedEvidence[]): ReadCheckExecutedEvidence => {
-  const [first] = evidences;
-  if (first === undefined) {
-    throw new RangeError('the record results of a READ check need at least one result');
+export const searchCheckVerdictOf = (observation: SearchCheckObservation): { readonly result: SearchCheckResult; readonly detail: SearchCheckDetail } => {
+  const verdict = (detail: SearchCheckDetail) => Object.freeze({ result: SEARCH_CHECK_DETAIL_RESULTS[detail], detail });
+  if (observation.blockedByBeakSight) return verdict('BLOCKED_BY_BEAKSIGHT');
+  if (observation.loginBouncedAgain) return verdict('LOGIN_BOUNCE');
+  if (observation.searchNotOpened) return verdict('NOT_OPENED');
+  if (observation.stateNotRebuilt) return verdict('STATE_NOT_REBUILT');
+  const statuses = observation.kind === 'FORM' ? [observation.documentStatus] : observation.reads.map(({ status }) => status);
+  const fromStatus = statuses.length === 0 ? null : strongestStatusDetailOf(statuses);
+  if (fromStatus === 'SERVER_ERROR') return verdict(observation.unsentHiddenFields ? 'UNSENT_HIDDEN_FIELDS' : 'SERVER_ERROR');
+  if (observation.auditStageDetail !== null) return verdict(observation.auditStageDetail);
+  return verdict(fromStatus ?? (observation.emptyValue ? 'EMPTY_NOT_SEARCHED' : 'NO_READ'));
+};
+
+/** 組の試し方（表示に使う。値を持たない。フォームの組の `field` は、`discovery.json` と同じく欄の名前）。 */
+export type SearchCheckHow =
+  | { readonly kind: 'BASELINE' }
+  | { readonly kind: 'TEXT'; readonly text: SearchCheckTextValue; readonly field?: string }
+  | { readonly kind: 'OPTION'; readonly field: string; readonly optionIndex: number }
+  | { readonly kind: 'CHECK'; readonly field: string };
+
+/** 組のきっかけの種類（GET のフォーム・押下・入力）。 */
+export const SEARCH_CHECK_TRIGGERS = Object.freeze(['FORM', 'PRESS', 'TYPED'] as const);
+export type SearchCheckTrigger = (typeof SEARCH_CHECK_TRIGGERS)[number];
+
+/** 組の成果物の共通の項目（組の鍵、きっかけ、画面の path、試し方）。 */
+export interface SearchCheckEvidenceBase {
+  readonly key: string;
+  readonly trigger: SearchCheckTrigger;
+  readonly pagePath: string;
+  readonly how: SearchCheckHow;
+}
+
+/** 組の成果物の共通の項目を作る（純粋）。 */
+export const searchCheckEvidenceBaseOf = (combo: SearchCheckCombo): SearchCheckEvidenceBase => Object.freeze({
+  key: combo.key,
+  trigger: combo.kind === 'FORM' ? 'FORM' : combo.trigger.kind,
+  pagePath: combo.page.path,
+  how: Object.freeze(combo.kind === 'FORM' ? combo.change : { kind: 'TEXT' as const, text: combo.text }),
+});
+
+/** RCA-7: GET のフォームの組を、定義の READ と同じ手順で読んだ結果の詳しい理由のうち、組の状態を作れなかったもの（候補が変わった・読めない・送れない）。 */
+const STATE_NOT_REBUILT_READ_DETAILS: ReadonlySet<ReadCheckDetail> = new Set<ReadCheckDetail>([
+  'TARGET_PAGE_UNKNOWN', 'TARGET_PAGE_UNREADABLE', 'CANDIDATE_NOT_FOUND', 'CANDIDATE_NOT_READ', 'PARAMETER_NOT_SENDABLE',
+]);
+/** RCA-7: 同じく、BeakSight の守りが読む前に止めたもの。 */
+const BLOCKED_READ_DETAILS: ReadonlySet<ReadCheckDetail> = new Set<ReadCheckDetail>([
+  'REQUEST_POLICY', 'SECRET_LIKE_PARAMETER', 'PARAMETER_DANGEROUS_WORD', 'URL_NOT_BUILT',
+]);
+
+/**
+ * RCA-7（検索の確かめの設計書 2.2）: GET のフォームの組を、定義の READ と同じ手順（候補の確かめ・URL の組み立て・要求の判定・読み込み）で読んだ結果から、組の成果物を
+ * 作る（純粋）。確かめなかった結果はその理由のまま。ログインの切れは、ログインし直す前に戻された組（`bouncedAgainIfLost`。REV-RCA の I-4）なら 2 回目の戻しとして
+ * 誤り（`LOGIN_BOUNCE`）、ほかは確かめなかった（`AUTH_SESSION_LOST`。ログインし直した後にやり直す）。
+ */
+export const formSearchCheckEvidenceOf = (
+  combo: Extract<SearchCheckCombo, { readonly kind: 'FORM' }>,
+  evidence: ReadCheckEvidence,
+  bouncedAgainIfLost: boolean,
+  /** REV-RCA の M-1: 確かめ直しの後も検索だけ開けず、フォームの画面は開けた（`NOT_OPENED`）。 */
+  searchNotOpened = false,
+): SearchCheckEvidence => {
+  const base = searchCheckEvidenceBaseOf(combo);
+  if (evidence.state === 'NOT_EXECUTED') {
+    return Object.freeze({ ...base, state: 'NOT_EXECUTED', reason: evidence.reason });
   }
-  const representative = evidences.find(({ result }) => result === 'NOT_MATCHED') ?? evidences.find(({ result }) => result !== 'MATCHED') ?? first;
-  return Object.freeze({ ...representative, records: Object.freeze(evidences.map(readCheckRecordEvidenceOf)) });
+  if (evidence.detail === 'SESSION_LOST' && !bouncedAgainIfLost) {
+    return Object.freeze({ ...base, state: 'NOT_EXECUTED', reason: 'AUTH_SESSION_LOST' });
+  }
+  const verdict = searchCheckVerdictOf({
+    kind: 'FORM',
+    documentStatus: evidence.httpStatus,
+    reads: [],
+    unsentHiddenFields: combo.unsentHiddenFields,
+    emptyValue: false,
+    blockedByBeakSight: BLOCKED_READ_DETAILS.has(evidence.detail),
+    loginBouncedAgain: evidence.detail === 'SESSION_LOST',
+    searchNotOpened,
+    stateNotRebuilt: STATE_NOT_REBUILT_READ_DETAILS.has(evidence.detail),
+    auditStageDetail: evidence.detail === 'SERVICE_READ_REFUSED' || evidence.detail === 'AUDIT_STAGE_REQUEST_BLOCKED' ? evidence.detail : null,
+  });
+  return Object.freeze({ ...base, state: 'EXECUTED', ...verdict, httpStatus: evidence.httpStatus, reads: Object.freeze([]) });
 };
+
+/** 組 1 つの成果物（確かめた・確かめなかった）。 */
+export type SearchCheckEvidence =
+  | (SearchCheckEvidenceBase & {
+    readonly state: Extract<ReadCheckEvidenceState, 'EXECUTED'>;
+    readonly result: SearchCheckResult;
+    readonly detail: SearchCheckDetail;
+    /** フォームの組の主の文書の状態（スクリプトの組・応答なしは null）。 */
+    readonly httpStatus: number | null;
+    /** スクリプトの組のきっかけが出した読み取りの形と状態（フォームの組は空）。 */
+    readonly reads: readonly SearchReadRecord[];
+  })
+  | (SearchCheckEvidenceBase & {
+    readonly state: Extract<ReadCheckEvidenceState, 'NOT_EXECUTED'>;
+    readonly reason: ReadCheckNotExecutedReason;
+  });
 
 /** 構造の要約（件数だけ）。 */
 export const readStructureSummaryOf =(structure: ReadPageStructure): ReadStructureSummary => Object.freeze({
@@ -681,10 +842,12 @@ export const readStructureSummaryOf =(structure: ReadPageStructure): ReadStructu
 
 /** 件数の要約（定義の数と、確かめた数）。 */
 export const readEvidenceSummaryOf = (
-  document: Pick<ReadEvidenceDocument, 'checks' | 'authentication' | 'safetyViolation'>,
+  document: Pick<ReadEvidenceDocument, 'checks' | 'searchChecks' | 'authentication' | 'safetyViolation'>,
 ): ReadEvidenceSummary => Object.freeze({
   checks: document.checks.length,
   executed: document.checks.filter(({ state }) => state === 'EXECUTED').length,
+  searchChecks: document.searchChecks.length,
+  searchCheckErrors: document.searchChecks.filter((check) => check.state === 'EXECUTED' && check.result === 'ERROR').length,
   ...authenticationSummaryPartOf(document),
   ...safetyViolationSummaryPartOf(document),
 });
@@ -698,7 +861,7 @@ export const readEvidenceSummaryOf = (
  * 結果: 違反は `ABORTED_BY_SAFETY`、PREFLIGHT の失敗は `FAILED`、すべてを確かめて `UNDETERMINED` がなければ `COMPLETE`（`NOT_MATCHED` などの
  * 結果は、確かめた結果として `COMPLETE` のまま）、ほかは `PARTIAL`。
  */
-export const readEvidenceRunStatusOf = (input: Pick<ReadEvidenceDocument, 'endReason' | 'checks'>): RunStatus => deriveRunStatus({
+export const readEvidenceRunStatusOf = (input: Pick<ReadEvidenceDocument, 'endReason' | 'checks' | 'searchChecks'>): RunStatus => deriveRunStatus({
   preflightFailed: input.endReason === 'PREFLIGHT_FAILED',
   safetyInvariantViolations: input.endReason === 'SAFETY_VIOLATION' ? 1 : 0,
   safetyLedgerTruncated: false,
@@ -707,11 +870,12 @@ export const readEvidenceRunStatusOf = (input: Pick<ReadEvidenceDocument, 'endRe
   crawlLimitReached: input.endReason === 'MAX_RUNTIME_REACHED',
   requiredArtifactsValid: true,
   executionComplete: input.endReason === 'COMPLETED' || input.endReason === 'MAX_RUNTIME_REACHED',
-  skippedRequiredWork: input.checks.filter(({ state }) => state === 'NOT_EXECUTED').length,
+  // RCA-5: 検索の確かめの組も、確かめなかった組と判定できなかった組を数える（誤りの組は確かめた結果として COMPLETE のまま）。
+  skippedRequiredWork: [...input.checks, ...input.searchChecks].filter(({ state }) => state === 'NOT_EXECUTED').length,
   blockedRequiredWork: 0,
   timedOutRequiredWork: 0,
   notObservedRequiredWork: 0,
-  notVerifiedRequiredWork: input.checks.filter((check) => check.state === 'EXECUTED' && check.result === 'UNDETERMINED').length,
+  notVerifiedRequiredWork: [...input.checks, ...input.searchChecks].filter((check) => check.state === 'EXECUTED' && check.result === 'UNDETERMINED').length,
   failedRequiredWork: 0,
   incompleteCollectorCount: 0,
 });

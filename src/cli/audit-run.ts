@@ -31,6 +31,7 @@ import { readFile, stat } from 'node:fs/promises';
 import { basename, resolve } from 'node:path';
 import { launchChromium } from '../browser/chromium-launch.js';
 import type { AuditConfig } from '../config/types.js';
+import type { DebugTimingSwitch } from '../core/debug-timing.js';
 import type { NavigationPacer } from '../crawl/navigation-pacer.js';
 import type { AuditRunResult, RunId, RunExecutionAutomaticRelogin, RunProgressReport, RunStatus } from '../core/contracts.js';
 import type { RunPages } from '../core/run-page-store.js';
@@ -70,6 +71,7 @@ import {
   RunCoordinator,
   RunDirectoryUnavailableError,
   RunResumeUnavailableError,
+  excludedCrawlCandidateOf,
   restoredRunPagesCollector,
   type RunCoordinatorCheckpointConclusion,
   type RunCoordinatorDependencies,
@@ -147,6 +149,11 @@ export interface AuditRunDependencies {
    * そのまま渡す（使い方は `RunCoordinatorDependencies.stageCarry`）。メモリの中だけで、成果物・保存・ログに書かない。省略すると、今と完全に同じ（CLI は渡さない）。
    */
   readonly stageCarry?: RunStageCarry | undefined;
+  /**
+   * DBG-1（設計書 `2026-11-20-beaksight-discovery-skip-and-debug-timing-design.md` 2.2）: 測りの記録の入切を読む口（起動の入口が作る）。Run Coordinator に、
+   * そのまま渡す（Run の始めに 1 回呼ぶ）。省略すると切。
+   */
+  readonly debugTimingSwitch?: DebugTimingSwitch | undefined;
 }
 
 /** 監査の中核の指定（CLI の引数から決まるもの）。 */
@@ -434,8 +441,8 @@ export async function executeAuditRun(
   const outputDirectory = resolve(config.output.directory);
   const writer = writerFor(dependencies);
 
-  // 0. 出力先のロック（SPEC-2、DEF-057）。別の起動が持っていれば、Run を始めない。
-  const runLock = await acquireRunExclusion(outputDirectory);
+  // 0. 出力先 + 対象の ID のロック（SPEC-2、DEF-057、PAR-a）。別の起動が持っていれば、Run を始めない。
+  const runLock = await acquireRunExclusion(outputDirectory, config.target.id);
   if (runLock.kind === 'HELD') {
     return { kind: 'RUN_ACTIVE', exitCode: RUN_UNAVAILABLE_EXIT_CODE };
   }
@@ -526,6 +533,8 @@ async function startAndRunAudit(input: {
     ...(dependencies.observationWindows === undefined ? {} : { observationWindows: dependencies.observationWindows }),
     // FM2d: まとめて実行の段の持ち越し（ワーカーだけが渡す。メモリの中だけ）。
     ...(dependencies.stageCarry === undefined ? {} : { stageCarry: dependencies.stageCarry }),
+    // DBG-1: 測りの記録の入切を読む口（あるときだけ）。
+    ...(dependencies.debugTimingSwitch === undefined ? {} : { debugTimingSwitch: dependencies.debugTimingSwitch }),
   });
 
   // 3. Run の後。
@@ -568,7 +577,9 @@ async function startAndRunAudit(input: {
   let outputs: AuditRunOutputs;
   try {
     // MEM-3d: Run Coordinator の置き場所を、そのまま書き出し・表示用モデル・HTML・バンドルに渡す（全ページを配列に戻さない）。
-    outputs = await writeAuditRunOutputs(result, outputDirectory, writer, options.profileName, options.plannedWriteScreenCount);
+    // DEF-296: リンクの確かめは、巡回と同じ除外の判定で、読む範囲の外の行き先を分ける。
+    outputs = await writeAuditRunOutputs(result, outputDirectory, writer, options.profileName, options.plannedWriteScreenCount,
+      excludedCrawlCandidateOf(config, dependencies.authentication ?? null));
   } catch (error) {
     await concludeCheckpointAfterOutputFailure(conclusion, session);
     throw error;
@@ -857,6 +868,7 @@ export interface AuditRunOutputs {
  * 書き手なので、表示用モデル、HTML、バンドルも、伏せ字の後の最終の Run から作る。T25f）。
  * `profileName` は省略できる（PRE42-BN。画面のジョブのプロファイルの名前。バンドルのファイル名だけに使う。CLI は渡さない）。
  * `plannedWriteScreenCount` は省略できる（OP-H。この後に登録・更新するチェックした画面の数。表示用モデルの事実。CLI は渡さない）。
+ * `isOutsideReadScope` は省略できる（DEF-296。巡回の候補の除外の判定 `excludedCrawlCandidateOf`。表示用モデルの事実。省略は、除外なし）。
  */
 export async function writeAuditRunOutputs(
   result: AuditRunResult<RunPages>,
@@ -864,13 +876,17 @@ export async function writeAuditRunOutputs(
   writer: ArtifactWriter = new ArtifactWriter(),
   profileName: string | undefined = undefined,
   plannedWriteScreenCount: number | undefined = undefined,
+  isOutsideReadScope: ((url: string) => boolean) | undefined = undefined,
 ): Promise<AuditRunOutputs> {
   const written = await writer.writeRun(result, { outputDirectory });
   // AUD-1c: 発表の前に、参照先のファイルがあるかを確かめてから表示用モデルを作る（HTML とバンドルが同じ欠けの数を示す）。
   const viewModel = await buildPublishedReportViewModel(
     written.result,
     artifactFileExistence(written.runDirectory),
-    plannedWriteScreenCount === undefined ? {} : { plannedWriteScreenCount },
+    {
+      ...(plannedWriteScreenCount === undefined ? {} : { plannedWriteScreenCount }),
+      ...(isOutsideReadScope === undefined ? {} : { isOutsideReadScope }),
+    },
   );
   // MEM-4: HTML は、断片を順に描きながら書く（全部を 1 つの文字列にしない）。
   const reportHtml = renderHtmlReportChunks(viewModel);

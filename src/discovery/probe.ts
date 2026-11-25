@@ -26,6 +26,7 @@
 //   読むときに、同じ要素を探すために使う（`listeners.ts`）。
 import type { Page } from 'playwright';
 import { isNonNegativeSafeInteger, isRecord } from '../core/guards.js';
+import { createSha256Fingerprint } from '../core/ids.js';
 import { normalizeWhitespace } from '../core/text.js';
 import { VISIBILITY_CHECK_OPTIONS } from '../core/visibility.js';
 import { isHttpProtocol } from '../crawl/normalize-url.js';
@@ -49,9 +50,13 @@ import {
   type MethodOverride,
 } from './candidate-contracts.js';
 import { submitterTextHasSubmitWord, submitterWordsOf } from './classify.js';
+import { textsHaveDestructiveActionWord } from './destructive-action.js';
+import { digitTemplateOf } from './state-keys.js';
 import { readElementsInIsolatedWorld, readInIsolatedWorld, type InPageElementsResult, type IsolatedElementReference } from './isolated-read.js';
 import { readInParts } from '../core/read-in-parts.js';
-import { composeInPage, type StandardReaders } from '../browser/in-page-readers.js';
+import {
+  composeInPage, DISCOVERY_CANDIDATE_ELEMENT_CRITERIA, type DiscoveryCandidateElementCriteria, type StandardReaders,
+} from '../browser/in-page-readers.js';
 
 // COV-6b-1（N26・N27）: 1 つの画面で走査する要素の数（前は 100,000）と候補の数（前は 500）の上限は撤廃した（全部の要素を、分けて全部読む）。
 // 定数は LZ-1 で消した。
@@ -59,10 +64,6 @@ import { composeInPage, type StandardReaders } from '../browser/in-page-readers.
 export const SHADOW_ROOT_STEP = -1;
 /** 別の文書を持ちうる要素の名前（あれば、その画面を `INCOMPLETE_FRAME_OR_CLOSED_SHADOW` にする）。 */
 export const FRAME_ELEMENT_NAMES = Object.freeze(['iframe', 'frame', 'frameset', 'object', 'embed', 'fencedframe', 'portal'] as const);
-/** ボタンの候補として読む `input` の `type`（ボタンの形。送信の形は、form に属すれば送信ボタン、属さなければボタンの候補）。 */
-const BUTTON_INPUT_TYPES = Object.freeze(['submit', 'image', 'button', 'reset'] as const);
-/** 送信ボタンになる `input` の `type`。 */
-const SUBMIT_INPUT_TYPES = Object.freeze(['submit', 'image'] as const);
 /** checkbox と radio の `value` の属性がないときの値（HTML の既定）。 */
 const DEFAULT_CHECKABLE_VALUE = 'on';
 /** `NodeFilter.SHOW_ELEMENT` の値（ページの中の `NodeFilter` を読まずに渡す）。 */
@@ -86,8 +87,8 @@ interface DiscoveryProbeInput {
   readonly shadowRootStep: number;
   readonly constraintNames: readonly string[];
   readonly frameElementNames: readonly string[];
-  readonly buttonInputTypes: readonly string[];
-  readonly submitInputTypes: readonly string[];
+  /** SKIP-1: 候補になる要素の基準（`DISCOVERY_CANDIDATE_ELEMENT_CRITERIA`。form の欄からボタンの形の `input` を除くのにも使う）。 */
+  readonly candidateElements: DiscoveryCandidateElementCriteria;
   readonly defaultCheckableValue: string;
   readonly methodOverrideFieldName: string;
   readonly methodOverrideValues: readonly string[];
@@ -114,6 +115,8 @@ interface RawProbeField {
   readonly hidden: boolean;
   readonly constraints: readonly (string | null)[];
   readonly options: readonly string[] | null;
+  /** REV-RCA の I-3: 選択肢ごとの表示の文字（select は option の文字、checkbox と radio は label の文字。Node の側で削除の語の判定にだけ使い、捨てる）。 */
+  readonly optionTexts?: readonly (readonly string[])[] | null;
   readonly omittedOptionCount: number;
   readonly hasValue: boolean;
 }
@@ -134,6 +137,8 @@ interface RawProbeCandidate {
   readonly target: string | null;
   readonly fields: readonly RawProbeField[];
   readonly submitterText: string | null;
+  /** CALDAY fix round 1: 押す組の決めだけに使う文字（`submitterShapeTextOf`）。 */
+  readonly submitterShapeText: string | null;
   readonly inlineHandler: boolean;
   readonly form: RawProbeElement | null;
   readonly submitter: RawProbeElement | null;
@@ -179,10 +184,9 @@ function discoveryProbeReader(R: StandardReaders, input: DiscoveryProbeInput): R
   const inputValueOf = getterOf(HTMLInputElement.prototype, 'value');
   const inputCheckedOf = getterOf(HTMLInputElement.prototype, 'checked');
   const inputFilesOf = getterOf(HTMLInputElement.prototype, 'files');
-  const inputFormOf = getterOf(HTMLInputElement.prototype, 'form');
+  const inputLabelsOf = getterOf(HTMLInputElement.prototype, 'labels');
+  const nodeListLengthOf = getterOf(NodeList.prototype, 'length');
   const fileListLengthOf = getterOf(FileList.prototype, 'length');
-  const buttonTypeOf = getterOf(HTMLButtonElement.prototype, 'type');
-  const buttonFormOf = getterOf(HTMLButtonElement.prototype, 'form');
   const selectTypeOf = getterOf(HTMLSelectElement.prototype, 'type');
   const selectOptionsOf = getterOf(HTMLSelectElement.prototype, 'options');
   const selectValueOf = getterOf(HTMLSelectElement.prototype, 'value');
@@ -273,38 +277,23 @@ function discoveryProbeReader(R: StandardReaders, input: DiscoveryProbeInput): R
   const forms: Element[] = [];
   const submittersByForm = new Map<unknown, Element[]>();
   const buttonCandidates: Element[] = [];
+  // SKIP-1: 候補の選び方は、点検の段の DOM の数え方と共通の部品（`discoveryCandidateElementOf`）。
   for (const element of elements) {
-    const name = text(localNameOf(element));
-    if (input.frameElementNames.includes(name)) {
+    if (input.frameElementNames.includes(text(localNameOf(element)))) {
       frameFound = true;
     }
-    if (name === 'form') {
+    const found = R.discoveryCandidateElementOf(element, input.candidateElements);
+    if (found === null) {
+      continue;
+    }
+    if (found.kind === 'FORM') {
       forms.push(element);
-      continue;
-    }
-    let owner: unknown = null;
-    let submitter = false;
-    if (name === 'button') {
-      owner = buttonFormOf(element);
-      submitter = text(buttonTypeOf(element)) === 'submit';
-    } else if (name === 'input') {
-      const type = text(inputTypeOf(element));
-      if (!input.buttonInputTypes.includes(type)) {
-        continue;
-      }
-      owner = inputFormOf(element);
-      submitter = input.submitInputTypes.includes(type);
-    } else if (text(getAttribute(element, 'role')).trim().toLowerCase().split(/\s+/u)[0] === 'button') {
-      // `role=button` の要素は送信ボタンにならないので、form の中でも外でもボタンの候補にする。
-    } else {
-      continue;
-    }
-    if (owner === null || !submitter) {
+    } else if (found.kind === 'BUTTON') {
       buttonCandidates.push(element);
     } else {
-      const list = submittersByForm.get(owner) ?? [];
+      const list = submittersByForm.get(found.form) ?? [];
       list.push(element);
-      submittersByForm.set(owner, list);
+      submittersByForm.set(found.form, list);
     }
   }
 
@@ -324,6 +313,21 @@ function discoveryProbeReader(R: StandardReaders, input: DiscoveryProbeInput): R
       .filter((part, index, all) => part.length > 0 && all.indexOf(part) === index);
     return parts.join(' ');
   };
+  /**
+   * CALDAY fix round 1: 押す組の決めだけに使う文字（見える文字。空なら支援技術の名前 `aria-label`・`title`）。Node の側で数字を `{n}` にした型の digest にし、
+   * 文字は持たない。
+   */
+  const submitterShapeTextOf = (element: Element): string => {
+    const name = text(localNameOf(element));
+    const own = (name === 'input'
+      ? text(getAttribute(element, text(inputTypeOf(element)) === 'image' ? 'alt' : 'value'))
+      : text(textContentOf(element))).replace(/\s+/gu, ' ').trim();
+    if (own.length > 0) return own;
+    return [text(getAttribute(element, 'aria-label')), text(getAttribute(element, 'title'))]
+      .map((part) => part.replace(/\s+/gu, ' ').trim())
+      .filter((part, index, all) => part.length > 0 && all.indexOf(part) === index)
+      .join(' ');
+  };
 
   // form の欄（form に属する入力の欄。送信ボタンとリセット・普通のボタンは含めない）と `_method` の値。
   const fieldsOf = (form: Element): { fields: RawProbeField[]; methodOverride: string | null } => {
@@ -340,7 +344,7 @@ function discoveryProbeReader(R: StandardReaders, input: DiscoveryProbeInput): R
       let type: string;
       if (tag === 'input') {
         type = text(inputTypeOf(element));
-        if (input.buttonInputTypes.includes(type)) {
+        if (input.candidateElements.buttonInputTypes.includes(type)) {
           continue;
         }
       } else if (tag === 'select') {
@@ -356,22 +360,32 @@ function discoveryProbeReader(R: StandardReaders, input: DiscoveryProbeInput): R
       }
       // L13（N28・N29）: 欄と選択肢は数で打ち切らない（前は 200 個目・50 個目の後を読まなかった。省いた選択肢の数の項目は 0 のまま。候補の識別に入るので残す）。
       let options: string[] | null = null;
+      // REV-RCA の I-3: 選択肢ごとの表示の文字（Node の側で削除の語の判定にだけ使う）。
+      let optionTexts: string[][] | null = null;
       const omittedOptionCount = 0;
       let hasValue: boolean;
       if (tag === 'select') {
         const optionElements = selectOptionsOf(element);
         const optionCount = lengthOf(optionElements);
         options = [];
+        optionTexts = [];
         for (let optionIndex = 0; optionIndex < optionCount; optionIndex += 1) {
           const option = itemOf(optionElements, optionIndex);
           // LZ-2: 選択肢の値は切り詰めない（前は 256 文字まで）。
           options.push(option === null ? '' : text(getAttribute(option, 'value')));
+          optionTexts.push(option === null ? [] : [text(textContentOf(option))]);
         }
         hasValue = text(selectValueOf(element)).length > 0;
       } else if (tag === 'textarea') {
         hasValue = text(textAreaValueOf(element)).length > 0;
       } else if (type === 'checkbox' || type === 'radio') {
         options = [getAttribute(element, 'value') ?? input.defaultCheckableValue];
+        const labels = inputLabelsOf(element) as NodeList | null;
+        const labelTexts: string[] = [];
+        for (let labelIndex = 0; labels !== null && labelIndex < Number(nodeListLengthOf(labels)); labelIndex += 1) {
+          labelTexts.push(text(textContentOf(NodeList.prototype.item.call(labels, labelIndex))));
+        }
+        optionTexts = [labelTexts];
         hasValue = inputCheckedOf(element) === true;
       } else if (type === 'file') {
         const files = inputFilesOf(element);
@@ -391,6 +405,7 @@ function discoveryProbeReader(R: StandardReaders, input: DiscoveryProbeInput): R
         // LZ-2: 制約の属性の値は切り詰めない（前は 512 文字まで）。
         constraints: input.constraintNames.map((constraint) => getAttribute(element, constraint)),
         options,
+        optionTexts,
         omittedOptionCount,
         hasValue,
       });
@@ -445,6 +460,7 @@ function discoveryProbeReader(R: StandardReaders, input: DiscoveryProbeInput): R
         target,
         fields,
         submitterText: submitter === null ? null : submitterTextOf(submitter),
+        submitterShapeText: submitter === null ? null : submitterShapeTextOf(submitter),
         inlineHandler: hasAttribute(form, 'onsubmit') || (submitter !== null && hasAttribute(submitter, 'onclick')),
         form: describe(form),
         submitter: submitter === null ? null : describe(submitter),
@@ -464,6 +480,7 @@ function discoveryProbeReader(R: StandardReaders, input: DiscoveryProbeInput): R
       target: null,
       fields: [],
       submitterText: submitterTextOf(button),
+      submitterShapeText: submitterShapeTextOf(button),
       inlineHandler: hasAttribute(button, 'onclick'),
       form: null,
       submitter: describe(button),
@@ -487,8 +504,7 @@ const DISCOVERY_PROBE_INPUT: DiscoveryProbeInput = Object.freeze({
   shadowRootStep: SHADOW_ROOT_STEP,
   constraintNames: FIELD_CONSTRAINT_NAMES,
   frameElementNames: FRAME_ELEMENT_NAMES,
-  buttonInputTypes: BUTTON_INPUT_TYPES,
-  submitInputTypes: SUBMIT_INPUT_TYPES,
+  candidateElements: DISCOVERY_CANDIDATE_ELEMENT_CRITERIA,
   defaultCheckableValue: DEFAULT_CHECKABLE_VALUE,
   methodOverrideFieldName: METHOD_OVERRIDE_FIELD_NAME,
   methodOverrideValues: METHOD_OVERRIDE_VALUES,
@@ -527,6 +543,11 @@ export interface ProbedCandidate {
    * probe の押す順だけが使う（候補の契約・識別の digest・成果物には入れない）。送信ボタンのない form は false。
    */
   readonly hasSubmitWord: boolean;
+  /**
+   * CALDAY fix round 1（設計者の判断 1）: 送信ボタンの文字の型の digest（`submitterTextShapeOf`。見える文字、空なら支援技術の名前の、数字を `{n}` にした型）。
+   * 送らずに観察する probe の押す組の決めだけが使う（候補の契約・識別の digest・成果物には入れない。`hasSubmitWord` と同じ扱い）。省略は読んでいない。
+   */
+  readonly submitterTextShape?: string;
   /** inline の処理（form の `onsubmit`、送信ボタンの `onclick` の属性）があるか。 */
   readonly inlineHandler: boolean;
   /** form（`BUTTON` は null）。 */
@@ -604,6 +625,12 @@ const fieldOf = (value: unknown): CandidateField => {
     : requireArray(raw['options']).map((option) => requireString(option));
   const omittedOptionCount = raw['omittedOptionCount'];
   if (!isNonNegativeSafeInteger(omittedOptionCount)) throw new ProbeShapeError();
+  // REV-RCA の I-3: 値か表示の文字が削除の語に当たる選択肢の位置（判定は操作さがしの選び方 REV-SD の I-4 (a) と同じ `textsHaveDestructiveActionWord`）。文字は捨てる。
+  const optionTexts = raw['optionTexts'] === null || raw['optionTexts'] === undefined ? [] : requireArray(raw['optionTexts']);
+  const destructiveOptionIndexes = (options ?? []).flatMap((option, index) => {
+    const texts = optionTexts[index] === undefined ? [] : requireArray(optionTexts[index]).map((entry) => requireString(entry));
+    return textsHaveDestructiveActionWord([option, ...texts]) ? [index] : [];
+  });
   return {
     name: requireString(raw['name']),
     tag: requireOneOf<CandidateFieldTag>(CANDIDATE_FIELD_TAGS, raw['tag']),
@@ -616,6 +643,7 @@ const fieldOf = (value: unknown): CandidateField => {
     options,
     omittedOptionCount,
     hasValue: requireBoolean(raw['hasValue']),
+    ...(destructiveOptionIndexes.length === 0 ? {} : { destructiveOptionIndexes }),
   };
 };
 
@@ -631,6 +659,16 @@ const elementOf = (value: unknown): ProbedElement | null => {
   return { path, localName: requireString(raw['localName']) };
 };
 
+/** CALDAY fix round 1: 文字の型の digest の入力の形の印（版つき）。 */
+const SUBMITTER_TEXT_SHAPE_FORMAT = 'beaksight-probe-submitter-text-shape/1';
+
+/**
+ * CALDAY fix round 1（設計者の判断 1）: 押す組の決めだけに使う、送信ボタンの文字の型の digest（数字の並びを `{n}` にした型。`digitTemplateOf`）。文字がない
+ * （送信ボタンのない form）は空の文字と同じ型。
+ */
+export const submitterTextShapeOf = (shapeText: string | null): string =>
+  createSha256Fingerprint(JSON.stringify([SUBMITTER_TEXT_SHAPE_FORMAT, digitTemplateOf(normalizeWhitespace(shapeText ?? ''))]));
+
 const candidateOf = (value: unknown): ProbedCandidate => {
   const raw = requireRecord(value);
   const kind = requireOneOf<CandidateKind>(['FORM', 'BUTTON'], raw['kind']);
@@ -641,6 +679,8 @@ const candidateOf = (value: unknown): ProbedCandidate => {
     hasSubmitterText: submitterText !== null && normalizeWhitespace(submitterText).length > 0,
     // T44c: 押す順だけの送信の語の印（文言は持たない）。
     hasSubmitWord: submitterText !== null && submitterTextHasSubmitWord(normalizeWhitespace(submitterText)),
+    // CALDAY fix round 1: 押す組の決めだけの文字の型（文字は持たない）。
+    submitterTextShape: submitterTextShapeOf(raw['submitterShapeText'] === undefined ? null : requireNullableString(raw['submitterShapeText'])),
     inlineHandler: requireBoolean(raw['inlineHandler']),
     submitter: elementOf(raw['submitter']),
   };

@@ -545,6 +545,25 @@ const carriesMarker = (text: string, markers: readonly string[]): boolean => {
 const safeNameOf = (name: string, markers: readonly string[]): string =>
   isValueLikeText(name) || carriesMarker(name, markers) ? REDACTED : name;
 
+/**
+ * RCA-1（検索の確かめの設計書 2.1）: URL の query のうち、値が目印のどれかを含む名前（型に残してよい形 `safeNameOf`。重なりなし・並べる）。読み取りの記録が、
+ * どの名前が欄に入れた値を運んだかを残すために使う（値は残さない）。URL を読めなければ空。
+ */
+export const markerCarryingQueryNameShapesOf = (url: string, markers: readonly string[]): readonly string[] => {
+  const scoped = markersOf(markers);
+  let parsed: URL;
+  try {
+    parsed = new URL(url);
+  } catch {
+    return Object.freeze([]);
+  }
+  const names = new Set<string>();
+  for (const [name, value] of parsed.searchParams) {
+    if (carriesMarker(value, scoped)) names.add(safeNameOf(name, scoped));
+  }
+  return Object.freeze(sortedTexts([...names]));
+};
+
 /** 並べた写し（UTF-16 のコード単位の順）。 */
 const sortedTexts = (values: readonly string[]): string[] => {
   const copy = [...values];
@@ -639,6 +658,17 @@ const pathShapeOf = (pathname: string, markers: readonly string[]): string => {
   }
   return segments.join(PATH_SEPARATOR);
 };
+
+/**
+ * QUIET-3（設計書 `2026-11-24-beaksight-discovery-stuck-step-design.md` 2.3）: 型と要求の口を突き合わせる鍵（method・Origin の区分・path の型）の唯一の作り方。
+ * 型は型の値から、要求の口は method（大文字）・Origin の区分・URL の path（目印なしで型にする）から作る。
+ */
+export const apiShapeEndpointKeyOf = (shape: Pick<ApiRequestShape, 'method' | 'origin' | 'pathShape'>): string =>
+  JSON.stringify([shape.method, shape.origin.kind, 'index' in shape.origin ? shape.origin.index : null, shape.pathShape]);
+
+/** QUIET-3: 要求の口（method・Origin の区分・URL の path）を、型と突き合わせる鍵にする（path の型は型と同じ部品 `pathShapeOf`）。 */
+export const apiEndpointShapeKeyOf = (method: string, origin: ApiRequestOriginShape, pathname: string): string =>
+  apiShapeEndpointKeyOf({ method: method.toUpperCase(), origin: originShapeOf(origin), pathShape: pathShapeOf(pathname, []) });
 
 /** query の名前と filter の形。 */
 const queryShapeOf = (

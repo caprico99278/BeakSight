@@ -184,7 +184,7 @@ export const readCheckPageUrlOf = (origin: string, path: string): string | null 
 // `fingerprint.ts` と同じ印）で、ほかに `{`・`}` を持たない。読む URL は、`{id}` に台帳の ID（安全な形だけ。判定は呼び出し側の唯一の判定
 // `isUsableRecordId` を受ける）を入れて、`readCheckPageUrlOf` で組み立てる。保存の確かめは、代わりの値（`READ_CHECK_PAGE_TEMPLATE_SAMPLE_ID`）を
 // 入れた path で、今の画面の READ の確かめを通す。`readCheckPageUrlOf` は型を組み立てない（fail-closed）。実際の照合（ID を入れて読む）は Task 40。
-// DEF-235: READ の確かめのジョブも、型の定義を、番号を埋めて読む（番号の元と一覧の画面は `read-check-record-ids.ts`。読む URL は照合と同じ確かめ直し）。
+// RCA-6（検索の確かめの設計書 2.2）: READ の確かめの段は、型の定義を読まない（DEF-235 の番号を埋めて読む所はやめた）。
 
 /** path の区切り。 */
 const PAGE_PATH_SEPARATOR = '/';

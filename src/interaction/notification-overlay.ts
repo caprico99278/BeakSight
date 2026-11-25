@@ -8,7 +8,9 @@
 // - 置き場所: 見分けた結果は、見るだけの点検と操作さがしの両方で、閉じるボタンを押す前の読み取りに使う（押す部品と同じ層）。ページを読む部品は、
 //   操作さがしの押す部品（`src/interaction/submission-probe.ts`）と同じく、isolated world の読み取りの部品（`src/discovery/isolated-read.ts`）だけで読む。
 import type { Page } from 'playwright';
-import { composeInPage, type StandardReaders } from '../browser/in-page-readers.js';
+import {
+  composeInPage, DISCOVERY_CANDIDATE_ELEMENT_CRITERIA, FRONT_WINDOW_MIN_VIEWPORT_RATIO, type PressableButtonFacts, type PressableButtonFactsCriteria, type StandardReaders,
+} from '../browser/in-page-readers.js';
 import { deadlineWithinTimeoutAtMs } from '../core/deadline.js';
 import { DISCOVERY_SETTLE_POLICY, waitForDiscoverySettled, type DiscoverySettlePolicy, type QuietSource } from '../discovery/settle.js';
 import { SYSTEM_CLOCK, type Clock } from '../core/clock.js';
@@ -16,6 +18,7 @@ import { isRecord } from '../core/guards.js';
 import { PRODUCTION_OBSERVATION_WINDOWS, observationWindowsOrProduction, type ObservationWindows } from '../core/observation-windows.js';
 import type {
   NotificationFrameEvidence,
+  NotificationFrameHiddenAt,
   NotificationFrameHiddenReason,
   NotificationFrameStatus,
   NotificationOverlayEvidence,
@@ -47,6 +50,7 @@ import { isPageInAuditScope } from '../orchestration/audit-scope-watch.js';
 import {
   readElementInIsolatedWorld,
   readElementsInIsolatedWorld,
+  readInIsolatedWorld,
   withSignaledElements,
   type InPageElementsResult,
   type IsolatedElementReference,
@@ -108,13 +112,17 @@ const IDENTITY_LANDMARK_NAMES = Object.freeze(['nav', 'aside', 'header', 'footer
 const IDENTITY_LANDMARK_ROLES = Object.freeze(['navigation', 'banner', 'complementary', 'contentinfo', 'main', 'dialog', 'alertdialog'] as const);
 /** 3.1 の 3: 押せる要素。 */
 const PRESSABLE_SELECTOR = 'button, [role="button"], a';
-/** NO-2: form の送信ボタン（form の中か `form` の属性を持つ、型のない button・submit・image）。閉じるボタンにしない。 */
-const FORM_SUBMITTER_SELECTOR = [
-  'form button:not([type])', 'form button[type="submit"]', 'form input[type="submit"]', 'form input[type="image"]',
-  'button[form]:not([type])', 'button[form][type="submit"]', 'input[form][type="submit"]', 'input[form][type="image"]',
-].join(', ');
 /** fix round 3（設計書 3.2.2 の 6）: ネットワークへ送らない form の method（`<form method="dialog">`）。 */
 const DIALOG_FORM_METHOD = 'dialog';
+/**
+ * FRET（2026-11-25）: 閉じるボタンの判定（`isCloseButton`）に渡す事実の読み方の基準と、押せる要素の selector（窓を開くボタンの確かめの、窓の中の閉じるボタンの
+ * 選び方と共有する）。NO-2 の form の送信ボタン（閉じるボタンにしない）は、FRET の fix round 3（2026-11-26）から、属性の selector でなく IDL の `type` と `form`
+ * で見分ける（`DISCOVERY_CANDIDATE_ELEMENT_CRITERIA` の基準。`<button type="x">` も送信ボタン）。
+ */
+export const CLOSE_BUTTON_FACTS_CRITERIA: PressableButtonFactsCriteria = Object.freeze({
+  candidateCriteria: DISCOVERY_CANDIDATE_ELEMENT_CRITERIA, dialogFormMethod: DIALOG_FORM_METHOD,
+});
+export const CLOSE_BUTTON_PRESSABLE_SELECTOR = PRESSABLE_SELECTOR;
 /** fix round 2: 枠の中の最初の見出し（枠そのものの名前の 1 つ）。 */
 const FRAME_HEADING_SELECTOR = 'h1, h2, h3, h4, h5, h6, [role="heading"]';
 /** DEF-204 と同じ扱い: 要素そのものが中身を描く種類の selector（画像・埋め込み・入力の欄）。 */
@@ -138,11 +146,13 @@ interface NotificationFrameReadInput {
   readonly identityNames: readonly string[];
   readonly identityRoles: readonly string[];
   readonly pressableSelector: string;
-  readonly formSubmitterSelector: string;
+  readonly candidateCriteria: PressableButtonFactsCriteria['candidateCriteria'];
   readonly replacedContentSelector: string;
   readonly headingSelector: string;
   readonly dialogFormMethod: string;
   readonly visibilityOptions: typeof VISIBILITY_CHECK_OPTIONS;
+  /** RVP-3: 前面の窓（`R.frontWindows`）とみなす面積の割合の下限（値は部品の側の 1 か所）。 */
+  readonly frontWindowRatio: number;
 }
 
 const NOTIFICATION_FRAME_READ_INPUT: NotificationFrameReadInput = Object.freeze({
@@ -158,11 +168,12 @@ const NOTIFICATION_FRAME_READ_INPUT: NotificationFrameReadInput = Object.freeze(
   identityNames: IDENTITY_LANDMARK_NAMES,
   identityRoles: IDENTITY_LANDMARK_ROLES,
   pressableSelector: PRESSABLE_SELECTOR,
-  formSubmitterSelector: FORM_SUBMITTER_SELECTOR,
+  candidateCriteria: DISCOVERY_CANDIDATE_ELEMENT_CRITERIA,
   headingSelector: FRAME_HEADING_SELECTOR,
   dialogFormMethod: DIALOG_FORM_METHOD,
   replacedContentSelector: REPLACED_CONTENT_SELECTOR,
   visibilityOptions: VISIBILITY_CHECK_OPTIONS,
+  frontWindowRatio: FRONT_WINDOW_MIN_VIEWPORT_RATIO,
 });
 
 /** ビューポートの座標の矩形（読んだ値）。 */
@@ -204,6 +215,13 @@ export interface NotificationCandidateRead {
    * この項目より前の読み取りの値にはない（ないときは名前なし）。
    */
   readonly names?: readonly string[];
+  /**
+   * AUD-2（設計書 `2026-11-19-beaksight-audit-result-review-fixes-design.md` 5.1）: 見えているモーダルの小窓（判定の 1 か所 `R.openModalDialogs`）か、その中の要素か、
+   * その暗転の要素か。この項目より前の読み取りの値にはない（ないときはモーダルでない）。
+   */
+  readonly modal?: boolean;
+  /** RVP-3: 前面の窓（判定の 1 か所 `R.frontWindows`）そのものか。この項目より前の読み取りの値にはない（ないときは前面の窓でない）。 */
+  readonly frontWindow?: boolean;
 }
 
 /** 読んだ押せる要素（いちばん近い祖先の枠の候補に属する）。 */
@@ -214,6 +232,8 @@ export interface NotificationButtonRead {
   readonly text: string;
   readonly ariaLabel: string;
   readonly title: string;
+  /** AUD-2（5.1）: 中の画像の `alt`（空白でつなぎ、空白をまとめる。ないときは空）。この項目より前の読み取りの値にはない。 */
+  readonly imageAlt?: string;
   /** 押せない（`:disabled` か `aria-disabled="true"`）か。 */
   readonly disabled: boolean;
   /**
@@ -270,9 +290,6 @@ const readNotificationFramesInPage = composeInPage((R: StandardReaders, input: N
   const clientWidthOf = standardGetter<number>(Element.prototype, 'clientWidth');
   const clientHeightOf = standardGetter<number>(Element.prototype, 'clientHeight');
   const documentElement = standardGetter<Element>(Document.prototype, 'documentElement')(document);
-  // fix round 7（F5-I1）: form の method は、属性の文字ではなく、ブラウザが決めた値（prototype の getter。空白や不正な値は dialog にならない）で比べる。
-  const buttonFormMethodOf = standardGetter<string>(HTMLButtonElement.prototype, 'formMethod');
-  const formMethodOf = standardGetter<string>(HTMLFormElement.prototype, 'method');
   const attributeOf = (element: Element, name: string): string => {
     const value: unknown = Element.prototype.getAttribute.call(element, name);
     return typeof value === 'string' ? value : '';
@@ -316,8 +333,14 @@ const readNotificationFramesInPage = composeInPage((R: StandardReaders, input: N
   const candidateIndexes = new Map<Element, number>();
   const candidates: {
     shape: string; position: string; dialog: boolean; popover: boolean; inExcludedLandmark: boolean; landmarks: string[];
-    parent: number; surface: number; element: number; names: string[];
+    parent: number; surface: number; element: number; names: string[]; modal: boolean; frontWindow: boolean;
   }[] = [];
+  // AUD-2: モーダルの小窓と暗転の要素（判定は部品の 1 か所）。小窓の中の要素も、モーダルの側にする。
+  const modalDialogs = R.openModalDialogs();
+  // RVP-3: 前面の窓（判定は部品の 1 か所）。
+  const frontWindows = R.frontWindows(input.frontWindowRatio);
+  const isModalSide = (element: Element): boolean => modalDialogs.some(({ dialog, backdrop }) =>
+    element === backdrop || element === dialog || Node.prototype.contains.call(dialog, element));
   // fix round 2: 枠そのものの名前（`aria-label`・`aria-labelledby` の要素の文字・枠の中の最初の見出しの文字）。
   const namesOf = (element: Element): string[] => {
     const names: string[] = [];
@@ -370,22 +393,15 @@ const readNotificationFramesInPage = composeInPage((R: StandardReaders, input: N
     candidateElements.push(element);
     candidates.push({
       shape: name + '[' + role + ']', position, dialog, popover, inExcludedLandmark, landmarks, parent,
-      surface: surfaceOf(element), element: candidateElements.length - 1, names: namesOf(element),
+      surface: surfaceOf(element), element: candidateElements.length - 1, names: namesOf(element), modal: isModalSide(element),
+      frontWindow: frontWindows.includes(element),
     });
   }
 
   const buttonElements: Element[] = [];
-  const buttons: {
-    candidate: number; text: string; ariaLabel: string; title: string; disabled: boolean; formSubmitter: boolean; chain: number[];
-    rect: { left: number; top: number; width: number; height: number }; element: number;
-    link: { isAnchor: boolean; href: string | null; download: boolean; target: string; formAction: string | null };
-    destructive: DestructiveActionFacts;
-  }[] = [];
-  const rawAttributeOf = (element: Element, name: string): string | null => {
-    const value: unknown = Element.prototype.getAttribute.call(element, name);
-    // URL-LEN: リンクの移りうる先は切り詰めない（前は 2,048 まで読んだ）。
-    return typeof value === 'string' ? value : null;
-  };
+  const buttons: (PressableButtonFacts & {
+    candidate: number; chain: number[]; rect: { left: number; top: number; width: number; height: number }; element: number;
+  })[] = [];
   const perCandidate = new Map<number, number>();
   const pressables = Document.prototype.querySelectorAll.call(document, input.pressableSelector);
   const pressableCount = nodeListLengthOf(pressables);
@@ -414,34 +430,11 @@ const readNotificationFramesInPage = composeInPage((R: StandardReaders, input: N
     const chain = [candidateSurface];
     const inner = ancestors.reverse().slice(0, Math.max(0, limits.maxSurfaceChainDepth - 1));
     for (const node of inner) chain.push(surfaceOf(node));
-    const disabled = matchesOf(element, ':disabled') || attributeOf(element, 'aria-disabled').trim().toLowerCase() === 'true';
-    // fix round 3（設計書 3.2.2 の 6）: `<form method="dialog">` の中のボタンは、ネットワークへ送らないので、送信ボタンにしない。
-    const ownerForm = Element.prototype.closest.call(element, 'form');
-    // fix round 5（設計書 3.2.4 の 1）: `formmethod` が dialog でないボタン、`formaction` のあるボタン、`form` 属性のあるボタンは、dialog の form の中でも送るので、
-    // 送信ボタンのまま扱う。
-    // fix round 7（F5-I1）: `formmethod` のあるボタンは、ブラウザが決めた `formMethod` が dialog のときだけ、ないボタンは form の `method` だけで決める。
-    const buttonMethodIsDialog = !Element.prototype.hasAttribute.call(element, 'formmethod')
-      || (element instanceof HTMLButtonElement && buttonFormMethodOf(element) === input.dialogFormMethod);
-    const inDialogForm = ownerForm instanceof HTMLFormElement && !Element.prototype.hasAttribute.call(element, 'form')
-      && !Element.prototype.hasAttribute.call(element, 'formaction')
-      && buttonMethodIsDialog
-      && formMethodOf(ownerForm) === input.dialogFormMethod;
-    const formSubmitter = matchesOf(element, input.formSubmitterSelector) && !inDialogForm;
-    const text = element instanceof HTMLElement ? innerTextOf(element) : '';
     buttonElements.push(element);
+    // FRET（2026-11-25）: 閉じるボタンの判定に渡す事実の読み方は、部品（`R.pressableButtonFactsOf`）の 1 か所（窓を開くボタンの確かめと共有する）。
+    // fix round 3・5・7 の、`<form method="dialog">` の中のボタンを送信ボタンにしない決まりも、部品の側にある。
     buttons.push({
-      candidate, text: squeezed(typeof text === 'string' ? text : ''), ariaLabel: squeezed(attributeOf(element, 'aria-label')),
-      title: squeezed(attributeOf(element, 'title')), disabled, formSubmitter, chain, rect: rectOf(element),
-      element: candidateElements.length + buttonElements.length - 1,
-      link: {
-        isAnchor: localNameOf(element) === 'a',
-        href: rawAttributeOf(element, 'href'),
-        download: Element.prototype.hasAttribute.call(element, 'download'),
-        target: (rawAttributeOf(element, 'target') ?? '').trim().toLowerCase(),
-        formAction: rawAttributeOf(element, 'formaction'),
-      },
-      // SD-1: 操作の前の判定の事実（判定は Node の側の `isDestructiveAction`）。
-      destructive: R.destructiveActionFactsOf(element),
+      ...R.pressableButtonFactsOf(element, input), candidate, chain, rect: rectOf(element), element: candidateElements.length + buttonElements.length - 1,
     });
   }
   return {
@@ -561,14 +554,15 @@ const hasNoVisibleWords = (text: string): boolean => {
  * 押せる要素が閉じるボタンか（見える文字・`aria-label`・`title` のどれかが閉じる語に当たる）。NO-2: form の送信ボタンは、閉じるボタンにしない（閉じる押下で、
  * 送信をしない）。SD-1（設計書 `2026-11-16-beaksight-action-based-delete-guard-design.md` 2.2・2.3）: 削除に関する操作（操作の前の判定 `isDestructiveAction`。
  * 名前の削除の語・行の ×・削除の確かめの枠の中など）は閉じるボタンにしない。枠を閉じる「キャンセル」（`isFrameClosingCancel`）は閉じるボタンにする。事実のない
- * 前の読み取りは、名前だけで判定する。
+ * 前の読み取りは、名前だけで判定する。FRET（2026-11-25）: 窓を開くボタンの確かめの、窓の中の閉じるボタンも、この 1 か所で選ぶ。
  */
-const isCloseButton = (
-  button: Pick<NotificationButtonRead, 'text' | 'ariaLabel' | 'title' | 'formSubmitter' | 'link' | 'destructive'>,
+export const isCloseButton = (
+  button: Pick<NotificationButtonRead, 'text' | 'ariaLabel' | 'title' | 'imageAlt' | 'formSubmitter' | 'link' | 'destructive'>,
   frameNames: readonly string[] = [],
   baseUrl = '',
 ): boolean => {
-  const names = [button.text, button.ariaLabel, button.title];
+  // AUD-2（5.1）: 名前が中の画像の alt だけのアイコンのボタンも見る（語の一覧と境目の決まりは今のまま）。
+  const names = [button.text, button.ariaLabel, button.title, button.imageAlt ?? ''];
   const facts = button.destructive ?? destructiveActionFactsOfNames(names);
   return button.formSubmitter !== true && !movesWhenPressed(button.link, baseUrl)
     // fix round 3（設計書 3.2.2 の 3）: 枠の名前を目的語として当てるのは、見える文字がない（アイコンか閉じる記号だけの）ボタンだけ。
@@ -628,8 +622,8 @@ export const notificationFrameDigestOf = (facts: NotificationFrameIdentityFacts)
 /** 見分けた枠の状態の閉じた一覧（定義は Evidence の型 `src/core/evidence-types.ts` の `NOTIFICATION_FRAME_STATUSES`）。 */
 export { NOTIFICATION_FRAME_STATUSES, type NotificationFrameStatus } from '../core/evidence-types.js';
 
-/** 見分けから外した理由（3.1 の 2 と、入れ子の外側）。 */
-export const NOTIFICATION_FRAME_EXCLUSIONS = Object.freeze(['IN_LAYOUT_LANDMARK', 'CONTAINS_FRAME'] as const);
+/** 見分けから外した理由（3.1 の 2 と、入れ子の外側。RVP-3: 自分の閉じるボタンの見つからない、モーダルでない前面の窓）。 */
+export const NOTIFICATION_FRAME_EXCLUSIONS = Object.freeze(['IN_LAYOUT_LANDMARK', 'CONTAINS_FRAME', 'FRONT_WINDOW'] as const);
 export type NotificationFrameExclusion = (typeof NOTIFICATION_FRAME_EXCLUSIONS)[number];
 
 /** 見分けた枠。 */
@@ -646,6 +640,8 @@ export interface NotificationFrame {
    */
   readonly surfaceAreaRatio: number | null;
   readonly digest: string;
+  /** AUD-2（5.1）: モーダルの小窓（その中の要素と暗転の要素を含む）か。モーダルの枠は隠さず、開いたまま点検する。 */
+  readonly modal: boolean;
 }
 
 /** 見分けの結果。 */
@@ -709,6 +705,12 @@ export const classifyNotificationFrames = (read: NotificationFramesRead): Notifi
       continue;
     }
     const closeButtons = closeButtonsOf.get(index) ?? [];
+    // RVP-3: 自分の閉じるボタンが見つからない前面の窓（閉じるボタンを、上に止まる見出しの帯などの別の候補に置いた形）は、閉じるボタンのない通知の枠と
+    // 見ない（候補から外す）。モーダルの小窓は、今どおり開いたまま点検する枠として残す。
+    if (candidate.frontWindow === true && candidate.modal !== true && closeButtons.length === 0) {
+      excluded.push({ candidate: index, reason: 'FRONT_WINDOW' });
+      continue;
+    }
     const pressable = closeButtons.find((button) => read.buttons[button]?.disabled === false);
     const named = pressable ?? closeButtons[0];
     const namedButton = named === undefined ? undefined : read.buttons[named];
@@ -731,6 +733,7 @@ export const classifyNotificationFrames = (read: NotificationFramesRead): Notifi
       status,
       closeButton: status === 'DISMISSIBLE' || status === 'TOO_LARGE' ? (pressable ?? null) : null,
       surfaceAreaRatio,
+      modal: candidate.modal === true,
       digest: notificationFrameDigestOf({
         shape: candidate.shape,
         position: candidate.position,
@@ -844,6 +847,46 @@ export async function readNotificationFrames(page: Page, deadlineAtMs: number): 
   });
 }
 
+/** AUD-2（5.3）: 見えているモーダルの小窓の、文書の根からの要素の位置（`/` でつなぐ。判定は部品の 1 か所 `R.openModalDialogs`）。 */
+const readOpenModalDialogKeysInPage = composeInPage((R: StandardReaders): string[] =>
+  R.openModalDialogs().map(({ dialog }) => (R.elementPathOf(dialog) ?? []).join('/')));
+
+/**
+ * AUD-2（設計書 `2026-11-19-beaksight-audit-result-review-fixes-design.md` 5.3）: 見えているモーダルの小窓の鍵（要素の位置）を読む（isolated world で読むだけ。
+ * ページに何も書かず、要求を足さない）。押す前と押した後に読み、押す前になかった小窓が見えるようになったかを比べる。読めなければ null。
+ */
+export async function readOpenModalDialogKeys(page: Page, deadlineAtMs: number): Promise<readonly string[] | null> {
+  const outcome = await readInIsolatedWorld(page, readOpenModalDialogKeysInPage, null, deadlineAtMs);
+  if (outcome.status !== 'READ' || !Array.isArray(outcome.value) || !outcome.value.every((key) => typeof key === 'string')) return null;
+  return Object.freeze([...(outcome.value as string[])]);
+}
+
+/**
+ * REV-AUD2 の I-1: 見えているモーダルの小窓がある画面で、`selector` に当たる要素（文書の順）のうち、小窓の中にあるものの番号。モーダルの小窓がなければ null。
+ */
+const readModalCandidateOrdinalsInPage = composeInPage((R: StandardReaders, selector: string): number[] | null => {
+  const dialogs = R.openModalDialogs();
+  if (dialogs.length === 0) return null;
+  const list = Document.prototype.querySelectorAll.call(document, selector);
+  const length = R.standardGetter<number>(NodeList.prototype, 'length')(list);
+  const inside: number[] = [];
+  for (let index = 0; index < length; index += 1) {
+    const element = NodeList.prototype.item.call(list, index);
+    if (element !== null && dialogs.some(({ dialog }) => dialog === element || Node.prototype.contains.call(dialog, element))) inside.push(index);
+  }
+  return inside;
+});
+
+/**
+ * REV-AUD2 の I-1（設計書 5.3 の「REV-AUD2 の後の判断」）: 開いた状態がモーダル（判定の 1 か所 `R.openModalDialogs`）のとき、操作の候補（`selector` に当たる要素の
+ * 文書の順の番号）のうち、小窓の中のものの番号を読む（isolated world で読むだけ）。モーダルでない・読めなければ null（候補を絞らない）。
+ */
+export async function readModalCandidateOrdinals(page: Page, selector: string, deadlineAtMs: number): Promise<readonly number[] | null> {
+  const outcome = await readInIsolatedWorld(page, readModalCandidateOrdinalsInPage, selector, deadlineAtMs);
+  if (outcome.status !== 'READ' || !Array.isArray(outcome.value) || !outcome.value.every((ordinal) => Number.isSafeInteger(ordinal))) return null;
+  return Object.freeze([...(outcome.value as number[])]);
+}
+
 // ---------------------------------------------------------------------------------------------------------------
 // 閉じる・隠す（NO-2。設計書 3.2・3.4）
 // ---------------------------------------------------------------------------------------------------------------
@@ -867,15 +910,40 @@ const isStillVisibleInPage = (element: Element, options: CheckVisibilityOptions)
   return rect.width > 0 && rect.height > 0;
 };
 
-/** 閉じられない枠を CSS で隠す（設計書 3.4。`visibility: hidden` と `pointer-events: none` を、その要素の style に付ける）。 */
-const hideFrameInPage = composeInPage((R: StandardReaders, element: Element): boolean => {
-  if (!(element instanceof HTMLElement)) return false;
+/**
+ * 閉じられない枠を CSS で隠す（設計書 3.4。`visibility: hidden` と `pointer-events: none` を、その要素の style に付ける）。AUD-2（5.2）: 隠したら、そのときの
+ * 画面の幅と文書のスクロールの位置を返す（隠せなければ null）。
+ */
+const hideFrameInPage = composeInPage((R: StandardReaders, element: Element): NotificationFrameHiddenAt | null => {
+  if (!(element instanceof HTMLElement)) return null;
   const style: unknown = R.standardGetter<CSSStyleDeclaration>(HTMLElement.prototype, 'style')(element);
-  if (!(style instanceof CSSStyleDeclaration)) return false;
+  if (!(style instanceof CSSStyleDeclaration)) return null;
   CSSStyleDeclaration.prototype.setProperty.call(style, 'visibility', 'hidden', 'important');
   CSSStyleDeclaration.prototype.setProperty.call(style, 'pointer-events', 'none', 'important');
-  return true;
+  const root = R.documentProperty<Element>('documentElement');
+  return {
+    viewportWidth: R.standardGetter<number>(Element.prototype, 'clientWidth')(root),
+    // isolated world の window で読む（ページの JS は書き換えられない）。
+    scrollX: window.scrollX,
+    scrollY: window.scrollY,
+  };
 });
+
+/** REV-AUD2 の M-2: 今の画面の幅と文書のスクロールの位置（読むだけ。隠すときの値と同じ読み方）。 */
+const readViewportPositionInPage = composeInPage((R: StandardReaders): NotificationFrameHiddenAt => ({
+  viewportWidth: R.standardGetter<number>(Element.prototype, 'clientWidth')(R.documentProperty<Element>('documentElement')),
+  scrollX: window.scrollX,
+  scrollY: window.scrollY,
+}));
+
+/** 読んだ画面の幅とスクロールの位置（形が違えば null）。 */
+const viewportPositionOf = (outcome: { readonly status: 'READ'; readonly value: unknown } | { readonly status: 'FAILED' }): NotificationFrameHiddenAt | null => {
+  if (outcome.status !== 'READ' || !isRecord(outcome.value)) return null;
+  const { viewportWidth, scrollX, scrollY } = outcome.value;
+  return typeof viewportWidth === 'number' && typeof scrollX === 'number' && typeof scrollY === 'number'
+    ? Object.freeze({ viewportWidth, scrollX, scrollY })
+    : null;
+};
 
 /** 閉じる処理の途中の結果を受け取る入れ物（fix round 2。外側の期限で打ち切ったときも、押した数と押した枠を残すため）。 */
 export interface NotificationDismissalProgress {
@@ -898,6 +966,11 @@ export interface NotificationDismissalOptions {
   readonly seenDigests?: Set<string>;
   /** 閉じる（隠す）前に、押すか隠す枠のうち初めての枠があるときだけ呼ぶ（設計書 3.3。閉じる前の layout を測るため）。 */
   readonly beforeFirstDismissal?: () => Promise<void>;
+  /**
+   * AUD-2（設計書 `2026-11-19-beaksight-audit-result-review-fixes-design.md` 5.2）: 最初の枠を隠す直前に 1 回だけ呼ぶ（隠す前の画面の画像を撮るため。読み込みは
+   * しない）。隠す枠がなければ呼ばない。失敗しても隠す処理は続ける。
+   */
+  readonly beforeFirstHide?: () => Promise<void>;
   /** fix round 2（設計書 3.2.1 の 6）: 途中の結果を、押すたびと隠すたびに書く入れ物。 */
   readonly progress?: NotificationDismissalProgress;
   /** RB-9: 観察の窓の一式（テストだけが差し込む。省略は本番の値）。 */
@@ -908,10 +981,15 @@ export interface NotificationDismissalOptions {
   readonly inAuditScope?: (() => boolean) | undefined;
 }
 
-/** 押す前に決まる、隠す理由（純粋。設計書 3.4）。`CLOSE_BUTTON_DISABLED` と、閉じるボタンがなく描く面が閾値を超える枠。 */
-export const hiddenReasonBeforePressOf = (frame: Pick<NotificationFrame, 'status' | 'surfaceAreaRatio'>): NotificationFrameHiddenReason | null => {
+/**
+ * 押す前に決まる、隠す理由（純粋。設計書 3.4）。`CLOSE_BUTTON_DISABLED` と、閉じるボタンがなく描く面が閾値を超える枠。AUD-2（5.1）: 閉じるボタンのないモーダルの
+ * 小窓は、背景を塞ぐ普通のモーダルなので、閉じられない枠にしない（隠さず、指摘にもしない）。
+ */
+export const hiddenReasonBeforePressOf = (
+  frame: Pick<NotificationFrame, 'status' | 'surfaceAreaRatio'> & { readonly modal?: boolean },
+): NotificationFrameHiddenReason | null => {
   if (frame.status === 'CLOSE_BUTTON_DISABLED') return 'CLOSE_BUTTON_DISABLED';
-  if (frame.status === 'NO_CLOSE_BUTTON' && frame.surfaceAreaRatio !== null
+  if (frame.status === 'NO_CLOSE_BUTTON' && frame.modal !== true && frame.surfaceAreaRatio !== null
     && frame.surfaceAreaRatio > NOTIFICATION_OVERLAY_LIMITS.maxViewportAreaRatio) {
     return 'NO_CLOSE_BUTTON';
   }
@@ -944,13 +1022,15 @@ interface DismissalFrame {
   readonly dismissed: boolean;
   readonly hidden: boolean;
   readonly hiddenReason: NotificationFrameHiddenReason | null;
+  readonly modal: boolean;
+  readonly hiddenAt: NotificationFrameHiddenAt | null;
   readonly frameElement: IsolatedElementReference;
 }
 
 type ReadFrames = Extract<NotificationFramesOutcome, { readonly status: 'READ' }>;
 
 /** 押すか隠す枠か（押す前に決まる）。 */
-const isActedFrame = (frame: Pick<NotificationFrame, 'status' | 'surfaceAreaRatio'>): boolean =>
+const isActedFrame = (frame: Pick<NotificationFrame, 'status' | 'surfaceAreaRatio' | 'modal'>): boolean =>
   isPressedStatus(frame.status) || hiddenReasonBeforePressOf(frame) !== null;
 
 /** 読んだ枠を覚える（読み直しで初めて見えた枠は、押すか隠す枠だけを足す。閉じた枠の外側に残った、閉じるボタンのない透明な入れ物などは足さない）。 */
@@ -972,7 +1052,8 @@ const rememberFrames = (
     if (!initial && !isActedFrame(frame)) continue;
     frames.push(Object.freeze({
       id, digest: frame.digest, status: frame.status, firstSeen: !seenBefore.has(frame.digest),
-      pressed: false, dismissed: false, hidden: false, hiddenReason: hiddenReasonBeforePressOf(frame), frameElement: frame.frameElement,
+      pressed: false, dismissed: false, hidden: false, hiddenReason: hiddenReasonBeforePressOf(frame), modal: frame.modal, hiddenAt: null,
+      frameElement: frame.frameElement,
     }));
   }
   return frames;
@@ -1009,8 +1090,10 @@ export interface NotificationDismissalPort {
   pressCloseButton(closeButton: IsolatedElementReference, deadlineAtMs: number): Promise<boolean>;
   /** 閉じるボタンが見えなくなったか（読めなければ偽）。 */
   isGone(backendNodeId: number, deadlineAtMs: number): Promise<boolean>;
-  /** 枠を CSS で隠す。隠せたか。 */
-  hideFrame(backendNodeId: number, deadlineAtMs: number): Promise<boolean>;
+  /** 枠を CSS で隠す。隠せたら、そのときの画面の幅とスクロールの位置（AUD-2。隠せなければ null）。 */
+  hideFrame(backendNodeId: number, deadlineAtMs: number): Promise<NotificationFrameHiddenAt | null>;
+  /** REV-AUD2 の M-2: 今の画面の幅とスクロールの位置（隠す前の画像を撮る部品が先頭へ移す前に読む。読めなければ null）。 */
+  readViewportPosition(deadlineAtMs: number): Promise<NotificationFrameHiddenAt | null>;
 }
 
 /** 本物の口（Playwright の page。押す期間と移動の数は、その Context の Guard に頼む）。 */
@@ -1030,6 +1113,13 @@ export const notificationDismissalPortOf = (page: Page): NotificationDismissalPo
     return visible.status === 'READ' && visible.value === false;
   },
   hideFrame: (backendNodeId: number, deadlineAtMs: number) => hideFrame(page, backendNodeId, deadlineAtMs),
+  readViewportPosition: async (deadlineAtMs: number) => {
+    try {
+      return viewportPositionOf(await readInIsolatedWorld(page, readViewportPositionInPage, null, deadlineAtMs));
+    } catch {
+      return null;
+    }
+  },
 });
 
 /**
@@ -1089,8 +1179,13 @@ export async function dismissNotificationFramesWith(
   };
   const evidence = (): NotificationOverlayEvidence => Object.freeze({
     readStatus: 'READ',
-    frames: Object.freeze(frames.map(({ digest, status, pressed, dismissed, hidden, hiddenReason, firstSeen }) =>
-      Object.freeze({ digest, status, pressed, dismissed, hidden, hiddenReason, firstSeen }))),
+    frames: Object.freeze(frames.map(({ digest, status, pressed, dismissed, hidden, hiddenReason, firstSeen, modal, hiddenAt }) =>
+      Object.freeze({
+        digest, status, pressed, dismissed, hidden, hiddenReason, firstSeen,
+        // AUD-2: モーダルの小窓は隠さず、開いたまま点検した印を残す。隠した枠は、そのときの幅とスクロールを残す。
+        ...(modal && !dismissed ? { keptOpen: true as const } : {}),
+        ...(hidden && hiddenAt !== null ? { hiddenAt: Object.freeze({ ...hiddenAt }) } : {}),
+      }))),
     pressCount,
     navigated: moved,
     truncated,
@@ -1147,10 +1242,24 @@ export async function dismissNotificationFramesWith(
     publish();
   }
   // 閉じられない枠を隠す（移動を試みた後は、隠さない）。読み直した後の、同じ要素の参照を使う。隠す処理も、押す期間の中で行う（3.2.2 の 2。始められなければ隠さない）。
+  // AUD-2（5.1）: モーダルの小窓は隠さない（開いたまま点検する）。5.2: 最初に隠す直前に 1 回だけ、隠す前の画面を撮る口を呼ぶ。
   if (!refreshMoved()) {
+    let captured = false;
+    // REV-AUD2 の M-2: 撮影の部品が先頭へ移す前の位置（撮るときだけ読む）。隠したときの記録は、この位置にする。
+    let positionBeforeCapture: NotificationFrameHiddenAt | null = null;
     for (const frame of frames) {
-      if (frame.hiddenReason === null || clock.now() >= deadlineAtMs || options.inAuditScope?.() === false || !startPressPeriod()) continue;
-      update(frame.id, { hidden: await port.hideFrame(frame.frameElement.backendNodeId, within(limits.readTimeoutMs)) });
+      if (frame.hiddenReason === null || frame.modal || clock.now() >= deadlineAtMs || options.inAuditScope?.() === false || !startPressPeriod()) continue;
+      if (!captured && options.beforeFirstHide !== undefined) {
+        captured = true;
+        positionBeforeCapture = await port.readViewportPosition(within(limits.readTimeoutMs));
+        try {
+          await options.beforeFirstHide();
+        } catch {
+          // 隠す前の画像を撮れなくても、隠す処理は続ける。
+        }
+      }
+      const hiddenAt = await port.hideFrame(frame.frameElement.backendNodeId, within(limits.readTimeoutMs));
+      update(frame.id, { hidden: hiddenAt !== null, hiddenAt: hiddenAt === null ? null : (positionBeforeCapture ?? hiddenAt) });
       publish();
     }
   }
@@ -1177,10 +1286,9 @@ async function pressCloseButton(page: Page, reference: IsolatedElementReference,
   }
 }
 
-/** 枠を CSS で隠す。隠せたか。 */
-async function hideFrame(page: Page, backendNodeId: number, deadlineAtMs: number): Promise<boolean> {
-  const outcome = await readElementInIsolatedWorld(page, backendNodeId, hideFrameInPage, null, deadlineAtMs);
-  return outcome.status === 'READ' && outcome.value === true;
+/** 枠を CSS で隠す。隠せたら、そのときの画面の幅とスクロールの位置（形が違えば、隠せなかったものとして null）。 */
+async function hideFrame(page: Page, backendNodeId: number, deadlineAtMs: number): Promise<NotificationFrameHiddenAt | null> {
+  return viewportPositionOf(await readElementInIsolatedWorld(page, backendNodeId, hideFrameInPage, null, deadlineAtMs));
 }
 
 /** 操作さがしの、通知の枠の処理（落ち着きの待ちと、閉じる・隠す）に使う時間の上限（ms。RB-2: 観察の窓の一式の `notification`）。 */

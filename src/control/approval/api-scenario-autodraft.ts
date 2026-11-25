@@ -25,7 +25,7 @@ import {
   withoutTrailingPathSeparator as withoutTrailingSeparator,
   type ReadCheckExpectation,
 } from '../../discovery/read-check-contracts.js';
-import { READ_CHECK_PAGE_OPENED_EXPECTATIONS } from '../../discovery/read-check-record-ids.js';
+import { ROW_COUNT_AT_LEAST_EXPECTATION_KIND } from '../../core/read-check-expectation-kinds.js';
 import { submissionProbeKeyFieldsOf, submissionProbeWriteOf, type SubmissionProbeRecord } from '../../discovery/submission-probe-contracts.js';
 import {
   DRAFT_PROBE_PATH_TEMPLATE,
@@ -191,10 +191,12 @@ export interface AutoDraftInferredItem {
 }
 
 /**
- * 照合の READ の `{id}` の型の定義の、仮の期待（今の決まり: 定義は期待を 1 件以上持つ）。DEF-235: 置き場は READ の確かめの番号の埋め方の部品
- * （`read-check-record-ids.ts` の `READ_CHECK_PAGE_OPENED_EXPECTATIONS`）。READ の確かめの段は、この期待だけの型の定義を「画面が開けた」で照らす。
+ * 照合の READ の `{id}` の型の定義の、仮の期待（今の決まり: 定義は期待を 1 件以上持つ。行が 1 行以上）。RCA-6: 置き場をここへ戻した（READ の確かめの段は、
+ * 型の定義を読まない。前は DEF-235 の `read-check-record-ids.ts` に置き、段で「画面が開けた」で照らした）。
  */
-export const AUTO_DRAFT_READ_CHECK_PLACEHOLDER_EXPECTATIONS: readonly ReadCheckExpectation[] = READ_CHECK_PAGE_OPENED_EXPECTATIONS;
+export const AUTO_DRAFT_READ_CHECK_PLACEHOLDER_EXPECTATIONS: readonly ReadCheckExpectation[] = Object.freeze([
+  Object.freeze({ kind: ROW_COUNT_AT_LEAST_EXPECTATION_KIND, count: 1 } as const),
+]);
 
 /** 登録の ID を読む応答の鍵の取り方（応答の本文の鍵）。 */
 const [RESPONSE_BODY_KEY_SOURCE] = SCENARIO_API_RECORD_ID_SOURCES;
@@ -220,14 +222,24 @@ const rowKeyOf = (identityDigest: string, shapeDigest: string | null): string =>
 const hasNoFieldBoundKey = (probe: SubmissionProbeRecord): boolean => submissionProbeKeyFieldsOf(probe).every(({ field }) => field === null);
 
 /**
+ * WBF（DEF-291 の B1）: 欄に目印を入れて押したのに、見た送信の本文のどの鍵にも目印がないか（保存の前の確かめの送信など。本当の保存は凍結が止めたので見ていない）。
+ * この型は登録を試せないが、一覧の行にして理由（`SCENARIO_API_FIELD_VALUES_NOT_SENT`）を出す。
+ */
+const fieldValuesNotSentOf = (probe: SubmissionProbeRecord): boolean =>
+  (probe.inputFields ?? []).some(({ marker }) => marker !== null) && (probe.shape?.body.markerKeys.length ?? 0) === 0;
+
+/** WBF: 入れた値を送るところを見届けられない理由。 */
+const FIELD_VALUES_NOT_SENT_REASON = 'SCENARIO_API_FIELD_VALUES_NOT_SENT' satisfies ScenarioDraftRejectionReason;
+
+/**
  * 候補の、書き込みの probe の行（型の digest と欄の範囲を持つ API の登録か更新）。ほかは null。DEF-208-3（H）: 欄に結び付く鍵が 0 の登録の型も null（一覧の行に
- * しない）。
+ * しない）。WBF（B1）: ただし、入れた値が送信のどこにもない登録の型（`fieldValuesNotSentOf`）は、理由を出すために行にする。
  */
 const rowOf = (candidate: DiscoveryCandidate): AutoDraftRow | null => {
   const probe = candidate.submissionProbe;
   const kind = probe === undefined ? null : submissionProbeWriteOf(probe.result)?.kind ?? null;
   return probe === undefined || kind === null || probe.shapeDigest === null || probe.shape === null || probe.inputFields === undefined
-    || (kind === CREATE_SCENARIO_KIND && hasNoFieldBoundKey(probe))
+    || (kind === CREATE_SCENARIO_KIND && hasNoFieldBoundKey(probe) && !fieldValuesNotSentOf(probe))
     ? null
     : { kind, candidate, shapeDigest: probe.shapeDigest };
 };
@@ -327,6 +339,10 @@ const firstDraftErrorOf = (draft: Readonly<Record<string, unknown>>, candidate: 
 const createPlanOf = (input: AutoDraftPlanInput, row: AutoDraftRow, rows: readonly AutoDraftRow[]): AutoDraftCreatePlan => {
   const { profileId, context } = input;
   const { candidate } = row;
+  // WBF（B1）: 入れた値が送信のどこにもない登録の型は、試せない（理由だけを出す）。
+  if (candidate.submissionProbe !== undefined && fieldValuesNotSentOf(candidate.submissionProbe)) {
+    return { status: 'REJECTED', row, reason: FIELD_VALUES_NOT_SENT_REASON };
+  }
   const { form, rejection } = apiScenarioFormOf({ profileId, candidate, context, scenarios: [] });
   const probe = candidate.submissionProbe;
   if (form === null || probe === undefined) {

@@ -453,7 +453,8 @@ describe('PageAuditor stops the page when the stress sweep or an interaction can
     // L1（設計書 `2026-11-09-beaksight-remove-limits-design.md` 6 の L1）: 期待を直した。幅の走査の期限（ページの期限から導いた）は撤廃したので、応答しない
     // 幅の読み込みは、進みの見張りが「応答しなかった」とし（残りの幅は始めない）、読み込みは部品の中の期限（Playwright の既定。L2 の範囲）の時間切れで終わる。
     expect(evidenceOf(outcome, 'layout', 'desktop')[0]?.payload.stressSweep).toEqual([
-      expect.objectContaining({ width: STRESS_WIDTHS[0], status: 'FAILED', stage: 'NAVIGATION', reason: 'NAVIGATION_FAILED' }),
+      // SWR: 幅の走査は、一番広い幅で読み込む。
+      expect.objectContaining({ width: STRESS_WIDTHS[1], status: 'FAILED', stage: 'NAVIGATION', reason: 'NAVIGATION_FAILED' }),
     ]);
     expect(result.viewports.desktop.incompleteReasons).toContainEqual({ code: 'STAGE_UNRESPONSIVE', detail: 'stress-layout' });
     expect(result.viewports.mobile).toEqual(skippedViewport(pageUrl, SITE_UNAVAILABLE_SKIPPED));
@@ -485,13 +486,13 @@ describe('PageAuditor goes on with the stress sweep when its load is not site un
       const { result } = outcome;
 
       const [layout] = evidenceOf(outcome, 'layout', 'desktop');
-      expect(layout?.payload.stressSweep?.map((width) => width.width)).toEqual([...STRESS_WIDTHS]);
+      expect(layout?.payload.stressSweep?.map((width) => width.width)).toEqual([...STRESS_WIDTHS].reverse());
       expect(result.viewports.mobile).toMatchObject({ navigationOutcome: 'OK', httpStatus: OK_STATUS });
       expect(result.viewports.mobile.status).not.toBe('SKIPPED');
       expect(evidenceOf(outcome, 'dom', 'mobile')).toHaveLength(1);
       expect(JSON.stringify(result)).not.toContain('SITE_UNAVAILABLE');
       expect(outcome.siteUnavailableDetail).toBeNull();
-      // Desktop、2つの幅、Mobile の読み込みが、サーバに届く。
+      // Desktop、幅の走査の 2 回（SWR: 大きさを変えて回す読み込みと、一番狭い幅の照らし合わせ）、Mobile の読み込みが、サーバに届く。
       expect(server.pageGets()).toBe(4);
       expect(pacer.snapshot().navigationCount).toBe(4);
       expect(retry.calls()).toBe(1);

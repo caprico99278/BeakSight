@@ -90,7 +90,7 @@ const ranOutcome: ReadCheckRunOutcome = {
   runDirectory: resolve(OUTPUT_DIRECTORY, RUN_ID),
   runStatus: 'PARTIAL',
   exitCode: EXIT_CODES.PARTIAL,
-  summary: { checks: 1, executed: 1 },
+  summary: { checks: 1, executed: 1, searchChecks: 0, searchCheckErrors: 0 },
   endReason: 'MAX_RUNTIME_REACHED',
 };
 
@@ -199,7 +199,7 @@ describe('audit worker session (T27e): the READ check job', () => {
         protocol: WORKER_PROTOCOL_VERSION,
         type: 'FINISHED',
         outcome: { kind: 'RAN', exitCode: EXIT_CODES.PARTIAL, runId: RUN_ID, runDirectory: RUN_ID, runStatus: 'PARTIAL' },
-        readCheck: { checks: 1, executed: 1 },
+        readCheck: { checks: 1, executed: 1, searchChecks: 0, searchCheckErrors: 0 },
       },
     ]);
     expect(run.exitCode).toBe(EXIT_CODES.PARTIAL);

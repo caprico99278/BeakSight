@@ -16,7 +16,10 @@ interface GotoCall {
 
 function fakePage(goto: (url: string, options: unknown) => Promise<Response | null>): { readonly page: Page; readonly calls: GotoCall[] } {
   const calls: GotoCall[] = [];
+  // DEF-310: Guard への知らせ（`announceOwnMainFrameNavigation`。FRET fix round 1 から Context の Guard の状態も読む）のため、偽の page も Context を持つ。
+  const context = {};
   const page = {
+    context: () => context,
     goto: (url: string, options: unknown) => {
       calls.push({ url, options });
       return goto(url, options);
@@ -63,6 +66,7 @@ describe('settleMainFrameLoad (CCX-7a)', () => {
   it('returns REJECTED, without throwing, when page.goto throws synchronously', async () => {
     const failure = new Error('injected synchronous failure');
     const page = {
+      context: () => ({}),
       goto: () => {
         throw failure;
       },

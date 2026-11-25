@@ -382,6 +382,11 @@ export const FOCUS_CHECK_SCREENSHOT_DIRECTORY_PREFIX = 'focus-';
  * EV-2: 対象まで動かして撮った viewport の画像のディレクトリの名前の接頭辞（`reveal-<その時点の中の番号>`。幅の走査の幅では `stress-<幅>/reveal-<番号>`）。
  */
 export const REVEAL_SCREENSHOT_DIRECTORY_PREFIX = 'reveal-';
+/**
+ * AUD-2（設計書 `2026-11-19-beaksight-audit-result-review-fixes-design.md` 5.2）: 通知の枠を隠す前に撮った viewport の画像のディレクトリの名前
+ * （`<ビューポート>/before-hide/viewport.png`。幅の走査の幅では `stress-<幅>/before-hide/viewport.png`）。
+ */
+export const BEFORE_HIDE_SCREENSHOT_DIRECTORY = 'before-hide';
 /** COV-4 の区切り 3: 見るだけの点検の操作で開いた状態の画像のディレクトリの名前の頭（`state-<番号>`。番号は 1 から）。 */
 export const OPENED_STATE_SCREENSHOT_DIRECTORY_PREFIX = 'state-';
 
@@ -504,6 +509,22 @@ export function screenshotRelativePath(
   return [
     PAGES_ARTIFACT_DIRECTORY, pageId, ...revisitDirectory, ...retryDirectory, viewport, ...stressDirectory, ...openedStateDirectory, ...stageDirectory, SCREENSHOT_FILE_NAMES[captureType],
   ].join('/');
+}
+
+/**
+ * AUD-2（5.2）: 通知の枠を隠す前に撮った viewport の画像の、Run のディレクトリからの相対パス（主の画像・幅の画像と同じ並びで、ファイルの前に
+ * `before-hide/` を置く）。
+ */
+export function beforeHideScreenshotRelativePath(
+  pageId: PageId,
+  viewport: ViewportProfile,
+  retryAttempt: number | null,
+  stressWidth: number | null,
+  revisitIndex: number | null,
+): string {
+  const base = screenshotRelativePath(pageId, viewport, 'VIEWPORT', retryAttempt, stressWidth, false, null, null, null, revisitIndex);
+  const fileAt = base.lastIndexOf('/');
+  return `${base.slice(0, fileAt)}/${BEFORE_HIDE_SCREENSHOT_DIRECTORY}${base.slice(fileAt)}`;
 }
 
 /**

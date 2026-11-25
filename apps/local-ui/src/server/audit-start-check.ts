@@ -19,12 +19,14 @@
  *   `profileOperationRejectionOf`）にした。書き込みのモード（`TEST_APPROVED_WRITE`）のプロファイルでも、発見・READ の確かめ・（自動ログインなら）
  *   ログインの確かめは、認証つきの読み取りの監査と同じ確かめになる。MI-5 から、書き込みのモードの監査も同じ確かめになる（前は
  *   `MODE_NOT_EXECUTABLE`。監査のジョブは、モードにかかわらず読み取りだけ）。
+ * - PAR-c（設計書 `2026-11-17-beaksight-parallel-site-audits-design.md` 3 章）: 開始の画面では、最後に、サイトごとに同時に 1 つの決まりの理由（同じサイトの
+ *   別の設定が点検中・パソコンの空きが足りない）も当てる（呼び出し側がジョブの管理から読んで渡す）。
  */
 import { validateAuthSetup } from '../../../../src/control/auth/auth-setup-policy.js';
 import type { ProfileValidationErrorCode, SiteProfile } from '../../../../src/control/contracts.js';
 import type { CredentialMetadata, CredentialProtectionState } from '../../../../src/control/credentials/credential-store.js';
 import { operationRequiresAuthSetup, profileOperationRejectionOf } from '../../../../src/control/execution-policy.js';
-import type { AuditJobStartResult } from '../../../../src/control/job/audit-job-manager.js';
+import type { AuditJobStartResult, AuditStartConcurrencyBlocker } from '../../../../src/control/job/audit-job-manager.js';
 import type { AutoLoginLimitDecision } from '../../../../src/control/job/auto-login-limits.js';
 import { checkAutoLoginStart, type AutoLoginPreflightRejectionReason } from '../../../../src/control/job/auto-login-preflight.js';
 import { manualLoginEveryTimeApplies } from '../../../../src/control/auth/automated-login-switch.js';
@@ -51,6 +53,7 @@ export type AuditStartBlocker = Extract<
   | 'AUTH_SETUP_INVALID'
   | 'READ_CHECK_DEFINITIONS_MISSING'
   | AutoLoginPreflightRejectionReason
+  | AuditStartConcurrencyBlocker
 >;
 
 
@@ -83,6 +86,11 @@ export interface AuditStartCheckInput {
    * 連鎖の READ の段では件数を開始の確かめに入れない）。
    */
   readonly readCheckDefinitionsRequired?: boolean;
+  /**
+   * PAR-c: サイトごとに同時に 1 つの決まりで、今始めると拒む理由（ジョブの管理の `startConcurrencyBlockerOf` を呼び出し側が読んで渡す。開始の画面だけ。
+   * 省略か `null` なら、この確かめをしない）。ジョブの管理と同じく、ほかの確かめの後に当てる。
+   */
+  readonly concurrencyBlocker?: AuditStartConcurrencyBlocker | null;
 }
 
 /** 確かめの結果。 */
@@ -136,6 +144,7 @@ export const auditStartCheckOf = (input: AuditStartCheckInput): AuditStartCheck 
     [validation !== null && !validation.ok, 'PROFILE_INVALID'],
     [setupCheck !== null && !setupCheck.ok, 'AUTH_SETUP_INVALID'],
     ...(preflight === null || preflight.ok ? [] : [[true, preflight.reason] as const]),
+    ...(input.concurrencyBlocker === undefined || input.concurrencyBlocker === null ? [] : [[true, input.concurrencyBlocker] as const]),
   ];
   const blocker = checks.find(([blocked]) => blocked)?.[1] ?? null;
   return {

@@ -24,6 +24,7 @@ import type {
   PageAuditStatus,
   PageId,
   PageIncompleteReasonCount,
+  RunPageSamenessCounts,
   RunCheckpointState,
   RunEnvironment,
   RunExecution,
@@ -44,6 +45,7 @@ import { safeErrorMessage } from '../core/errors.js';
 import { isRecord } from '../core/guards.js';
 import { deepFreeze } from '../core/immutable.js';
 import type { ObservationWindows } from '../core/observation-windows.js';
+import { createDebugTimingLog, DEBUG_TIMING_OFF, type DebugTimingLog, type DebugTimingSwitch } from '../core/debug-timing.js';
 import { createRunPageStore, forEachRunPage, type RunPages, type RunPageStore } from '../core/run-page-store.js';
 import { BROWSER_CLOSE_TIMEOUT_MS } from '../core/limits.js';
 import { lastRunExecutionOf } from '../core/run-executions.js';
@@ -104,7 +106,15 @@ import {
 } from './environment.js';
 import { IdAllocator } from './id-allocator.js';
 import { PageAuditor, type PageAuditorDependencies } from './page-auditor.js';
-import { SAFETY_VIOLATION_ABORT_REASON } from './page-audit-plan.js';
+import {
+  SAFETY_VIOLATION_ABORT_REASON,
+  acceptsAsSamenessReference,
+  samenessAnswersOf,
+  type PageAuditDepthDecision,
+  type PageSamenessAnswers,
+  type PageSamenessDecision,
+  type PageSamenessPort,
+} from './page-audit-plan.js';
 import { navigationFailureDetail } from './page-navigation.js';
 import {
   resolvePassiveSessionDeadlines,
@@ -137,6 +147,7 @@ import {
   countPagesByStatus,
   countPartialViewports,
   countPagesByIncompleteReason,
+  countPagesBySameness,
   countViewportPages,
   RunSafetyTotals,
   viewportEvidenceOfType,
@@ -237,7 +248,16 @@ interface RevisitCandidate {
    * 上書きしない。捨てた・途中で終わった読み直しの画像は、どの結果も指さないので、同じ番号で上書きしてよい）。
    */
   readonly revisitIndex: number;
+  /** DUP（設計書 2 章の再開）: 前の結果の点検の深さ（読み直しも同じ深さで点検する。軽い点検の読み直しは軽い点検のまま）。 */
+  readonly previousDepth: PageAuditDepthDecision;
 }
+
+/** DUP: Page Auditor が今のページで知らせた深さ（口の中で書き換わるので、関数で読む）。 */
+const decidedSamenessOf = (state: { readonly decision: PageSamenessDecision | null }): PageSamenessDecision | null => state.decision;
+
+/** DUP: 結果の点検の深さ（記録がなければ、しっかり点検した）。 */
+const depthOfResult = (result: Pick<PageAuditResult, 'sameness'>): PageAuditDepthDecision =>
+  (result.sameness === undefined ? { depth: 'FULL', sameAs: null } : { depth: result.sameness.depth, sameAs: result.sameness.sameAs });
 
 /** 設計者の判断（2026-11-16）: 次の読み直しの番号（その結果の画像が指す読み直しの番号のいちばん大きいものより 1 大きい。読み直しの画像がなければ 1）。 */
 const nextRevisitIndexOf = (result: PageAuditResult): number =>
@@ -273,7 +293,13 @@ export function restoredRunPagesCollector(): {
           // EV-5: 読み直す候補のページだけ、事実と Ledger の snapshot を持つ（読み直すかは、再開の実行が決める）。
           const fact = pageRevisitFactOf(result);
           if (needsRevisit(fact)) {
-            restored.revisits.set(url, { fact, status: result.status, safetyLedgerSnapshots, revisitIndex: nextRevisitIndexOf(withLeadingEvidence(result, earlier)) });
+            restored.revisits.set(url, {
+              fact,
+              status: result.status,
+              safetyLedgerSnapshots,
+              revisitIndex: nextRevisitIndexOf(withLeadingEvidence(result, earlier)),
+              previousDepth: depthOfResult(result),
+            });
           }
         },
         finish: () => restored,
@@ -379,6 +405,11 @@ export interface RunCoordinatorDependencies {
    * スクロールの待ち）に渡す。省略すると本番の値。CLI とワーカーの本番の入口は渡さない。
    */
   readonly observationWindows?: ObservationWindows | undefined;
+  /**
+   * DBG-1（設計書 `2026-11-20-beaksight-discovery-skip-and-debug-timing-design.md` 2.2）: 測りの記録の入切を読む口（起動の入口が作る。Run の始めに 1 回呼ぶ）。
+   * 入なら、Run のフォルダの測りの記録（`src/core/debug-timing.ts`）を Page Auditor に渡し、Run の終わりにまとめて書く。省略すると切。
+   */
+  readonly debugTimingSwitch?: DebugTimingSwitch | undefined;
   /** PREFLIGHT（テスト用の差し替え口）。省略すると `runPreflight`。 */
   readonly runPreflight?: typeof runPreflightDefault;
   /** 環境の事実の収集（テスト用の差し替え口）。省略すると `collectRunEnvironment`。 */
@@ -912,6 +943,9 @@ export class RunCoordinator {
   readonly #progressWatchQuietLimitMs: number | undefined;
   /** RB-2: 観察の窓の一式の注入（`RunCoordinatorDependencies.observationWindows`）。なければ factory と Page Auditor の本番の値。 */
   readonly #observationWindows: ObservationWindows | undefined;
+  /** DBG-1: 測りの記録の入切を読む口と、この Run の測りの記録（`run` が Run のディレクトリで作る。切なら何もしない口）。 */
+  readonly #debugTimingSwitch: DebugTimingSwitch | undefined;
+  #debugTimingLog: DebugTimingLog = DEBUG_TIMING_OFF;
   readonly #runPreflight: typeof runPreflightDefault;
   readonly #collectRunEnvironment: typeof collectRunEnvironmentDefault;
   readonly #readToolVersion: typeof readToolVersionDefault;
@@ -1062,6 +1096,7 @@ export class RunCoordinator {
     this.#collectSiteMetadata = dependencies.collectSiteMetadata ?? collectSiteMetadataDefault;
     this.#progressWatchQuietLimitMs = dependencies.progressWatchQuietLimitMs;
     this.#observationWindows = dependencies.observationWindows;
+    this.#debugTimingSwitch = dependencies.debugTimingSwitch;
     this.#runPreflight = dependencies.runPreflight ?? runPreflightDefault;
     this.#collectRunEnvironment = dependencies.collectRunEnvironment ?? collectRunEnvironmentDefault;
     this.#readToolVersion = dependencies.readToolVersion ?? readToolVersionDefault;
@@ -1323,6 +1358,9 @@ export class RunCoordinator {
       session.started = true;
     }
     const directoryFailure = created !== null && !created.ok ? created : null;
+    // DBG-1: 測りの記録（入切は Run の始めに 1 回読む。入のときだけ。Run のディレクトリを作れたときだけ書く。Run の終わりにまとめて書く）。
+    const debugTimingOn = directoryFailure === null && this.#debugTimingSwitch !== undefined && await this.#debugTimingSwitch().catch(() => false);
+    this.#debugTimingLog = createDebugTimingLog({ enabled: debugTimingOn, directory: runDirectory, now: this.#now });
 
     // 2. PREFLIGHT。PREFLIGHT の Ledger は、上の factory で作るので、登録にある（`safetyLedgers` は集計に使わない）。
     // Run のディレクトリを作れなかった場合と、保存のセッションを始められなかった場合は、PREFLIGHT を行わない（Browser を起動しない）。
@@ -1465,6 +1503,8 @@ export class RunCoordinator {
       recordRunStageCarry(this.#stageCarry, factory, auditStage, {
         pacer: navigationPacer, minIntervalMs: intervalTracking.minIntervalMs(), now: this.#now,
       });
+      // DBG-1: 測りの記録を、段（Run）の終わりにまとめて書く（切なら何もしない）。
+      await this.#debugTimingLog.flush();
     }
 
     // `run.json` の環境は、最初の実行のもの（中断した Run の再開の設計書 4.8。版が同じでなければ再開しないので、主な値は変わらない）。
@@ -1675,6 +1715,20 @@ export class RunCoordinator {
         await saveState(checkpoint);
       }
 
+      // DUP（設計書 `2026-11-18-beaksight-same-structure-pages-design.md` 2 章）: 同じ作りの画面の口。1 回目の表は巡回の記録（checkpoint に残る）。今のページの
+      // 答え方（読み直しは前の深さのまま）と、Page Auditor が知らせた深さは、ページを始めるたびに戻す。チェックした画面だけの点検（WSO）では渡さない。
+      const samenessTable: PageSamenessAnswers = {
+        referenceOf: (templateKey) => frontier.pageReferenceOf(templateKey),
+        sameContentAs: (templateKey, contentDigest) => frontier.samePageOf(templateKey, contentDigest),
+      };
+      const pageSameness = { answers: samenessTable, decision: null as PageSamenessDecision | null };
+      const samenessPort: PageSamenessPort | undefined = this.#pageScope !== null ? undefined : {
+        referenceOf: (templateKey) => pageSameness.answers.referenceOf(templateKey),
+        sameContentAs: (templateKey, contentDigest) => pageSameness.answers.sameContentAs(templateKey, contentDigest),
+        decided: (decision) => {
+          pageSameness.decision = decision;
+        },
+      };
       // 6. BFS。
       const auditor = this.#createPageAuditor({
         contextFactory: factory,
@@ -1688,6 +1742,8 @@ export class RunCoordinator {
         navigationPacer: progress.navigationPacer,
         ...(this.#progressWatchQuietLimitMs === undefined ? {} : { progressWatchQuietLimitMs: this.#progressWatchQuietLimitMs }),
         ...(this.#observationWindows === undefined ? {} : { observationWindows: this.#observationWindows }),
+        // DBG-1: 測りの記録（入のときだけ渡す）。
+        ...(this.#debugTimingLog.enabled ? { debugTiming: this.#debugTimingLog } : {}),
         // L0: Run の時間の上限（`maxRuntimeMs`。この実行の開始から）を、ページの途中でも効かせる。
         // L14 の後の段: 指定がなければ期限なし（進みの見張りで待つ）。
         ...(maxRuntimeMs === undefined ? {} : { runDeadlineAtMs: startedAtMs + maxRuntimeMs }),
@@ -1700,6 +1756,7 @@ export class RunCoordinator {
         acceptOpenedStructure: (structureKey) => frontier.acceptOpenedStructure(structureKey),
         // COV-4 の区切り 3（入れ子の開いた状態）: 開いた状態の中で押した組も、巡回の記録（checkpoint に残る）で 1 回だけ受け付ける。
         acceptOpenedPress: (press) => frontier.acceptOpenedPress(press),
+        ...(samenessPort === undefined ? {} : { pageSameness: samenessPort }),
         // T25c: 認証つきの Run だけ、セッションの切れを確かめさせる（Task 25 の設計書 4.3）。
         ...(this.#authentication === null ? {} : { sessionLostPathPrefix: this.#authentication.sessionLostPathPrefix }),
         // SD-2（設計書 `2026-11-16-beaksight-action-based-delete-guard-design.md` 2.4）: 点検の範囲の外へ移った画面は点検しない。
@@ -1759,6 +1816,9 @@ export class RunCoordinator {
         return { entry, revisiting: null };
       };
       for (let next = nextEntry(); next !== undefined; next = nextEntry()) {
+        // SLIM（設計書 `2026-11-25-beaksight-discovery-input-check-slim-design.md` 2.3 (a)）: 測りの記録を 1 ページごとに書き出す（前のページの行。どの終わり方の
+        // ページも次の輪の先頭を通る。最後のページの行は Run の終わりの `flush`。切なら何もしない）。
+        await this.#debugTimingLog.flush();
         // EV-5: 読み直すページ（終えたページ）は、止める理由があれば、記録を変えずに飛ばす（前の結果のまま）。ページ数の上限は、新しいページの数なので見ない。
         const { entry, revisiting } = next;
         // この記録を、この実行で何回確かめ直したか（0 なら 1 回目の試行）。1 回以上なら、待った後の確かめ直し（`requeueForRecheck` で
@@ -1817,6 +1877,9 @@ export class RunCoordinator {
           removeRetryRecordsOf(progress.retries, entry.url);
         }
         progress.pageLedgerStart = progress.safetyLedgers.length;
+        // DUP: 読み直しは前の深さのまま（軽い点検は軽い点検のまま）。知らせた深さは、ページごとに戻す。
+        pageSameness.answers = samenessAnswersOf(samenessTable, revisiting?.previousDepth ?? null);
+        pageSameness.decision = null;
         // 確かめ直しの記録は、捨てたときに `AUDITING` に戻してある（`requeueForRecheck`）。
         if (revisiting !== null) {
           frontier.reopenForRevisit(entry.url);
@@ -1965,6 +2028,12 @@ export class RunCoordinator {
         const pageRetryEvidence = progress.retryEvidence.get(entry.url) ?? [];
         await storeRunPage(progress, entry.url, result, pageRetryEvidence);
         frontier.markFinished(entry.url, result.status);
+        // DUP（設計書 2 章）: 点検を終えた画面を、同じ作りの表に入れる（しっかり点検した 1 回目と、中身が同じ画面を省く相手）。途中で止まった画面は入れない
+        // （次の同じ作りの画面をしっかり点検する）。省いた画面（SAME）は入れない。表は、下の状態の保存で checkpoint に残る。
+        const decided = decidedSamenessOf(pageSameness);
+        if (decided !== null && decided.templateKey !== null && decided.depth !== 'SAME' && acceptsAsSamenessReference(result)) {
+          frontier.acceptPageReference({ templateKey: decided.templateKey, pageId: entry.pageId, depth: decided.depth, contentDigest: decided.contentDigest });
+        }
         // Link は、Desktop の `link` の Evidence から取り、`INTERNAL_NAVIGABLE` のものだけをキューに入れる（ARCH03）。
         // T25c: 認証つきの Run では、監査の段の除外に当たる URL と、セッションの切れの path の URL を入れない（Task 25 の設計書 4.2、4.7）。
         // SD-1: 公開監査でも、削除の語の URL とリンクを入れない。
@@ -2014,6 +2083,7 @@ export class RunCoordinator {
                 safetyLedgerSnapshots: [...revisiting.safetyLedgerSnapshots, ...progress.safetyLedgers.slice(progress.pageLedgerStart).map((ledger) => ledger.snapshot())],
                 // 採った読み直しの画像を上書きしないよう、次の番号に置く。
                 revisitIndex: revisiting.revisitIndex + 1,
+                previousDepth: revisiting.previousDepth,
               },
             });
           } else if (!after.cutByRunTimeLimit && !revisitedPageIds.includes(entry.pageId)) {
@@ -2411,6 +2481,8 @@ export class RunCoordinator {
           // WSO（REV-WSO の I-2）: 「チェックした画面だけ」の点検は、sitemap と比べず、全部を巡回した前提の判定をしない。
           sitemap: this.#pageScope === null ? sitemapOf(progress.metadata) : null,
           crawlCoversSite: this.#pageScope === null,
+          // DEF-296: 巡回の候補から外した行き先へのリンクは、確かめていないリンクに数えない（巡回と同じ判定）。
+          isOutsideReadScope: excludedCrawlCandidateOf(config, this.#authentication),
         });
         progress.allocator.advanceFindingSequence(crossPage.nextFindingSequence);
         findings.push(...crossPage.findings);
@@ -2548,6 +2620,8 @@ export class RunCoordinator {
       incompleteReasons: reasons,
       // T44c（Task 44 の設計書 P1-4）: ページの未完了の理由ごとのページ数（理由を持つページがあるときだけ。ほかの Run の `run.json` は変えない）。
       ...pageIncompleteReasonCountsPartOf(summaries),
+      // DUP: 軽い点検にしたページと、点検を省いたページの数（どちらかがあるときだけ。ほかの Run の `run.json` は変えない）。
+      ...pageSamenessCountsPartOf(summaries),
       load: runLoad(config, progress),
       // T35c（Task 35 の設計書 3.7）: スクリプトで送るログインの監査の Run だけ、監査の段の数を記録する（ほかの Run の `run.json` は変えない）。
       // DEF-138: この実行がセッションの切れで止まったら、その証拠も記録する（監査の段の数のない Run は、証拠だけ）。
@@ -2564,6 +2638,12 @@ function pageIncompleteReasonCountsPartOf(
 ): { readonly pageIncompleteReasonCounts?: readonly PageIncompleteReasonCount[] } {
   const counts = countPagesByIncompleteReason(pages);
   return counts.length === 0 ? {} : { pageIncompleteReasonCounts: counts };
+}
+
+/** DUP: `run.json` の `pageSamenessCounts`（軽い点検のページも、省いたページもなければ項目を持たない）。 */
+function pageSamenessCountsPartOf(pages: readonly RunPageSummary[]): { readonly pageSamenessCounts?: RunPageSamenessCounts } {
+  const counts = countPagesBySameness(pages);
+  return counts === null ? {} : { pageSamenessCounts: counts };
 }
 
 /**
@@ -2767,9 +2847,10 @@ function normalizedStartUrl(config: AuditConfig): NormalizedHttpUrlEvidence {
 
 /**
  * 巡回の候補の除外の判定（T25c。認証つきの Run は、監査の段の除外・セッションの切れの path・危険な語。SD-1: 公開監査は削除の語）。巡回と、WSO の範囲の画面の
- * 読めるかの判定が使う（同じ 1 つの判定）。
+ * 読めるかの判定が使う（同じ 1 つの判定）。DEF-296: 確かめていないリンクの数（Cross-page rule）と、表示用モデルのリンクの確かめ（`ReportRunFacts`）も、
+ * 読む範囲の外の行き先をこの判定で分ける。
  */
-function excludedCrawlCandidateOf(config: AuditConfig, authentication: RunAuthentication | null): (url: string) => boolean {
+export function excludedCrawlCandidateOf(config: AuditConfig, authentication: RunAuthentication | null): (url: string) => boolean {
   const crawlAllowedOrigins: ReadonlySet<string> = new Set(config.site.allowedOrigins);
   return authentication === null
     ? (url: string): boolean => crawlUrlHasDestructiveWord(url)

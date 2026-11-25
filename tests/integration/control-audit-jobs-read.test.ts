@@ -8,7 +8,7 @@ import { join } from 'node:path';
 import { DatabaseSync } from 'node:sqlite';
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 import { MIN_PROFILE_REVISION } from '../../src/control/contracts.js';
-import { createStartingJob, readAllJobs, readJob, recordHeartbeat } from '../../src/control/job/job-store.js';
+import { createStartingJob, hasActiveJobForProfile, readAllJobs, readJob, recordHeartbeat } from '../../src/control/job/job-store.js';
 import { CONTROL_DB_BUSY_TIMEOUT_MS, closeControlDatabase, openControlDatabase, type ControlDatabase } from '../../src/control/store/control-database.js';
 import { resolveControlDatabasePath } from '../../src/control/store/database-path.js';
 import { createProfile } from '../../src/control/store/profile-store.js';
@@ -60,5 +60,13 @@ describe('audit job reads through withReadTransaction (T24e round 2)', () => {
     // 読んだ後の書き込み（UPDATE）が通り、読み直すと書いた値がある。
     expect(recordHeartbeat(database, JOB_ID, HEARTBEAT_AT)).toBe(true);
     expect(readJob(database, JOB_ID)?.lastHeartbeatAt).toBe(HEARTBEAT_AT);
+  });
+});
+
+// PAR-b: ログインの段の資格情報の確かめは、自分のジョブを除いて、そのプロファイルに終わっていないジョブがあるかを見る（読むだけ）。
+describe('hasActiveJobForProfile except its own job (PAR-b)', () => {
+  it('sees the active job of the profile, but not when it is the job given as its own', () => {
+    expect(hasActiveJobForProfile(database, PROFILE_ID)).toBe(true);
+    expect(hasActiveJobForProfile(database, PROFILE_ID, JOB_ID)).toBe(false);
   });
 });

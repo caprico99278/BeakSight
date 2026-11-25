@@ -90,7 +90,8 @@ import type { NormalizedHttpUrl, NormalizedUrlResult } from '../../src/crawl/nor
 import { collectAccessibilityEvidence } from '../../src/evidence/accessibility-collector.js';
 import type { CollectorHandle } from '../../src/evidence/collector-handle.js';
 import { ConsoleCollector } from '../../src/evidence/console-collector.js';
-import { collectDomEvidence } from '../../src/evidence/dom-collector.js';
+import { collectDomEvidence, recordedDomEvidenceOf } from '../../src/evidence/dom-collector.js';
+import type { CollectedDomEvidence } from '../../src/core/evidence-types.js';
 import { collectInteractionChangeEvidence } from '../../src/evidence/interaction-collector.js';
 import { collectLayoutEvidence, collectStressLayout } from '../../src/evidence/layout-collector.js';
 import { NetworkCollector } from '../../src/evidence/network-collector.js';
@@ -436,6 +437,8 @@ describe('C8: incomplete reason codes', () => {
     // L0（設計書 `2026-11-09-beaksight-remove-limits-design.md` 5 の 1）: 進みの見張りが、応答しなかった段・静まらなかった段を終えた。
     'STAGE_UNRESPONSIVE',
     'STAGE_NEVER_QUIET',
+    // DUP: 表示の中身が点検した画面と同じなので、Mobile を始めなかった（途中で止まった理由ではない）。
+    'SAME_CONTENT_AS_EARLIER_PAGE',
   ] as const;
 
   it('defines one frozen closed list that covers collector partial reasons and every Run Status input', () => {
@@ -537,7 +540,9 @@ describe('C8: evidence payload types', () => {
     // L1b: network の手綱の写しは、見張りの指定を受ける（`NetworkCollectorHandle`。`CollectorHandle` として使える）。
     expectTypeOf(NetworkCollector.attach).returns.toExtend<CollectorHandle<NetworkEvidence>>();
     expectTypeOf(ConsoleCollector.attach).returns.toEqualTypeOf<CollectorHandle<ConsoleEvidence>>();
-    expectTypeOf(collectDomEvidence).returns.resolves.toEqualTypeOf<DomEvidence>();
+    // DUP（REV-DUP の M-4）: 記録に残さない欄の表示の値の digest を添えて返す（記録するときは `recordedDomEvidenceOf` で外す）。
+    expectTypeOf(collectDomEvidence).returns.resolves.toEqualTypeOf<CollectedDomEvidence>();
+    expectTypeOf(recordedDomEvidenceOf).returns.toEqualTypeOf<DomEvidence>();
     expectTypeOf(discoverLinks).returns.resolves.toEqualTypeOf<LinkDiscoveryEvidence>();
     expectTypeOf(collectLayoutEvidence).returns.resolves.toEqualTypeOf<LayoutCollectionResult>();
     expectTypeOf(collectStressLayout).returns.resolves.toEqualTypeOf<readonly StressLayoutEvidence[]>();
@@ -658,6 +663,7 @@ describe('C8: evidence payload types', () => {
       'NOT_VISIBLE',
       'MALFORMED_CANDIDATE',
       'DESTRUCTIVE_ACTION_SKIPPED',
+      'AI_ACTION_SKIPPED',
     ]);
     expect(Object.isFrozen(INTERACTION_REJECTION_REASONS)).toBe(true);
     expectTypeOf<InteractionRejectionReason>().toEqualTypeOf<ValueOf<typeof INTERACTION_REJECTION_REASONS>>();
@@ -958,8 +964,9 @@ describe('F12: types derived from the core value arrays', () => {
     // DEF-040（DEF-039・DEF-040 の設計書 2.2。NP3）: Worker の中の WebSocket を CSP で止めた理由は、Passive と凍結の後の両方の一覧にある。
     // AS-c: 監査の段の送信の扱いで通せる接続の上限を超えた理由（`AUDIT_SEND_OVER_LIMIT`）を加えた。
     // DEF-276-relay（REV-DEF276 の M-2）: 文書の WebSocket の中継で、送りの列が上限を超えて閉じた理由（`WEBSOCKET_SEND_QUEUE_FULL`）を加えた。
+    // FRETWS: 窓を開くボタンの押す期間に止めた接続の理由（`SCROLL_KEY_PRESS_RESTRICTED`）を加えた。
     expectTypeOf<CoreEvidence.BlockedWebSocketEvent['reason']>()
-      .toEqualTypeOf<'PASSIVE_WEBSOCKET' | 'WORKER_CONNECT_POLICY' | 'AUDIT_SEND_OVER_LIMIT' | 'WEBSOCKET_SEND_QUEUE_FULL'>();
+      .toEqualTypeOf<'PASSIVE_WEBSOCKET' | 'WORKER_CONNECT_POLICY' | 'AUDIT_SEND_OVER_LIMIT' | 'WEBSOCKET_SEND_QUEUE_FULL' | 'SCROLL_KEY_PRESS_RESTRICTED'>();
     // DEF-039・DEF-040 の設計書 2.1.3: 操作中に遮断したリクエストの理由は、Guard の遮断と出口の中継の拒否を区別する閉じた一覧。
     expectTypeOf<CoreEvidence.BlockedInteractionRequestEvent['reason']>()
       .toEqualTypeOf<ValueOf<typeof CoreEvidence.BLOCKED_INTERACTION_REQUEST_REASONS>>();
@@ -1006,7 +1013,7 @@ describe('F12: types derived from the core value arrays', () => {
       // T25b round 1: 監査の段の除外で遮断した要求の理由（`blockedAuditExclusions` の中だけで使う）。
       BLOCKED_AUDIT_EXCLUSION_REASONS: ['AUDIT_EXCLUDED_URL'],
       // DEF-040（NP3）: `WORKER_CONNECT_POLICY` は、Worker の中の WebSocket を CSP で止めた理由。
-      BLOCKED_WEBSOCKET_REASONS: ['PASSIVE_WEBSOCKET', 'WORKER_CONNECT_POLICY', 'AUDIT_SEND_OVER_LIMIT', 'WEBSOCKET_SEND_QUEUE_FULL'],
+      BLOCKED_WEBSOCKET_REASONS: ['PASSIVE_WEBSOCKET', 'WORKER_CONNECT_POLICY', 'AUDIT_SEND_OVER_LIMIT', 'WEBSOCKET_SEND_QUEUE_FULL', 'SCROLL_KEY_PRESS_RESTRICTED'],
       INTERACTION_FROZEN_REASONS: ['INTERACTION_FROZEN'],
       // DEF-085: `GUARD_BYPASS_EGRESS` は、Guard を通らずに出ようとした要求を、すべての Guard の Context の中継が拒んだ理由。
       BLOCKED_INTERACTION_REQUEST_REASONS: ['INTERACTION_FROZEN', 'INTERACTION_FROZEN_EGRESS', 'EGRESS_UPSTREAM_DENIED', 'GUARD_BYPASS_EGRESS'],

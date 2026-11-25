@@ -3,7 +3,7 @@
 // 今の形の確かめを、今の版の管理データの上にまとめた（前の版からの上げと前の版の形の確かめは捨てた。CHECK の値の一覧が名前つきの一覧と等しいことは
 // `control-store-base-schema.test.ts`）。
 // - `jobs` は `STRICT` で、状態・理由・結果の種類・Run の状態・ジョブの種類の CHECK は名前つきの一覧と同じ。ジョブの種類は NOT NULL で既定の値がない。
-//   終わっていないジョブは全体で 1 行まで（一意の部分索引）。終わりの状態と `finished_at`、理由の有無が食い違う行を拒む。
+//   終わっていないジョブはプロファイルごとに 1 行まで（一意の部分索引。PAR-b の版 23 から。前は全体で 1 行まで）。終わりの状態と `finished_at`、理由の有無が食い違う行を拒む。
 // - 最後の認証の状態（`last_auth_state`）と止まったページの URL（`session_lost_url`）、書き込みのジョブの報告の確かめ（`write_report_check`）の形。
 // - 一時のフォルダだけを使い、終わったら消す。
 import type { DatabaseSync } from 'node:sqlite';
@@ -37,6 +37,8 @@ import {
 } from '../helpers/control-store-schema.js';
 
 const PROFILE_ID = 'example-jobs';
+/** 別のプロファイル（PAR-b。終わっていないジョブはプロファイルごとに 1 行まで）。 */
+const OTHER_PROFILE_ID = 'example-jobs-other';
 const CREATED_AT = '20261009000000';
 const FINISHED_AT = '20261009000100';
 
@@ -71,7 +73,7 @@ describe('Control store: the jobs table', () => {
     expect(checkListOf(sql, 'last_auth_state')).toEqual([...WORKER_AUTH_STATES]);
     expect(checkListOf(sql, 'job_kind')).toEqual([...AUDIT_JOB_KINDS]);
     expect(AUDIT_JOB_FAILURE_REASONS).toEqual(expect.arrayContaining(['AUTH_SETUP_CHANGED', ...WORKER_LOGIN_FAILURE_STATES]));
-    expect(indexNamesOf(connection, 'jobs')).toEqual(['jobs_created_at', 'jobs_single_active']);
+    expect(indexNamesOf(connection, 'jobs')).toEqual(['jobs_created_at', 'jobs_profile_single_active']);
   });
 
   it('accepts rows in the right shape for every state', () => {
@@ -110,9 +112,11 @@ describe('Control store: the jobs table', () => {
     expect(countOf(connection, 'jobs')).toBe(0);
   });
 
-  it('keeps at most one job that has not ended (STARTING, RUNNING or STOPPING) in the whole table', () => {
-    const connection = preparedConnection();
+  // PAR-b（版 23）: 終わっていないジョブは、プロファイルごとに 1 行まで（ほかのプロファイルのジョブは同時に動かせる）。
+  it('keeps at most one job that has not ended (STARTING, RUNNING or STOPPING) per profile', () => {
+    const connection = workspace.latestConnection([PROFILE_ID, OTHER_PROFILE_ID]);
     insertJob(connection, jobRow({ job_id: 'job-1', state: 'RUNNING' }));
+    insertJob(connection, jobRow({ job_id: 'job-other', profile_id: OTHER_PROFILE_ID, state: 'RUNNING' }));
     for (const state of ACTIVE_AUDIT_JOB_STATES) {
       expect(() => insertJob(connection, jobRow({ job_id: `job-${state.toLowerCase()}`, state }))).toThrow(/UNIQUE/u);
     }

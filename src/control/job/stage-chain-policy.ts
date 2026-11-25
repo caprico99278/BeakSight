@@ -210,6 +210,8 @@ export const CHAIN_REASON_CODE_DECISIONS: { readonly [Code in IncompleteReasonCo
   // L0: 進みの見張りが段を終えた（ページ単位の理由。それまでの記録で次へ進む）。
   STAGE_UNRESPONSIVE: 'CONTINUE',
   STAGE_NEVER_QUIET: 'CONTINUE',
+  // DUP: 表示の中身が点検した画面と同じなので、Mobile を始めなかった（途中で止まった理由ではない）。
+  SAME_CONTENT_AS_EARLIER_PAGE: 'CONTINUE',
 });
 
 /** 理由のコードの止める理由（進むなら `null`。表にない値（型の外から来たもの）は、止める側に倒して段の失敗）。 */

@@ -156,8 +156,8 @@ describe('T38R-fix I-2: secret-like names of the page keys and the record id key
     expect(validate(withPageKey('items', [{ id: 1 }]), { pageKeys: ['items'] })).toEqual(['SCENARIO_API_ARRAY_NESTED']);
     expect(validate(withPageKey('source', 1), { pageKeys: ['source'] })).toEqual([]);
     // T40R-fix-B: 一覧の最後に、照合の READ の理由を足した（この 3 つの後ろ）。T40R2-fix: ID の型の理由は注意に下げて外した。T41a: その後ろに 2 つを
-    // 足した（`scenario-api-update-contract.test.ts`）。ARR-2: さらに後ろに 4 つを足した。ARR-3: さらに 1 つ。ARR-5: さらに 2 つ。ARR-5 fix round 1: さらに 2 つ。
-    expect(SCENARIO_DRAFT_REJECTION_REASONS.slice(-15, -11)).toEqual([
+    // 足した（`scenario-api-update-contract.test.ts`）。ARR-2: さらに後ろに 4 つを足した。ARR-3: さらに 1 つ。ARR-5: さらに 2 つ。ARR-5 fix round 1: さらに 2 つ。WBF: さらに 1 つ。
+    expect(SCENARIO_DRAFT_REJECTION_REASONS.slice(-16, -12)).toEqual([
       'SCENARIO_API_DISCOVERY_PROFILE_STALE', 'SCENARIO_API_PAGE_KEY_NOT_SCALAR', 'SCENARIO_API_RECORD_ID_KEY_SECRET_LIKE',
       'SCENARIO_API_READ_VERIFICATION_NOT_BOUND',
     ]);

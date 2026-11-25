@@ -27,6 +27,8 @@ import { DEFAULT_EXCLUDED_URL_WORDS } from '../../src/core/default-excluded-url-
 import { validateArtifact } from '../../src/core/schema-validator.js';
 import { filterAuthenticatedState } from '../../src/control/auth/authenticated-state.js';
 import { WORKER_PROTOCOL_VERSION, validateWorkerToParentMessage } from '../../src/control/worker-protocol.js';
+import { apiAutoDraftPlanOf } from '../../src/control/approval/api-scenario-autodraft.js';
+import type { ScenarioDraftContext } from '../../src/control/approval/scenario-policy.js';
 import { submissionProbeKeyFieldsOf } from '../../src/discovery/submission-probe-contracts.js';
 import type { DiscoveryDocument } from '../../src/discovery/discovery-result.js';
 import type { ReadEvidenceDocument } from '../../src/discovery/read-check-evaluation.js';
@@ -222,6 +224,36 @@ document.getElementById('f').addEventListener('submit', (e) => { e.preventDefaul
   x.send(JSON.stringify({ notes: v('notes'), makers: [], holders: v('holder') ? [v('holder')] : [], basis: v('basis'), labels: v('label') ? [v('label')] : [], title: v('title') })); });
 </script>`;
 
+/** WBF（DEF-291）: 保存で承認した API の Origin の `/api/items` へ POST（JSON）する画面の送り方。 */
+const WBF_SEND = `const send = (o) => fetch(API + '/api/items', { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify(o) });`;
+const WBF_PRECHECK_PATH = '/wbf/precheck';
+/** WBF: 登録の画面の形（A: 名前のない制御された欄、B: form の外の保存、C: 入れた後に遅れて値を持つ欄、B1: 保存の前の確かめの POST）。 */
+const WBF_PAGES: Readonly<Record<string, string>> = Object.freeze({
+  '/wbf/nameless': `<main><h1>品目の登録</h1><div><label>題 <input type="text"></label></div><div><label>メモ <input type="text"></label></div>
+<button type="button" id="save">${SAVE_WORD}</button></main>
+<script>${WBF_SEND} const s = { title: '', memo: '' }; const k = ['title', 'memo'];
+document.querySelectorAll('input').forEach((el, i) => el.addEventListener('input', (e) => { s[k[i]] = e.target.value; }));
+document.getElementById('save').addEventListener('click', () => send(s));</script>`,
+  '/wbf/outside': `<header><input type="search" placeholder="検索"></header><main><h1>品目の登録</h1>
+<form onsubmit="return false"><label>題 <input type="text" name="title"></label><label>メモ <input type="text" name="memo"></label></form>
+<div><button type="button" id="save">${SAVE_WORD}</button></div></main>
+<script>${WBF_SEND} const v = (n) => document.querySelector('[name=' + n + ']').value;
+document.getElementById('save').addEventListener('click', () => send({ title: v('title'), memo: v('memo') }));</script>`,
+  '/wbf/later': `<main><h1>品目の登録</h1><label>題 <input type="text" name="title"></label><label>メモ <input type="text" name="memo"></label>
+<button type="button" id="save">${SAVE_WORD}</button></main>
+<script>${WBF_SEND} const s = { title: '', memo: '' }; let t = null;
+document.querySelector('[name=title]').addEventListener('input', (e) => { clearTimeout(t); const v = e.target.value; t = setTimeout(() => { s.title = v; }, 300); });
+document.querySelector('[name=memo]').addEventListener('input', (e) => { s.memo = e.target.value; });
+document.getElementById('save').addEventListener('click', () => send(s));</script>`,
+  [WBF_PRECHECK_PATH]: `<main><h1>品目の登録</h1><label>題 <input type="text" name="title"></label><label>メモ <input type="text" name="memo"></label>
+<button type="button" id="save">${SAVE_WORD}</button></main>
+<script>const v = (n) => document.querySelector('[name=' + n + ']').value;
+document.getElementById('save').addEventListener('click', async () => {
+  await fetch(API + '/api/session/check', { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ purpose: 'save' }) });
+  await fetch(API + '/api/items', { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ title: v('title'), memo: v('memo') }) });
+});</script>`,
+});
+
 /** 1 回だけ流す場面の Chromium（組の先頭の回。`chromiumRunsOf` の決まり）。 */
 const [ONCE_NAME, launchOnce] = PROBE_SCENE_LAUNCHERS[0] ?? ['', () => Promise.reject(new Error('no Chromium run'))];
 
@@ -269,9 +301,11 @@ describe(`the probe scenes of one press (${ONCE_NAME})`, () => {
     expect(nonReadHitsOf(opened.hits)).toEqual([]);
     expect(probeResultOfWord(probed, '保存')).toBe('NOT_OBSERVED DISABLED_SUBMITTER');
     expect(probed.candidates.filter((candidate) => candidate.submitterWords.join('/') === '登録' && candidate.submissionProbe?.result !== undefined
-      && candidate.submissionProbe.reason !== 'TARGET_NOT_FOUND').map(({ submissionProbe }) => submissionProbe?.reason)).toEqual(['DISABLED_SUBMITTER']);
-    // 枠の文字のあるボタン 3 つを全部押す（どれも何も送らない。COV-1: 押す数の上限はない）。
-    expect(probed.candidates.filter((candidate) => candidate.submitterWords.length === 0 && candidate.submissionProbe?.result === 'NO_REQUEST')).toHaveLength(3);
+      && candidate.submissionProbe.reason !== 'TARGET_NOT_VISIBLE').map(({ submissionProbe }) => submissionProbe?.reason)).toEqual(['DISABLED_SUBMITTER']);
+    // 枠の文字のあるボタン 3 つ（番号だけ違う同じ形）は、CALDAY: 最初の 1 つを押して何も起きないので、残りは押さない。
+    const menus = probed.candidates.filter((candidate) => candidate.submitterWords.length === 0 && candidate.submissionProbe !== undefined);
+    expect(menus.map(({ submissionProbe }) => `${String(submissionProbe?.result)} ${String(submissionProbe?.reason)}`).sort())
+      .toEqual(['NOT_OBSERVED SAME_SHAPE_NO_CHANGE', 'NOT_OBSERVED SAME_SHAPE_NO_CHANGE', 'NO_REQUEST null']);
   }, TEST_TIMEOUT_MS);
 
   it('DEF-214: the save button that becomes enabled by the required input is filled and pressed', async () => {
@@ -291,10 +325,10 @@ describe(`the probe scenes of one press (${ONCE_NAME})`, () => {
       .map(({ submissionProbe }) => submissionProbe);
     expect(disabled.map((probe) => probe?.reason)).toEqual(Array.from({ length: 8 }, () => 'DISABLED_SUBMITTER'));
     expect(disabled.map((probe) => probe?.filledFieldCount)).toEqual(Array.from({ length: 8 }, () => 1));
-    // 押せなかったボタンは、ほかの押下（「確定」）の後に、もう一度欄に入れて読む（8 × 2 + 1）。
+    // 押せなかったボタンは、ほかの押下（「確定」）の後に、もう一度欄に入れて読む（8 × 2 + 1）。RCA-3: 押す前に、form に属さない欄へ 1 回入れる（+ 1）。
     const pressed = probed.candidates.filter(({ submissionProbe }) => submissionProbe !== undefined && submissionProbe.result !== 'NOT_OBSERVED').length;
     expect(pressed).toBe(1);
-    expect(opened.hits.filter((hit) => hit.method === 'GET' && hit.path.startsWith('/api/check'))).toHaveLength(disabled.length * 2 + pressed);
+    expect(opened.hits.filter((hit) => hit.method === 'GET' && hit.path.startsWith('/api/check'))).toHaveLength(disabled.length * 2 + pressed + 1);
     const confirm = probed.candidates.find((candidate) => candidate.submissionProbe !== undefined && candidate.submitterWords.length === 0);
     expect(confirm?.submissionProbe?.result).not.toBe('NOT_OBSERVED');
     expect(confirm?.submissionProbe?.filledFieldCount).toBe(1);
@@ -380,6 +414,24 @@ describe(`the probe scenes of one press (${ONCE_NAME})`, () => {
     await settleProbeSceneSite(opened);
     expect(nonReadHitsOf(opened.hits)).toEqual([]);
   }, TEST_TIMEOUT_MS);
+
+  // WBF（DEF-291）: 名前のない欄（A）、form の外の保存（B）、入れた後に遅れて値を持つ欄（C）は、登録を試せる下書きになる。保存の前の確かめの POST の形（B1）は、
+  // 理由つきで試せない。どの形も、サーバに書き込みは届かない。
+  it.each(Object.keys(WBF_PAGES))('WBF: the probe of %s gives the expected create plan and sends nothing', async (path) => {
+    const opened = await openSite(WBF_PAGES);
+    const { probed } = await probeSceneOf(browser, opened, path);
+    const candidates = probed.candidates.filter((candidate) => candidate.submitterWords.includes(SAVE_WORD));
+    const context = { scenarioId: null, scenarios: [], approvedServiceOrigins: [opened.apiOrigin], profileRevisions: { discoveryJob: 1, current: 1 } };
+    const plan = apiAutoDraftPlanOf({ profileId: 'example-wbf', candidates, context: context as unknown as ScenarioDraftContext, scenarios: [] });
+    const created = plan.creates.map((item) => (item.status === 'REJECTED' ? item.reason : item.status));
+    expect(created).toEqual([path === WBF_PRECHECK_PATH ? 'SCENARIO_API_FIELD_VALUES_NOT_SENT' : 'NEW']);
+    const [create] = plan.creates;
+    if (create?.status === 'NEW') {
+      expect(create.draft['fieldNames']).toEqual(['memo', 'title']);
+    }
+    await settleProbeSceneSite(opened);
+    expect(nonReadHitsOf(opened.hits)).toEqual([]);
+  });
 });
 
 // ---------- DEF-144・DEF-145（発見のジョブと READ の確かめの本物の流れ） ----------

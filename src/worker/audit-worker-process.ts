@@ -34,6 +34,7 @@ import { loadConfig } from '../config/load-config.js';
 import { loginOriginOf } from '../control/auth/automated-login-results.js';
 import { createCredentialStore, type CredentialStore } from '../control/credentials/credential-store.js';
 import { observationWindowsOf, type ObservationWindowsOverrides } from '../core/observation-windows.js';
+import { debugSettingsPathOf, debugTimingSwitchOf, type DebugTimingSwitch } from '../core/debug-timing.js';
 import type { WorkerToParentMessage } from '../control/worker-protocol.js';
 import { LOGIN_BROWSER_HEADLESS, runLoginStage, type LoginStageDependencies } from './authenticated-login.js';
 import { runAutomatedLoginStage, type AutomatedLoginStageDependencies, type AutomatedLoginStageResult } from './automated-login.js';
@@ -108,6 +109,15 @@ function withObservationWindows(runDependencies: AuditRunDependencies, overrides
     runDependencies: { ...runDependencies, observationWindows },
     executeDiscovery: (request, observer) => executeDiscoveryRun({ ...request, observationWindows }, observer),
     executeWriteCreate: (request, observer) => executeWriteCreateRun({ ...request, observationWindows }, observer),
+  };
+}
+
+/** DBG-1: 監査の Run の依存と操作さがしの流れの依頼に、測りの記録の入切を読む口を渡す（読むのは Run の始め）。 */
+function withDebugTimingSwitch(flows: ObservedFlows, debugTimingSwitch: DebugTimingSwitch): ObservedFlows {
+  return {
+    ...flows,
+    runDependencies: { ...flows.runDependencies, debugTimingSwitch },
+    executeDiscovery: (request, observer) => flows.executeDiscovery({ ...request, debugTimingSwitch }, observer),
   };
 }
 
@@ -186,9 +196,13 @@ export function runAuditWorkerProcess(target: NodeJS.Process, options: AuditWork
   const automatedLoginStage: AutomatedLoginStageDependencies = { ...PRODUCTION_AUTOMATED_LOGIN_STAGE_DEPENDENCIES, ...options.automatedLoginStage };
   const openCredentialStore = options.openCredentialStore ?? createCredentialStore;
   // FM2d: テストだけの口（`launchRunBrowser`）があれば、Run の Browser の起動だけを替える。RB-2: テストだけの一式があれば、Run と流れに渡す。
-  const flows = withObservationWindows(options.launchRunBrowser === undefined
+  // DBG-1（設計書 `2026-11-20-beaksight-discovery-skip-and-debug-timing-design.md` 2.2）: 測りの記録の入切を読む口を、起動の入口で作り、監査と操作さがしの流れへ
+  // 渡す（Run（段）の始めに 1 回読む）。ワーカーは自分で読む: 親はワーカーの作業のフォルダをリポジトリの根にして起動する（ターゲット JSON と同じ決め方）ので、
+  // CLI と同じ `local/` の設定ファイルを見る。
+  const flows = withDebugTimingSwitch(withObservationWindows(options.launchRunBrowser === undefined
     ? PRODUCTION_RUN_DEPENDENCIES
-    : { ...PRODUCTION_RUN_DEPENDENCIES, launchBrowser: options.launchRunBrowser }, options.observationWindows);
+    : { ...PRODUCTION_RUN_DEPENDENCIES, launchBrowser: options.launchRunBrowser }, options.observationWindows),
+  () => debugTimingSwitchOf(debugSettingsPathOf(target.cwd())));
   const worker = startAuditWorker({
     channel,
     stderr: streamOutput(target.stderr),

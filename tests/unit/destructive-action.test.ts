@@ -5,6 +5,8 @@ import {
   crawlUrlHasDestructiveWord,
   destructiveActionFactsFrom,
   destructiveActionFactsOfNames,
+  isAiAction,
+  isAiRequest,
   isDestructiveAction,
   linkTextHasDestructiveWord,
   urlHasDestructiveWord,
@@ -33,6 +35,52 @@ describe('押さない操作（設計書 2.2）', () => {
       facts({ names: ['実行'], chosenTexts: ['一括削除'] }),
     ];
     expect(cases.map(isDestructiveAction)).toEqual(cases.map(() => true));
+  });
+});
+
+// AIW（2026-11-20 のユーザーの判断）: 名前に「AI」の語があるボタンは押さない（サイトの AI の生成を起こさない）。「生成」などの広い語は止めない。
+describe('AI の操作', () => {
+  it('名前に AI の語（語の境界つき・全角・人工知能）があるボタンだけを AI の操作とする', () => {
+    const ai = ['AI で作り直す', 'AIで本文を編集', 'ＡＩに相談', '人工知能に聞く'].map((name) => facts({ names: [name] }));
+    const plain = ['作成', 'QR コードを生成', 'レポートを生成', 'メールを送る', '詳細', 'MAIL', 'DETAIL'].map((name) => facts({ names: [name] }));
+    expect(ai.map(isAiAction)).toEqual(ai.map(() => true));
+    expect(plain.map(isAiAction)).toEqual(plain.map(() => false));
+  });
+
+  it('キラキラの印（✨・sparkle・magic・wand のアイコン）と、AI の枠の中の生成・作成・実行のボタンも AI の操作とする（枠の中の保存や、枠の外の生成は押す）', () => {
+    const ai = [
+      facts({ names: ['✨ 下書き'] }),
+      facts({ names: ['下書き'], iconTokens: ['lucide lucide-sparkles'] }),
+      facts({ names: [''], iconTokens: ['icon-magic-wand'] }),
+      facts({ names: ['下書きを生成'], regionTexts: ['記事の下書きを自動作成する'] }),
+      facts({ names: ['実行'], regionTexts: ['AI アシスタント'] }),
+    ];
+    const plain = [
+      facts({ names: ['保存'], regionTexts: ['記事の下書きを自動作成する'] }),
+      facts({ names: ['閉じる'], regionTexts: ['AI アシスタント'] }),
+      facts({ names: ['QR コードを生成'] }),
+      facts({ names: ['パスワードを生成'], regionTexts: ['アカウントの設定'] }),
+      facts({ names: ['メール'], iconTokens: ['icon-mail'] }),
+    ];
+    expect(ai.map(isAiAction)).toEqual(ai.map(() => true));
+    expect(plain.map(isAiAction)).toEqual(plain.map(() => false));
+  });
+
+  it('押下で出た AI の送信（path の区切りの AI の語・流し続ける答え）を見分け、静的なファイルと画面の移動は数えない', () => {
+    const ai = [
+      { url: 'https://api.example.test/functions/v1/assist-text', resourceType: 'fetch' },
+      { url: 'https://api.example.test/v1/generate-summary', resourceType: 'fetch' },
+      { url: 'https://api.example.test/chat/ai-reply', resourceType: 'xhr' },
+      { url: 'https://example.test/stream', resourceType: 'fetch', contentType: 'text/event-stream; charset=utf-8' },
+    ];
+    const plain = [
+      { url: 'https://example.test/static/js/generateChart.js', resourceType: 'script' },
+      { url: 'https://example.test/ai/help', resourceType: 'document' },
+      { url: 'https://example.test/api/mail', resourceType: 'fetch' },
+      { url: 'https://example.test/api/details', resourceType: 'fetch' },
+    ];
+    expect(ai.map(isAiRequest)).toEqual(ai.map(() => true));
+    expect(plain.map(isAiRequest)).toEqual(plain.map(() => false));
   });
 });
 

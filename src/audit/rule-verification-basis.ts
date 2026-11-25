@@ -70,6 +70,10 @@ export const RULE_VERIFICATION_BASIS_TABLE: readonly RuleVerificationBasisEntry[
   id('COLOR_CONTRAST_VIOLATION', RENDERED),
   // AUD-4d: フォーカスを当てた描いた画面（矩形・見えるか・hit-test）で確かめた。
   id('FOCUSED_CONTROL_HIDDEN', RENDERED),
+  // FRET: キーボードで押して閉じる操作で再現した。
+  id('DIALOG_FOCUS_NOT_RETURNED', INTERACTION_REPRODUCED),
+  id('DIALOG_FOCUS_NOT_MOVED', INTERACTION_REPRODUCED),
+  id('DIALOG_NOT_CLOSABLE_BY_KEYBOARD', INTERACTION_REPRODUCED),
   Object.freeze({ ruleIdPrefix: 'A11Y_', basis: STATIC_CANDIDATE }),
   // --- PERFORMANCE（読み込みの計測。INP だけは操作への応答） ---
   id('POOR_LCP', NAVIGATION_OBSERVED),

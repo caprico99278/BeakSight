@@ -23,6 +23,7 @@ import { AdvancedSettings } from '../../components/AdvancedSettings';
 import { ConfirmDialog } from '../../components/ConfirmDialog';
 import { EntryCheckStartButton, NEXT_STEPS_ANCHOR, ProfileActionLink, type ProfileLinkAction } from '../../components/NextSteps';
 import { Notice } from '../../components/Notice';
+import { searchCheckSummaryTextsOf } from '../../components/SearchCheckOutcome';
 import { arrivedFromJobOf } from '../../components/JobArrival';
 import { PageFrame, arrivalSearchOf } from '../../components/PageFrame';
 import { ProfileForm, formValuesOf, profileDocumentOf } from '../../components/ProfileForm';
@@ -153,6 +154,11 @@ export const Route = createFileRoute('/profiles/$profileId')({
       writeScreens,
       // OP-2（4.1.2）・OP-G（指示書の 3）: 移ってきた点検の、チェックした画面の登録・更新の 1 行の種類（実際に送った段と結果から。サーバが決める）。
       arrivalWrite: arrivedSiteJob?.inspectionWrite ?? null,
+      // RCA-8（検索の確かめの設計書 2.4）: 移ってきた点検の、検索の確かめの結果（ためした数と開けなかった数の 1 行。ためしたものも誤りもなければ出さない）。
+      arrivalSearch: arrivedSiteJob?.searchCheck !== undefined && arrivedSiteJob.searchCheck !== null
+        && (arrivedSiteJob.searchCheck.tried > 0 || arrivedSiteJob.searchCheck.errors.length > 0)
+        ? arrivedSiteJob.searchCheck
+        : null,
       displaySettings,
       crawlLimits,
       entryCheckJobs: entryCheckJobs.filter((job) => job.profileId === params.profileId && job.jobKind === WORKER_ENTRY_CHECK_JOB_KIND),
@@ -283,7 +289,7 @@ function ProfileActionButton({ action, primary, profileId, revision, reportHref 
  * 表示の設定、読む上限、サイトの設定の編集、取り消し）。主のボタンと二次のボタンは、サーバが選んだ段（`profileOnboardingFn` の `stage`）の値を描くだけ。
  */
 function ProfilePage() {
-  const { detail, candidates, onboarding, writeScreens, arrivalWrite, displaySettings, crawlLimits, entryCheckJobs, arrival } = Route.useLoaderData();
+  const { detail, candidates, onboarding, writeScreens, arrivalWrite, arrivalSearch, displaySettings, crawlLimits, entryCheckJobs, arrival } = Route.useLoaderData();
   const search = Route.useSearch();
   // DEF-137: 保存の知らせは、画面の改訂が保存した改訂に届いたときだけ出す（改訂のない知らせは今のまま）。MI-C（MI-1 の発見事項 1）: ルータは根の生の
   // search も子へ渡すので、`validateSearch` で外した値も残る。知らせと改訂も、描く前に閉じた一覧と形をもう一度確かめる（`?saved=foo` で空の枠を出さない）。
@@ -356,6 +362,10 @@ function ProfilePage() {
         {/* PL-U（14.1 の U1・U2）: 点検から移ってきたときは、その点検の結果の 1 行（問題の数。一部のページを見られなかったこと）。 */}
         {arrival === null ? null : <p data-testid="profile-arrival" data-result={arrival.result}>{arrival.text}</p>}
         {/* OP-2（4.1.2）・OP-G（指示書の 3）: 点検の中の、チェックした画面の登録・更新の 1 行（実際に行ったこと。確かめられなかった・試せなかったときは、その事実）。 */}
+        {/* RCA-8: 点検の中の、検索の確かめの行（ためした数と問題があった数。REV-RCA の M-2: 操作さがしでサイトが誤りを返した操作は別の行）。 */}
+        {arrival === null || arrivalSearch === null ? null : (
+          <p data-testid="profile-arrival-search" data-errors={arrivalSearch.errors.length}>{searchCheckSummaryTextsOf(arrivalSearch).join('')}</p>
+        )}
         {arrival !== null && arrivalWrite !== null ? (
           <p data-testid="profile-arrival-wrote" data-outcome={arrivalWrite}>{LOCAL_UI_WRITE_SCREENS_TEXT.inspectionWrite[arrivalWrite]}</p>
         ) : null}

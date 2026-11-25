@@ -21,7 +21,8 @@ describe('DEF-195: the progress of the discovery job', () => {
     const reports: RunProgressReport[] = [];
     const run = await runDiscoveryOnPlainSite(
       launchHeadlessChromium, (path) => (PAGES.includes(path as (typeof PAGES)[number]) ? document(path) : null), PAGES[0], MAX_PAGES, 'job-def195-progress',
-      {}, (report) => { reports.push(report); },
+      // DBG-1: 時間の内訳は、測りの記録が入のときだけ書く。
+      {}, (report) => { reports.push(report); }, undefined, true,
     );
     const readPages = run.document.pages.filter((page) => page.state === 'READ').length;
     expect(readPages).toBe(PAGES.length);
@@ -38,6 +39,15 @@ describe('DEF-195: the progress of the discovery job', () => {
     // 各画面の文書の要求は 1 回だけ（進み具合のために読み込みを足さない）。
     for (const path of PAGES) {
       expect(run.seen.filter((entry) => entry.method === 'GET' && entry.path === path)).toHaveLength(1);
+    }
+    // DTIME（DBG-1: 測りの記録が入のとき）: 読んだ画面ごとに時間の内訳が入り、区分・見張りの終わり・そのほかの和が全体と合う（読み込みは 1 回、落ち着きを待った）。
+    for (const page of run.document.pages) {
+      if (page.state !== 'READ') continue;
+      const time = page.timeBreakdown;
+      expect(time).toMatchObject({ loads: 1, reloads: 0, presses: 0, stageEndMs: 0 });
+      expect(time?.settleMs).toBeGreaterThan(0);
+      expect((time?.pacingWaitMs ?? 0) + (time?.loadMs ?? 0) + (time?.settleMs ?? 0) + (time?.afterPressWindowMs ?? 0) + (time?.pressReadinessMs ?? 0)
+        + (time?.inputChecksMs ?? 0) + (time?.stageEndMs ?? 0) + (time?.otherMs ?? 0)).toBe(time?.totalMs);
     }
   }, TEST_TIMEOUT_MS);
 });

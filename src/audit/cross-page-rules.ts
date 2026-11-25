@@ -14,7 +14,9 @@ import { compareCodeUnits, normalizeWhitespace } from '../core/text.js';
 import { classifyUrl, type UrlAdmission } from '../crawl/admission-policy.js';
 import { internalNavigableUrlsOf } from '../crawl/internal-navigable-links.js';
 import { canonicalizeAllowedOrigins, normalizeUrl } from '../crawl/normalize-url.js';
-import { listText, truncatedListText } from '../presentation/messages.js';
+import { dataFreePathOfUrl } from '../discovery/fingerprint.js';
+import { DUPLICATE_PAGE_TITLE_TEXT, listText, truncatedListText } from '../presentation/messages.js';
+import { findingClassKeyOf, sameTemplateKeyOf, sameTitleKeyOf } from './finding-grouping-keys.js';
 import type { FindingDraft, RulePlainMessageOwner } from './rule.js';
 import {
   compareRuleEvaluationFailures,
@@ -25,7 +27,7 @@ import {
   type MaterializeFindingDraftsResult,
   type RuleEvaluationFailure,
 } from './rule-engine.js';
-import { RULE_CATALOG, freezeCatalog, pageRulePlainMessageOf, ruleOfFindingRuleId } from './rule-catalog.js';
+import { RULE_CATALOG, freezeCatalog, isOperationRecordRuleId, pageRulePlainMessageOf, ruleOfFindingRuleId } from './rule-catalog.js';
 import {
   ERROR_HTTP_STATUS_RANGE,
   SUCCESS_HTTP_STATUS_RANGE,
@@ -48,7 +50,7 @@ export type CrossPageViewportResult = ViewportAuditResult;
  * - `evidence` のうち、link の Evidence（リンク）、DOM の Evidence（title と canonical）、network の Evidence（参照だけ）を使う。
  * - `viewports` のビューポートごとの identity（最終URL、HTTP ステータス、ナビゲーションの失敗、ナビゲーションの結果の種類）を使う。
  */
-export type CrossPagePageResult = Pick<PageAuditResult, 'pageId' | 'pageUrl' | 'evidence'> & {
+export type CrossPagePageResult = Pick<PageAuditResult, 'pageId' | 'pageUrl' | 'evidence' | 'templateKey'> & {
   readonly viewports: Readonly<Record<ViewportProfile, CrossPageViewportResult>>;
 };
 
@@ -88,6 +90,8 @@ export interface CrossPagePageFacts {
   readonly documents: readonly CrossPageDocumentFact[];
   readonly links: readonly CrossPageLinkFact[];
   readonly networks: readonly CrossPageNetworkFact[];
+  /** AUD-5（S-07）: ページの作りの鍵（`PageAuditResult.templateKey`。なければ `null`）。 */
+  readonly templateKey: string | null;
 }
 
 /** MEM-3b: 1 ページの、Cross-page rule の材料（Evidence の順。入力を変えない）。 */
@@ -121,6 +125,7 @@ export const crossPagePageFactsOf = (page: CrossPagePageResult): CrossPagePageFa
     documents,
     links,
     networks,
+    templateKey: page.templateKey ?? null,
   };
 };
 
@@ -149,13 +154,19 @@ export interface CrossPageRuleInput {
    * （sitemap の URL が発見されなかった、canonical の先が発見されなかった）をしない。
    */
   readonly crawlCoversSite?: boolean;
+  /**
+   * DEF-296: 巡回の候補の除外の判定（読む範囲の外・読まないパス・危険な語。Run Coordinator の `excludedCrawlCandidateOf` の 1 か所）。監査していない行き先が
+   * 当たるリンクは、意図して読まないので、検証できなかった内部リンクに数えない。省略は、除外なし。
+   */
+  readonly isOutsideReadScope?: (url: string) => boolean;
 }
 
 export interface CrossPageEvaluationResult extends MaterializeFindingDraftsResult {
   /**
    * 検証できなかった内部リンクの件数。リンク元のページとリンク先のURLの組を1件と数える。
    * リンク先が監査されなかった（上限などでキューから外れた、どのビューポートもスキップされた）ため、
-   * リンク切れかどうかを判定できなかったもの。これらから Finding は作らない。
+   * リンク切れかどうかを判定できなかったもの。これらから Finding は作らない。DEF-296: 監査していない行き先が巡回の候補の除外に当たる
+   * （`CrossPageRuleInput.isOutsideReadScope`）リンクは数えない。
    */
   readonly unverifiedInternalLinkCount: number;
 }
@@ -616,21 +627,35 @@ const DUPLICATE_PAGE_TITLE = defineRule(
     const drafts: CrossPageFindingDraft[] = [];
     for (const [title, members] of groups) {
       for (const indexed of members) {
-        const others = members.filter((other) => other.documentKey !== indexed.documentKey);
+        // DEF-305: データを除いた path（DUP の `dataFreePathOf`）が同じ画面（query だけ・記録の番号だけが違う）は、重なりの相手にしない。
+        const dataFreePath = dataFreePathOfUrl(indexed.page.pageUrl);
+        const others = members.filter((other) => other.documentKey !== indexed.documentKey
+          && (dataFreePath === null || dataFreePathOfUrl(other.page.pageUrl) !== dataFreePath));
         if (others.length === 0) {
           continue;
         }
         const listedOthers = others.slice(0, MAX_LISTED_URLS);
-        drafts.push(
-          createDraft(
-            rule,
-            pageContext(indexed.page),
-            `title「${title}」が、canonical の異なるほかの ${others.length} ページと同じです: `
-              + truncatedListText(others.map((other) => other.page.pageUrl), MAX_LISTED_URLS),
-            [indexed, ...listedOthers].flatMap((member) => member.titles.get(title) ?? []),
-            [{ name: 'title', value: title }],
-          ),
+        // AUD-5（S-07）: 作りの鍵（DUP の `auditPageTemplateKeyOf` の値）が、ほかのページの全部と同じなら、同じ画面の別のデータとして区分の鍵と、作りの鍵と
+        // 題名の digest のまとめの鍵を付け、文で分ける（確信度は候補群で下げる）。ほかは、題名の digest のまとめの鍵で、同じ題名の指摘を 1 つの群にする（DEF-305）。
+        const { templateKey } = indexed.page;
+        const screenKey = templateKey !== null && others.every((other) => other.page.templateKey === templateKey) ? templateKey : null;
+        const sameTemplate = screenKey !== null;
+        const draft = createDraft(
+          rule,
+          pageContext(indexed.page),
+          `title「${title}」が、canonical の異なるほかの ${others.length} ページと同じです: `
+            + truncatedListText(others.map((other) => other.page.pageUrl), MAX_LISTED_URLS)
+            + (sameTemplate ? `。${DUPLICATE_PAGE_TITLE_TEXT.sameTemplateNote}` : ''),
+          [indexed, ...listedOthers].flatMap((member) => member.titles.get(title) ?? []),
+          [{ name: 'title', value: title }],
         );
+        drafts.push({
+          ...draft,
+          draft: {
+            ...draft.draft,
+            linkKeys: sameTemplate ? [findingClassKeyOf('SAME_TEMPLATE'), sameTemplateKeyOf(screenKey, title)] : [sameTitleKeyOf(title)],
+          },
+        });
       }
     }
     return drafts;
@@ -937,6 +962,12 @@ export const rulePlainMessageOf = (ruleId: string): string | null =>
   ruleOfFindingRuleId(CROSS_PAGE_RULES, ruleId)?.plainMessage ?? pageRulePlainMessageOf(ruleId);
 
 /**
+ * S-12: Finding の ruleId が、点検のための操作の記録の Rule のものか（一覧の持ち主は Rule Catalog の `isOperationRecordRuleId`）。報告の表示用モデルが、指摘の数から
+ * 外して別に数えるのに使う（`rulePlainMessageOf` と同じく、報告が Rule の定義を引く口はこのファイル）。Rule を評価しない。
+ */
+export const isOperationRecordFindingRuleId = (ruleId: string): boolean => isOperationRecordRuleId(ruleId);
+
+/**
  * ページをまたぐ構造の Rule を評価する、唯一の入口（Task 12・13 の設計書 第7章）。クロールの後に1回呼ぶ。
  * - 下書きの検査、fingerprint、並べ替え、Finding ID の採番は `materializeFindingDrafts` が行う。
  * - 入力のページ・Evidence・リンク・sitemap のURLの順序は、出力の順序と fingerprint に影響しない。
@@ -974,6 +1005,7 @@ export const evaluateCrossPageRules = (
     // `MaterializeFindingDraftsResult.failures` と同じく、ruleId の順に並べる。
     failures: [...evaluationFailures, ...materialized.failures].sort(compareRuleEvaluationFailures),
     nextFindingSequence: materialized.nextFindingSequence,
-    unverifiedInternalLinkCount: index.internalLinks.filter((link) => !isLinkTargetVerified(link)).length,
+    unverifiedInternalLinkCount: index.internalLinks.filter((link) => !isLinkTargetVerified(link)
+      && !(link.target === undefined && input.isOutsideReadScope?.(link.targetUrl) === true)).length,
   });
 };

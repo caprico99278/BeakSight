@@ -43,7 +43,7 @@ import {
   WORKER_LOGIN_CHECK_JOB_KIND,
   WORKER_READ_CHECK_JOB_KIND,
 } from '../../../../src/core/audit-job-values.js';
-import type { AuditJobLoginConfirmResult, EntryCheckFollowUp } from '../../../../src/control/job/audit-job-manager.js';
+import type { AuditJobLoginConfirmResult, AuditJobProgressBaseline, EntryCheckFollowUp } from '../../../../src/control/job/audit-job-manager.js';
 import { chainStagesOfMode, type StageChainView } from '../../../../src/control/job/stage-chain-policy.js';
 import { FINISHED_CHAIN_STATE, RUNNING_CHAIN_STAGE_STATE, RUNNING_CHAIN_STATE } from '../../../../src/core/stage-chain-states.js';
 import type { AuditPageScopeKind } from '../../../../src/core/audit-page-scope.js';
@@ -68,6 +68,7 @@ import {
 } from '../../../../src/control/worker-protocol.js';
 import { DEFAULT_AUDIT_SEND_POLICY, hasAuditSendWebSocketCaution, type AuditSendPolicyName } from '../../../../src/core/audit-send-policy.js';
 import type {
+  DiscoveredPagesSplit,
   IncompleteReasonCode,
   JobSafetyViolation,
   PageIncompleteReasonCount,
@@ -86,6 +87,8 @@ import type {
 } from '../../../../src/control/discovery-view.js';
 import type { SessionLossEvidence } from '../../../../src/core/evidence-types.js';
 import { listJobArtifacts, readJobResultDocument, type JobArtifactView, type JobResultDocumentKind } from './artifact-files';
+import { readDiscoveryDocuments } from './discovery-documents';
+import { searchCheckOutcomeOf, type ReadEvidenceDocument, type SearchCheckOutcome } from '../../../../src/control/discovery-view.js';
 import type { AuthSetupErrorView } from './auth-setup-errors';
 import { auditStartCheckOf, startRejectionViewOf, type AuditStartBlocker } from './audit-start-check';
 import { localUiAuditJobs } from './audit-jobs';
@@ -127,6 +130,13 @@ export interface AuditJobRowView {
   readonly stopRequestedAt: string | null;
 }
 
+/** DPROG: 動いている読み取りの段の作業と、その最後の進み具合。 */
+export interface ChainStageProgressView {
+  readonly jobId: string;
+  readonly kind: AuditJobKind;
+  readonly progress: RunProgressReport;
+}
+
 /** ジョブの詳細と進み具合。 */
 export interface AuditJobDetailView extends AuditJobRowView {
   readonly lastProgress: RunProgressReport | null;
@@ -153,6 +163,11 @@ export interface AuditJobDetailView extends AuditJobRowView {
   readonly write: WriteResultSummaryView | null;
   /** FM2d: まとめて実行の段の一覧と状態（まとめて実行の段のジョブだけ。ジョブの管理のメモリの中。ほかは `null`）。 */
   readonly stageChain: StageChainView | null;
+  /**
+   * DPROG: まとめて実行の連鎖が動いていて、見ている作業が終わっている間の、動いている読み取りの段（操作さがし・見るだけの確かめ）の作業の最後の進み具合
+   * （その段の作業が進み具合を送っていなければ `null`）。点検の画面の「進み具合」の欄と見積もりに、点検の数の代わりに使う。
+   */
+  readonly chainStageProgress: ChainStageProgressView | null;
   /**
    * OP-G2（OP-G の指示書の 6）: まとめて実行の連鎖が動いている間の、動いている書き込みの段の作業の種類（最後に始めた書き込みの段の作業が動いているときだけ。
    * ほかは `null`）。点検の画面の要点の 1 行目（`summary.chainStage`）に使う。
@@ -196,7 +211,7 @@ export interface AuditJobDetailView extends AuditJobRowView {
   readonly externalSchemeProbes: DiscoveryExternalSchemeProbes | null;
   /**
    * T44c（Task 44 の設計書 P1-4。設計者の判断）: 終わった監査のジョブの、ページの未完了の理由ごとのページ数（`run.json` の `pageIncompleteReasonCounts`。持つときだけ。
-   * ほかは `null`）。数と理由のコードだけ。
+   * ほかは `null`）。PIR: 数と理由のコードに、範囲の外の印とページのアドレスの全部を添える（ユーザーの指摘で、URL を持たない T44c の決めを覆した）。
    */
   readonly pageIncompleteReasons: readonly PageIncompleteReasonCount[] | null;
   /**
@@ -233,6 +248,11 @@ export interface AuditJobDetailView extends AuditJobRowView {
   readonly runEnd: AuditJobRunEndView | null;
   /** T44e: 終わった発見と READ の確かめのジョブの終わり方（成果物を読めたときだけ。ほかは `null`）。 */
   readonly profileJobEnd: AuditJobProfileJobEndView | null;
+  /**
+   * RCA-8（検索の確かめの設計書 2.4）: 検索の確かめの結果（見るだけの確かめのジョブか、その段を含む連鎖の作業だけ。ためした数と、開けなかった検索の一覧。
+   * 操作さがしで記録した 5xx も入る）。出すものがなければ `null`。
+   */
+  readonly searchCheck: SearchCheckOutcome | null;
   /**
    * T44e（Task 44 の設計書 P2-4）: 書き込みのジョブが送る前の確かめで送らずに止めたときの具体的な理由（`action-run.json` の `precheckDetail`。スキーマと
    * ジョブの ID を確かめて読む。項目のない記録・ほかの止め方・書き込みでないジョブは `null`）。
@@ -316,8 +336,15 @@ export type JobSummaryAdvance =
  * 進み具合の知らせ（1 ページ以上読んだ）と時間の上限を読めたときだけ。`pagesTotal` は見つけたページの数（ページの上限まで。読み進めて増えれば増える）。
  */
 export interface JobProgressEstimateView {
+  /** DPROG: 見積もった作業の種類（点検はページの語、操作さがしは画面の語で出す）。 */
+  readonly jobKind: AuditJobKind;
   readonly pagesFinished: number;
   readonly pagesTotal: number;
+  /**
+   * DSEED2: 連鎖の操作さがしの、分母（見つけた画面）の分け方（ワーカーの数のまま）。進み具合が分け方を持ち、分母が見つけた画面そのもの（ページの上限で
+   * 小さくしていない）ときだけ持つ。
+   */
+  readonly pagesTotalSplit?: DiscoveredPagesSplit;
   readonly remainingMs: number;
 }
 
@@ -581,6 +608,19 @@ const runningWriteStageKindOf = (chain: StageChainView | null): WorkerWriteJobKi
   return writeJob !== null && ACTIVE_STATES.has(writeJob.state) && isWriteJobKind(writeJob.jobKind) ? writeJob.jobKind : null;
 };
 
+/**
+ * DPROG: 動いている連鎖の、動いている読み取りの段の作業の最後の進み具合（管理データのその作業の行。段が動いていない・進み具合がなければ `null`）。
+ */
+const chainStageProgressOf = (chain: StageChainView | null): ChainStageProgressView | null => {
+  const stage = chain === null || chain.state !== RUNNING_CHAIN_STATE
+    ? undefined
+    : chain.stages.find((candidate) => candidate.state === RUNNING_CHAIN_STAGE_STATE);
+  const stageJob = stage === undefined || stage.jobId === null ? null : localUiAuditJobs().getAuditJob(stage.jobId);
+  return stage === undefined || stageJob === null || stageJob.lastProgress === null || !ACTIVE_STATES.has(stageJob.state)
+    ? null
+    : { jobId: stageJob.jobId, kind: stage.kind, progress: structuredClone(stageJob.lastProgress) };
+};
+
 const detailWithoutSummaryOf = async (job: AuditJobView): Promise<Omit<AuditJobDetailView, 'summary'>> => ({
   ...rowOf(job),
   lastProgress: job.lastProgress === null ? null : structuredClone(job.lastProgress),
@@ -603,6 +643,7 @@ const detailWithoutSummaryOf = async (job: AuditJobView): Promise<Omit<AuditJobD
   // T31h-2: 登録と更新の書き込みのジョブ（`write-kinds.ts`）。
   write: isWriteJobKind(job.jobKind) ? await writeResultSummaryOfJob(job.jobId) : null,
   stageChain: localUiAuditJobs().getStageChainOfJob(job.jobId),
+  chainStageProgress: ACTIVE_STATES.has(job.state) ? null : chainStageProgressOf(localUiAuditJobs().getStageChainOfJob(job.jobId)),
   stageChainWriteKind: runningWriteStageKindOf(localUiAuditJobs().getStageChainOfJob(job.jobId)),
   inspectionWrite: await inspectionWriteOf(localUiAuditJobs().getStageChainOfJob(job.jobId)),
   loginEndDetection: localUiAuditJobs().loginEndDetectionOf(job.jobId),
@@ -621,6 +662,7 @@ const detailWithoutSummaryOf = async (job: AuditJobView): Promise<Omit<AuditJobD
   entryCheckAuthSetup: await entryCheckAuthSetupOfJob(job),
   runEnd: await runEndOf(job),
   profileJobEnd: await profileJobEndOf(job),
+  searchCheck: await searchCheckOfJob(job),
   writePrecheckDetail: await writePrecheckDetailOfJob(job),
   reportSummary: await reportSummaryOfJob(job),
 });
@@ -714,7 +756,15 @@ const pageIncompleteReasonsOfJob = async (job: AuditJobView): Promise<readonly P
   }
   const run = await readJobResultDocument(job, 'run') as { readonly pageIncompleteReasonCounts?: readonly PageIncompleteReasonCount[] } | null;
   const counts = run?.pageIncompleteReasonCounts;
-  return counts === undefined ? null : counts.map(({ code, pages }) => ({ code, pages }));
+  // PIR: 範囲の外へ移った読み込みの失敗の印（`detail`）と、ページのアドレスの全部（`pageUrls`。前の書き手の Run は持たない）も写す。
+  return counts === undefined
+    ? null
+    : counts.map(({ code, detail, pages, pageUrls }) => ({
+      code,
+      ...(detail === undefined ? {} : { detail }),
+      pages,
+      ...(pageUrls === undefined ? {} : { pageUrls: [...pageUrls] }),
+    }));
 };
 
 /**
@@ -744,6 +794,24 @@ const runEndOf = async (job: AuditJobView): Promise<AuditJobRunEndView | null> =
     skippedPageCount: run.skippedPageCount ?? 0,
     checkedScreensOnly: run.pageScope !== undefined,
   };
+};
+
+/**
+ * RCA-8（検索の確かめの設計書 2.4）: 検索の確かめの結果。見るだけの確かめのジョブはそのジョブ、連鎖の作業はその連鎖の見るだけの確かめの段のジョブの
+ * `read-evidence.json`（終わったものだけ）と、プロファイルの最新の操作さがしの `discovery.json`（押下・選択・入力の 5xx）から作る。どちらでもない作業は `null`。
+ */
+const searchCheckOfJob = async (job: AuditJobView): Promise<SearchCheckOutcome | null> => {
+  const chain = job.jobKind === WORKER_READ_CHECK_JOB_KIND ? null : localUiAuditJobs().getStageChainOfJob(job.jobId);
+  const stageJobId = chain?.stages.find(({ kind }) => kind === WORKER_READ_CHECK_JOB_KIND)?.jobId ?? null;
+  const readJob = job.jobKind === WORKER_READ_CHECK_JOB_KIND ? job : stageJobId === null ? null : localUiAuditJobs().getAuditJob(stageJobId);
+  if (readJob === null && chain === null) {
+    return null;
+  }
+  const evidence = readJob === null || readJob.state !== FINISHED_AUDIT_JOB_STATE
+    ? null
+    : await readJobResultDocument(readJob, 'read-evidence') as ReadEvidenceDocument | null;
+  const { latest } = await readDiscoveryDocuments(job.profileId);
+  return searchCheckOutcomeOf(evidence, latest);
 };
 
 /** T44e: 終わった発見と READ の確かめのジョブの、成果物の終わり方（なければ `null`）。 */
@@ -845,18 +913,22 @@ const currentProfileOf = (profileId: string): AuditJobDetailView['currentProfile
 /** 要点を求めるのに使う、ジョブの詳細（要点のほか）。 */
 type JobDetailFacts = Omit<AuditJobDetailView, 'summary'>;
 
-/** 作業が終わるまでの見積もりに使う上限（ターゲット設定の `crawl` の値）。 */
+/** 作業が終わるまでの見積もりに使う値（要点のほかから読む。ターゲット設定の `crawl` の値と、ジョブの管理の見積もりの基準）。 */
 interface EstimateLimits {
   /** L14: 指定したときだけ（ないときは、時間の上限の残りで見積もりを縮めない）。 */
   readonly maxRuntimeMs: number | undefined;
+  /** DPROG (b): 見積もる作業の、このワーカーの実行から最初に受けた進み（ジョブの管理のメモリ。なければ `null` で、見積もりを出さない）。 */
+  readonly baseline: AuditJobProgressBaseline | null;
 }
 
 /** DEF-195: 進み具合と見積もりを出す作業の種類（点検と操作さがし。どちらも同じ進み具合の知らせ `PROGRESS` を送る）。 */
-const ESTIMATED_JOB_KINDS: ReadonlySet<string> = new Set([WORKER_AUDIT_JOB_KIND, WORKER_DISCOVERY_JOB_KIND]);
+// RCA-8（検索の確かめの設計書 2.3）: 見るだけの確かめも、この段のワーカーが送る進み具合（確かめた組 N / 全部の組 M）で見積もる。
+const ESTIMATED_JOB_KINDS: ReadonlySet<string> = new Set([WORKER_AUDIT_JOB_KIND, WORKER_DISCOVERY_JOB_KIND, WORKER_READ_CHECK_JOB_KIND]);
 
 /**
  * PL-2（13 章の 11。DEF-192: 2026-11-04 改）: 作業が終わるまでの見積もり（ms。0 以上）。残りのページの数（`pagesTotal` − 読み終えたページ）× 1 ページにかかった
- * 実際の時間（経過 ÷ 読み終えたページ）と、時間の上限の残り（時間の上限 − 経過）の、小さい方。読み終えたページがまだなければ `null`（求めない）。
+ * 実際の時間と、時間の上限の残り（時間の上限 − 経過）の、小さい方。DPROG (b): 1 ページの時間は、このワーカーの実行で進んだページの数と、その経過で求める
+ * （基準 `baseline` は、その実行から最初に受けた進み。続きの実行で、前の実行の分を入れない）。進んだページがまだなければ `null`（最初の 1 回だけでは求めない）。
  * 求め方はここだけ（点検と操作さがしが共有する。画面は分に直して描くだけ）。サーバだけの関数。
  */
 export const progressRemainingMs = createServerOnlyFn((input: Readonly<{
@@ -864,24 +936,38 @@ export const progressRemainingMs = createServerOnlyFn((input: Readonly<{
   pagesTotal: number;
   elapsedMs: number;
   maxRuntimeMs: number | undefined;
+  baseline: AuditJobProgressBaseline;
 }>): number | null => {
-  if (input.pagesFinished <= 0) {
+  const pagesRead = input.pagesFinished - input.baseline.pagesFinished;
+  if (pagesRead <= 0) {
     return null;
   }
-  const pageMs = input.elapsedMs / input.pagesFinished;
+  const pageMs = Math.max(0, input.elapsedMs - input.baseline.elapsedMs) / pagesRead;
   const byPages = Math.max(0, input.pagesTotal - input.pagesFinished) * pageMs;
   // L14: 時間の上限を指定していなければ、残りのページの時間だけで見積もる。
   return Math.max(0, input.maxRuntimeMs === undefined ? byPages : Math.min(byPages, input.maxRuntimeMs - input.elapsedMs));
 });
 
-/** 点検・操作さがしの作業が動いている間だけ、プロファイルのターゲット設定から見積もりの上限を読む（読めなければ `null`。例外を投げない）。 */
+/**
+ * DPROG: 見積もりと「進み具合」の欄に使う作業と進み具合。見ている作業が動いていれば、その作業の進み具合。まとめて実行の連鎖が動いていて見ている作業が終わって
+ * いれば、動いている読み取りの段の作業の進み具合（`chainStageProgress`。画面の「進み具合」の欄も、連鎖が動いている間はこれを描く）。
+ */
+const progressSourceOf = (detail: JobDetailFacts): ChainStageProgressView | null => {
+  if (detail.active) {
+    return detail.lastProgress === null ? null : { jobId: detail.jobId, kind: detail.jobKind, progress: detail.lastProgress };
+  }
+  return detail.chainStageProgress;
+};
+
+/** 見積もる作業が動いている間だけ、プロファイルのターゲット設定から見積もりの上限を、ジョブの管理から見積もりの基準を読む（読めなければ `null`。例外を投げない）。 */
 const estimateLimitsOf = async (detail: JobDetailFacts): Promise<EstimateLimits | null> => {
-  if (!detail.active || !ESTIMATED_JOB_KINDS.has(detail.jobKind)) {
+  const source = progressSourceOf(detail);
+  if (source === null || !ESTIMATED_JOB_KINDS.has(source.kind)) {
     return null;
   }
   try {
     const crawl = (await readProfileStart(detail.profileId))?.context?.targetConfig.crawl;
-    return crawl === undefined ? null : { maxRuntimeMs: crawl.maxRuntimeMs };
+    return crawl === undefined ? null : { maxRuntimeMs: crawl.maxRuntimeMs, baseline: localUiAuditJobs().progressBaselineOf(source.jobId) };
   } catch {
     return null;
   }
@@ -889,18 +975,23 @@ const estimateLimitsOf = async (detail: JobDetailFacts): Promise<EstimateLimits 
 
 /**
  * 見積もり（DEF-192）。分母は見つけたページの数（ページの上限まで。読み終えたページを下回らない）。進み具合の知らせがまだない（1 ページも読んでいない）
- * ときは出さない（見つけたページの数も 1 ページの時間も分からない）。
+ * ときと、見積もりの基準がないときは出さない（見つけたページの数も 1 ページの時間も分からない）。
  */
 const progressEstimateOf = (detail: JobDetailFacts, limits: EstimateLimits | null): JobProgressEstimateView | null => {
-  const progress = detail.lastProgress;
-  if (limits === null || progress === null || !ESTIMATED_JOB_KINDS.has(detail.jobKind)) {
+  const source = progressSourceOf(detail);
+  if (limits === null || limits.baseline === null || source === null || !ESTIMATED_JOB_KINDS.has(source.kind)) {
     return null;
   }
+  const { progress } = source;
   const { pagesFinished } = progress;
   // L14: ページの上限を指定していなければ、見つけたページの数まで。
   const pagesTotal = Math.max(pagesFinished, progress.maxPages === undefined ? progress.pagesDiscovered : Math.min(progress.pagesDiscovered, progress.maxPages));
-  const remainingMs = progressRemainingMs({ pagesFinished, pagesTotal, elapsedMs: progress.elapsedMs, maxRuntimeMs: limits.maxRuntimeMs });
-  return remainingMs === null ? null : { pagesFinished, pagesTotal, remainingMs };
+  const remainingMs = progressRemainingMs({
+    pagesFinished, pagesTotal, elapsedMs: progress.elapsedMs, maxRuntimeMs: limits.maxRuntimeMs, baseline: limits.baseline,
+  });
+  // DSEED2: 分母が見つけた画面そのものの間だけ、ワーカーの分け方を添える。
+  const split = progress.pagesDiscoveredSplit === undefined || pagesTotal !== progress.pagesDiscovered ? {} : { pagesTotalSplit: progress.pagesDiscoveredSplit };
+  return remainingMs === null ? null : { jobKind: source.kind, pagesFinished, pagesTotal, ...split, remainingMs };
 };
 
 /** 書き込みのジョブの結果の 1 行の種類。 */
@@ -1075,6 +1166,10 @@ const advanceOf = (detail: JobDetailFacts, result: JobSummaryResult, awaitingReg
   // OP-1（4.1.3 の 3）: 印つきの下調べは、続けて始めた点検の作業へ移す。始めなかったときは、下調べの結果によらずサイトの画面へ移す（サイトの画面が理由を出す）。
   const followUp = detail.entryCheckFollowUp;
   if (followUp !== null && followUp.state !== 'WAITING') {
+    // REV-PAR の m-4: 同じサイトの別の設定が動いていて始めなかったときは、移さずに、この画面で理由を出す（サイトの画面はこの理由を出さない）。
+    if (followUp.state === 'SKIPPED' && followUp.reason !== undefined) {
+      return null;
+    }
     return followUp.state === 'STARTED' ? { kind: 'JOB', jobId: followUp.jobId } : { kind: 'SITE' };
   }
   // OP-2 の修正の 1 回目（指示書の 8）: 書き込みの段を含む点検の後は、どの段の作業からもサイトの画面へ（書き込みの手順の詳細へは移さない）。
@@ -1277,8 +1372,12 @@ export const auditStartSummaryFn = createServerFn({ method: 'GET' })
       };
     // T25e: 認証の設定が要るモードでは、保存してある設定の新しさと、今のプロファイルとターゲット設定での検証の結果も見る（ジョブの管理と同じ順）。
     // T26e: 自動ログインのプロファイルは、ジョブの管理と同じ開始の前の確かめも行う（読むだけ）。
-    const check = auditStartCheckOf(checkInput);
-    const chain = stageChainStartOf(profile.mode, checkInput);
+    // PAR-c: サイトごとに同時に 1 つの決まりの理由（同じサイトの別の設定が点検中・パソコンの空きが足りない）も、ジョブの管理から読んで最後に当てる。
+    const startInput = context === undefined
+      ? checkInput
+      : { ...checkInput, concurrencyBlocker: localUiAuditJobs().startConcurrencyBlockerOf(profile.profileId, context.targetConfig.site.allowedOrigins) };
+    const check = auditStartCheckOf(startInput);
+    const chain = stageChainStartOf(profile.mode, startInput);
     return {
       ...base,
       target,

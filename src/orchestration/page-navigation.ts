@@ -147,7 +147,7 @@ export async function navigatePage(page: Page, url: string, options: PageNavigat
   const judge = options.isOutsideAuditScope;
   const currentUrl = currentUrlOf(page);
   const movedOutside = loadObservation.navigationOutcome === 'OK' && judge !== undefined
-    && (currentUrl === '' || auditScopeLeftUrl(currentUrl, judge) !== null);
+    && (currentUrl === '' || auditScopeLeftUrl(currentUrl, judge, url) !== null);
   const outcome: NavigationOutcomeKind = movedOutside || (loadObservation.navigationOutcome === 'FAILED'
     && blockedExternalNavigationCount(ledger) > blockedBefore)
     ? 'BLOCKED_EXTERNAL_REDIRECT'

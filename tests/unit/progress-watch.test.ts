@@ -112,6 +112,19 @@ describe('progress watch (L0)', () => {
     expect(signals?.signal.aborted).toBe(true);
   });
 
+  // QUIET-2（設計書 `2026-11-24-beaksight-discovery-stuck-step-design.md` 2.2）: ページの印が窓の早いうちに止まった打ち切りは、静まらないでなく応答しなかった。
+  it('QUIET-2: ends the stage as unresponsive when the page itself stopped changing early in the window', async () => {
+    let signals: ProgressSignals | undefined;
+    const watched = watchProgress((given) => {
+      signals = given;
+      return new Promise<never>(() => undefined);
+    }, { quietLimitMs: LIMIT_MS });
+    await advance(LIMIT_MS / 10);
+    signals?.mark('DOM_CHANGE');
+    await advance(LIMIT_MS);
+    await expect(watched).resolves.toEqual({ status: 'ENDED', end: 'STAGE_UNRESPONSIVE' });
+  });
+
   it('L1: counts the page network and the screen changes as content progress when the stage says so (a load)', async () => {
     const work = pendingWork<string>();
     let signals: ProgressSignals | undefined;

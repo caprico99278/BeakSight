@@ -16,11 +16,15 @@
 //   届かなかった画面の印（`SERVICE_READ_REFUSED`。読み切れなかった画面に数える）。READ の確かめの成果物（`read-check-evaluation.ts`）も、詳しい理由の
 //   一覧と数の比べ方をここから使う。成果物の版を 1.1 に上げた。
 import type { AuditSendPolicyName } from '../core/audit-send-policy.js';
-import { SESSION_LOST_DETAILS, type JobSafetyViolation, type RunAuthenticationSummary, type RunStatus } from '../core/contracts.js';
+import {
+  SESSION_LOST_DETAILS, type DiscoveredPagesSplit, type JobSafetyViolation, type RunAuthenticationSummary, type RunStatus,
+} from '../core/contracts.js';
+import type { DiscoveryPageTimeBreakdown } from './page-time-breakdown.js';
 import type { SessionLossEvidence } from '../core/evidence-types.js';
 import { deriveRunStatus } from '../core/status.js';
 import { isSecretLikeText } from '../core/secret-like-text.js';
 import { compareCodeUnits, normalizeWhitespace } from '../core/text.js';
+import type { DiscoverySearchTriggerRecord } from './search-read-contracts.js';
 import {
   CANDIDATE_REASON_CLASSIFICATIONS,
   INCOMPLETE_REASONS,
@@ -119,6 +123,8 @@ export type DiscoveryEndReason = (typeof DISCOVERY_END_REASONS)[number];
  *   すでに読んだ（同じ型は最初の 1 つだけ読む。設定どおり読まなかった）。
  * - `REBUILD_FAILED`（COV-2c fix round 5。SREV-COV 4 回目の I-2）: 続きから始めた後、押下から生まれた画面に行くための前の画面（伏せた URL の祖先）を、押下を
  *   押し直して作り直せなかった（凍結の外では読まないので、読まなかった）。
+ * - `NO_PRESSABLE_ELEMENTS`（SKIP-1。設計書 `2026-11-20-beaksight-discovery-skip-and-debug-timing-design.md` 2.1）: 点検の段の証拠で、Desktop と Mobile の両方に押す物が
+ *   ないと分かった画面（判定は `src/core/audit-stage-links.ts` の 1 か所）。読み込まない（設定どおり読まなかった）。
  */
 export const DISCOVERY_UNREAD_REASONS = Object.freeze([
   'EXCLUDED',
@@ -135,6 +141,7 @@ export const DISCOVERY_UNREAD_REASONS = Object.freeze([
   'PREFLIGHT_FAILED',
   'SAME_TEMPLATE_PAGE_READ',
   'REBUILD_FAILED',
+  'NO_PRESSABLE_ELEMENTS',
 ] as const);
 export type DiscoveryUnreadReason = (typeof DISCOVERY_UNREAD_REASONS)[number];
 
@@ -165,7 +172,7 @@ const UNRELIABLE_INCOMPLETE_REASONS: ReadonlySet<IncompleteReason> = new Set<Inc
 ]);
 
 /** Run Status を `COMPLETE` のままにする、読まなかった理由（設定どおりに読まなかった）。 */
-const EXPECTED_UNREAD_REASONS: ReadonlySet<DiscoveryUnreadReason> = new Set<DiscoveryUnreadReason>(['EXCLUDED', 'SAME_TEMPLATE_PAGE_READ']);
+const EXPECTED_UNREAD_REASONS: ReadonlySet<DiscoveryUnreadReason> = new Set<DiscoveryUnreadReason>(['EXCLUDED', 'SAME_TEMPLATE_PAGE_READ', 'NO_PRESSABLE_ELEMENTS']);
 
 /** 1 画面分の記録（発見の入口 `src/discovery/discover-page.ts` の `discoverPageCandidates` が返す形。CC-070 (a)）。 */
 export interface DiscoveryReadPageRecord {
@@ -185,6 +192,11 @@ export interface DiscoveryReadPageRecord {
    * 選択肢がない画面と、前の書き手の成果物にはない（任意の項目。版は変えない）。
    */
   readonly optionChoices?: readonly DiscoveryOptionChoiceRecord[];
+  /**
+   * RCA-1（検索の確かめの設計書 2.1）: 押下・選択肢の選択・打つだけの欄への入力のうち、データの読み取りを起こしたきっかけと、その読み取りの形と状態（起きた順。
+   * 契約は `search-read-contracts.ts`）。ない画面と、前の書き手の成果物にはない（任意の項目。版は変えない）。
+   */
+  readonly searchTriggers?: readonly DiscoverySearchTriggerRecord[];
 }
 
 /** COV-3: 選択肢を選んだ欄の種類（select か、名前の同じ radio の組）。 */
@@ -281,6 +293,8 @@ export type DiscoveryPageEntry =
     readonly safetyViolations?: readonly JobSafetyViolation[];
     /** DEF-144: 残りの候補を押すために、この画面を読み込み直した（1 画面 1 回まで）。読み込み直していなければ持たない。 */
     readonly reloadedForProbe?: true;
+    /** DTIME: この画面の時間の内訳（ms と回数。設計者が成果物から数える。画面には出さない。DBG-1: 測りの記録が入のときだけ書く。前の書き手の成果物にはない）。 */
+    readonly timeBreakdown?: DiscoveryPageTimeBreakdown;
   }
   | {
     readonly url: string;
@@ -307,6 +321,8 @@ export interface DiscoveryDocument {
    * （`discovery.schema.json`）が求める項目で、前の成果物を読むために残す（LZ-1: 版の決まりがないため、消さない）。
    */
   readonly omittedUnreadPages: number;
+  /** DSEED2: 連鎖の操作さがしだけが持つ、見つけた画面の分け方（最後の進み具合と同じ数。版は 1.1 のまま）。 */
+  readonly pagesDiscoveredSplit?: DiscoveredPagesSplit;
   /**
    * COV-2c の M-1（設計者の判断）: 凍結の中でだけ読む状態の祖先を、最初から凍結した Context で読めず（描けない・作り直せない・お知らせの枠を閉じる押下が止められた）、
    * 凍結の外で読み込む形に戻した回数（1 回以上のときだけ持つ）。
@@ -458,6 +474,8 @@ export const withIncompleteReason = (record: DiscoveryReadPageRecord, reason: In
   ...(record.screenName === undefined ? {} : { screenName: record.screenName }),
   // COV-3: 選択肢を選んだ欄の記録も写す。
   ...(record.optionChoices === undefined ? {} : { optionChoices: record.optionChoices }),
+  // RCA-1: 読み取りを起こしたきっかけの記録も写す。
+  ...(record.searchTriggers === undefined ? {} : { searchTriggers: record.searchTriggers }),
 });
 
 /**

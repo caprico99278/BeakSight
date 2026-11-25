@@ -356,10 +356,11 @@ const ATTEMPT_COLUMNS = [
 const SELECT_JOBS_FROM = `SELECT ${JOB_COLUMNS}, ${ATTEMPT_COLUMNS} FROM jobs LEFT JOIN auto_login_attempts AS attempts ON attempts.job_id = jobs.job_id`;
 const SELECT_JOB_SQL = `${SELECT_JOBS_FROM} WHERE jobs.job_id = ?`;
 const SELECT_ALL_JOBS_SQL = `${SELECT_JOBS_FROM} ORDER BY jobs.created_at DESC, jobs.job_id DESC`;
-/** プロファイルの終わっていないジョブの数（T26d-2。資格情報の変更の確かめ）。 */
+/** プロファイルの終わっていないジョブの数（T26d-2。資格情報の変更の確かめ。PAR-b: 自分のジョブを除ける。除かないときは `?` に null）。 */
 const COUNT_ACTIVE_PROFILE_JOBS_SQL =
-  'SELECT count(*) AS active FROM jobs WHERE profile_id = ? AND state IN (SELECT value FROM json_each(?))';
-const SELECT_ACTIVE_JOB_IDS_SQL = 'SELECT job_id FROM jobs WHERE state IN (SELECT value FROM json_each(?)) ORDER BY job_id';
+  'SELECT count(*) AS active FROM jobs WHERE profile_id = ? AND state IN (SELECT value FROM json_each(?)) AND job_id IS NOT ?';
+/** 終わっていないジョブの ID とプロファイル（PAR-b。ジョブの管理の開始の確かめ）。 */
+const SELECT_ACTIVE_JOBS_SQL = 'SELECT job_id, profile_id FROM jobs WHERE state IN (SELECT value FROM json_each(?)) ORDER BY job_id';
 const INSERT_JOB_SQL =
   'INSERT INTO jobs (job_id, profile_id, profile_revision, state, start_new, created_at, job_kind) VALUES (?, ?, ?, ?, ?, ?, ?)';
 /** 自動ログインの試し始めた記録（T26c。結果は未確定の `null`）。 */
@@ -652,15 +653,31 @@ const viewOf = (row: JobRow): AuditJobView => {
 const readRow = (connection: SqliteConnection, jobId: string): JobRow | undefined =>
   connection.prepare(SELECT_JOB_SQL).get(jobId) as JobRow | undefined;
 
-const activeJobIdsOf = (connection: SqliteConnection): readonly string[] =>
-  (connection.prepare(SELECT_ACTIVE_JOB_IDS_SQL).all(ACTIVE_STATES_JSON) as { job_id: string }[]).map((row) => row.job_id);
+/** 終わっていないジョブ（PAR-b。ジョブの ID とプロファイル）。 */
+export interface ActiveJobRow {
+  readonly jobId: string;
+  readonly profileId: string;
+}
+
+/**
+ * 開いているトランザクションの接続（`createStartingJob` の `guard` が受けたもの）で、終わっていないジョブを読む（読むだけ。PAR-b: ジョブの管理が、
+ * 知らないジョブと同じサイトのジョブを確かめる）。
+ */
+export const activeJobsWith = (connection: SqliteConnection): readonly ActiveJobRow[] =>
+  (connection.prepare(SELECT_ACTIVE_JOBS_SQL).all(ACTIVE_STATES_JSON) as { job_id: string; profile_id: string }[])
+    .map((row) => Object.freeze({ jobId: row.job_id, profileId: row.profile_id }));
+
+/** 終わっていないジョブを読む（読むだけの入口。PAR-c: 開始の画面の押す前の確かめ）。 */
+export const readActiveJobs = (database: ControlDatabase): readonly ActiveJobRow[] =>
+  withReadTransaction(database, (connection) => activeJobsWith(connection));
 
 /** 変えた行の数が 1 か（終わっていない行だけを書き換える文で、書き換えたか）。 */
 const changedOne = (changes: number | bigint): boolean => Number(changes) === ONE_ROW;
 
 /**
- * `STARTING` のジョブを作る。同じトランザクションの中で、`guard`（プロファイルの確かめ直し）と、終わっていないジョブがないことを確かめる。
- * 終わっていないジョブがあれば（一意の部分索引の違反を含む）、`JOB_ALREADY_ACTIVE`。
+ * `STARTING` のジョブを作る。同じトランザクションの中で、`guard`（プロファイルの確かめ直し）と、そのプロファイルに終わっていないジョブがないことを
+ * 確かめる（PAR-b。前は管理データ全体で 1 つ）。そのプロファイルに終わっていないジョブがあれば（一意の部分索引の違反を含む）、`JOB_ALREADY_ACTIVE`。
+ * 連鎖の段の移り（前の段の行を締めてから次の段の行を作る）は、この確かめで通る。
  * T26c: ジョブの種類を必ず書く。自動ログインの試し始めた記録（`job.autoLoginAttempt`）があれば、同じトランザクションの中で書く（どちらかが
  * 書けなければ、両方とも元に戻る。Task 26 の設計書 4.5、変更履歴の「Blocker: T26c」の行の (1)）。
  */
@@ -678,7 +695,7 @@ export const createStartingJob = <Reason extends string>(
       if (rejection !== null) {
         return Object.freeze({ ok: false, reason: rejection });
       }
-      if (activeJobIdsOf(connection).length > 0) {
+      if (activeJobsWith(connection).some(({ profileId }) => profileId === job.profileId)) {
         return Object.freeze({ ok: false, reason: 'JOB_ALREADY_ACTIVE' });
       }
       connection.prepare(INSERT_JOB_SQL).run(
@@ -824,10 +841,13 @@ export const recordLoginCheckFinished = (database: ControlDatabase, jobId: strin
   withWriteTransaction(database, (connection) =>
     changedOne(connection.prepare(UPDATE_LOGIN_CHECK_FINISHED_SQL).run(exitCode, at, jobId, ACTIVE_STATES_JSON).changes));
 
-/** プロファイルに、終わっていないジョブがあるか（T26d-2。資格情報の変更と削除を拒むかの確かめ）。 */
-export const hasActiveJobForProfile = (database: ControlDatabase, profileId: string): boolean =>
+/**
+ * プロファイルに、終わっていないジョブがあるか（T26d-2。資格情報の変更と削除を拒むかの確かめ）。PAR-b: `exceptJobId` を渡すと、そのジョブを除く
+ * （ログインの段の口から書くジョブが、自分を数えないため）。
+ */
+export const hasActiveJobForProfile = (database: ControlDatabase, profileId: string, exceptJobId: string | null = null): boolean =>
   withReadTransaction(database, (connection) =>
-    Number((connection.prepare(COUNT_ACTIVE_PROFILE_JOBS_SQL).get(profileId, ACTIVE_STATES_JSON) as { active: number }).active) > 0);
+    Number((connection.prepare(COUNT_ACTIVE_PROFILE_JOBS_SQL).get(profileId, ACTIVE_STATES_JSON, exceptJobId) as { active: number }).active) > 0);
 
 /**
  * 書き込みのジョブの報告の確かめの結果を記録する（T32g。Task 32 の設計書 4.1 の「報告の確かめの記録」）。ジョブの管理が、書き込みの結果の締めと

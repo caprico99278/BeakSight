@@ -5,7 +5,7 @@
  * - 一部だけ終わった画面: Run の時間の上限で止めた段・ビューポートの理由（`MAX_RUNTIME_REACHED`、段の `<段>:MAX_RUNTIME_REACHED`、期限切れ
  *   `DEADLINE_EXCEEDED`。段の期限は Run の時間の上限より後にしない）があるページ。
  * - 証拠の足りない指摘の確かめ: 画像に対象が写っていない（`TARGET_NOT_IN_IMAGE`）・対象まで動かして撮れなかった（`NOT_OPERATED`）指摘のあるページ。追加の証拠は
- *   同じ読み込みの中で取りきる作りなので、そのページを読み直す。準備の終わらない画面（`PAGE_NOT_READY`）は、読み直しで取る証拠ではないので数えない。
+ *   同じ読み込みの中で取りきる作りなので、そのページを読み直す。AUD-4: 記録と画像の状態がずれた（`EVIDENCE_MISMATCH`）指摘も、読み直しで撮り直す。準備の終わらない画面（`PAGE_NOT_READY`）は、読み直しで取る証拠ではないので数えない。AUD-6: 落ち着きの待ちを終えられず準備の状態が分からない（`PAGE_READINESS_UNKNOWN`）指摘は、読み直しで確かめる。
  * - 読み直しの終わり（構造の事実。回数で決めない）: 読み直した後も確かめを待つ指摘が減らなくなったら（または 0 になったら）終える（`readAgainAfterRevisit`）。
  * 読み込みは、今の移動の間隔の守り（Run Coordinator の pacer）の中で数える。
  */
@@ -13,8 +13,13 @@ import type { IncompleteReason, PageAuditResult, RunExecutionEndReason } from '.
 import { isUncollectedAuditStatus } from '../core/status.js';
 import { findingHoldReasonsOnPage, type FindingHoldReason } from '../core/finding-image-regions.js';
 
-/** 読み直しで取りに行く保留の理由（画像に写っていない・動かして撮れなかった）。 */
-const REVISIT_HOLD_REASONS: ReadonlySet<FindingHoldReason> = new Set<FindingHoldReason>(['TARGET_NOT_IN_IMAGE', 'NOT_OPERATED']);
+/**
+ * 読み直しで取りに行く保留の理由（画像に写っていない・動かして撮れなかった・AUD-4 の記録と画像の状態がずれた・AUD-6 の落ち着きの待ちを終えられず準備の状態が
+ * 分からない）。
+ */
+const REVISIT_HOLD_REASONS: ReadonlySet<FindingHoldReason> = new Set<FindingHoldReason>([
+  'TARGET_NOT_IN_IMAGE', 'NOT_OPERATED', 'EVIDENCE_MISMATCH', 'PAGE_READINESS_UNKNOWN',
+]);
 
 /** Run の時間の上限で止めた理由のコードと、段の理由（`COLLECTOR_INCOMPLETE` の `<段>:<理由>`）の理由。 */
 const RUN_TIME_LIMIT_REASONS: ReadonlySet<string> = new Set(['MAX_RUNTIME_REACHED', 'DEADLINE_EXCEEDED']);
@@ -29,7 +34,8 @@ export interface PageRevisitFact {
   readonly collectedViewportCount: number;
 }
 
-const isRunTimeLimitReason = ({ code, detail }: IncompleteReason): boolean =>
+/** Run の時間の上限で止めた理由か（ビューポートの理由と、段の理由。DUP の 1 回目の決まりも使う）。 */
+export const isRunTimeLimitReason = ({ code, detail }: IncompleteReason): boolean =>
   RUN_TIME_LIMIT_REASONS.has(code)
   || (code === 'COLLECTOR_INCOMPLETE' && detail !== null && RUN_TIME_LIMIT_REASONS.has(detail.slice(detail.lastIndexOf(':') + 1)));
 

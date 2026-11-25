@@ -32,8 +32,15 @@ export const AUDIT_JOB_START_REJECTION_REASONS = Object.freeze([
   'TARGET_CONFIG_UNAVAILABLE',
   /** 今のターゲット設定で、プロファイルが `validateSiteProfile` を通らない。 */
   'PROFILE_INVALID',
-  /** 終わっていないジョブがある（同時に 1 つだけ）。 */
+  /**
+   * このサイトの作業が動いている（そのプロファイルに終わっていないジョブがある。PAR-b から、ジョブはプロファイルごとに同時に 1 つ）。ジョブの管理が
+   * 知らない終わっていないジョブ（前の画面のサーバのワーカーがまだ動いている）があるときも、この理由。
+   */
   'JOB_ALREADY_ACTIVE',
+  /** 許可 Origin のどれかが重なるほかのプロファイル（同じサイトの別の設定）のジョブが動いている（PAR-b。同じサイトは同時に始めない）。 */
+  'SITE_ALREADY_ACTIVE',
+  /** ほかのジョブが動いている間に、端末の空きメモリが足りない（PAR-b。2 本目からだけ確かめる）。 */
+  'MACHINE_MEMORY_LOW',
   /** 自動ログインのプロファイルで、資格情報のファイルがない（Task 26 の設計書 4.5。T26c）。 */
   'CREDENTIAL_MISSING',
   /** 保存した資格情報のログインの Origin が、今の認証の設定の `loginStartUrl` の Origin と違う（T26c）。 */
